@@ -785,6 +785,57 @@ final class TowerClient: NSObject, ObservableObject {
     /// gets "no", rather than the question being unaskable there.
     @Published private(set) var isStreamingToTower = false
 
+    /// Whether frames are being **held on the phone** rather than sent.
+    ///
+    /// ## Why a gate here, and not a camera pause or a `stream_stop`
+    ///
+    /// The CV Lab's camera card offers Pause and Resume, and neither of the
+    /// two obvious implementations is available. DAT offers no app-initiated
+    /// camera pause: `StreamState.paused` is something the **glasses** do, on
+    /// a temple press or on heat, and `GlassesConnection` documents that it
+    /// cannot be overridden in either direction. And sending `stream_stop`
+    /// would end the capture lineage on the Tower — the bracket is what a
+    /// capture is keyed to, and in the operator's configuration a new bracket
+    /// spawns a new follower on the next start.
+    ///
+    /// So the gate sits on the one hop this app fully owns. While it is
+    /// closed the glasses camera keeps running, the socket and the stream
+    /// bracket stay up, the Tower keeps the experiment armed, and the only
+    /// thing the Tower sees is silence: its `source.receiving_frames` turns
+    /// false after `idle_after_s` (5 s), which is exactly what the Lab's LIVE
+    /// indicator already reads. Nothing is sent to announce the hold, because
+    /// there is no message for it and the Tower's own idle detection is the
+    /// truthful report.
+    ///
+    /// Readable in both configurations, like `isStreamingToTower` beside it,
+    /// so `disconnect()` can clear it without a build-conditional. It is
+    /// consulted only on the frame path, which is `#if DEBUG`.
+    ///
+    /// Cleared by `disconnect()` and by `sendStreamStop()`, and deliberately
+    /// **not** by `teardownConnection`: a socket that drops and reconnects on
+    /// its own schedule is not a person changing their mind, and a hold they
+    /// set should still be there when the link comes back.
+    @Published private(set) var isFrameSendingPaused = false
+
+    /// Closes the frame gate. Idempotent.
+    ///
+    /// Frames selected while it is closed are counted as session-gate drops:
+    /// they reached a terminal outcome on this side, and
+    /// `SenderMetrics.framesUnaccounted` — the one number that exists to prove
+    /// frames are not quietly queueing — must not read them as backlog.
+    func pauseFrameSending() {
+        guard !isFrameSendingPaused else { return }
+        isFrameSendingPaused = true
+        log("frame sending paused — frames are held on the phone; the camera and the stream bracket stay up")
+    }
+
+    /// Reopens the frame gate. Idempotent.
+    func resumeFrameSending() {
+        guard isFrameSendingPaused else { return }
+        isFrameSendingPaused = false
+        log("frame sending resumed")
+    }
+
     /// How much outbound latency a frame may carry before the window that
     /// admitted it is considered oversized.
     ///
@@ -1173,6 +1224,10 @@ final class TowerClient: NSObject, ObservableObject {
         cancelReconnect()
         teardownConnection(cancelWith: .normalClosure)
         status = .offline
+        // The user asked for this connection to end, so the hold they set
+        // during it ends too — a fresh connect streams. See the property for
+        // why an *automatic* teardown does not do this.
+        isFrameSendingPaused = false
         log("disconnect cleanup complete")
     }
 
@@ -1255,6 +1310,18 @@ final class TowerClient: NSObject, ObservableObject {
             metrics.recordSessionGateDrop()
             if shouldLog {
                 log("frame #\(sequence) not sent — no stream_start sent yet (or stream_stop already sent)")
+            }
+            return
+        }
+        guard !isFrameSendingPaused else {
+            // A person closed the gate. Not an error, and not a stall: the
+            // socket is fine and nothing is queued. Counted as a session-gate
+            // drop for the reason `pauseFrameSending()` gives, and checked
+            // before the stall test below so a long hold cannot be misread as
+            // a socket that stopped draining.
+            metrics.recordSessionGateDrop()
+            if shouldLog {
+                log("frame #\(sequence) held — frame sending is paused")
             }
             return
         }
@@ -1461,6 +1528,14 @@ final class TowerClient: NSObject, ObservableObject {
     /// From this point, `sendFrame` will not forward anything until the next
     /// `sendStreamStart()`. A no-op if not currently streaming.
     func sendStreamStop() {
+        // A hold belongs to the camera session it was set in. The camera has
+        // stopped; a later start must stream, not inherit a pause nobody
+        // remembers setting and that no control on that later screen shows.
+        // Cleared BEFORE the bracket guard, deliberately: a socket drop
+        // already closed the bracket (`teardownConnection`), and a camera
+        // stopped during that gap would otherwise keep the hold into the
+        // next session, where Home has no control that shows it.
+        isFrameSendingPaused = false
         guard isStreamingToTower else {
             log("stream_stop suppressed — not currently streaming")
             return

@@ -53,8 +53,9 @@ struct SenderMetricsSnapshot: Equatable, Sendable {
     /// A non-zero value here is the pipeline correctly shedding load rather
     /// than queueing it.
     var sendWindowDrops = 0
-    /// Frames dropped because the Tower was not online, or no `stream_start`
-    /// was in effect.
+    /// Frames dropped because the Tower was not online, no `stream_start`
+    /// was in effect, or frame sending was paused on the phone
+    /// (`TowerClient.isFrameSendingPaused`).
     var sessionGateDrops = 0
     /// Bytes handed to the WebSocket (JSON envelope, excluding WebSocket and
     /// TCP framing).
