@@ -57,15 +57,19 @@ import SwiftUI
 ///   be streaming and `source.receiving_frames` to be true, and the first half
 ///   is permanently false here.
 ///
-/// ## No capture controls here, deliberately
+/// ## The camera card, and what it does and does not change
 ///
-/// Home carries the app's session controls; this workspace adds none, and that
-/// is unchanged by gaining experiment controls. Starting an experiment is a
-/// request to the *Tower* about what to compute; it opens no camera, and
-/// `startCameraSession()` is not reachable from this file. The invariant that
-/// the app never starts the camera on its own remains structural — one button
-/// per workspace that has one, no `.onAppear` anywhere — and this workspace
-/// still has none.
+/// This workspace used to carry no capture control at all, and said so here.
+/// It now mounts a `CVCameraCard`, because a person running an experiment
+/// otherwise had to leave for Home to start the camera that feeds it and come
+/// back to read the result — three screens for one question. What has **not**
+/// changed is the shape of the invariant: one button, the one
+/// `GlassesConnection`, reached through `startCameraSession()` and
+/// `stopCameraSession()` exactly as Home and World Builder reach it, and no
+/// `.onAppear` anywhere. Starting an *experiment* still opens no camera — that
+/// is a request to the Tower about what to compute — and the card's own Pause
+/// is a frame gate on `TowerClient`, not a camera operation at all; see
+/// `TowerClient.isFrameSendingPaused` for why.
 struct ExperimentalCVWorkspaceView: View {
     /// A value, not the connection. Reachability changes almost never, and
     /// `TowerReachabilityReader` — which supplies this — exists so a workspace
@@ -85,12 +89,25 @@ struct ExperimentalCVWorkspaceView: View {
     /// reference by identity, so a reply does not re-run this body at all.
     let tower: TowerClient
 
+    /// The camera, held the same way `tower` is and for the same reason.
+    /// `GlassesConnection` publishes `frameCount` and `latestCapturedFrame` at
+    /// the 24 Hz capture rate; observing it here would re-evaluate the whole
+    /// workspace at that rate. `CVCameraCard` is the leaf that observes it,
+    /// and the only thing in this file that touches it.
+    let glasses: GlassesConnection
+
     @StateObject private var lab: ExperimentalCVViewModel
 
     /// The client is injected and owned by `ProjectManager`; see
     /// `CartridgeClients`.
-    init(isTowerReachable: Bool, tower: TowerClient, client: any ExperimentalCVClient) {
+    init(
+        isTowerReachable: Bool,
+        glasses: GlassesConnection,
+        tower: TowerClient,
+        client: any ExperimentalCVClient
+    ) {
         self.isTowerReachable = isTowerReachable
+        self.glasses = glasses
         self.tower = tower
         _lab = StateObject(wrappedValue: ExperimentalCVViewModel(client: client))
     }
@@ -99,8 +116,15 @@ struct ExperimentalCVWorkspaceView: View {
         VStack(spacing: 16) {
             header
 
-            // FIRST, above everything, because it is the answer to the
-            // question a person wearing the glasses is actually asking. This
+            // The socket, before anything that depends on it. Every panel
+            // below reads what the Tower said; this row is where a person
+            // finds out whether it can say anything, and reconnects without
+            // leaving for the shell's sheet. A leaf that observes `tower` on
+            // its own, so the reply-rate invalidation stops there.
+            TowerConnectionRow(tower: tower)
+
+            // FIRST among the Lab's own panels, because it is the answer to
+            // the question a person wearing the glasses is actually asking. This
             // screen used to open with eleven numbers at equal weight, every
             // one of them true and none of them saying whether the algorithm
             // could see the doorway. The numbers did not go away; they stopped
@@ -118,6 +142,13 @@ struct ExperimentalCVWorkspaceView: View {
             // answer the Tower is producing right now; everything below it is
             // about choosing what produces the next one.
             CVFrameReadingPanel(tower: tower, isTowerReachable: isTowerReachable)
+
+            // Above the Lab and its catalog, because the camera is what feeds
+            // them: an experiment armed with the camera off measures nothing,
+            // and the panels below say so in their own words. Drawn under
+            // every availability, including an unreachable Tower — the card
+            // itself says what a start would do about that.
+            CVCameraCard(glasses: glasses, tower: tower)
 
             if let forcedPhase = lab.availability(isTowerReachable: isTowerReachable).forcedPhase {
                 CartridgeStatePanel(
@@ -399,6 +430,11 @@ struct ExperimentalCVWorkspaceView: View {
     /// Which half of "live" is missing, said in the words that fit the build.
     private func notLiveExplanation(isReceivingFrames: Bool) -> String {
         #if DEBUG
+        if tower.isFrameSendingPaused {
+            // The camera card directly above says "Paused (held on phone)";
+            // telling the user to check the glasses here would contradict it.
+            return "Frames are held on the phone — see the Camera card above. Resume to feed it."
+        }
         if !tower.isStreamingToTower {
             return isReceivingFrames
                 ? """
@@ -429,13 +465,32 @@ struct ExperimentalCVWorkspaceView: View {
     @ViewBuilder
     private func controls(for run: CVExperimentRun, isPaused: Bool) -> some View {
         if lab.canSendCommands {
+            // Every control is disabled while any command is out, not only
+            // the one pressed: pause and stop against one run are not
+            // independent while the Tower has not said what the run is doing.
+            // Bounded — the client clears it at the reply or at ten seconds,
+            // whichever comes first. On each button rather than on the row,
+            // so the spinner beside them is not drawn dimmed.
             HStack(spacing: 12) {
                 if isPaused {
                     Button("Resume") { lab.resume() }
+                        .disabled(lab.isCommandPending)
                 } else {
                     Button("Pause") { lab.pause() }
+                        .disabled(lab.isCommandPending)
                 }
                 Button("Stop") { lab.stop() }
+                    .disabled(lab.isCommandPending)
+                // The question that is out, while it is out. A pending start
+                // is drawn on its catalog row instead, which is where the tap
+                // happened.
+                if let pending = lab.pendingCommand, pending.command != .start {
+                    ProgressView()
+                        .padding(.leading, 4)
+                    Text("Asking the Tower…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .buttonStyle(.bordered)
             .font(.subheadline)
@@ -565,15 +620,34 @@ struct ExperimentalCVWorkspaceView: View {
     /// would not** — never a greyed-out button, which still invites the press
     /// that produces the refusal. The Tower's own reason is shown instead,
     /// verbatim, because only the Tower knows which module is missing.
+    ///
+    /// The one disabled state is different in kind: while a command is out,
+    /// every row is disabled for at most ten seconds, and the row that asked
+    /// says so. That is not "this cannot be started" but "the last question
+    /// has not been answered", and on a one-slot Lab where last start wins, a
+    /// second tap in that window is a race, not a retry.
     @ViewBuilder
     private func experimentRow(_ experiment: CVExperiment) -> some View {
-        if lab.canSendCommands && experiment.isStartable {
+        if lab.isAwaitingStart(of: experiment) {
+            // Asked, not loading. The Tower's `starting` is the next phase and
+            // is drawn from the document, in `labPanel`, when it arrives.
+            VStack(alignment: .leading, spacing: 6) {
+                experimentLabel(experiment)
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Asking the Tower…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if lab.canSendCommands && experiment.isStartable {
             Button {
                 lab.run(experiment)
             } label: {
                 experimentLabel(experiment)
             }
             .buttonStyle(.plain)
+            .disabled(lab.isCommandPending)
             .accessibilityHint("Starts this experiment on the Tower, replacing whatever is running")
         } else {
             experimentLabel(experiment)

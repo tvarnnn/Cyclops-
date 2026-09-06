@@ -61,9 +61,12 @@ import functools
 import importlib.util
 import math
 import logging
+import os
 import threading
 import time
 import uuid
+
+import psutil
 
 from tower.cv_lab import catalog
 from tower.logging_config import client_safe_reason
@@ -77,6 +80,7 @@ from tower.cv_lab.contracts import (
     ERR_STALE_RUN,
     ERR_UNKNOWN_EXPERIMENT,
     FRAME_REFUSAL_REASONS,
+    FRAME_REFUSED_FAILED,
     FRAME_RESULT_CONTRACT,
     ORIGIN_CLIENT_REQUEST,
     ORIGIN_STARTUP_DEFAULT,
@@ -92,9 +96,9 @@ from tower.cv_lab.contracts import (
     TIME_BASIS,
 )
 from tower.cv_lab.preview import LivePreview, PreviewPolicy
+from tower.cv_lab.loader import ExperimentLoader
 from tower.cv_lab.run import LabRun
 from tower.experiments import EXPERIMENTS, ExperimentSettings, experiment_metadata
-from tower.loading import run_abandonable
 from tower.modules.base import FrameProcessingError
 
 # Imported for `json_safe` alone, and the direction is deliberate.
@@ -211,6 +215,19 @@ def _wire_safe(value):
     return _clip(value, 120)
 
 
+def _own_process():
+    """A handle on this process for the status document, or None.
+
+    Built once: `psutil.Process()` resolves a creation time on
+    construction, and the document is built twice a second.
+    """
+    try:
+        return psutil.Process()
+    except Exception:  # pragma: no cover - psutil could not see itself
+        logger.exception("[Tower][CVLab] psutil could not open this process")
+        return None
+
+
 class CVLab:
     """The one Lab slot's contents, its lifecycle, and what it reports."""
 
@@ -293,18 +310,33 @@ class CVLab:
         # one that left a stopped run's last frame on somebody's screen.
         self._preview = LivePreview(preview or PreviewPolicy(), clock=clock)
 
+        # ONE loader thread for every arm this Lab ever performs, started
+        # on first use. A fresh thread per arm leaked torch's intra-op team
+        # every switch to a model-backed experiment -- 19 OS threads and
+        # ~8 MB a time, measured -- see tower/cv_lab/loader.py.
+        self._loader = ExperimentLoader()
+        self._process = _own_process()
+
     # -- module-facing lifecycle ---------------------------------------
 
     async def load_initial(self) -> None:
         """Arm the startup default. Called from `Module._do_load`.
 
-        Deliberately NOT the same path as `start()`. This one propagates:
-        an unknown name or a failed load here reaches `ModuleContainer`,
-        which marks the module FAILED, which is the behaviour every
-        existing lifecycle and load-timeout test encodes. A typo in
-        `TOWER_CV_EXPERIMENT` must still be loud.
+        Loud, and no longer terminal. Until 2026-09-06 an unknown name or
+        a failed load here propagated to `ModuleContainer`, which marked
+        the module FAILED -- a state with no way back -- so a typo in
+        `TOWER_CV_EXPERIMENT`, or a `depth` default on a Tower that could
+        not reach torch.hub, killed every experiment for the life of the
+        process. The mission brief's "restart Tower" step was this.
 
-        The interactive path is the one that recovers. See `start()`.
+        Now the failure is logged at ERROR naming the variable, the Lab
+        reports `failed` with the reason on every surface, the module
+        reaches ACTIVE, and a client picks any other experiment with
+        `cv_lab_start`. What still propagates is `CancelledError`: the
+        container's load TIMEOUT cancels this coroutine and must go on
+        marking the module FAILED, because a load that overran the bound
+        has been abandoned on its thread and the invalidation latch is
+        what makes that safe (`tower/loading.py`).
         """
         # A fresh load is not a released Lab. Nothing reaches this
         # today -- `ModuleContainer` has no reload path and `unload()`
@@ -313,49 +345,83 @@ class CVLab:
         # would refuse every request while answering every frame.
         self._released = False
         experiment_id = self._initial_experiment_id
-        if self._injected_experiment is None:
-            factory = EXPERIMENTS.get(experiment_id)
-            if factory is None:
-                raise ValueError(
-                    f"unknown experiment {experiment_id!r}; "
-                    f"available: {sorted(EXPERIMENTS)}"
-                )
-            experiment = factory()
-        else:
-            experiment = self._injected_experiment
+        experiment = None
+        try:
+            if self._injected_experiment is None:
+                factory = EXPERIMENTS.get(experiment_id)
+                if factory is None:
+                    raise ValueError(
+                        f"unknown experiment {experiment_id!r}; "
+                        f"available: {sorted(EXPERIMENTS)}"
+                    )
+                experiment = factory()
+            else:
+                experiment = self._injected_experiment
 
-        # Published BEFORE the load, so a status read during a slow
-        # startup says `starting` and names what it is starting rather
-        # than reporting an idle Lab that is in fact busy.
-        self._transition(
-            STATE_STARTING,
-            selected=experiment_id,
-            run=self._new_run(experiment_id, ORIGIN_STARTUP_DEFAULT),
-        )
-        # Installed BEFORE the load, unlike the interactive path in
-        # `_arm`. A partially-loaded startup experiment must still be
-        # reachable by `release()`: the container's load timeout ABANDONS
-        # the loading thread and then marks the module FAILED, and if
-        # nothing holds the instance at that moment, nothing closes
-        # `LoadInvalidation`'s latch and the abandoned thread installs a
-        # live model -- on CUDA, resident GPU memory -- into a module that
-        # will never be released again. `process()` cannot reach it in the
-        # meantime because the state is STARTING, not RUNNING.
-        with self._guard:
-            self._experiment = experiment
+            # Published BEFORE the load, so a status read during a slow
+            # startup says `starting` and names what it is starting rather
+            # than reporting an idle Lab that is in fact busy.
+            self._transition(
+                STATE_STARTING,
+                selected=experiment_id,
+                run=self._new_run(experiment_id, ORIGIN_STARTUP_DEFAULT),
+            )
+            # Installed BEFORE the load, unlike the interactive path in
+            # `_arm`. A partially-loaded startup experiment must still be
+            # reachable by `release()`: the container's load timeout
+            # ABANDONS the loading thread and then marks the module
+            # FAILED, and if nothing holds the instance at that moment,
+            # nothing closes `LoadInvalidation`'s latch and the abandoned
+            # thread installs a live model -- on CUDA, resident GPU
+            # memory -- into a module that will never be released again.
+            # `process()` cannot reach it in the meantime because the
+            # state is STARTING, not RUNNING.
+            with self._guard:
+                self._experiment = experiment
 
-        # On a thread, not inline. `asyncio.wait_for` can cancel only at an
-        # await point, and a model-backed `load()` is a torch import, a
-        # weight download and a `.to(device)`, none of which yield one.
-        # `run_abandonable` rather than `asyncio.to_thread` because
-        # `asyncio.run` joins the default executor on close -- see
-        # tower/loading.py for the measurement.
-        await run_abandonable(experiment.load, self._settings)
+            # On the Lab's loader thread, not inline. `asyncio.wait_for`
+            # can cancel only at an await point, and a model-backed
+            # `load()` is a torch import, a weight download and a
+            # `.to(device)`, none of which yield one.
+            await self._loader.run(experiment.load, self._settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_startup(experiment_id, exc)
+            return
 
         with self._guard:
             self._experiment = experiment
             self._set_state_locked(STATE_RUNNING)
             self._record_runtime_locked(experiment)
+            self._record_arm_locked()
+
+    def _fail_startup(self, experiment_id: str, exc: BaseException) -> None:
+        """The startup default could not arm. Say so, loudly, and go on."""
+        logger.error(
+            "[Tower][CVLab] TOWER_CV_EXPERIMENT=%r could not be armed at "
+            "startup: %s. The Lab reports `failed`; a client may select any "
+            "other experiment with cv_lab_start, and no restart is needed",
+            experiment_id,
+            exc,
+            exc_info=True,
+        )
+        reason = (
+            f"{experiment_id} could not be armed at startup: "
+            f"{client_safe_reason(exc)}"
+        )
+        self._drop_experiment()
+        with self._guard:
+            self._selected_id = experiment_id
+            if self._run is None or self._run.experiment_id != experiment_id:
+                # The name was unknown, so no run was ever minted. Mint one
+                # so that the document has a run to hang the reason on --
+                # a `failed` state with `run: null` would say less than
+                # the log did.
+                self._run = self._new_run(experiment_id, ORIGIN_STARTUP_DEFAULT)
+            self._set_state_locked(STATE_FAILED, reason=_clip(reason))
+            if self._run.ended_at is None:
+                self._run.ended_at = self._clock()
 
     async def shutdown(self, reason: str = "the Tower is shutting down") -> None:
         """Release, and WAIT for an in-flight arm to unwind.
@@ -432,6 +498,9 @@ class CVLab:
             self._preview.end()
         if experiment is not None:
             experiment.release()
+        # The loader thread exits once it is idle. An arm that is still
+        # loading keeps it alive until the load returns and is discarded.
+        self._loader.close()
 
     # -- the frame path -------------------------------------------------
 
@@ -461,6 +530,33 @@ class CVLab:
         self._arm_preview_for_frame(now)
         try:
             result = experiment.run(raw_bytes)
+        except FrameProcessingError:
+            # The experiment refused THIS frame and said why -- it would
+            # not decode, it was too small. The run goes on.
+            self._last_frame_provenance = None
+            if run is not None:
+                run.record_failed(now)
+            raise
+        except Exception as exc:
+            # Anything else is a bug in the experiment, and until
+            # 2026-09-06 it propagated to `ModuleContainer.process`,
+            # which marks the module FAILED -- terminal, for the life of
+            # the process. One odd frame ended every experiment until a
+            # restart. Now it ends the RUN: the experiment is released,
+            # the state is `failed` with the reason, and the container
+            # sees a refused frame. The next `cv_lab_start` arms a fresh
+            # instance. `BaseException` (KeyboardInterrupt, SystemExit)
+            # is not a run failure and still propagates below.
+            self._last_frame_provenance = None
+            if run is not None:
+                run.record_failed(now)
+            self._fail_run_on_frame(run, experiment, exc)
+            raise FrameProcessingError(
+                f"{self._selected_id} failed while processing a frame and "
+                f"its run has ended: {client_safe_reason(exc)}. Select an "
+                "experiment to continue.",
+                reason=FRAME_REFUSED_FAILED,
+            ) from exc
         except BaseException:
             self._last_frame_provenance = None
             if run is not None:
@@ -743,7 +839,7 @@ class CVLab:
             # no state transition anyone can see -- Rule 15 wants a
             # defined failure transition, and `failed` is it.
             await asyncio.wait_for(
-                run_abandonable(experiment.load, self._settings),
+                self._loader.run(experiment.load, self._settings),
                 timeout=ARM_TIMEOUT_S,
             )
         except asyncio.CancelledError:
@@ -799,6 +895,7 @@ class CVLab:
                 self._experiment = experiment
                 self._set_state_locked(STATE_RUNNING)
                 self._record_runtime_locked(experiment)
+                self._record_arm_locked()
             if mine:
                 self._switching = False
         if stale is not None:
@@ -1070,6 +1167,45 @@ class CVLab:
             self._last_frame_provenance = None
         self._release_quietly(experiment)
 
+    def _fail_run_on_frame(self, run, experiment, exc: BaseException) -> None:
+        """A frame crash ends the run and frees the experiment. Never raises.
+
+        Guarded on identity: `process()` snapshots the experiment without
+        the lock, so by the time a slow frame raises, a switch may already
+        have installed a successor. Failing the successor's run for the
+        predecessor's crash would be the misattribution the run id exists
+        to prevent, so the state changes only if the crashed instance is
+        still the one installed.
+        """
+        logger.exception(
+            "[Tower][CVLab] %s raised on a frame; run %s is failed and the "
+            "experiment released. The Lab stays available and another start "
+            "may be sent",
+            self._selected_id,
+            run.run_id if run is not None else None,
+        )
+        reason = _clip(
+            f"{self._selected_id} failed on a frame: {client_safe_reason(exc)}"
+        )
+        with self._guard:
+            still_current = self._experiment is experiment
+            if still_current:
+                self._experiment = None
+                self._last_frame_provenance = None
+                self._set_state_locked(STATE_FAILED, reason=reason)
+                if self._run is not None and self._run.ended_at is None:
+                    self._run.ended_at = self._clock()
+        if still_current:
+            self._release_quietly(experiment)
+
+    def _record_arm_locked(self) -> None:
+        """How long the current run took to arm. Set once, on install."""
+        run = self._run
+        if run is not None and run.arm_ms is None:
+            run.arm_ms = round(
+                (time.perf_counter() - run.arm_started_perf) * 1000.0, 1
+            )
+
     def _record_runtime_locked(self, experiment) -> None:
         """Ask the experiment what it actually loaded, if it will say.
 
@@ -1191,6 +1327,27 @@ class CVLab:
             },
         })
 
+    def process_stats(self) -> dict:
+        """What this Tower process is using right now.
+
+        Served beside the status document on `GET /cv-lab`, and
+        deliberately NOT inside it. The document is one object on three
+        surfaces and a test holds them byte-equal; thread and RSS
+        figures differ between two reads a millisecond apart, and the
+        result channel would republish the document on every poll for a
+        number that changed by 0.1 MB. This is an operator's reading --
+        "did the last switch give its memory back" -- for `curl` and the
+        switch soak, from a Tower nobody has a shell on.
+        """
+        threads = rss_mb = None
+        if self._process is not None:
+            try:
+                threads = self._process.num_threads()
+                rss_mb = round(self._process.memory_info().rss / (1024 * 1024), 1)
+            except Exception:
+                logger.debug("[Tower][CVLab] could not read process stats", exc_info=True)
+        return {"pid": os.getpid(), "threads": threads, "rss_mb": rss_mb}
+
     def _clients_connected(self) -> int | None:
         if self._connection_count is None:
             return None
@@ -1255,6 +1412,10 @@ class CVLab:
             "started_at": run.started_at,
             "ended_at": run.ended_at,
             "elapsed_s": round(elapsed, 3),
+            # From `cv_lab_start` accepted to the first frame this run
+            # could answer. `null` while arming, and `null` forever for a
+            # run whose arm failed.
+            "arm_ms": run.arm_ms,
             # What the experiment says it actually loaded -- device,
             # weights, versions. Empty for an experiment that holds none.
             "runtime": dict(run.runtime),

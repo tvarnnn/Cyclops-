@@ -52,6 +52,26 @@ protocol ExperimentalCVClient: CartridgeClient {
     /// for, since a refusal changes nothing and carries the unchanged document.
     var lastRefusal: CVLabControlRefusal? { get }
 
+    /// The command this client has sent and the Tower has not yet answered,
+    /// or `nil`. See `CVLabPendingCommand` for what sets and clears it.
+    ///
+    /// Not folded into `state`, for the same reason `lastRefusal` is not: a
+    /// question in flight changes nothing on the Tower, and the state is the
+    /// Tower's.
+    var pendingCommand: CVLabPendingCommand? { get }
+
+    /// Every change to `pendingCommand` after the value held at construction.
+    var pendingCommandUpdates: AnyPublisher<CVLabPendingCommand?, Never> { get }
+
+    /// Failures discovered **after** a command was sent — today, exactly one:
+    /// the reply bound passing with no answer.
+    ///
+    /// A publisher rather than a thrown error because the command's `throws`
+    /// covers only "could not be sent", and this is discovered ten seconds
+    /// later, on nobody's call stack. The view model files it where a refused
+    /// send goes, so a person reads both in one place.
+    var commandFailures: AnyPublisher<CartridgeFailure, Never> { get }
+
     /// Whether this build can issue commands at all.
     ///
     /// `false` where the Tower has not offered the cartridge, where the socket
@@ -94,6 +114,17 @@ extension ExperimentalCVClient {
     }
 
     var lastRefusal: CVLabControlRefusal? { nil }
+
+    /// A client that sends nothing has nothing pending, ever.
+    var pendingCommand: CVLabPendingCommand? { nil }
+
+    var pendingCommandUpdates: AnyPublisher<CVLabPendingCommand?, Never> {
+        Just<CVLabPendingCommand?>(nil).eraseToAnyPublisher()
+    }
+
+    var commandFailures: AnyPublisher<CartridgeFailure, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
 
     var canSendCommands: Bool { false }
 
@@ -243,12 +274,30 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
 
     private(set) var lastRefusal: CVLabControlRefusal?
 
+    /// The command sent and not yet answered. `settlePending(...)` and
+    /// `clearPending()` below are its only writers, so the reply bound and the
+    /// value can never disagree about whether something is in flight.
+    private(set) var pendingCommand: CVLabPendingCommand? {
+        didSet {
+            guard pendingCommand != oldValue else { return }
+            pendingSubject.send(pendingCommand)
+        }
+    }
+
     var stateUpdates: AnyPublisher<ExperimentalCVState, Never> {
         stateSubject.eraseToAnyPublisher()
     }
 
     var statusUpdates: AnyPublisher<CVLabStatus?, Never> {
         statusSubject.eraseToAnyPublisher()
+    }
+
+    var pendingCommandUpdates: AnyPublisher<CVLabPendingCommand?, Never> {
+        pendingSubject.eraseToAnyPublisher()
+    }
+
+    var commandFailures: AnyPublisher<CartridgeFailure, Never> {
+        commandFailureSubject.eraseToAnyPublisher()
     }
 
     /// Whether a command may be sent right now.
@@ -269,11 +318,13 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
     ///    which is exactly what the contract versions the control vocabulary
     ///    separately for.
     ///
-    /// Note what condition 3 is **not**: it is not this workspace acquiring a
-    /// session control. Nothing in this cartridge calls `startCameraSession()`,
-    /// the invariant that the app never starts the camera on its own is
-    /// untouched, and a person still starts the camera from Home. This is the
-    /// narrower statement that a build with no camera must not offer to arm an
+    /// Note what condition 3 is **not**: it is not this *client* acquiring a
+    /// session control. Nothing in this file calls `startCameraSession()`. The
+    /// workspace now carries a `CVCameraCard`, and that card reaches the camera
+    /// the way Home and World Builder do — one button, the one
+    /// `GlassesConnection`, no `.onAppear` — so the invariant that the app
+    /// never starts the camera on its own is untouched. This is the narrower
+    /// statement that a build with no camera must not offer to arm an
     /// experiment for it.
     var canSendCommands: Bool {
         #if DEBUG
@@ -285,8 +336,17 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
 
     private let stateSubject = PassthroughSubject<ExperimentalCVState, Never>()
     private let statusSubject = PassthroughSubject<CVLabStatus?, Never>()
+    private let pendingSubject = PassthroughSubject<CVLabPendingCommand?, Never>()
+    private let commandFailureSubject = PassthroughSubject<CartridgeFailure, Never>()
     private let tower: TowerClient
     private var cancellables: Set<AnyCancellable> = []
+
+    /// The sleep that ends the current pending command if nothing else does.
+    /// Cancelled by every clear, so a reply that arrives in time leaves no
+    /// timer behind to fire against the *next* command.
+    private var replyBoundTask: Task<Void, Never>?
+    /// `Self.replyBoundSeconds`, except in a test that cannot wait ten seconds.
+    private let replyBound: TimeInterval
 
     /// The open subscription on the **current** socket, or `nil`. The Tower's
     /// ids restart at `sub-1` on every connection, so nothing keeps one across
@@ -326,8 +386,15 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
     /// enforced by whoever remembers.
     private var commandCounter = 0
 
-    init(tower: TowerClient) {
+    /// - Parameter replyBoundSeconds: how long a sent command may go unanswered
+    ///   before it is given up on. Overridable for tests only; every production
+    ///   construction takes the default.
+    init(
+        tower: TowerClient,
+        replyBoundSeconds: TimeInterval = TowerExperimentalCVClient.replyBoundSeconds
+    ) {
         self.tower = tower
+        self.replyBound = replyBoundSeconds
 
         // `.receive(on:)` on the two `@Published` sources, and it is
         // load-bearing rather than stylistic: a `@Published` publisher fires
@@ -408,22 +475,38 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
             )
         }
         try guardCommandChannel()
-        tower.sendCVLabStart(experimentID: experiment.id, requestID: nextRequestID())
+        let requestID = nextRequestID()
+        tower.sendCVLabStart(experimentID: experiment.id, requestID: requestID)
+        // Recorded after the send rather than before it, and the order is not
+        // cosmetic: `guardCommandChannel()` can still throw between the two,
+        // and a pending command for a message that never went out would sit on
+        // screen until the reply bound cleared it. `TowerClient` reports
+        // nothing back — its send path is fire-and-forget by design, so the
+        // control plane cannot cost the frame path — which is what the reply
+        // bound is for: a message the socket dropped is indistinguishable here
+        // from one the Tower is slow to answer, and both end the same way.
+        settlePending(.start, experimentID: experiment.id, requestID: requestID)
     }
 
     func pause() throws {
         try guardCommandChannel()
-        tower.sendCVLabPause(runID: currentRunID, requestID: nextRequestID())
+        let requestID = nextRequestID()
+        tower.sendCVLabPause(runID: currentRunID, requestID: requestID)
+        settlePending(.pause, experimentID: nil, requestID: requestID)
     }
 
     func resume() throws {
         try guardCommandChannel()
-        tower.sendCVLabResume(runID: currentRunID, requestID: nextRequestID())
+        let requestID = nextRequestID()
+        tower.sendCVLabResume(runID: currentRunID, requestID: requestID)
+        settlePending(.resume, experimentID: nil, requestID: requestID)
     }
 
     func stop() throws {
         try guardCommandChannel()
-        tower.sendCVLabStop(runID: currentRunID, requestID: nextRequestID())
+        let requestID = nextRequestID()
+        tower.sendCVLabStop(runID: currentRunID, requestID: requestID)
+        settlePending(.stop, experimentID: nil, requestID: requestID)
     }
 
     /// Asks the Lab to describe itself, without changing anything.
@@ -488,6 +571,83 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
         return "cv-\(commandCounter)"
     }
 
+    // MARK: The command in flight
+
+    /// How long a sent command may go unanswered before this client stops
+    /// waiting for it.
+    ///
+    /// The Tower answers every command **immediately** — a start is answered
+    /// `accepted` before the experiment loads, which is the whole reason the
+    /// outcome arrives as state — so a reply that has not come in ten seconds
+    /// is not a slow reply. It is a lost one: a socket that closed between the
+    /// guard and the send, a message the Tower never received, or a reply that
+    /// did not survive the trip. Ten seconds, not the 120 s arm timeout,
+    /// because this bounds the *reply* and the arm is reported by the document.
+    ///
+    /// `nonisolated` so it can be a default argument: default arguments are
+    /// evaluated in the caller's context, and an immutable `Sendable` value
+    /// needs no isolation to read.
+    nonisolated static let replyBoundSeconds: TimeInterval = 10
+
+    /// Records a command as in flight and starts its reply bound.
+    ///
+    /// A second command while one is pending **replaces** it rather than being
+    /// refused here. The workspace disables its controls while something is
+    /// pending, so this is reached only by code, and a client that refused
+    /// would be inventing a `lab_busy` the Tower did not send. The superseded
+    /// command's reply, if it comes, no longer matches and clears nothing.
+    private func settlePending(_ command: CVLabCommand, experimentID: String?, requestID: String) {
+        replyBoundTask?.cancel()
+        pendingCommand = CVLabPendingCommand(
+            command: command,
+            experimentID: experimentID,
+            requestID: requestID,
+            sentAt: Date()
+        )
+        let bound = replyBound
+        replyBoundTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(bound * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.replyBoundElapsed(for: requestID)
+        }
+    }
+
+    /// Clears the pending command if, and only if, `replyRequestID` names it.
+    ///
+    /// Called with every `cv_lab_status` and `cv_lab_error`, most of which
+    /// name nothing: the document is pushed on the result channel and read on
+    /// connect, and neither carries a request id. `CVLabPendingCommand`
+    /// explains why those must not clear it.
+    private func clearPending(ifAnsweredBy replyRequestID: String?) {
+        guard let pending = pendingCommand, pending.isAnswered(by: replyRequestID) else { return }
+        clearPending()
+    }
+
+    private func clearPending() {
+        replyBoundTask?.cancel()
+        replyBoundTask = nil
+        pendingCommand = nil
+    }
+
+    /// The reply bound passed with no answer. Cleared, and reported as the
+    /// request failure it is — **not** as a state change. Nothing is known
+    /// about whether the command took effect; the next document says.
+    private func replyBoundElapsed(for requestID: String) {
+        guard let pending = pendingCommand, pending.requestID == requestID else { return }
+        clearPending()
+        let seconds = String(format: "%g", replyBound)
+        commandFailureSubject.send(
+            CartridgeFailure(
+                kind: .timedOut,
+                message: """
+                    The Tower did not answer the \(pending.verb) request within \
+                    \(seconds) s. Whether it took effect is not known from here; \
+                    the Lab's state above is what the Tower last said.
+                    """
+            )
+        )
+    }
+
     // MARK: Connection lifecycle
 
     private func connectionChanged(to status: TowerStatus) {
@@ -511,6 +671,11 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
             self.status = nil
             state = .idle(available: [])
             lastRefusal = nil
+            // A reply to a command sent on the old socket cannot arrive on the
+            // new one — the Tower answers on the connection that asked — so
+            // waiting for it would only ever end at the reply bound, ten
+            // seconds after the answer became impossible.
+            clearPending()
             return
         }
         subscribeIfPossible()
@@ -562,6 +727,7 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
     private func handle(_ event: CVLabEvent) {
         switch event {
         case .status(let reply):
+            clearPending(ifAnsweredBy: reply.requestID)
             // `acceptedCommand` is read for one purpose: an accepted command
             // clears the refusal that a previous one left on screen. It is
             // deliberately **not** used to decide what state to move to — the
@@ -571,6 +737,7 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
             apply(CVLabStatus(json: reply.status))
 
         case .refused(let refusal):
+            clearPending(ifAnsweredBy: refusal.requestID)
             lastRefusal = refusal
             // The document is applied even on a refusal, and it is the
             // *unchanged* one: the request did not take effect, so this is not
@@ -882,6 +1049,10 @@ final class ExperimentalCVViewModel: ObservableObject {
     /// already showing.
     @Published private(set) var lastRequestFailure: CartridgeFailure?
 
+    /// The command sent and not yet answered, republished so the row that
+    /// asked can say so and the others can wait. See `CVLabPendingCommand`.
+    @Published private(set) var pendingCommand: CVLabPendingCommand?
+
     private let client: any ExperimentalCVClient
     private var cancellables: Set<AnyCancellable> = []
 
@@ -890,6 +1061,7 @@ final class ExperimentalCVViewModel: ObservableObject {
         self.client = client
         self.state = client.state
         self.status = client.status
+        self.pendingCommand = client.pendingCommand
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
@@ -900,6 +1072,28 @@ final class ExperimentalCVViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] status in self?.status = status }
             .store(in: &cancellables)
+
+        client.pendingCommandUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] pending in self?.pendingCommand = pending }
+            .store(in: &cancellables)
+
+        // Filed where a refused send goes, deliberately: "could not be sent"
+        // and "was sent and never answered" are both answers to "what happened
+        // when I pressed that", and a person should find both in one place.
+        client.commandFailures
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] failure in self?.lastRequestFailure = failure }
+            .store(in: &cancellables)
+    }
+
+    /// Whether any command is awaiting the Tower's answer.
+    var isCommandPending: Bool { pendingCommand != nil }
+
+    /// Whether `experiment` is the one an unanswered start named.
+    func isAwaitingStart(of experiment: CVExperiment) -> Bool {
+        guard let pending = pendingCommand, pending.command == .start else { return false }
+        return pending.experimentID == experiment.id
     }
 
     /// Experiments the Tower declared, whatever the Lab is currently doing.

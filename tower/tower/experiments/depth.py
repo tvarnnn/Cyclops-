@@ -38,6 +38,75 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
+# torch's intra-op pool defaults to one thread per logical CPU -- twenty
+# on this host -- and Intel OpenMP workers spin-wait for 200 ms after every
+# parallel region. At a 40-80 ms frame interval they never sleep, so every
+# core that ever joined a team reads busy, which is what "object detection
+# pegs the machine at 99% CPU" was. Measured on this host on 2026-09-06
+# (20 logical CPUs, RTX 5070, torch 2.13.0+cu132, 40 timed frames a row):
+#
+#     object_detection  CUDA  threads 20 / 4 / 2 / 1
+#                             cores   12.6 / 3.6 / 1.8 / 0.9
+#                             p50 ms  43.6 / 40.0 / 40.1 / 40.0
+#     depth             CUDA  threads 20 / 2 / 1
+#                             cores    6.2 / 1.1 / 0.9
+#                             p50 ms  11.8 / 11.7 / 16.3
+#     object_detection  CPU   threads 20 / 4      cores 13.1 / 3.8   p50 46.6 / 35.9
+#     depth             CPU   threads 20 / 8 / 4  cores 12.5 / 7.7 / 3.9  p50 42.3 / 34.1 / 48.2
+#
+# On CUDA the CPU work is preprocessing, and two threads cost nothing in
+# latency while returning ten cores. On CPU, four is object detection's
+# best and within 15% of depth's best (eight) at half the cores; a
+# machine that also runs the World Builder's followers wants the cores
+# more than depth wants the 8 ms.
+TORCH_THREADS_CUDA = 2
+TORCH_THREADS_CPU = 4
+
+
+def resolve_torch_threads(device: str, requested="auto") -> int | None:
+    """The intra-op budget to apply, or None to leave torch's default alone.
+
+    `requested` is `ExperimentSettings.torch_threads`: "auto", a
+    non-negative integer, or the string of one. Garbage raises rather than
+    silently becoming a default -- `config.py` already sanitises the
+    environment variable, so anything that reaches here came from code.
+    """
+    if requested is None:
+        return None
+    if isinstance(requested, str):
+        text = requested.strip().lower()
+        if text == "auto":
+            return (
+                TORCH_THREADS_CUDA
+                if str(device).startswith("cuda")
+                else TORCH_THREADS_CPU
+            )
+        if not text.isdigit():
+            raise ValueError(f"torch_threads must be 'auto' or an integer, not {requested!r}")
+        requested = int(text)
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0:
+        raise ValueError(f"torch_threads must be 'auto' or a non-negative integer, not {requested!r}")
+    return requested or None
+
+
+def apply_torch_threads(threads: int | None) -> None:
+    """Apply the budget on THIS thread.
+
+    OpenMP keeps its thread budget per calling thread, so a cap set on the
+    loader thread does not reach the event loop thread that runs
+    inference. Experiments therefore call this twice: once in `load()`,
+    on the loader, so that building the model does not spin twenty
+    workers; and on every `run()`, on whichever thread runs frames, where
+    it costs one `omp_get_max_threads()` read when nothing has to change.
+    """
+    if threads is None:
+        return
+    import torch
+
+    if torch.get_num_threads() != threads:
+        torch.set_num_threads(threads)
+
+
 class DepthEstimation:
     """Stateful monocular depth estimation (MiDaS-small).
 
@@ -59,6 +128,7 @@ class DepthEstimation:
         # silent downgrade, and only both numbers together can
         # tell the two apart after the fact.
         self._requested_device = None
+        self._torch_threads: int | None = None
         # Opt-in, bounded observability hook for offline research analysis
         # (World Builder Experiment 1, depth_temporal_consistency): the wire
         # protocol only carries the scalar mean, but temporal-stability
@@ -90,6 +160,10 @@ class DepthEstimation:
         requested = "auto" if settings is None else settings.device
         self._requested_device = requested
         device = resolve_device(requested)
+        self._torch_threads = resolve_torch_threads(
+            device, "auto" if settings is None else settings.torch_threads
+        )
+        apply_torch_threads(self._torch_threads)
         import torch  # local import: torch is an optional [ml] extra;
         # nothing outside a depth-selected module may require it.
 
@@ -239,6 +313,7 @@ class DepthEstimation:
             "device_requested": self._requested_device or "auto",
             "model": "MiDaS_small",
             "output": "relative inverse depth, not metric distance",
+            "torch_threads": self._torch_threads,
         }
 
     def set_preview_capture(self, enabled: bool) -> None:
@@ -266,6 +341,9 @@ class DepthEstimation:
 
         import torch  # deferred: only the stages below need it, so an
         # undecodable frame never requires torch to be installed at all.
+
+        # On the inference thread, every frame: see `apply_torch_threads`.
+        apply_torch_threads(self._torch_threads)
 
         with timer.stage("preprocess"):
             try:

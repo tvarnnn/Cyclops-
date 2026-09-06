@@ -3016,6 +3016,109 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - The frame gate
+
+    /// The hold is cleared by the camera STOPPING, not by a `stream_stop`
+    /// actually leaving. A socket drop closes the bracket on its own
+    /// (`teardownConnection`); a camera stopped during that gap used to keep
+    /// the hold into the next session, where Home shows no control for it.
+    func testStopClearsTheFrameGateEvenWhenTheBracketIsAlreadyGone() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        // No `sendStreamStart()`: the bracket is not open, as after a drop.
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+
+        client.sendStreamStop()
+
+        XCTAssertFalse(client.isFrameSendingPaused, "the hold outlived the camera session")
+        XCTAssertFalse(client.isStreamingToTower)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let stops = recorder.all.compactMap(decode).filter { $0["type"] as? String == "stream_stop" }
+        XCTAssertEqual(stops.count, 0, "a stop with no open bracket must still send nothing")
+    }
+
+    /// Paused: the frame is selected, counted, and never leaves the phone.
+    /// Resumed: the next one does. The bracket is untouched throughout — no
+    /// `stream_stop` goes out, because the whole point of the gate is that the
+    /// Tower keeps the capture lineage and the armed experiment.
+    func testPausedFrameSendingHoldsFramesOnThePhone() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+
+        func count(_ type: String) -> Int {
+            recorder.all.compactMap(decode).filter { $0["type"] as? String == type }.count
+        }
+
+        XCTAssertFalse(client.isFrameSendingPaused, "the gate must start open")
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(count("frame"), 0, "a frame left the phone while sending was paused")
+        XCTAssertEqual(count("stream_stop"), 0, "the gate must hold frames, not end the bracket")
+        XCTAssertTrue(client.isStreamingToTower, "the gate closed the stream bracket")
+
+        client.resumeFrameSending()
+        XCTAssertFalse(client.isFrameSendingPaused)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 2)
+        await expect("no frame flowed after resume") { count("frame") == 1 }
+
+        client.disconnect()
+    }
+
+    /// `disconnect()` is the user ending the connection; a hold set during it
+    /// must not survive into the next connect.
+    func testDisconnectResetsTheFrameGate() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.disconnect()
+        XCTAssertFalse(client.isFrameSendingPaused, "a disconnect left the frame gate closed")
+    }
+
+    /// A hold belongs to the camera session it was set in. `stream_stop` ends
+    /// that session's bracket, and the next start must stream.
+    func testStreamStopResetsTheFrameGate() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        client.sendStreamStart()
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.sendStreamStop()
+        XCTAssertFalse(client.isFrameSendingPaused, "a stream_stop left the frame gate closed")
+
+        client.disconnect()
+    }
 }
 
 /// Collects CV Lab control-plane events in arrival order.

@@ -34,6 +34,20 @@ class Settings:
     dev_mode: bool
     cv_experiment: str
     cv_device: str
+    # TOWER_CV_TORCH_THREADS. The intra-op thread budget torch gets while a
+    # CV Lab experiment holds a model. "auto" is 2 on CUDA and 4 on CPU,
+    # from a measured sweep (`tower/experiments/depth.py`); a positive
+    # integer is applied as given; 0 leaves torch's default of one thread
+    # per logical CPU, which on this host is twenty OpenMP workers
+    # spin-waiting between kernel launches -- the 99% CPU that object
+    # detection was seen to cost.
+    #
+    # PROCESS-WIDE in effect, like torch's own setting, and applied on
+    # the thread that runs inference each time a model-backed experiment
+    # is armed. `TOWER_SCENE_TORCH_THREADS` caps the same pool for Scene
+    # Understanding; if both cartridges run in one process, whichever
+    # loaded last decides.
+    cv_torch_threads: int | str = "auto"
     # Whether the CV Lab derives a live picture of what the running
     # experiment sees, and serves it over `GET /cv-lab/preview`.
     #
@@ -451,6 +465,7 @@ def get_settings() -> Settings:
         dev_mode=os.environ.get("TOWER_DEV_MODE", "true").lower() in ("1", "true", "yes"),
         cv_experiment=os.environ.get("TOWER_CV_EXPERIMENT", "baseline"),
         cv_device=os.environ.get("TOWER_CV_DEVICE", "auto"),
+        cv_torch_threads=_torch_threads(os.environ.get("TOWER_CV_TORCH_THREADS")),
         cv_preview=_flag("TOWER_CV_PREVIEW", default=True),
         cv_preview_max_edge_px=_non_negative_int(
             os.environ.get("TOWER_CV_PREVIEW_MAX_EDGE_PX"), default=320
@@ -638,6 +653,22 @@ def _flag(name: str, *, default: bool) -> bool:
     # which would silently disable a cartridge whose flag defaults
     # ON. A spelling of true must never mean false.
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _torch_threads(value: str | None) -> int | str:
+    """"auto", or a non-negative integer. Garbage is "auto", not a crash.
+
+    Same reasoning as `_non_negative_int`: a typo in a thread budget must
+    not stop a Tower from serving frames, and the value is logged at
+    startup so the typo is still visible.
+    """
+    if value is None or not value.strip() or value.strip().lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError:
+        return "auto"
+    return parsed if parsed >= 0 else "auto"
 
 
 def _non_negative_int(value: str | None, *, default: int) -> int:

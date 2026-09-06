@@ -83,7 +83,10 @@ def _build_cv_module(settings: Settings, connection_count=None) -> Module:
     """
     return ExperimentalCVModule(
         settings.cv_experiment,
-        ExperimentSettings(device=settings.cv_device),
+        ExperimentSettings(
+            device=settings.cv_device,
+            torch_threads=settings.cv_torch_threads,
+        ),
         connection_count=connection_count,
         # Whether this Tower draws anything at all is an operator's
         # decision, so it arrives from `Settings` rather than being a
@@ -436,10 +439,12 @@ def _log_effective_configuration(
             )
 
     logger.info(
-        "[Tower][Config] CV Lab startup default is %r on device %r; a client "
-        "may select another with cv_lab_start, no restart required",
+        "[Tower][Config] CV Lab startup default is %r on device %r with torch "
+        "threads %r; a client may select another with cv_lab_start, no "
+        "restart required",
         settings.cv_experiment,
         settings.cv_device,
+        settings.cv_torch_threads,
     )
 
     attached = supervisor.worker_names()

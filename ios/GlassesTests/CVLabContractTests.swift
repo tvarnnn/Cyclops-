@@ -1304,4 +1304,311 @@ final class CVLabPreviewBytesTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
+
+    // MARK: - The command in flight: the value
+
+    /// Two records of the same send are the same record, and a different
+    /// request id is a different send even for the same button.
+    func testPendingCommandEqualityIsByEveryField() {
+        let sentAt = Date(timeIntervalSince1970: 1_787_833_032)
+        let a = CVLabPendingCommand(command: .start, experimentID: "depth", requestID: "cv-3", sentAt: sentAt)
+        let b = CVLabPendingCommand(command: .start, experimentID: "depth", requestID: "cv-3", sentAt: sentAt)
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(
+            a, CVLabPendingCommand(command: .start, experimentID: "depth", requestID: "cv-4", sentAt: sentAt),
+            "a different request id is a different send"
+        )
+        XCTAssertNotEqual(
+            a, CVLabPendingCommand(command: .stop, experimentID: nil, requestID: "cv-3", sentAt: sentAt),
+            "a different command is a different send"
+        )
+        XCTAssertNotEqual(
+            a, CVLabPendingCommand(command: .start, experimentID: "depth", requestID: "cv-3", sentAt: sentAt.addingTimeInterval(1)),
+            "a different send time is a different send"
+        )
+    }
+
+    /// A reply that names no request answers no request. The status document
+    /// is pushed on the subscription and read on connect without one, and
+    /// neither of those may clear a question it was never asked.
+    func testAReplyWithoutARequestIDAnswersNothing() {
+        let pending = CVLabPendingCommand(command: .pause, experimentID: nil, requestID: "cv-7", sentAt: Date())
+        XCTAssertTrue(pending.isAnswered(by: "cv-7"))
+        XCTAssertFalse(pending.isAnswered(by: "cv-8"))
+        XCTAssertFalse(pending.isAnswered(by: nil))
+    }
+
+    func testPendingCommandVerbsAreTheWordsAPersonWouldUse() {
+        func verb(_ command: CVLabCommand) -> String {
+            CVLabPendingCommand(command: command, experimentID: nil, requestID: "cv-1", sentAt: Date()).verb
+        }
+        XCTAssertEqual(verb(.start), "start")
+        XCTAssertEqual(verb(.pause), "pause")
+        XCTAssertEqual(verb(.resume), "resume")
+        XCTAssertEqual(verb(.stop), "stop")
+        XCTAssertEqual(verb(.status), "status")
+    }
+
+    // MARK: - The connection row's four words
+
+    /// Four statuses, four distinct words. Pinned separately from
+    /// `StateDisplay.tower(_:)`, which the shell's own test pins, because the
+    /// row deliberately says "Disconnected" where the shell says "Offline".
+    func testConnectionRowLabelsAreFourDistinctWords() {
+        XCTAssertEqual(CVTowerConnectionLabel.text(for: .offline), "Disconnected")
+        XCTAssertEqual(CVTowerConnectionLabel.text(for: .connecting), "Connecting")
+        XCTAssertEqual(CVTowerConnectionLabel.text(for: .online), "Connected")
+        XCTAssertEqual(CVTowerConnectionLabel.text(for: .failed("Could not connect")), "Error")
+        let words: Set<String> = [
+            CVTowerConnectionLabel.text(for: .offline),
+            CVTowerConnectionLabel.text(for: .connecting),
+            CVTowerConnectionLabel.text(for: .online),
+            CVTowerConnectionLabel.text(for: .failed("x")),
+        ]
+        XCTAssertEqual(words.count, 4, "two statuses share a word")
+    }
+
+    /// The one action per state, the same three `ConnectionSheet` offers.
+    func testConnectionRowActionMirrorsTheConnectionSheet() {
+        XCTAssertEqual(CVTowerConnectionLabel.actionTitle(for: .offline), "Connect")
+        XCTAssertEqual(CVTowerConnectionLabel.actionTitle(for: .failed("x")), "Connect")
+        XCTAssertEqual(CVTowerConnectionLabel.actionTitle(for: .connecting), "Cancel")
+        XCTAssertEqual(CVTowerConnectionLabel.actionTitle(for: .online), "Disconnect")
+    }
+
+    // MARK: - The command in flight: the clearing rules, against a socket
+
+    /// A start records what it sent, with the id that actually went out.
+    ///
+    /// The wire is asserted, not only the property: a pending id that differed
+    /// from the one on the wire could never be cleared by a reply, and the
+    /// row would sit "asking" until the bound.
+    func testAStartRecordsAPendingCommandWithTheRequestIDItSent() async throws {
+        let bench = try await CVLabBench.start()
+        defer { bench.stop() }
+        await settle { bench.lab.canSendCommands }
+        XCTAssertTrue(bench.lab.canSendCommands, "the declaration never made the Lab commandable")
+
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+
+        let pending = try XCTUnwrap(bench.lab.pendingCommand)
+        XCTAssertEqual(pending.command, .start)
+        XCTAssertEqual(pending.experimentID, "edge_detection")
+
+        await settle { bench.sent(ofType: "cv_lab_start").count == 1 }
+        let wire = try XCTUnwrap(bench.sent(ofType: "cv_lab_start").first)
+        XCTAssertEqual(wire["request_id"] as? String, pending.requestID)
+        XCTAssertEqual(wire["experiment_id"] as? String, "edge_detection")
+    }
+
+    /// A `cv_lab_status` echoing the request id is the answer, and clears it.
+    func testAReplyEchoingTheRequestIDClearsThePendingCommand() async throws {
+        let bench = try await CVLabBench.start()
+        defer { bench.stop() }
+        await settle { bench.lab.canSendCommands }
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+        let pending = try XCTUnwrap(bench.lab.pendingCommand)
+
+        bench.server.send(
+            text: bench.statusReply(runID: "f863dcc35bce-9", requestID: pending.requestID, acceptedCommand: "cv_lab_start")
+        )
+
+        await settle { bench.lab.pendingCommand == nil }
+        XCTAssertNil(bench.lab.pendingCommand, "the Tower answered and the row is still asking")
+        XCTAssertEqual(bench.lab.status?.lifecycle.runID, "f863dcc35bce-9", "the answer's document was not applied")
+    }
+
+    /// A `cv_lab_error` echoing the request id is also the answer.
+    func testARefusalEchoingTheRequestIDClearsThePendingCommand() async throws {
+        let bench = try await CVLabBench.start()
+        defer { bench.stop() }
+        await settle { bench.lab.canSendCommands }
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+        let pending = try XCTUnwrap(bench.lab.pendingCommand)
+
+        bench.server.send(text: bench.refusal(requestID: pending.requestID))
+
+        await settle { bench.lab.pendingCommand == nil }
+        XCTAssertNil(bench.lab.pendingCommand, "a refusal is an answer, and the row is still asking")
+        XCTAssertEqual(bench.lab.lastRefusal?.reason, "lab_busy")
+    }
+
+    /// The two documents that arrive without asking — a push, and somebody
+    /// else's reply — leave the question standing.
+    func testDocumentsNamingAnotherOrNoRequestLeaveThePendingCommandAlone() async throws {
+        let bench = try await CVLabBench.start()
+        defer { bench.stop() }
+        await settle { bench.lab.canSendCommands }
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+        let pending = try XCTUnwrap(bench.lab.pendingCommand)
+
+        // No request id: the shape of a read or a push.
+        bench.server.send(text: bench.statusReply(runID: "f863dcc35bce-1", requestID: nil, acceptedCommand: nil))
+        // Another client's request id, with an accepted command.
+        bench.server.send(
+            text: bench.statusReply(runID: "f863dcc35bce-2", requestID: "somebody-else", acceptedCommand: "cv_lab_start")
+        )
+
+        // Both documents were applied — the second is the one on record — and
+        // the question is still out.
+        await settle { bench.lab.status?.lifecycle.runID == "f863dcc35bce-2" }
+        XCTAssertEqual(bench.lab.status?.lifecycle.runID, "f863dcc35bce-2")
+        XCTAssertEqual(bench.lab.pendingCommand, pending, "a document that named no request, or another's, cleared it")
+    }
+
+    /// The reply cannot arrive on a socket that is gone.
+    func testLeavingOnlineClearsThePendingCommand() async throws {
+        let bench = try await CVLabBench.start()
+        defer { bench.stop() }
+        await settle { bench.lab.canSendCommands }
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+        XCTAssertNotNil(bench.lab.pendingCommand)
+
+        bench.tower.disconnect()
+
+        await settle { bench.lab.pendingCommand == nil }
+        XCTAssertNil(bench.lab.pendingCommand, "a pending command survived the socket it was sent on")
+    }
+
+    /// No answer within the bound: cleared, and reported where a refused send
+    /// is reported — never as a state change.
+    func testAnUnansweredCommandExpiresAsARequestFailure() async throws {
+        let bench = try await CVLabBench.start(replyBoundSeconds: 0.3)
+        defer { bench.stop() }
+        let model = ExperimentalCVViewModel(client: bench.lab)
+        await settle { bench.lab.canSendCommands }
+        let stateBefore = bench.lab.state
+
+        try bench.lab.run(CVExperiment(id: "edge_detection", name: "Edge detection"))
+        XCTAssertNotNil(bench.lab.pendingCommand)
+        XCTAssertNil(model.lastRequestFailure, "the send went out; nothing has failed yet")
+
+        await settle { bench.lab.pendingCommand == nil }
+        XCTAssertNil(bench.lab.pendingCommand, "the reply bound passed and the row is still asking")
+        await settle { model.lastRequestFailure != nil }
+        let failure = try XCTUnwrap(model.lastRequestFailure)
+        XCTAssertEqual(failure.kind, .timedOut)
+        XCTAssertTrue(
+            failure.message.contains("did not answer the start request"),
+            "the failure must name the command: \(failure.message)"
+        )
+        XCTAssertEqual(bench.lab.state, stateBefore, "a missing reply moved the state machine")
+    }
+}
+
+/// A mock Tower, a `TowerClient` on it, and a `TowerExperimentalCVClient`
+/// wired to that — the three things every clearing-rule test needs — already
+/// online and already declaring the Lab, so the client's `canSendCommands`
+/// can come true.
+///
+/// Lives here rather than borrowing `TowerClientTests`' helpers because those
+/// are private to that case, and what they encode is small: answer the
+/// client's handshake ping with a pong, and record what was sent.
+@MainActor
+private final class CVLabBench {
+    let server: MockTowerServer
+    let tower: TowerClient
+    let lab: TowerExperimentalCVClient
+    private let recorder = MessageRecorder()
+
+    private init(server: MockTowerServer, tower: TowerClient, lab: TowerExperimentalCVClient) {
+        self.server = server
+        self.tower = tower
+        self.lab = lab
+    }
+
+    /// Connects, waits for `.online`, and sends the declaration that offers
+    /// the Lab under the contract this build implements.
+    static func start(
+        replyBoundSeconds: TimeInterval = TowerExperimentalCVClient.replyBoundSeconds
+    ) async throws -> CVLabBench {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let tower = TowerClient(metrics: SenderMetrics())
+        let lab = TowerExperimentalCVClient(tower: tower, replyBoundSeconds: replyBoundSeconds)
+        let bench = CVLabBench(server: server, tower: tower, lab: lab)
+        let recorder = bench.recorder
+        server.onText = { text in
+            recorder.record(text)
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                json["type"] as? String == "ping"
+            else { return }
+            server.send(text: #"{"type":"pong"}"#)
+        }
+        tower.connect(to: URL(string: "ws://127.0.0.1:\(port)/")!)
+        let deadline = Date().addingTimeInterval(3)
+        while tower.status != .online, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(tower.status, .online, "the client never came online against the mock Tower")
+        server.send(text: bench.declaration)
+        return bench
+    }
+
+    func stop() {
+        tower.disconnect()
+        server.stop()
+    }
+
+    /// Every message the client sent of one type, decoded.
+    func sent(ofType type: String) -> [[String: Any]] {
+        recorder.all.compactMap { text -> [String: Any]? in
+            guard let data = text.data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        .filter { $0["type"] as? String == type }
+    }
+
+    /// The Tower offering the Lab, available, under this build's contract.
+    private var declaration: String {
+        """
+        {"type":"cartridges",
+         "envelope_contract":"cartridge_results.envelope/2026-08-23",
+         "cartridges":[{"cartridge":"experimental_cv","result_type":"status",
+                        "contract":"\(ExperimentalCVContract.status)",
+                        "available":true,"unavailable_reason":null,
+                        "snapshot_only":true}],
+         "not_offered":[],
+         "http_contracts":[]}
+        """
+    }
+
+    /// A `cv_lab_status`, shaped as the Tower sends it, with or without the
+    /// two fields only a reply to a command carries.
+    func statusReply(runID: String, requestID: String?, acceptedCommand: String?) -> String {
+        let request = requestID.map { ",\"request_id\":\"\($0)\"" } ?? ""
+        let accepted = acceptedCommand.map { ",\"accepted_command\":\"\($0)\"" } ?? ""
+        return """
+            {"type":"cv_lab_status",
+             "control_contract":"experimental_cv.control/2026-08-27",
+             "contract":"\(ExperimentalCVContract.status)"\(request)\(accepted),
+             "status":{"contract":"\(ExperimentalCVContract.status)",
+               "tower_instance_id":"f863dcc35bce",
+               "lifecycle":{"state":"running","reason":null,
+                            "since":1787833032.19,"run_id":"\(runID)"},
+               "available":[],"selected":"edge_detection",
+               "source":{"clients_connected":1,"receiving_frames":true,
+                         "last_frame_at":1787833032.32,"frames_offered_total":2,
+                         "frames_rejected_before_lab":0,"idle_after_s":5.0}}}
+            """
+    }
+
+    /// A transient refusal echoing the request, with the unchanged document.
+    func refusal(requestID: String) -> String {
+        """
+        {"type":"cv_lab_error","control_contract":"experimental_cv.control/2026-08-27",
+         "reason":"lab_busy","message":"a start is already in flight",
+         "command":"cv_lab_start","request_id":"\(requestID)",
+         "status":{"contract":"\(ExperimentalCVContract.status)",
+           "tower_instance_id":"f863dcc35bce",
+           "lifecycle":{"state":"starting","reason":null,
+                        "since":1787833032.19,"run_id":"f863dcc35bce-4"},
+           "available":[],"selected":"edge_detection",
+           "source":{"clients_connected":1,"receiving_frames":false,
+                     "last_frame_at":null,"frames_offered_total":0,
+                     "frames_rejected_before_lab":0,"idle_after_s":5.0}}}
+        """
+    }
 }

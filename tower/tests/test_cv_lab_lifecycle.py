@@ -474,13 +474,13 @@ def test_a_failed_arm_ends_the_run_it_never_started():
 
 
 def test_an_interactive_start_that_fails_leaves_the_lab_usable():
-    """The distinction this whole design turns on.
+    """A load failure from a REQUEST reports `failed` with a reason and the
+    next start is accepted. Otherwise a missing torch would mean a restart
+    to get back to `baseline`.
 
-    A load failure at STARTUP is terminal, because a typo in
-    TOWER_CV_EXPERIMENT must be loud. A load failure from a REQUEST is
-    not: the Lab reports `failed` with a reason and the next start is
-    accepted. Otherwise a missing torch would mean a restart to get back
-    to `baseline`.
+    (A load failure at STARTUP used to be the terminal exception to this,
+    "because a typo in TOWER_CV_EXPERIMENT must be loud". Since 2026-09-06
+    it is loud AND recoverable -- see test_cv_lab_runtime_controls.py.)
     """
 
     class _Exploding:
