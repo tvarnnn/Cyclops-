@@ -52,10 +52,11 @@ Per session:
 | `capture_id` | string \| null | The capture this session followed, when it followed one |
 | `keyframes_accepted` | int | As recorded on the session |
 | `has_geometry` | bool | A derived tree exists for this session (`poses.json` and `points.json`). The geometry manifest may still answer `current: false` |
+| `abandoned` | bool | `ended_at` is `null` **and** the world is not `live`: the builder ended without finalising the record (killed inside the Tower's shutdown grace, or by hand). Its `keyframes_accepted` is then the start-of-session value, not the journal length, and its geometry is whatever the last interim build wrote. Additive (2026-09-06, Windows validation) |
 
 ## 3. Rules
 
-1. **Absent is never zero** (`WORLD-BUILDER-GEOMETRY.md` §6 applies): `ended_at: null` is an open session; `display_name: null` is an unnamed world.
+1. **Absent is never zero** (`WORLD-BUILDER-GEOMETRY.md` §6 applies): `ended_at: null` is an open session; `display_name: null` is an unnamed world. An open session with `abandoned: true` is not still open: nobody is writing it, and a client should say so rather than "still open".
 2. **A world that cannot be read is omitted, never invented.** A session that cannot be read is omitted from its world.
 3. **No imagery, no paths.** `capture_id` is an opaque id, not a location.
 4. Opening a world means: subscribe with `world_id` (+ `session_id`) on the status channel, then pull geometry exactly as for the live world. There is no second geometry path.

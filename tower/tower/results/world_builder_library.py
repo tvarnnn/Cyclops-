@@ -53,6 +53,7 @@ def build_world_listing(store: WorldStore) -> dict:
             world = store.read_world(world_id)
         except (WorldStoreError, OSError, ValueError, KeyError):
             continue
+        live = _world_is_live(store, world_id)
         sessions = []
         for session_id in store.list_session_ids(world_id):
             try:
@@ -68,6 +69,13 @@ def build_world_listing(store: WorldStore) -> dict:
                 "capture_id": session.capture_id,
                 "keyframes_accepted": session.keyframes_accepted,
                 "has_geometry": _has_geometry(store, world_id, session_id),
+                # The record is only finalised by `stop_session`; a builder
+                # killed before that (the supervisor's shutdown grace, a
+                # hard kill) leaves `ended_at: null` behind forever. Open
+                # with nobody writing is not "still open", and the phone
+                # would otherwise say exactly that. Counts on such a record
+                # are the start-of-session values, not the journal length.
+                "abandoned": session.ended_at is None and not live,
             })
         sessions.sort(key=lambda s: s["started_at"])
         worlds.append({
@@ -75,7 +83,7 @@ def build_world_listing(store: WorldStore) -> dict:
             "display_name": world.display_name,
             "created_at": world.created_at,
             "updated_at": world.updated_at,
-            "live": _world_is_live(store, world_id),
+            "live": live,
             "session_count": len(sessions),
             "sessions": sessions,
         })
