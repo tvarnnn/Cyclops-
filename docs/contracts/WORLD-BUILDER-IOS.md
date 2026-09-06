@@ -226,7 +226,7 @@ turn every WiFi blip into "this will never work" when the truthful reading is
 
 | Missing | What exists Tower-side | What iOS needs |
 |---|---|---|
-| **World picker / reopen a saved world** | `result_subscribe` with `world_id` pins the channel to a stored world — the Tower half of `WorldInspectionMode.inspecting(worldID:)` | A list of worlds and a way to choose one. `WorldInspectionMode` is modelled and always `.live` |
+| ~~World picker / reopen a saved world~~ | **Done 2026-09-06.** `GET /worlds` lists worlds (`WORLD-BUILDER-WORLDS.md`), `WorldPickerView` chooses one, `TowerWorldBuilderClient.inspect(worldID:sessionID:)` pins the channel, `WorldInspectionMode.inspecting(worldID:)` is set, and `GET /worlds/{id}/render` (§4 of that contract) shows the picture inside the app | — |
 | **Replay** | `WorldView.trajectory(session_id)` returns per keyframe: pose, segment, pose status, and `image_relpath` — a recorded camera path with a real first-person view at each point. `world_inspect.py --trajectory` renders it today | The poses and points now cross the wire (geometry contract) and iOS draws them 2D, per segment. What is still missing is the **first-person view**: `image_relpath` and every keyframe byte stay Tower-side, and a 3D view needs a floor plane that does not exist (`up_axis: "unknown"`) |
 | **Privacy disclosure** | `retains_raw_imagery: true` and the redaction process claim are on every session record | A surface that states what the Tower keeps. See §7 |
 | **Calibration status/action** | `calibration` state is on the wire and rendered | Nothing invites or explains calibration, and without it there is no geometry at all (§7) |

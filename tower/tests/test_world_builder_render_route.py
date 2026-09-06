@@ -149,6 +149,63 @@ def test_a_world_id_cannot_close_the_script_block(tmp_path):
     assert "&lt;/script&gt;" in html
 
 
+def test_the_payload_carries_no_angle_bracket(derived_world):
+    """`<` in the JSON is what could end or escape the script block; it is
+    written as \\u003c, which the browser's JSON parser reads back."""
+    store, world_id, session_id = derived_world
+    html = build_world_render(store, world_id, session_id)
+    start = html.index("const FRAMES = ") + len("const FRAMES = ")
+    end = html.index(";\n", start)
+    assert "<" not in html[start:end]
+
+
+def test_the_response_forbids_every_external_resource(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(f"/worlds/{world_id}/render")
+    csp = response.headers["content-security-policy"]
+    assert "default-src 'none'" in csp and "script-src 'unsafe-inline'" in csp
+
+
+def test_a_world_id_that_escapes_the_root_is_no_world(derived_world):
+    """The geometry routes' containment guard applies here too: on Windows a
+    backslash is a separator the route pattern does not exclude, and every
+    store path is joined from this id. Checked at the adapter, where the
+    id arrives however the router spelled it, and over HTTP for the
+    backslash spelling the router lets through."""
+    store, world_id, session_id = derived_world
+    for spelling in ("..\\..\\elsewhere\\worlds\\victim", "../../elsewhere/worlds/victim",
+                     "..", "."):
+        with pytest.raises(WorldRenderUnavailable) as excinfo:
+            build_world_render(store, spelling, None)
+        assert "no world" in excinfo.value.reason, spelling
+    response = _client(store).get("/worlds/..%5C..%5Celsewhere%5Cworlds%5Cvictim/render")
+    assert response.status_code == 404
+    # A non-canonical spelling that stays inside the root names the real
+    # world and is served as it (POSIX resolves the `..`; the geometry
+    # transport test covers the Windows spelling).
+    assert build_world_render(store, f"junk/../{world_id}", session_id).startswith("<!doctype")
+
+
+def test_a_detail_never_carries_a_filesystem_path(derived_world):
+    store, world_id, session_id = derived_world
+    # Geometry gone between the existence check and the read.
+    import tower.results.world_builder_render as adapter
+
+    original = adapter.render_html
+
+    def vanish(*args, **kwargs):
+        raise FileNotFoundError(str(store.root / "worlds" / world_id / "derived" / "points.json"))
+
+    adapter.render_html = vanish
+    try:
+        with pytest.raises(WorldRenderUnavailable) as excinfo:
+            build_world_render(store, world_id, session_id)
+    finally:
+        adapter.render_html = original
+    assert str(store.root) not in excinfo.value.reason
+    assert "no geometry yet" in excinfo.value.reason
+
+
 def test_the_adapter_raises_its_own_error_for_a_missing_world(tmp_path):
     from tower.world_builder.store import WorldStore
 

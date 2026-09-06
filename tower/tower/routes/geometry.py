@@ -100,4 +100,13 @@ def world_render(
     # The phone fetches with its cache bypassed, and this header says the
     # same thing from this side: a world under construction changes with
     # every build, and there are no validators to revalidate against.
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    #
+    # The policy states what the contract promises -- a page that loads
+    # nothing from anywhere -- so a browser enforces it too: its own inline
+    # script and style, and no other resource of any kind.
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+        ),
+    })

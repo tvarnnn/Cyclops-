@@ -20,6 +20,7 @@ second at the mobile point budget).
 
 from __future__ import annotations
 
+from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import DEFAULT_MAX_POINTS, render_html
 from tower.world_builder.store import WorldStore, WorldStoreError
 
@@ -45,24 +46,40 @@ def _has_geometry(store: WorldStore, world_id: str, session_id: str) -> bool:
     return (derived / "poses.json").exists() and (derived / "points.json").exists()
 
 
+def _clip(value: str, limit: int = 80) -> str:
+    """An id as it appears in a 404 detail: bounded, like `_echo_safe` on
+    the result channel, because the detail echoes a request-supplied
+    string and the phone shows it verbatim."""
+    return value if len(value) <= limit else value[:limit] + "..."
+
+
 def resolve_session(store: WorldStore, world_id: str, session_id: str | None) -> str:
     """The session to draw. An explicit id is taken as given; otherwise
     the newest session of the world that has geometry -- the listing
-    orders sessions oldest first by `started_at`, and this follows it."""
+    orders sessions oldest first by `started_at`, and this follows it.
+
+    `session_id` is checked against the world's own sessions before any
+    path is joined from it, so it cannot name a directory outside the
+    world. `world_id` is contained by the caller (`build_world_render`).
+    """
     try:
         world = store.read_world(world_id)
     except (WorldStoreError, OSError, ValueError, KeyError):
-        raise WorldRenderUnavailable(f"no world {world_id!r}") from None
+        raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}") from None
+    # The directory scan the listing uses, not `world.json`'s list: the
+    # engine writes `session.json` before it appends to `world.json`, and a
+    # session the listing offers must be one the render can find.
+    sessions = set(store.list_session_ids(world_id)) | set(world.session_ids)
     if session_id is not None:
-        if session_id not in world.session_ids:
+        if session_id not in sessions:
             raise WorldRenderUnavailable(
-                f"world {world_id!r} has no session {session_id!r}")
+                f"world {_clip(world_id)!r} has no session {_clip(session_id)!r}")
         if not _has_geometry(store, world_id, session_id):
             raise WorldRenderUnavailable(
                 f"session {session_id!r} of world {world_id!r} has no geometry yet")
         return session_id
     candidates = []
-    for candidate in world.session_ids:
+    for candidate in sorted(sessions):
         if not _has_geometry(store, world_id, candidate):
             continue
         try:
@@ -79,11 +96,26 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
                        max_points: int | None = None) -> str:
     """The viewer page for one session of one world, or
-    `WorldRenderUnavailable` naming what is missing."""
+    `WorldRenderUnavailable` naming what is missing.
+
+    `world_id` goes through the geometry adapter's containment guard
+    first, for the reason its docstring gives: on Windows a backslash is
+    a separator Starlette's route pattern does not exclude, and every
+    store path below is joined from this id. An id that escapes the root
+    is "no world", and the id is answered under its canonical spelling.
+    """
+    contained = contained_world_id(store, world_id)
+    if contained is None:
+        raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
+    world_id = contained
     chosen = resolve_session(store, world_id, session_id)
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
         return render_html(store, world_id, chosen, max_points=budget)
-    except FileNotFoundError as exc:
+    except FileNotFoundError:
         # Raced a `clear_derived` between the existence check and the read.
-        raise WorldRenderUnavailable(str(exc)) from None
+        # Worded here rather than from the exception: the phone shows the
+        # detail verbatim, and an OSError's text carries a filesystem path
+        # (contract §3 rule 3: no paths on the wire).
+        raise WorldRenderUnavailable(
+            f"session {chosen!r} of world {world_id!r} has no geometry yet") from None

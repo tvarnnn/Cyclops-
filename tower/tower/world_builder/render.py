@@ -528,10 +528,12 @@ def canvas_html(frames: list, unregistered: list, ordering: list, title: str, *,
     caption = _escape(CAPTION)
     if current is False:
         caption += f" <b>{_escape(CAPTION_BEHIND)}</b>"
-    # `</script>` inside the JSON would end the script block early. No
-    # world id contains it, but the payload is written once and read by
-    # a browser, so the escape is cheap insurance rather than trust.
-    frames_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    # A `<` inside the JSON is the one character that could end the
+    # script block early (`</script>`) or, as `<!--`, put the parser into
+    # its escaped state. Every string in the payload is server-composed
+    # today, but the payload is written once and read by a browser, so it
+    # is escaped as `\u003c`, which JSON.parse reads back as `<`.
+    frames_json = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
     return (_CANVAS_VIEWER
             .replace("__TITLE__", _escape(title))
             .replace("__CAPTION__", caption)

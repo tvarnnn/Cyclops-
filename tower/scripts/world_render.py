@@ -37,9 +37,9 @@ reason in the tile title. Their scales disagree by up to ~87x on a real
 walk; overlaying them would fabricate a room.
 
 The composition itself is the store's own: `Sim3.apply` from
-`scripts/world_registration.py`, X_ref = scale * R @ X_seg + t, with the
-quaternion decoded by the same `_quaternion_wxyz_to_rotation` the
-registration pass used to encode it. Nothing here re-derives a convention.
+`tower/world_builder/render.py`, X_ref = scale * R @ X_seg + t, with the
+quaternion decoded by the same wxyz convention the registration pass used
+to encode it. Nothing here re-derives a convention.
 
 Poses are `T_world_camera` (tower/world_builder/schema.py): the persisted
 translation IS the camera centre in the segment frame and the quaternion is
@@ -475,16 +475,19 @@ def write_html_plotly(path: Path, frames: list, unregistered: list, ordering: li
 
 
 def write_html_canvas(path: Path, frames: list, unregistered: list, ordering: list,
-                      title: str) -> str:
+                      title: str, current=None) -> str:
     """Self-contained viewer with no external library: an orthographic
     orbit camera on a 2-D canvas. Chosen so the tool works with nothing
-    but a browser. The template is `tower.world_builder.render`'s."""
-    path.write_text(canvas_html(frames, unregistered, ordering, title), encoding="utf-8")
+    but a browser. The template is `tower.world_builder.render`'s, so the
+    operator's page and the phone's are the same page, BEHIND caption
+    included."""
+    path.write_text(canvas_html(frames, unregistered, ordering, title, current=current),
+                    encoding="utf-8")
     return "canvas"
 
 
 def write_html(path: Path, frames: list, unregistered: list, ordering: list,
-               title: str, backend: str = "auto") -> str:
+               title: str, backend: str = "auto", current=None) -> str:
     if backend in ("auto", "plotly"):
         try:
             import plotly  # noqa: F401,PLC0415
@@ -493,7 +496,7 @@ def write_html(path: Path, frames: list, unregistered: list, ordering: list,
                 raise
         else:
             return write_html_plotly(path, frames, unregistered, ordering, title)
-    return write_html_canvas(path, frames, unregistered, ordering, title)
+    return write_html_canvas(path, frames, unregistered, ordering, title, current=current)
 
 
 # -- orchestration --------------------------------------------------------
@@ -554,7 +557,7 @@ def render_world(store: WorldStore, world_id: str, session_id: str, out: Path, *
         html_path = out / "world.html"
         files["html"] = html_path.name
         files["html_backend"] = write_html(html_path, frames, unregistered, ordering,
-                                           title, backend=html_backend)
+                                           title, backend=html_backend, current=current)
 
     summary = {
         "world_id": world_id,
