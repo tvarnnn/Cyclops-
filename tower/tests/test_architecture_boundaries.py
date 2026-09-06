@@ -137,6 +137,10 @@ _RESULT_CHANNEL_ADAPTERS = frozenset(
         # adapter over the World Builder store exactly like the geometry
         # producer above.
         TOWER / "results" / "world_builder_library.py",
+        # Added 2026-09-06: the interactive viewer (GET /worlds/{id}/render),
+        # the same shape again -- an adapter over the store, named after
+        # the cartridge, serving HTML where the others serve JSON.
+        TOWER / "results" / "world_builder_render.py",
         TOWER / "results" / "__init__.py",
         # Added 2026-08-27 with the Scene Understanding and Document
         # Memory wire paths. Same shape, same rule: one adapter per

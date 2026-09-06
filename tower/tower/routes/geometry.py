@@ -13,6 +13,7 @@ and the hash off the event loop with no executor of our own.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 
 from tower.results.world_builder_geometry import (
     build_manifest,
@@ -20,6 +21,11 @@ from tower.results.world_builder_geometry import (
     store_from_root,
 )
 from tower.results.world_builder_library import build_world_listing
+from tower.results.world_builder_render import (
+    MAX_POINTS_CEILING,
+    WorldRenderUnavailable,
+    build_world_render,
+)
 
 router = APIRouter()
 
@@ -65,3 +71,33 @@ def geometry_segment(
     if chunk is None:
         raise HTTPException(status_code=404, detail="no such segment")
     return chunk
+
+
+@router.get("/worlds/{world_id}/render", response_class=HTMLResponse)
+def world_render(
+    world_id: str, request: Request,
+    session_id: str | None = Query(default=None),
+    max_points: int | None = Query(default=None, ge=1, le=MAX_POINTS_CEILING),
+) -> HTMLResponse:
+    """The interactive viewer of one saved world, as a self-contained page.
+
+    Contract `WORLD-BUILDER-WORLDS.md` §4. Composed on request from the
+    derived tree by the same code `scripts/world_render.py` writes
+    `world.html` with. Sync `def` for the reason the geometry handlers
+    are: the read and the composition stay off the event loop.
+
+    404 means ABSENT -- no root, no such world, no such session, or no
+    geometry built for it yet -- and `detail` says which, because the
+    phone shows it. Geometry behind the newest keyframes is served with
+    its own caption saying so, never hidden.
+    """
+    try:
+        html = build_world_render(
+            _store(request), world_id, session_id, max_points=max_points
+        )
+    except WorldRenderUnavailable as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from None
+    # The phone fetches with its cache bypassed, and this header says the
+    # same thing from this side: a world under construction changes with
+    # every build, and there are no validators to revalidate against.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
