@@ -536,6 +536,15 @@ def render_frame_pngs(frame: Frame, out: Path, ordering: list, *, dpi=PNG_DPI,
     xyz, owner = frame.points_world()
     cameras = frame.cameras_world()
     bounds = robust_bounds(xyz)
+    # The cameras stand in front of what they see, so a box over the points
+    # alone can leave half the trajectory outside the picture (measured on
+    # the 2026-09-01 loop: 232 of 424 cameras clipped). Widen to the
+    # cameras' own robust box, so the walk is drawn with the room.
+    if bounds is not None and cameras:
+        centres = np.array([c[0] for c in cameras], dtype=np.float64)
+        cam_bounds = robust_bounds(centres, percentiles=(2, 98), pad=0.02) if len(centres) >= 4 else (centres.min(axis=0), centres.max(axis=0))
+        if cam_bounds is not None:
+            bounds = (np.minimum(bounds[0], cam_bounds[0]), np.maximum(bounds[1], cam_bounds[1]))
     files = {}
     dropped_by_view = {}
     header = (

@@ -133,6 +133,10 @@ _RESULT_CHANNEL_ADAPTERS = frozenset(
     {
         TOWER / "results" / "world_builder.py",
         TOWER / "results" / "world_builder_geometry.py",
+        # Added 2026-09-06: the saved-worlds listing (GET /worlds), an
+        # adapter over the World Builder store exactly like the geometry
+        # producer above.
+        TOWER / "results" / "world_builder_library.py",
         TOWER / "results" / "__init__.py",
         # Added 2026-08-27 with the Scene Understanding and Document
         # Memory wire paths. Same shape, same rule: one adapter per

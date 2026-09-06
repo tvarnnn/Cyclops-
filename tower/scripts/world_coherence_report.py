@@ -174,8 +174,15 @@ def coherence(
     # `admitted_pairs_source` says which reading produced the numbers so
     # that two runs are never silently compared across the two.
     if admitted is None:
-        registered_component = [sorted(registered)] if len(registered) > 1 else []
-        components = registered_component
+        # Since the global solve (2026-09-06) a session can carry MORE than
+        # one registered cluster, each under its own reference segment,
+        # and they are different frames. Group by reference rather than
+        # treating every registered segment as one component.
+        by_reference: dict = {}
+        for placement in placements:
+            if placement.state == "registered":
+                by_reference.setdefault(placement.reference_segment, []).append(placement.segment_index)
+        components = [sorted(members) for members in by_reference.values() if len(members) > 1]
         pairs_source = "placement-state"
     else:
         pairs = [tuple(sorted((int(a), int(b)))) for a, b in admitted]

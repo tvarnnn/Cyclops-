@@ -262,3 +262,55 @@ release) once into `~/.cache/colmap/` and reuses it.
   `tests/test_world_builder_solve_cadence.py` (4),
   `tests/test_world_builder_library.py` (5); World Builder subset
   648 passed / 0 failed.
+
+## E13. The live path, replayed: `world_replay.py --captures ddcf9426 --solve --register` — 0906
+
+- **What ran.** The builder exactly as the Tower supervises it: observe every
+  frame, rebuild every 4 keyframes (111 rebuilds), a background solve child
+  every 50 accepted keyframes (**3 launched**, each ~20–45 s, merged by the
+  next rebuild so the phone would have seen segments snap together
+  mid-walk), then the final in-process solve after the last frame.
+- **Result** (`Glasses-scratch\wbrecon\live\0906\`, `replay0906.log`): wall
+  207 s for a 119 s walk on this host, `observe_ms_per_frame` 37 ms with the
+  solves running beside it; final solve 134 s (extract 1.6 s — features
+  already in the database, match 36 s with loop detection, GLOMAP 94 s);
+  **425/438 keyframes posed, 395 solved + 34 anchors, 9 refused, 14,953
+  points**; registration reported `attempted: false, placements come from
+  the global solve`. Final `build()` 0.59 s.
+- **Artifact:** `Glasses-scratch\wbrecon\live\0906.render\overview.png`,
+  `world.ply`, `world.html`; coherence `live\0906.coherence.json`.
+- **Decision:** the product path is the offline path. Nothing is special-
+  cased for replay.
+
+## E14. FINAL — every benchmark walk through the product path
+
+`world_replay.py --captures … --solve --register` (background solves during
+the walk, final solve with loop detection after it, Sim3 registrar stood
+down), then `world_coherence_report.py` and `world_render.py`. Roots and
+renders under `Glasses-scratch\wbrecon\final\<walk>` / `<walk>.render`
+(0906 under `Glasses-scratch\wbrecon\live\0906`).
+
+**Before** = baseline (§0): the chain + Sim3 registrar. **After** = this branch.
+"One frame" = keyframes / points in the largest coherent component.
+
+| walk | keyframes | before: registered segs, keyframes in one frame, points share | after: registered segs, keyframes posed, points share | after: components (images) | solver reprojection median / p99 px | final solve s | walk wall s (replay) |
+|---|---|---|---|---|---|---|---|
+| **0906** | 438 | 2/17, 58 kf, 36.7% | **29/34 registered, 425 posed, 99.1%** | 429 + 7 | 0.75 / 3.74 | 134 (3 background solves) | 207 |
+| 0901 loop | 434 | 10/18, 156 kf, 74.9% | **26/30, 424 posed, 100%** (the loop closed) | 427 | 0.67 / 3.68 | 107 (3) | 200 |
+| worldB drawer | 218 | 6/22, 61 kf, 58.1% | **29/33, 207 posed, 97.1%** | 207 + 5 | 0.71 / 4.11 | 33 (2) | 65 |
+| worldA normal | 229 | 0/8, 51 kf, 41.3% | **22/23, 203 posed, 90.3%** | 204 + 18 + 5 | 0.59 / 3.48 | 33 (2) | 54 |
+| dense 08-29 | 77 | 1 pair, 59 kf, 84.1% | **6/6, 76 posed, 100%** | 77 | 0.74 / 3.62 | 11 (1) | 24 |
+| long 08-27 | 339 | 4 pairs, 27 kf, 19.7% | **38/40, 322 posed, 97.0%** | 335 | 0.65 / 3.62 | 57 (3) | 121 |
+
+Reprojection is the solver's own self-check over every observation it kept
+(184,982 on 0906), in the undistorted pinhole camera; p99 sits under 4.2 px
+on every walk. Two walks show a single far-outlier observation (0901 max
+702 px, worldB 283 px) — one track each, kept by GLOMAP's filter; the
+medians and p99s are unaffected.
+
+**Known limitation seen in the renders:** on long0827 a handful of cameras
+posed on far, low-parallax structure (points 100–500 units out, ~1° of
+parallax — GLOMAP's own floor) sit far outside the room. They pass the
+support floor because they do observe ≥30 points. A per-camera
+triangulation-angle floor is the next instrument; the render's p2–p98
+clipping already keeps them out of the picture.
