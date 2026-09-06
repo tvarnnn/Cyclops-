@@ -63,9 +63,16 @@ def test_full_lifecycle_reaches_unloaded():
     assert module.state == ModuleState.UNLOADED
 
 
-def test_unknown_experiment_name_fails_load_and_start_via_container():
-    container = ModuleContainer(ExperimentalCVModule("not-a-real-experiment"))
+def test_unknown_experiment_name_leaves_the_module_active_and_the_lab_failed():
+    """Loud, not terminal. Until 2026-09-06 this marked the module FAILED
+    -- a state with no way back -- so a typo in TOWER_CV_EXPERIMENT killed
+    every experiment until a restart. The Lab now reports `failed` with
+    the reason and any `cv_lab_start` recovers it."""
+    module = ExperimentalCVModule("not-a-real-experiment")
+    container = ModuleContainer(module)
 
     asyncio.run(container.load_and_start())  # must not raise
 
-    assert container.state == ModuleState.FAILED
+    assert container.state == ModuleState.ACTIVE
+    assert module.lab.status()["lifecycle"]["state"] == "failed"
+    assert "not-a-real-experiment" in module.lab.status()["lifecycle"]["reason"]
