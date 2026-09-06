@@ -25,6 +25,11 @@
 //  (xcodebuild forwards a variable to the test runner only under the
 //  TEST_RUNNER_ prefix; the runner sees it without the prefix.)
 //
+//  Debug configuration only: the app honours GLASSES_TOWER_AUTHORITY under
+//  `#if DEBUG`. A Release-configured run would talk to the development
+//  Tower instead, so `setUp` refuses to run against anything but a build
+//  that shows the DEBUG-only capture surface.
+//
 
 import XCTest
 
@@ -51,6 +56,12 @@ final class TowerSmokeUITests: XCTestCase {
             return false
         }
         app.launch()
+        // The DEBUG-only Home capture control is the proof this build reads
+        // the override at all; without it the tests would be steering the
+        // wrong Tower and any result would be about something else.
+        let debugOnlyControl = app.buttons["Start session"]
+        try XCTSkipUnless(debugOnlyControl.waitForExistence(timeout: 10),
+                          "not a DEBUG build; the Tower override is not read, so these tests cannot steer it.")
     }
 
     private func attach(_ name: String) {
@@ -73,13 +84,35 @@ final class TowerSmokeUITests: XCTestCase {
         return element.exists && element.isHittable
     }
 
+    /// Tap `element` until `effect` is true. A tap that lands while a sheet
+    /// is still animating in can be swallowed; the effect, not the tap, is
+    /// what the test is about.
+    @discardableResult
+    private func tap(_ element: XCUIElement, until effect: @autoclosure () -> Bool,
+                     attempts: Int = 3, wait: TimeInterval = 3) -> Bool {
+        for _ in 0..<attempts {
+            if element.exists && element.isHittable { element.tap() }
+            let deadline = Date().addingTimeInterval(wait)
+            while Date() < deadline {
+                if effect() { return true }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+        return effect()
+    }
+
     private func open(cartridge name: String) {
         let cartridges = app.buttons["Cartridges"]
         XCTAssertTrue(cartridges.waitForExistence(timeout: 10), "the shell's Cartridges button")
-        cartridges.tap()
+        let drawerDone = app.buttons["Done"]
+        XCTAssertTrue(tap(cartridges, until: drawerDone.exists), "the cartridge drawer opened")
         let row = app.buttons.containing(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
         XCTAssertTrue(reveal(row), "a drawer row for \(name)")
-        row.tap()
+        // The workspace has arrived when the drawer is gone and the shell's
+        // title names it -- not when a static text with that name exists,
+        // which the drawer row itself satisfies.
+        XCTAssertTrue(tap(row, until: !drawerDone.exists && app.navigationBars[name].exists),
+                      "the \(name) workspace opened")
     }
 
     // MARK: World Builder
@@ -88,15 +121,14 @@ final class TowerSmokeUITests: XCTestCase {
     /// the app -> Close -> Back to live.
     func testASavedWorldsPictureOpensInsideTheApp() throws {
         open(cartridge: "World Builder")
-        XCTAssertTrue(app.staticTexts["World Builder"].waitForExistence(timeout: 5))
         attach("world-builder-live")
 
         // Nothing named yet: the picture button is offered and disabled.
         let picture = app.buttons["Interactive picture of the world"]
         XCTAssertTrue(reveal(picture))
+        XCTAssertFalse(picture.isEnabled, "no world has been named, so there is nothing to open")
 
-        app.buttons["Saved worlds"].tap()
-        XCTAssertTrue(app.navigationBars["Saved worlds"].waitForExistence(timeout: 5))
+        XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
         // The first world's own row (a section header button), whatever it is
         // called: the Tower's list, not a fixture name.
         let sessionTag = app.staticTexts.containing(NSPredicate(format: "label ENDSWITH %@", "session")).firstMatch
@@ -106,17 +138,15 @@ final class TowerSmokeUITests: XCTestCase {
         attach("saved-worlds")
         let worldRow = sessionTag.exists ? sessionTag : sessionsTag
         XCTAssertTrue(reveal(worldRow))
-        worldRow.tap()
 
         // The header now names the world, and the picture is offered.
         let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
-        XCTAssertTrue(looking.waitForExistence(timeout: 5))
+        XCTAssertTrue(tap(worldRow, until: looking.exists), "the world opened and the picker closed")
         XCTAssertTrue(reveal(picture))
         XCTAssertTrue(picture.isEnabled)
         attach("inspecting-saved-world")
 
-        picture.tap()
-        XCTAssertTrue(app.navigationBars["Reconstruction"].waitForExistence(timeout: 5))
+        XCTAssertTrue(tap(picture, until: app.navigationBars["Reconstruction"].exists))
         // The page arrived and the web view drew it: the page's own title
         // bar names the world, and its caption says what the picture is.
         let pageTitle = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "world ")).firstMatch
@@ -134,11 +164,10 @@ final class TowerSmokeUITests: XCTestCase {
         attach("picture-after-gestures")
         XCTAssertTrue(app.navigationBars["Reconstruction"].exists)
 
-        app.buttons["Close"].tap()
+        XCTAssertTrue(tap(app.buttons["Close"], until: !app.navigationBars["Reconstruction"].exists))
         XCTAssertTrue(looking.waitForExistence(timeout: 5))
         XCTAssertTrue(reveal(app.buttons["Back to live"]))
-        app.buttons["Back to live"].tap()
-        XCTAssertTrue(looking.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(tap(app.buttons["Back to live"], until: !looking.exists))
         attach("back-to-live")
     }
 
@@ -147,20 +176,20 @@ final class TowerSmokeUITests: XCTestCase {
     func testASessionWithoutGeometrySaysSo() throws {
         open(cartridge: "World Builder")
         XCTAssertTrue(reveal(app.buttons["Saved worlds"]))
-        app.buttons["Saved worlds"].tap()
-        XCTAssertTrue(app.navigationBars["Saved worlds"].waitForExistence(timeout: 5))
+        XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
         let noGeometry = app.staticTexts["no geometry"].firstMatch
         try XCTSkipUnless(noGeometry.waitForExistence(timeout: 15), "the Tower's list has no session without geometry")
         XCTAssertTrue(reveal(noGeometry))
-        noGeometry.tap()
+        let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
+        XCTAssertTrue(tap(noGeometry, until: looking.exists), "the session opened and the picker closed")
         let picture = app.buttons["Interactive picture of the world"]
         XCTAssertTrue(reveal(picture))
-        picture.tap()
+        XCTAssertTrue(tap(picture, until: app.navigationBars["Reconstruction"].exists))
         let message = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "no geometry yet")).firstMatch
         XCTAssertTrue(message.waitForExistence(timeout: 15), "the Tower's 404 detail is shown")
         XCTAssertTrue(app.buttons["Try again"].exists)
         attach("no-geometry")
-        app.buttons["Close"].tap()
+        XCTAssertTrue(tap(app.buttons["Close"], until: !app.navigationBars["Reconstruction"].exists))
     }
 
     // MARK: CV Lab
@@ -171,7 +200,6 @@ final class TowerSmokeUITests: XCTestCase {
     /// truthful about having no glasses.
     func testTheLabConnectsAndSwitchesExperimentsFromItsOwnScreen() throws {
         open(cartridge: "Experimental CV Lab")
-        XCTAssertTrue(app.staticTexts["Experimental CV Lab"].waitForExistence(timeout: 5))
 
         let connected = app.staticTexts["Connected"]
         XCTAssertTrue(connected.waitForExistence(timeout: 20), "the shell's auto-connect reached the Tower")
@@ -189,37 +217,32 @@ final class TowerSmokeUITests: XCTestCase {
 
         // Switch twice. Each arm is acknowledged by the Tower within the
         // client's ten-second bound, after which the row is a button again.
-        edge.tap()
         let armedEdge = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH[c] %@ AND label CONTAINS %@", "Edge detection", "armed")).firstMatch
-        XCTAssertTrue(armedEdge.waitForExistence(timeout: 15), "the run header names Edge detection as armed")
+        XCTAssertTrue(tap(edge, until: armedEdge.exists, wait: 15), "the run header names Edge detection as armed")
         attach("cv-lab-edge")
         XCTAssertTrue(reveal(baseline, timeout: 15))
-        baseline.tap()
         let armedBaseline = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", "Baseline", "armed")).firstMatch
-        XCTAssertTrue(armedBaseline.waitForExistence(timeout: 15))
+        XCTAssertTrue(tap(baseline, until: armedBaseline.exists, wait: 15))
         attach("cv-lab-baseline")
         XCTAssertTrue(connected.exists, "the socket never dropped across the switches")
 
         // Pause / Resume / Stop act on the run. The run panel sits above the
         // catalog, so scroll back up to it.
         app.swipeDown(velocity: .slow); app.swipeDown(velocity: .slow)
-        XCTAssertTrue(app.buttons["Pause"].waitForExistence(timeout: 5))
-        app.buttons["Pause"].tap()
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Paused.")).firstMatch.waitForExistence(timeout: 15))
-        app.buttons["Resume"].tap()
-        XCTAssertTrue(app.buttons["Pause"].waitForExistence(timeout: 15))
-        app.buttons["Stop"].tap()
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Stopped.")).firstMatch.waitForExistence(timeout: 15))
+        XCTAssertTrue(reveal(app.buttons["Pause"]))
+        let paused = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Paused.")).firstMatch
+        XCTAssertTrue(tap(app.buttons["Pause"], until: paused.exists, wait: 15))
+        XCTAssertTrue(tap(app.buttons["Resume"], until: app.buttons["Pause"].exists, wait: 15))
+        let stopped = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Stopped.")).firstMatch
+        XCTAssertTrue(tap(app.buttons["Stop"], until: stopped.exists, wait: 15))
         attach("cv-lab-stopped")
 
         // Disconnect and reconnect from the row.
         app.swipeDown(velocity: .slow); app.swipeDown(velocity: .slow)
-        XCTAssertTrue(app.buttons["Disconnect"].waitForExistence(timeout: 5))
-        app.buttons["Disconnect"].tap()
-        XCTAssertTrue(app.staticTexts["Disconnected"].waitForExistence(timeout: 10))
+        XCTAssertTrue(reveal(app.buttons["Disconnect"]))
+        XCTAssertTrue(tap(app.buttons["Disconnect"], until: app.staticTexts["Disconnected"].exists, wait: 10))
         attach("cv-lab-disconnected")
-        app.buttons["Connect"].tap()
-        XCTAssertTrue(connected.waitForExistence(timeout: 20))
+        XCTAssertTrue(tap(app.buttons["Connect"], until: connected.exists, wait: 20))
         XCTAssertTrue(reveal(edge, timeout: 20), "the catalog came back after the reconnect")
         attach("cv-lab-reconnected")
     }

@@ -479,6 +479,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// The open subscription on the **current** socket, or `nil`. Cleared on
     /// every disconnect because the Tower's ids are per connection.
     private var subscriptionID: String?
+
+    /// Subscription ids this client has closed on the current socket, so a
+    /// heartbeat the Tower had already queued for one of them is recognised
+    /// and dropped. Ids are per connection and restart at `sub-1` on a new
+    /// one, so the set is cleared with the connection. See `handle(.result)`.
+    private var retiredSubscriptionIDs: Set<String> = []
     /// A `result_subscribe` has been sent and not yet answered. Without this a
     /// declaration republished while the ack is in flight would open a second
     /// subscription for the same cartridge.
@@ -581,6 +587,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // sufficient cleanup — and nothing about the world is forgotten,
             // because availability already reports the connection truthfully.
             subscriptionID = nil
+            retiredSubscriptionIDs = []
             isSubscribing = false
             // The socket that the subscribe was sent on is gone, so the bound
             // has nothing left to bound. Leaving it armed would report a
@@ -673,6 +680,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private func restartSubscription() {
         if let id = subscriptionID {
             tower.unsubscribeFromResults(subscriptionID: id)
+            retiredSubscriptionIDs.insert(id)
             subscriptionID = nil
         }
         isSubscribing = false
@@ -766,6 +774,17 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
         case .result(let envelope):
             guard envelope.cartridge == WorldBuilderResultContract.towerCartridge else { return }
+            // Matched on the subscription as well as the cartridge. A pin
+            // change (`inspect` / `followLive`) closes one subscription and
+            // opens another, and the Tower's sender may already have queued
+            // a heartbeat for the old one; that envelope names a world the
+            // reader has just left, and applying it would name that world
+            // for the picture button — for a live world with no geometry
+            // yet, permanently, since nothing else would arrive to correct
+            // it. Matched against the ids this client has *left* rather
+            // than for equality with the current one, so an envelope that
+            // races its own `result_subscribed` is still applied.
+            if let id = envelope.subscriptionID, retiredSubscriptionIDs.contains(id) { return }
             apply(envelope)
 
         case .failed(let error):

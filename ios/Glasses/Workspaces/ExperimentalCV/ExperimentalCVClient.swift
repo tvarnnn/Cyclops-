@@ -378,7 +378,9 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
     private var resubscribesUsed = 0
     private static let resubscribeBudget = 3
 
-    /// Monotonic, per connection, and used only to build a `request_id`.
+    /// Monotonic for the life of this client — deliberately not reset per
+    /// connection, so an id can never be reused across a reconnect — and
+    /// used only to build a `request_id`.
     ///
     /// Bounded by construction: `"cv-1"` reaches the Tower's 64-character limit
     /// somewhere past `10^60` commands. `TowerClient` bounds it again on the
@@ -426,6 +428,16 @@ final class TowerExperimentalCVClient: ExperimentalCVClient {
         // closing changes what this screen may claim, without a single byte
         // arriving from the Tower.
         tower.$isStreamingToTower
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.republishState() }
+            .store(in: &cancellables)
+
+        // The hold, for the same reason: the workspace holds `tower` as a
+        // plain reference and re-reads it only when `lab` publishes, so
+        // without this a Pause or Resume would show on the run header at the
+        // next heartbeat (up to 2 s) rather than at the tap.
+        tower.$isFrameSendingPaused
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.republishState() }

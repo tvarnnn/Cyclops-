@@ -395,8 +395,13 @@ struct ExperimentalCVWorkspaceView: View {
     @ViewBuilder
     private func runHeader(_ run: CVExperimentRun, isPaused: Bool) -> some View {
         let receiving = lab.source?.receivingFrames ?? false
+        // A hold is this phone not streaming, and this phone knows it before
+        // the Tower does: `receiving_frames` stays true for `idle_after_s`
+        // (5 s) after the last frame, and LIVE for those seconds above a card
+        // that reads "held on phone" would be the screen disagreeing with
+        // itself.
         let isLive = lab.state.isLive(
-            isStreaming: tower.isStreamingToTower,
+            isStreaming: tower.isStreamingToTower && !tower.isFrameSendingPaused,
             isReceivingFrames: receiving
         )
         VStack(alignment: .leading, spacing: 4) {

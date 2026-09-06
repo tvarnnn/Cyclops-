@@ -485,6 +485,11 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         recorder: MessageRecorder? = nil
     ) {
         let reason = unavailableReason.map { "\"\($0)\"" } ?? "null"
+        // Numbered per connection, as the Tower's `next_subscription_id`
+        // does: a client that re-subscribes gets `sub-2`, and a heartbeat
+        // for `sub-1` after that is one it has left. A constant `sub-1`
+        // here once hid exactly that race.
+        var subscribeCount = 0
         server.onText = { text in
             recorder?.record(text)
             guard
@@ -496,6 +501,9 @@ final class TowerWorldBuilderClientTests: XCTestCase {
             case "ping":
                 server.send(text: #"{"type":"pong"}"#)
             case "cartridges":
+                // Asked once per connection, so a reconnect starts the
+                // numbering again, as the Tower's per-connection channel does.
+                subscribeCount = 0
                 server.send(text: """
                     {"type":"cartridges",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
@@ -505,10 +513,11 @@ final class TowerWorldBuilderClientTests: XCTestCase {
                      "not_offered":[]}
                     """)
             case "result_subscribe":
+                subscribeCount += 1
                 server.send(text: """
                     {"type":"result_subscribed",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
-                     "subscription_id":"sub-1","cartridge":"world_builder",
+                     "subscription_id":"sub-\(subscribeCount)","cartridge":"world_builder",
                      "result_type":"status","contract":"\(contract)",
                      "snapshot_only":true,"world_id":null,"session_id":null,
                      "cursor_status":"absent"}
@@ -525,12 +534,13 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         keyframes: Int,
         revision: String,
         revisionChanged: Bool = true,
-        tracking: String = "good"
+        tracking: String = "good",
+        subscription: String = "sub-1"
     ) -> String {
         """
         {"type":"cartridge_result",
          "envelope_contract":"cartridge_results.envelope/2026-08-23",
-         "subscription_id":"sub-1","cartridge":"world_builder","result_type":"status",
+         "subscription_id":"\(subscription)","cartridge":"world_builder","result_type":"status",
          "contract":"\(Self.contract)","seq":\(seq),"revision":"\(revision)",
          "revision_changed":\(revisionChanged),"coalesced":0,"cursor_status":null,
          "snapshot":true,"tower_sent_at":1787463092.9,"time_basis":"tower-receipt",
@@ -1274,8 +1284,8 @@ final class TowerWorldBuilderClientTests: XCTestCase {
             "the live subscription was left open under the pinned one"
         )
 
-        // The pinned world's snapshot lands like any other.
-        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored"))
+        // The pinned world's snapshot lands like any other, under the new id.
+        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored", subscription: "sub-2"))
         await expect { client.state.snapshot?.keyframeCount == 143 }
 
         client.followLive()
@@ -1286,6 +1296,49 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         XCTAssertFalse(live.keys.contains("session_id"))
 
         XCTAssertEqual(modes, [.inspecting(worldID: "w-stored"), .live])
+
+        tower.disconnect()
+    }
+
+    /// An envelope for a subscription this client has already left is not
+    /// applied. The Tower's sender may have queued a heartbeat for the old
+    /// subscription before the unsubscribe reached it; that envelope names
+    /// the world the reader just left, and applying it would put that
+    /// world's snapshot — and its geometry address — back on screen under a
+    /// header naming the new one.
+    func testAnEnvelopeFromTheSubscriptionJustLeftIsIgnored() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder: recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+        server.send(text: snapshotMessage(seq: 1, modelState: "receiving", keyframes: 30, revision: "r1"))
+        await expect { client.state.snapshot?.keyframeCount == 30 }
+
+        client.inspect(worldID: "w-stored", sessionID: "s-stored")
+        await expect { self.subscribes(recorder).count == 2 }
+
+        // A late heartbeat for `sub-1`: the live world, which the reader has
+        // left. It must not become the stored world's state.
+        server.send(text: snapshotMessage(seq: 2, modelState: "receiving", keyframes: 31, revision: "r2"))
+        // Then the stored world's own snapshot under `sub-2`, which must.
+        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored", subscription: "sub-2"))
+        await expect { client.state.snapshot?.keyframeCount == 143 }
+        XCTAssertEqual(client.state.snapshot?.keyframeCount, 143)
+        XCTAssertEqual(client.inspection, .inspecting(worldID: "w-stored"))
+
+        // And after Back to live, a straggler for `sub-2` is dropped the same way.
+        client.followLive()
+        await expect { self.subscribes(recorder).count == 3 }
+        server.send(text: snapshotMessage(seq: 2, modelState: "finalized", keyframes: 144, revision: "r-stored2", subscription: "sub-2"))
+        server.send(text: snapshotMessage(seq: 3, modelState: "receiving", keyframes: 32, revision: "r3", subscription: "sub-3"))
+        await expect { client.state.snapshot?.keyframeCount == 32 }
+        XCTAssertEqual(client.state.snapshot?.keyframeCount, 32)
 
         tower.disconnect()
     }
@@ -1339,7 +1392,7 @@ final class TowerWorldBuilderClientTests: XCTestCase {
         XCTAssertEqual(client.sessionBinding, .awaiting(captureID: nil))
 
         client.inspect(worldID: "w-stored", sessionID: "s-stored")
-        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored"))
+        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored", subscription: "sub-2"))
         await expect { client.state.snapshot?.keyframeCount == 143 }
         XCTAssertEqual(client.sessionBinding, WorldSessionBinding.none)
 
@@ -2094,7 +2147,25 @@ final class WorldRenderViewerTests: XCTestCase {
         } catch let error as WorldRenderFetchError {
             XCTAssertEqual(error, .absent(detail: "world 'w1' has no session with geometry yet"))
             XCTAssertTrue(error.message.contains("no session with geometry yet"))
+            XCTAssertFalse(error.message.contains("yet:"), "the detail says whether it is a 'yet'; the sentence must not")
             XCTAssertTrue(error.isRetryable, "a world still being built answers 404 until its first solve lands")
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    /// FastAPI's "Not Found" is a Tower without the route, not a world
+    /// without geometry, and trying again will not grow it a route.
+    func testAnUnmatchedRouteIsNamedAsSuchAndNotRetried() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (404, #"{"detail": "Not Found"}"#)])
+        do {
+            _ = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: nil))
+            XCTFail("a 404 must throw")
+        } catch let error as WorldRenderFetchError {
+            XCTAssertEqual(error, .absent(detail: "Not Found"))
+            XCTAssertTrue(error.message.contains("does not serve the picture route"))
+            XCTAssertFalse(error.message.contains("no picture for this world"))
+            XCTAssertFalse(error.isRetryable)
         } catch {
             XCTFail("wrong error: \(error)")
         }

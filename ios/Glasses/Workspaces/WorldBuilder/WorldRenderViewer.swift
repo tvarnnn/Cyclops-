@@ -148,10 +148,18 @@ nonisolated extension WorldRenderFetchError {
     /// broken, and never blames the world for a link that dropped.
     var message: String {
         switch self {
+        case .absent(let detail?) where detail == Self.unmatchedRouteDetail:
+            // FastAPI's default for a path it does not serve, which is never
+            // one of the contract's five sentences. That is a Tower older
+            // than the route, not a world with nothing built.
+            return "This Tower does not serve the picture route; it predates WORLD-BUILDER-WORLDS.md §4."
         case .absent(let detail?):
-            return "The Tower has no picture for this world yet: \(detail)."
+            // No "yet": the detail says which — a world still being built
+            // answers "no geometry yet", and a world that does not exist
+            // answers "no world", and only the Tower knows which.
+            return "The Tower has no picture for this world: \(detail)."
         case .absent(nil):
-            return "The Tower has no picture for this world yet — no geometry has been built for it, or the world is gone."
+            return "The Tower has no picture for this world — no geometry has been built for it, or the world is gone."
         case .badAddress:
             return "This world's identifier could not be made into a Tower address."
         case .towerError(let status):
@@ -165,13 +173,17 @@ nonisolated extension WorldRenderFetchError {
 
     /// Whether trying again could change the answer. A world still being
     /// built answers 404 until its first solve lands, so `absent` is
-    /// retryable; a bad id is not.
+    /// retryable; a bad id is not, and neither is a Tower without the route.
     var isRetryable: Bool {
         switch self {
         case .badAddress, .undecodable: return false
+        case .absent(let detail?) where detail == Self.unmatchedRouteDetail: return false
         case .absent, .towerError, .transport: return true
         }
     }
+
+    /// What FastAPI answers for a path no route serves.
+    static let unmatchedRouteDetail = "Not Found"
 }
 
 /// Owns one fetch of one page. Created by the sheet and destroyed with it;
@@ -193,8 +205,12 @@ final class WorldRenderViewerModel: ObservableObject {
         do {
             state = .ready(html: try await client.page(for: target))
         } catch let error as WorldRenderFetchError {
+            // A dismissed sheet cancels the task mid-fetch; that is not a
+            // failure to report, and nobody is looking.
+            guard !Task.isCancelled else { return }
             state = .failed(message: error.message, retryable: error.isRetryable)
         } catch {
+            guard !Task.isCancelled else { return }
             state = .failed(message: error.localizedDescription, retryable: true)
         }
     }
@@ -208,8 +224,14 @@ final class WorldRenderViewerModel: ObservableObject {
 /// The page is loaded with `loadHTMLString(_:baseURL:nil)`, so its only
 /// navigation is the initial one, to `about:blank`. Anything else — a link
 /// the page does not contain today, a `window.location` a future page might
-/// set, a target the Tower's HTML could carry — is refused. The page is
-/// self-contained by contract (§4), so refusing costs it nothing.
+/// set, a target the Tower's HTML could carry — is refused, and so is a
+/// *second* navigation to `about:blank`, which would blank the page. The
+/// page is self-contained by contract (§4), so refusing costs it nothing.
+///
+/// This governs navigations. Subresource loads — a `fetch`, an `<img src>`,
+/// a `<script src>`, a WebSocket — are not navigations and are not seen
+/// here; the contract's "no external script, stylesheet, image or fetch"
+/// is what keeps them absent, and the page is the Tower's own.
 nonisolated enum WorldRenderNavigationPolicy {
     static func allows(_ url: URL?, isInitialLoad: Bool) -> Bool {
         guard isInitialLoad, let url else { return false }
@@ -253,10 +275,19 @@ struct WorldRenderWebView: UIViewRepresentable {
         /// The string on screen, so `updateUIView` — called on every parent
         /// re-render — reloads only when the page actually changed.
         private var loaded: String?
+        /// Whether the one allowed navigation has been decided. Each
+        /// `loadHTMLString` is one; the flag is reset when one is issued.
+        private var hasDecidedInitialLoad = false
 
         func load(_ html: String, into webView: WKWebView) {
             guard loaded != html else { return }
             loaded = html
+            reload(into: webView)
+        }
+
+        private func reload(into webView: WKWebView) {
+            guard let html = loaded else { return }
+            hasDecidedInitialLoad = false
             // No base URL: the page has no origin, can name no relative
             // resource, and its one navigation is to `about:blank`.
             webView.loadHTMLString(html, baseURL: nil)
@@ -267,13 +298,23 @@ struct WorldRenderWebView: UIViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
         ) {
-            let isInitialLoad = navigationAction.navigationType == .other
+            let isInitialLoad = !hasDecidedInitialLoad
+                && navigationAction.navigationType == .other
                 && navigationAction.targetFrame?.isMainFrame == true
-            decisionHandler(
-                WorldRenderNavigationPolicy.allows(
-                    navigationAction.request.url, isInitialLoad: isInitialLoad
-                ) ? .allow : .cancel
+            let allowed = WorldRenderNavigationPolicy.allows(
+                navigationAction.request.url, isInitialLoad: isInitialLoad
             )
+            if allowed { hasDecidedInitialLoad = true }
+            decisionHandler(allowed ? .allow : .cancel)
+        }
+
+        /// WebKit's content process was killed — under memory pressure, a
+        /// multi-megabyte page redrawing 80k points on every gesture is a
+        /// candidate — and the view is now blank. The string is still here,
+        /// so put it back rather than leaving the reader a black rectangle
+        /// with nothing to do but Close and reopen.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            reload(into: webView)
         }
     }
 }

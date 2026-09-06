@@ -98,6 +98,7 @@ private extension CVCameraCard {
     var isRunning: Bool { glasses.isCaptureEngaged }
 
     var isStopping: Bool { glasses.cameraStreamState == .stopping }
+    var isStreaming: Bool { glasses.cameraStreamState == .streaming }
 
     /// Frames are being held on the phone. A fact about `TowerClient`, not
     /// about the glasses — see the type's doc comment.
@@ -189,7 +190,12 @@ private extension CVCameraCard {
                             .padding(.vertical, 6)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(isStopping)
+                    // Only while frames exist to hold. A hold set during
+                    // "Starting" outlives a start that then fails: nothing
+                    // sends `stream_stop` for a camera that never opened, so
+                    // the gate would stay closed into the next session, where
+                    // Home has no control that shows it.
+                    .disabled(!isStreaming)
                 }
             }
             .font(.headline)

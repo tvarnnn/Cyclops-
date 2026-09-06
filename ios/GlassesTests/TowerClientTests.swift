@@ -3189,8 +3189,24 @@ final class TowerConfigurationOverrideTests: XCTestCase {
 
     func testAnythingButAHostAndPortIsRefused() {
         for candidate in ["", "   ", "http://127.0.0.1:8000", "127.0.0.1:8000/ws",
-                          "user@host:1", "host:1?x=1", "host:1#f", ":8000", "host:notaport"] {
+                          "user@host:1", "host:1?x=1", "host:1#f", ":8000", "host:notaport",
+                          // Percent-encoding: `host` decodes it, so these would
+                          // pass the character checks and then not build a URL.
+                          "%20:8000", "%7Bx%7D:1", "%2F:1", "x%23y:1"] {
             XCTAssertNil(TowerConfiguration.acceptedAuthority(candidate), candidate)
+        }
+    }
+
+    /// Whatever is accepted builds both URLs, because the two `static let`s
+    /// force-unwrap them: an accepted value that did not would be a crash at
+    /// first use, which is the one outcome the override promises never to be.
+    func testEveryAcceptedValueBuildsBothUrls() {
+        for candidate in ["127.0.0.1:8000", "tower.local", "[::1]:8000", "a-b.c_d:65535", "10.0.0.7"] {
+            guard let accepted = TowerConfiguration.acceptedAuthority(candidate) else {
+                return XCTFail("\(candidate) should be accepted")
+            }
+            XCTAssertNotNil(URL(string: "http://\(accepted)"), candidate)
+            XCTAssertNotNil(URL(string: "ws://\(accepted)/ws"), candidate)
         }
     }
 

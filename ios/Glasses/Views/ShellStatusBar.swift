@@ -81,7 +81,11 @@ struct ShellStatusBar: View {
     /// coming up.
     private var cameraValue: String {
         switch glasses.cameraStreamState {
-        case .streaming: return "On"
+        // The CV Lab's frame hold is a fact about the socket, not the
+        // camera, but it is set on one screen and the camera is shown on
+        // every screen; a pill reading "On" over a Home whose "Sent to
+        // Tower" figure is decaying would be the shell not knowing.
+        case .streaming: return tower.isFrameSendingPaused ? "On · held" : "On"
         case .stopped: return "Off"
         default: return StateDisplay.cameraStream(glasses.cameraStreamState)
         }
