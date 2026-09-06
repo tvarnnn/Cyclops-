@@ -3170,3 +3170,36 @@ final class EventRecorder {
 
     func record(_ event: CartridgeResultEvent) { all.append(event) }
 }
+
+// MARK: - The Tower address override
+
+/// `TowerConfiguration` reads one environment variable in DEBUG so the
+/// Simulator can be pointed at a Tower on the Mac beside it. What it accepts
+/// is a `host[:port]` and nothing else; the URLs are built from it, so a
+/// value that would not build one must be refused rather than crash the app
+/// at first use of a `static let`.
+final class TowerConfigurationOverrideTests: XCTestCase {
+
+    func testAHostAndPortAreAccepted() {
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("127.0.0.1:8000"), "127.0.0.1:8000")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority(" tower.local:8000\n"), "tower.local:8000")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("tower.local"), "tower.local")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("[::1]:8000"), "[::1]:8000")
+    }
+
+    func testAnythingButAHostAndPortIsRefused() {
+        for candidate in ["", "   ", "http://127.0.0.1:8000", "127.0.0.1:8000/ws",
+                          "user@host:1", "host:1?x=1", "host:1#f", ":8000", "host:notaport"] {
+            XCTAssertNil(TowerConfiguration.acceptedAuthority(candidate), candidate)
+        }
+    }
+
+    /// Whatever the authority resolved to, both URLs are built from the same
+    /// one and name the routes the Tower serves.
+    func testBothUrlsAreBuiltFromTheOneAuthority() {
+        let authority = TowerConfiguration.authority
+        XCTAssertEqual(TowerConfiguration.webSocketURL.absoluteString, "ws://\(authority)/ws")
+        XCTAssertEqual(TowerConfiguration.httpBaseURL.absoluteString, "http://\(authority)")
+        XCTAssertNotNil(TowerConfiguration.acceptedAuthority(authority))
+    }
+}
