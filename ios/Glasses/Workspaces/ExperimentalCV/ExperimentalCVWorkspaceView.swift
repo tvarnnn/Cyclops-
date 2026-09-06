@@ -442,7 +442,7 @@ struct ExperimentalCVWorkspaceView: View {
                     phone — this session is not streaming, and another client is \
                     feeding the Tower.
                     """
-                : "Armed and waiting for a stream. Start a session to feed it."
+                : "Armed and waiting for a stream. Start the camera above to feed it."
         }
         return """
             Armed, and the Tower has not seen a frame recently enough to call \
