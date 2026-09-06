@@ -2023,3 +2023,202 @@ final class TowerWorldBuilderSessionBindingTests: XCTestCase {
         tower.disconnect()
     }
 }
+
+// MARK: - The interactive picture (`GET /worlds/{id}/render`)
+
+/// The viewer's fetch, its address, its sentences and its navigation policy,
+/// with no `WKWebView` in any of them. The page itself is the Tower's; what
+/// this app owns is asking for it correctly, saying truthfully why it did not
+/// come, and refusing to go anywhere else.
+@MainActor
+final class WorldRenderViewerTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+
+    private func client() -> WorldRenderClient {
+        WorldRenderClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession())
+    }
+
+    // MARK: Address
+
+    func testTheAddressIsTheContractRouteWithTheSessionAsAQuery() {
+        let pinned = WorldRenderClient.url(
+            for: WorldRenderTarget(worldID: "w1", sessionID: "s1"), baseURL: Self.host
+        )
+        XCTAssertEqual(pinned?.absoluteString, "http://stub.invalid/worlds/w1/render?session_id=s1")
+
+        let unpinned = WorldRenderClient.url(
+            for: WorldRenderTarget(worldID: "w1", sessionID: nil), baseURL: Self.host
+        )
+        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render")
+    }
+
+    /// A wire-supplied id stays one path component. A `/` inside it must not
+    /// become a second segment that addresses a different route.
+    func testAnIdIsOnePathComponentHoweverItIsSpelled() {
+        let url = WorldRenderClient.url(
+            for: WorldRenderTarget(worldID: "a/b c", sessionID: "s&1"), baseURL: Self.host
+        )
+        XCTAssertEqual(url?.path, "/worlds/a/b c/render")
+        XCTAssertEqual(url?.absoluteString, "http://stub.invalid/worlds/a%2Fb%20c/render?session_id=s%261")
+    }
+
+    func testAnEmptyIdIsRefusedRatherThanAddressed() {
+        XCTAssertNil(WorldRenderClient.url(
+            for: WorldRenderTarget(worldID: "", sessionID: nil), baseURL: Self.host
+        ))
+        XCTAssertNil(WorldRenderClient.url(
+            for: WorldRenderTarget(worldID: "w1", sessionID: ""), baseURL: Self.host
+        ))
+    }
+
+    // MARK: Fetch
+
+    func testAPageComesBackAsItsText() async throws {
+        StubbedGeometryProtocol.reset(routes: [
+            "/worlds/w1/render": (200, "<!doctype html><html><body>hi</body></html>"),
+        ])
+        let html = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: "s1"))
+        XCTAssertTrue(html.hasPrefix("<!doctype html>"))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: "/worlds/w1/render"), 1)
+    }
+
+    /// The Tower's 404 says WHICH thing is missing, and the phone keeps it.
+    func testAbsenceCarriesTheTowersOwnDetail() async {
+        StubbedGeometryProtocol.reset(routes: [
+            "/worlds/w1/render": (404, #"{"detail": "world 'w1' has no session with geometry yet"}"#),
+        ])
+        do {
+            _ = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: nil))
+            XCTFail("a 404 must throw")
+        } catch let error as WorldRenderFetchError {
+            XCTAssertEqual(error, .absent(detail: "world 'w1' has no session with geometry yet"))
+            XCTAssertTrue(error.message.contains("no session with geometry yet"))
+            XCTAssertTrue(error.isRetryable, "a world still being built answers 404 until its first solve lands")
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    func testA404WithNoReadableBodyIsStillAbsent() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (404, "<html>nope</html>")])
+        do {
+            _ = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: nil))
+            XCTFail("a 404 must throw")
+        } catch let error as WorldRenderFetchError {
+            XCTAssertEqual(error, .absent(detail: nil))
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    func testAnotherStatusIsATowerError() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (500, "")])
+        do {
+            _ = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: nil))
+            XCTFail("a 500 must throw")
+        } catch let error as WorldRenderFetchError {
+            XCTAssertEqual(error, .towerError(status: 500))
+            XCTAssertTrue(error.message.contains("500"))
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    func testAnUnreachableTowerIsATransportFailureNotAMissingWorld() async {
+        StubbedGeometryProtocol.reset(routes: [:])
+        do {
+            _ = try await client().page(for: WorldRenderTarget(worldID: "w1", sessionID: nil))
+            XCTFail("a dropped connection must throw")
+        } catch let error as WorldRenderFetchError {
+            guard case .transport = error else { return XCTFail("wrong error: \(error)") }
+            XCTAssertFalse(error.message.contains("no picture for this world"),
+                           "a link that dropped must not be blamed on the world")
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+    // MARK: The sheet's model
+
+    func testTheModelReportsLoadingThenReadyOrFailed() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        XCTAssertEqual(model.state, .loading)
+        await model.load()
+        XCTAssertEqual(model.state, .ready(html: "<!doctype html>"))
+
+        StubbedGeometryProtocol.set(route: "/worlds/w1/render", to: (404, #"{"detail": "no world 'w1'"}"#))
+        await model.load()
+        guard case .failed(let message, let retryable) = model.state else {
+            return XCTFail("expected failed, got \(model.state)")
+        }
+        XCTAssertTrue(message.contains("no world 'w1'"))
+        XCTAssertTrue(retryable)
+    }
+
+    // MARK: Navigation policy
+
+    /// The page is loaded as a string with no base URL, so its one legitimate
+    /// navigation is the initial `about:blank`. Everything else is refused.
+    func testOnlyTheInitialBlankNavigationIsAllowed() {
+        XCTAssertTrue(WorldRenderNavigationPolicy.allows(URL(string: "about:blank"), isInitialLoad: true))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "about:blank"), isInitialLoad: false),
+                       "a link click to about:blank is still a link click")
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "http://stub.invalid/"), isInitialLoad: true))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "https://example.com/"), isInitialLoad: true))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "file:///etc/passwd"), isInitialLoad: true))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "about:srcdoc"), isInitialLoad: true))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(nil, isInitialLoad: true))
+    }
+
+    // MARK: Where the picture button gets its target
+
+    /// Opening a stored world names it for the viewer at once — the person
+    /// chose it, and if the Tower has nothing built the viewer says so in
+    /// the Tower's words. Returning to live forgets it until the Tower names
+    /// the live world's geometry.
+    func testOpeningAStoredWorldNamesItAndReturningToLiveForgetsIt() {
+        let viewModel = WorldBuilderViewModel(client: UnavailableWorldBuilderClient())
+        XCTAssertNil(viewModel.renderTarget, "nothing has been named yet")
+
+        viewModel.open(worldID: "w-old", sessionID: nil)
+        XCTAssertEqual(viewModel.renderTarget, WorldRenderTarget(worldID: "w-old", sessionID: nil))
+
+        viewModel.open(worldID: "w-old", sessionID: "s-2")
+        XCTAssertEqual(viewModel.renderTarget, WorldRenderTarget(worldID: "w-old", sessionID: "s-2"))
+
+        viewModel.returnToLive()
+        XCTAssertNil(viewModel.renderTarget)
+    }
+
+    /// The live world earns a picture only when the Tower names geometry for
+    /// it — and keeps it even when the manifest that follows cannot be
+    /// fetched, because the render route is a different question.
+    func testGeometryCoordinatesNameTheLiveWorldEvenWhenTheManifestFails() async {
+        StubbedGeometryProtocol.reset(routes: [:])  // every fetch fails
+        let viewModel = WorldBuilderViewModel(
+            client: UnavailableWorldBuilderClient(),
+            geometry: WorldGeometryClient(
+                baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()
+            )
+        )
+        await viewModel.geometryDidChange(worldID: "w-live", sessionID: "s-live", revision: "g1")
+        XCTAssertEqual(viewModel.renderTarget, WorldRenderTarget(worldID: "w-live", sessionID: "s-live"))
+
+        // A heartbeat under the same revision changes nothing and publishes
+        // nothing new.
+        var publishes = 0
+        let cancellable = viewModel.$renderTarget.dropFirst().sink { _ in publishes += 1 }
+        await viewModel.geometryDidChange(worldID: "w-live", sessionID: "s-live", revision: "g1")
+        XCTAssertEqual(publishes, 0)
+        cancellable.cancel()
+
+        // A half-known address names nothing, exactly as it fetches nothing.
+        viewModel.returnToLive()
+        await viewModel.geometryDidChange(worldID: "w-live", sessionID: nil, revision: "g2")
+        XCTAssertNil(viewModel.renderTarget)
+    }
+}

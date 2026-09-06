@@ -238,6 +238,19 @@ final class WorldBuilderViewModel: ObservableObject {
     /// Tower's own answer — no world root configured — and is worded as that.
     @Published private(set) var worldListFailure: String?
 
+    /// The world whose interactive picture can be opened, or `nil` when none
+    /// has been named yet.
+    ///
+    /// Set from two places and cleared from one. Opening a stored world sets
+    /// it to the pin — the person chose that world, and if the Tower has built
+    /// nothing for it the viewer shows the Tower's own sentence saying so.
+    /// Geometry coordinates arriving on the status channel set it to the world
+    /// and session the Tower named, which is the only way the *live* world
+    /// earns one: a live world without geometry has no picture to open, and a
+    /// button that could not lead anywhere is not offered. `returnToLive()`
+    /// clears it, and the next report re-earns it.
+    @Published private(set) var renderTarget: WorldRenderTarget?
+
     /// Whether the world on screen belongs to the capture the phone has open.
     ///
     /// Republished rather than derived, for the reason `state` is: the client
@@ -369,10 +382,19 @@ final class WorldBuilderViewModel: ObservableObject {
     /// this from a partially-known address is refused here rather than
     /// composing a URL out of what it happened to have.
     func geometryDidChange(worldID: String?, sessionID: String?, revision: String?) async {
-        guard
-            let worldID, let sessionID, let revision,
-            revision != lastGeometryRevision
-        else { return }
+        guard let worldID, let sessionID, let revision else { return }
+
+        // The Tower has named a world with geometry; that is what the viewer
+        // can draw. Recorded before the revision guard and before the fetch,
+        // deliberately: a heartbeat under an unchanged revision still names
+        // the world truthfully, and a manifest that fails — a 404 that raced
+        // a rebuild — must not withhold a picture the render route would
+        // serve. Guarded on equality so the two-second heartbeat does not
+        // republish an unchanged value.
+        let named = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
+        if renderTarget != named { renderTarget = named }
+
+        guard revision != lastGeometryRevision else { return }
         lastGeometryRevision = revision
 
         guard let manifest = try? await geometry.manifest(
@@ -537,12 +559,14 @@ final class WorldBuilderViewModel: ObservableObject {
     func open(worldID: String, sessionID: String?) {
         client.inspect(worldID: worldID, sessionID: sessionID)
         clearGeometry()
+        renderTarget = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
     }
 
     /// Back to the live world, by the same route.
     func returnToLive() {
         client.followLive()
         clearGeometry()
+        renderTarget = nil
     }
 
     /// Forget what is drawn and rearm the fetch. A fetch already in flight for

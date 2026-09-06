@@ -77,6 +77,12 @@ struct WorldBuilderWorkspaceView: View {
     /// Whether the saved-worlds sheet is up. View state, so it lives here.
     @State private var isShowingWorlds = false
 
+    /// The world whose interactive picture is up, or `nil`. Captured from
+    /// `world.renderTarget` at the tap rather than read live, so a report
+    /// that renames the live world mid-look does not swap the sheet's content
+    /// under the reader.
+    @State private var viewerTarget: WorldRenderTarget?
+
     /// The client is injected rather than constructed here, and owned by
     /// `ProjectManager`. See `CartridgeClients` for why: this `@StateObject` is
     /// destroyed on every cartridge switch, and a Tower-backed client holding a
@@ -128,6 +134,9 @@ struct WorldBuilderWorkspaceView: View {
         .sheet(isPresented: $isShowingWorlds) {
             WorldPickerView(world: world)
         }
+        .sheet(item: $viewerTarget) { target in
+            WorldRenderViewerView(target: target)
+        }
     }
 
     // MARK: Header
@@ -138,8 +147,22 @@ struct WorldBuilderWorkspaceView: View {
                 Text("World Builder")
                     .font(.title2.weight(.semibold))
                 Spacer()
-                // Reads only, so it is not `#if DEBUG`: a Release build with
-                // no camera can still look at what the Tower has stored.
+                // Both read only, so neither is `#if DEBUG`: a Release build
+                // with no camera can still look at what the Tower has stored.
+                //
+                // The picture button is disabled, not hidden, until the Tower
+                // has named a world with geometry (`renderTarget`): a control
+                // that appears from nowhere is one nobody looks for, and a
+                // disabled one says "not yet" truthfully.
+                Button {
+                    viewerTarget = world.renderTarget
+                } label: {
+                    Label("Picture", systemImage: "cube.transparent")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .disabled(world.renderTarget == nil)
+                .accessibilityLabel("Interactive picture of the world")
                 Button {
                     isShowingWorlds = true
                 } label: {
