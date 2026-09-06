@@ -101,6 +101,12 @@ class ExperimentSettings:
     """
 
     device: str = "auto"
+    # The intra-op thread budget torch gets while a model-backed experiment
+    # holds a model. "auto" resolves per device in
+    # `tower.experiments.depth.resolve_torch_threads` (2 on CUDA, 4 on
+    # CPU, from a sweep on this host); a positive integer is applied as
+    # given; 0 leaves torch's default alone. Cheap experiments ignore it.
+    torch_threads: int | str = "auto"
 
 
 @dataclass(frozen=True)
