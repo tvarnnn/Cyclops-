@@ -133,7 +133,7 @@ def derived_world(tmp_path):
         "backend_id": "classical-sfm", "session_id": session_id,
         "keyframes": 4, "poses_solved": 1, "poses_refused": 1,
         "poses_anchor": 2, "poses_positioned": 2, "points": 2,
-        "segments": 2, "scale_state": "unknown",
+        "segments": 2, "scale_state": "unknown", "global_solve": None,
     }
     store.write_derived(world_id, session_id, poses=poses, points=points,
                         manifest=manifest)

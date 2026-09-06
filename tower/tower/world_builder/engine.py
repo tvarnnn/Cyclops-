@@ -57,6 +57,7 @@ from tower.world_builder.schema import (
     SCALE_RELATIVE,
     SCALE_UNKNOWN,
 )
+from tower.world_builder import global_solve
 from tower.world_builder.store import WorldStore, compute_input_digest
 
 logger = logging.getLogger(__name__)
@@ -705,6 +706,43 @@ class WorldBuilderEngine:
 
         backend.release()
 
+        # A global solution (tower/world_builder/global_solve.py), when one
+        # has been persisted for this session, is expressed through the
+        # derived tree here and nowhere else: build() stays the single
+        # writer of poses.json / points.json / support.json, and the
+        # placements the solution implies are written beside them under the
+        # same input digest, so the geometry route serves them as current.
+        # Counts below are recomputed from the merged rows; the chain's own
+        # root/cascaded refusal split is kept as a diagnostic of the chain.
+        input_digest = compute_input_digest(keyframes)
+        solve_summary = None
+        placements = None
+        solution = global_solve.load_solution(self._store, world_id, session_id)
+        if solution is not None:
+            merged = global_solve.merge(
+                keyframes, pose_rows, point_rows, support_rows, solution,
+                input_digest=input_digest,
+            )
+            pose_rows = merged.pose_rows
+            point_rows = merged.point_rows
+            support_rows = merged.support_rows
+            placements = merged.placements
+            solve_summary = {**merged.summary, "segments": merged.segments}
+            poses_solved = sum(1 for r in pose_rows if r["status"] == POSE_STATUS_SOLVED)
+            poses_anchor = sum(1 for r in pose_rows if r["status"] == POSE_STATUS_ANCHOR)
+            poses_refused = len(pose_rows) - poses_solved - poses_anchor
+            solved_by_segment: dict[int, int] = {}
+            anchors_by_segment: dict[int, int] = {}
+            for r in pose_rows:
+                if r["status"] == POSE_STATUS_SOLVED:
+                    solved_by_segment[r["segment_index"]] = solved_by_segment.get(r["segment_index"], 0) + 1
+                elif r["status"] == POSE_STATUS_ANCHOR:
+                    anchors_by_segment[r["segment_index"]] = anchors_by_segment.get(r["segment_index"], 0) + 1
+            poses_positioned = sum(
+                n + anchors_by_segment.get(seg, 0) for seg, n in solved_by_segment.items()
+            )
+            total_points = len(point_rows)
+
         # Scale becomes "relative" only once something actually solved:
         # an internally consistent world with an arbitrary unit. Without a
         # solved pose there is no unit at all, so it stays "unknown".
@@ -744,7 +782,7 @@ class WorldBuilderEngine:
             support=support_rows,
             manifest={
                 "schema_version": world.schema_version,
-                "input_digest": compute_input_digest(keyframes),
+                "input_digest": input_digest,
                 "built_at": self._clock(),
                 "backend_id": backend.capabilities.backend_id,
                 "session_id": session_id,
@@ -784,8 +822,11 @@ class WorldBuilderEngine:
                 "points_triangulated": total_triangulated,
                 "segments": len(segments),
                 "scale_state": scale_state,
+                "global_solve": solve_summary,
             },
         )
+        if placements is not None:
+            self._store.write_placements(world_id, session_id, placements)
 
         return BuildResult(
             world_id=world_id,

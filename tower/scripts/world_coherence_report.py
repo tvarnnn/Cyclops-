@@ -232,6 +232,20 @@ def coherence(
             store, world_id, session_id
         )
         report["reprojection_gate_px"] = PNP_REPROJECTION_ERROR_PX
+    # A globally solved session has no support rows for its solved segments
+    # (they would index the wrong keypoints -- see global_solve.merge), so
+    # the ORB reprojection above covers only chain-built segments. The
+    # solver's own observations are reprojected here instead, and the
+    # report says which segments each number speaks for.
+    from tower.world_builder import global_solve  # noqa: PLC0415
+
+    solution = global_solve.load_solution(store, world_id, session_id)
+    if solution is not None:
+        manifest = store.read_derived_manifest(world_id) or {}
+        block = dict((manifest.get("global_solve") or {}))
+        block.pop("segments", None)
+        block["reprojection_px"] = global_solve.reprojection_summary(solution)
+        report["global_solve"] = block
     return report
 
 

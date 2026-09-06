@@ -131,6 +131,7 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
         return None
 
     register = ("--register",) if settings.world_register else ()
+    solve = ("--solve",) if settings.world_solve else ()
 
     return WorkerSpec(
         argv=(
@@ -148,6 +149,10 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
             # as a command line -- and because registration is seconds of
             # solving that the frame path must never see.
             *register,
+            # The global solver, same reasoning: a child of the builder,
+            # never the web process, and seconds to minutes of solving the
+            # frame path must never see.
+            *solve,
             # So a producer whose Tower died without closing the manifest
             # stops following instead of polling that directory forever.
             # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and

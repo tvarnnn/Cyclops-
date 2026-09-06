@@ -72,6 +72,7 @@ import io
 import itertools
 import json
 import logging
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -95,6 +96,14 @@ from tower.world_builder.records import (  # noqa: E402
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 DEFAULT_ROOT = Path("data/world_builder")
+TOWER_ROOT = Path(__file__).resolve().parents[1]
+# Accepted keyframes between background global solves. At ~3.6 keyframes per
+# second of walk this is roughly every 15 s; a solve over a two-minute walk
+# costs ~40-80 s on this host (ledger E8/E9), so a longer walk simply gets
+# fewer, larger solves rather than a queue.
+DEFAULT_SOLVE_EVERY = 50
+# How long Stop waits for a background solve before running the final one.
+DEFAULT_SOLVE_WAIT_SECONDS = 120.0
 
 logger = logging.getLogger("tower.world_build_session")
 
@@ -122,6 +131,11 @@ class ObservedFrame:
     # and `observed_size_of` decodes the bytes instead.
     width: int | None = None
     height: int | None = None
+    # Where the raw frame lives on disk, when it lives anywhere. The global
+    # solver reads raw frames in preference to the session's redacted
+    # copies (global_solve.py, ledger E6), and only the process that
+    # observed the frame knows the path.
+    source_path: Path | None = None
 
 
 def load_frames(directory: Path) -> list[ObservedFrame]:
@@ -129,7 +143,10 @@ def load_frames(directory: Path) -> list[ObservedFrame]:
     if not paths:
         raise SystemExit(f"no .jpg frames found under {directory}")
     return [
-        ObservedFrame(payload=path.read_bytes(), source_seq=index, wire_seq=index)
+        ObservedFrame(
+            payload=path.read_bytes(), source_seq=index, wire_seq=index,
+            source_path=path,
+        )
         for index, path in enumerate(paths)
     ]
 
@@ -292,6 +309,7 @@ def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
             received_at=frame.received_at,
             width=frame.width,
             height=frame.height,
+            source_path=directory / frame.relpath,
         )
 
 
@@ -323,6 +341,137 @@ def synthetic_frames(count: int, width: int, height: int):
         for index, image in enumerate(images)
     ]
     return frames, intrinsics
+
+
+class BackgroundSolver:
+    """The global solve, run as a child of the builder so the frame path never
+    waits for it.
+
+    One child at a time. `maybe_launch` starts `scripts/world_solve.py`
+    when no solve is running and at least `every` keyframes have been
+    accepted since the last launch; `finished()` reports (once) that a
+    launch has completed, which is the builder's cue to rebuild so the new
+    solution reaches the derived tree without waiting for the next
+    rebuild interval. Output goes to `solve/<session>/solve.log`.
+    """
+
+    def __init__(self, *, root: Path, world_id: str, session_id: str, every: int,
+                 capture_dirs, threads: int | None = None):
+        self.root = root
+        self.world_id = world_id
+        self.session_id = session_id
+        self.every = max(1, every)
+        self.capture_dirs = [Path(d) for d in capture_dirs]
+        self.threads = threads
+        self._child = None
+        self._launched_at_keyframes = 0
+        self._launches = 0
+        self._completed_unseen = False
+        self._log = None
+
+    @property
+    def running(self) -> bool:
+        return self._child is not None and self._child.poll() is None
+
+    @property
+    def launches(self) -> int:
+        return self._launches
+
+    def _reap(self) -> None:
+        if self._child is not None and self._child.poll() is not None:
+            self._child = None
+            self._completed_unseen = True
+            if self._log is not None:
+                self._log.close()
+                self._log = None
+
+    def finished(self) -> bool:
+        """True once per completed launch."""
+        self._reap()
+        if self._completed_unseen:
+            self._completed_unseen = False
+            return True
+        return False
+
+    def maybe_launch(self, store: WorldStore, accepted: int, sources: dict) -> bool:
+        self._reap()
+        if self.running or accepted - self._launched_at_keyframes < self.every or accepted < 2:
+            return False
+        from tower.world_builder import global_solve  # noqa: PLC0415
+
+        global_solve.write_sources(store, self.world_id, self.session_id, sources)
+        workspace = global_solve.workspace_for(store, self.world_id, self.session_id)
+        workspace.root.mkdir(parents=True, exist_ok=True)
+        argv = [
+            sys.executable, str(TOWER_ROOT / "scripts" / "world_solve.py"),
+            "--root", str(self.root), "--world", self.world_id, "--session", self.session_id,
+        ]
+        for capture_dir in self.capture_dirs:
+            argv += ["--capture-dir", str(capture_dir)]
+        if self.threads is not None:
+            argv += ["--threads", str(self.threads)]
+        self._log = open(workspace.root / "solve.log", "ab")
+        self._child = subprocess.Popen(
+            argv, cwd=str(TOWER_ROOT), stdout=self._log, stderr=subprocess.STDOUT
+        )
+        self._launched_at_keyframes = accepted
+        self._launches += 1
+        logger.info(
+            "[Tower][WorldBuilder] background solve %s launched at %s keyframes (pid %s)",
+            self._launches, accepted, self._child.pid,
+        )
+        return True
+
+    def wait(self, timeout: float | None) -> bool:
+        """Wait for a running child. False if it had to be abandoned."""
+        if self._child is None:
+            return True
+        try:
+            self._child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[Tower][WorldBuilder] background solve still running after %ss; "
+                "the final solve proceeds without it", timeout,
+            )
+            return False
+        finally:
+            self._reap()
+        return True
+
+
+def solve_session(store: WorldStore, world_id: str, session_id: str, *, capture_dirs,
+                  sources: dict, loop_detection: bool = True) -> dict:
+    """The finalisation solve, in this process, after the last frame.
+
+    Never raises: a walk that reconstructed locally is worth keeping even
+    if the global solve failed, exactly as `register_session` reasons.
+    """
+    from tower.world_builder import global_solve  # noqa: PLC0415
+    from tower.world_builder.store import compute_input_digest  # noqa: PLC0415
+
+    started = time.perf_counter()
+    try:
+        global_solve.write_sources(store, world_id, session_id, sources)
+        keyframes = store.read_keyframes(world_id, session_id)
+        summary = global_solve.solve(
+            store, world_id, session_id, capture_dirs=capture_dirs, final=True,
+            num_threads=-1, loop_detection=loop_detection,
+            input_digest=compute_input_digest(keyframes),
+        )
+    except Exception as error:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "[Tower][WorldBuilder] final global solve failed for %s: %s", session_id, error
+        )
+        return {"attempted": True, "solved": False, "error": f"{type(error).__name__}: {error}"}
+    summary["seconds"] = round(time.perf_counter() - started, 3)
+    summary["attempted"] = True
+    logger.info(
+        "[Tower][WorldBuilder] final global solve: solved=%s solver=%s posed=%s/%s "
+        "components=%s in %.2fs",
+        summary.get("solved"), summary.get("solver"), summary.get("keyframes_posed"),
+        summary.get("keyframes"), len(summary.get("components") or []), summary["seconds"],
+    )
+    return summary
 
 
 def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
@@ -483,6 +632,31 @@ def main(argv=None) -> int:
             "Give up after N quiet polls on a capture that never closes. "
             "Unset waits for the recorder to close it."
         ),
+    )
+    parser.add_argument(
+        "--solve",
+        action="store_true",
+        help=(
+            "Run the global solver (tower/world_builder/global_solve.py): in "
+            "the background every --solve-every accepted keyframes during the "
+            "walk, and once more, in this process, after the last frame. Its "
+            "solution is merged into the derived tree by build(). When it "
+            "produces a solution, --register is skipped: the placements come "
+            "from one reconstruction rather than from Sim3 fits between "
+            "fragments."
+        ),
+    )
+    parser.add_argument(
+        "--solve-every",
+        type=int,
+        default=DEFAULT_SOLVE_EVERY,
+        help="accepted keyframes between background solves (0 = final solve only)",
+    )
+    parser.add_argument(
+        "--solve-wait-seconds",
+        type=float,
+        default=DEFAULT_SOLVE_WAIT_SECONDS,
+        help="how long Stop waits for a running background solve before the final solve",
     )
     parser.add_argument(
         "--register",
@@ -711,6 +885,15 @@ def main(argv=None) -> int:
     rebuilds = 0
     since_rebuild = 0
     accepted = 0
+    # keyframe_id -> raw frame path, for the global solver (see ObservedFrame).
+    sources: dict = {}
+    capture_dirs = [d for d in (args.follow_capture, args.frames) if d is not None]
+    solver = None
+    if args.solve and args.solve_every > 0:
+        solver = BackgroundSolver(
+            root=args.root.resolve(), world_id=world_id, session_id=session_id,
+            every=args.solve_every, capture_dirs=capture_dirs,
+        )
     for frame in frames:
         outcome = engine.observe(
             frame.payload,
@@ -723,10 +906,18 @@ def main(argv=None) -> int:
             continue
         accepted += 1
         since_rebuild += 1
+        if frame.source_path is not None:
+            sources[outcome.keyframe_id] = str(frame.source_path)
+        # A finished background solve is worth a rebuild now: the solution
+        # reaches the derived tree only through build(), and the wearer
+        # should see the world snap together as soon as it is known.
+        solve_landed = solver is not None and solver.finished()
         # Two keyframes is the minimum a two-view backend can say anything
         # about. Rebuilding on one would burn a build to produce an anchor
         # pose and nothing else.
-        if args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2:
+        if (args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2) or (
+            solve_landed and accepted >= 2
+        ):
             rebuild_started = time.perf_counter()
             interim = engine.build(world_id, session_id)
             rebuilds += 1
@@ -745,8 +936,20 @@ def main(argv=None) -> int:
                 interim.segments,
                 time.perf_counter() - rebuild_started,
             )
+            if solver is not None:
+                solver.maybe_launch(store, accepted, sources)
     observe_seconds = time.perf_counter() - started
     summary = engine.stop_session()
+
+    solve_report = None
+    if args.solve:
+        if solver is not None:
+            solver.wait(args.solve_wait_seconds)
+        solve_report = solve_session(
+            store, world_id, session_id, capture_dirs=capture_dirs, sources=sources,
+        )
+        if solver is not None:
+            solve_report["background_launches"] = solver.launches
 
     built = time.perf_counter()
     result = engine.build(world_id, session_id)
@@ -792,8 +995,17 @@ def main(argv=None) -> int:
     # the derived tree and binds its answer to that build's digest, so a
     # mid-walk run would solve against geometry the next rebuild
     # replaces and be discarded at serve time anyway.
-    if args.register:
+    if solve_report is not None:
+        report["global_solve"] = solve_report
+    # The Sim3 registrar places fragments against each other; when the
+    # global solve produced a solution the placements already come from one
+    # reconstruction and a second, weaker answer must not overwrite them.
+    if args.register and not (solve_report or {}).get("solved"):
         report["registration"] = register_session(store, world_id, session_id)
+    elif args.register:
+        report["registration"] = {
+            "attempted": False, "reason": "placements come from the global solve",
+        }
 
     if args.format == "json":
         print(json.dumps(report, indent=2))
