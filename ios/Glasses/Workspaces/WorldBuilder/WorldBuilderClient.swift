@@ -80,6 +80,23 @@ protocol WorldBuilderClient: CartridgeClient {
     /// Emits nothing at all for a client with no Tower behind it, which is the
     /// correct and complete behaviour rather than an omission.
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> { get }
+
+    /// Whether this client is following the live world or pinned to a stored
+    /// one. `.live` for every client that cannot pin, which is every client
+    /// but the Tower-backed one.
+    var inspection: WorldInspectionMode { get }
+
+    /// Every mode after the one `inspection` held when the view model was
+    /// built.
+    var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> { get }
+
+    /// Pin the world subscription to a stored world, and optionally to one of
+    /// its sessions. A no-op for a client with no transport.
+    func inspect(worldID: String, sessionID: String?)
+
+    /// Return to following the live world. A no-op for a client with no
+    /// transport.
+    func followLive()
 }
 
 extension WorldBuilderClient {
@@ -107,6 +124,20 @@ extension WorldBuilderClient {
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
+
+    /// A client that cannot open a stored world is always live, and says so
+    /// once.
+    var inspection: WorldInspectionMode { .live }
+
+    var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// Nothing to pin; nothing happens. Not an error, because the picker is
+    /// simply not offered a world by such a client.
+    func inspect(worldID: String, sessionID: String?) {}
+
+    func followLive() {}
 }
 
 /// A World Builder client with no Tower behind it.
@@ -192,9 +223,20 @@ final class WorldBuilderViewModel: ObservableObject {
     /// aspiration.
     @Published private(set) var state: WorldModelState
 
-    /// Live vs. stored-world inspection. Nothing can change it yet because
-    /// there is no stored world to open.
-    @Published private(set) var inspection: WorldInspectionMode = .live
+    /// Live vs. stored-world inspection. Seeded from the client and
+    /// republished from `inspectionUpdates`, for the reason `state` is: the
+    /// client owns the pin, because the pin is a fact about its subscription.
+    @Published private(set) var inspection: WorldInspectionMode
+
+    /// The stored worlds the Tower listed, newest first, or empty until
+    /// `loadWorlds()` has answered. Empty is also what a Tower with no world
+    /// root reports; `worldListFailure` says which.
+    @Published private(set) var worlds: [WorldListingEntry] = []
+
+    /// Why the last `loadWorlds()` produced nothing, in a sentence, or `nil`
+    /// after a listing that succeeded. `WorldListFetchError.notFound` is the
+    /// Tower's own answer — no world root configured — and is worded as that.
+    @Published private(set) var worldListFailure: String?
 
     /// Whether the world on screen belongs to the capture the phone has open.
     ///
@@ -235,6 +277,9 @@ final class WorldBuilderViewModel: ObservableObject {
     /// runtime references and tears nothing down, still stands.
     private let geometry: WorldGeometryClient
     private let geometryStore = WorldGeometryStore()
+    /// The saved-worlds list, over HTTP. A struct holding a `URL` and the
+    /// shared session, like `geometry`, and defaulted for the same reason.
+    private let library: WorldListClient
 
     /// The `geometry.revision` whose manifest is currently on screen, or `nil`
     /// when there is none.
@@ -265,12 +310,15 @@ final class WorldBuilderViewModel: ObservableObject {
     /// fails, which is behaviour no amount of reading proves.
     init(
         client: any WorldBuilderClient,
-        geometry: WorldGeometryClient = WorldGeometryClient()
+        geometry: WorldGeometryClient = WorldGeometryClient(),
+        library: WorldListClient = WorldListClient()
     ) {
         self.client = client
         self.state = client.state
         self.sessionBinding = client.sessionBinding
+        self.inspection = client.inspection
         self.geometry = geometry
+        self.library = library
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
@@ -280,6 +328,10 @@ final class WorldBuilderViewModel: ObservableObject {
         client.bindingUpdates
             .receive(on: DispatchQueue.main)
             .sink { [weak self] binding in self?.sessionBinding = binding }
+            .store(in: &cancellables)
+        client.inspectionUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] mode in self?.inspection = mode }
             .store(in: &cancellables)
         client.geometryUpdates
             .receive(on: DispatchQueue.main)
@@ -444,6 +496,62 @@ final class WorldBuilderViewModel: ObservableObject {
                 + "points=\(chunks.values.reduce(0) { $0 + $1.points.count })"
                 + (anySegmentFailed ? " SOME FAILED — will retry on the next report" : "")
         )
+    }
+
+    // MARK: Saved worlds
+
+    /// Ask the Tower which worlds it holds. Called by the picker as it opens.
+    ///
+    /// `try?`-shaped like the geometry fetches, with the failure kept as a
+    /// sentence rather than swallowed: the picker has to say why it is empty,
+    /// and "no world root" and "the request failed" are different answers.
+    func loadWorlds() async {
+        do {
+            worlds = try await library.worlds().worlds
+            worldListFailure = nil
+        } catch let error as WorldListFetchError {
+            worlds = []
+            switch error {
+            case .notFound:
+                worldListFailure = "The Tower answered that no world root is configured, so it has no saved worlds to list."
+            case .undecodable:
+                worldListFailure = "The Tower's world list could not be read as the contract this build implements."
+            case .transport(let detail):
+                worldListFailure = "The world list could not be fetched: \(detail)"
+            }
+            logGeometry("worlds FAILED — \(worldListFailure ?? "")")
+        } catch {
+            worlds = []
+            worldListFailure = "The world list could not be fetched: \(error.localizedDescription)"
+            logGeometry("worlds FAILED — \(error.localizedDescription)")
+        }
+    }
+
+    /// Open a stored world. The client re-subscribes with the pin, and the
+    /// pinned status payload then carries the geometry address exactly as the
+    /// live one does — so the fetch path below needs no change.
+    ///
+    /// The gallery is cleared **here**, not when the new manifest lands: until
+    /// it does, the fragments on screen would be the previous world's, under a
+    /// heading naming this one.
+    func open(worldID: String, sessionID: String?) {
+        client.inspect(worldID: worldID, sessionID: sessionID)
+        clearGeometry()
+    }
+
+    /// Back to the live world, by the same route.
+    func returnToLive() {
+        client.followLive()
+        clearGeometry()
+    }
+
+    /// Forget what is drawn and rearm the fetch. A fetch already in flight for
+    /// the previous world finds the marker moved and publishes nothing —
+    /// the same staleness guard `geometryDidChange` already relies on.
+    private func clearGeometry() {
+        lastGeometryRevision = nil
+        fragmentsModel = WorldFragmentsModel(segments: [])
+        geometryChunks = [:]
     }
 
     /// The geometry pull, in the console.

@@ -76,6 +76,30 @@ final class WorldGeometryDecoderTests: XCTestCase {
         XCTAssertEqual(manifest?.segments[0].pointCount, 2)
     }
 
+    /// `coverage` is additive (`WORLD-BUILDER-GEOMETRY.md` §8). Absent and
+    /// `null` both mean "nothing has judged this segment" and decode to `nil`
+    /// — never to `"unresolved"`, which is a judgment. A word the Tower sends
+    /// is carried verbatim, including one this build does not know.
+    func testCoverageIsNilWhenAbsentOrNullAndVerbatimWhenSent() throws {
+        XCTAssertNil(WorldGeometryDecoder.manifest(from: manifestJSON())?.segments[0].coverage)
+
+        var json = manifestJSON()
+        var segments = try XCTUnwrap(json["segments"] as? [[String: Any]])
+        segments[0]["coverage"] = NSNull()
+        segments[1]["coverage"] = "unresolved"
+        json["segments"] = segments
+        let decoded = try XCTUnwrap(WorldGeometryDecoder.manifest(from: json))
+        XCTAssertNil(decoded.segments[0].coverage)
+        XCTAssertEqual(decoded.segments[1].coverage, "unresolved")
+
+        segments[0]["coverage"] = "partial"
+        segments[1]["coverage"] = "a-word-this-build-does-not-know"
+        json["segments"] = segments
+        let verbatim = try XCTUnwrap(WorldGeometryDecoder.manifest(from: json))
+        XCTAssertEqual(verbatim.segments[0].coverage, "partial")
+        XCTAssertEqual(verbatim.segments[1].coverage, "a-word-this-build-does-not-know")
+    }
+
     func testAManifestThatIsBehindTheJournalDecodesAsNotCurrent() {
         // The Tower used to answer 404 for geometry that was real but behind,
         // which during a walk meant the whole capture. It now serves it with
@@ -702,7 +726,8 @@ final class WorldFragmentsModelTests: XCTestCase {
     private func summary(
         index: Int, points: Int, state: WorldSegmentResolution,
         bounds: WorldBounds? = nil,
-        placement: WorldPlacementFields = notRegistered()
+        placement: WorldPlacementFields = notRegistered(),
+        coverage: String? = nil
     ) -> WorldSegmentSummary {
         WorldSegmentSummary(
             segmentIndex: index, contentHash: "h\(index)",
@@ -710,7 +735,23 @@ final class WorldFragmentsModelTests: XCTestCase {
             placement: placement,
             resolutionState: state, dominantDegeneracy: "low_parallax",
             keyframeCount: 10, solvedCount: points > 0 ? 5 : 0,
-            pointCount: points, bounds: bounds
+            pointCount: points, bounds: bounds, coverage: coverage
+        )
+    }
+
+    /// A segment the Tower tried to place and could not, in its own words.
+    private func refused(reason: String?) -> WorldPlacementFields {
+        WorldPlacementFields(
+            registered: false, state: .refused, refusalReason: reason,
+            transform: nil, placementHash: nil
+        )
+    }
+
+    /// A segment nobody has looked at yet.
+    private func unplaced() -> WorldPlacementFields {
+        WorldPlacementFields(
+            registered: false, state: .unplaced, refusalReason: nil,
+            transform: nil, placementHash: nil
         )
     }
 
@@ -797,7 +838,11 @@ final class WorldFragmentsModelTests: XCTestCase {
                     placement: placed(into: 4)),
         ])
         XCTAssertTrue(model.hasSharedFrame)
-        XCTAssertEqual(model.headline, "1 world")
+        // One cluster holding every drawable segment, and the headline says
+        // how many it holds rather than only that there is one.
+        XCTAssertEqual(model.clusters.count, 1)
+        XCTAssertTrue(model.unclusteredFragments.isEmpty)
+        XCTAssertEqual(model.headline, "1 connected world of 2 segments")
     }
 
     /// **The refusal `registered` alone cannot express.**
@@ -980,6 +1025,591 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertEqual(one.fragments.map(\.segmentIndex), [7])
     }
 
+    // MARK: Connected worlds beside loose fragments
+
+    /// The headline names both halves and never adds them: two segments in
+    /// one frame are "1 connected world of 2 segments", and the third, which
+    /// shares a frame with nobody, is counted on its own.
+    func testAConnectedWorldAndLooseFragmentsAreCountedSeparately() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 2, points: 900, state: .resolved, bounds: box),
+        ])
+
+        XCTAssertEqual(model.clusters.count, 1)
+        XCTAssertEqual(model.clusters.first?.memberIndexes, [0, 1])
+        XCTAssertEqual(model.unclusteredFragments.map(\.segmentIndex), [2])
+        XCTAssertEqual(
+            model.headline,
+            "1 connected world of 2 segments, 1 fragment not yet connected"
+        )
+    }
+
+    /// Two references are two groups. They are counted together in the
+    /// headline and drawn on two canvases — never on one.
+    func testTwoConnectedGroupsAreNamedAsTwoAndNeverMerged() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 2, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 19)),
+            summary(index: 3, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 19)),
+        ])
+
+        XCTAssertEqual(model.clusters.count, 2)
+        XCTAssertTrue(model.unclusteredFragments.isEmpty)
+        XCTAssertEqual(model.headline, "2 connected groups of 4 segments")
+        for cluster in model.clusters {
+            XCTAssertEqual(cluster.members.count, 2)
+            XCTAssertTrue(
+                cluster.members.allSatisfy { $0.transformToWorld?.referenceSegment == cluster.referenceSegment },
+                "a cluster holds a segment from another reference frame"
+            )
+        }
+    }
+
+    /// A registered segment whose reference nobody else shares is a group of
+    /// one, which is not "connected" to anything: it keeps its tile.
+    func testALoneRegisteredSegmentStaysATileNotAWorld() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 50, state: .resolved, bounds: box),
+        ])
+        XCTAssertTrue(model.clusters.isEmpty)
+        XCTAssertEqual(model.unclusteredFragments.map(\.segmentIndex), [0, 1])
+        XCTAssertEqual(model.headline, "2 fragments, not yet connected")
+    }
+
+    // MARK: Coverage
+
+    /// `partial` is drawn muted and only `partial` is. `confident` is drawn as
+    /// it was, an unknown word is drawn as it was — muting it would be a
+    /// judgment the Tower did not make — and `nil` is nothing at all.
+    func testOnlyPartialCoverageIsMuted() {
+        XCTAssertTrue(WorldFragmentsModel.isMuted(
+            summary(index: 0, points: 10, state: .resolved, bounds: box, coverage: "partial")
+        ))
+        XCTAssertFalse(WorldFragmentsModel.isMuted(
+            summary(index: 0, points: 10, state: .resolved, bounds: box, coverage: "confident")
+        ))
+        XCTAssertFalse(WorldFragmentsModel.isMuted(
+            summary(index: 0, points: 10, state: .resolved, bounds: box, coverage: "speculative")
+        ))
+        XCTAssertFalse(WorldFragmentsModel.isMuted(
+            summary(index: 0, points: 10, state: .resolved, bounds: box, coverage: nil)
+        ))
+    }
+
+    /// A segment the solve called `unresolved` is counted with the other
+    /// unresolved ones and is never given a tile, whatever `resolution_state`
+    /// and `bounds` happen to say. Counted once, not twice, when both fields
+    /// agree.
+    func testUnresolvedCoverageIsCountedAndNeverPlaced() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box, coverage: "confident"),
+            summary(index: 1, points: 3, state: .resolved, bounds: box, coverage: "unresolved"),
+            summary(index: 2, points: 0, state: .unresolved, coverage: "unresolved"),
+            summary(index: 3, points: 0, state: .unresolved),
+        ])
+        XCTAssertEqual(model.fragments.map(\.segmentIndex), [0])
+        XCTAssertEqual(model.unresolvedCount, 3)
+    }
+
+    /// The tile caption is the Tower's registration word and, when it gave
+    /// one, its refusal reason verbatim. No state, no caption: a Tower that
+    /// predates `registration_state` has said nothing to repeat.
+    func testTilesCaptionTheTowersWordsVerbatim() {
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: refused(reason: "the wearer stood still")
+            )),
+            "refused — the wearer stood still"
+        )
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: refused(reason: nil)
+            )),
+            "refused"
+        )
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: placed(into: 4)
+            )),
+            "registered"
+        )
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: unplaced()
+            )),
+            "unplaced"
+        )
+        XCTAssertNil(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box
+            ))
+        )
+
+        XCTAssertEqual(
+            WorldFragmentsModel.coverageCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box, coverage: "partial"
+            )),
+            "coverage partial"
+        )
+        XCTAssertNil(
+            WorldFragmentsModel.coverageCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box
+            ))
+        )
+    }
+
+    /// Counted by the Tower's `registration_state`, never inferred from the
+    /// bool, and a row that carries no state is counted as unknown rather
+    /// than as unplaced.
+    func testPlacementCountsFollowTheTowersStateAndOmitZeroes() {
+        let model = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box,
+                    placement: placed(into: 4)),
+            summary(index: 1, points: 10, state: .resolved, bounds: box,
+                    placement: refused(reason: "the wearer stood still")),
+            summary(index: 2, points: 0, state: .unresolved,
+                    placement: refused(reason: "the wearer stood still")),
+            summary(index: 3, points: 10, state: .resolved, bounds: box,
+                    placement: unplaced()),
+            summary(index: 4, points: 10, state: .resolved, bounds: box),
+        ])
+        XCTAssertEqual(model.registeredCount, 1)
+        XCTAssertEqual(model.refusedCount, 2)
+        XCTAssertEqual(model.unplacedCount, 1)
+        XCTAssertEqual(model.placementUnknownCount, 1)
+        XCTAssertEqual(model.placementSummary, "1 registered, 2 refused, 1 unplaced")
+
+        let olderTower = WorldFragmentsModel(segments: [
+            summary(index: 0, points: 100, state: .resolved, bounds: box),
+        ])
+        XCTAssertEqual(olderTower.placementUnknownCount, 1)
+        XCTAssertNil(olderTower.placementSummary, "counts were invented for a Tower that sent none")
+    }
+
+}
+
+// MARK: - Clusters
+
+/// `WorldClusterBuilder` on its own: the grouping and the box around a group,
+/// with no view in the loop.
+final class WorldClusterBuilderTests: XCTestCase {
+
+    private let box = WorldBounds(json: ["min": [-1.0, 0.0, -1.0],
+                                         "max": [1.0, 2.0, 1.0]])!
+
+    private func summary(
+        index: Int, points: Int = 100, placement: WorldPlacementFields
+    ) -> WorldSegmentSummary {
+        WorldSegmentSummary(
+            segmentIndex: index, contentHash: "h\(index)",
+            frameID: "segment:\(index)", registered: placement.registered,
+            placement: placement, resolutionState: .resolved,
+            dominantDegeneracy: nil, keyframeCount: 4, solvedCount: 3,
+            pointCount: points, bounds: box, coverage: nil
+        )
+    }
+
+    /// A placement with a real Sim3, for the bounds tests. Identity rotation
+    /// so the arithmetic under test is the scale and translation.
+    private func placedWith(
+        translation: [Double], scale: Double, into reference: Int = 4, hash: String
+    ) -> WorldPlacementFields {
+        WorldPlacementFields(
+            registered: true, state: .registered, refusalReason: nil,
+            transform: WorldTransform(
+                rotationWXYZ: [1, 0, 0, 0], translation: translation, scale: scale,
+                referenceSegment: reference, frameRevision: 1
+            ),
+            placementHash: hash
+        )
+    }
+
+    private func chunk(
+        for summary: WorldSegmentSummary, points: [[Double]], poses: [WorldPose] = []
+    ) -> WorldSegmentChunk {
+        WorldSegmentChunk(
+            segmentIndex: summary.segmentIndex, contentHash: summary.contentHash,
+            registered: summary.registered, placement: summary.placement,
+            poses: poses, points: points,
+            pointsSent: points.count, pointsTotal: points.count, pointSampling: "none"
+        )
+    }
+
+    func testSegmentsSharingAReferenceFormOneCluster() {
+        let clusters = WorldClusterBuilder.clusters(from: [
+            summary(index: 0, placement: placed(into: 4)),
+            summary(index: 1, placement: placed(into: 4)),
+            summary(index: 2, placement: placed(into: 4)),
+        ])
+        XCTAssertEqual(clusters.count, 1)
+        XCTAssertEqual(clusters.first?.referenceSegment, 4)
+        XCTAssertEqual(clusters.first?.frameRevision, 1)
+        XCTAssertEqual(clusters.first?.memberIndexes, [0, 1, 2])
+    }
+
+    /// **Different references never cluster.** A Sim3 maps into its own
+    /// reference's frame and there is no global frame above that, so two
+    /// registered segments naming different references share no space.
+    func testDifferentReferencesNeverCluster() {
+        XCTAssertTrue(
+            WorldClusterBuilder.clusters(from: [
+                summary(index: 0, placement: placed(into: 4)),
+                summary(index: 1, placement: placed(into: 19)),
+            ]).isEmpty
+        )
+
+        let two = WorldClusterBuilder.clusters(from: [
+            summary(index: 0, placement: placed(into: 4)),
+            summary(index: 1, placement: placed(into: 19)),
+            summary(index: 2, placement: placed(into: 4)),
+            summary(index: 3, placement: placed(into: 19)),
+        ])
+        XCTAssertEqual(two.count, 2)
+        XCTAssertEqual(two.map(\.referenceSegment), [4, 19])
+        XCTAssertEqual(two[0].memberIndexes, [0, 2])
+        XCTAssertEqual(two[1].memberIndexes, [1, 3])
+    }
+
+    /// A coordinate stamped with one gauge may not be reinterpreted under
+    /// another.
+    func testDifferentFrameRevisionsNeverCluster() {
+        XCTAssertTrue(
+            WorldClusterBuilder.clusters(from: [
+                summary(index: 0, placement: placed(into: 4, frameRevision: 1)),
+                summary(index: 1, placement: placed(into: 4, frameRevision: 2)),
+            ]).isEmpty
+        )
+    }
+
+    /// `registered: false` forbids it outright, and an unregistered segment
+    /// beside two registered ones is left out rather than pulled in.
+    func testUnregisteredSegmentsNeverCluster() {
+        XCTAssertTrue(
+            WorldClusterBuilder.clusters(from: [
+                summary(index: 0, placement: notRegistered()),
+                summary(index: 1, placement: notRegistered()),
+            ]).isEmpty
+        )
+
+        let mixed = WorldClusterBuilder.clusters(from: [
+            summary(index: 0, placement: placed(into: 4)),
+            summary(index: 1, placement: notRegistered()),
+            summary(index: 2, placement: placed(into: 4)),
+        ])
+        XCTAssertEqual(mixed.count, 1)
+        XCTAssertEqual(mixed.first?.memberIndexes, [0, 2])
+    }
+
+    func testAGroupOfOneIsNotACluster() {
+        XCTAssertTrue(
+            WorldClusterBuilder.clusters(from: [
+                summary(index: 0, placement: placed(into: 4)),
+            ]).isEmpty
+        )
+    }
+
+    /// Members are in gallery order — most points first, index breaking ties
+    /// — so a cluster's caption reads the way the grid does.
+    func testAClusterOrdersItsMembersLikeTheGallery() {
+        let clusters = WorldClusterBuilder.clusters(from: [
+            summary(index: 0, points: 50, placement: placed(into: 4)),
+            summary(index: 1, points: 900, placement: placed(into: 4)),
+            summary(index: 2, points: 50, placement: placed(into: 4)),
+        ])
+        XCTAssertEqual(clusters.first?.members.map(\.segmentIndex), [1, 0, 2])
+        XCTAssertEqual(clusters.first?.pointCount, 1000)
+    }
+
+    /// A box over the members that happened to arrive would frame a partial
+    /// world as the whole one; until every chunk is in hand there is no box.
+    func testBoundsAreNilWhenAnyMemberChunkIsMissing() throws {
+        let a = summary(index: 0, placement: placedWith(translation: [0, 0, 0], scale: 1, hash: "pa"))
+        let b = summary(index: 1, placement: placedWith(translation: [0, 0, 0], scale: 1, hash: "pb"))
+        let cluster = try XCTUnwrap(WorldClusterBuilder.clusters(from: [a, b]).first)
+
+        let onlyA = [a.cacheKey: chunk(for: a, points: [[1, 1, 1]])]
+        XCTAssertNil(WorldClusterBuilder.referenceFrameBounds(of: cluster, chunks: onlyA))
+
+        let both = [
+            a.cacheKey: chunk(for: a, points: [[1, 1, 1]]),
+            b.cacheKey: chunk(for: b, points: [[2, 2, 2]]),
+        ]
+        XCTAssertNotNil(WorldClusterBuilder.referenceFrameBounds(of: cluster, chunks: both))
+    }
+
+    /// The box is over the **transformed** points, and the corner it reports
+    /// is exactly what `WorldTransform.apply` says that corner is. A box over
+    /// the local points would place every member at its own origin — the
+    /// identity-transform failure §6 names.
+    func testBoundsAreTheTransformAppliedToEachMembersPoints() throws {
+        let moved = summary(
+            index: 0, placement: placedWith(translation: [10, 0, -5], scale: 2, hash: "pm")
+        )
+        let still = summary(
+            index: 1, placement: placedWith(translation: [0, 0, 0], scale: 1, hash: "ps")
+        )
+        let cluster = try XCTUnwrap(WorldClusterBuilder.clusters(from: [moved, still]).first)
+        let chunks = [
+            moved.cacheKey: chunk(for: moved, points: [[1, 2, 3]]),
+            still.cacheKey: chunk(for: still, points: [[-1, -1, -1]]),
+        ]
+
+        let bounds = try XCTUnwrap(
+            WorldClusterBuilder.referenceFrameBounds(of: cluster, chunks: chunks)
+        )
+        // 2 · [1, 2, 3] + [10, 0, -5] = [12, 4, 1].
+        XCTAssertEqual(bounds.max, [12, 4, 1])
+        XCTAssertEqual(bounds.min, [-1, -1, -1])
+        let transform = try XCTUnwrap(moved.transformToWorld)
+        XCTAssertEqual(bounds.max, transform.apply(to: [1, 2, 3]))
+    }
+
+    /// The camera path is inside the box too, in the same frame, and a refused
+    /// pose contributes nothing rather than a point at the origin.
+    func testPoseTranslationsAreInsideTheBoundsAndRefusedPosesAreNot() throws {
+        let a = summary(index: 0, placement: placedWith(translation: [0, 0, 0], scale: 1, hash: "pa"))
+        let b = summary(index: 1, placement: placedWith(translation: [0, 0, 0], scale: 1, hash: "pb"))
+        let cluster = try XCTUnwrap(WorldClusterBuilder.clusters(from: [a, b]).first)
+        let chunks = [
+            a.cacheKey: chunk(
+                for: a, points: [[1, 1, 1]],
+                poses: [
+                    WorldPose(keyframeID: "k0", status: "solved", degeneracy: "",
+                              rotation: [1, 0, 0, 0], translation: [100, 1, 1]),
+                    WorldPose(keyframeID: "k1", status: "refused", degeneracy: "low_parallax",
+                              rotation: nil, translation: nil),
+                ]
+            ),
+            b.cacheKey: chunk(for: b, points: [[2, 2, 2]]),
+        ]
+
+        let bounds = try XCTUnwrap(
+            WorldClusterBuilder.referenceFrameBounds(of: cluster, chunks: chunks)
+        )
+        XCTAssertEqual(bounds.max[0], 100)
+        XCTAssertEqual(bounds.min, [1, 1, 1], "a refused pose was placed at the origin")
+    }
+}
+
+// MARK: - The viewport
+
+/// The pan/zoom/rotate arithmetic, with no gesture in the loop.
+final class WorldViewportStateTests: XCTestCase {
+
+    /// Centre `(100, 50)`.
+    private let size = CGSize(width: 200, height: 100)
+
+    private func assertEqual(
+        _ actual: CGPoint, _ expected: CGPoint,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.x, expected.x, accuracy: 1e-9, file: file, line: line)
+        XCTAssertEqual(actual.y, expected.y, accuracy: 1e-9, file: file, line: line)
+    }
+
+    func testTheIdentityStateMovesNothing() {
+        assertEqual(
+            WorldViewportState.identity.apply(CGPoint(x: 30, y: 70), in: size),
+            CGPoint(x: 30, y: 70)
+        )
+    }
+
+    /// A pinch zooms into the middle of the canvas, not into its top-left
+    /// corner: the centre stays put and everything else moves away from it.
+    func testScaleIsAboutTheCentre() {
+        var state = WorldViewportState.identity
+        state.scale = 2
+        assertEqual(state.apply(CGPoint(x: 100, y: 50), in: size), CGPoint(x: 100, y: 50))
+        assertEqual(state.apply(CGPoint(x: 110, y: 50), in: size), CGPoint(x: 120, y: 50))
+        assertEqual(state.apply(CGPoint(x: 100, y: 40), in: size), CGPoint(x: 100, y: 30))
+    }
+
+    /// The pan is applied last, in canvas points, so it is the same slide at
+    /// every zoom.
+    func testOffsetSlidesAfterScaling() {
+        var state = WorldViewportState.identity
+        state.scale = 2
+        state.offset = CGSize(width: 5, height: -5)
+        assertEqual(state.apply(CGPoint(x: 110, y: 50), in: size), CGPoint(x: 125, y: 45))
+    }
+
+    /// A quarter turn about the centre takes a point one unit to the right of
+    /// it to one unit below it, in CoreGraphics' own convention — which is the
+    /// convention `GraphicsContext` draws in, so nothing here flips a sign.
+    func testRotationIsAboutTheCentre() {
+        var state = WorldViewportState.identity
+        state.rotation = .pi / 2
+        assertEqual(state.apply(CGPoint(x: 100, y: 50), in: size), CGPoint(x: 100, y: 50))
+        assertEqual(state.apply(CGPoint(x: 101, y: 50), in: size), CGPoint(x: 100, y: 51))
+    }
+
+    func testScaleIsClampedToTheRange() {
+        XCTAssertEqual(WorldViewportState.clampedScale(0.01), 0.25)
+        XCTAssertEqual(WorldViewportState.clampedScale(100), 20)
+        XCTAssertEqual(WorldViewportState.clampedScale(3), 3)
+
+        var state = WorldViewportState.identity
+        state.scale = 1000
+        XCTAssertEqual(state.clamped().scale, 20)
+        XCTAssertEqual(state.scale, 1000, "`clamped()` mutated its receiver")
+    }
+}
+
+// MARK: - The saved-worlds listing
+
+/// `GET /worlds`, decoded. Refusals are the point: a wrong contract or a row
+/// that will not decode drops the whole listing rather than offering a world
+/// that was half-read.
+final class WorldListingDecoderTests: XCTestCase {
+
+    /// Two worlds, newest first as the Tower orders them; the second has no
+    /// display name and no sessions. Timestamps are written as `Double`
+    /// literals because a Swift `Int` boxed in `Any` does not cast to
+    /// `Double` — on the wire every number is an `NSNumber`, and the JSON-text
+    /// test below covers that path.
+    private func listingJSON() -> [String: Any] {
+        [
+            "contract": "world_builder.worlds/2026-09-06",
+            "worlds": [
+                [
+                    "world_id": "w-new", "display_name": "Kitchen walk",
+                    "created_at": 1787463000.0, "updated_at": 1787463900.5,
+                    "live": true,
+                    "sessions": [
+                        [
+                            "session_id": "s-open", "started_at": 1787463001.0,
+                            "ended_at": NSNull(), "end_reason": NSNull(),
+                            "frame_source": "live-capture", "capture_id": "c1",
+                            "has_geometry": true,
+                        ],
+                        [
+                            "session_id": "s-done", "started_at": 1787462000.0,
+                            "ended_at": 1787462500.0, "end_reason": "stop",
+                            "frame_source": "recorded-capture", "capture_id": NSNull(),
+                            "has_geometry": false,
+                        ],
+                    ],
+                ],
+                [
+                    "world_id": "w-old", "display_name": NSNull(),
+                    "created_at": 1787400000.0, "updated_at": 1787400000.0,
+                    "live": false, "sessions": [[String: Any]](),
+                ],
+            ],
+        ]
+    }
+
+    func testAListingDecodesFieldForFieldInTheTowersOrder() throws {
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: listingJSON()))
+        XCTAssertEqual(listing.worlds.map(\.worldID), ["w-new", "w-old"])
+
+        let newest = listing.worlds[0]
+        XCTAssertEqual(newest.displayName, "Kitchen walk")
+        XCTAssertEqual(newest.title, "Kitchen walk")
+        XCTAssertTrue(newest.live)
+        XCTAssertEqual(newest.createdAt, 1787463000.0)
+        XCTAssertEqual(newest.sessions.count, 2)
+
+        let open = newest.sessions[0]
+        XCTAssertEqual(open.sessionID, "s-open")
+        XCTAssertNil(open.endedAt)
+        XCTAssertTrue(open.isStillOpen)
+        XCTAssertEqual(open.frameSource, "live-capture")
+        XCTAssertEqual(open.captureID, "c1")
+        XCTAssertTrue(open.hasGeometry)
+
+        let done = newest.sessions[1]
+        XCTAssertEqual(done.endedAt, 1787462500.0)
+        XCTAssertFalse(done.isStillOpen)
+        XCTAssertEqual(done.endReason, "stop")
+        XCTAssertNil(done.captureID)
+        XCTAssertFalse(done.hasGeometry)
+    }
+
+    /// `display_name: null` is `nil`, and the picker falls back to the id
+    /// itself — visibly, never to an empty row.
+    func testANullDisplayNameFallsBackToTheWorldID() throws {
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: listingJSON()))
+        let unnamed = listing.worlds[1]
+        XCTAssertNil(unnamed.displayName)
+        XCTAssertEqual(unnamed.title, "w-old")
+        XCTAssertFalse(unnamed.live)
+        XCTAssertTrue(unnamed.sessions.isEmpty)
+    }
+
+    func testAnotherContractIsRefusedWhole() {
+        var json = listingJSON()
+        json["contract"] = "world_builder.worlds/2027-01-01"
+        XCTAssertNil(WorldListingDecoder.listing(from: json))
+        json["contract"] = nil
+        XCTAssertNil(WorldListingDecoder.listing(from: json))
+    }
+
+    /// One session missing a required field drops the listing, not the
+    /// session: a world offered with the sessions this build could read would
+    /// be a world it half-read.
+    func testAMalformedSessionRowDropsTheWholeListing() throws {
+        var json = listingJSON()
+        var worlds = try XCTUnwrap(json["worlds"] as? [[String: Any]])
+        var sessions = try XCTUnwrap(worlds[0]["sessions"] as? [[String: Any]])
+        sessions[1]["frame_source"] = nil
+        worlds[0]["sessions"] = sessions
+        json["worlds"] = worlds
+        XCTAssertNil(WorldListingDecoder.listing(from: json))
+    }
+
+    /// `has_geometry` and `live` are required and absent is not `false`.
+    func testAMissingBoolIsARefusalNotFalse() throws {
+        var json = listingJSON()
+        var worlds = try XCTUnwrap(json["worlds"] as? [[String: Any]])
+        worlds[1]["live"] = nil
+        json["worlds"] = worlds
+        XCTAssertNil(WorldListingDecoder.listing(from: json))
+    }
+
+    /// The bytes as the Tower would send them, through `JSONSerialization`,
+    /// with an integer timestamp — which arrives as an `NSNumber` and must
+    /// still read as a `Double`.
+    func testAListingDecodesFromJSONTextWithIntegerTimestamps() throws {
+        let text = """
+            {"contract":"world_builder.worlds/2026-09-06",
+             "worlds":[{"world_id":"w1","display_name":null,
+                        "created_at":1787463000,"updated_at":1787463900,
+                        "live":false,
+                        "sessions":[{"session_id":"s1","started_at":1787463001,
+                                     "ended_at":null,"end_reason":null,
+                                     "frame_source":"live-capture","capture_id":null,
+                                     "has_geometry":true}]}]}
+            """
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        )
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: json))
+        XCTAssertEqual(listing.worlds.first?.createdAt, 1787463000)
+        XCTAssertEqual(listing.worlds.first?.sessions.first?.startedAt, 1787463001)
+        XCTAssertNil(listing.worlds.first?.sessions.first?.endedAt)
+    }
+
+    func testTheListingContractIsItsOwn() {
+        XCTAssertEqual(WorldListingContract.identifier, "world_builder.worlds/2026-09-06")
+        XCTAssertNotEqual(WorldListingContract.identifier, WorldGeometryContract.identifier)
+        XCTAssertNotEqual(WorldListingContract.identifier, WorldBuilderResultContract.identifier)
+    }
 }
 
 // MARK: - The contract this build adopted

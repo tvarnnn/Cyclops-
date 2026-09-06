@@ -74,6 +74,9 @@ struct WorldBuilderWorkspaceView: View {
     /// belongs on `ProjectManager`, not here.
     @StateObject private var world: WorldBuilderViewModel
 
+    /// Whether the saved-worlds sheet is up. View state, so it lives here.
+    @State private var isShowingWorlds = false
+
     /// The client is injected rather than constructed here, and owned by
     /// `ProjectManager`. See `CartridgeClients` for why: this `@StateObject` is
     /// destroyed on every cartridge switch, and a Tower-backed client holding a
@@ -122,21 +125,51 @@ struct WorldBuilderWorkspaceView: View {
             HelperText("Capture is not available in this build.")
             #endif
         }
+        .sheet(isPresented: $isShowingWorlds) {
+            WorldPickerView(world: world)
+        }
     }
 
     // MARK: Header
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("World Builder")
-                .font(.title2.weight(.semibold))
+            HStack(alignment: .firstTextBaseline) {
+                Text("World Builder")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                // Reads only, so it is not `#if DEBUG`: a Release build with
+                // no camera can still look at what the Tower has stored.
+                Button {
+                    isShowingWorlds = true
+                } label: {
+                    Label("Saved worlds", systemImage: "archivebox")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+            }
             Text("What the glasses see, and what the Tower reports it has built from that. Figures come from the Tower; absent ones are not drawn.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if case .inspecting(let worldID) = world.inspection {
+                HStack(spacing: 8) {
+                    Text("Looking at saved world \(worldID ?? "(unnamed)").")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Back to live") {
+                        world.returnToLive()
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
     }
 }
 

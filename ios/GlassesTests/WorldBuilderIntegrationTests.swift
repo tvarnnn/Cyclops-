@@ -1201,6 +1201,181 @@ final class TowerWorldBuilderClientTests: XCTestCase {
             "the client answered from something other than the graph's connection"
         )
     }
+
+    // MARK: Stored worlds
+
+    private func subscribes(_ recorder: MessageRecorder) -> [[String: Any]] {
+        recorder.all.compactMap(decode).filter { $0["type"] as? String == "result_subscribe" }
+    }
+
+    /// Following the live world sends **no** pin. The keys are absent, not
+    /// `null`: a `"world_id": null` would be a claim about a world rather than
+    /// the absence of one, and the Tower's own default is what resolves the
+    /// live world.
+    func testFollowingTheLiveWorldSendsNeitherWorldNorSessionID() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder: recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        let sent = subscribes(recorder)
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertFalse(sent[0].keys.contains("world_id"), "an unpinned subscribe named a world")
+        XCTAssertFalse(sent[0].keys.contains("session_id"), "an unpinned subscribe named a session")
+        XCTAssertEqual(client.inspection, .live)
+
+        tower.disconnect()
+    }
+
+    /// Opening a stored world closes the live subscription and opens a new one
+    /// carrying `world_id` and `session_id`; returning to live opens a third
+    /// with neither. The live world's snapshot does not survive the switch —
+    /// the pinned subscribe is answered with a complete snapshot of the other
+    /// world, and until it lands the honest state is "waiting".
+    func testInspectingAStoredWorldResubscribesWithThePinAndBackWithout() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder: recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        var modes: [WorldInspectionMode] = []
+        let cancellable = client.inspectionUpdates.sink { modes.append($0) }
+        defer { cancellable.cancel() }
+
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+        server.send(text: snapshotMessage(seq: 1, modelState: "receiving", keyframes: 30, revision: "r1"))
+        await expect { client.state.snapshot?.keyframeCount == 30 }
+
+        client.inspect(worldID: "w-stored", sessionID: "s-stored")
+        XCTAssertEqual(client.inspection, .inspecting(worldID: "w-stored"))
+        XCTAssertEqual(client.state, .awaitingFirstUpdate, "the live world's snapshot survived the switch")
+
+        await expect { self.subscribes(recorder).count == 2 }
+        let pinned = subscribes(recorder)[1]
+        XCTAssertEqual(pinned["world_id"] as? String, "w-stored")
+        XCTAssertEqual(pinned["session_id"] as? String, "s-stored")
+        XCTAssertEqual(pinned["cartridge"] as? String, "world_builder")
+        XCTAssertEqual(pinned["contract"] as? String, Self.contract)
+        XCTAssertTrue(
+            recorder.all.compactMap(decode).contains {
+                $0["type"] as? String == "result_unsubscribe"
+                    && $0["subscription_id"] as? String == "sub-1"
+            },
+            "the live subscription was left open under the pinned one"
+        )
+
+        // The pinned world's snapshot lands like any other.
+        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored"))
+        await expect { client.state.snapshot?.keyframeCount == 143 }
+
+        client.followLive()
+        XCTAssertEqual(client.inspection, .live)
+        await expect { self.subscribes(recorder).count == 3 }
+        let live = subscribes(recorder)[2]
+        XCTAssertFalse(live.keys.contains("world_id"))
+        XCTAssertFalse(live.keys.contains("session_id"))
+
+        XCTAssertEqual(modes, [.inspecting(worldID: "w-stored"), .live])
+
+        tower.disconnect()
+    }
+
+    /// A pin with no session lets the Tower choose the session, and sends
+    /// only the world.
+    func testInspectingAWorldWithoutASessionSendsOnlyTheWorldID() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder: recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        client.inspect(worldID: "w-stored", sessionID: nil)
+        await expect { self.subscribes(recorder).count == 2 }
+        let pinned = subscribes(recorder)[1]
+        XCTAssertEqual(pinned["world_id"] as? String, "w-stored")
+        XCTAssertFalse(pinned.keys.contains("session_id"), "a nil session was sent as a key")
+
+        tower.disconnect()
+    }
+
+    /// While pinned, the capture bracket is not consulted: the reader asked
+    /// for that world by name, so the gate's answer is `.none` and the stored
+    /// world is drawn even though this phone has a capture open. Without the
+    /// pin the same message — no `session` block — would present as waiting.
+    func testAPinnedWorldIsDrawnEvenWhileThisPhoneHasACaptureOpen() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        tower.sendStreamStart()
+        await expect { tower.isStreamingToTower }
+
+        // Unpinned, a snapshot with no session block is `.awaiting` and is
+        // presented as waiting — the existing gate.
+        server.send(text: snapshotMessage(seq: 1, modelState: "receiving", keyframes: 30, revision: "r1"))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(client.state, .awaitingFirstUpdate)
+        XCTAssertEqual(client.sessionBinding, .awaiting(captureID: nil))
+
+        client.inspect(worldID: "w-stored", sessionID: "s-stored")
+        server.send(text: snapshotMessage(seq: 1, modelState: "finalized", keyframes: 143, revision: "r-stored"))
+        await expect { client.state.snapshot?.keyframeCount == 143 }
+        XCTAssertEqual(client.sessionBinding, WorldSessionBinding.none)
+
+        tower.sendStreamStop()
+        tower.disconnect()
+    }
+
+    /// The pin is kept across a reconnect: a reader looking at a stored world
+    /// who loses WiFi is still looking at that world when it comes back.
+    func testThePinSurvivesAReconnect() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder: recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics(), autoReconnect: true)
+        let client = TowerWorldBuilderClient(tower: tower)
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        client.inspect(worldID: "w-stored", sessionID: "s-stored")
+        await expect { self.subscribes(recorder).count == 2 }
+
+        server.dropConnection()
+        await expect { tower.status != .online }
+        await expect(timeout: 8) { tower.status == .online }
+        await expect(timeout: 5) { self.subscribes(recorder).count == 3 }
+
+        let resubscribed = subscribes(recorder)[2]
+        XCTAssertEqual(resubscribed["world_id"] as? String, "w-stored")
+        XCTAssertEqual(resubscribed["session_id"] as? String, "s-stored")
+        XCTAssertEqual(client.inspection, .inspecting(worldID: "w-stored"))
+
+        tower.disconnect()
+    }
 }
 
 // MARK: - The 2026-08-25 contract: anchors, segments, and whose world this is
