@@ -417,6 +417,25 @@ def _placement_fields(placement) -> dict:
     }
 
 
+def manifest_for(store, world_id: str) -> dict | None:
+    try:
+        return store.read_derived_manifest(world_id)
+    except Exception:  # noqa: BLE001 -- an unreadable manifest is "no judgement"
+        return None
+
+
+def coverage_for_segment(index: int, poses: list, points: list, solve_segments: dict) -> str | None:
+    """The global solve's coverage class for a segment, or a truthful
+    fallback: `unresolved` for a segment with keyframes and no points, and
+    null when nothing has judged a segment that does have points."""
+    judged = solve_segments.get(str(index)) or solve_segments.get(index)
+    if judged and judged.get("coverage") in ("confident", "partial", "unresolved"):
+        return judged["coverage"]
+    if poses and not points:
+        return "unresolved"
+    return None
+
+
 def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     # Rebound BEFORE anything reads it, because this function builds the
     # payload from its own copy: canonicalising inside `_read` changed a
@@ -432,6 +451,7 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     placements = usable_placements(store, world_id, session_id)
 
     segments = []
+    solve_segments = ((manifest_for(store, world_id) or {}).get("global_solve") or {}).get("segments") or {}
     for index in sorted(grouped):
         poses = grouped[index]["poses"]
         points = grouped[index]["points"]
@@ -451,6 +471,12 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
             "solved_count": sum(1 for p in poses if p.get("status") == "solved"),
             "point_count": len(points),
             "bounds": _bounds(points),
+            # Additive (2026-09-06). How much to trust this segment's
+            # geometry, from the global solve when it ran:
+            # confident | partial | unresolved, or null when no solve has
+            # judged it. Unresolved is "keyframes exist, no geometry";
+            # unseen space has no segment at all and is never drawn.
+            "coverage": coverage_for_segment(index, poses, points, solve_segments),
         })
 
     return {

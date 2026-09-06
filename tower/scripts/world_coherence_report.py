@@ -174,8 +174,15 @@ def coherence(
     # `admitted_pairs_source` says which reading produced the numbers so
     # that two runs are never silently compared across the two.
     if admitted is None:
-        registered_component = [sorted(registered)] if len(registered) > 1 else []
-        components = registered_component
+        # Since the global solve (2026-09-06) a session can carry MORE than
+        # one registered cluster, each under its own reference segment,
+        # and they are different frames. Group by reference rather than
+        # treating every registered segment as one component.
+        by_reference: dict = {}
+        for placement in placements:
+            if placement.state == "registered":
+                by_reference.setdefault(placement.reference_segment, []).append(placement.segment_index)
+        components = [sorted(members) for members in by_reference.values() if len(members) > 1]
         pairs_source = "placement-state"
     else:
         pairs = [tuple(sorted((int(a), int(b)))) for a, b in admitted]
@@ -232,6 +239,20 @@ def coherence(
             store, world_id, session_id
         )
         report["reprojection_gate_px"] = PNP_REPROJECTION_ERROR_PX
+    # A globally solved session has no support rows for its solved segments
+    # (they would index the wrong keypoints -- see global_solve.merge), so
+    # the ORB reprojection above covers only chain-built segments. The
+    # solver's own observations are reprojected here instead, and the
+    # report says which segments each number speaks for.
+    from tower.world_builder import global_solve  # noqa: PLC0415
+
+    solution = global_solve.load_solution(store, world_id, session_id)
+    if solution is not None:
+        manifest = store.read_derived_manifest(world_id) or {}
+        block = dict((manifest.get("global_solve") or {}))
+        block.pop("segments", None)
+        block["reprojection_px"] = global_solve.reprojection_summary(solution)
+        report["global_solve"] = block
     return report
 
 

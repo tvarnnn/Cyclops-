@@ -19,6 +19,7 @@ from tower.results.world_builder_geometry import (
     build_segment,
     store_from_root,
 )
+from tower.results.world_builder_library import build_world_listing
 
 router = APIRouter()
 
@@ -28,6 +29,17 @@ def _store(request: Request):
     if root is None:
         raise HTTPException(status_code=404, detail="no world root is configured")
     return store_from_root(root)
+
+
+@router.get("/worlds")
+def world_listing(request: Request) -> dict:
+    """Every saved world and its sessions, so a viewer can open an old one.
+
+    Contract `world_builder.worlds/2026-09-06`. Read-only; a directory
+    walk over `world.json` / `session.json`, no geometry. Sync `def` like
+    the geometry handlers, and for the same reason.
+    """
+    return build_world_listing(_store(request))
 
 
 @router.get("/worlds/{world_id}/geometry/manifest")

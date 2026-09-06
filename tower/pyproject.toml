@@ -13,6 +13,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The World Builder's global solver (tower/world_builder/global_solve.py).
+# BSD-3, Windows cp312 wheel, depends on numpy only; CPU-only on Windows,
+# which is fine at 360x640 (a 438-keyframe walk solves in ~90 s). Optional:
+# without it the World Builder behaves exactly as before and says so.
+# NOTE for product licensing review: the wheel bundles Ceres with
+# SuiteSparse (CHOLMOD has GPL modules).
+sfm = [
+    "pycolmap==4.2.0",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a

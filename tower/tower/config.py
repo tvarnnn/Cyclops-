@@ -431,6 +431,16 @@ class Settings:
     # finalised the instant it stops can turn it off without losing the
     # reconstruction.
     world_register: bool = True
+    # The global solver (tower/world_builder/global_solve.py): a
+    # structure-from-motion solve over EVERY keyframe of the session, run
+    # as a child of the builder every few dozen keyframes and once more
+    # after Stop. It is what turns a walk into one room rather than a bag
+    # of fragments (docs/world-builder-reconstruction-experiments.md, E8:
+    # 58 -> 428 of 438 keyframes in one frame on the 2026-09-06 walk).
+    # Requires pycolmap; without it the builder says so and behaves as
+    # before. The Sim3 registrar (world_register) is skipped whenever the
+    # solver produced a solution.
+    world_solve: bool = True
 
 
 def get_settings() -> Settings:
@@ -474,6 +484,7 @@ def get_settings() -> Settings:
             os.environ.get("TOWER_WORLD_REBUILD_EVERY"), default=4
         ),
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
+        world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
         scene_understanding=_flag("TOWER_SCENE_UNDERSTANDING", default=False),
         scene_device=os.environ.get("TOWER_SCENE_DEVICE", "cpu"),
         scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=False),

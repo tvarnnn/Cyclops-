@@ -1623,16 +1623,25 @@ final class TowerClient: NSObject, ObservableObject {
     /// serving a payload this build was not written against — a
     /// `contract_mismatch` error is a better outcome than a silent
     /// misinterpretation.
-    func subscribeToResults(cartridge: String, resultType: String, contract: String) {
-        sendResultMessage(
-            [
-                "type": "result_subscribe",
-                "cartridge": cartridge,
-                "result_type": resultType,
-                "contract": contract,
-            ],
-            label: "result_subscribe(\(cartridge))"
-        )
+    ///
+    /// `worldID` and `sessionID` pin the subscription to a stored world; the
+    /// Tower resolves the newest live world when neither is sent. The keys are
+    /// inserted only when non-nil, so an unpinned subscribe is byte-for-byte
+    /// the message it always was — a `"world_id": null` would be a claim about
+    /// a world rather than the absence of one.
+    func subscribeToResults(
+        cartridge: String, resultType: String, contract: String,
+        worldID: String? = nil, sessionID: String? = nil
+    ) {
+        var message: [String: Any] = [
+            "type": "result_subscribe",
+            "cartridge": cartridge,
+            "result_type": resultType,
+            "contract": contract,
+        ]
+        if let worldID { message["world_id"] = worldID }
+        if let sessionID { message["session_id"] = sessionID }
+        sendResultMessage(message, label: "result_subscribe(\(cartridge))")
     }
 
     /// Closes a subscription. Not required before disconnecting — the Tower

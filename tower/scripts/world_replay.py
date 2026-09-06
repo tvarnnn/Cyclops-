@@ -175,6 +175,12 @@ def main(argv=None) -> int:
         action="store_true",
         help="Run cross-segment registration after the final build.",
     )
+    parser.add_argument(
+        "--solve",
+        action="store_true",
+        help="run the global solver during and after the replay (see world_build_session.py --solve)",
+    )
+    parser.add_argument("--solve-every", type=int, default=None)
     parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args(argv)
 
@@ -209,6 +215,10 @@ def main(argv=None) -> int:
     ]
     if args.register:
         argv_build.append("--register")
+    if args.solve:
+        argv_build.append("--solve")
+        if args.solve_every is not None:
+            argv_build += ["--solve-every", str(args.solve_every)]
 
     started = time.perf_counter()
     completed = subprocess.run(

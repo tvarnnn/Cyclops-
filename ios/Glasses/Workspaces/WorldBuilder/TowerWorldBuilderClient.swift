@@ -427,8 +427,28 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         bindingSubject.eraseToAnyPublisher()
     }
 
+    /// Live, or pinned to a stored world. Changes only through `inspect` and
+    /// `followLive`, and is published on a real change like the two above.
+    private(set) var inspection: WorldInspectionMode = .live {
+        didSet {
+            guard inspection != oldValue else { return }
+            inspectionSubject.send(inspection)
+        }
+    }
+
+    var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> {
+        inspectionSubject.eraseToAnyPublisher()
+    }
+
+    /// The pin the next `result_subscribe` carries, or `nil` to follow the
+    /// live world. Kept across reconnects on purpose: a reader looking at a
+    /// stored world who loses WiFi is still looking at that world when it
+    /// comes back.
+    private var pinned: (worldID: String, sessionID: String?)?
+
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
+    private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -613,9 +633,52 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         tower.subscribeToResults(
             cartridge: offer.cartridge,
             resultType: offer.resultType,
-            contract: offer.contract
+            contract: offer.contract,
+            worldID: pinned?.worldID,
+            sessionID: pinned?.sessionID
         )
         armSubscribeTimeout()
+    }
+
+    // MARK: Stored worlds
+
+    /// Pin the subscription to a stored world.
+    ///
+    /// Closes the open subscription, forgets the report it produced, and opens
+    /// a new one carrying the pin. The Tower answers a pinned subscribe with a
+    /// complete snapshot of that world, so nothing is merged and nothing from
+    /// the live world survives the switch. An id the Tower does not know comes
+    /// back as its own `unsupported`/error wording, which the existing paths
+    /// already render verbatim.
+    func inspect(worldID: String, sessionID: String?) {
+        pinned = (worldID, sessionID)
+        inspection = .inspecting(worldID: worldID)
+        restartSubscription()
+    }
+
+    /// Back to the live world, by the same route.
+    func followLive() {
+        pinned = nil
+        inspection = .live
+        restartSubscription()
+    }
+
+    /// Tear down the current subscription and open one under the current pin.
+    ///
+    /// The unsubscribe is best-effort and its `result_unsubscribed` is ignored
+    /// by construction: `subscriptionID` is cleared here, so the ack for the
+    /// old id no longer matches anything, and the new subscribe's own ack is
+    /// what sets it again. The Tower treats a closed socket as sufficient
+    /// cleanup anyway; this just spares it a subscription nobody is reading.
+    private func restartSubscription() {
+        if let id = subscriptionID {
+            tower.unsubscribeFromResults(subscriptionID: id)
+            subscriptionID = nil
+        }
+        isSubscribing = false
+        disarmSubscribeTimeout()
+        lastReport = nil
+        subscribeIfPossible()
     }
 
     /// Bound the wait for the Tower's `result_subscribed`.
@@ -810,6 +873,18 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         publishLastReport()
     }
 
+    /// The phone's half of the binding, as the gate should see it.
+    ///
+    /// While pinned to a stored world the bracket is **not** consulted: the
+    /// reader asked for that world by name, so the question "is this the
+    /// capture I have open?" has no bearing on whether to draw it, and the
+    /// gate's answer is `.none` — the state passes through and the label says
+    /// "Saved world". Following the live world, this is the capture bracket
+    /// exactly as before.
+    private var isCaptureBracketOpen: Bool {
+        pinned == nil && tower.isStreamingToTower
+    }
+
     /// The binding when there is nothing to judge yet.
     ///
     /// Not a hardcoded `.none`: a bracket can be open with no snapshot behind
@@ -818,7 +893,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// there is still exactly one place that decides.
     private var bindingWithNoReport: WorldSessionBinding {
         WorldSessionGate.binding(
-            isCaptureBracketOpen: tower.isStreamingToTower,
+            isCaptureBracketOpen: isCaptureBracketOpen,
             session: nil,
             modelState: .awaitingFirstUpdate
         )
@@ -827,7 +902,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private func publishLastReport() {
         guard let report = lastReport else { return }
         let binding = WorldSessionGate.binding(
-            isCaptureBracketOpen: tower.isStreamingToTower,
+            isCaptureBracketOpen: isCaptureBracketOpen,
             session: report.session,
             modelState: report.state
         )

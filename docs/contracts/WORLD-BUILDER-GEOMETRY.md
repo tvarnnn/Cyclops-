@@ -273,3 +273,45 @@ segments are not, and must not be composited. `frame_revision` stamps the gauge
 the Sim3 is expressed in; a coordinate stamped with one revision may not be
 reinterpreted under another, and a mismatch is a refuse-to-draw condition rather
 than something to guess past.
+
+---
+
+## 8. Addendum 2026-09-06 — the global solve (additive, no identifier bump)
+
+The Tower now runs a global structure-from-motion solve over EVERY keyframe of
+a session (`tower/tower/world_builder/global_solve.py`; design record
+`tower/docs/superpowers/specs/2026-09-06-world-builder-global-solver-design.md`).
+It reaches the wire **through the layers this contract already has** — per-
+segment geometry plus placements — so the identifier is unchanged and an
+older decoder reads exactly what it read before. What an older decoder sees
+differently is only *how many* segments are `registered` and that they share
+one `reference_segment`: on the 2026-09-06 walk, 29 of 34 instead of 2 of 17.
+
+What the solve guarantees about rows it wrote:
+
+- A `registered` segment's `transform_to_world` is exact, not fitted: every
+  segment of one solve component is one reconstruction, `scale` is exactly
+  `1.0`, and the transform is the segment's anchor pose in the component's
+  frame relative to the reference segment's anchor. Segments in different
+  components carry different `reference_segment`s and MUST NOT be composited
+  (§7's rule, unchanged).
+- A segment the solve could not place keeps whatever the local chain built
+  and a `refused` placement whose `registration_refusal_reason` says so; a
+  segment newer than the last solve is `unplaced` (the live "still building"
+  case in §4).
+- A pose row the solve did not support has `status: "unavailable"` and
+  degeneracy `"unregistered"`, with `translation: null` (§6, unchanged).
+
+Additive fields (an older decoder ignores them; per `CARTRIDGE-RESULTS.md`
+§12 not grounds for a bump):
+
+| Where | Field | Type | Meaning |
+|---|---|---|---|
+| manifest, per segment | `coverage` | `confident` \| `partial` \| `unresolved` \| null | How much to trust the segment's geometry. `unresolved` = keyframes exist, no geometry (the "observed but unresolved" state); `partial` = placed with thin support or few points; `confident` = placed, ≥ 60 3-D observations per keyframe (median), ≥ 50 points, at least half its keyframes posed. `null` = nothing has judged it (no solve ran). **Unseen space has no segment and is never represented.** |
+| derived `poses.json` row | `observations` | int, optional | 3-D points this keyframe observes in the solve. Written only by the solve. Not yet carried on the chunk. |
+| derived `points.json` row | `rgb` | `[r,g,b]`, optional | Colour sampled from the frame that first observed the point. Written only by the solve. Not yet carried on the chunk. |
+| derived `manifest.json` | `global_solve` | object \| null | The solve's summary: `solver` (`glomap` \| `incremental`), `solved_at`, `horizon_keyframes`, `components[]` (`reference_segment`, `segments`, `keyframes`, `points`), counts, and `segments{index → {state, coverage, keyframes_posed, …}}`. Tower-side; not on the wire. |
+
+A renderer that wants the progressive-coverage model draws `confident`
+segments normally, `partial` muted, and `unresolved` as a count or a marker
+without a position (they have no `bounds`). Nothing is invented for gaps.
