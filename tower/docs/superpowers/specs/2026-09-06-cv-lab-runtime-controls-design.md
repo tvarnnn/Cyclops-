@@ -146,9 +146,13 @@ load wins -- also stated. Defaults come from the table above.
 - `run.arm_ms`: milliseconds from `start` accepted to `running`, `null`
   until then. It is the number tomorrow's checklist asks for.
 - `run.runtime.torch_threads`: from `describe()`.
-- `process`: `{pid, threads, rss_mb}` from psutil, built inside
-  `status()`. It is what lets the live soak and a phone read the Tower's
-  own resource state without a shell on the Windows box.
+- `process`: `{pid, threads, rss_mb}` from psutil, served **beside**
+  `status` on `GET /cv-lab` only. *Amended during implementation:* the
+  first cut put it inside the document, and two existing tests were
+  right to fail -- the document is held byte-equal across its three
+  surfaces, and a live RSS figure is not, and the result channel would
+  have republished the document on every poll. The HTTP reply is the
+  operator's surface anyway; it is what the live soak reads.
 All three are additive; no contract identifier changes. The contract
 document gains the fields and a changelog entry; the protocol test that
 reads the document keeps passing because no new message type, state or
