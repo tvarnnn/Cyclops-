@@ -181,11 +181,18 @@ def require_ocr_extra() -> None:
     """
     import importlib.util
 
-    if importlib.util.find_spec("easyocr") is None:
-        raise OcrExtraMissing(
-            "the OCR extra is not installed; install it with "
-            "`pip install -e .[ocr]` after the `[ml]` torch wheels"
-        )
+    for name in ("torch", "easyocr"):
+        try:
+            present = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            # A finder that refuses the name -- the torchless-host tests
+            # install one -- is a host without it.
+            present = False
+        if not present:
+            raise OcrExtraMissing(
+                f"{name} is not installed; the OCR extra needs the `[ml]` "
+                "torch wheels first, then `pip install -e .[ocr]`"
+            )
 
 
 def resolve_ocr_device(requested: str) -> bool:
