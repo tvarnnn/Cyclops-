@@ -40,6 +40,9 @@ from tower.world_builder.keyframes import (
 )
 from tower.world_builder.redaction import FaceRedactor
 from tower.world_builder.records import (
+    FINAL_SOLVE_PENDING,
+    FINALIZATION_PENDING,
+    FINALIZATION_STATES,
     CameraIntrinsics,
     Keyframe,
     KeyframeEdge,
@@ -429,19 +432,49 @@ class WorldBuilderEngine:
             decision.outcome, decision.reason, keyframe_id=keyframe.keyframe_id
         )
 
-    def stop_session(self, reason: str = END_REASON_STOP) -> SessionSummary:
+    def stop_session(
+        self, reason: str = END_REASON_STOP, *, hold_lock: bool = False
+    ) -> SessionSummary:
+        """Close the session record. Optionally keep the writer lock.
+
+        `hold_lock=True` is the live builder's path. The final solve and
+        the final build run AFTER this call and take up to a couple of
+        minutes; while they run, the lock -- held by a process the Tower
+        can see is alive -- is the only fact on disk that says "somebody
+        is still finishing this world" rather than "this world was left
+        half-built". The record is also given a `finalization` block in
+        state `pending`, so a builder that dies inside that window leaves
+        a lock naming a dead pid AND a pending finalization, which is a
+        different, truthful story from a builder that was never asked to
+        finalize. `release_world()` drops the lock when the caller is done;
+        `mark_finalization()` moves the record on.
+
+        Default `False` keeps every offline caller exactly as it was.
+        """
         if self._session is None:
             raise SessionNotActiveError("stop_session() requires an active session")
 
+        now = self._clock()
+        finalization = None
+        if hold_lock:
+            finalization = {
+                "state": FINALIZATION_PENDING,
+                "final_solve": FINAL_SOLVE_PENDING,
+                "started_at": now,
+                "updated_at": now,
+                "detail": None,
+            }
         session = replace(
             self._session,
-            ended_at=self._clock(),
+            ended_at=now,
             end_reason=reason,
             rejected_by_reason=dict(self._rejected),
+            finalization=finalization,
         )
         self._store.write_session(session)
         self._events.append("session_stopped", {"end_reason": reason})
-        self._store.release_writer_lock(session.world_id)
+        if not hold_lock:
+            self._store.release_writer_lock(session.world_id)
 
         summary = SessionSummary(
             session_id=session.session_id,
@@ -459,6 +492,50 @@ class WorldBuilderEngine:
         self._tracker = None
         self._events = None
         return summary
+
+    @property
+    def session_active(self) -> bool:
+        """Whether a session is open: started and not yet stopped."""
+        return self._session is not None
+
+    def release_world(self, world_id: str) -> None:
+        """Drop the writer lock a `stop_session(hold_lock=True)` kept."""
+        self._store.release_writer_lock(world_id)
+
+    def mark_finalization(
+        self,
+        world_id: str,
+        session_id: str,
+        *,
+        state: str,
+        final_solve: str | None,
+        detail: str | None = None,
+    ) -> None:
+        """Rewrite the session's finalization block, and nothing else.
+
+        The counts, the end reason and the timestamps written by
+        `stop_session` are re-read from disk and kept; only the
+        finalization moves. `started_at` is preserved from the pending
+        record when there is one, so "how long did finalization take" stays
+        answerable from the record alone.
+        """
+        if state not in FINALIZATION_STATES:
+            raise ValueError(f"unknown finalization state {state!r}")
+        session = self._store.read_session(world_id, session_id)
+        now = self._clock()
+        previous = session.finalization or {}
+        self._store.write_session(
+            replace(
+                session,
+                finalization={
+                    "state": state,
+                    "final_solve": final_solve,
+                    "started_at": previous.get("started_at", now),
+                    "updated_at": now,
+                    "detail": detail,
+                },
+            )
+        )
 
     # -- build ---------------------------------------------------------
 
