@@ -696,12 +696,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     session = websocket.app.state.session
     active_measurement: SessionMetrics | None = None
     sender = _ConnectionSender(websocket)
-    channels = results_ws.ChannelHolder(time.time)
     # Identity for this connection, used to stop a DEAD socket's teardown
     # from disarming a LIVE socket's recording. `object()` rather than a
     # counter: it needs to be unique and comparable, nothing more, and it
     # never leaves this process.
     connection_token = object()
+    # The result channel reports this connection's subscriptions to the
+    # live cartridges as DEMAND under the same token, so a subscription
+    # and a stream from one phone are recognisably one phone's.
+    channels = results_ws.ChannelHolder(
+        time.time,
+        owner=connection_token,
+        live=getattr(websocket.app.state, "live_cartridges", None),
+    )
     await websocket.accept()
     session.client_connected()
     logger.info("client connected")
@@ -833,19 +840,32 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # which capture.py's own docstring promises cannot happen.
         # Before the capture teardown, and unconditionally. A
         # subscription that outlived its socket would keep the shared
-        # reader polling disk for a client that is gone. close() cannot
-        # raise, so nothing below it can be skipped.
-        await channels.close()
-        _stop_capture(
-            websocket, END_REASON_DISCONNECT, owner=connection_token
-        )
-        # On ANY exit, not only a polite stream_stop, and for the same
-        # reason the recorder is torn down here: a wearable client
-        # disconnects abruptly as the NORMAL case. A scene session left
-        # running by a dropped connection would hold a model, park a
-        # worker, and -- worse -- keep serving a scene of a room whose
-        # wearer walked out of range.
-        await _close_cartridge_streams(websocket, connection_token)
-        if active_measurement is not None:
-            _finalize_stream_measurement(active_measurement, end_reason="disconnect")
-        session.client_disconnected()
+        # reader polling disk for a client that is gone.
+        #
+        # In a try/finally rather than bare, because `close()` CAN raise
+        # in one case: when this handler task is itself being cancelled
+        # -- app shutdown, or a test client's teardown -- the channel's
+        # own sender cancellation is re-raised on purpose so the outer
+        # cancellation is not swallowed. Everything below must still run
+        # in that case: a capture left armed by a cancelled connection is
+        # the incidental-capture defect described above, and a stream
+        # left open in a live cartridge's book means its "last stream
+        # out" can never come.
+        try:
+            await channels.close()
+        finally:
+            _stop_capture(
+                websocket, END_REASON_DISCONNECT, owner=connection_token
+            )
+            # On ANY exit, not only a polite stream_stop, and for the same
+            # reason the recorder is torn down here: a wearable client
+            # disconnects abruptly as the NORMAL case. A scene session
+            # left running by a dropped connection would hold a model,
+            # park a worker, and -- worse -- keep serving a scene of a
+            # room whose wearer walked out of range.
+            await _close_cartridge_streams(websocket, connection_token)
+            if active_measurement is not None:
+                _finalize_stream_measurement(
+                    active_measurement, end_reason="disconnect"
+                )
+            session.client_disconnected()

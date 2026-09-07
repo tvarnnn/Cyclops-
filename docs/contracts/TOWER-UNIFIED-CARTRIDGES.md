@@ -275,25 +275,43 @@ deliberately rather than harmonised during integration. Unifying them is a
 contract change and belongs to a human. Until then, **this table is the
 contract.**
 
-**Stream-bound lifecycle.** `stream_start` starts a Scene session and
-`stream_stop` or a disconnect ends it — which is the normal case for a
-wearable. The phone sends **nothing** to open a cartridge; a test asserts
-the wire stays silent. `lifecycle.follows_stream` reports whether that is
-on. Ownership is a **set of connection tokens**, so with two phones
-streaming the first to drop does not stop the session out from under the
-second.
+**Demand-bound lifecycle (2026-09-07).** A Scene session runs while
+**somebody is streaming AND somebody is watching**, or while an operator
+holds it open by hand. The two facts are tracked apart:
 
-> ⚠️ **It does NOT protect a session an operator started by hand.** An
-> earlier draft of this paragraph claimed it did; that was wrong, and a
-> reviewer reproduced the opposite on the shipped default. `stream_opened`
-> adds a connection to the owner set **whether or not it started
-> anything**, so a phone that sends `stream_start` is adopted as an owner
-> of an already-running session — and when it disconnects it is the last
-> owner out, and the operator's session stops.
->
-> The protection covers only a connection that **never sent
-> `stream_start`**. During a physical test, drive Scene from the routes
-> and do not stream from a phone at the same time.
+- the **stream** is the feed. `stream_start` opens it, `stream_stop` or a
+  disconnect closes it. The **last open stream closing stops the session
+  whoever started it** — frames come from nowhere else, and a scene kept
+  past its feed is a claim about a room the wearer has left. This closes
+  the "owned by nobody after Stop → Start" defect the earlier draft of this
+  paragraph described.
+- a **watcher** is a `result_subscribe` to `scene_understanding/live`. It is
+  the phone saying "a person is looking at this". A phone streaming for
+  World Builder or the CV Lab is *not* a request to detect people in the
+  room, so a stream with no watcher leaves the session `stopped` and its
+  frames counted in `frames_dropped_not_running`. When the last watcher
+  leaves (`result_unsubscribe`, or its socket closing) the detector is
+  released and the GPU handed back.
+- the **operator** path is `POST /scene/start`: it runs at once, with or
+  without a stream, so a physical test can be driven from a Mac or curl
+  without a phone build. `POST /scene/stop` ends that hold. The operator's
+  session survives watchers leaving; it does not survive its last stream
+  closing.
+
+No demand event ever resumes a Pause. `lifecycle.follows_stream` reports
+whether the stream-and-watcher rule is on (`TOWER_SCENE_AUTOSTART`, default
+on); off leaves only the operator path. `lifecycle.demand` reports the
+rule's inputs as counts — `streams`, `watchers`, `operator_hold` — and the
+rule itself as `runs_when: "stream-and-watcher-or-operator"`, so a client
+can tell "stopped because nobody is streaming" from "stopped because nobody
+is watching". The counts are volatile (excluded from the revision) and
+never carry a token or a subscription id.
+
+> A phone build that subscribes at connection time rather than when the
+> Scene screen is open will keep the detector running for as long as it is
+> connected and streaming. That is the 2026-08-27 behaviour, not a
+> regression, and the fix is on the phone: subscribe on appear, unsubscribe
+> on disappear.
 
 Document Memory's
 `follows_stream` defaults **false** — that cartridge writes, and a session
@@ -572,7 +590,8 @@ Constant self-description, safe to assert against: `claim:
 `lifecycle` carries `state`, `states`, `session_id` (int, increments per
 Start), `scene_is_current`, `failure_reason`, `started_at`, `ready_at`,
 `loading_seconds`, `load_overdue`, `load_overdue_after_seconds` (120.0),
-`follows_stream`.
+`follows_stream`, and `demand` (`streams`, `watchers`, `operator_hold`,
+`runs_when` — see *Demand-bound lifecycle*).
 
 > **Two payloads with different `session_id` came from different tracking
 > sessions and must not be compared.**

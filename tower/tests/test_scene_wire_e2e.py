@@ -27,6 +27,7 @@ exercised, opt-in behind `TOWER_RUN_MODEL_TESTS`.
 import base64
 import io
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,7 +135,61 @@ def _send_frames(ws, count: int, *, width=640, height=360) -> None:
                 "data": payload,
             }
         )
-        assert ws.receive_json()["type"] == "frame_result"
+        assert _next_frame_result(ws)["type"] == "frame_result"
+
+
+def _next_frame_result(ws) -> dict:
+    """The next `frame_result`, skipping results the subscription pushes.
+
+    With a live subscription open on the same socket, `cartridge_result`
+    heartbeats interleave with frame replies. They are the subscription
+    working, not noise, and a test that asserts on frame replies steps
+    over them.
+    """
+    for _ in range(50):
+        message = ws.receive_json()
+        if message["type"] != "cartridge_result":
+            return message
+    raise AssertionError("no frame_result arrived")
+
+
+def _subscribe(ws) -> str:
+    """Subscribe to the live scene on this socket; returns the id.
+
+    A subscription is the phone saying "a person is looking at this",
+    and it is what lets a stream start the detector: a phone streaming
+    for World Builder must not have Scene Understanding running behind
+    it. The first snapshot is consumed here so a test reads only what it
+    asked for afterwards.
+    """
+    ws.send_json(
+        {
+            "type": "result_subscribe",
+            "cartridge": "scene_understanding",
+            "result_type": "live",
+            "contract": CONTRACT,
+        }
+    )
+    reply = ws.receive_json()
+    assert reply["type"] == "result_subscribed", reply
+    assert ws.receive_json()["type"] == "cartridge_result"
+    return reply["subscription_id"]
+
+
+def _await_state(client, want: str, timeout_polls: int = 400) -> dict:
+    """Poll the HTTP view until the lifecycle reaches `want`.
+
+    A stop reached through a disconnect crosses two thread hops
+    (`watchers_left`, then `stream_closed`), so a poll that never yields
+    can exhaust its budget before the second hop runs. The sleep is
+    short; the budget is what bounds the wait.
+    """
+    for _ in range(timeout_polls):
+        payload = client.get("/scene").json()
+        if payload["lifecycle"]["state"] == want:
+            return payload
+        time.sleep(0.005)
+    raise AssertionError(f"the session never reached {want!r}")
 
 
 def _await_scene(client, timeout_polls: int = 200):
@@ -572,21 +627,23 @@ class TestTheSessionIsNotRunningUnlessSomebodySaidSo:
         assert "TOWER_SCENE_UNDERSTANDING" in offer["unavailable_reason"]
 
 
-class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
-    """The defect this class exists for: nothing on the wire could start.
+class TestAPhoneThatStreamsAndWatchesSeesAScene:
+    """Nothing but the wire starts the session, and only the right wire.
 
     `IOS-to-Tower.md` 6.2 is explicit that opening a cartridge on the
-    phone sends NOTHING, and a test on the iOS side asserts the wire
-    stays silent. So a session that only an HTTP POST could start was a
-    contract reported `available: true`, subscribable, and answering
-    "not observing" forever -- offered and unservable on the only path a
-    product has.
-
-    `stream_start` is the signal, because it is the moment a feed exists.
+    phone sends no VERB, and a test on the iOS side asserts that. What
+    the phone does send is a `result_subscribe` for the live scene, and
+    together with `stream_start` -- the moment a feed exists -- that is
+    the whole start signal. A stream alone is a phone using some other
+    cartridge's camera and must not run a people detector behind it; a
+    subscription alone has nothing to observe.
     """
 
-    def test_stream_start_starts_the_session_without_any_http_call(self, client):
+    def test_stream_and_subscription_start_the_session_without_any_http_call(
+        self, client
+    ):
         with client.websocket_connect("/ws") as ws:
+            _subscribe(ws)
             ws.send_json({"type": "stream_start"})
             _send_frames(ws, 4)
             scene = _await_scene(client)
@@ -594,18 +651,77 @@ class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
         assert scene["counts"]["person"] == 2
         assert scene["lifecycle"]["scene_is_current"] is True
 
+    def test_a_stream_alone_does_not_start_it(self, client):
+        """World Builder's camera is not a request to detect people."""
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            status = client.get("/scene").json()
+
+        assert status["lifecycle"]["state"] == "stopped"
+        assert status["lifecycle"]["demand"] == {
+            "streams": 1,
+            "watchers": 0,
+            "operator_hold": False,
+            "runs_when": "stream-and-watcher-or-operator",
+        }
+        assert status["frames_dropped_not_running"] == 4
+
+    def test_a_subscription_alone_does_not_start_it(self, client):
+        with client.websocket_connect("/ws") as ws:
+            _subscribe(ws)
+            status = client.get("/scene").json()
+
+        assert status["lifecycle"]["state"] == "stopped"
+        assert status["lifecycle"]["demand"]["watchers"] == 1
+        assert status["lifecycle"]["demand"]["streams"] == 0
+
+    def test_unsubscribing_stops_it_and_discards_the_scene(self, client):
+        """Leaving the Scene screen hands the GPU back."""
+        with client.websocket_connect("/ws") as ws:
+            subscription_id = _subscribe(ws)
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            _await_scene(client)
+            ws.send_json(
+                {"type": "result_unsubscribe", "subscription_id": subscription_id}
+            )
+            assert ws.receive_json()["type"] == "result_unsubscribed"
+            after = _await_state(client, "stopped")
+
+        assert after["scene_available"] is False
+        assert after["counts"] is None
+        assert after["lifecycle"]["demand"]["watchers"] == 0
+        assert after["lifecycle"]["demand"]["streams"] == 1
+
+    def test_resubscribing_on_the_same_stream_starts_a_fresh_session(
+        self, client
+    ):
+        with client.websocket_connect("/ws") as ws:
+            first_id = _subscribe(ws)
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            first = _await_scene(client)
+            ws.send_json({"type": "result_unsubscribe", "subscription_id": first_id})
+            assert ws.receive_json()["type"] == "result_unsubscribed"
+            _await_state(client, "stopped")
+
+            _subscribe(ws)
+            _send_frames(ws, 4)
+            second = _await_scene(client)
+
+        assert second["lifecycle"]["session_id"] == first["lifecycle"]["session_id"] + 1
+        assert second["counts"]["person"] == 2
+
     def test_stream_stop_ends_it_and_discards_the_scene(self, client):
         with client.websocket_connect("/ws") as ws:
+            _subscribe(ws)
             ws.send_json({"type": "stream_start"})
             _send_frames(ws, 4)
             _await_scene(client)
             ws.send_json({"type": "stream_stop"})
-            for _ in range(400):
-                after = client.get("/scene").json()
-                if after["lifecycle"]["state"] == "stopped":
-                    break
+            after = _await_state(client, "stopped")
 
-        assert after["lifecycle"]["state"] == "stopped"
         assert after["scene_available"] is False
         assert after["counts"] is None
 
@@ -617,17 +733,28 @@ class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
         room whose wearer is gone.
         """
         with client.websocket_connect("/ws") as ws:
+            _subscribe(ws)
             ws.send_json({"type": "stream_start"})
             _send_frames(ws, 4)
             _await_scene(client)
 
+        # The watchers leave first and the stream closes after, on two
+        # separate hops off the event loop; wait for both.
         for _ in range(400):
             after = client.get("/scene").json()
-            if after["lifecycle"]["state"] == "stopped":
+            if (
+                after["lifecycle"]["state"] == "stopped"
+                and after["lifecycle"]["demand"]["streams"] == 0
+            ):
                 break
-
-        assert after["lifecycle"]["state"] == "stopped"
+            time.sleep(0.005)
         assert after["scene_available"] is False
+        assert after["lifecycle"]["demand"] == {
+            "streams": 0,
+            "watchers": 0,
+            "operator_hold": False,
+            "runs_when": "stream-and-watcher-or-operator",
+        }
 
     def test_a_connection_that_never_streamed_does_not_end_an_operator_s_session(
         self, client
@@ -648,6 +775,23 @@ class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
 
         assert after["lifecycle"]["state"] == "running"
         assert after["scene_available"] is True
+
+    def test_a_restarted_operator_session_still_stops_with_its_stream(
+        self, client
+    ):
+        """Integration finding 15, on the real wire."""
+        with client.websocket_connect("/ws") as ws:
+            _subscribe(ws)
+            ws.send_json({"type": "stream_start"})
+            _send_frames(ws, 4)
+            _await_scene(client)
+            client.post("/scene/stop")
+            client.post("/scene/start")
+            _send_frames(ws, 4)
+            _await_scene(client)
+
+        after = _await_state(client, "stopped")
+        assert after["scene_available"] is False
 
     def test_autostart_can_be_turned_off(self, monkeypatch):
         """An operator who wants the manual control keeps it."""
@@ -671,6 +815,7 @@ class TestAPhoneThatOnlyStreamsCanStillSeeAScene:
         _OPEN.append(manual)
 
         with manual.websocket_connect("/ws") as ws:
+            _subscribe(ws)
             ws.send_json({"type": "stream_start"})
             _send_frames(ws, 4)
 

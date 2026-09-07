@@ -217,6 +217,12 @@ VOLATILE_PATHS = (
     "lifecycle.ready_at",
     "lifecycle.loading_seconds",
     "people.oldest_estimate_seconds",
+    # How many are streaming and watching is diagnostics about the
+    # channel, not news about the scene. A subscriber joining must not
+    # mint an envelope for every other subscriber.
+    "lifecycle.demand.streams",
+    "lifecycle.demand.watchers",
+    "lifecycle.demand.operator_hold",
 )
 
 # Why there is no entity list, as a value rather than an absence.
@@ -464,6 +470,12 @@ def _lifecycle_block(status: dict) -> dict:
         # True is the default and is what makes the cartridge reachable
         # from a phone, which sends nothing when a cartridge is opened.
         "follows_stream": bool(status.get("follows_stream", False)),
+        # Why the session is or is not running, as counts: how many
+        # connections are streaming frames, how many subscriptions are
+        # watching this live result, and whether an operator is holding
+        # it open by hand. `runs_when` is the rule, pinned as a word.
+        # Counts and never tokens -- a subscription id would be a handle.
+        "demand": dict(status.get("demand") or {}),
     }
 
 

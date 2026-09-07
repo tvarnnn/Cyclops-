@@ -367,66 +367,31 @@ class TestTheWorkerIsReused:
 
 
 class TestStopThenStart:
-    """Integration finding 15, reproduced.
+    """Integration finding 15, reproduced here as an xfail and now closed.
 
     `stop()` clears `_stream_owners` ("a manual stop disowns the
-    stream") and `_begin_session_locked` clears it again ("a fresh
-    session owns nothing until a stream claims it"). Neither re-adopts a
-    stream that is STILL OPEN, so after Stop -> Start on the HTTP routes
-    the session is owned by nobody.
+    stream") and `_begin_session_locked` clears it again, so after
+    Stop -> Start on the HTTP routes a session built on the base class's
+    owner set was owned by nobody, and its own stream closing could not
+    end it. For a cartridge whose subject is detecting PEOPLE that was a
+    privacy defect and not only a resource one.
 
-    This is a privacy defect and not only a resource one. Scene
-    Understanding's whole subject is detecting PEOPLE, and "keeps
-    observing after the wearer's phone disconnects, and cannot be
-    stopped by disconnecting" is a claim about the product, not about
-    the process table.
-
-    XFAIL, STRICT, AND DELIBERATELY NOT FIXED HERE.
-
-    The reproduction is kept in the suite rather than in a scratch
-    directory because it is real and because the next person to touch
-    this should inherit it running, not a paragraph describing it.
-    `strict=True` means this turns into a FAILURE the moment somebody
-    fixes the defect, which is the prompt to delete the marker.
-
-    It is not fixed here because the mechanical fix is not obviously the
-    right one, and this is a hardening lane. `stop()` clearing
-    `_stream_owners` is DELIBERATE and is itself a fix: the comment on
-    `_stream_owners` records that a surviving flag meant "an operator's
-    hand-started session was killed by the next phone that dropped --
-    verbatim the failure `stream_closed` claims to prevent". So the two
-    defects are opposite ends of one decision:
-
-        adopt too eagerly -> a passing connection stops a session an
-                             operator started by hand
-        adopt not at all  -> a stream-started session, once restarted
-                             over HTTP, can never be stopped by the
-                             stream again
-
-    Choosing between them means deciding whether an HTTP `start()` while
-    a stream is open should be owned by that stream. That is a product
-    decision about iOS-facing lifecycle semantics, it needs the set of
-    OPEN streams tracked separately from the set of OWNING ones, and it
-    is not a decision an optimization pass gets to make on its own.
+    `SceneLive` now tracks OPEN streams apart from who started the
+    session -- the split this class's original docstring said the fix
+    needed -- and the last stream closing stops the session whoever
+    pressed Start. `tests/test_scene_activation.py` holds the full rule;
+    this test stays here, unmarked, because it is the reproduction that
+    found the defect and should keep running against the fix.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "integration finding 15, reproduced and open: after Stop -> "
-            "Start on the HTTP routes the session is owned by nobody, so "
-            "the stream closing cannot stop it. Fixing it needs open "
-            "streams tracked apart from owning ones, which is a product "
-            "decision -- see this class's docstring"
-        ),
-    )
     def test_a_restarted_session_is_still_stopped_by_its_stream_closing(self):
         token = "connection-token-A"
         session = _session()
 
         session.stream_opened(owner=token)
+        session.watcher_joined("sub", owner=token)
         assert _await_state(session, STATE_RUNNING), (
-            "Scene follows the stream, so a phone connecting starts it"
+            "a phone that streams and watches starts it"
         )
 
         session.stop()

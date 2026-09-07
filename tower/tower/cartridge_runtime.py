@@ -90,6 +90,56 @@ class LiveCartridges:
     # to the configured-off wording, which stays pinned by its own test.
     scene_unavailable_reason: str | None = None
 
+    # -- demand from the result channel ---------------------------------
+    #
+    # A subscription to a live cartridge's result is the phone saying "a
+    # person is looking at this right now", and for Scene Understanding
+    # that is what decides whether the detector runs at all (see
+    # `tower/scene/live.py`, WHEN IT RUNS). The result channel is
+    # cartridge-blind and must stay so, so it reports the subscription by
+    # cartridge NAME and this object decides which session, if any, that
+    # name is demand for. Every method is safe to call for any cartridge
+    # and never raises: a demand hook that could end a connection over a
+    # status subscription would be the failure `results_ws.handle` exists
+    # to prevent.
+
+    def watcher_joined(self, cartridge: str, token, *, owner=None) -> None:
+        session = self._demand_target(cartridge)
+        if session is not None:
+            try:
+                session.watcher_joined(token, owner=owner)
+            except Exception:
+                logger.exception("[Tower][Cartridge] watcher_joined failed")
+
+    def watcher_left(self, cartridge: str, token) -> None:
+        session = self._demand_target(cartridge)
+        if session is not None:
+            try:
+                session.watcher_left(token)
+            except Exception:
+                logger.exception("[Tower][Cartridge] watcher_left failed")
+
+    def watchers_left(self, *, owner) -> None:
+        """A connection closed. Every session it was watching is told."""
+        for session in self.frame_consumers:
+            left = getattr(session, "watchers_left", None)
+            if left is None:
+                continue
+            try:
+                left(owner=owner)
+            except Exception:
+                logger.exception("[Tower][Cartridge] watchers_left failed")
+
+    def _demand_target(self, cartridge: str):
+        # The name is compared to a string rather than to an import from
+        # `tower.results.contracts`, so this module keeps importing
+        # nothing from the result channel and the channel nothing from
+        # here. `test_the_result_channel_core_is_cartridge_blind` guards
+        # the other direction.
+        if cartridge == "scene_understanding":
+            return self.scene
+        return None
+
     def shutdown(self) -> None:
         """Stop every live session. Never raises.
 
