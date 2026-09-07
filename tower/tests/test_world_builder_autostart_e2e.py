@@ -81,9 +81,58 @@ def tower(monkeypatch, tmp_path):
     monkeypatch.setenv("TOWER_WORLD_REBUILD_EVERY", "2")
     app = create_app()
     client = TestClient(app)
+    # The World Builder workspace is on the phone's screen: since 2026-09-06
+    # a builder attaches to a capture only while this session is active,
+    # exactly as the object-memory producer always has.
+    assert client.post(f"{WORLD_BUILDER_SESSION_URL}/start").status_code == 200
     yield client, app, tmp_path
     # Never leave a follower running, whatever the assertions did.
     app.state.capture_workers.shutdown(grace_seconds=5.0)
+
+
+WORLD_BUILDER_SESSION_URL = "/cartridges/world_builder/session"
+
+
+def test_a_capture_with_world_builder_inactive_attaches_no_builder(tower):
+    """The cartridge-switch requirement: a camera session started for some
+    other cartridge must not spawn a builder and its solver children.
+    `TOWER_WORLD_AUTOBUILD` is on; the SESSION is what is off."""
+    client, app, tmp_path = tower
+    assert client.post(f"{WORLD_BUILDER_SESSION_URL}/stop").status_code == 200
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(_frames(6), start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        assert app.state.capture_workers.status() == []
+        ws.send_json({"type": "stream_stop"})
+        ws.send_json({"type": "ping"})
+        ws.receive_json()
+    assert not (tmp_path / "world" / "worlds").exists() or not list(
+        (tmp_path / "world" / "worlds").iterdir()
+    )
+
+
+def test_entering_world_builder_mid_capture_attaches_a_builder_from_now(tower):
+    """The wearer started the camera elsewhere and then opened World
+    Builder: `start` attaches to the capture already recording."""
+    client, app, tmp_path = tower
+    assert client.post(f"{WORLD_BUILDER_SESSION_URL}/stop").status_code == 200
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(_frames(6), start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        assert app.state.capture_workers.status() == []
+        body = client.post(f"{WORLD_BUILDER_SESSION_URL}/start").json()
+        capture_id = app.state.frame_observers[0].status.capture_id
+        assert body["attached_capture_id"] == capture_id
+        workers = _wait_for(app.state.capture_workers.status, 10.0, "a builder")
+        assert workers[0]["capture_id"] == capture_id
+        ws.send_json({"type": "stream_stop"})
+        ws.send_json({"type": "ping"})
+        ws.receive_json()
+    _wait_for(lambda: not app.state.capture_workers.status(), 90.0, "the builder to finish")
 
 
 def test_start_walk_stop_produces_a_world_with_no_manual_step(tower):
