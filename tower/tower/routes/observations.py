@@ -109,15 +109,34 @@ _RETENTION_DAYS = Query(
 )
 
 
+# `ge=0`: a negative moment is meaningless. It is a Tower-receipt epoch
+# second (`time.time()`), the same clock a session's `started_at` is on, so
+# a client asks "what did THIS recording remember" by passing the session's
+# own start. Absent means the whole store, which is the historical view.
+_SINCE = Query(
+    default=None,
+    ge=0,
+    description=(
+        "Only observations the Tower WROTE at or after this moment "
+        "(recorded_at >= since). Pass a session's started_at to get just "
+        "that recording's memories; omit for the whole store. Separates a "
+        "recording's new memories from history so an empty recording cannot "
+        "borrow history's."
+    ),
+)
+
+
 @router.get("/object-memory/observations")
 def observations(
     request: Request,
     object_class: str | None = Query(default=None),
+    since: float | None = _SINCE,
     retention_days: float | None = _RETENTION_DAYS,
 ) -> dict:
     return build_observations(
         _store(request, retention_days),
         object_class=object_class,
+        since=since,
         requested_retention_days=retention_days,
         recorded_classes=_recorded_classes(request),
     )

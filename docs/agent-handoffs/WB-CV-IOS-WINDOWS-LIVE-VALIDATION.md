@@ -178,26 +178,31 @@ not made here because Swift cannot be compiled on this box.
 | Commit | What |
 |---|---|
 | `1647c4b` | `feat(world-builder): the listing says when an open session was abandoned` — `world_builder_library.py`, one test (finished → false; open + dead lock → true; open + no lock → true; open + running lock → false), contract row + rule in `WORLD-BUILDER-WORLDS.md` |
+| `b10ab36` | this document, first version |
+| `12e4f1e` | `fix(world-builder): a rebuild that cannot write no longer ends the session` — `storage._replace_with_retry` budget 60 ms → 2 s with backoff; `world_build_session.py` logs and retries a failed interim rebuild; `tests/test_storage_replace_retry.py` (2), `tests/test_world_builder_rebuild_failure.py` (1). Related suites: 226 passed. Root cause and evidence in §8.4 |
 
-Made through a throw-away linked worktree
+Each made through a throw-away linked worktree
 (`Glasses-worktrees\wb-cv-ios-validation-win`, branch `tmp/…-fix`) and a
 `--ff-only` merge in the canonical checkout, because the lane guard refuses
 agent commits in the canonical checkout and `--no-verify` is not an option.
 The worktree and the temporary branch were removed afterwards; the canonical
 checkout is on `integration/wb-cv-ios-validation-v1` at `1647c4b`, clean.
 
-## 8. What ran under real load without the phone
+## 8. What ran under real load
 
-**No iPhone connected to this Tower during the session** (the Tower log on
-port 8000 shows zero `/ws` accepts between 16:43 and the end of the
-session). Every phone step of the mission's §10 and §12 lists — the
-viewer inside the app, Saved Worlds navigation, a live capture from the
-glasses, Start camera inside CV Lab, Pause/Resume on the wire — therefore
-**did not run** and is not claimed. The iOS build's commit could not be
-confirmed from this side either: the app carries no build identity on the
-wire (`CURRENT_PROJECT_VERSION = 1`, no hello payload from the phone), so
-it must be confirmed on the phone (the Picture button beside *Saved worlds*
-and the Tower row at the top of CV Lab exist only on this branch).
+The session had two halves. Until 20:12 no phone connected and this box
+measured what it could on its own (§8.1–8.2). At 20:12:43 the iPhone
+(`100.75.17.33`) connected; the person at the keyboard then ran their own
+Towers on port 8000 from this checkout (three instances between 20:13 and
+20:31; their console output was not captured to a file) and drove the
+phone through a live World Builder capture and the CV Lab list. Those runs
+were observed from here through the Tower's HTTP surface and the world
+directory, not through the app's screen (§8.4–8.5). The iOS build's commit
+still cannot be confirmed from this side: the app carries no build identity
+on the wire (`CURRENT_PROJECT_VERSION = 1`, no hello payload from the
+phone); the Picture button beside *Saved worlds* and the Tower row at the
+top of CV Lab exist only on this branch, and the person holding the phone
+is the only one who can say they were there.
 
 What this box could measure on its own, against the branch's Tower:
 
@@ -255,15 +260,115 @@ would `TerminateProcess` the builder at the 10 s grace and lose the final
 solution, keeping the last background one. The session record and lock
 are already final by then (§6).
 
-### 8.3 How to run the phone steps against this box
+### 8.4 Live World Builder capture from the glasses (20:14–20:17)
 
-The Tower for the World Builder list is **running now** on
-`0.0.0.0:8000` from the canonical checkout at `1647c4b`, `.env`, autobuild
-and solve on (pid pair 14756 launcher / 19924 interpreter; log
-`Glasses-scratch\wb-validate\logs\tower-8000-wb.log`). Open World Builder →
-Saved worlds → **2026-09-06 walk (global solve, replay)** → Picture.
+Tower instance `8f42e16dc7ac` (the person's own, from this checkout at
+`b10ab36`, `.env`, autobuild **on**, solve on). Observed through `/health`,
+`/worlds`, the render route and the world directory
+(`logs\live-world-fcbca9e9.jsonl`, `logs\cvlab-phone-8000.jsonl`):
 
-For the CV Lab list, restart it with the follower disabled:
+| Time | What |
+|---|---|
+| 20:12:43 | phone `/ws` accepted on the Tower this lane had started; that Tower was ended at 20:12:56 and the person's own took port 8000 at 20:13:03 |
+| 20:14:16 | capture `7febdae8…` starts; builder follower spawned (launcher 26560, interpreter **19604**); frames arriving |
+| 20:14:17 | world `fcbca9e90b244785bdb671530b33c6a5`, session `158ef0ef…` created |
+| 20:14:58, 20:15:14, 20:15:37, 20:16:07, 20:16:37, 20:17:06 | background solves land every ~50 keyframes; each is merged by the next rebuild (`manifest.global_solve.solved_at` tracks `solution.solved_at`) — **the phone saw segments snap together mid-walk, as designed** |
+| ~20:15:25 | `GET /worlds/fcbca9e9…/render` from here: 200, 292 KB, 115 ms, 14 frames, world frame 133 cameras / 7 registered segments, BEHIND caption; `GET /worlds` lists it `live: true` |
+| **20:17:12** | last keyframe accepted (467, segment 79); `poses.json` rewritten 20:17:12.798, `points.json` **not** (still 20:17:11.7), no `.tmp` left |
+| 20:17:13 | `/health` `capture_workers.workers` empty — the supervisor reaped the builder. **It died 20 s before Stop, not at shutdown; the Tower kept running.** |
+| 20:17:33 | phone Stop; `capture.json` `ended_at`, `end_reason: stop`, 2270 frames |
+| 20:17:44 | the last background solve child (launched 20:17:10) finishes and writes its solution; nobody is left to merge it |
+| afterwards | `session.json` `ended_at: null`, `keyframes_accepted: 0`; `LOCK` names dead pid 19604; no `session_stopped`; no final solve; derived tree torn (`poses.json` from build N+1, `points.json`/manifest from build N). `GET /worlds` lists it **`abandoned: true`** (§7), `live: false`; the render still serves the last merged solve: 39 frames, 257 cameras in the world frame, 23 registered segments, BEHIND |
+
+**Root cause** (evidence: the file timestamps above; a read-only code
+investigation; a reproduction in isolation). The builder died inside
+`write_derived` on the atomic replace of `points.json`:
+`storage._replace_with_retry` gave up after 12 × 5 ms because a reader
+held the destination open. On Windows `os.replace` fails with
+`WinError 5` while *any* handle is open on the target, and the reader
+here is the Tower's own web thread reading the 2.2 MB `points.json` for
+the phone's geometry pull — descheduled under the background solve child,
+which uses 18 of 20 cores. Reproduced in isolation: a reader holding the
+file for 120–150 ms a few times a second fails **7 of 30** atomic writes
+under the 60 ms budget (`logs\` and `tests/test_storage_replace_retry.py`).
+The same capture replayed offline through the identical builder path
+(`--solve --register`, no concurrent reader) built **519 keyframes, 88
+segments, final solve 93 s, exit 0**, so frames, merge and solver are not
+the trigger. The morning's eight abandoned worlds have a different
+signature (complete last build, killed at Tower shutdown).
+
+**Fix** (`12e4f1e`, §7): the replace budget is now 2 s with 5→50 ms
+backoff (0 of 30 failures against the same reader; a parked reader still
+fails within the budget), and an `OSError` from an *interim* rebuild is
+logged and retried at the next rebuild instead of ending the session —
+so the stop, the final solve and the final build still happen. Builder
+followers are spawned fresh per capture and import `storage` on start,
+so the person's running Tower picks the fix up on its next capture with
+autobuild on, without a restart. Not re-run on hardware in this session.
+
+**Final-solve timing** could not be measured on the live walk because the
+builder never reached it; the offline figure for this capture is 93 s
+(match 32 s, map 57 s) and for the 09-06 capture 103 s (§8.2).
+
+### 8.5 Live CV Lab from the phone (20:30–20:37)
+
+Tower instance `36ed7ec381c0` (the person's own, this checkout, autobuild
+**off** — `capture_workers.configured` was `object-memory-session` only),
+observed at 1 Hz through `GET /cv-lab` with `psutil` on the interpreter
+pid (`logs\cvlab-phone-8000.jsonl`):
+
+| Time | run | experiment | `arm_ms` | device / torch threads | socket | camera |
+|---|---|---|---|---|---|---|
+| 20:30:49 | -1 | baseline (startup default) | 0.6 | | connected | |
+| 20:31:09 | -1 | | | | | **frames arriving** (`receiving_frames: true`) |
+| 20:31:20→:25 | -2 | depth | **4322** (first in process) | cuda / 2 | same | alive |
+| 20:31:31 | -3 | edge_detection | 3.4 | | same | alive |
+| 20:31:48 | -4 | feature_detection | 0.8 | | same | alive |
+| 20:31:58 | -5 | frame_quality | 0.6 | | same | alive |
+| 20:32:12→:13 | -6 | object_detection | **417** (first in process) | cuda / 2 | same | alive |
+| 20:33:44 | -7 | optical_flow | 3.2 | | same | alive |
+| 20:34:12 | -8 | redaction_impact | 0.6 | | same | alive |
+| 20:35:21 | -8 | | | | connected | frames stop (`receiving_frames: false`), run still `running`, `run_id` unchanged |
+| 20:36:19 → 20:36:32 | -8 | | | | **disconnected → reconnected** | |
+| 20:36:42 | -8 | | | | connected | frames resume; a capture with an object-memory worker starts |
+
+Earlier, on instance `8f42e16dc7ac` at 20:18:24–20:18:38 the phone armed
+`depth` (5122 ms cold), then **paused** (`lifecycle.state: paused`), then
+**stopped** the run, then disconnected — the run-level Pause/Resume/Stop
+controls, on the wire.
+
+What that pass proves: all eight experiments switched from the phone on
+**one socket and one Tower process** (instance id and `clients_connected`
+never changed through the eight arms), the camera stayed alive across
+every switch, warm arms are single-digit milliseconds, the heavy models
+land on `cuda` with the two-thread budget, and a frame stop with the run
+left armed keeps `run_id` and `lifecycle.state`. Whether the 20:35:21
+frame stop was the camera card's *Pause frames* or *Stop* cannot be told
+from the Tower side; both look the same there by design.
+
+Resource readings in that pass, from the OS: threads 26 idle → 50 after
+`depth` → 63 after `edge_detection` → 74 at `object_detection` → 81 at
+`redaction_impact` → **95** after the disconnect/reconnect and the new
+capture; RSS 70 → 1201 MB (depth) → 1708 MB (object detection) → 1798 MB.
+The soak in §8.1 holds 64 threads flat across four full cycles once warm,
+so the climb from 63 to 95 here is **not the experiment switching**; the
+pass also included two capture recordings, a websocket disconnect and
+reconnect, and an object-memory producer worker (`children: 2`), none of
+which the soak exercises. One pass cannot separate those; it is recorded
+as an observation, not a leak.
+
+Frame rate from the glasses was ~12 fps; `object_detection` processed at
+up to 55 ms per frame, `depth` 45 ms.
+
+### 8.3 How to run the phone steps against this box (as it was set up)
+
+The Tower this lane started for the World Builder list ran on
+`0.0.0.0:8000` from the canonical checkout at `1647c4b` (`.env`, autobuild
+and solve on) until the person replaced it with their own at 20:13. To
+repeat: open World Builder → Saved worlds → **2026-09-06 walk (global
+solve, replay)** → Picture.
+
+For the CV Lab list, run with the follower disabled:
 
 ```powershell
 cd C:\Users\tvllo\Projects\Glasses\tower
@@ -286,44 +391,72 @@ solution.solved_at`, or `solution.timing.final == false`, or the Tower's
 
 Before anything ran: **zero** `python`/`uvicorn` processes on the box,
 nothing listening on 8000–8020 — no stale process from an earlier session
-existed to clean up. Towers started here: 8010 (route checks, stopped),
-8000 (WB mode, restarted once after the §7 commit, **left running**), 8017
-(soak, stopped). Each was stopped through its own task handle and the
-process table was re-read afterwards; at the end it holds exactly the 8000
-pair. The full pytest run left nothing behind.
+existed to clean up. Towers started by this lane: 8010 (route checks,
+stopped), 8000 (WB mode, restarted once after the §7 commit; ended at
+20:12:56 when the person took the port), 8017 (soak, stopped). Each was
+stopped through its own task handle and the process table re-read
+afterwards. From 20:13 the Towers on 8000 were the person's own (three
+instances, the last stopped at 20:38:03). This lane's 1 Hz samplers
+(`cv_lab_watch.py`, the state and world monitors) were stopped at the end.
+The full pytest run left nothing behind. The builder that died at 20:17:12
+left no process; its LOCK is reclaimed by the next writer of that world.
 
 ## 10. Remaining defects and open items
 
-1. **Hardware steps not run** (§8): the in-app viewer, Saved Worlds
-   navigation, live capture, CV Lab camera/pause/resume on the wire. Tower
-   side is ready and measured; the phone side is unproven on Windows.
-2. **Builder is never asked to stop** (shared infrastructure, pre-existing):
+1. **Not observed from this side**: whether the in-app viewer (Picture) and
+   Saved Worlds navigation were exercised on the phone. The phone was
+   connected and drove a live capture and the CV Lab list (§8.4–8.5), but
+   the HTTP access log of the person's Tower went to their console, so a
+   `GET /worlds/{id}/render` from the phone is neither confirmed nor
+   denied here. The route is proven against the real data (§3); the
+   in-app rendering is the Mac Simulator's proof plus whatever the person
+   saw.
+2. **Live final solve not yet observed on hardware**: the one live walk
+   died before Stop (§8.4, fixed in `12e4f1e`). The next live capture with
+   autobuild on is the test of the fix and of the 30–135 s final-solve
+   window; the timeline recipe is in §8.3.
+3. **Thread count after a phone session** (§8.5): 63 → 95 across a pass
+   that mixed experiment switching with capture recording, a socket
+   disconnect/reconnect and an object-memory worker. The soak shows
+   switching alone is flat; the other three need their own soak.
+4. **Reader side of the replace race** (pre-existing): a route reading a
+   derived file while the builder replaces it can get `PermissionError`
+   on `open`; readers treat that as absent geometry for that request. Not
+   changed here; the writer side is what killed a session.
+5. **Builder is never asked to stop** (shared infrastructure, pre-existing):
    no stdin/CTRL_BREAK channel, so Tower shutdown terminates it after 10 s
    and a mid-walk kill leaves an abandoned session (28 on this box). The
    listing now says `abandoned`; the phone still says "still open" until
    the two-line iOS follow-up lands. The root fix (a stop channel plus
    `stop_session` in a `finally`, and a longer grace while a solve runs)
    belongs to a shared-infrastructure lane.
-3. **Interim geometry on abandoned sessions renders as if finished**: three
+6. **Interim geometry on abandoned sessions renders as if finished**: three
    of the 28 are exactly current, so the page shows no BEHIND line and no
    other hint that the walk ended by a kill. Only the listing flag says so.
-4. **One derived manifest per world** (Mac handoff §9, unchanged).
-5. **Per-process CUDA memory is unobservable** on this box (`nvidia-smi`
+7. **One derived manifest per world** (Mac handoff §9, unchanged).
+8. **Per-process CUDA memory is unobservable** on this box (`nvidia-smi`
    `[N/A]` under WDDM); CUDA release must be judged by the soak's in-process
    counters or device-wide memory.
 
 ## 11. Verdict
 
-Everything the Windows box can prove without a phone is proven: the
-branch checks out and tests clean here (2613/0), the real reconstructions
-are visible to and rendered by the combined Tower from the canonical
-world root, the solver path solves the real walk on this venv, and the CV
-Lab runtime fixes hold under real CUDA inference load (threads flat, RSS
-flat, ~1.7 cores for object detection, no follower). The one defect found
-is fixed additively and tested. **This branch is ready to become the new
-integration baseline once the Mac handoff's §10 phone steps (World
-Builder 5–13, CV Lab 1–7) have been run against this Tower**; nothing
-found here argues against it, and nothing here substitutes for the phone.
+The branch checks out and tests clean on Windows (2613/0), the real
+reconstructions are visible to and rendered by the combined Tower from the
+canonical world root, the solver path solves the real walk on this venv,
+and the CV Lab runtime fixes hold under real CUDA inference load in the
+soak and under the phone: eight experiments on one socket, camera alive,
+no restart. The live World Builder walk found a real defect — a builder
+that dies when the Tower reads the file it is replacing — with the root
+cause pinned from disk, reproduced in isolation, fixed and tested
+(`12e4f1e`), but **not yet re-run on hardware**. The listing gap the
+abandoned sessions exposed is fixed additively (`1647c4b`).
+
+**Recommendation:** merge this branch into `integration/all-current-v1`
+as the new baseline after one more live World Builder capture with
+autobuild on reaches its final solve and its saved world reopens on the
+phone (§8.3's timeline recipe). Everything else the mission asked for is
+either proven here or proven on the Mac; nothing found argues against the
+merge, and the one thing found is fixed on this branch.
 
 ## 12. Temporary resources (filesystem policy rule 9)
 
