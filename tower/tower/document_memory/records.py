@@ -81,6 +81,19 @@ class PageObservation:
     observed_at: float | None = None
     observation_count: int = 1
     image_relpath: str | None = None
+    # A 64-bit perceptual hash of the text region, as 16 hex characters,
+    # or None. NOT imagery: sixteen characters cannot be rendered back
+    # into a page. It is what lets a later sighting of the same page be
+    # recognised without keeping the pixels that would prove it.
+    visual_hash: str | None = None
+    # How many text boxes the detector found in the region this page
+    # was read from. Evidence for the gate, kept so an unreadable page
+    # can say "text was there" rather than nothing.
+    box_count: int = 0
+    # Whether this page's text passed the readability floor. A page can
+    # have regions and no readable text: OCR looked, and what it found
+    # was noise. That is a different fact from never looking.
+    readable: bool = False
 
     @property
     def word_count(self) -> int:
@@ -101,13 +114,17 @@ class PageObservation:
             "observed_at": self.observed_at,
             "observation_count": self.observation_count,
             "image_relpath": self.image_relpath,
+            "visual_hash": self.visual_hash,
+            "box_count": self.box_count,
+            "readable": self.readable,
         }
 
 
 def page_observation_from_json_dict(data: dict) -> PageObservation:
+    text = data["text"]
     return PageObservation(
         page_index=data["page_index"],
-        text=data["text"],
+        text=text,
         text_source=data.get("text_source", TEXT_SOURCE_OCR),
         region_count=data.get("region_count", 0),
         mean_region_confidence=data.get("mean_region_confidence"),
@@ -119,6 +136,50 @@ def page_observation_from_json_dict(data: dict) -> PageObservation:
         observed_at=data.get("observed_at"),
         observation_count=data.get("observation_count", 1),
         image_relpath=data.get("image_relpath"),
+        visual_hash=data.get("visual_hash"),
+        box_count=data.get("box_count", 0),
+        # A record written before this field existed is readable exactly
+        # when it carries text: that is what "readable" meant then.
+        readable=data.get("readable", bool(text.strip())),
+    )
+
+
+@dataclass(frozen=True)
+class Sighting:
+    """One later observation of a document already on record.
+
+    A wearer who looks back at a page they read ten minutes ago has not
+    read a new document. The record gains a sighting -- when, for how
+    long, from which capture -- and nothing about the FIRST observation
+    is rewritten: its provenance stays exactly what it was.
+    """
+
+    observed_at: float
+    observed_seconds: float
+    capture_id: str | None = None
+    source_seq: int | None = None
+    end_reason: str = END_REASON_LOST
+    frames_considered: int = 0
+
+    def to_json_dict(self) -> dict:
+        return {
+            "observed_at": self.observed_at,
+            "observed_seconds": self.observed_seconds,
+            "capture_id": self.capture_id,
+            "source_seq": self.source_seq,
+            "end_reason": self.end_reason,
+            "frames_considered": self.frames_considered,
+        }
+
+
+def sighting_from_json_dict(data: dict) -> Sighting:
+    return Sighting(
+        observed_at=data["observed_at"],
+        observed_seconds=data.get("observed_seconds", 0.0),
+        capture_id=data.get("capture_id"),
+        source_seq=data.get("source_seq"),
+        end_reason=data.get("end_reason", END_REASON_LOST),
+        frames_considered=data.get("frames_considered", 0),
     )
 
 
@@ -162,6 +223,9 @@ class DocumentObservation:
     retains_raw_imagery: bool = False
     redaction: str = REDACTION_NONE
     privacy_tags: tuple[str, ...] = ("document-text", "first-person")
+    # Later observations of this same document, oldest first. Empty for
+    # a document seen once. See `Sighting`.
+    sightings: tuple[Sighting, ...] = ()
 
     @property
     def pages_observed(self) -> int:
@@ -175,6 +239,21 @@ class DocumentObservation:
     @property
     def word_count(self) -> int:
         return sum(page.word_count for page in self.pages)
+
+    @property
+    def sighting_count(self) -> int:
+        """How many times this document was observed, first one included."""
+        return 1 + len(self.sightings)
+
+    @property
+    def last_observed_at(self) -> float:
+        if not self.sightings:
+            return self.observed_at
+        return max(self.observed_at, max(s.observed_at for s in self.sightings))
+
+    @property
+    def total_observed_seconds(self) -> float:
+        return self.observed_seconds + sum(s.observed_seconds for s in self.sightings)
 
     def to_json_dict(self) -> dict:
         return {
@@ -200,6 +279,7 @@ class DocumentObservation:
             "redaction": self.redaction,
             "privacy_tags": list(self.privacy_tags),
             "pages": [page.to_json_dict() for page in self.pages],
+            "sightings": [sighting.to_json_dict() for sighting in self.sightings],
         }
 
 
@@ -229,4 +309,7 @@ def document_observation_from_json_dict(data: dict) -> DocumentObservation:
         retains_raw_imagery=data.get("retains_raw_imagery", False),
         redaction=data.get("redaction", REDACTION_NONE),
         privacy_tags=tuple(data.get("privacy_tags", ())),
+        sightings=tuple(
+            sighting_from_json_dict(entry) for entry in data.get("sightings", [])
+        ),
     )

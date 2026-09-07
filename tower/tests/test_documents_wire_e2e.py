@@ -35,8 +35,8 @@ from tower.document_memory.engine import DocumentMemoryEngine
 from tower.document_memory.ocr import FixedTextRecogniser
 from tower.document_memory.store import DocumentStore
 
-CONTRACT = "document_memory.status/2026-08-27"
-LIBRARY_CONTRACT = "document_memory.library/2026-08-27"
+CONTRACT = "document_memory.status/2026-09-07"
+LIBRARY_CONTRACT = "document_memory.library/2026-09-07"
 POLICY = DwellPolicy(min_frames=3, min_seconds=0.6)
 
 _OPEN: list = []
@@ -92,8 +92,13 @@ def _client(
     else:
         monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(capture_root))
     if document_root is None:
+        # "Unconfigured" is reachable only by switching the cartridge off
+        # since the root gained a managed default (2026-09-07). Deleting
+        # the variable would now produce a CONFIGURED Tower.
         monkeypatch.delenv("TOWER_DOCUMENT_ROOT", raising=False)
+        monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "false")
     else:
+        monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "true")
         monkeypatch.setenv("TOWER_DOCUMENT_ROOT", str(document_root))
     monkeypatch.setenv("TOWER_DOCUMENT_CAPTURE", "true" if capture else "false")
 
@@ -183,8 +188,8 @@ class TestAnEmptyMemoryIsNotAnEmptyWorld:
         # in the present tense reads as current state. This platform's
         # corpus grows continuously, so it is not.
         measurement = payload["recording_measurement"]
-        assert measurement["measured_at"] == "2026-08-26"
-        assert measurement["corpus_frames"] == 9199
+        assert measurement["measured_at"] == "2026-09-06"
+        assert measurement["corpus_frames"] == 45594
         assert measurement["is_current"] is False
 
 
@@ -334,7 +339,9 @@ class TestProvenanceSurvivesToTheWire:
 
         provenance = client.get("/documents").json()["documents"][0]["provenance"]
 
-        assert provenance["frames_considered"] >= 8
+        # Seven of eight: the first frame of a stream is never admitted,
+        # because nothing precedes it to be steady against.
+        assert provenance["frames_considered"] >= 7
         assert provenance["frames_ocred"] <= 2
 
 

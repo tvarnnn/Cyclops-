@@ -1,30 +1,58 @@
 """Frames in, observed documents out.
 
 The whole shape of this file follows from one measurement: OCR costs
-~1.2 s per page. That is roughly 400x the per-frame detection cost, so
-the pipeline is built to make the expensive stage rare rather than fast.
+~0.3 s per page on the GPU and ~1.9 s on the CPU, while deciding whether
+a frame is worth OCR costs ~3 ms. So the pipeline is built to make the
+expensive stage rare rather than fast.
 
-    every frame     decode, detect a page, update dwell     ~3 ms
-    per dwell       pick the best one or two frames         free
-    per dwell       warp and OCR those                      ~1.2 s each
+    every frame     decode, steady-and-sharp gate                 ~3 ms
+    stable frames   text detector, at most 4x a second           ~35 ms
+    per dwell       keep the sharpest one or two frames/segment   free
+    per dwell       crop, OCR, judge readability                 ~0.3 s each
+    per dwell       is this a page already on record?             ~1 ms
 
 Nothing here runs on the Tower event loop. Like World Builder, this is an
 engine plus an offline/live driver, because the module contract is a
-registry of one with a scalar-shaped result and 1.2 s of OCR could not
+registry of one with a scalar-shaped result and a page of OCR could not
 sit on the frame path regardless.
+
+WHAT CHANGED ON 2026-09-07 AND WHY
+
+The per-frame stage used to be a contour-quad detector with a glyph
+statistic (`detect.py`). On 9,199 real frames it fired six times, all on
+blinds and keyboards, and zero times after re-derivation; on a rendered
+page it needed four clean convex corners. It is replaced by
+`gate.PageFinder`: a motion/sharpness gate plus the OCR engine's own text
+detector, which finds text where a text detector finds it and needs no
+corners. `detect.py` is retained for its warp and for the corpus tests
+that measure it; nothing on this path calls it.
+
+The other change is identity. A dwell used to become a new record every
+time; now a dwell whose page is already on record -- same words, same
+look, per `identity.compare` -- becomes a SIGHTING of that record. That
+is what stops twenty seconds of looking at one page from becoming a
+library of one page.
 """
 
 import logging
-import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
 
 from tower.confidence import Confidence
-from tower.document_memory.detect import detect_page, warp_page
 from tower.document_memory.dwell import DwellPolicy, DwellTracker
+from tower.document_memory.gate import PageFinder, crop_region
+from tower.document_memory.identity import (
+    MIN_WORDS_FOR_TEXT,
+    SAME_PAGE_TOKEN_OVERLAP,
+    Reading,
+    compare,
+    perceptual_hash,
+    token_overlap,
+    tokenise,
+)
 from tower.document_memory.ocr import OcrResult, TextRecogniser
 from tower.document_memory.records import (
     END_REASON_STOPPED,
@@ -34,40 +62,27 @@ from tower.document_memory.records import (
     TIMING_MIXED,
     DocumentObservation,
     PageObservation,
+    Sighting,
 )
 from tower.storage import new_id
 
 logger = logging.getLogger(__name__)
 
-# Two pages whose text overlaps this much are the same page seen twice,
-# not two pages. Chosen above the level ordinary prose shares by chance
-# (common words alone rarely exceed ~0.4 between different pages) and
-# below what re-OCR of the same page reaches (typically >0.85, since OCR
-# is not deterministic across slightly different frames).
-SAME_PAGE_TOKEN_OVERLAP = 0.65
+__all__ = [
+    "DocumentMemoryEngine",
+    "ObserveResult",
+    "SAME_PAGE_TOKEN_OVERLAP",
+    "MIN_WORDS_FOR_TEXT",
+    "is_same_page",
+    "token_overlap",
+    "tokenise",
+]
 
-# A page whose OCR produced fewer words than this is not a page worth
-# remembering as text. It is still counted as observed.
-MIN_WORDS_FOR_TEXT = 3
-
-_TOKEN = re.compile(r"[a-z0-9]+")
-
-
-def tokenise(text: str) -> list[str]:
-    return _TOKEN.findall(text.lower())
-
-
-def token_overlap(left: str, right: str) -> float:
-    """Jaccard overlap of token SETS.
-
-    Sets, not counts: a page re-observed produces the same vocabulary but
-    not the same word frequencies, because OCR splits and merges words
-    differently on each view.
-    """
-    a, b = set(tokenise(left)), set(tokenise(right))
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
+# How many recently recorded documents a new dwell is compared against.
+# Recent by RECORDING order: what a wearer looks back at is what they
+# read a moment ago. Two hundred is far above any real session and
+# costs under a millisecond of set arithmetic.
+RESIGHT_CANDIDATES = 200
 
 
 def is_same_page(existing: str, incoming: str) -> bool:
@@ -100,11 +115,14 @@ def is_same_page(existing: str, incoming: str) -> bool:
 class ObserveResult:
     """What happened to one frame. Cheap to produce, cheap to log."""
 
-    outcome: str  # "no_page" | "dwelling" | "document"
+    outcome: str  # "no_page" | "dwelling" | "document" | "resighted" | "unreadable"
     document_id: str | None = None
     in_dwell: bool = False
     page_detected: bool = False
     sharpness: float | None = None
+    # True when this frame ended a dwell whose page was already on
+    # record; `document_id` then names THAT record.
+    resighted: bool = False
 
 
 class DocumentMemoryEngine:
@@ -123,16 +141,21 @@ class DocumentMemoryEngine:
         policy: DwellPolicy | None = None,
         clock=time.time,
         *,
+        finder: PageFinder | None = None,
         capture_id: str | None = None,
         world_id: str | None = None,
         world_session_id: str | None = None,
         keep_page_images: bool = False,
         assumed_frame_interval_s: float | None = None,
+        resight: bool = True,
     ) -> None:
         self._store = store
         self._recogniser = recogniser
         self._policy = policy or DwellPolicy()
         self._tracker = DwellTracker(self._policy)
+        # The detector is the recogniser itself unless a caller says
+        # otherwise: one model, loaded once, both stages.
+        self._finder = finder or PageFinder(recogniser)
         self._clock = clock
         self._capture_id = capture_id
         self._world_id = world_id
@@ -145,6 +168,7 @@ class DocumentMemoryEngine:
         # has to assume a frame interval, and the assumption is recorded
         # on every document it produces rather than hidden here.
         self._assumed_interval = assumed_frame_interval_s
+        self._resight = resight
         # The last timestamp handed out, real or synthetic. A synthetic
         # one continues from here rather than restarting at "now", so a
         # single frame with a missing timestamp cannot detach the clock
@@ -154,6 +178,9 @@ class DocumentMemoryEngine:
         self._used_assumed_time = False
         self._frames_observed = 0
         self._documents_recorded = 0
+        self._documents_resighted = 0
+        self._dwells_unreadable = 0
+        self._pages_ocred = 0
 
     @property
     def frames_observed(self) -> int:
@@ -164,12 +191,36 @@ class DocumentMemoryEngine:
         return self._documents_recorded
 
     @property
+    def documents_resighted(self) -> int:
+        return self._documents_resighted
+
+    @property
+    def dwells_unreadable(self) -> int:
+        return self._dwells_unreadable
+
+    @property
+    def pages_ocred(self) -> int:
+        return self._pages_ocred
+
+    @property
+    def pages_turned(self) -> int:
+        return self._tracker.segments_opened
+
+    @property
+    def detections(self) -> int:
+        return self._finder.detections
+
+    @property
     def in_dwell(self) -> bool:
         return self._tracker.in_dwell
 
     @property
     def capture_id(self) -> str | None:
         return self._capture_id
+
+    @property
+    def last_gate_verdict(self):
+        return self._finder.last_verdict
 
     def set_capture_id(self, capture_id: str | None) -> None:
         """Adopt the lineage of the frames now arriving.
@@ -184,15 +235,8 @@ class DocumentMemoryEngine:
         was fed by frames from the previous lineage, and restamping it
         would attach a reading to a recording it did not come from.
         Provenance that can be rewritten after the fact is not
-        provenance.
-
-        This paragraph was true as a comment and false as code until
-        2026-08-27. `_record` read `self._capture_id` at RECORD time, so
-        a `stream_start` arriving mid-dwell moved the whole reading onto
-        the new capture and a `stream_stop` nulled it -- both measured,
-        both producing a `page_source_seqs` pointer that resolved into
-        the wrong recording. The id now travels ON THE DWELL, fixed when
-        it started; see `Dwell.lineage`.
+        provenance. The id travels ON THE DWELL, fixed when it started;
+        see `Dwell.lineage`.
         """
         self._capture_id = capture_id
 
@@ -215,7 +259,7 @@ class DocumentMemoryEngine:
             finished = self._tracker.observe(None, at=at)
             return self._resolve(finished, page_detected=False)
 
-        candidate = detect_page(gray)
+        candidate = self._finder.find(gray, at=at)
         diagonal = float(np.hypot(*gray.shape[:2]))
         finished = self._tracker.observe(
             candidate,
@@ -241,7 +285,8 @@ class DocumentMemoryEngine:
         finished = self._tracker.flush(reason)
         if finished is None:
             return None
-        return self._record(finished)
+        document_id, _resighted = self._record(finished)
+        return document_id
 
     def release(self) -> None:
         self._recogniser.release()
@@ -259,6 +304,7 @@ class DocumentMemoryEngine:
         own rule: "we looked and found no readable text" is a real answer,
         and losing the document entirely is not.
         """
+        self._pages_ocred += 1
         try:
             return self._recogniser.read(page_image)
         except Exception:
@@ -310,13 +356,20 @@ class DocumentMemoryEngine:
 
     def _resolve(self, finished, *, page_detected, sharpness=None) -> ObserveResult:
         if finished is not None:
-            document_id = self._record(finished)
+            document_id, resighted = self._record(finished)
+            if document_id is None:
+                outcome = "unreadable"
+            elif resighted:
+                outcome = "resighted"
+            else:
+                outcome = "document"
             return ObserveResult(
-                outcome="document",
+                outcome=outcome,
                 document_id=document_id,
                 in_dwell=self._tracker.in_dwell,
                 page_detected=page_detected,
                 sharpness=sharpness,
+                resighted=resighted,
             )
         return ObserveResult(
             outcome="dwelling" if self._tracker.in_dwell else "no_page",
@@ -325,8 +378,16 @@ class DocumentMemoryEngine:
             sharpness=sharpness,
         )
 
-    def _record(self, dwell) -> str:
-        """The expensive path: warp, OCR, dedup, summarise, persist."""
+    def _record(self, dwell) -> tuple[str | None, bool]:
+        """The expensive path: crop, OCR, dedup, identify, persist.
+
+        Returns `(document_id, resighted)`. `(None, False)` means the
+        dwell produced nothing worth keeping -- OCR found no text at all
+        in any selected frame -- and it is counted, not persisted. A
+        library of "looked, saw nothing" rows is noise to the person
+        searching it; the count on the session status is where that fact
+        belongs.
+        """
         document_id = new_id()
         pages: list[PageObservation] = []
         # OCR returns one region per detected line, so the first region of
@@ -334,21 +395,28 @@ class DocumentMemoryEngine:
         # splitting the joined text would be guessing at structure the
         # recogniser already gave us.
         title_candidate: str | None = None
+        selected = dwell.selected
 
-        for index, frame in enumerate(dwell.best):
-            page_image = warp_page(frame.gray, frame.candidate.corners)
+        for index, frame in enumerate(selected):
+            page_image = crop_region(frame.gray, frame.candidate)
             result = self._read(page_image)
+            readable = _is_readable(result)
+            text = result.text if readable else ""
+            visual_hash = perceptual_hash(page_image)
 
-            duplicate = _find_duplicate(pages, result.text)
+            duplicate = _find_duplicate(pages, text)
             if duplicate is not None:
                 # The same page seen twice within one dwell -- which is the
                 # NORMAL case, since best-frame selection deliberately picks
                 # two views of one page. Merge rather than duplicate, and
                 # keep the higher-confidence reading.
-                pages[pages.index(duplicate)] = _merge(duplicate, result, frame)
+                pages[pages.index(duplicate)] = _merge(
+                    duplicate, result, frame, text=text, readable=readable,
+                    visual_hash=visual_hash,
+                )
                 continue
 
-            if title_candidate is None:
+            if title_candidate is None and readable:
                 title_candidate = _title_from_regions(result.regions)
 
             relpath = None
@@ -358,18 +426,47 @@ class DocumentMemoryEngine:
             pages.append(
                 PageObservation(
                     page_index=len(pages),
-                    text=result.text if result.region_count else "",
+                    text=text,
                     region_count=result.region_count,
                     mean_region_confidence=result.mean_confidence,
                     min_region_confidence=result.min_confidence,
-                    confidence=result.confidence_label,
+                    confidence=result.confidence_label if readable else Confidence.UNKNOWN,
                     sharpness=frame.candidate.sharpness,
                     squareness=frame.candidate.squareness,
                     source_seq=frame.source_seq,
                     observed_at=frame.at,
                     image_relpath=relpath,
+                    visual_hash=visual_hash,
+                    box_count=getattr(frame.candidate, "box_count", 0),
+                    readable=readable,
                 )
             )
+
+        if not any(page.readable for page in pages):
+            # The detector said text; the recogniser could not read it.
+            # PERSISTED all the same, as a page that is not readable:
+            # "we looked and found no readable text" is a real answer and
+            # a different one from "we never looked", and the session
+            # counts these so a library filling with them is visible.
+            self._dwells_unreadable += 1
+
+        if self._resight:
+            existing = self._find_resighting(pages)
+            if existing is not None:
+                sighting = Sighting(
+                    observed_at=dwell.started_at,
+                    observed_seconds=dwell.seconds,
+                    capture_id=dwell.lineage,
+                    source_seq=selected[0].source_seq if selected else None,
+                    end_reason=dwell.end_reason,
+                    frames_considered=dwell.frames_considered,
+                )
+                updated = _with_sighting(existing, sighting, pages)
+                if self._store.update(updated):
+                    self._documents_resighted += 1
+                    return existing.document_id, True
+                # The record vanished between read and write -- a purge
+                # raced us. Fall through and record it afresh.
 
         document = DocumentObservation(
             document_id=document_id,
@@ -380,7 +477,7 @@ class DocumentMemoryEngine:
             title=title_candidate or _title_of(pages),
             summary=_summarise(pages),
             frames_considered=dwell.frames_considered,
-            frames_ocred=len(dwell.best),
+            frames_ocred=len(selected),
             end_reason=dwell.end_reason,
             confidence=_document_confidence(pages),
             # From the DWELL, not from this engine's current field: the
@@ -399,7 +496,46 @@ class DocumentMemoryEngine:
         )
         self._store.append(document)
         self._documents_recorded += 1
-        return document_id
+        return document_id, False
+
+    def _find_resighting(self, pages) -> DocumentObservation | None:
+        """The recorded document these pages are a later look at, or None.
+
+        The FIRST readable page decides. A multi-page dwell whose first
+        page matches a record is that record seen again; whether its
+        later pages are new to the record is a question this version
+        does not answer -- it keeps the record's pages and adds a
+        sighting, which loses nothing that was on disk.
+        """
+        incoming = next((page for page in pages if page.readable), None)
+        if incoming is None:
+            return None
+        probe = Reading(
+            text=incoming.text,
+            mean_confidence=incoming.mean_region_confidence,
+            visual_hash=incoming.visual_hash,
+        )
+        if not probe.can_testify:
+            return None
+        try:
+            candidates = self._store.read_recent(RESIGHT_CANDIDATES)
+        except Exception:
+            logger.exception(
+                "document memory: could not read the library for dedup; "
+                "recording the dwell as new"
+            )
+            return None
+        for document in reversed(candidates):
+            for page in document.pages:
+                if not page.readable:
+                    continue
+                verdict = compare(
+                    Reading(page.text, page.mean_region_confidence, page.visual_hash),
+                    probe,
+                )
+                if verdict.same:
+                    return document
+        return None
 
     def _persist_page_image(self, document_id, index, page_image) -> str | None:
         ok, buffer = cv2.imencode(
@@ -415,6 +551,77 @@ class DocumentMemoryEngine:
         return f"{IMAGES_DIRNAME}/{filename}"
 
 
+# Below this mean confidence what OCR returned is its noise floor: on
+# real 360x640 screen frames it returns fragments at median confidence
+# 0.056, and storing those as text makes a library that matches queries
+# it should not. Deliberately BELOW `identity.MIN_CONFIDENCE_TO_TESTIFY`
+# (0.30): a low-confidence page is kept and labelled LOW, it just cannot
+# vouch for whether another page is the same one.
+READABLE_MIN_CONFIDENCE = 0.15
+
+
+def _is_readable(result: OcrResult) -> bool:
+    """Did OCR produce words a person could search for?
+
+    At least one token of two characters at a mean confidence above the
+    noise floor. The regions are counted either way; the words are kept
+    only when they clear this.
+    """
+    if not result.region_count:
+        return False
+    if (result.mean_confidence or 0.0) < READABLE_MIN_CONFIDENCE:
+        return False
+    words = [token for token in tokenise(result.text) if len(token) >= 2]
+    return len(words) >= 1
+
+
+def _with_sighting(existing, sighting, pages) -> DocumentObservation:
+    """The record, with one more sighting and the better reading kept.
+
+    The first observation's provenance is untouched: `observed_at`,
+    `capture_id`, `pages[*].source_seq` stay what they were. What may
+    improve is the TEXT, page by page, when the new look read the same
+    page with higher confidence -- a re-sighting is often a better look.
+    """
+    improved = list(existing.pages)
+    for incoming in pages:
+        if not incoming.readable:
+            continue
+        for index, page in enumerate(improved):
+            if not page.readable:
+                continue
+            if token_overlap(page.text, incoming.text) < SAME_PAGE_TOKEN_OVERLAP:
+                continue
+            better = (incoming.mean_region_confidence or 0.0) > (
+                page.mean_region_confidence or 0.0
+            )
+            improved[index] = replace(
+                page,
+                text=incoming.text if better else page.text,
+                region_count=incoming.region_count if better else page.region_count,
+                mean_region_confidence=(
+                    incoming.mean_region_confidence
+                    if better
+                    else page.mean_region_confidence
+                ),
+                min_region_confidence=(
+                    incoming.min_region_confidence
+                    if better
+                    else page.min_region_confidence
+                ),
+                confidence=incoming.confidence if better else page.confidence,
+                observation_count=page.observation_count + 1,
+            )
+            break
+    return replace(
+        existing,
+        pages=tuple(improved),
+        sightings=existing.sightings + (sighting,),
+        summary=_summarise(improved) or existing.summary,
+        confidence=_document_confidence(improved),
+    )
+
+
 def _find_duplicate(pages, incoming: str):
     """Which already-recorded page, if any, this reading belongs to.
 
@@ -424,7 +631,7 @@ def _find_duplicate(pages, incoming: str):
     reading the same words again is the same page wherever it sits.
 
     A BLANK match is restricted to the page recorded IMMEDIATELY BEFORE.
-    The dwell's best frames are the two sharpest views of a region, not
+    The dwell's best frames are the sharpest views of a segment, not
     guaranteed to be the same physical page -- a wearer can turn a page
     without the region moving. An adversarial review showed the
     unrestricted rule erasing a genuinely different page whenever OCR
@@ -467,17 +674,19 @@ def _decode_gray(raw_bytes: bytes):
         return None
 
 
-def _merge(page: PageObservation, result, frame) -> PageObservation:
+def _merge(page: PageObservation, result, frame, *, text, readable, visual_hash):
     """Keep the better reading of the same page, and count both views."""
-    from dataclasses import replace
-
     incoming_confidence = result.mean_confidence or 0.0
     existing_confidence = page.mean_region_confidence or 0.0
-    if incoming_confidence <= existing_confidence:
-        return replace(page, observation_count=page.observation_count + 1)
+    if not readable or incoming_confidence <= existing_confidence:
+        return replace(
+            page,
+            observation_count=page.observation_count + 1,
+            visual_hash=page.visual_hash or visual_hash,
+        )
     return replace(
         page,
-        text=result.text if result.region_count else page.text,
+        text=text,
         region_count=result.region_count,
         mean_region_confidence=result.mean_confidence,
         min_region_confidence=result.min_confidence,
@@ -485,6 +694,9 @@ def _merge(page: PageObservation, result, frame) -> PageObservation:
         sharpness=frame.candidate.sharpness,
         squareness=frame.candidate.squareness,
         observation_count=page.observation_count + 1,
+        visual_hash=visual_hash or page.visual_hash,
+        box_count=getattr(frame.candidate, "box_count", page.box_count),
+        readable=True,
     )
 
 

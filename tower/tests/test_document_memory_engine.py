@@ -107,7 +107,10 @@ class TestItObservesADocument:
         _run(store, fx.document_frames(fx.RECEIPT, 20), recogniser=recogniser)
 
         assert recogniser.calls <= POLICY.best_frames
-        assert store.read_all()[0].frames_considered >= 20
+        # Nineteen, not twenty: the first frame of a stream has nothing
+        # to be steady AGAINST, so the gate never admits it. Since
+        # 2026-09-07 a dwell starts on the second frame at the earliest.
+        assert store.read_all()[0].frames_considered >= 19
 
 
 class TestItSeparatesAndDeduplicates:
@@ -230,7 +233,9 @@ class TestHonesty:
 
         assert document.timing_source == TIMING_ASSUMED_INTERVAL
         assert document.assumed_frame_interval_s == 0.3
-        assert document.observed_seconds == pytest.approx(0.3 * 7, abs=0.01)
+        # Six intervals over seven admitted frames: the first frame of
+        # the stream is never admitted (nothing to be steady against).
+        assert document.observed_seconds == pytest.approx(0.3 * 6, abs=0.01)
 
     def test_a_document_is_only_as_confident_as_its_worst_page(self, store):
         """Averaging would let one crisp page hide a barely legible one."""

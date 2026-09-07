@@ -147,40 +147,154 @@ class FixedTextRecogniser:
             text=" ".join(region.text for region in regions), regions=regions
         )
 
+    def detect(self, gray):
+        """Where the text is, by morphology. See `gate.classical_text_boxes`.
+
+        The fake reads text a test chose; it cannot know where a test's
+        rendered page is. The classical detector can, deterministically
+        and offline, on the rendered pages the fixtures produce.
+        """
+        from tower.document_memory.gate import classical_text_boxes
+
+        return classical_text_boxes(gray)
+
     def release(self) -> None:
         return None
 
 
+class OcrExtraMissing(RuntimeError):
+    """The `[ocr]` extra is not installed in this environment.
+
+    Its own type so a message written for a person passes through
+    `client_safe_reason` to the phone, where "ModuleNotFoundError" would
+    not have told anyone what to install.
+    """
+
+
+def require_ocr_extra() -> None:
+    """Refuse, with instructions, when easyocr is not installed.
+
+    `find_spec` locates without importing: the web process must not pay
+    torch's import to learn whether a cartridge is available, and
+    `test_the_ocr_dependency_is_not_imported_at_module_load` holds it to
+    that.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("easyocr") is None:
+        raise OcrExtraMissing(
+            "the OCR extra is not installed; install it with "
+            "`pip install -e .[ocr]` after the `[ml]` torch wheels"
+        )
+
+
+def resolve_ocr_device(requested: str) -> bool:
+    """Whether the reader may use CUDA. "auto" downgrades; "cuda" refuses.
+
+    Returns a bool because that is what EasyOCR takes. The rule is the
+    one `cartridge_runtime._resolve_device` states for Scene: an
+    unnoticed downgrade from cuda to cpu turns a GPU deployment into a
+    CPU one with a GPU label on it, which is worse than a failure.
+    """
+    if requested == "cpu":
+        return False
+    import torch
+
+    available = bool(torch.cuda.is_available())
+    if requested == "cuda" and not available:
+        raise RuntimeError("cuda requested but torch reports it is unavailable")
+    return available
+
+
+@dataclass(frozen=True)
+class TextBox:
+    """One region the DETECTOR found, before any recognition.
+
+    Axis-aligned, in the coordinates of the image it was found in. The
+    detector answers "is there text, and where" for a few tens of
+    milliseconds on a GPU; recognition, ten times the cost, is spent
+    only on a frame this evidence has earned.
+    """
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def height(self) -> float:
+        return abs(self.y1 - self.y0)
+
+    @property
+    def area(self) -> float:
+        return abs(self.x1 - self.x0) * abs(self.y1 - self.y0)
+
+
 class EasyOcrRecogniser:
-    """EasyOCR, loaded lazily and released explicitly.
+    """EasyOCR, loaded explicitly and released for real.
 
     Chosen over the alternatives for one disqualifying reason on each of
     them: `pytesseract` needs a system binary that is not present and pip
-    cannot install; `rapidocr_onnxruntime` pulls `opencv-python` alongside
-    this project's `opencv-python-headless`, and two cv2 distributions in
-    one environment is a known breakage. EasyOCR adds no cv2 and reuses
-    the torch already in the `ml` extra.
+    cannot install; `rapidocr_onnxruntime` and PaddleOCR pull
+    `opencv-python` alongside this project's `opencv-python-headless`,
+    and two cv2 distributions in one environment is a known breakage.
+    EasyOCR adds no cv2 and reuses the torch already in the `ml` extra.
 
-    Measured on a rendered 800x1040 page: reader construction 5.1 s once,
-    then 1.19 s per page on CPU, 0.987 sequence similarity against the
-    known rendered text.
+    Measured 2026-09-06 on an RTX 5070 against rendered pages with known
+    text: reader construction 1.3 s, 0.27 s per 800x1040 page on CUDA
+    against 1.86 s on CPU, 0.98 word recall at 360x640 when the page
+    fills the frame. The detector-only stage (`detect`) is 31-47 ms at
+    360x640 and 55-66 ms at 504x896, and 0 boxes on a noise frame.
+
+    `device` follows the Tower's vocabulary ("auto" / "cuda" / "cpu")
+    and is resolved at `load`, on the worker thread, so the web process
+    never imports torch to construct a session.
     """
 
     name = "easyocr"
 
-    def __init__(self, languages=("en",), gpu: bool = False) -> None:
+    def __init__(self, languages=("en",), device: str = "auto") -> None:
         self._languages = list(languages)
-        self._gpu = gpu
+        self._device = device
+        self._gpu: bool | None = None
         self._reader = None
+
+    @property
+    def device(self) -> str | None:
+        """The device actually in use once loaded, else None."""
+        if self._gpu is None:
+            return None
+        return "cuda" if self._gpu else "cpu"
 
     def load(self) -> None:
         # Local import: easyocr is an optional [ocr] extra and nothing
         # outside a document-reading path may require it.
         import easyocr
 
+        self._gpu = resolve_ocr_device(self._device)
         self._reader = easyocr.Reader(
             self._languages, gpu=self._gpu, verbose=False
         )
+
+    def detect(self, gray) -> tuple[TextBox, ...]:
+        """Where the text is, without reading it. The cheap GPU stage."""
+        if self._reader is None:
+            self.load()
+        horizontal, free = self._reader.detect(gray)
+        boxes = []
+        for group in horizontal:
+            for entry in group:
+                try:
+                    x0, x1, y0, y1 = (float(value) for value in entry)
+                except (TypeError, ValueError):
+                    continue
+                boxes.append(TextBox(x0, y0, x1, y1))
+        for group in free:
+            for polygon in group:
+                bounds = _bounds(polygon)
+                if bounds is not None:
+                    boxes.append(TextBox(*bounds))
+        return tuple(boxes)
 
     def read(self, page_gray) -> OcrResult:
         if self._reader is None:
@@ -200,7 +314,27 @@ class EasyOcrRecogniser:
         )
 
     def release(self) -> None:
+        """Drop the models and hand the GPU memory back.
+
+        Dropping the reference alone left ~1.4 GB reserved on the device
+        after a session (measured); the cache release brings it to the
+        ~0.2 GB the CUDA context itself costs, which is what "a cartridge
+        that is not running holds nothing worth mentioning" has to mean
+        on a Tower that will run other cartridges next.
+        """
+        import gc
+
         self._reader = None
+        was_gpu = self._gpu
+        self._gpu = None
+        gc.collect()
+        if was_gpu:
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # pragma: no cover - torch absent or no device
+                logger.debug("document memory: could not empty the CUDA cache")
 
 
 def _bounds(polygon) -> tuple[float, float, float, float] | None:

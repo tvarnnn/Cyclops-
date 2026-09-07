@@ -65,6 +65,7 @@ class TestASceneSessionWritesNothing:
         monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
         monkeypatch.delenv("TOWER_CAPTURE_ROOT", raising=False)
         monkeypatch.delenv("TOWER_DOCUMENT_ROOT", raising=False)
+        monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "false")
         monkeypatch.setattr(
             cartridge_runtime,
             "_scene_session",

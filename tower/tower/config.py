@@ -26,6 +26,16 @@ TOWER_ROOT = Path(__file__).resolve().parent.parent
 # harder-to-see form.
 DEFAULT_OBSERVATION_ROOT = str(TOWER_ROOT / "data" / "object_memory")
 
+# Where Document Memory writes what it read and where `/documents` reads
+# it back, when nobody says otherwise. The same reasoning as the
+# observation root above, arrived at from the same failure: until
+# 2026-09-07 this cartridge had NO default, so a stock Tower declared
+# it unavailable and the phone told the wearer to set an environment
+# variable. A cartridge a person cannot reach without editing a shell
+# is not a product feature. Isolated from the sibling cartridges by
+# directory, never shared with them.
+DEFAULT_DOCUMENT_ROOT = str(TOWER_ROOT / "data" / "document_memory")
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -399,16 +409,38 @@ class Settings:
     #
     # None means the document routes answer 404 and `/cartridges` reports
     # the cartridge unavailable -- a claim about configuration, never
-    # about what was ever read.
+    # about what was ever read. Since 2026-09-07 it is reachable ONLY by
+    # switching the cartridge off (`document_enabled`), never by
+    # forgetting to set a path: the default is `DEFAULT_DOCUMENT_ROOT`.
     document_root: str | None = None
+    # Whether this Tower runs Document Memory at all.
+    #
+    # On by default, and that is a smaller claim than it looks: an
+    # enabled cartridge records nothing until a wearer starts a session.
+    # Off means no root, no session, and `/documents` answers 404.
+    document_enabled: bool = True
     # Whether a live document session may attach to the stream.
     #
-    # OFF by default and separately from the root, because the two
-    # answer different questions. A root with capture off is a Tower that
-    # will serve a library recorded elsewhere and record nothing itself,
-    # which is the right posture for a machine reprocessing captures
-    # offline -- and the same escape hatch `world_autobuild` provides.
-    document_capture: bool = False
+    # ON when the cartridge is enabled, since 2026-09-07. A session that
+    # EXISTS is not a session that RECORDS: it starts only when a person
+    # starts it (`document_autostart` below stays off). Off is the
+    # posture for a machine that serves a library recorded elsewhere and
+    # records nothing itself -- the escape hatch `world_autobuild`
+    # provides for the builder.
+    document_capture: bool = True
+    # Where the OCR reader runs: "auto", "cuda" or "cpu". Resolved when a
+    # session starts, in the cartridge, because this process must not
+    # import torch to read its settings. Measured on the RTX 5070: a page
+    # reads in ~0.3 s on CUDA against ~1.9 s on CPU, and the difference
+    # is the difference between a flush at Stop that fits inside the
+    # session's 5 s join budget and one that does not.
+    document_device: str = "auto"
+    # How long a recorded document is kept, in days. 30, matching the
+    # session's own default rather than the store's constructor default
+    # of "forever": documents are the platform's clearest case of
+    # sensitive content and an unbounded window must be chosen, never
+    # inherited.
+    document_retention_days: float = 30.0
     # Whether `stream_start` starts a DOCUMENT session.
     #
     # OFF by default, unlike Scene Understanding's, and the asymmetry is
@@ -459,6 +491,7 @@ class Settings:
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
+    document_enabled = _flag("TOWER_DOCUMENT_ENABLED", default=True)
     return Settings(
         host=os.environ.get("TOWER_HOST", "0.0.0.0"),
         port=int(os.environ.get("TOWER_PORT", "8000")),
@@ -507,9 +540,32 @@ def get_settings() -> Settings:
             os.environ.get("TOWER_SCENE_TORCH_THREADS"), default=0
         ),
         scene_autostart=_flag("TOWER_SCENE_AUTOSTART", default=True),
-        document_root=_optional_path(os.environ.get("TOWER_DOCUMENT_ROOT")),
-        document_capture=_flag("TOWER_DOCUMENT_CAPTURE", default=False),
+        document_root=_document_root(document_enabled),
+        document_enabled=document_enabled,
+        document_capture=(
+            document_enabled and _flag("TOWER_DOCUMENT_CAPTURE", default=True)
+        ),
         document_autostart=_flag("TOWER_DOCUMENT_AUTOSTART", default=False),
+        document_device=_device(
+            os.environ.get("TOWER_DOCUMENT_DEVICE"), default="auto"
+        ),
+        document_retention_days=_non_negative_float(
+            os.environ.get("TOWER_DOCUMENT_RETENTION_DAYS"), default=30.0
+        ),
+    )
+
+
+def _document_root(enabled: bool) -> str | None:
+    """The one path the session writes and the read routes serve.
+
+    Same shape as `_observation_root`, for the same reason: an explicit
+    `TOWER_DOCUMENT_ROOT` wins, not choosing one no longer means the
+    cartridge is unreachable, and switching it off wins over both.
+    """
+    if not enabled:
+        return None
+    return _optional_path(os.environ.get("TOWER_DOCUMENT_ROOT")) or (
+        DEFAULT_DOCUMENT_ROOT
     )
 
 

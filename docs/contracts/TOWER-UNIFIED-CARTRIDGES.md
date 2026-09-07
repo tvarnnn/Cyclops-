@@ -48,8 +48,8 @@ of identifier is a change of contract and is the only signal a client gets.
 | `experimental_cv.control/2026-08-27` | CV Lab command vocabulary | §6 |
 | `experimental_cv.frame_result/2026-08-27` | the `cv_lab` block on every `frame_result` | §6 |
 | `scene_understanding.live/2026-08-27` | Scene Understanding live state | §7 |
-| `document_memory.status/2026-08-27` | Document Memory session status, subscription | §8 |
-| `document_memory.library/2026-08-27` | Document Memory library, HTTP | §8 |
+| `document_memory.status/2026-09-07` | Document Memory session status, subscription | §8 |
+| `document_memory.library/2026-09-07` | Document Memory library, HTTP | §8 |
 | `object_memory.observations/2026-08-26` | Object Memory query results, HTTP | §9 |
 | `object_memory.imagery/2026-08-27` | Object Memory frame/crop retrieval, HTTP | §9 |
 | `cartridge_session.control/2026-08-27` | the generic Start/Pause/Resume/Stop surface | §4 |
@@ -117,9 +117,9 @@ is the designated answer for a failure only a load can discover.
 | `world_builder` | `status` | `world_builder.status/2026-08-25` | `TOWER_WORLD_ROOT` is set |
 | `experimental_cv` | `status` | `experimental_cv.status/2026-08-27` | a CV Lab module exists (normally always) |
 | `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | `TOWER_SCENE_UNDERSTANDING` is on **and** the session constructs (needs `torch`/`torchvision`, the `[ml]` extra) |
-| `document_memory` | `status` | `document_memory.status/2026-08-27` | `TOWER_DOCUMENT_ROOT` is set |
+| `document_memory` | `status` | `document_memory.status/2026-09-07` | `TOWER_DOCUMENT_ENABLED` is on (the default since 2026-09-07; the root has a managed default under `tower/data/document_memory`, `TOWER_DOCUMENT_ROOT` overrides it) |
 
-`http_contracts` carries one entry — `document_memory.library/2026-08-27`
+`http_contracts` carries one entry — `document_memory.library/2026-09-07`
 at `entry_route: /documents` — with an `available`, an
 `unavailable_reason` and a `why_not_a_subscription`. World Builder's
 geometry and Object Memory's observations are the same shape and are

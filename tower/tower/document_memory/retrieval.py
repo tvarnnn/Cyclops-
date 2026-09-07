@@ -13,11 +13,31 @@ retrieval" would be an overclaim of exactly the kind `02-DEVELOPMENT-RULES.md`
 Rule 16 exists to prevent, so every result carries `match_kind:
 "lexical"` and the API name says `search_text`, not `search_meaning`.
 
+Three things changed on 2026-09-07, all measured against OCR output
+rather than clean text:
+
+**Pages are the unit of scoring.** A document is a dwell; a dwell may
+hold several pages; the wearer asks about the page. Scoring pages and
+reporting the best one per document is what lets a result say WHICH
+page said "port 8000", and the snippet comes from that page.
+
+**A query term matches an OCR'd token that is nearly it.** OCR reads
+"Kubernetes" as "Kubemetes" often enough that exact tokens miss real
+pages. A term of five or more characters also matches a token within
+one edit of it, or one that begins with it; shorter terms match exactly.
+Tolerance is bounded so "port" does not match "sport".
+
+**The corpus is cached on the journal's stamp.** The status producer
+already stat-gates on `(mtime_ns, size)`; the corpus does the same, so a
+query re-tokenises the library only when the library changed. A newly
+persisted page changes the stamp and is searchable on the next query,
+which is the "immediately searchable" the product needs.
+
 Embeddings are the documented upgrade path, with a named trigger: when a
 measured query set shows lexical recall failing on paraphrase. Until then
-BM25 is forty lines, needs no dependency, and -- more important here than
-ranking finesse -- is **explainable**: every result carries the terms it
-matched on and a snippet of the text it matched in, so an answer is always
+BM25 needs no dependency and -- more important here than ranking
+finesse -- is **explainable**: every result carries the terms it matched
+on and a snippet of the text it matched in, so an answer is always
 traceable back to text that was actually captured.
 
 Nothing here ever synthesises an answer. It returns records, or it
@@ -26,6 +46,7 @@ returns nothing and says so.
 
 import math
 import re
+import threading
 from dataclasses import dataclass, field
 
 from tower.confidence import Confidence
@@ -43,6 +64,19 @@ BM25_B = 0.75
 # data once a real query set exists.
 MIN_SCORE = 0.10
 
+# A term this long or longer may match a token one edit away or one it
+# is a prefix of. Shorter terms match exactly: "port" must not find
+# "sport", and a four-letter word one edit from another four-letter
+# word is usually a different word.
+FUZZY_MIN_TERM_LENGTH = 5
+# And a fuzzy match is worth less than an exact one, so a page that
+# actually says the word outranks one that nearly does.
+FUZZY_WEIGHT = 0.6
+
+# Words in a page's TITLE count this many times over. The title is the
+# document's first line, which is what a person remembers.
+TITLE_WEIGHT = 2
+
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 # Deliberately tiny. A large stopword list is a language model in
@@ -58,6 +92,25 @@ def tokenise(text: str) -> list[str]:
     return [token for token in _TOKEN.findall(text.lower()) if token not in STOPWORDS]
 
 
+def within_one_edit(left: str, right: str) -> bool:
+    """Levenshtein distance <= 1, without building the matrix.
+
+    Two strings of equal length differ by one substitution; strings one
+    apart in length differ by one insertion. Anything else is farther.
+    """
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(1 for a, b in zip(left, right) if a != b) == 1
+    short, long_ = (left, right) if len(left) < len(right) else (right, left)
+    index = 0
+    while index < len(short) and short[index] == long_[index]:
+        index += 1
+    return short[index:] == long_[index + 1 :]
+
+
 @dataclass(frozen=True)
 class Match:
     """One retrieved document, and why it was retrieved."""
@@ -67,6 +120,11 @@ class Match:
     match_kind: str
     matched_terms: tuple[str, ...] = ()
     snippet: str = ""
+    # Which page carried the best-scoring text, and its own score.
+    page_index: int | None = None
+    page_score: float = 0.0
+    # Whether any matched term was a near-miss rather than the word.
+    fuzzy: bool = False
 
     @property
     def document_id(self) -> str:
@@ -85,6 +143,8 @@ class Match:
             "match_kind": self.match_kind,
             "matched_terms": list(self.matched_terms),
             "snippet": self.snippet,
+            "page_index": self.page_index,
+            "fuzzy": self.fuzzy,
         }
 
 
@@ -103,6 +163,7 @@ class QueryResult:
     sufficient_evidence: bool = False
     reason: str = ""
     searched_documents: int = 0
+    searched_pages: int = 0
     min_score: float = MIN_SCORE
 
     def to_json_dict(self) -> dict:
@@ -111,52 +172,114 @@ class QueryResult:
             "sufficient_evidence": self.sufficient_evidence,
             "reason": self.reason,
             "searched_documents": self.searched_documents,
+            "searched_pages": self.searched_pages,
             "min_score": self.min_score,
             "matches": [match.to_json_dict() for match in self.matches],
         }
 
 
 @dataclass
-class _Corpus:
-    documents: list[DocumentObservation]
-    tokens: list[list[str]] = field(default_factory=list)
+class _Page:
+    """One scoring unit: a page's tokens plus its document's title's."""
+
+    document_index: int
+    page_index: int
+    tokens: list[str]
+    text: str
+    frequencies: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        self.tokens = [tokenise(document.text) for document in self.documents]
-        lengths = [len(token_list) for token_list in self.tokens]
-        self.average_length = sum(lengths) / len(lengths) if lengths else 0.0
-        # How many documents contain each term. A property of (corpus,
-        # term) and NOT of the document being scored, which is why it
-        # belongs here and not in `_bm25`.
-        #
-        # It used to be computed inside the per-document loop as
-        # `sum(1 for token_list in corpus.tokens if term in set(token_list))`
-        # -- so scoring D documents against T query terms rescanned the
-        # whole corpus D*T times AND rebuilt a set per document per scan.
-        # Exactly quadratic in library size. Same-session A/B on the test
-        # fixture's short documents: 0.89 ms -> 0.49 ms at 25, and
-        # 356.92 ms -> 14.18 ms at 800. An independent audit measured
-        # 9,532 ms at 800 on a heavier corpus of realistic page-length
-        # text; both are the same defect at different document lengths.
-        #
-        # This pass costs 0.98 ms at 800 on the short-document corpus and
-        # scales with total tokens, not with D^2. The multiplier is
-        # roughly length-INDEPENDENT (old is O(D^2*T*L), new is O(D*L),
-        # so L cancels); what grows with page length is the absolute time
-        # saved, measured at 671 ms for 400 realistic pages.
-        #
-        # Arithmetically identical, not merely close: `containing` for a
-        # given term took the same value on every iteration it was
-        # recomputed, so hoisting cannot move a score. Pinned by
-        # TestDocumentFrequencyIsCorpusWideAndComputedOnce, which checks
-        # this map against the original expression term by term and holds
-        # the three ranked scores the old code produced.
-        self.document_frequency: dict[str, int] = {}
-        for token_list in self.tokens:
-            for token in set(token_list):
-                self.document_frequency[token] = (
-                    self.document_frequency.get(token, 0) + 1
+        for token in self.tokens:
+            self.frequencies[token] = self.frequencies.get(token, 0) + 1
+
+
+@dataclass
+class _Corpus:
+    documents: list[DocumentObservation]
+    pages: list[_Page] = field(default_factory=list)
+
+    def __post_init__(self):
+        for document_index, document in enumerate(self.documents):
+            title_tokens = tokenise(document.title or "") * TITLE_WEIGHT
+            readable = [page for page in document.pages if page.text.strip()]
+            if not readable:
+                continue
+            for page in readable:
+                self.pages.append(
+                    _Page(
+                        document_index=document_index,
+                        page_index=page.page_index,
+                        tokens=tokenise(page.text) + title_tokens,
+                        text=page.text,
+                    )
                 )
+        lengths = [len(page.tokens) for page in self.pages]
+        self.average_length = sum(lengths) / len(lengths) if lengths else 0.0
+        # How many pages contain each token. A property of (corpus,
+        # term) and NOT of the page being scored, computed once: an
+        # earlier version recomputed it inside the scoring loop and was
+        # quadratic in library size (356.92 ms -> 14.18 ms at 800 docs
+        # when hoisted).
+        self.page_frequency: dict[str, int] = {}
+        for page in self.pages:
+            for token in set(page.tokens):
+                self.page_frequency[token] = self.page_frequency.get(token, 0) + 1
+        self.vocabulary = list(self.page_frequency)
+
+    def expand(self, term: str) -> dict[str, float]:
+        """The corpus tokens a query term matches, each with its weight.
+
+        Exact is 1.0. For a long enough term, a token within one edit or
+        one the term is a prefix of is `FUZZY_WEIGHT`. Bounded to the
+        vocabulary, which is what keeps this cheap: a library of a
+        thousand pages has a few thousand distinct tokens.
+        """
+        matches = {}
+        if term in self.page_frequency:
+            matches[term] = 1.0
+        if len(term) < FUZZY_MIN_TERM_LENGTH:
+            return matches
+        for token in self.vocabulary:
+            if token == term:
+                continue
+            if token.startswith(term) or within_one_edit(term, token):
+                matches[token] = max(matches.get(token, 0.0), FUZZY_WEIGHT)
+        return matches
+
+
+class _CorpusCache:
+    """One parsed corpus per store path, keyed on the journal's stamp.
+
+    Process-wide and lock-guarded, because the routes construct a fresh
+    `DocumentStore` per request and a cache on the store would be a
+    cache of one.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict = {}
+
+    def get(self, store) -> _Corpus:
+        path = getattr(store, "path", None)
+        if path is None:
+            return _Corpus(store.read_all())
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size, store.retention_seconds)
+        except FileNotFoundError:
+            stamp = None
+        key = str(path)
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None and cached[0] == stamp and stamp is not None:
+                return cached[1]
+        corpus = _Corpus(store.read_all())
+        with self._lock:
+            self._entries[key] = (stamp, corpus)
+        return corpus
+
+
+_CACHE = _CorpusCache()
 
 
 class DocumentMemory:
@@ -166,9 +289,14 @@ class DocumentMemory:
         self._store = store
 
     def recent(self, limit: int = 10) -> list[DocumentObservation]:
-        """The most recently observed documents, newest first."""
+        """The most recently observed documents, newest first.
+
+        By LAST observation: a document seen again this morning is more
+        recent than one seen once an hour ago, whatever their first
+        observations say.
+        """
         documents = self._store.read_all()
-        documents.sort(key=lambda document: document.observed_at, reverse=True)
+        documents.sort(key=lambda document: document.last_observed_at, reverse=True)
         return documents[:limit]
 
     def around(
@@ -179,25 +307,29 @@ class DocumentMemory:
         Ordered by how close each observation is to the asked-about time,
         because "about" is the operative word: the nearest document is
         the answer, and the window only bounds how far "about" stretches.
+        A sighting inside the window counts as much as a first
+        observation: the document WAS in view then.
 
         `observed_at` is `tower-receipt` time, not capture time. Over the
         minutes-scale windows this API is for, the difference is far below
         the resolution of the question -- but a caller rendering an exact
         clock time must still label it as received (Rule 16).
         """
-        documents = [
-            document
-            for document in self._store.read_all()
-            if abs(document.observed_at - when) <= window_seconds
-        ]
-        documents.sort(key=lambda document: abs(document.observed_at - when))
-        return documents
+        scored = []
+        for document in self._store.read_all():
+            times = [document.observed_at] + [s.observed_at for s in document.sightings]
+            distance = min(abs(at - when) for at in times)
+            if distance <= window_seconds:
+                scored.append((distance, document))
+        scored.sort(key=lambda entry: entry[0])
+        return [document for _distance, document in scored]
 
     def search_text(
         self, query: str, limit: int = 5, min_score: float = MIN_SCORE
     ) -> QueryResult:
-        """Lexical BM25 over stored OCR text. Refuses rather than guesses."""
-        documents = self._store.read_all()
+        """Lexical BM25 over stored OCR text, page by page. Refuses rather than guesses."""
+        corpus = _CACHE.get(self._store)
+        documents = corpus.documents
         query_terms = tokenise(query)
 
         if not documents:
@@ -212,26 +344,34 @@ class DocumentMemory:
                 query=query,
                 reason="the query contains no searchable terms",
                 searched_documents=len(documents),
+                searched_pages=len(corpus.pages),
                 min_score=min_score,
             )
 
-        corpus = _Corpus(documents)
-        scored = []
-        for index, document in enumerate(documents):
-            score, matched = _bm25(query_terms, corpus, index)
+        expansions = {term: corpus.expand(term) for term in set(query_terms)}
+        best_per_document: dict[int, Match] = {}
+        for page in corpus.pages:
+            score, matched, fuzzy = _bm25(expansions, corpus, page)
             if score < min_score:
                 continue
-            scored.append(
-                Match(
-                    document=document,
-                    score=score,
-                    match_kind="lexical",
-                    matched_terms=tuple(sorted(matched)),
-                    snippet=_snippet(document.text, matched),
-                )
+            document = documents[page.document_index]
+            current = best_per_document.get(page.document_index)
+            if current is not None and current.page_score >= score:
+                continue
+            best_per_document[page.document_index] = Match(
+                document=document,
+                score=score,
+                match_kind="lexical",
+                matched_terms=tuple(sorted(matched)),
+                snippet=_snippet(page.text, matched),
+                page_index=page.page_index,
+                page_score=score,
+                fuzzy=fuzzy,
             )
 
-        scored.sort(key=lambda match: match.score, reverse=True)
+        scored = sorted(
+            best_per_document.values(), key=lambda match: match.score, reverse=True
+        )
         if not scored:
             return QueryResult(
                 query=query,
@@ -241,6 +381,7 @@ class DocumentMemory:
                     "documents say"
                 ),
                 searched_documents=len(documents),
+                searched_pages=len(corpus.pages),
                 min_score=min_score,
             )
         return QueryResult(
@@ -249,6 +390,7 @@ class DocumentMemory:
             sufficient_evidence=True,
             reason="lexical match on stored OCR text",
             searched_documents=len(documents),
+            searched_pages=len(corpus.pages),
             min_score=min_score,
         )
 
@@ -284,37 +426,40 @@ class DocumentMemory:
         }
 
 
-def _bm25(query_terms, corpus: _Corpus, index: int) -> tuple[float, set[str]]:
-    tokens = corpus.tokens[index]
+def _bm25(expansions, corpus: _Corpus, page: _Page) -> tuple[float, set[str], bool]:
+    tokens = page.tokens
     if not tokens:
-        return 0.0, set()
+        return 0.0, set(), False
 
     length = len(tokens)
-    total_documents = len(corpus.documents)
-    frequencies = {}
-    for token in tokens:
-        frequencies[token] = frequencies.get(token, 0) + 1
-
+    total_pages = len(corpus.pages)
     score = 0.0
     matched = set()
-    for term in set(query_terms):
-        term_frequency = frequencies.get(term, 0)
-        if term_frequency == 0:
+    fuzzy = False
+    for term, candidates in expansions.items():
+        # The best-weighted corpus token this term matches on this page.
+        best_weight = 0.0
+        best_token = None
+        for token, weight in candidates.items():
+            if page.frequencies.get(token, 0) and weight > best_weight:
+                best_weight, best_token = weight, token
+        if best_token is None:
             continue
-        matched.add(term)
-        containing = corpus.document_frequency.get(term, 0)
+        matched.add(best_token)
+        if best_weight < 1.0:
+            fuzzy = True
+        term_frequency = page.frequencies[best_token]
+        containing = corpus.page_frequency.get(best_token, 0)
         # The +0.5/+0.5 smoothing keeps IDF positive on a tiny corpus. On
-        # three documents the textbook form goes NEGATIVE for a term that
-        # appears in most of them, which would rank a document DOWN for
+        # three pages the textbook form goes NEGATIVE for a term that
+        # appears in most of them, which would rank a page DOWN for
         # containing the word that was asked for.
-        idf = math.log(
-            1.0 + (total_documents - containing + 0.5) / (containing + 0.5)
-        )
+        idf = math.log(1.0 + (total_pages - containing + 0.5) / (containing + 0.5))
         denominator = term_frequency + BM25_K1 * (
             1 - BM25_B + BM25_B * length / max(corpus.average_length, 1.0)
         )
-        score += idf * (term_frequency * (BM25_K1 + 1)) / denominator
-    return score, matched
+        score += best_weight * idf * (term_frequency * (BM25_K1 + 1)) / denominator
+    return score, matched, fuzzy
 
 
 def _snippet(text: str, matched_terms, width: int = 160) -> str:

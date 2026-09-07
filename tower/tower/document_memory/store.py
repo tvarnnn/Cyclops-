@@ -85,6 +85,43 @@ class DocumentStore:
         with self._lock:
             append_jsonl(self._path, document.to_json_dict())
 
+    def update(self, document: DocumentObservation) -> bool:
+        """Replace the stored record with this id. False if there is none.
+
+        The one write that is not an append, and it exists for one
+        reason: a document seen AGAIN gains a sighting, and a sighting
+        belongs on the record it is a sighting of. Rewritten the way
+        prune and purge rewrite -- atomically, whole-file, on raw dicts
+        -- so a crash mid-update leaves the previous file intact and an
+        unknown key on some other record survives untouched.
+        """
+        import json
+        import os
+
+        with self._lock:
+            raw_records, _ = read_raw_jsonl(self._path)
+            replaced = False
+            kept = []
+            for record in raw_records:
+                if record.get("document_id") == document.document_id:
+                    kept.append(document.to_json_dict())
+                    replaced = True
+                else:
+                    kept.append(record)
+            if not replaced:
+                return False
+            temp_path = self._path.with_name(self._path.name + TEMP_SUFFIX)
+            try:
+                with temp_path.open("w", encoding="utf-8") as handle:
+                    for record in kept:
+                        handle.write(json.dumps(record) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temp_path.replace(self._path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+            return True
+
     def write_page_image(self, filename: str, jpeg_bytes: bytes) -> Path:
         """Persist one corrected page image. Off the default path.
 
@@ -216,6 +253,16 @@ class DocumentStore:
             if document.document_id == document_id:
                 return document
         return None
+
+    def read_recent(self, limit: int) -> list[DocumentObservation]:
+        """The `limit` most recently RECORDED documents, newest last.
+
+        Recorded order, not observed order: this is the dedup candidate
+        set, and what a wearer is likely to look at again is what was
+        written most recently.
+        """
+        documents = self.read_all()
+        return documents[-limit:] if limit > 0 else []
 
     def count(self, *, include_expired: bool = False) -> int:
         # The keyword was accepted and dropped for one commit. A privacy

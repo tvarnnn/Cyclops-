@@ -61,6 +61,7 @@ def make_snapshot_for(
     scene_source=None,
     document_source=None,
     cv_lab=None,
+    document_unavailable_reason=None,
 ):
     """A callable turning (cartridge, result_type, world, session) into a Snapshot.
 
@@ -161,7 +162,10 @@ def make_snapshot_for(
             producer = producers.get(cartridge)
             if producer is None:
                 producer = DocumentStatusProducer(
-                    document_root, document_source, clock=clock
+                    document_root,
+                    document_source,
+                    clock=clock,
+                    unavailable_reason=document_unavailable_reason,
                 )
                 producers[cartridge] = producer
             payload = producer.payload()
@@ -213,6 +217,7 @@ def build_hub(
     scene_source=None,
     document_source=None,
     cv_lab=None,
+    document_unavailable_reason=None,
 ) -> ResultHub:
     return ResultHub(
         make_snapshot_for(
@@ -222,6 +227,7 @@ def build_hub(
             scene_source=scene_source,
             document_source=document_source,
             cv_lab=cv_lab,
+            document_unavailable_reason=document_unavailable_reason,
         ),
         clock=clock,
     )

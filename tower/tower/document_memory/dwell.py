@@ -1,26 +1,35 @@
 """Has this page been held in view long enough to be worth reading?
 
-The expensive path costs ~1.2 s of OCR per page, so the whole design
-depends on this stage being both cheap and stingy. A single frame
-containing a page-shaped object is not a reading event; it is a glance, a
+The expensive path costs ~0.3 s of GPU OCR per page (1.9 s on CPU), so
+the whole design depends on this stage being both cheap and stingy. A
+single frame containing text is not a reading event; it is a glance, a
 reflection, or a poster on a wall the wearer walked past.
 
 **Both a frame count and a wall-clock duration are required.** Frame rate
-is not fixed here -- at the delivered ~3.3 fps, "six frames" is nearly two
-seconds; at 12 fps it is half of one. A policy expressed only in frames
-would silently mean something different every time the transport changed.
+is not fixed here -- at ~3.3 fps, "six frames" is nearly two seconds; at
+the 12 fps now delivered it is half of one. A policy expressed only in
+frames would silently mean something different every time the transport
+changed, which is why the loss tolerance below is in SECONDS.
 
-None of this measures attention. It measures a page-like region being
-present and steady. `07-PLATFORM-CONSTRAINTS.md` Limitation 8 is explicit
-that the camera cannot establish that the wearer looked at, noticed or
-read anything, and no threshold in this file changes that.
+**A dwell is made of segments.** A wearer who turns a page without
+moving their head presents the same region with different content. The
+region tracker cannot see that; the content check can (a phase
+correlation of the region against the segment's first frame collapses
+when the words change). Each segment keeps its own best frames, so a
+three-page read within one dwell yields three pages, not the two
+sharpest frames of the whole thing.
+
+None of this measures attention. It measures a text region being present
+and steady. `07-PLATFORM-CONSTRAINTS.md` Limitation 8 is explicit that
+the camera cannot establish that the wearer looked at, noticed or read
+anything, and no threshold in this file changes that.
 """
 
 from dataclasses import dataclass, field, replace
 
+import cv2
 import numpy as np
 
-from tower.document_memory.detect import PageCandidate
 from tower.document_memory.records import (
     END_REASON_LOST,
     END_REASON_MAX_DURATION,
@@ -40,9 +49,12 @@ class DwellPolicy:
     # A glance is not a reading event. Both must be satisfied.
     min_frames: int = 4
     min_seconds: float = 1.0
-    # A page turn, a blink of occlusion or one bad frame must not end a
-    # dwell; walking away must.
-    max_missing_frames: int = 3
+    # A page turn, a blink of occlusion, a hand across the page or a run
+    # of blurred frames must not end a dwell; walking away must. In
+    # SECONDS, because at 12 fps three frames is a quarter of a second
+    # and a page turn takes a full one. The frame bound is a backstop.
+    max_missing_seconds: float = 1.5
+    max_missing_frames: int = 60
     # Rule 15: nothing unbounded. A page left on a desk in view all
     # afternoon becomes one bounded observation, not an ever-growing one.
     max_seconds: float = 180.0
@@ -59,10 +71,26 @@ class DwellPolicy:
     # And how much it may change size. Leaning in is the same page.
     min_area_ratio: float = 0.5
     max_area_ratio: float = 2.0
-    # How many frames get the expensive path, per dwell.
+    # How many frames get the expensive path, per SEGMENT. Two, because
+    # OCR is not deterministic across views and the better reading wins.
     best_frames: int = 2
+    # And how many segments a dwell may hold. Bounds the OCR a flush at
+    # Stop can cost: 6 x 2 x ~0.3 s on the GPU.
+    max_segments: int = 6
     # A frame this blurry is not worth OCR even if it is the best one seen.
-    min_sharpness: float = 60.0
+    # Variance of the Laplacian over the text region. Real frames are
+    # lower-contrast than the renderer; the selector is best-of-window,
+    # this is only the floor under it.
+    min_sharpness: float = 40.0
+    # Content check: phase-correlation response of the region against the
+    # segment's reference crop. A page shifted slightly stays above 0.9;
+    # different words on the same region drop to ~0.24 (synthetic).
+    content_change_response: float = 0.45
+    # And it must fail this many consecutive frames before a new segment
+    # opens, so one noisy frame cannot split a page in two.
+    content_change_frames: int = 2
+    # Width of the crop the content check compares at.
+    content_probe_width: int = 160
 
 
 @dataclass
@@ -71,8 +99,9 @@ class ScoredFrame:
 
     source_seq: int | None
     at: float
-    candidate: PageCandidate
+    candidate: object
     gray: np.ndarray
+    segment: int = 0
 
     @property
     def score(self) -> float:
@@ -95,9 +124,13 @@ class Dwell:
     frames_seen: int = 0
     frames_considered: int = 0
     missing_frames: int = 0
-    best: list[ScoredFrame] = field(default_factory=list)
+    # The best frames of the CURRENT segment.
+    best: list = field(default_factory=list)
+    # The best frames of every CLOSED segment, in order.
+    closed: list = field(default_factory=list)
+    segment: int = 0
     end_reason: str = END_REASON_LOST
-    reference: PageCandidate | None = None
+    reference: object | None = None
     # Whatever the caller said the frames belonged to when this dwell
     # STARTED, kept opaque so this module stays free of any notion of a
     # capture. Set once, in `_start`, and never touched by `_extend`.
@@ -113,6 +146,10 @@ class Dwell:
     # Accumulated FORWARD-ONLY, one inter-frame delta at a time.
     elapsed_seconds: float = 0.0
     clock_regressions: int = 0
+    # The content check's reference for the current segment, and how
+    # many consecutive frames have disagreed with it.
+    content_reference: np.ndarray | None = None
+    content_disagreements: int = 0
 
     @property
     def seconds(self) -> float:
@@ -127,11 +164,24 @@ class Dwell:
         """
         return self.elapsed_seconds
 
+    @property
+    def selected(self) -> list:
+        """Every frame that earned OCR, closed segments first, in order."""
+        frames = []
+        for segment in self.closed:
+            frames.extend(segment)
+        frames.extend(self.best)
+        return frames
+
+    @property
+    def segments(self) -> int:
+        return len(self.closed) + (1 if self.best else 0)
+
     def qualifies(self, policy: DwellPolicy) -> bool:
         return (
             self.frames_seen >= policy.min_frames
             and self.seconds >= policy.min_seconds
-            and bool(self.best)
+            and bool(self.selected)
         )
 
 
@@ -146,6 +196,7 @@ class DwellTracker:
     def __init__(self, policy: DwellPolicy | None = None) -> None:
         self._policy = policy or DwellPolicy()
         self._current: Dwell | None = None
+        self._segments_opened = 0
 
     @property
     def policy(self) -> DwellPolicy:
@@ -159,9 +210,14 @@ class DwellTracker:
     def current(self) -> Dwell | None:
         return self._current
 
+    @property
+    def segments_opened(self) -> int:
+        """Page turns detected inside dwells, over the tracker's life."""
+        return self._segments_opened
+
     def observe(
         self,
-        candidate: PageCandidate | None,
+        candidate,
         *,
         at: float,
         gray: np.ndarray | None = None,
@@ -251,10 +307,17 @@ class DwellTracker:
         # eventually fail the same-region test against where they started.
         dwell.reference = candidate
 
+        if gray is not None:
+            self._check_content(dwell, candidate, gray)
+
         if gray is None or candidate.sharpness < self._policy.min_sharpness:
             return
         scored = ScoredFrame(
-            source_seq=source_seq, at=at, candidate=candidate, gray=gray
+            source_seq=source_seq,
+            at=at,
+            candidate=candidate,
+            gray=gray,
+            segment=dwell.segment,
         )
         dwell.best.append(scored)
         dwell.best.sort(key=lambda frame: frame.score, reverse=True)
@@ -262,12 +325,63 @@ class DwellTracker:
         # retained, so a long dwell cannot accumulate imagery.
         del dwell.best[self._policy.best_frames :]
 
+    def _check_content(self, dwell: Dwell, candidate, gray) -> None:
+        """Same region, different words? Then this is a new segment."""
+        probe = self._content_probe(candidate, gray)
+        if probe is None or float(probe.std()) < 1.0:
+            # A featureless crop correlates with nothing, including
+            # itself. It is inconclusive, not a page turn.
+            return
+        reference = dwell.content_reference
+        if reference is None or reference.shape != probe.shape:
+            dwell.content_reference = probe
+            dwell.content_disagreements = 0
+            return
+        _shift, response = cv2.phaseCorrelate(reference, probe)
+        if response >= self._policy.content_change_response:
+            dwell.content_disagreements = 0
+            return
+        dwell.content_disagreements += 1
+        if dwell.content_disagreements < self._policy.content_change_frames:
+            return
+        # A page turn. Close the segment, keep its best frames, and let a
+        # new one begin with this frame as its reference.
+        if dwell.best:
+            dwell.closed.append(list(dwell.best))
+            dwell.best = []
+        dwell.segment += 1
+        self._segments_opened += 1
+        dwell.content_reference = probe
+        dwell.content_disagreements = 0
+        if len(dwell.closed) >= self._policy.max_segments:
+            # Bounded. The oldest segment's frames are dropped rather than
+            # the newest: what the wearer is looking at NOW is the page
+            # they are most likely to ask about.
+            del dwell.closed[0]
+
+    def _content_probe(self, candidate, gray) -> np.ndarray | None:
+        from tower.document_memory.gate import crop_region
+
+        crop = crop_region(gray, candidate)
+        if crop.size == 0:
+            return None
+        width = self._policy.content_probe_width
+        height = max(8, int(round(crop.shape[0] * width / max(crop.shape[1], 1))))
+        # A fixed probe size, so a region that grows as the wearer leans
+        # in still compares against its own reference.
+        small = cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+        return np.float32(small)
+
     def _miss(self, at: float) -> Dwell | None:
         if self._current is None:
             return None
         self._current.missing_frames += 1
         self._current.frames_considered += 1
-        if self._current.missing_frames > self._policy.max_missing_frames:
+        gone_for = at - self._current.last_seen_at
+        if (
+            self._current.missing_frames > self._policy.max_missing_frames
+            or gone_for > self._policy.max_missing_seconds
+        ):
             return self._finish(END_REASON_LOST)
         return None
 
@@ -279,9 +393,7 @@ class DwellTracker:
         dwell = replace(dwell, end_reason=reason)
         return dwell if dwell.qualifies(self._policy) else None
 
-    def _is_same_region(
-        self, candidate: PageCandidate, frame_diagonal: float | None
-    ) -> bool:
+    def _is_same_region(self, candidate, frame_diagonal: float | None) -> bool:
         reference = self._current.reference
         if reference is None:
             return True
