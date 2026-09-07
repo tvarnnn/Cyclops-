@@ -2,7 +2,7 @@
 
 The lifecycle, the single-slot frame path and the abandoned-load latch are
 `tower/live_session.py`, shared with Scene Understanding. What is here is
-what is specific to this cartridge, and there are four things.
+what is specific to this cartridge, and there are five things.
 
 **1. Stop KEEPS what it recorded.** Scene Understanding's Stop discards
 its state; this one must not. That asymmetry is the difference between the
@@ -14,6 +14,8 @@ afterwards.
 when a session pauses or stops has read something, and throwing it away
 would lose a real observation to a UI action. `_on_pause` runs off the
 session lock precisely so it can afford the OCR that flushing may trigger.
+The flush is bounded by `DwellPolicy.max_segments * best_frames` pages,
+which at ~0.3 s each on the GPU sits inside the session's 5 s join.
 
 **3. Provenance comes from the capture, and it comes from outside.** A
 `DocumentObservation` carries the `capture_id` its frames came from and,
@@ -29,27 +31,34 @@ that resolves.
 `prune_expired` had exactly one production caller -- the end of
 `scripts/document_memory_session.py` -- so a long-running Tower would
 never have pruned at all. This session prunes at start and after every
-document it records. The document rate is what makes that affordable and
-it is not a small number by accident: the detector fires on essentially
-nothing at this platform's delivered geometry, so "after every document"
-is, measurably, almost never.
+document it records.
+
+**5. A session nobody is streaming to winds itself down.** The OCR reader
+holds ~1.4 GB of GPU memory while loaded. A session started by a phone
+that then disconnected and never came back would hold it forever, on a
+Tower whose next cartridge wants that memory. So when the stream closes,
+a timer starts; if no stream reopens within `idle_stop_s`, the session
+stops itself -- flushing, as any Stop does. A reconnect within the
+window cancels it and the session carries on, which is the case a phone
+dropping Wi-Fi for ten seconds needs.
 
 WHAT THIS COSTS, AND WHY IT IS SAFE TO LEAVE RUNNING
 
-The per-frame path is `detect_page` at a measured median of 0.771 ms and
-p95 1.92 ms on real 360x640 frames. The expensive path -- warp plus OCR at
-~1.19 s a page -- runs at most twice per completed dwell, capped
-structurally by `DwellPolicy.best_frames = 2` rather than by a caller
-remembering to be careful.
+The per-frame path is the steady-and-sharp gate at ~3 ms, plus the text
+detector at ~35 ms on at most a quarter of the steady frames. The
+expensive path -- crop plus OCR at ~0.3 s a page on the GPU -- runs at
+most `best_frames` times per segment of a completed dwell, capped
+structurally rather than by a caller remembering to be careful.
 
-The OCR reader itself costs about 5.1 s to construct, ONCE. It is loaded
-in `_create`, on the worker thread, so that cost is paid inside
-`state: "starting"` where a client can see it -- rather than lazily,
-inside the first frame that happens to complete a dwell, which is where
-`EasyOcrRecogniser.read` would otherwise put it.
+The OCR reader itself costs about 1.3 s to construct on the GPU (5 s on
+CPU), ONCE per session. It is loaded in `_create`, on the worker thread,
+so that cost is paid inside `state: "starting"` where a client can see
+it -- rather than lazily, inside the first frame that happens to complete
+a dwell, which is where `EasyOcrRecogniser.read` would otherwise put it.
 """
 
 import logging
+import threading
 
 from tower.document_memory.dwell import DwellPolicy
 from tower.document_memory.engine import DocumentMemoryEngine
@@ -69,6 +78,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETENTION_DAYS = 30.0
 
 SECONDS_PER_DAY = 86400.0
+
+# How long a running session survives with no stream before stopping
+# itself. Ten minutes: long enough for a phone to drop and rejoin a
+# network, far shorter than "until somebody restarts the Tower".
+DEFAULT_IDLE_STOP_S = 600.0
 
 # Above this many stored documents the session says so on every status.
 #
@@ -100,6 +114,8 @@ class DocumentLive(LiveSession):
         recogniser_factory=None,
         keep_page_images: bool = False,
         follow_stream: bool = False,
+        device: str = "auto",
+        idle_stop_s: float | None = DEFAULT_IDLE_STOP_S,
         **kwargs,
     ) -> None:
         # OFF by default, unlike Scene Understanding's, and the asymmetry
@@ -116,15 +132,19 @@ class DocumentLive(LiveSession):
         self._retention_days = retention_days
         self._policy = policy
         self._recogniser_factory = recogniser_factory
+        self._device = device
+        self._idle_stop_s = idle_stop_s
         # OFF, and it must stay off by default. A document's whole point
         # is to be readable and this platform has no redaction, so a
         # persisted page image is an unredacted photograph of whatever
-        # the wearer was reading. `engine.py:130` says the same.
+        # the wearer was reading. `engine.py` says the same.
         self._keep_page_images = bool(keep_page_images)
 
         self._store = None
         self._capture_id = None
         self._documents_recorded = 0
+        self._documents_resighted = 0
+        self._dwells_unreadable = 0
         self._pages_detected = 0
         self._dwells_started = 0
         self._in_dwell = False
@@ -133,6 +153,13 @@ class DocumentLive(LiveSession):
         self._library_count = None
         self._pruned_documents = 0
         self._prune_incomplete = False
+        self._ocr_device = None
+        self._idle_timer: threading.Timer | None = None
+        self._idle_stops = 0
+        # True only while the idle timer's own thread is inside `stop()`,
+        # so `_on_pause` knows not to run OCR there.
+        self._idle_abandon = False
+        self._flushed_document_id = None
 
     # -- capture lineage -----------------------------------------------
 
@@ -164,6 +191,66 @@ class DocumentLive(LiveSession):
         if engine is not None:
             engine.set_capture_id(None)
 
+    # -- idle wind-down ------------------------------------------------
+
+    def stream_opened(self, owner=None) -> None:
+        self._cancel_idle_timer()
+        super().stream_opened(owner)
+
+    def stream_closed(self, owner=None) -> None:
+        super().stream_closed(owner)
+        # Only a session that is still running after the base class had
+        # its say needs a timer: one that followed the stream has already
+        # stopped, and one that was never started has nothing to release.
+        if self._idle_stop_s is None:
+            return
+        with self._condition:
+            running = self._state in ("running", "starting", "paused")
+        if running:
+            self._arm_idle_timer()
+
+    def offer_frame(self, raw_bytes, *, received_at=None, source_seq=None) -> None:
+        # A frame arriving is a stream that is open, whatever the hooks
+        # said: a Tower without a recorder never calls `stream_opened`.
+        if self._idle_timer is not None:
+            self._cancel_idle_timer()
+        super().offer_frame(raw_bytes, received_at=received_at, source_seq=source_seq)
+
+    def _arm_idle_timer(self) -> None:
+        self._cancel_idle_timer()
+        timer = threading.Timer(self._idle_stop_s, self._idle_stop)
+        timer.daemon = True
+        timer.name = "tower-Document-idle"
+        self._idle_timer = timer
+        timer.start()
+        logger.info(
+            "[Tower][Document] no stream; the session will stop itself in "
+            "%.0f s unless one opens",
+            self._idle_stop_s,
+        )
+
+    def _cancel_idle_timer(self) -> None:
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _idle_stop(self) -> None:
+        self._idle_timer = None
+        with self._condition:
+            running = self._state in ("running", "starting", "paused")
+        if not running:
+            return
+        logger.info(
+            "[Tower][Document] stopping an idle session: no stream for %.0f s",
+            self._idle_stop_s,
+        )
+        self._idle_stops += 1
+        self._idle_abandon = True
+        try:
+            self.stop()
+        finally:
+            self._idle_abandon = False
+
     # -- hooks ---------------------------------------------------------
 
     def _retention_seconds(self):
@@ -177,10 +264,12 @@ class DocumentLive(LiveSession):
         load = getattr(recogniser, "load", None)
         if load is not None:
             # Explicitly, here, on the worker thread. `read()` would do it
-            # lazily on the first completed dwell instead, which puts a
-            # ~5 s stall inside a frame and inside `state: "running"`,
-            # where nothing reports it.
+            # lazily on the first completed dwell instead, which puts the
+            # load inside a frame and inside `state: "running"`, where
+            # nothing reports it.
             load()
+        with self._condition:
+            self._ocr_device = getattr(recogniser, "device", None)
         engine = DocumentMemoryEngine(
             store,
             recogniser,
@@ -197,7 +286,7 @@ class DocumentLive(LiveSession):
             return self._recogniser_factory()
         from tower.document_memory.ocr import EasyOcrRecogniser
 
-        return EasyOcrRecogniser()
+        return EasyOcrRecogniser(device=self._device)
 
     def _engine_name(self, engine):
         return getattr(getattr(engine, "_recogniser", None), "name", None)
@@ -206,7 +295,7 @@ class DocumentLive(LiveSession):
         result = engine.observe(
             raw_bytes, received_at=received_at, source_seq=source_seq
         )
-        if result.outcome == "document":
+        if result.outcome in ("document", "resighted"):
             # Off the session lock, and only when something was written.
             # Retention that runs once at process exit is retention a
             # long-lived Tower never applies.
@@ -219,8 +308,13 @@ class DocumentLive(LiveSession):
         if result.in_dwell and not self._in_dwell:
             self._dwells_started += 1
         self._in_dwell = bool(result.in_dwell)
+        if result.unreadable:
+            self._dwells_unreadable += 1
         if result.document_id is not None:
-            self._documents_recorded += 1
+            if result.resighted:
+                self._documents_resighted += 1
+            else:
+                self._documents_recorded += 1
             self._last_document_id = result.document_id
             self._last_document_at = received_at
 
@@ -235,11 +329,27 @@ class DocumentLive(LiveSession):
         document arrived because the session ended rather than because
         the wearer looked away.
         """
+        if self._idle_abandon:
+            # The idle timer's thread. No OCR here: a torch thread pool
+            # built on a `threading.Timer` thread is never reclaimed, and
+            # the dwell it would read ended ten minutes ago in any case.
+            if engine.abandon():
+                logger.warning(
+                    "[Tower][Document] an idle stop dropped a dwell that "
+                    "was still open when the stream closed; it was not read"
+                )
+            return
         document_id = engine.flush(END_REASON_STOPPED)
         if document_id is None:
             return
+        outcome = engine.last_outcome
         with self._condition:
-            self._documents_recorded += 1
+            if outcome is not None and outcome.resighted:
+                self._documents_resighted += 1
+            else:
+                self._documents_recorded += 1
+            if outcome is not None and outcome.unreadable:
+                self._dwells_unreadable += 1
             self._last_document_id = document_id
             self._flushed_document_id = document_id
         self._prune(self._store)
@@ -249,6 +359,8 @@ class DocumentLive(LiveSession):
 
     def _on_start_locked(self) -> None:
         self._documents_recorded = 0
+        self._documents_resighted = 0
+        self._dwells_unreadable = 0
         self._pages_detected = 0
         self._dwells_started = 0
         self._in_dwell = False
@@ -257,6 +369,7 @@ class DocumentLive(LiveSession):
         self._flushed_document_id = None
         self._pruned_documents = 0
         self._prune_incomplete = False
+        self._ocr_device = None
 
     def _on_stop_locked(self) -> None:
         """Nothing is discarded. See the module header.
@@ -266,6 +379,7 @@ class DocumentLive(LiveSession):
         an operator can read what the session did after it ended.
         """
         self._in_dwell = False
+        self._cancel_idle_timer()
 
     def _prune(self, store) -> None:
         """Apply retention. Never raises, always reports what it could not do.
@@ -299,17 +413,22 @@ class DocumentLive(LiveSession):
     def _extra_status(self) -> dict:
         return {
             "recogniser": getattr(self, "_engine_label", None),
+            "ocr_device": self._ocr_device,
             "capture_id": self._capture_id,
             "capture_id_validated": False,
             "in_dwell": bool(self._in_dwell),
             "dwells_started": self._dwells_started,
             "pages_detected": self._pages_detected,
             "documents_recorded": self._documents_recorded,
+            "documents_resighted": self._documents_resighted,
+            "dwells_unreadable": self._dwells_unreadable,
             "last_document_id": self._last_document_id,
             "last_document_at": self._last_document_at,
-            "flushed_document_id": getattr(self, "_flushed_document_id", None),
+            "flushed_document_id": self._flushed_document_id,
             "keeps_page_images": bool(self._keep_page_images),
             "follows_stream": bool(self._follow_stream),
+            "idle_stop_seconds": self._idle_stop_s,
+            "idle_stop_pending": self._idle_timer is not None,
             "retention_days": self._retention_days,
             "documents_pruned": self._pruned_documents,
             # True when a deletion could not be completed -- a locked

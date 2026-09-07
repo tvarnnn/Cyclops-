@@ -1424,9 +1424,9 @@ carried beside it.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `contract` | string | `document_memory.library/2026-08-27` |
+| `contract` | string | `document_memory.library/2026-09-07` |
 | `claim` | `"a-page-was-in-view-and-was-ocred"` | The wire value, pinned as `DOCUMENT_CLAIM` in `tower/results/document_memory.py`. Until the 2026-08-27 unification this table quoted an older spelling that said a document "was read" — a claim the camera cannot establish, five keys above the note saying so. The code had been corrected and the doc had not. `test_the_contract_quotes_the_values_the_wire_actually_carries` now pins the two together, and asserts the retired spelling appears nowhere in this file |
-| `identity` | `"no-document-identity-across-sightings"` | reading the same page twice yields two unrelated records |
+| `identity` | `"same-page-by-text-and-look-within-library"` | since 2026-09-07 a later dwell whose first readable page carries the same words AND looks the same as a page already on record becomes a **sighting** of that record (`sighting_count`, `last_observed_at`, `total_observed_seconds`) rather than a new one. Anything weaker — same template different numbers, half-shared text, an unreadable re-view — stays a separate record. The earlier value said no such join was made; it was true then |
 | `absence_means` | `"not-recorded-by-this-cartridge"` | |
 | `time_basis` | `"tower-receipt"` | |
 | `spatial_ref` | always `null` | this cartridge does not know where anything is |
@@ -1460,9 +1460,19 @@ learn the window its writer used. A `retention_days` query parameter
 
 `document_id`, `claim`, `identity`, `title`, `title_is_derived`,
 `summary_available`, `confidence`, `confidence_basis`, `observed_at`,
-`recorded_at`, `observed_seconds`, `pages_observed`, `text_availability`,
-`end_reason`, `timing`, `provenance`, `retains_raw_imagery`,
-`redaction`, `imagery_treatment`, `privacy_tags`, `schema_version`.
+`recorded_at`, `observed_seconds`, `sighting_count`, `last_observed_at`,
+`total_observed_seconds`, `pages_observed`, `pages_readable`,
+`text_availability`, `end_reason`, `timing`, `provenance`,
+`retains_raw_imagery`, `redaction`, `imagery_treatment`, `privacy_tags`,
+`schema_version`.
+
+**Sightings.** `observed_at`, `observed_seconds`, `provenance` and every
+page's `source_seq` describe the FIRST observation and are never
+rewritten. `sighting_count` is how many times the record was observed
+in total (one for a record seen once), `last_observed_at` the most
+recent of those, `total_observed_seconds` their sum. `pages_readable`
+counts the pages whose text cleared the readability floor; a record can
+hold pages that OCR looked at and could not read.
 
 > **The prose fields are NOT here. They are on the envelope, once.**
 > `record_notes` carries five entries — `summary_withheld`,
@@ -1569,13 +1579,17 @@ not be rendered identically to a measured one.
 |---|---|---|
 | `match_kind` | `"lexical"` | literal term matching. Never `"semantic"`; see `semantic_retrieval` |
 | `searched_documents` | int | how many records were scored. Compare with `documents_in_memory`: a difference means the retention window narrowed this read |
-| `min_score` | float | the BM25 floor a document had to clear. Default `0.1` |
+| `searched_pages` | int | how many PAGES were scored. Since 2026-09-07 the page is the unit of scoring and a document's score is its best page's |
+| `min_score` | float | the BM25 floor a page had to clear. Default `0.1` |
 | `sufficient_evidence` | bool | whether the memory held enough to answer at all. `false` with `answer: "no_observation"` is an empty memory; `false` with `not_found` is a query whose terms nothing contained |
+| `match_tolerance` | string | says in words what `fuzzy` below means: a query term of five or more characters also matches a token within one edit of it or one it begins, weighted below an exact match. OCR reads "Kubernetes" as "Kubemetes" often enough to matter |
 
 Each matched document additionally carries `score` (rounded to 4 places),
-`matched_terms`, and `snippet` — `snippet_max_chars` characters around the
+`matched_terms`, `snippet` — `snippet_max_chars` characters around the
 first matched term, **so an answer is always traceable back to text that
-was actually captured** rather than to a number a client has to trust.
+was actually captured** rather than to a number a client has to trust —
+`page_index`, the page the score and snippet came from, and `fuzzy`,
+true when any matched term was a near-miss rather than the word itself.
 
 `snippet_max_chars` is **48**, and it is on the envelope so a client reads
 the bound rather than assuming one. This paragraph said 160 until the
@@ -1599,6 +1613,8 @@ four hundred lines above it. Read the field, not the prose.
 | `source_seq` | int or null | the frame this page was read from. Null on a record written before provenance existed |
 | `observed_at` | float or null | Tower-receipt time of that frame |
 | `observation_count` | int | how many separate views of this page were merged into it. Two readings of one page during one dwell is one page with a count of two, not two pages |
+| `readable` | bool | whether `text` cleared the readability floor (at least one word at a mean confidence above the recogniser's noise floor). `false` with `region_count > 0` is a page OCR looked at and could not read — a different fact from never looking |
+| `box_count` | int | text boxes the detector found in the region this page was read from. Evidence that text was there even when it was not readable |
 | `image_kept` | bool | whether a page image exists on this Tower's disk. **False unless page images were explicitly enabled**, which is off by default, must stay off, and has no configuration path from a web process: this platform has no redaction, so a stored page image is an unredacted photograph of what the wearer was reading |
 | `image_served` | bool | always `false`. A BOOLEAN and not the path, which told a reader where in the store to find that photograph — disclosure with no consumer, since no route resolves it and none may |
 
@@ -1621,8 +1637,19 @@ exists:
 | Block | Meaning |
 |---|---|
 | `contract_note` | a string pointing at the HTTP routes, carried IN the payload so a client that reads only this channel still learns the documents are elsewhere |
-| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `bytes`, `location_disclosed: false` |
-| `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off |
+| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `revision`, `bytes`, `location_disclosed: false` |
+| `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off or the session could not be constructed (the OCR extra is not installed, most likely; `reason` says which) |
+
+**`library.revision` is the live-update trigger.** It changes whenever
+the journal changes — an append, a sighting merged onto an existing
+record, a prune — and never otherwise. A client holding a listing
+re-fetches `/documents` (or re-runs its standing search) when this
+moves; the count alone would miss a sighting, and a prune plus an append
+in one tick. It is an opaque integer (the journal's modification stamp),
+not a clock, and `newest_observed_at` now reflects the most recent
+SIGHTING of any record, not only first observations. Polling
+`/documents` on a timer remains the wrong design: it re-parses the
+journal for nothing.
 
 `library.document_count_unfiltered` and `session.library_count` are
 DIFFERENT QUANTITIES and are named apart for that reason. The first
@@ -1662,12 +1689,36 @@ serves documents recorded elsewhere and records nothing itself.
 (`state`, `states`, `session_id`, `failure_reason`, `started_at`,
 `ready_at`, `loading_seconds`, `load_overdue`, `frames_offered`,
 `frames_observed`, `frames_skipped`, `frames_dropped_not_running`) plus:
-`recogniser`, `capture_id`, `capture_id_validated`, `in_dwell`,
-`dwells_started`, `pages_detected`, `documents_recorded`,
-`last_document_id`, `last_document_at`, `flushed_document_id`,
-`keeps_page_images`, `retention_days`, `documents_pruned`,
-`retention_incomplete`, `library_count`, `library_soft_limit`,
-`library_over_soft_limit`, `library_soft_limit_note`.
+`recogniser`, `ocr_device`, `capture_id`, `capture_id_validated`,
+`in_dwell`, `dwells_started`, `pages_detected`, `documents_recorded`,
+`documents_resighted`, `dwells_unreadable`, `last_document_id`,
+`last_document_at`, `flushed_document_id`, `keeps_page_images`,
+`follows_stream`, `idle_stop_seconds`, `idle_stop_pending`,
+`retention_days`, `documents_pruned`, `retention_incomplete`,
+`library_count`, `library_soft_limit`, `library_over_soft_limit`,
+`library_soft_limit_note`.
+
+**`ocr_device`** is where the reader actually loaded — `"cuda"` or
+`"cpu"` — once the session is running, null before. `TOWER_DOCUMENT_DEVICE`
+asks; this reports. **`documents_recorded`** counts NEW records this
+session wrote; **`documents_resighted`** counts dwells this session
+merged onto a record that already existed (see `identity`);
+`last_document_id` names whichever happened last. **`dwells_unreadable`**
+counts dwells whose every page OCR looked at and could not read — they
+are persisted, with `readable: false` on each page, and a session where
+this climbs while `documents_recorded` does not is a session pointed at
+something that is not a page.
+
+**`idle_stop_seconds` / `idle_stop_pending`.** A running session whose
+stream closed starts a timer; if no stream reopens within
+`idle_stop_seconds` the session stops itself, so a phone that
+disconnected for good does not leave ~1.4 GB of OCR model resident on a
+Tower whose next cartridge wants it. Unlike a Stop a person presses, an
+idle stop does NOT read a dwell that was still open: that dwell ended
+when the stream did, and the Tower logs that it was dropped.
+`idle_stop_pending` is true while that timer runs; a reconnect or a
+frame cancels it. A Stop or Pause a person presses reads at most four
+frames of an open dwell, newest first.
 
 **`retention_incomplete`** is reported rather than logged: a deletion that
 quietly failed looks exactly like one that was kept.
@@ -1683,26 +1734,35 @@ session stops has read something.
 
 ### 15.5 Known limitations
 
-1. **The premise is untested.** §15.0. Someone has to wear the glasses and
-   read a page.
-2. **No cross-session document identity.** Reading the same page on Monday
-   and Tuesday produces two unrelated records with different ids and no
-   link. `identity` says so. Dedup exists only WITHIN one dwell, keyed on
-   a 0.65 token-set overlap.
+1. **The premise is untested on a physical page.** §15.0. The pipeline is
+   validated on rendered pages with known text; someone has to wear the
+   glasses and read a page.
+2. **Identity is one rule, and it is conservative.** A later dwell joins
+   a record only when its first readable page has the same words (token
+   overlap ≥ 0.70, numbers agreeing) AND the same look (perceptual hash
+   within 6 bits). Two invoices on one template, two pages of one book,
+   or an unreadable re-view stay separate records. A multi-page dwell
+   that matches on its first page adds a sighting and keeps the record's
+   pages; its later pages are not merged in. Records are not grouped
+   into "documents" across dwells: a dwell is the record.
 3. **No pagination.** `limit` is the only bound, capped at 200.
-4. **No semantic retrieval.** BM25 over literal terms. Calling it semantic
-   would be an overclaim, and a client routing a description here will get
-   a lexical answer.
-5. **A match cannot be attributed to a page.** Scoring is over the
-   concatenated page text.
-6. **No redaction exists.** `redaction` is an enum of one, `"none"`, and
+4. **No semantic retrieval.** BM25 over literal terms with bounded
+   near-miss tolerance. Calling it semantic would be an overclaim, and a
+   client routing a description here will get a lexical answer.
+5. **No redaction exists.** `redaction` is an enum of one, `"none"`, and
    that is the honest value for imagery this platform cannot redact. Page
    images are OFF by default and must stay off.
-7. **`retention.writer_window_days` is null.** §15.3.
-8. **Every query re-parses the journal.** There is no index. The session
-   `status` block is stat-gated and does not.
-9. **No capture timestamp.** Everything is `tower-receipt`. This is a
+6. **`retention.writer_window_days` is null.** §15.3.
+7. **The search corpus is rebuilt when the journal changes**, and cached
+   on the journal's stamp between changes. There is no persistent index;
+   the JSONL journal is the only truth and a newly persisted page is
+   searchable on the next query.
+8. **No capture timestamp.** Everything is `tower-receipt`. This is a
    cross-boundary blocker, not a Tower gap.
+9. **A text-detector false positive reaches OCR.** A keyboard or a
+   screen held steady long enough is a dwell; what OCR makes of it is
+   kept as a page with `readable: false`, and the session counts these
+   as `dwells_unreadable`.
 
 ---
 
@@ -1809,6 +1869,32 @@ Start and a Stop that World Builder's file-reading status did not.
 The design was explicitly "designed, not implemented", so no consumer was
 broken. Minting the date the agreement actually reached a wire is the
 whole discipline these identifiers exist for.
+
+### `document_memory.status/2026-09-07` and `document_memory.library/2026-09-07` — identity, sightings, live updates
+
+Both identifiers moved because `identity` changed meaning. The
+2026-08-27 value, `"no-document-identity-across-sightings"`, described a
+cartridge that made no join across dwells; this one joins a later dwell
+onto an existing record when the words and the look both agree, and a
+decoder written against the old value would render a merged record as a
+single observation. Additive on top of that, all with defaults a
+2026-08-27 decoder would have ignored:
+
+- per document: `sighting_count`, `last_observed_at`,
+  `total_observed_seconds`, `pages_readable`;
+- per page: `readable`, `box_count`;
+- per search match: `page_index`, `fuzzy`; on the search envelope:
+  `searched_pages`, `match_tolerance`;
+- on the status `library` block: `revision`, the live-update trigger;
+- on the status `session` block: `ocr_device`, `documents_resighted`,
+  `dwells_unreadable`, `idle_stop_seconds`, `idle_stop_pending`.
+
+The 404 bodies still name `TOWER_DOCUMENT_ROOT` and
+`TOWER_DOCUMENT_CAPTURE`, which the phone string-matches, even though the
+root now has a managed default and "unconfigured" is reachable only by
+`TOWER_DOCUMENT_ENABLED=false`. The session verbs still answer `200`
+with the full envelope; the phone renders any other status as a
+transport failure.
 
 ### `document_memory.status/2026-08-27` and `document_memory.library/2026-08-27` — new
 

@@ -1624,7 +1624,7 @@ final class TowerClientTests: XCTestCase {
                         "available":true,"unavailable_reason":null,
                         "snapshot_only":true},
                        {"cartridge":"document_memory","result_type":"status",
-                        "contract":"document_memory.status/2026-08-27",
+                        "contract":"document_memory.status/2026-09-07",
                         "available":true,"unavailable_reason":null,
                         "snapshot_only":true},
                        {"cartridge":"experimental_cv","result_type":"status",
@@ -1633,7 +1633,7 @@ final class TowerClientTests: XCTestCase {
                         "snapshot_only":true}],
          "not_offered":[],
          "http_contracts":[{"cartridge":"document_memory",
-                            "contract":"document_memory.library/2026-08-27",
+                            "contract":"document_memory.library/2026-09-07",
                             "entry_route":"/documents","available":true,
                             "unavailable_reason":null,
                             "why_not_a_subscription":"document text is bulk and is the most sensitive data this platform holds"}]}

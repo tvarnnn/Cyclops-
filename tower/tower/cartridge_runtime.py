@@ -76,6 +76,11 @@ class LiveCartridges:
     frame_consumers: list = field(default_factory=list)
     scene: object | None = None
     document: object | None = None
+    # Why `document` is None when the reason is not "capture is off": the
+    # OCR extra is not installed, or the session could not be built. Read
+    # by the session routes and the status producer so a phone is told
+    # what is actually wrong rather than which variable to set.
+    document_unavailable_reason: str | None = None
     # Why `scene` is None, when the reason is not "nobody enabled it".
     #
     # Without this the declaration blamed the wrong thing. A construction
@@ -279,14 +284,26 @@ def _document_session(settings):
     posture for a machine reprocessing captures offline.
     """
     from tower.document_memory.live import DocumentLive
+    from tower.document_memory.ocr import require_ocr_extra
+
+    # A capability is offered only when it is genuinely there. `find_spec`
+    # locates without executing, which is exactly enough for "the extra
+    # is not installed" and costs no import of torch on the web process.
+    # (Scene refused `find_spec` for a different question -- "does this
+    # installed package load" -- which a session start still answers.)
+    require_ocr_extra()
 
     logger.info(
-        "[Tower][Config] document capture enabled, writing to %s; no "
-        "session is running until one is started",
+        "[Tower][Config] document capture enabled on device %r, writing to "
+        "%s; no session is running until one is started",
+        settings.document_device,
         settings.document_root,
     )
     return DocumentLive(
-        settings.document_root, follow_stream=settings.document_autostart
+        settings.document_root,
+        follow_stream=settings.document_autostart,
+        device=settings.document_device,
+        retention_days=settings.document_retention_days,
     )
 
 
@@ -305,6 +322,7 @@ def build_live_cartridges(settings) -> LiveCartridges:
     scene = None
     document = None
     scene_unavailable_reason = None
+    document_unavailable_reason = None
 
     if settings.scene_understanding:
         try:
@@ -335,12 +353,22 @@ def build_live_cartridges(settings) -> LiveCartridges:
         try:
             document = _document_session(settings)
             consumers.append(document)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Tower][Config] document capture is enabled but could not "
                 "be constructed; this Tower will record no documents"
             )
             document = None
+            # Same wire, same rule as the scene reason above: a person's
+            # sentence passes through, anything else reduces to its type.
+            # Names TOWER_DOCUMENT_CAPTURE because iOS keys its "no capture
+            # session" outcome on that substring.
+            document_unavailable_reason = (
+                "this Tower runs no document capture session: Document "
+                "Memory is enabled (TOWER_DOCUMENT_CAPTURE is on) but the "
+                f"session could not be constructed: {client_safe_reason(exc)}. "
+                "Documents recorded elsewhere are still served"
+            )
     elif settings.document_capture:
         logger.warning(
             "[Tower][Config] TOWER_DOCUMENT_CAPTURE is on but "
@@ -353,4 +381,5 @@ def build_live_cartridges(settings) -> LiveCartridges:
         scene=scene,
         document=document,
         scene_unavailable_reason=scene_unavailable_reason,
+        document_unavailable_reason=document_unavailable_reason,
     )

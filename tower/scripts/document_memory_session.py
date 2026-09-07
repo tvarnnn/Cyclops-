@@ -109,6 +109,12 @@ def main(argv=None) -> int:
             "which has real receipt times."
         ),
     )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="where the OCR reader runs; auto downgrades to cpu, cuda refuses",
+    )
     parser.add_argument("--poll-seconds", type=float, default=0.25)
     parser.add_argument("--max-idle-polls", type=int, default=None)
     parser.add_argument("--min-dwell-frames", type=int, default=None)
@@ -165,7 +171,9 @@ def main(argv=None) -> int:
         )
 
     recogniser = (
-        EasyOcrRecogniser() if args.ocr == "easyocr" else FixedTextRecogniser()
+        EasyOcrRecogniser(device=args.device)
+        if args.ocr == "easyocr"
+        else FixedTextRecogniser()
     )
     retention = None if args.retention_days <= 0 else args.retention_days * 86400.0
     store = DocumentStore(args.root, retention_seconds=retention)

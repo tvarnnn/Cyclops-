@@ -237,9 +237,9 @@ class TestDocumentFrequencyIsCorpusWideAndComputedOnce:
     and the fact that a term absent from a document contributes nothing.
     """
 
-    def _reference_document_frequency(self, corpus, term):
+    def _reference_page_frequency(self, corpus, term):
         """The original expression, kept as the thing parity is checked against."""
-        return sum(1 for token_list in corpus.tokens if term in set(token_list))
+        return sum(1 for page in corpus.pages if term in set(page.tokens))
 
     def test_the_precomputed_frequency_equals_the_original_expression(self):
         from tower.document_memory.retrieval import _Corpus
@@ -251,12 +251,12 @@ class TestDocumentFrequencyIsCorpusWideAndComputedOnce:
         ]
         corpus = _Corpus(documents)
 
-        every_term = {token for token_list in corpus.tokens for token in token_list}
+        every_term = {token for page in corpus.pages for token in page.tokens}
         assert every_term, "the fixture corpus tokenised to nothing"
 
         for term in sorted(every_term):
-            assert corpus.document_frequency[term] == (
-                self._reference_document_frequency(corpus, term)
+            assert corpus.page_frequency[term] == (
+                self._reference_page_frequency(corpus, term)
             ), term
 
     def test_a_term_in_no_document_has_frequency_zero(self):
@@ -264,20 +264,18 @@ class TestDocumentFrequencyIsCorpusWideAndComputedOnce:
 
         corpus = _Corpus([_document("depth", DEPTH, NOW)])
 
-        assert corpus.document_frequency.get("nonexistentterm", 0) == 0
+        assert corpus.page_frequency.get("nonexistentterm", 0) == 0
 
-    def test_ranking_is_unchanged_by_the_hoist(self, memory):
-        """The scores themselves, pinned against the pre-hoist implementation.
+    def test_ranking_order_survives_page_scoring(self, memory):
+        """The ORDER, pinned. The scores moved on 2026-09-07, deliberately.
 
-        Recorded by running the ORIGINAL quadratic code on this exact
-        fixture. If a future change moves a score, this is the test that
-        should have to be argued with.
+        Scoring became per page with the title weighted double, so the
+        absolute figures the pre-hoist code produced no longer apply.
+        What must not move is which document a four-term query ranks
+        first: the one that contains the most of them.
         """
         result = memory.search_text("transformer attention depth receipt")
 
-        ranked = [(match.document_id, match.score) for match in result.matches]
-        assert ranked == [
-            ("transformers", 2.307606327102424),
-            ("depth", 1.4577347001839878),
-            ("receipt", 0.9658420488061142),
-        ]
+        ranked = [match.document_id for match in result.matches]
+        assert ranked == ["transformers", "depth", "receipt"]
+        assert all(match.page_index is not None for match in result.matches)

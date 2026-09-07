@@ -51,6 +51,12 @@ final class ProjectManager: ObservableObject {
     /// `@StateObject`."*
     let objectMemoryRecording: ObjectMemoryRecordingCoordinator
 
+    /// The same camera owner, for Document Memory's Start and Stop. Owned here
+    /// rather than resolved in the view so both cartridges start the one
+    /// capture Home and World Builder can see and stop. `nil` in Release,
+    /// like the coordinator's.
+    let documentMemoryCamera: (any ObjectMemoryCaptureOwner)?
+
     /// The four cartridge clients.
     ///
     /// Owned here rather than in the workspace views because a workspace's
@@ -169,6 +175,7 @@ final class ProjectManager: ObservableObject {
             camera: cameraOwner,
             client: self.cartridgeClients.objectMemory
         )
+        self.documentMemoryCamera = cameraOwner
 
         let health = DeviceHealth()
         self.deviceHealth = health

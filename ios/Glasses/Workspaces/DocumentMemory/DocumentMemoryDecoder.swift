@@ -229,7 +229,7 @@ enum DocumentMemoryDecoder {
         let availability = json["text_availability"] as? [String: Any] ?? [:]
         let observedAt = json["observed_at"] as? Double
 
-        return RememberedDocument(
+        var document = RememberedDocument(
             id: id,
             // Already clipped to `title_max_chars` by the Tower. Not clipped
             // again here: two places applying the same bound is two places for
@@ -288,6 +288,13 @@ enum DocumentMemoryDecoder {
             summaryIsModelOutput: json["summary_is_model_output"] as? Bool ?? false,
             match: matchEvidence(from: json)
         )
+        // Sightings (`document_memory.library/2026-09-07`). Defaults describe
+        // a record seen once, which is what an absent field means.
+        document.sightingCount = json["sighting_count"] as? Int ?? 1
+        document.lastObservedAt = ((json["last_observed_at"] as? Double) ?? observedAt)
+            .map(Date.init(timeIntervalSince1970:))
+        document.pagesReadable = json["pages_readable"] as? Int
+        return document
     }
 
     /// The four search-only fields, or `nil` on a listing that has none.
@@ -418,7 +425,8 @@ enum DocumentMemoryDecoder {
             journalBytes: bytes["journal"] as? Int,
             imageBytes: bytes["images"] as? Int,
             totalBytes: bytes["total"] as? Int,
-            locationDisclosed: json["location_disclosed"] as? Bool ?? false
+            locationDisclosed: json["location_disclosed"] as? Bool ?? false,
+            revision: json["revision"] as? Int
         )
     }
 
@@ -470,7 +478,13 @@ enum DocumentMemoryDecoder {
             librarySoftLimit: json["library_soft_limit"] as? Int,
             libraryOverSoftLimit: json["library_over_soft_limit"] as? Bool ?? false,
             librarySoftLimitNote: json["library_soft_limit_note"] as? String,
-            reason: json["reason"] as? String
+            reason: json["reason"] as? String,
+            // Present and null on a 2026-08-27 payload's shape; absent
+            // entirely from an older Tower. Both decode to the defaults.
+            ocrDevice: json["ocr_device"] as? String,
+            documentsResighted: json["documents_resighted"] as? Int,
+            dwellsUnreadable: json["dwells_unreadable"] as? Int,
+            idleStopPending: json["idle_stop_pending"] as? Bool ?? false
         )
     }
 }

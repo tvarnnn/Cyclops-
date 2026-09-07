@@ -208,6 +208,11 @@ def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
     somebody declares Object Memory without that coordination, this line
     is what notices.
     """
+    # Document Memory has a managed root since 2026-09-07, so on a stock
+    # Tower it IS subscribable. "Declared and unavailable" is reachable
+    # only by switching it off, which is the configuration this test
+    # describes.
+    monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "false")
     client = make_client(monkeypatch, world_root)
     with client.websocket_connect("/ws") as ws:
         for cartridge in ("object_memory", "translator"):

@@ -392,14 +392,17 @@ def _log_effective_configuration(
 
     if settings.document_root is None:
         logger.info(
-            "[Tower][Config] TOWER_DOCUMENT_ROOT is unset: /documents/* "
+            "[Tower][Config] TOWER_DOCUMENT_ENABLED is off: /documents/* "
             "will answer 404 and the contract is reported unavailable"
         )
     else:
         logger.info(
-            "[Tower][Config] document root %s (capture %s)",
+            "[Tower][Config] document root %s (capture %s, OCR device %s, "
+            "retention %s days)",
             settings.document_root,
             "on" if settings.document_capture else "off",
+            settings.document_device,
+            settings.document_retention_days,
         )
 
     if settings.observation_root is None:
@@ -672,6 +675,14 @@ def create_app() -> FastAPI:
     # records a document only when a session is started; unset means the
     # routes answer 404.
     app.state.document_root = settings.document_root
+    # The window the session writes under, so a read with no window of
+    # its own sees what the writer promised rather than forever. 0 means
+    # the operator chose forever, and None is what the routes read that as.
+    app.state.document_retention_days = (
+        settings.document_retention_days
+        if settings.document_retention_days and settings.document_retention_days > 0
+        else None
+    )
     # Whether a live session exists is a SEPARATE question from whether
     # the library can be read, and the two must not be conflated. A Tower
     # reprocessing captures offline has a library and no session; that is
@@ -694,6 +705,7 @@ def create_app() -> FastAPI:
         scene_source=live.scene,
         document_source=live.document,
         cv_lab=app.state.cv_lab,
+        document_unavailable_reason=live.document_unavailable_reason,
     )
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never
