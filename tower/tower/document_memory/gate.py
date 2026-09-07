@@ -226,6 +226,12 @@ class RegionPolicy:
     # runs the last region is carried forward. 4 Hz at ~35 ms is ~14%
     # of the worker's time at 12 fps.
     detect_interval_s: float = 0.25
+    # A floor under `detect_interval_s`, so a policy that sets the
+    # interval to zero to "detect everything" still cannot spend the
+    # detector on every frame of a 12 fps stream. A steady view of a
+    # screen with busy text is the expensive case: the detector's own
+    # post-processing grows with the number of boxes it finds.
+    min_detect_interval_s: float = 0.1
     # And a region older than this is not carried forward at all.
     carry_forward_s: float = 1.5
 
@@ -373,10 +379,14 @@ class PageFinder:
             # frame the detector should not be spent on.
             return None
 
-        due = (
-            self._last_detect_at is None
-            or at - self._last_detect_at >= self._policy.detect_interval_s
-            or verdict.content_changed
+        # On a cadence, never per frame. A content change does NOT ask
+        # for an early re-run: a frame whose content changed is by
+        # definition not steady, so it never reaches here, and the page
+        # turn it signals is the dwell tracker's business (it compares
+        # the region against the segment's own reference).
+        since = None if self._last_detect_at is None else at - self._last_detect_at
+        due = since is None or since >= max(
+            self._policy.detect_interval_s, self._policy.min_detect_interval_s
         )
         if due:
             region = self._detect(gray)

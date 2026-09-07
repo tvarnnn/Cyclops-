@@ -87,8 +87,9 @@ class DwellPolicy:
     # different words on the same region drop to ~0.24 (synthetic).
     content_change_response: float = 0.45
     # And it must fail this many consecutive frames before a new segment
-    # opens, so one noisy frame cannot split a page in two.
-    content_change_frames: int = 2
+    # opens, so a noisy frame or two cannot split a page in two. Three
+    # is a quarter of a second at 12 fps, well inside a real page turn.
+    content_change_frames: int = 3
     # Width of the crop the content check compares at.
     content_probe_width: int = 160
 
@@ -365,6 +366,15 @@ class DwellTracker:
         crop = crop_region(gray, candidate)
         if crop.size == 0:
             return None
+        # The INNER part of the crop. The region is padded by design and
+        # its border is whatever surrounds the page; a page held steady
+        # against a moving background (a wearer walking with a sheet in
+        # hand) turned that border into four spurious page turns in one
+        # 48-frame replay. The words are in the middle.
+        height, width_px = crop.shape[:2]
+        inset_y, inset_x = int(height * 0.1), int(width_px * 0.1)
+        if height - 2 * inset_y >= 8 and width_px - 2 * inset_x >= 8:
+            crop = crop[inset_y : height - inset_y, inset_x : width_px - inset_x]
         width = self._policy.content_probe_width
         # A FIXED probe size, square, whatever the crop's aspect: a region
         # that grows as the wearer leans in, or whose text block is a

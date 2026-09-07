@@ -2,24 +2,30 @@
 
 ## Status
 
-**PARTIALLY IMPLEMENTED** as of 2026-08-22. Promoted from the research
-seed at `docs/superpowers/research/2026-08-20-document-memory-design.md`,
-which remains the fuller survey of alternatives.
+**IMPLEMENTED, AWAITING A PHYSICAL PAGE** as of 2026-09-07. Promoted from
+the research seed at `docs/superpowers/research/2026-08-20-document-memory-design.md`,
+rebuilt on 2026-09-07 after the reality check of 2026-08-26 showed the
+original detector fired on nothing real. Full account:
+`docs/agent-handoffs/DOCUMENT-MEMORY-V1-RESEARCH-IMPLEMENTATION.md`.
 
 | Part | Status |
 |---|---|
-| Page detection, dwell tracking, best-frame selection, perspective correction | **CURRENTLY IMPLEMENTED** (`tower/document_memory/`) |
-| OCR via EasyOCR, behind a substitutable seam | **CURRENTLY IMPLEMENTED** (optional `[ocr]` extra) |
+| Managed storage root, capability on by default | **CURRENTLY IMPLEMENTED** (`tower/data/document_memory`, `TOWER_DOCUMENT_ENABLED`) |
+| Steadiness gate + text-detector region finder (no page outline needed) | **CURRENTLY IMPLEMENTED** (`tower/document_memory/gate.py`) |
+| Dwell tracking with page-turn segments, best-frame selection | **CURRENTLY IMPLEMENTED** (`dwell.py`) |
+| OCR via EasyOCR on CUDA, released at Stop | **CURRENTLY IMPLEMENTED** (optional `[ocr]` extra; `TOWER_DOCUMENT_DEVICE`) |
+| Same-page identity across dwells (sightings) | **CURRENTLY IMPLEMENTED** (`identity.py`: words AND look must agree) |
 | Persistence, retention window, real purge | **CURRENTLY IMPLEMENTED** |
-| Retrieval by time, by content (lexical), by recency | **CURRENTLY IMPLEMENTED** |
-| Query interface | **CURRENTLY IMPLEMENTED** as a CLI + Python API |
-| Reading a page at the resolution the glasses deliver | **BLOCKED** — see Resolution below. This is the headline limitation |
+| Retrieval by time, by content (lexical, page-level, OCR-tolerant), by recency | **CURRENTLY IMPLEMENTED** |
+| Live library updates to the phone | **CURRENTLY IMPLEMENTED** (`library.revision` on the status channel) |
+| Idle self-stop of a session that lost its stream | **CURRENTLY IMPLEMENTED** (600 s) |
+| Perspective correction from a quad | **RETAINED, UNUSED** on the live path (`detect.py`) |
+| Reading a physical page through the glasses | **UNTESTED** — no capture contains one; see below |
 | Semantic (embedding) retrieval | **PLANNED**, with a named trigger |
 | Registration as a production module | **BLOCKED** at the same V1.0/V1.1 boundary as World Builder |
 | Voice queries | **PLANNED**, deliberately out of V1 |
-| Validation on real footage | **BLOCKED** on hardware |
 
-Report: `reports/2026-08-22-document-memory-v1-report.md`.
+Earlier report: `reports/2026-08-22-document-memory-v1-report.md`.
 
 ## Goal
 
@@ -48,54 +54,68 @@ may be.
 ## Pipeline
 
 ```
-frames (live capture or recorded)
+frames (live stream, 360x640 @ 12 fps, or a recorded capture)
    |
-[every frame]  page-quad detection + text-likeness      ~2.6 ms
+[every frame]   steady-and-sharp gate                       ~1-3 ms
+   |              phase correlation vs previous frame,
+   |              variance of Laplacian vs rolling median
    |
-[every frame]  dwell / stability tracking                 ~0 ms
+[stable frames] text detector (EasyOCR/CRAFT), <= 4 Hz     ~35 ms GPU
+   |              union of boxes = the region; no quad needed
    |
-   +-- not a page, or not held --> discarded, nothing persisted
+[every frame]   dwell / same-region tracking                ~0 ms
+   |              + content check vs the segment's reference:
+   |                a page turned in place opens a new segment
    |
-[per dwell]    best-frame selection (sharpness x squareness)
+   +-- no region, or not held >= 1 s --> discarded, nothing persisted
    |
-[per dwell]    perspective correction from the quad
+[per segment]   best 1-2 frames (sharpness x squareness)
    |
-[1-2 per doc]  OCR                                       ~1.2 s
+[per frame]     crop the region, OCR                        ~0.3 s GPU
    |
-               page assembly, dedup, extractive summary
+                readability floor, within-dwell merge, title, excerpt
    |
-               persist derived text (not pixels)
+                identity: same words AND same look as a record?
+                  yes -> a SIGHTING of that record
+                  no  -> a new record
    |
-               retrieval: by time, by content, by recency
+                persist derived text (not pixels); journal stamp moves
+   |
+                retrieval: by time, by content (per page), by recency
 ```
 
-**The 400× cost ratio between detection and OCR is the whole design.**
-The pipeline exists to make the expensive stage rare, not fast.
+**The 100x cost ratio between the gate and OCR is the whole design.**
+The pipeline exists to make the expensive stage rare, not fast. Measured
+over 5,000+ real frames it spends 1.2 ms on the median frame and 4-8 ms
+on the mean, and OCR runs only when a dwell qualifies.
 
-## The binding constraint — CORRECTED 2026-08-26
+## The binding constraint — REPLACED 2026-09-07
 
-> **This section was wrong in the way that mattered.** It named recognition
-> as the binding constraint and detection as healthy. Running the cartridge
-> against 9,199 real Ray-Ban frames for the first time reversed both halves.
-> Full evidence:
-> `docs/superpowers/research/2026-08-26-document-memory-reality-check.md`.
+> The 2026-08-26 reality check found the contour-quad detector fired 6
+> times in 9,199 real frames, all false, and zero times after
+> re-derivation. Detection, not recognition, was the binding constraint.
+> Evidence: `docs/superpowers/research/2026-08-26-document-memory-reality-check.md`.
 
-**Detection fires 6 times in 9,199 real frames — 0.065% — and all six are
-false positives.** One venetian blind and five backlit keyboards. OCR on
-those six crops returned zero characters. Nothing that is actually a page
-has ever been detected, because no capture in `data/captures/` contains a
-single sheet of paper.
+**The detector was replaced, not re-derived.** A text detector answers
+"is there text, and where" far better than a contour finder plus a glyph
+statistic ever could from 360x640 pixels, and EasyOCR ships one (CRAFT)
+that costs ~35 ms on the GPU. The per-frame stage now asks only whether
+the camera is steady and the image sharp; the detector runs on steady
+frames at most four times a second; the region a dwell tracks is the
+union of the boxes it found. No quadrilateral is required, which matters
+because only 4.9% of real frames contained a convex four-corner contour
+of any size and a partial page, a screen or a sheet under a hand never
+does.
 
-**The glyph gate's safety margin was an artefact of the renderer.** This
-document's own Detection section reports blinds and keyboards at 0 row
-transitions against a threshold of 8. On real frames they measure **8.0 and
-19–23**. `MIN_ROW_TRANSITIONS` was tuned against negatives that do not
-resemble the real world, and must be re-derived against the 9,199 real
-negatives that now exist.
-
-**So detection, not recognition, is the binding constraint.** The sentence
-that used to sit here — "Detection still works at that resolution, only
-recognition is starved" — was the exact inverse of the truth.
+**Measured on real footage (2026-09-07, `scripts/document_memory_replay.py`):**
+over five captures and 7,124 frames — the sharpest laptop-screen sessions,
+the backlit-keyboard capture that fooled the old detector, and the
+blurriest walk — the gate admitted 20-67% of frames, the detector ran
+111-800 times, and **zero regions, zero dwells and zero records** resulted.
+With a rendered page composited onto 48 consecutive real frames of the
+same captures, exactly **one record** resulted each time, at word recall
+0.979 (sitting) and 0.894 (walking). The premise is still untested on a
+physical page: no capture contains one.
 
 ### Recall, restated in geometries the hardware can actually produce
 
@@ -142,39 +162,44 @@ cannot be overridden"* — and the numbers above turn that prediction into
 a requirement on the iOS/DAT side. It is recorded in
 `docs/agent-handoffs/TOWER-TO-IOS.md`.
 
-## Detection: three gates, not one
+## Detection: two stages, and what each may claim
 
-A closed laptop lid, a picture frame, a monitor bezel and a blank
-whiteboard are all page-shaped. Rectangle detection alone would call every
-one of them a document.
+**Stage 1 (every frame) claims nothing about text.** Steady means the
+phase-correlation shift against the previous frame is under 1% of the
+diagonal with a response above 0.6; sharp means the variance of the
+Laplacian clears an absolute floor (25, World Builder's) and 0.55 of the
+rolling median of the last 30 frames. The first frame of a stream is
+never steady (nothing precedes it), and a rung change resets the
+comparison.
 
-1. **Shape.** Contour → `approxPolyDP` → a convex quadrilateral of
-   plausible area, aspect and solidity.
-2. **Text-likeness.** Inside the warped quad, the fraction of ROWS whose
-   ink content stands out against the median row. Lines of text produce
-   that structure; a blank sheet and a photograph do not.
-3. **Glyphs.** The median number of dark/light transitions ALONG an inky
-   row. Gate 2 is necessary and badly insufficient on its own: venetian
-   blinds, brick courses, floor tiles and a striped shirt all have rows of
-   dark pixels, and an adversarial review drove a brick wall through
-   detection, dwell, OCR and persistence. Text is many short runs per row;
-   a slat is one. Measured — text 43–86, every structure above 0 —
-   threshold 8.
+**Stage 2 (steady frames, <= 4 Hz) is the OCR engine's own text
+detector.** Its boxes make a region when there are at least three, their
+median height is at least 7 px (body text at 360x640 is ~8 px and is
+readable at that height only when the page fills the frame) and their
+padded union covers at least 3% of the frame. Between runs the last
+region is carried forward for up to 1.5 s while the view stays steady.
 
-### Known false negatives
+**A dwell is made of segments.** The region tracker compares each frame's
+region crop against the segment's first frame by phase correlation; three
+consecutive frames below 0.45 open a new segment. Each segment keeps its
+own best one or two frames, so a three-page read within one dwell yields
+three pages. Segments are capped at six per dwell.
 
-The gates that keep a brick wall out are the same gates that keep these
-out, so each is a trade-off rather than an oversight:
+### What still gets through, and what is kept out
 
-- **Sparse pages** — a title-only note or a business card falls below the
-  text-row gate. A six-line receipt passes, so the boundary is narrow.
-- **A page on a near-white desk** — Canny finds no border where page and
-  surface share an intensity.
-- **A page held closer than 98% of frame area** — rejected by
-  `MAX_AREA_FRACTION`, which does contradict "the wearer reads normally"
-  for anyone who holds reading material close.
-
-Dark and dim pages are fine: Otsu adapts down to about 25% brightness.
+- **A keyboard or a screen held steady** is text to a text detector. It
+  reaches OCR; what OCR makes of it is kept as a page with
+  `readable: false` (regions but no words above the noise floor), and the
+  session counts it as `dwells_unreadable`. On real footage of exactly
+  those surfaces the detector found no region at all, but that is a
+  measurement, not a guarantee.
+- **Body text at 360x640 needs the page close.** Recall on rendered pages
+  is 0.98 with the page filling the frame, 0.74 at 60% of the frame
+  height, 0.02 at 40%. At 504x896 it is 1.00 / 0.98 / 0.66.
+- **A partial page, a page under a hand, a screen** are all fine: no
+  outline is required. The quad detector's known false negatives (sparse
+  pages, a white desk, a page closer than 98% of the frame) no longer
+  apply.
 
 ## Retrieval is lexical, and says so
 
@@ -192,9 +217,15 @@ justified; until then BM25 is forty lines, needs no dependency, and is
 explainable — which matters more here, because a retrieval answer must be
 traceable to text that was actually captured.
 
-**Scaling trigger:** search recomputes the corpus per query. Measured at
-0.3 ms over 10 documents, 4.6 ms over 100, **252 ms over 1000**. An index
-becomes justified in the high hundreds.
+**Pages are the unit of scoring** (since 2026-09-07), so a result names
+the page the snippet came from; a term of five or more characters also
+matches a token within one OCR edit of it (with the rn/m confusion
+folded), weighted below an exact match and never above one. The corpus
+is cached on the journal's `(mtime, size)` stamp, so a query re-tokenises
+the library only when it changed and a newly persisted page is
+searchable on the next query. Measured before the cache: 0.3 ms over 10
+documents, 4.6 ms over 100, 252 ms over 1000; a persistent index becomes
+justified in the thousands.
 
 ## Anti-hallucination, as data rather than convention
 

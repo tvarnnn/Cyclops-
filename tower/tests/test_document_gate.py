@@ -220,6 +220,20 @@ class TestThePageFinder:
         # frames arrive inside the interval and reuse it.
         assert finder.detections == 1
 
+    def test_the_detector_floor_holds_even_when_the_interval_is_zero(self):
+        """A policy that asks for the detector on every frame still gets
+        it at most every `min_detect_interval_s`."""
+        finder = self._finder(detect_interval_s=0.0, min_detect_interval_s=0.3)
+        gray = _page_gray()
+        at = 0.0
+        finder.find(gray, at=at)
+        for index in range(1, 13):
+            at += 0.08
+            finder.find(_shifted(gray, index % 2), at=at)
+
+        # ~1 s of steady frames: one to start, then one per 0.3 s.
+        assert 1 <= finder.detections <= 5
+
     def test_a_stale_region_is_not_carried_forever(self):
         finder = self._finder(detect_interval_s=10.0, carry_forward_s=0.5)
         gray = _page_gray()
