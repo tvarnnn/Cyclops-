@@ -6,13 +6,20 @@ channel is a side surface that must be able to fail without implicating
 it. Separate module, separate failure domain, and `ws.py` gains four small
 dispatch branches rather than three hundred lines.
 
-Every handler here returns without raising. A malformed subscribe, an
-unknown cartridge, a hostile payload: all become a `result_error` on the
-wire. The receive loop must never learn that the result channel had a
-problem, because the receive loop is what answers frames.
+Every handler here returns without raising -- with ONE exception that is
+not a result-channel problem at all. A malformed subscribe, an unknown
+cartridge, a hostile payload: all become a `result_error` on the wire, and
+the receive loop never learns the result channel had a problem, because the
+receive loop is what answers frames. But a `WebSocketDisconnect` means the
+SOCKET is gone, which is the receive loop's business and not a subscription
+bug; it propagates, so the connection ends cleanly rather than being
+swallowed here and re-surfacing as an uncaught `RuntimeError` from the next
+`receive_json`. See `handle`.
 """
 
 import logging
+
+from fastapi import WebSocketDisconnect
 
 from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
@@ -90,7 +97,12 @@ def _echo_safe(value) -> str:
 
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
-    """Dispatch one result-channel message. Never raises."""
+    """Dispatch one result-channel message.
+
+    Returns without raising for every result-channel FAULT -- see the module
+    docstring -- but lets a `WebSocketDisconnect` through, because that is
+    the socket dying, not a subscription going wrong.
+    """
     try:
         message_type = message.get("type")
         if message_type == MSG_CARTRIDGES:
@@ -99,6 +111,17 @@ async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
             await _subscribe(message, websocket, sender, channel_holder)
         elif message_type == MSG_UNSUBSCRIBE:
             await _unsubscribe(message, sender, channel_holder)
+    except WebSocketDisconnect:
+        # NOT a result-channel fault, and the one thing the broad handler
+        # below must not eat. A send or a subscribe on a socket the client
+        # has already dropped raises this; swallowing it here leaves the
+        # receive loop to discover the dead socket on its NEXT
+        # `receive_json`, which raises a bare `RuntimeError: WebSocket is
+        # not connected` that ws.py does not catch and uvicorn logs as
+        # "Exception in ASGI application". Propagated, it reaches the
+        # endpoint's own `except WebSocketDisconnect` and the connection
+        # ends the way every other disconnect does.
+        raise
     except Exception:
         # Deliberately broad, and deliberately swallowed after logging.
         # This handler is called from the frame-serving receive loop; an

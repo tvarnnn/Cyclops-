@@ -404,10 +404,32 @@ if ($CheckOnly) {
 # would build a second one.
 # --host is always explicit: uvicorn's own default is 127.0.0.1, not 0.0.0.0,
 # so omitting it makes the tower unreachable from the phone.
+#
+# --loop keeps a LONG-LIVED Tower alive. On Windows uvicorn runs on
+# asyncio.ProactorEventLoop, whose accept path (CPython gh-93821, unfixed in
+# 3.12 and on main) CLOSES the listening socket and never re-arms it when a
+# connection queued in the backlog is reset before it is accepted -- which a
+# reconnecting phone on a flaky link does routinely. The process stays alive,
+# the loop keeps running, and port 8000 simply disappears. A physical test
+# hit exactly this: process resident, /health refused everywhere, no listener
+# on 8000, restart the only cure. tower/serve_loop.py is a ProactorEventLoop
+# whose accept survives that one transient error and stays up. Note that
+# --loop asyncio does NOT fix it: it still yields a Proactor loop on win32.
+#
+# --timeout-graceful-shutdown BOUNDS shutdown. With uvicorn's default (None)
+# a Ctrl-C after a websocket transport stalls -- a phone suspended with the
+# socket open, whose window went to zero -- waits FOREVER for that connection
+# to drain, and a second Ctrl-C does not help because uvicorn still awaits
+# wait_closed() on the same transport. That is the "INFO: Shutting down" that
+# then hung indefinitely in the field. Ten seconds is enough for the ws
+# teardown's own fsync and its 5 s cartridge-stream join, and turns an
+# unbounded hang into a bounded, controlled exit.
 $uvicornArgs = @(
     '-m', 'uvicorn', 'tower.main:app',
     '--host', $BindHost,
-    '--port', "$Port"
+    '--port', "$Port",
+    '--loop', 'tower.serve_loop:resilient_loop_factory',
+    '--timeout-graceful-shutdown', '10'
 )
 if (Test-Path -LiteralPath $envFile) {
     $uvicornArgs += @('--env-file', $envFile)
