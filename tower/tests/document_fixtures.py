@@ -52,13 +52,51 @@ RECEIPT = [
 ]
 
 
+# Font files to try, in order, for the rendered pages these fixtures use
+# as OCR ground truth. The bare names resolve on Windows and on most
+# Linux images; the absolute paths are macOS, which ships none of them.
+#
+# WHY THE ABSOLUTE PATHS MATTER, AND WHAT THEIR ABSENCE COST.
+#
+# `ImageFont.load_default()` with no size returns a 10-PIXEL BITMAP font
+# and silently ignores the `font_size` these fixtures ask for. On macOS,
+# where none of the three bare names resolves, every "printed page" this
+# module rendered therefore came out very nearly blank -- measured, a
+# full page of body text at a requested 34 px had a mean luminance of
+# 249 of 255. Nothing downstream could see it: the capture gate found no
+# text regions, `detect_page` returned None, no dwell ever opened, and
+# roughly thirty Document Memory tests failed asserting that a page they
+# believed they had drawn was recorded.
+#
+# None of that was a Tower defect. It is the fixture failing to draw,
+# and it fails SILENTLY -- a missing font is not an error, it is a
+# smaller font -- which is the reason it read as a product failure for a
+# whole platform. The size-carrying `load_default(size=)` is the last
+# resort rather than the first, because a real TrueType face is what the
+# thresholds in `gate.py` were derived against.
+_FONT_CANDIDATES = (
+    "arial.ttf",
+    "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+
+
 def _font(size: int):
-    for name in ("arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
+    for name in _FONT_CANDIDATES:
         try:
             return ImageFont.truetype(name, size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    try:
+        # Pillow >= 10.1. Still a bitmap face, but at the size asked for
+        # rather than at 10 px, so a page is at least legible ink.
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def render_page(

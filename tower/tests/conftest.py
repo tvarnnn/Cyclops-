@@ -69,6 +69,44 @@ def _isolate_the_default_observation_root(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_the_default_document_root(monkeypatch, tmp_path):
+    """No test reads the documents of whoever owns this checkout.
+
+    Every word of `_isolate_the_default_observation_root` above applies
+    here unchanged, and this fixture exists because the reasoning was
+    not carried across when Document Memory gained a default root.
+
+    Before 2026-09-07 `config.document_root` had no default: a stock
+    Tower declared the cartridge unavailable and told the wearer to set
+    `TOWER_DOCUMENT_ROOT`. Document Memory V1 fixed that with
+    `DEFAULT_DOCUMENT_ROOT = TOWER_ROOT / "data" / "document_memory"`,
+    which is the same correct product decision Object Memory made a
+    fortnight earlier -- and it inherits the same test hazard, which
+    Object Memory's fixture had already been written to close.
+
+    The hazard is worse for this cartridge, not better. What Document
+    Memory persists is the TEXT OF PAGES a person held in front of their
+    face: an unisolated suite would read a real wearer's correspondence
+    off disk and assert against it. `data/` is gitignored, so on a fresh
+    clone the default is empty and every "no documents recorded" passes
+    for the wrong reason; on a machine that has actually read a page the
+    same assertion fails and looks like a mystery.
+
+    A temp directory, for the same reason as above: "unconfigured" must
+    keep meaning "the default root, whatever it is", so the routes still
+    answer with an empty library and the 404 path stays reachable only by
+    switching the cartridge off with `TOWER_DOCUMENT_ENABLED`. The
+    directory is not created -- a Tower that has never read a page has no
+    store either, and the read routes have to cope with that.
+    """
+    from tower import config
+
+    monkeypatch.setattr(
+        config, "DEFAULT_DOCUMENT_ROOT", str(tmp_path / "default_document_memory")
+    )
+
+
 def _keyframe(session_id: str, seq: int, segment_index: int) -> Keyframe:
     return Keyframe(
         keyframe_id=f"{session_id}:{seq:08d}",

@@ -32,7 +32,15 @@ class TestTheManagedRoot:
         settings = get_settings()
 
         assert settings.document_enabled is True
-        assert settings.document_root == DEFAULT_DOCUMENT_ROOT
+        # `config.DEFAULT_DOCUMENT_ROOT`, read live, not the name bound at
+        # import. The claim is "a stock Tower resolves to the product
+        # default, whatever it is", and the autouse fixture in conftest
+        # repoints that default at a temp directory so the suite never
+        # reads the documents of whoever owns this checkout. Comparing
+        # against the import-time value would assert the fixture away.
+        # That the product default really is TOWER_ROOT/data/document_memory
+        # is the separate claim tested below.
+        assert settings.document_root == config.DEFAULT_DOCUMENT_ROOT
 
     def test_the_default_is_absolute_and_under_the_tower_data_directory(self):
         from pathlib import Path
@@ -83,7 +91,8 @@ class TestCaptureIsOnButRecordsNothingUntilStarted:
         settings = get_settings()
 
         assert settings.document_capture is False
-        assert settings.document_root == DEFAULT_DOCUMENT_ROOT
+        # Live, for the reason given in TestTheManagedRoot above.
+        assert settings.document_root == config.DEFAULT_DOCUMENT_ROOT
 
     def test_disabling_the_cartridge_disables_capture_too(self, monkeypatch):
         monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "0")
