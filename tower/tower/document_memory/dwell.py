@@ -151,6 +151,14 @@ class Dwell:
     # many consecutive frames have disagreed with it.
     content_reference: np.ndarray | None = None
     content_disagreements: int = 0
+    # Frames that disagreed with the reference but have not yet opened a
+    # segment. Held HERE, not in `best`: an independent review showed a
+    # sharp new page scoring into the OLD segment's slots during the
+    # frames before the split, so both of that page's OCR slots held the
+    # new page and the old page's text was gone. On a split these seed
+    # the new segment; when the disagreement turns out to be noise they
+    # are dropped.
+    pending: list = field(default_factory=list)
 
     @property
     def seconds(self) -> float:
@@ -167,11 +175,17 @@ class Dwell:
 
     @property
     def selected(self) -> list:
-        """Every frame that earned OCR, closed segments first, in order."""
+        """Every frame that earned OCR, closed segments first, in order.
+
+        Pending frames count: a dwell that ends mid-disagreement was
+        looking at something, and the last look is the one the wearer is
+        most likely to ask about.
+        """
         frames = []
         for segment in self.closed:
             frames.extend(segment)
         frames.extend(self.best)
+        frames.extend(self.pending)
         return frames
 
     @property
@@ -320,11 +334,15 @@ class DwellTracker:
             gray=gray,
             segment=dwell.segment,
         )
-        dwell.best.append(scored)
-        dwell.best.sort(key=lambda frame: frame.score, reverse=True)
+        # A frame that disagrees with the segment's reference may be the
+        # first of a new page. It must not compete for the old page's
+        # slots; it waits until the disagreement is confirmed or dismissed.
+        target = dwell.pending if dwell.content_disagreements > 0 else dwell.best
+        target.append(scored)
+        target.sort(key=lambda frame: frame.score, reverse=True)
         # Bounded: only the frames that will actually be OCR'd are
         # retained, so a long dwell cannot accumulate imagery.
-        del dwell.best[self._policy.best_frames :]
+        del target[self._policy.best_frames :]
 
     def _check_content(self, dwell: Dwell, candidate, gray) -> None:
         """Same region, different words? Then this is a new segment."""
@@ -340,16 +358,21 @@ class DwellTracker:
             return
         _shift, response = cv2.phaseCorrelate(reference, probe)
         if response >= self._policy.content_change_response:
+            # Agreement again: whatever disagreed was noise, not a page.
             dwell.content_disagreements = 0
+            dwell.pending = []
             return
         dwell.content_disagreements += 1
         if dwell.content_disagreements < self._policy.content_change_frames:
             return
         # A page turn. Close the segment, keep its best frames, and let a
-        # new one begin with this frame as its reference.
+        # new one begin, seeded with the frames that announced it.
         if dwell.best:
             dwell.closed.append(list(dwell.best))
-            dwell.best = []
+        dwell.best = dwell.pending
+        dwell.pending = []
+        for frame in dwell.best:
+            frame.segment = dwell.segment + 1
         dwell.segment += 1
         self._segments_opened += 1
         dwell.content_reference = probe

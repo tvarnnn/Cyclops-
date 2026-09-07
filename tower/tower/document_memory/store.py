@@ -19,7 +19,27 @@ from tower.document_memory.records import (
     DocumentObservation,
     document_observation_from_json_dict,
 )
-from tower.storage import append_jsonl, read_raw_jsonl
+from tower.storage import _replace_with_retry, append_jsonl, read_raw_jsonl
+
+# A reader that meets a rewrite mid-flight on Windows gets PermissionError
+# on open. Retried briefly: the rewrite is atomic and finishes in
+# milliseconds, and a status producer that died on it reported the
+# library unavailable for one tick, which is a false claim.
+READ_RETRIES = 5
+READ_RETRY_S = 0.02
+
+
+def _read_raw_with_retry(path):
+    import time
+
+    for attempt in range(READ_RETRIES):
+        try:
+            return read_raw_jsonl(path)
+        except PermissionError:
+            if attempt == READ_RETRIES - 1:
+                raise
+            time.sleep(READ_RETRY_S * (attempt + 1))
+    return [], 0  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +119,7 @@ class DocumentStore:
         import os
 
         with self._lock:
-            raw_records, _ = read_raw_jsonl(self._path)
+            raw_records, _ = _read_raw_with_retry(self._path)
             replaced = False
             kept = []
             for record in raw_records:
@@ -117,7 +137,10 @@ class DocumentStore:
                         handle.write(json.dumps(record) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
-                temp_path.replace(self._path)
+                # Retried, never bare: a status producer, a search or the
+                # phone's re-fetch may hold the journal open at this
+                # instant, and Windows refuses a rename onto an open file.
+                _replace_with_retry(temp_path, self._path)
             finally:
                 temp_path.unlink(missing_ok=True)
             return True
@@ -144,7 +167,7 @@ class DocumentStore:
                 handle.write(jpeg_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temp_path.replace(path)
+            _replace_with_retry(temp_path, path)
         finally:
             temp_path.unlink(missing_ok=True)
         return path
@@ -212,7 +235,7 @@ class DocumentStore:
         deletes, an operator auditing the file -- and is never the right
         answer for anything a wearer will be shown.
         """
-        raw_records, corrupt = read_raw_jsonl(self._path)
+        raw_records, corrupt = _read_raw_with_retry(self._path)
         if corrupt:
             logger.warning(
                 "document store: skipped %s corrupt line(s) in %s",
@@ -415,10 +438,16 @@ class DocumentStore:
         import os
 
         with self._lock:
-            raw_records, _ = read_raw_jsonl(self._path)
+            raw_records, _ = _read_raw_with_retry(self._path)
             kept = [record for record in raw_records if keep(record)]
             dropped = len(raw_records) - len(kept)
             if not self._path.exists():
+                return 0
+            if dropped == 0:
+                # Nothing to drop is nothing to rewrite. The session prunes
+                # after every document it records, and rewriting an
+                # unchanged journal on each one was a whole-file fsync per
+                # page and a rename a concurrent reader could refuse.
                 return 0
             temp_path = self._path.with_name(self._path.name + TEMP_SUFFIX)
             try:
@@ -427,7 +456,7 @@ class DocumentStore:
                         handle.write(json.dumps(record) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
-                temp_path.replace(self._path)
+                _replace_with_retry(temp_path, self._path)
             finally:
                 temp_path.unlink(missing_ok=True)
             return dropped

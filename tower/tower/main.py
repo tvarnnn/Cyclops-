@@ -611,6 +611,14 @@ def create_app() -> FastAPI:
     # records a document only when a session is started; unset means the
     # routes answer 404.
     app.state.document_root = settings.document_root
+    # The window the session writes under, so a read with no window of
+    # its own sees what the writer promised rather than forever. 0 means
+    # the operator chose forever, and None is what the routes read that as.
+    app.state.document_retention_days = (
+        settings.document_retention_days
+        if settings.document_retention_days and settings.document_retention_days > 0
+        else None
+    )
     # Whether a live session exists is a SEPARATE question from whether
     # the library can be read, and the two must not be conflated. A Tower
     # reprocessing captures offline has a library and no session; that is

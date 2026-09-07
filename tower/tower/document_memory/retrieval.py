@@ -47,6 +47,7 @@ returns nothing and says so.
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 
 from tower.confidence import Confidence
@@ -72,6 +73,9 @@ FUZZY_MIN_TERM_LENGTH = 5
 # And a fuzzy match is worth less than an exact one, so a page that
 # actually says the word outranks one that nearly does.
 FUZZY_WEIGHT = 0.6
+
+# How long a cached corpus may outlive a record's retention window.
+RETENTION_STAMP_BUCKET_S = 60
 
 # Words in a page's TITLE count this many times over. The title is the
 # document's first line, which is what a person remembers.
@@ -290,7 +294,17 @@ class _CorpusCache:
             return _Corpus(store.read_all())
         try:
             stat = path.stat()
-            stamp = (stat.st_mtime_ns, stat.st_size, store.retention_seconds)
+            # With a retention window the corpus also ages out: a record
+            # that crossed the window since the last parse must stop
+            # matching even though the journal did not change. A minute
+            # bucket bounds the staleness to sixty seconds and the rebuild
+            # rate to once a minute on an idle library.
+            aging = (
+                None
+                if store.retention_seconds is None
+                else int(time.time() // RETENTION_STAMP_BUCKET_S)
+            )
+            stamp = (stat.st_mtime_ns, stat.st_size, store.retention_seconds, aging)
         except FileNotFoundError:
             stamp = None
         key = str(path)

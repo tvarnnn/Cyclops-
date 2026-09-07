@@ -139,7 +139,10 @@ class Reading:
 
     @property
     def word_count(self) -> int:
-        return len(tokenise(self.text))
+        # Tokens of two or more characters. OCR noise is largely single
+        # characters at plausible confidence, and three of those must not
+        # qualify a reading to vouch for another page's identity.
+        return sum(1 for token in tokenise(self.text) if len(token) >= 2)
 
     @property
     def can_testify(self) -> bool:

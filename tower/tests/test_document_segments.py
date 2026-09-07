@@ -76,6 +76,61 @@ class TestSegments:
         assert engine.pages_turned == 1
         assert {page.page_index for page in documents[0].pages} == {0, 1}
 
+    def test_a_sharper_second_page_does_not_evict_the_first(self, store):
+        """The review's blocker: before the split is confirmed, frames of
+        the NEW page must not compete for the OLD page's OCR slots.
+        Blurred page A, then sharp page B: both must survive."""
+        clock = _Clock()
+        engine, recogniser = _engine(
+            store,
+            [fx.page_regions(fx.TRANSFORMER_PAPER), fx.page_regions(fx.DEPTH_NOTES)],
+            clock,
+        )
+        soft = [
+            fx.encode(fx.blur(cv2.imdecode(np.frombuffer(f, np.uint8), cv2.IMREAD_COLOR), 3))
+            for f in fx.document_frames(fx.TRANSFORMER_PAPER, 8, frame_size=(360, 640))
+        ]
+        sharp = fx.document_frames(fx.DEPTH_NOTES, 8, frame_size=(360, 640))
+
+        _feed(engine, soft + sharp, clock)
+        engine.flush()
+
+        document = store.read_all()[0]
+        assert document.pages_observed == 2
+        texts = {page.text.split(" ")[0] for page in document.pages}
+        assert texts == {"Attention", "Monocular"}
+
+    def test_an_unreadable_next_page_is_its_own_page(self, store):
+        """Blank after a reading merges only INSIDE a segment. Across a
+        page turn it is a page OCR could not read, not another look at
+        the previous one."""
+        clock = _Clock()
+        engine, recogniser = _engine(
+            store, [fx.page_regions(fx.TRANSFORMER_PAPER), "", ""], clock
+        )
+        first = fx.document_frames(fx.TRANSFORMER_PAPER, 8, frame_size=(360, 640))
+        second = fx.document_frames(fx.DEPTH_NOTES, 8, frame_size=(360, 640))
+
+        _feed(engine, first + second, clock)
+        engine.flush()
+
+        document = store.read_all()[0]
+        assert document.pages_observed == 2
+        assert document.pages[0].readable and not document.pages[1].readable
+        assert document.pages[0].observation_count <= 2
+
+    def test_a_flush_is_bounded_and_keeps_the_newest_frames(self, store):
+        clock = _Clock()
+        engine, recogniser = _engine(store, [fx.page_regions(fx.RECEIPT)], clock)
+        _feed(engine, fx.document_frames(fx.RECEIPT, 8, frame_size=(360, 640)), clock)
+        before = recogniser.calls
+
+        engine.flush(max_frames=1)
+
+        assert recogniser.calls == before + 1
+        assert engine.last_outcome is not None
+        assert engine.last_outcome.pages_ocred == 1
+
     def test_one_noisy_frame_does_not_split_a_page(self, store):
         """The content check must disagree on consecutive frames."""
         tracker = DwellTracker(POLICY)
@@ -237,6 +292,52 @@ class TestTheStoreUpdate:
         renamed, untouched = store.read_all()
         assert renamed.title == "renamed"
         assert untouched.document_id == second.document_id
+
+    def test_update_survives_a_reader_holding_the_journal_open(self, store):
+        """Windows refuses a rename onto an open file. A status producer,
+        a search and the phone's re-fetch all open the journal; the
+        rewrite must retry rather than lose a sighting."""
+        import threading
+        from dataclasses import replace
+
+        clock = _Clock()
+        engine, _ = _engine(store, [fx.page_regions(fx.RECEIPT)], clock)
+        _feed(engine, fx.document_frames(fx.RECEIPT, 8, frame_size=(360, 640)), clock)
+        engine.flush()
+        document = store.read_all()[0]
+        stop = threading.Event()
+        reads = []
+
+        def reader():
+            while not stop.is_set():
+                reads.append(len(store.read_all()))
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        try:
+            for index in range(60):
+                assert store.update(replace(document, title=f"t{index}")) is True
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert store.read_all()[0].title == "t59"
+        assert reads and all(count == 1 for count in reads)
+
+    def test_a_prune_with_nothing_to_drop_does_not_rewrite(self, store):
+        clock = _Clock()
+        engine, _ = _engine(store, [fx.page_regions(fx.RECEIPT)], clock)
+        _feed(engine, fx.document_frames(fx.RECEIPT, 8, frame_size=(360, 640)), clock)
+        engine.flush()
+        stat = store.path.stat()
+
+        # The test clock records at epoch ~1000 s; a window wide enough to
+        # reach back to it is what "nothing expired" means here.
+        report = DocumentStore(store.directory, retention_seconds=10.0**12).prune_expired()
+
+        assert report["documents_removed"] == 0
+        after = store.path.stat()
+        assert (after.st_mtime_ns, after.st_size) == (stat.st_mtime_ns, stat.st_size)
 
     def test_update_of_a_missing_record_is_false(self, store, tmp_path):
         clock = _Clock()

@@ -112,6 +112,28 @@ class TestWhatTheStatusSays:
         assert DocumentStore(tmp_path).count() == 1
         assert DocumentStore(tmp_path).read_all()[0].sighting_count == 2
 
+    def test_an_unreadable_dwell_is_recorded_and_counted(self, tmp_path, frames):
+        recognisers = []
+
+        def factory():
+            recogniser = _Recogniser(pages=[""])
+            recognisers.append(recogniser)
+            return recogniser
+
+        session = DocumentLive(
+            tmp_path, policy=POLICY, recogniser_factory=factory, retention_days=1.0
+        )
+        session.start()
+        assert _wait(lambda: session.status()["state"] == "running")
+        at = _feed(session, frames)
+        _feed(session, [fx.encode(fx.no_page_frame(frame_size=FRAME))] * 12, start=at, seq=100)
+
+        assert _wait(lambda: session.status()["dwells_unreadable"] == 1)
+        assert session.status()["documents_recorded"] == 1
+        session.stop()
+        document = DocumentStore(tmp_path).read_all()[0]
+        assert not any(page.readable for page in document.pages)
+
     def test_stop_flushes_a_dwell_in_progress_and_releases_the_reader(
         self, tmp_path, frames
     ):
@@ -196,6 +218,25 @@ class TestTheIdleWindDown:
         assert session.status()["idle_stop_pending"] is True
         assert _wait(lambda: session.status()["state"] == "stopped", timeout=3.0)
         assert recognisers[0].released == 1
+
+    def test_an_idle_stop_never_runs_ocr_on_the_timer_thread(self, tmp_path, frames):
+        """A dwell open when the stream closed is dropped, not read: the
+        timer's thread must not build a torch thread pool, and the dwell
+        ended ten minutes ago in any case. Logged, never silent."""
+        recognisers = []
+        session = _session(tmp_path, recognisers, idle_stop_s=0.3)
+        session.start()
+        assert _wait(lambda: session.status()["state"] == "running")
+        _feed(session, frames[:6])
+        assert _wait(lambda: session.status()["in_dwell"] is True)
+        calls_before = recognisers[0].calls
+
+        session.stream_closed("phone")
+        assert _wait(lambda: session.status()["state"] == "stopped", timeout=3.0)
+
+        assert recognisers[0].calls == calls_before
+        assert session.status()["flushed_document_id"] is None
+        assert DocumentStore(tmp_path).count() == 0
 
     def test_a_reconnect_cancels_the_wind_down(self, tmp_path, frames):
         recognisers = []

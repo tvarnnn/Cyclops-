@@ -153,6 +153,24 @@ class TestFreshness:
         assert result.sufficient_evidence
         assert result.matches[0].document_id == "new"
 
+    def test_a_record_that_ages_out_stops_matching_within_a_minute(self, tmp_path, monkeypatch):
+        """The corpus cache is keyed on the journal, which does not change
+        when a record crosses the retention window. A minute bucket in
+        the stamp bounds how long an expired record can keep matching."""
+        from tower.document_memory import retrieval
+
+        clock = {"now": NOW}
+        windowed = DocumentStore(tmp_path, retention_seconds=100.0, clock=lambda: clock["now"])
+        windowed.append(_document("fresh", ["The lighthouse keeper's log."], at=NOW - 10))
+        monkeypatch.setattr(retrieval.time, "time", lambda: clock["now"])
+        memory = DocumentMemory(windowed)
+        assert memory.search_text("lighthouse").sufficient_evidence
+
+        clock["now"] = NOW + 1000
+
+        assert not memory.search_text("lighthouse").sufficient_evidence
+        assert memory.recent() == []
+
     def test_a_purged_page_stops_matching(self, store):
         memory = DocumentMemory(store)
         assert memory.search_text("receipt cable").sufficient_evidence

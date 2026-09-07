@@ -156,6 +156,9 @@ class DocumentLive(LiveSession):
         self._ocr_device = None
         self._idle_timer: threading.Timer | None = None
         self._idle_stops = 0
+        # True only while the idle timer's own thread is inside `stop()`,
+        # so `_on_pause` knows not to run OCR there.
+        self._idle_abandon = False
         self._flushed_document_id = None
 
     # -- capture lineage -----------------------------------------------
@@ -242,7 +245,11 @@ class DocumentLive(LiveSession):
             self._idle_stop_s,
         )
         self._idle_stops += 1
-        self.stop()
+        self._idle_abandon = True
+        try:
+            self.stop()
+        finally:
+            self._idle_abandon = False
 
     # -- hooks ---------------------------------------------------------
 
@@ -301,7 +308,7 @@ class DocumentLive(LiveSession):
         if result.in_dwell and not self._in_dwell:
             self._dwells_started += 1
         self._in_dwell = bool(result.in_dwell)
-        if result.outcome == "unreadable":
+        if result.unreadable:
             self._dwells_unreadable += 1
         if result.document_id is not None:
             if result.resighted:
@@ -322,11 +329,27 @@ class DocumentLive(LiveSession):
         document arrived because the session ended rather than because
         the wearer looked away.
         """
+        if self._idle_abandon:
+            # The idle timer's thread. No OCR here: a torch thread pool
+            # built on a `threading.Timer` thread is never reclaimed, and
+            # the dwell it would read ended ten minutes ago in any case.
+            if engine.abandon():
+                logger.warning(
+                    "[Tower][Document] an idle stop dropped a dwell that "
+                    "was still open when the stream closed; it was not read"
+                )
+            return
         document_id = engine.flush(END_REASON_STOPPED)
         if document_id is None:
             return
+        outcome = engine.last_outcome
         with self._condition:
-            self._documents_recorded += 1
+            if outcome is not None and outcome.resighted:
+                self._documents_resighted += 1
+            else:
+                self._documents_recorded += 1
+            if outcome is not None and outcome.unreadable:
+                self._dwells_unreadable += 1
             self._last_document_id = document_id
             self._flushed_document_id = document_id
         self._prune(self._store)

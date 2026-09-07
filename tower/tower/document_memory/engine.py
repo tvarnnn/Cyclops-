@@ -115,7 +115,7 @@ def is_same_page(existing: str, incoming: str) -> bool:
 class ObserveResult:
     """What happened to one frame. Cheap to produce, cheap to log."""
 
-    outcome: str  # "no_page" | "dwelling" | "document" | "resighted" | "unreadable"
+    outcome: str  # "no_page" | "dwelling" | "document" | "resighted"
     document_id: str | None = None
     in_dwell: bool = False
     page_detected: bool = False
@@ -123,6 +123,29 @@ class ObserveResult:
     # True when this frame ended a dwell whose page was already on
     # record; `document_id` then names THAT record.
     resighted: bool = False
+    # True when the record this frame produced has no readable page: OCR
+    # looked and found only noise. Persisted all the same, and counted.
+    unreadable: bool = False
+
+
+@dataclass(frozen=True)
+class RecordOutcome:
+    """What `_record` did with a finished dwell."""
+
+    document_id: str | None
+    resighted: bool = False
+    unreadable: bool = False
+    pages_ocred: int = 0
+
+
+# How many frames a FLUSH may OCR. A Stop or a Pause runs the flush on the
+# caller's thread -- an HTTP handler, usually -- and a dwell with six
+# segments of two frames is twelve pages: ~4 s on the GPU and ~23 s on a
+# CPU that `auto` fell back to. Four keeps the worst case near a second
+# on the GPU and under eight on the CPU, and the NEWEST frames are the
+# ones kept, because the page in view when a person pressed Stop is the
+# page they will ask about.
+FLUSH_MAX_FRAMES = 4
 
 
 class DocumentMemoryEngine:
@@ -181,6 +204,7 @@ class DocumentMemoryEngine:
         self._documents_resighted = 0
         self._dwells_unreadable = 0
         self._pages_ocred = 0
+        self._last_outcome: RecordOutcome | None = None
 
     @property
     def frames_observed(self) -> int:
@@ -275,18 +299,36 @@ class DocumentMemoryEngine:
             sharpness=None if candidate is None else candidate.sharpness,
         )
 
-    def flush(self, reason: str = END_REASON_STOPPED) -> str | None:
+    def flush(
+        self, reason: str = END_REASON_STOPPED, *, max_frames: int | None = FLUSH_MAX_FRAMES
+    ) -> str | None:
         """End an open dwell because the stream ended.
 
         A wearer who is still reading when the session stops has still
         read; discarding that observation would lose exactly the document
-        they were most engaged with.
+        they were most engaged with. Bounded to `max_frames` OCR calls,
+        newest first; `last_outcome` says what was recorded.
         """
         finished = self._tracker.flush(reason)
         if finished is None:
             return None
-        document_id, _resighted = self._record(finished)
-        return document_id
+        return self._record(finished, max_frames=max_frames).document_id
+
+    def abandon(self) -> bool:
+        """Drop an open dwell WITHOUT reading it. True if one was open.
+
+        For the one caller that must not run OCR on its own thread: the
+        idle timer that stops a session nobody has streamed to for ten
+        minutes. Whatever dwell was open then ended at least that long
+        ago, and reading it there would build a torch thread pool on a
+        thread that is about to die. Logged by the caller, never silent.
+        """
+        return self._tracker.flush(END_REASON_STOPPED) is not None
+
+    @property
+    def last_outcome(self) -> RecordOutcome | None:
+        """What the most recent `_record` did. None until a dwell ended."""
+        return self._last_outcome
 
     def release(self) -> None:
         self._recogniser.release()
@@ -356,20 +398,15 @@ class DocumentMemoryEngine:
 
     def _resolve(self, finished, *, page_detected, sharpness=None) -> ObserveResult:
         if finished is not None:
-            document_id, resighted = self._record(finished)
-            if document_id is None:
-                outcome = "unreadable"
-            elif resighted:
-                outcome = "resighted"
-            else:
-                outcome = "document"
+            recorded = self._record(finished)
             return ObserveResult(
-                outcome=outcome,
-                document_id=document_id,
+                outcome="resighted" if recorded.resighted else "document",
+                document_id=recorded.document_id,
                 in_dwell=self._tracker.in_dwell,
                 page_detected=page_detected,
                 sharpness=sharpness,
-                resighted=resighted,
+                resighted=recorded.resighted,
+                unreadable=recorded.unreadable,
             )
         return ObserveResult(
             outcome="dwelling" if self._tracker.in_dwell else "no_page",
@@ -378,24 +415,36 @@ class DocumentMemoryEngine:
             sharpness=sharpness,
         )
 
-    def _record(self, dwell) -> tuple[str | None, bool]:
+    def _record(self, dwell, *, max_frames: int | None = None) -> RecordOutcome:
         """The expensive path: crop, OCR, dedup, identify, persist.
 
-        Returns `(document_id, resighted)`. `(None, False)` means the
-        dwell produced nothing worth keeping -- OCR found no text at all
-        in any selected frame -- and it is counted, not persisted. A
-        library of "looked, saw nothing" rows is noise to the person
-        searching it; the count on the session status is where that fact
-        belongs.
+        Every qualifying dwell is persisted, readable or not: "we looked
+        and found no readable text" is a real answer and a different one
+        from "we never looked". The outcome says which, and the session
+        counts the unreadable ones so a library filling with them is
+        visible.
         """
+        outcome = self._record_inner(dwell, max_frames=max_frames)
+        self._last_outcome = outcome
+        return outcome
+
+    def _record_inner(self, dwell, *, max_frames: int | None) -> RecordOutcome:
         document_id = new_id()
         pages: list[PageObservation] = []
+        # Which segment each page came from, parallel to `pages`, so the
+        # blank-merge rule cannot fold an unreadable NEXT page into the
+        # previous one across a page turn.
+        page_segments: list[int] = []
         # OCR returns one region per detected line, so the first region of
         # the first page IS the title line. Reconstructing a title by
         # splitting the joined text would be guessing at structure the
         # recogniser already gave us.
         title_candidate: str | None = None
         selected = dwell.selected
+        if max_frames is not None and len(selected) > max_frames:
+            # Newest first: the last segments are the pages in view when
+            # the session ended, which are the ones a person asks about.
+            selected = selected[-max_frames:]
 
         for index, frame in enumerate(selected):
             page_image = crop_region(frame.gray, frame.candidate)
@@ -404,7 +453,9 @@ class DocumentMemoryEngine:
             text = result.text if readable else ""
             visual_hash = perceptual_hash(page_image)
 
-            duplicate = _find_duplicate(pages, text)
+            duplicate = _find_duplicate(
+                pages, text, segment=frame.segment, page_segments=page_segments
+            )
             if duplicate is not None:
                 # The same page seen twice within one dwell -- which is the
                 # NORMAL case, since best-frame selection deliberately picks
@@ -423,6 +474,7 @@ class DocumentMemoryEngine:
             if self._keep_page_images:
                 relpath = self._persist_page_image(document_id, index, page_image)
 
+            page_segments.append(frame.segment)
             pages.append(
                 PageObservation(
                     page_index=len(pages),
@@ -442,12 +494,11 @@ class DocumentMemoryEngine:
                 )
             )
 
-        if not any(page.readable for page in pages):
+        unreadable = not any(page.readable for page in pages)
+        if unreadable:
             # The detector said text; the recogniser could not read it.
-            # PERSISTED all the same, as a page that is not readable:
-            # "we looked and found no readable text" is a real answer and
-            # a different one from "we never looked", and the session
-            # counts these so a library filling with them is visible.
+            # PERSISTED all the same, as a page that is not readable, and
+            # counted.
             self._dwells_unreadable += 1
 
         if self._resight:
@@ -464,7 +515,12 @@ class DocumentMemoryEngine:
                 updated = _with_sighting(existing, sighting, pages)
                 if self._store.update(updated):
                     self._documents_resighted += 1
-                    return existing.document_id, True
+                    return RecordOutcome(
+                        existing.document_id,
+                        resighted=True,
+                        unreadable=unreadable,
+                        pages_ocred=len(selected),
+                    )
                 # The record vanished between read and write -- a purge
                 # raced us. Fall through and record it afresh.
 
@@ -496,7 +552,9 @@ class DocumentMemoryEngine:
         )
         self._store.append(document)
         self._documents_recorded += 1
-        return document_id, False
+        return RecordOutcome(
+            document_id, unreadable=unreadable, pages_ocred=len(selected)
+        )
 
     def _find_resighting(self, pages) -> DocumentObservation | None:
         """The recorded document these pages are a later look at, or None.
@@ -622,7 +680,7 @@ def _with_sighting(existing, sighting, pages) -> DocumentObservation:
     )
 
 
-def _find_duplicate(pages, incoming: str):
+def _find_duplicate(pages, incoming: str, *, segment: int = 0, page_segments=None):
     """Which already-recorded page, if any, this reading belongs to.
 
     Two rules, and the difference between them matters.
@@ -630,21 +688,25 @@ def _find_duplicate(pages, incoming: str):
     A TEXT-to-TEXT match may be against any page in the document: OCR
     reading the same words again is the same page wherever it sits.
 
-    A BLANK match is restricted to the page recorded IMMEDIATELY BEFORE.
-    The dwell's best frames are the sharpest views of a segment, not
-    guaranteed to be the same physical page -- a wearer can turn a page
-    without the region moving. An adversarial review showed the
-    unrestricted rule erasing a genuinely different page whenever OCR
-    happened to fail on it, which is an observation gap reported as
-    content.
+    A BLANK match is restricted to the page recorded IMMEDIATELY BEFORE,
+    AND ONLY WITHIN THE SAME SEGMENT. The dwell's best frames are the
+    sharpest views of a segment, not guaranteed to be the same physical
+    page -- a wearer can turn a page without the region moving, and the
+    segment boundary is where the tracker saw that happen. An adversarial
+    review showed the unrestricted rule erasing a genuinely different
+    page whenever OCR happened to fail on it, and a later one showed the
+    same-segment restriction missing: an unreadable next page folded
+    into the previous page's observation count.
     """
+    previous_same_segment = bool(pages) and (
+        page_segments is None or page_segments[-1] == segment
+    )
     incoming_blank = not incoming.strip()
     if incoming_blank:
-        if pages and not pages[-1].text.strip():
-            return pages[-1]
-        if pages and pages[-1].text.strip():
-            # The previous page read fine and this view did not. Same
-            # page, seen badly once -- keep the reading that worked.
+        if previous_same_segment:
+            # Blank after blank: the same unreadable page. Blank after a
+            # reading: the same page, seen badly once -- keep the reading
+            # that worked. Either way it is this segment's page.
             return pages[-1]
         return None
     for page in pages:
@@ -652,8 +714,9 @@ def _find_duplicate(pages, incoming: str):
             continue
         if token_overlap(page.text, incoming) >= SAME_PAGE_TOKEN_OVERLAP:
             return page
-    # A blank page followed by a reading: the reading belongs to it.
-    if pages and not pages[-1].text.strip():
+    # A blank page followed by a reading, in the same segment: the
+    # reading belongs to it.
+    if previous_same_segment and not pages[-1].text.strip():
         return pages[-1]
     return None
 

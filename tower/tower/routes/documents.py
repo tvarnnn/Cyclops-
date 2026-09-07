@@ -84,6 +84,15 @@ def _root(request: Request):
 
 
 def _store(request: Request, retention_days):
+    # The Tower's own window when the caller names none. Until 2026-09-07
+    # a read with no `retention_days` saw FOREVER while the session wrote
+    # under thirty days, so an expired-but-not-yet-pruned record was
+    # served. A caller can still narrow; nothing can widen.
+    configured = getattr(request.app.state, "document_retention_days", None)
+    if retention_days is None:
+        retention_days = configured
+    elif configured is not None:
+        retention_days = min(retention_days, configured)
     return store_from_root(_root(request), retention_days=retention_days)
 
 
