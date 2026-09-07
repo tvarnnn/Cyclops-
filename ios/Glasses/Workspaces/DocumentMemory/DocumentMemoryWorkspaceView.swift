@@ -53,11 +53,14 @@ struct DocumentMemoryWorkspaceView: View {
     init(
         isTowerReachable: Bool,
         client: any DocumentMemoryClient,
-        camera: (any ObjectMemoryCaptureOwner)? = nil
+        camera: (any ObjectMemoryCaptureOwner)? = nil,
+        cameraClaim: CartridgeCameraClaim? = nil
     ) {
         self.isTowerReachable = isTowerReachable
         _memory = StateObject(
-            wrappedValue: DocumentMemoryViewModel(client: client, camera: camera)
+            wrappedValue: DocumentMemoryViewModel(
+                client: client, camera: camera, cameraClaim: cameraClaim
+            )
         )
     }
 

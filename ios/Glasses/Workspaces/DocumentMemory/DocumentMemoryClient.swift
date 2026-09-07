@@ -610,7 +610,15 @@ final class DocumentMemoryViewModel: ObservableObject {
     /// Tower half still works and the panel says the camera half cannot be
     /// reached from here.
     private let camera: (any ObjectMemoryCaptureOwner)?
-    private var startedTheCamera = false
+    /// Whether this app started the running capture. Injected rather than
+    /// stored, because this view model is a `@StateObject` and is destroyed
+    /// on every cartridge switch -- see `CartridgeCameraClaim` for what that
+    /// cost when the fact lived here.
+    private let cameraClaim: CartridgeCameraClaim
+    private var startedTheCamera: Bool {
+        get { cameraClaim.startedByThisApp }
+        set { cameraClaim.startedByThisApp = newValue }
+    }
     private var cancellables: Set<AnyCancellable> = []
 
     /// The question the screen is currently showing the answer to, re-asked
@@ -619,9 +627,23 @@ final class DocumentMemoryViewModel: ObservableObject {
     private var lastLibraryRevision: Int?
 
     /// No default argument for `client` — see `WorldBuilderViewModel.init(client:)`.
-    init(client: any DocumentMemoryClient, camera: (any ObjectMemoryCaptureOwner)? = nil) {
+    init(
+        client: any DocumentMemoryClient,
+        camera: (any ObjectMemoryCaptureOwner)? = nil,
+        // Optional with a nil default, and built in the body rather than in
+        // the signature: a default-argument expression is evaluated in a
+        // nonisolated context, and `CartridgeCameraClaim` is @MainActor, so
+        // `= CartridgeCameraClaim()` here is a main-actor call from outside
+        // the actor. The same trap this project has hit before with
+        // `= WorldGeometryClient()`.
+        cameraClaim: CartridgeCameraClaim? = nil
+    ) {
         self.client = client
         self.camera = camera
+        // A view model given no claim gets its own, which is right for the
+        // tests and previews that construct one directly: nothing else
+        // shares their camera.
+        self.cameraClaim = cameraClaim ?? CartridgeCameraClaim()
         self.state = client.state
         self.session = client.session
         self.lastSessionOutcome = client.lastSessionOutcome

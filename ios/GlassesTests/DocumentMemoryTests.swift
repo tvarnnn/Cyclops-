@@ -1102,6 +1102,52 @@ final class DocumentSessionTests: XCTestCase {
         XCTAssertEqual(record.time.observedAt, first.time.observedAt)
     }
 
+    /// The camera claim must survive the wearer changing cartridge.
+    ///
+    /// `DocumentMemoryViewModel` is a `@StateObject` owned by its workspace
+    /// view, so SwiftUI destroys it the moment another cartridge opens and
+    /// builds a fresh one on the way back. This lane shipped
+    /// `startedTheCamera` as a private property of that view model, which
+    /// means the memory of having started the camera died with it: the
+    /// capture kept running, the rebuilt screen said the camera belonged to
+    /// somebody else, and its Stop no longer stopped it, because the branch
+    /// that calls `stopCameraSession()` is guarded on the flag that was just
+    /// lost. Only Home could then end the capture.
+    ///
+    /// The fact now lives on a `CartridgeCameraClaim` that `ProjectManager`
+    /// owns. This test destroys the view model exactly as a cartridge switch
+    /// does, keeps the claim, and asserts the second view model can still
+    /// stop what the first one started.
+    func testTheCameraClaimSurvivesACartridgeSwitch() {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+
+        // The wearer opens Document Memory and presses Start.
+        var first: DocumentMemoryViewModel? = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+        first?.send(.start)
+        XCTAssertEqual(camera.starts, 1, "Start must start the camera when nothing holds it")
+        XCTAssertTrue(claim.startedByThisApp)
+
+        // The wearer opens another cartridge. The view model goes; the
+        // camera does not.
+        first = nil
+        XCTAssertEqual(camera.stops, 0, "a cartridge switch must not stop the capture")
+
+        // And comes back. A NEW view model, the same claim.
+        let second = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+        second.send(.stop)
+
+        XCTAssertEqual(
+            camera.stops, 1,
+            "Stop after a cartridge switch must still stop the camera this app started"
+        )
+        XCTAssertFalse(claim.startedByThisApp)
+    }
+
     /// A deletion that quietly failed looks exactly like one that was kept, so
     /// it is reported rather than logged.
     func testAnIncompleteRetentionSweepIsReported() throws {

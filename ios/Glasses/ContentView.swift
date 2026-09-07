@@ -215,7 +215,8 @@ struct ContentView: View {
                     DocumentMemoryWorkspaceView(
                         isTowerReachable: isTowerReachable,
                         client: project.cartridgeClients.documentMemory,
-                        camera: project.documentMemoryCamera
+                        camera: project.documentMemoryCamera,
+                        cameraClaim: project.documentMemoryCameraClaim
                     )
                 }
             case .sceneUnderstanding:

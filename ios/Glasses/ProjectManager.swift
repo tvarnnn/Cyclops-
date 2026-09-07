@@ -57,6 +57,12 @@ final class ProjectManager: ObservableObject {
     /// like the coordinator's.
     let documentMemoryCamera: (any ObjectMemoryCaptureOwner)?
 
+    /// Whether Document Memory's Start is what put the camera on. Held here,
+    /// not in the workspace's view model, because that view model is
+    /// destroyed on every cartridge switch and this fact must survive one.
+    /// See `CartridgeCameraClaim`.
+    let documentMemoryCameraClaim = CartridgeCameraClaim()
+
     /// The four cartridge clients.
     ///
     /// Owned here rather than in the workspace views because a workspace's
