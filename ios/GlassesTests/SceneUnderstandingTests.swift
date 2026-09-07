@@ -1095,3 +1095,56 @@ final class SceneUnderstandingClientTests: XCTestCase {
         XCTAssertEqual(client.cartridgeID, "scene-understanding")
     }
 }
+
+// MARK: - 2026-09-07 additions
+
+final class SceneUnderstandingAdditionsTests: XCTestCase {
+    private func people(_ extra: [String: Any]) -> ScenePeople {
+        var json: [String: Any] = ["count": 2, "facing_wearer": 1, "facing_answered": true]
+        json.merge(extra) { _, new in new }
+        return SceneUnderstandingDecoder.people(from: json)!
+    }
+
+    func testAnOlderTowerDecodesWithNothingInvented() {
+        let decoded = people([:])
+        XCTAssertEqual(decoded.partialBottomEdge, 0)
+        XCTAssertEqual(decoded.byApparentSize, [:])
+        XCTAssertNil(decoded.orientationStatus)
+        XCTAssertNil(decoded.apparentSizeNote)
+    }
+
+    func testThePartialBucketAndSizesDecode() {
+        let decoded = people([
+            "partial_bottom_edge": 1,
+            "by_apparent_size": ["large": 1, "medium": 0, "small": 1, "unknown": 0],
+            "apparent_size_note": "sizes, never distances",
+            "orientation_status": "experimental",
+        ])
+        XCTAssertEqual(decoded.partialBottomEdge, 1)
+        XCTAssertEqual(decoded.byApparentSize["large"], 1)
+        XCTAssertEqual(decoded.byApparentSize["small"], 1)
+        XCTAssertEqual(decoded.orientationStatus, "experimental")
+        XCTAssertEqual(decoded.apparentSizeNote, "sizes, never distances")
+    }
+
+    func testPeopleAreNeverPersons() {
+        XCTAssertEqual(SceneReadingView.everydayName(for: "person", count: 1), "person")
+        XCTAssertEqual(SceneReadingView.everydayName(for: "person", count: 2), "people")
+    }
+
+    func testSizesTextOmitsEmptyBucketsAndSaysInView() {
+        XCTAssertNil(SceneReadingView.sizesText([:]))
+        XCTAssertNil(SceneReadingView.sizesText(["large": 0, "unknown": 2]))
+        XCTAssertEqual(
+            SceneReadingView.sizesText(["large": 1, "medium": 0, "small": 2]),
+            "Size in view: 1 large, 2 small"
+        )
+    }
+
+    func testTheStubClientIgnoresVisibility() {
+        let client = UnavailableSceneUnderstandingClient()
+        client.workspaceVisibilityChanged(isVisible: true)
+        client.workspaceVisibilityChanged(isVisible: false)
+        if case .unsupported = client.state {} else { XCTFail("the stub's state must not move") }
+    }
+}

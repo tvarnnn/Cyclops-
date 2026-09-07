@@ -200,7 +200,10 @@ def run(args) -> dict:
     seen_ids: set = set()
     labelled_rows = []
     frames_read = 0
-    first_at = last_at = None
+    # Footage time is summed PER CAPTURE: captures are days apart, and
+    # the span from the first capture's first frame to the last capture's
+    # last frame is calendar time, not footage.
+    spans: dict[str, list[float]] = {}
     wall_started = time.perf_counter()
 
     for capture_id, name, raw, received_at in iter_frames(
@@ -212,8 +215,8 @@ def run(args) -> dict:
         if frame is None:
             continue
         frames_read += 1
-        first_at = received_at if first_at is None else first_at
-        last_at = received_at
+        span = spans.setdefault(capture_id, [received_at, received_at])
+        span[1] = received_at
         started = time.perf_counter()
         state = engine.observe(frame, received_at=received_at)
         totals.append((time.perf_counter() - started) * 1000)
@@ -256,7 +259,7 @@ def run(args) -> dict:
     engine.release()
     release_seconds = time.perf_counter() - stop_started
 
-    minutes = ((last_at - first_at) if first_at is not None and last_at is not None else 0.0) / 60.0
+    minutes = sum(max(end - start, 0.0) for start, end in spans.values()) / 60.0
     report = {
         "kind": "exploratory-unless-labelled",
         "device": device,

@@ -289,6 +289,22 @@ struct ScenePeople: Equatable, Sendable {
     /// The Tower's own wording for what facing means. Data, not decoration.
     let facingNote: String?
 
+    /// Person boxes cut off by the bottom edge with no head region in view,
+    /// kept OUT of `count`. From a camera worn at head height that is most
+    /// often the wearer's own hands, arms, lap or legs. Since 2026-09-07;
+    /// defaults to 0 for an older Tower, which is the reading that adds
+    /// nothing rather than the one that invents something.
+    var partialBottomEdge: Int = 0
+    /// How many counted people are `large`, `medium`, `small` or `unknown`
+    /// in the frame — sizes in the picture, never distances. Empty for an
+    /// older Tower.
+    var byApparentSize: [String: Int] = [:]
+    /// The Tower's own wording for what a size means. Shown, not paraphrased.
+    var apparentSizeNote: String?
+    /// `"experimental"` while the facing stage has been validated only on
+    /// still photographs. `nil` for an older Tower.
+    var orientationStatus: String?
+
     /// `count − facingWearer − facingUnknown`, when both are measurements.
     ///
     /// Named a remainder rather than a category, because that is what it is:

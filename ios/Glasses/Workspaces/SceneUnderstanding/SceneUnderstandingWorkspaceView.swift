@@ -70,6 +70,13 @@ struct SceneUnderstandingWorkspaceView: View {
                 scenePanel
             }
         }
+        // Appearing is what opens the live subscription, and disappearing is
+        // what closes it. On the Tower that subscription is the difference
+        // between a people detector running and not running, so the screen
+        // — not the connection — decides. See
+        // `TowerSceneUnderstandingClient.workspaceVisible`.
+        .onAppear { scene.workspaceVisibilityChanged(isVisible: true) }
+        .onDisappear { scene.workspaceVisibilityChanged(isVisible: false) }
     }
 
     // MARK: Header
@@ -304,6 +311,8 @@ struct SceneReadingView: View {
         case "tv": singular = "screen or TV"
         case "cell phone": singular = "phone"
         case "dining table": singular = "table"
+        // "persons" is a word, and not the one anybody says.
+        case "person": return count == 1 ? "person" : "people"
         default: singular = label
         }
         guard count != 1 else { return singular }
@@ -404,6 +413,32 @@ struct SceneReadingView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if people.partialBottomEdge > 0 {
+                // Kept out of the count on purpose, and said out loud: from a
+                // camera worn at head height a figure cut off by the bottom
+                // edge with no head in view is most often the wearer.
+                Text(people.partialBottomEdge == 1
+                     ? "1 partial figure at the bottom edge, not counted — from a camera at head height that is usually your own body."
+                     : "\(people.partialBottomEdge) partial figures at the bottom edge, not counted — from a camera at head height that is usually your own body.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let sizes = Self.sizesText(people.byApparentSize) {
+                // Sizes in the picture, never distances. The Tower's own note
+                // says why, and it is shown rather than paraphrased.
+                Text(sizes)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let note = people.apparentSizeNote {
+                    Text(note)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             facing(people)
         }
     }
@@ -419,8 +454,18 @@ struct SceneReadingView: View {
     private func facing(_ people: ScenePeople) -> some View {
         if let facingWearer = people.facingWearer {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(facingWearer) facing your direction")
+                // "Appears to be": the Tower establishes that the front of a
+                // head is visible, and nothing more.
+                Text(facingWearer == 1
+                     ? "1 appears to be facing your direction"
+                     : "\(facingWearer) appear to be facing your direction")
                     .font(.caption)
+                if people.orientationStatus == "experimental" {
+                    Text("Experimental: checked only on still photographs, never on a person seen through these glasses.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if let unknown = people.facingUnknown, unknown > 0 {
                     Text("\(unknown) with orientation unknown")
                         .font(.caption2)
@@ -498,6 +543,19 @@ struct SceneReadingView: View {
                 }
             }
         }
+    }
+
+    /// Apparent sizes in words, or nil when there is nobody to size.
+    ///
+    /// "In view" rather than "away": these are fractions of the frame, and a
+    /// seated person or a child is "small" at any distance.
+    static func sizesText(_ sizes: [String: Int]) -> String? {
+        var parts: [String] = []
+        for key in ["large", "medium", "small"] {
+            if let n = sizes[key], n > 0 { parts.append("\(n) \(key)") }
+        }
+        guard !parts.isEmpty else { return nil }
+        return "Size in view: " + parts.joined(separator: ", ")
     }
 
     /// Side counts in words. Buckets with nothing in them are omitted rather
