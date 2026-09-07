@@ -869,6 +869,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # the incidental-capture defect described above, and a stream
         # left open in a live cartridge's book means its "last stream
         # out" can never come.
+        # The bookkeeping that must not wait: `/health` must stop saying a
+        # client is connected the moment this one is gone, not after its
+        # cartridge teardown has drained through two thread hops. Both
+        # calls are synchronous and cheap.
+        session.client_disconnected()
+        if active_measurement is not None:
+            _finalize_stream_measurement(
+                active_measurement, end_reason="disconnect"
+            )
         try:
             await channels.close()
         finally:
@@ -882,8 +891,3 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # park a worker, and -- worse -- keep serving a scene of a
             # room whose wearer walked out of range.
             await _close_cartridge_streams(websocket, connection_token)
-            if active_measurement is not None:
-                _finalize_stream_measurement(
-                    active_measurement, end_reason="disconnect"
-                )
-            session.client_disconnected()
