@@ -394,8 +394,9 @@ labels are 94 positional *category* crop verdicts in an older benchmark
 passed + 1 gated; serve_loop 1 passed + 1 xfail; transport 34 passed;
 lifecycle/capture-worker/graceful-stop 101 passed; result-channel + startup
 103 passed). The gated owlv2 test passes in ~18 s and was proven to fail
-without the fix. **The full `tower/` suite passes: 2586 passed, 75 skipped,
-2 xfailed, 0 failed in 502 s** (excluding the opt-in gated owlv2 test). It
+without the fix. **The full `tower/` suite passes with all fixes and the
+review changes: 2592 passed, 76 skipped, 2 xfailed, 0 failed in 487 s**
+(the opt-in gated owlv2 test is among the skips unless enabled). It
 must be run with a **short `--basetemp`** (`C:\Users\tvllo\AppData\Local\
 Temp\gf`) or World Builder's nested UUID tmp paths trip Windows MAX_PATH and
 manufacture phantom failures.
