@@ -157,6 +157,15 @@ class TestTheProducerCanBeAskedToStop:
                 "the producer exited before it could be asked to stop"
             )
             process.stdin.close()
+            # Detached before `communicate()` sees it. Closing stdin IS the
+            # stop request under test, and CPython's `Popen._communicate`
+            # then flushes the closed writer -- which raises `ValueError:
+            # I/O operation on closed file`, a error that code tolerates
+            # only as `BrokenPipeError`. `communicate()` also sets
+            # `_communication_started` in its own `finally`, so the retry
+            # below would fail again on a missing `_fileobj2output` and
+            # bury the first error.
+            process.stdin = None
             stdout, stderr = process.communicate(timeout=STOP_TIMEOUT_SECONDS)
         finally:
             if process.poll() is None:
@@ -486,6 +495,15 @@ class TestTheStopChannelDoesNotFireOnItsOwn:
                 "is the whole defect this case exists for"
             )
             process.stdin.close()
+            # Detached before `communicate()` sees it. Closing stdin IS the
+            # stop request under test, and CPython's `Popen._communicate`
+            # then flushes the closed writer -- which raises `ValueError:
+            # I/O operation on closed file`, a error that code tolerates
+            # only as `BrokenPipeError`. `communicate()` also sets
+            # `_communication_started` in its own `finally`, so the retry
+            # below would fail again on a missing `_fileobj2output` and
+            # bury the first error.
+            process.stdin = None
             stdout, stderr = process.communicate(timeout=STOP_TIMEOUT_SECONDS)
         finally:
             if process.poll() is None:
@@ -512,6 +530,15 @@ class TestTheStopChannelDoesNotFireOnItsOwn:
         process = self._spawn(open_capture, tmp_path / "memory")
         try:
             process.stdin.close()
+            # Detached before `communicate()` sees it. Closing stdin IS the
+            # stop request under test, and CPython's `Popen._communicate`
+            # then flushes the closed writer -- which raises `ValueError:
+            # I/O operation on closed file`, a error that code tolerates
+            # only as `BrokenPipeError`. `communicate()` also sets
+            # `_communication_started` in its own `finally`, so the retry
+            # below would fail again on a missing `_fileobj2output` and
+            # bury the first error.
+            process.stdin = None
             stdout, stderr = process.communicate(timeout=STOP_TIMEOUT_SECONDS)
         finally:
             if process.poll() is None:
