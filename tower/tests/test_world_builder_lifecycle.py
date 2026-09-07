@@ -138,6 +138,23 @@ def _keyframes_written(root) -> int:
 
 
 def _finish(process):
+    # The soft-stop tests close `process.stdin` THEMSELVES -- that closure
+    # is the stop request under test -- and then ask for the output. The
+    # handle has to be dropped before `communicate()` sees it: CPython's
+    # `Popen._communicate` unconditionally does `self.stdin.flush()` when
+    # `self.stdin` is set and communication has not started, and flushing
+    # an already-closed writer raises `ValueError: I/O operation on closed
+    # file`, not the `BrokenPipeError` that code is written to tolerate.
+    # Worse, `communicate()` sets `_communication_started` in its own
+    # `finally`, so the retry in the `finally` below then fails a second
+    # time with `AttributeError: 'Popen' object has no attribute
+    # '_fileobj2output'` and buries the first error.
+    #
+    # Detaching is what the standard library itself does once stdin is
+    # done with, and it costs nothing: the descriptor is already closed,
+    # and nothing here writes to the builder again.
+    if process.stdin is not None and process.stdin.closed:
+        process.stdin = None
     try:
         stdout, stderr = process.communicate(timeout=EXIT_TIMEOUT_S)
     finally:
