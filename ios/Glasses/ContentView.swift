@@ -214,7 +214,8 @@ struct ContentView: View {
                 TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
                     DocumentMemoryWorkspaceView(
                         isTowerReachable: isTowerReachable,
-                        client: project.cartridgeClients.documentMemory
+                        client: project.cartridgeClients.documentMemory,
+                        camera: project.documentMemoryCamera
                     )
                 }
             case .sceneUnderstanding:

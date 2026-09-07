@@ -23,9 +23,9 @@ import XCTest
 enum DocumentFixtures {
     /// `GET /documents`, verbatim.
     static let recent: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "spatial_ref": NSNull(),
@@ -77,9 +77,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -106,9 +106,9 @@ enum DocumentFixtures {
 
     /// `GET /documents/search?text=invoice`, verbatim.
     static let search: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "spatial_ref": NSNull(),
@@ -160,9 +160,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -196,9 +196,9 @@ enum DocumentFixtures {
 
     /// `GET /documents-session`, verbatim.
     static let session: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "recording_limitations": [
@@ -220,9 +220,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -282,7 +282,7 @@ enum DocumentFixtures {
     static let socketStatus: [String: Any] = [
         "contract_note": "session progress only. The documents themselves are on HTTP: /documents, /documents/{document_id}, /documents/search",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "library": [
@@ -360,9 +360,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -380,7 +380,7 @@ enum DocumentFixtures {
     static let record: [String: Any] = [
         "document_id": "doc-1",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "title": NSNull(),
         "title_is_derived": true,
         "title_max_chars": 60,
@@ -629,7 +629,7 @@ final class DocumentLimitationTests: XCTestCase {
     func testTheMeasurementIsNotPresentedAsCurrent() throws {
         let response = try XCTUnwrap(DocumentMemoryDecoder.library(from: DocumentFixtures.recent))
         XCTAssertFalse(response.recordingMeasurement.isCurrent)
-        XCTAssertEqual(response.recordingMeasurement.corpusFrames, 9199)
+        XCTAssertEqual(response.recordingMeasurement.corpusFrames, 45594)
         var bare = DocumentFixtures.recent
         bare["recording_measurement"] = NSNull()
         let plain = try XCTUnwrap(DocumentMemoryDecoder.library(from: bare))
@@ -1029,8 +1029,64 @@ final class DocumentSessionTests: XCTestCase {
     /// just on HTTP. The two contracts are separate, and so are the two checks.
     func testTheStatusPayloadIsAlsoAssertedAgainstTheConstants() {
         var drifted = DocumentFixtures.socketStatus
-        drifted["identity"] = "document-identity-across-sightings"
+        drifted["identity"] = "no-document-identity-across-sightings"
         XCTAssertNil(DocumentMemoryDecoder.status(from: drifted))
+    }
+
+    /// The 2026-09-07 additions decode, and their absence decodes to the
+    /// defaults a 2026-08-27-shaped payload implies.
+    func testTheLiveUpdateFieldsDecodeWithDefaults() throws {
+        let bare = try XCTUnwrap(
+            DocumentMemoryDecoder.status(from: DocumentFixtures.socketStatus)
+        )
+        XCTAssertNil(bare.library.revision)
+        XCTAssertNil(bare.session.ocrDevice)
+        XCTAssertNil(bare.session.documentsResighted)
+        XCTAssertFalse(bare.session.idleStopPending)
+
+        var live = DocumentFixtures.socketStatus
+        var library = live["library"] as! [String: Any]
+        library["revision"] = 1_757_200_000_000_000_000
+        live["library"] = library
+        var session = live["session"] as! [String: Any]
+        session["ocr_device"] = "cuda"
+        session["documents_resighted"] = 2
+        session["dwells_unreadable"] = 1
+        session["idle_stop_pending"] = true
+        live["session"] = session
+
+        let decoded = try XCTUnwrap(DocumentMemoryDecoder.status(from: live))
+        XCTAssertEqual(decoded.library.revision, 1_757_200_000_000_000_000)
+        XCTAssertEqual(decoded.session.ocrDevice, "cuda")
+        XCTAssertEqual(decoded.session.documentsResighted, 2)
+        XCTAssertEqual(decoded.session.dwellsUnreadable, 1)
+        XCTAssertTrue(decoded.session.idleStopPending)
+    }
+
+    /// A record seen once decodes as such; a record with sightings carries
+    /// them, and the first observation's `observed_at` is untouched.
+    func testSightingsDecodeOnADocument() throws {
+        let response = try XCTUnwrap(
+DocumentMemoryDecoder.library(from: DocumentFixtures.recent)
+        )
+        let first = try XCTUnwrap(response.documents.first)
+        XCTAssertEqual(first.sightingCount, 1)
+        XCTAssertEqual(first.lastObservedAt, first.time.observedAt)
+
+        var payload = DocumentFixtures.recent
+        var documents = payload["documents"] as! [[String: Any]]
+        documents[0]["sighting_count"] = 3
+        documents[0]["last_observed_at"] = 1_700_000_900.0
+        documents[0]["pages_readable"] = 1
+        payload["documents"] = documents
+        let seenAgain = try XCTUnwrap(
+            DocumentMemoryDecoder.library(from: payload)
+        )
+        let record = try XCTUnwrap(seenAgain.documents.first)
+        XCTAssertEqual(record.sightingCount, 3)
+        XCTAssertEqual(record.lastObservedAt, Date(timeIntervalSince1970: 1_700_000_900))
+        XCTAssertEqual(record.pagesReadable, 1)
+        XCTAssertEqual(record.time.observedAt, first.time.observedAt)
     }
 
     /// A deletion that quietly failed looks exactly like one that was kept, so
@@ -1119,10 +1175,10 @@ final class DocumentContractTests: XCTestCase {
     /// other.
     func testTheTwoIdentifiersAreSeparateAndNeverInterchanged() {
         XCTAssertEqual(
-            DocumentMemoryContract.statusIdentifier, "document_memory.status/2026-08-27"
+            DocumentMemoryContract.statusIdentifier, "document_memory.status/2026-09-07"
         )
         XCTAssertEqual(
-            DocumentMemoryContract.libraryIdentifier, "document_memory.library/2026-08-27"
+            DocumentMemoryContract.libraryIdentifier, "document_memory.library/2026-09-07"
         )
         XCTAssertNotEqual(
             DocumentMemoryContract.statusIdentifier, DocumentMemoryContract.libraryIdentifier
