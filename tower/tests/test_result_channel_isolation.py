@@ -208,6 +208,10 @@ def test_no_other_cartridge_can_be_subscribed_to(monkeypatch, world_root):
     somebody declares Object Memory without that coordination, this line
     is what notices.
     """
+    # Scene Understanding switched off explicitly: since 2026-09-07 an
+    # unset variable means auto, and auto offers the cartridge on a host
+    # with the [ml] extra, which is exactly not the refusal under test.
+    monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "off")
     client = make_client(monkeypatch, world_root)
     with client.websocket_connect("/ws") as ws:
         for cartridge in ("object_memory", "translator"):

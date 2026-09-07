@@ -87,6 +87,9 @@ def test_cartridges_without_a_contract_are_not_offered(monkeypatch, built):
     test is really for.
     """
     root, _, _ = built
+    # Off explicitly: unset means auto since 2026-09-07, and this test is
+    # about the unavailable wording, not about a host that can run it.
+    monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "off")
     client = make_client(monkeypatch, root)
     declaration = client.get("/cartridges").json()
 
