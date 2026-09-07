@@ -71,7 +71,29 @@ installed); DEIMv2 excluded (custom licence, broken conversion).
 | dfine_m_obj2coco (fp16) | 0.737 | 0.569 | 0.895 | 0.640 | 0.904 | 0.888 | 35.4 / 38.4 | 210 | Apache-2.0 |
 
 `*` measured under GPU contention (the first batch overlapped other
-research jobs); quiet re-measurements are the unstarred numbers.
+research jobs); quiet re-measurements are the unstarred numbers. The
+fp32 figure for D-FINE (121 ms) is the plain `dfine-small-coco`
+checkpoint; the obj2coco checkpoint measured 110 ms fp32 under
+contention and was not re-measured quiet in fp32. LW-DETR-small fp32:
+51 ms under contention.
+
+**Per-image people count (all labelled persons), exact rate / MAE:**
+ssdlite320 @0.4 0.659 / 1.15; rtdetr_v2_r18 @0.5 0.733 / 0.48;
+lwdetr_small @0.4 **0.783 / 0.42**; dfine_s_obj2coco @0.5 0.729 / 0.48,
+@0.6 0.757 / 0.48.
+
+**Disclosures the reviewer asked for.** The 700 images are an
+engineered subset (400 with people and indoor objects, 300 with objects
+and no people), landscape third-person photography, not this camera's
+portrait egocentric domain. Each detector's threshold was chosen on the
+same 700 images its accuracy is reported on -- a four-point sweep, no
+held-out split. LW-DETR-small beats the chosen default on the count
+metric and on mAP50 at equal latency; it was not made the default
+because its speed depends on fp16 autocast (51 ms in fp32 under
+contention) and its hub weights are a contributor's conversion whose
+lineage to the authors' checkpoints the model card does not state
+(card: Apache-2.0; upstream: Apache-2.0). It is selectable at its own
+best threshold (0.4).
 
 CPU (60 frames): ssdlite320 43.5 ms; frcnn_mbv3_320 61; dfine_n 66;
 rtdetr_v2_r18 226; dfine_s 148.
@@ -119,9 +141,19 @@ Count window (old tracker, pooled): kept 1.0 s / counted 1.0 s → exact
 
 **Choices:** cardinality-first Hungarian (keeps the no-starvation
 guarantee the existing adversarial tests pin, 63% fewer switches than
-Kuhn, equal counts); no Kalman (fewer switches but more phantoms and 3×
-the cost, no count gain); tracks kept 1.0 s (corpus-derived, unchanged)
-and **counted only while seen within 0.5 s**. Absolute count accuracy on
+Kuhn, equal counts, 13% fewer phantoms than plain max-weight, which
+had 14% fewer switches still -- the trade is stated in `tracking.py`);
+no Kalman (fewer switches but 30-50% more phantoms at 3× the cost, for
+a count gain of +0.01 to +0.03 exact); tracks kept 1.0 s
+(corpus-derived, unchanged) and **counted only while seen within
+0.5 s**. Disclosures: the fixture pans and zooms a single still, so
+nobody in it walks or crosses anybody -- the classic driver of real
+switches is not exercised; its random walk is unseeded, and a rerun of
+the same configuration moved MAE from 1.187 to 1.134 (~5%).
+`bonus_hungarian_experiment.py` as first run compared plain max-weight
+(then in production) with the +1 variant; after production adopted +1
+the script's "maxweight" row became a copy of production, and it has
+been corrected to construct plain max-weight explicitly. Absolute count accuracy on
 this fixture is low for every tracker because GT counts persons at ≥30%
 visibility that no detector sees; the relative comparisons are what the
 fixture is for. Real footage (unlabelled, 5 captures × 400 frames): the
@@ -152,7 +184,9 @@ on CPU, no VRAM.
 ≥0.9, **two states only** (toward / not established), 2-of-3 temporal vote
 at the ~250 ms cadence, 6 s expiry, confidence capped at MEDIUM, status
 **EXPERIMENTAL**. The COCO base rate (47% of people face the camera) is an
-upper bound for a glasses camera; no person has been measured through
+upper bound for a glasses camera: holding recall 0.641 and false-positive
+rate 0.118 (60 of 509) fixed, precision at a 10-20% base rate is
+0.38-0.58, and the wire says so. No person has been measured through
 these glasses.
 
 ## 5. Position and size (`corpus-audit/fov_analysis.json`)
@@ -165,10 +199,14 @@ band could not hold one. Apparent size buckets for people: box height
 1.7 m adult projects to 0.58 at 2 m, 0.39 at 3 m; a seated person breaks
 it). Depth relations remain refused (2026-08-26 MiDaS measurement stands).
 
-Bottom-edge rule: a person box with bottom ≥0.97 h and top ≥0.45 h (no
-head region) is reported as `partial_bottom_edge`, not counted. From a
-head-worn camera that is the wearer's own body in the overwhelming
-majority of corpus frames; the wire says it can also be someone's legs.
+Partial-figure rule (v2): a person box whose top is at or below 0.45 h
+(no head region), or that spans ≥0.8 of the width down to the bottom
+edge with its top below 0.25 h, is reported as `partial_bottom_edge`,
+not counted. Derived from the 53 person boxes on 49 labelled wearer-only
+frames (tops 0.31–0.91, 50 of them ≥0.45); the wire says it can also be
+someone's legs. The size buckets and band widths are projections from
+calibrated intrinsics with **no real bystander box to check them
+against** -- the weakest evidentiary base of the four features.
 
 ## 6. Lifecycle (`tower/scene/live.py`, `tests/test_scene_activation.py`)
 

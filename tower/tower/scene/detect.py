@@ -6,21 +6,40 @@ measurement decides what is worth it (`docs/superpowers/research/
 COCO val2017 images resized to this camera's 640 px long side, and 300
 real corpus frames on a quiet RTX 5070):
 
-                          mAP50   person AP50   chair AP50   CUDA ms   CPU ms   VRAM
-    ssdlite320            0.367   0.604         0.199        29.5      43.5     56 MB
-    rtdetr_v2_r18         0.669   0.856         0.540        17.3     226       298 MB
-    dfine_s_obj2coco*     0.702   0.875         0.596        28.3     148       152 MB
-    dfine_m_obj2coco*     0.737   0.895         0.640        35.4       -       210 MB
+                          mAP50   person AP50   chair AP50   people count   CUDA ms   CPU ms   VRAM
+                                                             exact / MAE
+    ssdlite320 @0.4       0.367   0.604         0.199        0.659 / 1.15   29.5      43.5     56 MB
+    rtdetr_v2_r18 @0.5    0.669   0.856         0.540        0.733 / 0.48   17.3     226       298 MB
+    lwdetr_small* @0.4    0.689   0.872         0.606        0.783 / 0.42   18.2       -       138 MB
+    dfine_s_obj2coco* @0.5 0.702  0.876         0.596        0.729 / 0.48   28.3     148       152 MB
+    dfine_m_obj2coco* @0.5 0.737  0.895         0.640          -            35.4       -       210 MB
 
-    * needs fp16 autocast on CUDA; in fp32 the same model is 121 ms.
+    * speed needs fp16 autocast on CUDA. In fp32 D-FINE-S (the plain
+      coco checkpoint) measured 121 ms and the obj2coco checkpoint
+      110 ms under contention; LW-DETR-small 51 ms under contention.
+      "people count" is per-image exact rate / mean error over all
+      labelled persons, at the threshold shown.
 
 **On CUDA, RT-DETRv2-R18.** Nearly twice the baseline's accuracy at
 60% of its latency, in plain fp32, from the model's own authors' hub
 organisation (PekingU, Apache-2.0), through the `transformers` package
-this repository already carries for Object Memory's verifier. D-FINE is
-a few points better still and is selectable (`TOWER_SCENE_DETECTOR`),
-but its speed depends on an fp16 autocast path and its hub checkpoints
-carry a documented conversion caveat, so it is not the default.
+this repository already carries for Object Memory's verifier.
+
+**What it is NOT the best at, and why it is the default anyway.**
+LW-DETR-small counts people better on the labelled stills (exact 0.783
+against 0.733) and is two mAP50 points ahead at the same latency, and
+D-FINE-S/M are ahead on mAP50. Both reach that speed only under fp16
+autocast -- in fp32 they are three to six times slower -- and LW-DETR's
+hub weights are a contributor's conversion (Apache-2.0 on the card;
+upstream Apache-2.0) whose lineage to the authors' checkpoints the card
+does not state, while D-FINE's carry a documented conversion caveat
+(transformers issue #40253). A default that depends on an autocast
+path and on weights whose provenance is unstated is a worse default
+than one that runs in plain fp32 from the authors' own organisation,
+for a five-point difference measured on stills of a different camera.
+Both are selectable with `TOWER_SCENE_DETECTOR`, each at its own best
+threshold, and a physical validation that favours one is what should
+move the default.
 
 **On CPU, SSDLite320 stays.** At 43 ms it is the only candidate that
 keeps up with a 12 fps feed on a CPU; RT-DETRv2-R18 is 226 ms there and
@@ -113,13 +132,18 @@ DETECTOR_CHOICES = {
     "rtdetr_v2_r34": "PekingU/rtdetr_v2_r34vd (Apache-2.0), fp32",
     "dfine_s": "ustc-community/dfine-small-obj2coco (Apache-2.0), fp16 on CUDA",
     "dfine_m": "ustc-community/dfine-medium-obj2coco (Apache-2.0), fp16 on CUDA",
+    "lwdetr_small": "stevenbucaille/lwdetr_small_60e_coco (Apache-2.0, contributor conversion), fp16 on CUDA",
 }
 
+# repo, transformers class, wants fp16 on CUDA, counting threshold.
+# Thresholds are each model's best per-image people-count operating
+# point on the 700 labelled images (see the table above).
 _HUB_MODELS = {
-    "rtdetr_v2_r18": ("PekingU/rtdetr_v2_r18vd", "RTDetrV2ForObjectDetection", False),
-    "rtdetr_v2_r34": ("PekingU/rtdetr_v2_r34vd", "RTDetrV2ForObjectDetection", False),
-    "dfine_s": ("ustc-community/dfine-small-obj2coco", "DFineForObjectDetection", True),
-    "dfine_m": ("ustc-community/dfine-medium-obj2coco", "DFineForObjectDetection", True),
+    "rtdetr_v2_r18": ("PekingU/rtdetr_v2_r18vd", "RTDetrV2ForObjectDetection", False, 0.5),
+    "rtdetr_v2_r34": ("PekingU/rtdetr_v2_r34vd", "RTDetrV2ForObjectDetection", False, 0.5),
+    "dfine_s": ("ustc-community/dfine-small-obj2coco", "DFineForObjectDetection", True, 0.5),
+    "dfine_m": ("ustc-community/dfine-medium-obj2coco", "DFineForObjectDetection", True, 0.5),
+    "lwdetr_small": ("stevenbucaille/lwdetr_small_60e_coco", "LwDetrForObjectDetection", True, 0.4),
 }
 
 
@@ -198,7 +222,7 @@ class TransformersDetector:
         if choice not in _HUB_MODELS:
             raise ValueError(f"unknown hub detector {choice!r}")
         self.name = choice
-        self._repo, self._class_name, self._wants_fp16 = _HUB_MODELS[choice]
+        self._repo, self._class_name, self._wants_fp16, _ = _HUB_MODELS[choice]
         self.score_threshold = score_threshold
         self._score_threshold = score_threshold
         self._classes = set(classes) if classes else None
@@ -301,7 +325,9 @@ HUB_SCORE_THRESHOLD = 0.5
 
 
 def score_threshold_for(choice: str) -> float:
-    return SCORE_THRESHOLD if choice == "ssdlite320" else HUB_SCORE_THRESHOLD
+    if choice == "ssdlite320":
+        return SCORE_THRESHOLD
+    return _HUB_MODELS[choice][3] if choice in _HUB_MODELS else HUB_SCORE_THRESHOLD
 
 
 def resolve_choice(device: str, choice: str = "auto") -> str:

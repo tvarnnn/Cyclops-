@@ -201,6 +201,8 @@ class TestDetectorChoice:
         assert score_threshold_for("ssdlite320") == SCORE_THRESHOLD == pytest.approx(0.4)
         assert score_threshold_for("rtdetr_v2_r18") == HUB_SCORE_THRESHOLD == pytest.approx(0.5)
         assert score_threshold_for("dfine_s") == HUB_SCORE_THRESHOLD
+        # LW-DETR counts best at 0.4 on the same images (0.783 exact).
+        assert score_threshold_for("lwdetr_small") == pytest.approx(0.4)
 
 
 class TestTheEnginePublishesTheDetectorsThreshold:

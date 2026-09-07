@@ -471,7 +471,7 @@ class TestThePayloadSaysWhatItMayNotSay:
         assert sum(people["by_apparent_size"].values()) == people["count"]
         assert people["partial_bottom_edge"] == 0
         assert people["orientation_status"] == "experimental"
-        assert "never" in people["orientation_validation"]
+        assert "never" in people["orientation_validation"].lower()
         assert "distance" in people["apparent_size_note"]
 
     def test_every_count_declares_itself_a_lower_bound(self, payload):

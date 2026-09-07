@@ -125,6 +125,14 @@ def _drain(ws, until_type: str, limit: int = 200) -> dict:
     raise RuntimeError(f"no {until_type} in {limit} messages")
 
 
+def _drain_any(ws, until_types, limit: int = 200) -> dict:
+    for _ in range(limit):
+        message = ws.receive_json()
+        if message["type"] in until_types:
+            return message
+    raise RuntimeError(f"none of {until_types} in {limit} messages")
+
+
 def run(args) -> dict:
     os.environ.setdefault("TOWER_SCENE_UNDERSTANDING", "auto")
     os.environ.pop("TOWER_CAPTURE_ROOT", None)
@@ -173,12 +181,17 @@ def run(args) -> dict:
                 row["scene_after_stop_available"] = after["scene_available"]
                 row["watchers_after"] = after["lifecycle"]["demand"]["watchers"]
                 if args.switch:
-                    ws.send_json({"type": "cv_lab_start", "experiment": "edge_detection"})
+                    # The Lab's own verbs: `experiment_id`, answered with a
+                    # `cv_lab_status` (or a `cv_lab_error`), then frames as
+                    # usual. `_drain` skips the status traffic in between.
+                    ws.send_json({"type": "cv_lab_start", "experiment_id": "edge_detection"})
+                    reply = _drain_any(ws, ("cv_lab_status", "cv_lab_error"))
+                    row["cv_lab"] = reply.get("type")
                     for seq, data in enumerate(frames[:10]):
                         ws.send_json({"type": "frame", "seq": seq, "width": 360, "height": 640, "format": "jpeg", "data": data})
-                        _drain(ws, "frame_result")
+                        _drain_any(ws, ("frame_result", "frame_error"))
                     ws.send_json({"type": "cv_lab_stop"})
-                    time.sleep(0.2)
+                    _drain_any(ws, ("cv_lab_status", "cv_lab_error"))
                 row.update(_sample())
                 rows.append(row)
                 print(_row(row), flush=True)

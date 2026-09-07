@@ -162,9 +162,11 @@ COUNT_LIMITATIONS = (
         "detail": (
             "on 700 labelled stills the CUDA detector's per-image count "
             "of people is exact on 73% of images with a mean error of "
-            "0.48 people (CPU detector: 64%, 1.25). Those are stills of "
-            "other people's photographs; no count has been checked "
-            "against a person standing in front of these glasses"
+            "0.48 people (CPU detector at its 0.4 floor: 66%, 1.15). "
+            "Those are stills of other people's photographs, the same "
+            "700 the operating threshold was chosen on; no count has "
+            "been checked against a person standing in front of these "
+            "glasses"
         ),
     },
     {
@@ -510,10 +512,12 @@ def _people_block(state) -> dict:
             "a face detector on each tracked person's box; 'facing' needs "
             "a strong face in two of the last three estimates, about half "
             "a second. Measured at 0.83 precision and 0.64 recall on 966 "
-            "human-labelled persons in COCO stills -- other people's "
-            "photographs, where people face the camera far more often "
-            "than they face a passer-by -- and never on a person seen "
-            "through these glasses"
+            "human-labelled persons in COCO stills, where 47% of people "
+            "face the camera. At the same recall and false-positive rate, "
+            "a room where only 10-20% of people face the wearer at a given "
+            "instant would give roughly 0.4-0.6 precision: about half of "
+            "the 'facing' claims could be wrong there. Never measured on a "
+            "person seen through these glasses"
         ),
         # The wording is part of the contract. `IOS-to-Tower.md` 4.2: this
         # is body/head orientation relative to the camera, it is NOT gaze,

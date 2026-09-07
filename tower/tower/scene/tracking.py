@@ -42,6 +42,17 @@ the constant makes every extra matched pair worth more than any
 overlap, so cardinality still wins first, and the IoU decides among the
 complete matchings. Track ids are never published, so what a switch
 costs here is orientation history and a spurious "somebody new".
+
+**The alternative that was measured and not taken.** Plain maximum
+total IoU (no constant) did better still on identity -- 1,739 switches
+against 2,018, consistency 0.587 against 0.577 -- and equally on the
+count (exact 0.325 against 0.314), but it starves a track whenever
+another's best match is that track's only match, which is the geometry
+the adversarial review found and `tests/test_scene_tracker_hostile.py`
+pins, and it confirmed 13% more phantom tracks (628 against 554). For a
+cartridge that publishes counts and not ids, a phantom is a wrong count
+and a switch is not; cardinality first is the trade this module makes,
+deliberately, with the numbers stated.
 """
 
 from dataclasses import dataclass
