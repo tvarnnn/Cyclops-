@@ -625,26 +625,42 @@ async def check_worker_lifecycle_and_shutdown(process, port: int, checks: Checks
         max_size=8 * 1024 * 1024,
         open_timeout=60,
     ) as ws:
+        # THE GATE FIRST, and its absence proved before it is opened.
+        #
+        # Until 2026-09-06 a builder attached to EVERY capture, so this
+        # section opened a stream and waited. It now attaches only while the
+        # World Builder cartridge session is active -- the session the phone
+        # opens when that workspace appears -- which is what stopped a CV Lab
+        # camera session from starting background global solves nobody asked
+        # for. A stream on its own must therefore attach NOTHING, and that is
+        # worth asserting rather than assuming: it is the whole of the gate.
         await ws.send(json.dumps({"type": "stream_start"}))
+
+        if psutil is not None:
+            await asyncio.sleep(2.0)
+            ungated = _world_build_children(process, psutil)
+            checks.that(
+                not ungated,
+                "a stream with no World Builder session attaches NO builder "
+                f"(found {[w.pid for w in ungated]})",
+            )
+
+        status, _ = _post(base, "/cartridges/world_builder/session/start")
+        checks.that(
+            status == 200, "the World Builder cartridge session starts over HTTP"
+        )
 
         workers = []
         if psutil is not None:
             deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
-                try:
-                    workers = [
-                        child
-                        for child in psutil.Process(process.pid).children(recursive=True)
-                        if "world_build_session" in " ".join(child.cmdline())
-                    ]
-                except Exception:
-                    workers = []
+                workers = _world_build_children(process, psutil)
                 if workers:
                     break
                 await asyncio.sleep(0.25)
             checks.that(
                 bool(workers),
-                "a world-build worker attached to the open capture "
+                "a world-build worker attached once the cartridge was active "
                 f"(found {[w.pid for w in workers]})",
             )
         else:
@@ -668,6 +684,18 @@ async def check_worker_lifecycle_and_shutdown(process, port: int, checks: Checks
                 "no capture worker outlives the Tower "
                 f"(still running: {[w.pid for w in alive]})",
             )
+
+
+def _world_build_children(process, psutil):
+    """Every live world-build child of this Tower, by command line."""
+    try:
+        return [
+            child
+            for child in psutil.Process(process.pid).children(recursive=True)
+            if "world_build_session" in " ".join(child.cmdline())
+        ]
+    except Exception:
+        return []
 
 
 def _signal_shutdown(process) -> bool:
