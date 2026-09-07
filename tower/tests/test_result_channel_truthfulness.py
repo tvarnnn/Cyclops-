@@ -132,13 +132,16 @@ def test_a_live_session_is_receiving_on_the_evidence_of_the_lock(
         engine.stop_session()
 
 
-def test_a_dead_builder_is_reported_as_failed_not_as_receiving(
+def test_a_dead_builder_is_reported_as_interrupted_not_as_receiving(
     monkeypatch, tmp_path
 ):
     """A stale lock is a real, visible failure and must not read as health.
 
     Reporting `receiving` forever would be a stale observation presented
-    as current state.
+    as current state. Since 2026-09-06 the word is `interrupted` rather
+    than `failed`: the session did not end properly, and the geometry
+    block beside it says whether anything was built (on the physical walk
+    that made this visible, 463 keyframes were).
     """
     root = tmp_path / "worlds"
     world_id, _, engine = start_live_world(root, frames=6)
@@ -157,8 +160,9 @@ def test_a_dead_builder_is_reported_as_failed_not_as_receiving(
         )
 
         payload = _payload(monkeypatch, root)
-        assert payload["lifecycle"]["state"] == "failed"
+        assert payload["lifecycle"]["state"] == "interrupted"
         assert "no longer running" in payload["lifecycle"]["evidence"]
+        assert payload["model_state"] == "interrupted"
     finally:
         engine.stop_session()
 
@@ -675,6 +679,7 @@ IOS_MODEL_STATES = {
     "receiving",
     "finalizing",
     "finalized",
+    "interrupted",
     "failed",
 }
 IOS_TRACKING = {"good", "limited", "lost", "unavailable"}

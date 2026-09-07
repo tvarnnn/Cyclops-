@@ -6,7 +6,7 @@ something does not exist, it says so and says why.
 
 **Envelope contract:** `cartridge_results.envelope/2026-08-23`
 **Producers offered:** World Builder `status`, contract
-`world_builder.status/2026-08-25`. Nothing else. See §9.
+`world_builder.status/2026-09-06`. Nothing else. See §9.
 
 **Audience.** Whoever implements the iOS consumer. You should be able to
 write it from this document without reading Tower's Python. If you find
@@ -71,7 +71,7 @@ asserts they cannot drift. **The phone does not need it.**
     {
       "cartridge": "world_builder",
       "result_type": "status",
-      "contract": "world_builder.status/2026-08-25",
+      "contract": "world_builder.status/2026-09-06",
       "available": true,
       "unavailable_reason": null,
       "snapshot_only": true
@@ -132,7 +132,7 @@ subscription open.
   "type": "result_subscribe",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-06",
   "world_id": null,
   "session_id": null,
   "since_revision": null
@@ -162,7 +162,7 @@ counter that moved would be a bug.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-06",
   "snapshot_only": true,
   "world_id": null,
   "session_id": null,
@@ -203,7 +203,7 @@ cartridge-specific part.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-06",
   "seq": 4,
   "revision": "e252f739c1cdedab",
   "revision_changed": true,
@@ -442,7 +442,7 @@ move.
 
 | Cartridge | Result type | Contract | Section |
 |---|---|---|---|
-| World Builder | `status` | `world_builder.status/2026-08-25` | §10 |
+| World Builder | `status` | `world_builder.status/2026-09-06` | §10 |
 | Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 | Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
 | Document Memory | `status` | `document_memory.status/2026-08-27` | §15 |
@@ -529,7 +529,7 @@ and that is worth knowing before adding a third:
 
 ## 10. World Builder `status` payload
 
-Contract: `world_builder.status/2026-08-25`.
+Contract: `world_builder.status/2026-09-06`.
 
 ### 10.0 If you implement nothing else, implement this
 
@@ -571,17 +571,29 @@ it is an App Store release rather than a Tower restart.
 ```
 
 **`model_state`** — one of `unsupported`, `idle`, `receiving`,
-`finalizing`, `finalized`, `failed`. `model_state_reason` is prose for a
-person, or null.
+`finalizing`, `finalized`, `interrupted`, `failed`. `model_state_reason` is
+prose for a person, or null.
 
 | Tower sends | Meaning | Note |
 |---|---|---|
 | `unsupported` | this Tower cannot serve World Builder at all | e.g. no world root configured. Do not invite the user to wait |
 | `idle` | Tower is fine, there is nothing to show yet | no worlds, or a world with no sessions |
 | `receiving` | a mapping session is live | a process holds the world's writer lock |
-| `finalizing` | capture ended; the stored figures are **not** the final figures | see the caveat under `lifecycle` below — Tower cannot see whether a build is *running* |
+| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat |
 | `finalized` | capture ended and the stored geometry matches the keyframes | |
-| `failed` | the builder died, or the session recorded an error | `model_state_reason` says which |
+| `interrupted` | the session did not end the way a walk ends: the builder died, was asked to stop mid-walk, recorded an error, or finalization was left unfinished | **`world_snapshot` and `geometry` still describe whatever was built.** `model_state_reason` says what happened; `lifecycle.finalization` says how far finalization got. Added at `/2026-09-06` (the reason the identifier moved) |
+| `failed` | reserved; nothing on disk maps to it since `/2026-09-06` | a client must still decode it |
+
+**`selection`** — why *this* world is on the wire. Added at `/2026-09-06`.
+Always present, including on an unavailable payload. **Not part of the
+revision:** two subscriptions describing the same bytes agree on `revision`
+whatever their `selection`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | `"pinned"`, `"live"`, `"finalizing"`, `"latest"`, `"none"` | `pinned`: the client named the world. `live`: a running builder holds its lock and its session is open. `finalizing`: a running builder holds its lock and its session has stopped. `latest`: **nothing is live; this is merely the most recently updated world on disk** — a client following the live world must not draw it as the live world. `none`: nothing to report |
+| `world_id`, `session_id` | string or null | what was resolved |
+| `reason` | string | prose |
 
 **`awaiting_first_update` is never sent**, deliberately. It means "frames
 are going out and the Tower has said nothing yet" — a fact about the
@@ -641,32 +653,39 @@ evidence behind these values.
 
 | `state` | Means | Evidence |
 |---|---|---|
-| `receiving` | a mapping session is live | a live pid holds the writer lock |
-| `stopped_unbuilt` | capture ended; stored geometry is not current with the keyframes | no manifest, or a stale one |
-| `ready` | capture ended; stored geometry matches the keyframes | manifest current |
-| `failed` | the builder died, or the session recorded an error | a lock held by a dead pid |
+| `receiving` | a mapping session is live | a live pid holds the writer lock, no `session_stopped` |
+| `finalizing` | the session stopped and the builder is finishing it (final solve, final build) | a live pid holds the writer lock **and** `session_stopped` was written. Since 2026-09-06 the live builder keeps its lock through finalization |
+| `ready` | the session finished; stored geometry is what it produced | `finalization.state == "complete"` and the lock released; or, on an older record, manifest current |
+| `interrupted` | the session did not end the way a walk ends | a lock held by a dead pid (mid-walk or mid-finalization); `end_reason` `error` or `interrupted`; or a `finalization` left `pending`/`interrupted` with no live holder. **`geometry.available` says whether a reconstruction exists regardless** |
+| `stopped_unbuilt` | (records older than 2026-09-06) capture ended; stored geometry is not current with the keyframes | no manifest, or a stale one, and no `finalization` record |
+| `failed` | reserved; no longer emitted | — |
 | `idle` | a world with no live session and no stop event | — |
 | `unavailable` | nothing could be read | see `reason` |
 
 `evidence` is prose naming what was observed. `reason` is prose for a
 person, or null.
 
-> **There is deliberately no `finalizing`.** A build *does* rewrite several
-> files before its manifest lands, so the directory changes while it runs —
-> but those writes are indistinguishable from a build that made them and
-> then **died**. The writer lock is already released by then and no event
-> is written, so nothing on disk says "a process is working right now". The
-> Tower cannot observe that work is continuing, and a state named
-> `finalizing` would assert exactly that.
->
-> `lifecycle.build_in_progress` is **`null`** in every stopped state — not
-> `false`, which would be a claim that no build is running.
-> `build_in_progress_unavailable_reason` carries the explanation. It is
-> `false` only while `receiving`, where the lock proves no build has begun.
->
-> If you want to render `.finalizing`, `stopped_unbuilt` is the state to
-> map it from — but do so knowing Tower is telling you "the stored figures
-> are not the final figures", not "a process is working right now".
+**`lifecycle.finalization`** — the builder's own account of what happened
+after `session_stopped`, copied from the session record, or **null** on a
+record written before 2026-09-06 or a session that never stopped.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `"pending"`, `"complete"`, `"interrupted"` | `pending` with a live lock is `finalizing`; `pending` with no live lock is `interrupted` |
+| `final_solve` | `"pending"`, `"solved"`, `"skipped"`, `"failed"`, `"unavailable"`, or null | null when no final solve was configured. `skipped` names why in `detail` (a stop request mid-walk, a hard stop during finalization) |
+| `started_at`, `updated_at` | float | Tower clock |
+| `detail` | string or null | prose: the error, or why the solve was skipped |
+
+> **`finalizing` is now a live claim.** The builder keeps the writer lock
+> until its final build is written, so a lock held by a running pid after
+> `session_stopped` means a process is working, and
+> `lifecycle.build_in_progress` is **`true`** in that state on the evidence
+> of the lock. On records older than that change nothing on disk says so:
+> there `stopped_unbuilt` still means only "the stored figures are not the
+> final figures", `build_in_progress` is **`null`** (not `false`, which
+> would be a claim), and `build_in_progress_unavailable_reason` explains.
+> It is `false` while `receiving` and in every `interrupted` state, where
+> the lock's holder is known to be gone.
 
 **`progress`** — or `null` with no session.
 
@@ -1799,7 +1818,7 @@ because they govern different surfaces with different failure modes: the
 `library` payload is bulk text on HTTP and is pulled. A change to one is
 not a change to the other.
 
-### `world_builder.status/2026-08-25`
+### `world_builder.status/2026-09-06`
 
 Supersedes `world_builder.status/2026-08-23`. **One field changed
 meaning**, which is why the identifier moved rather than staying put for

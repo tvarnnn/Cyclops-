@@ -24,7 +24,7 @@ Contracts in play:
 | | |
 |---|---|
 | Envelope | `cartridge_results.envelope/2026-08-23` |
-| World Builder payload | `world_builder.status/2026-08-25` |
+| World Builder payload | `world_builder.status/2026-09-06` (supersedes `/2026-08-25`: `model_state` gained `interrupted`; the payload gained `selection` and `lifecycle.finalization`) |
 | World Builder geometry | `world_builder.geometry/2026-08-25` — **its own document: [`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md)**. Different transport (HTTP), versioned independently |
 | Tower cartridge name | `world_builder` |
 | iOS catalog id | `world-build` |
@@ -93,9 +93,10 @@ Verdicts: **CLEAN** (1:1), **ADAPTER** (small mapping, no duplicated state),
 | `unsupported` | `.unsupported(reason:)` | CLEAN | `model_state_reason` verbatim; a fallback sentence when null |
 | `idle` | `.idle` | CLEAN | Tower's reason is dropped — `.idle` carries none. Its prose ("no worlds exist under this Tower's world root") is diagnostic, not actionable |
 | `receiving` | `.receiving(snapshot)` | ADAPTER | With `world_snapshot: null` → `.awaitingFirstUpdate`. Unreachable in practice; a live session implies a world |
-| `finalizing` | `.finalizing(snapshot)` | ADAPTER | **Read the caveat in §3.** |
+| `finalizing` | `.finalizing(snapshot)` | ADAPTER | **Read the caveat in §3.** Since 2026-09-06 `lifecycle.build_in_progress == true` means a live process is finishing and the phone may say so |
 | `finalized` | `.finalized(snapshot)` | CLEAN | |
-| `failed` | `.failed(.towerReportedFailure)` | CLEAN | Attribution matters: the Tower reported it, so it is not `.transport` and not `.notSupported` |
+| `interrupted` | `.interrupted(snapshot, reason:)` | CLEAN | New at `/2026-09-06`. The session ended abnormally (builder died, was asked to stop mid-walk, recorded an error, or finalization was left unfinished); the snapshot and the geometry still describe what exists. Rendered with its own headline, the Tower's reason, the figures, the fragments and the Picture — never as `.failed`, never as `.finalized` |
+| `failed` | `.failed(.towerReportedFailure)` | CLEAN | Attribution matters: the Tower reported it, so it is not `.transport` and not `.notSupported`. No disk state maps to it since `/2026-09-06`; still decoded |
 | *(never sent)* | `.awaitingFirstUpdate` | IOS-ONLY | Subscribed, not yet answered. Only the phone can know this, which is why Tower does not send it |
 | unknown word | `.failed(.undecodableResponse)` | ADAPTER | A disagreement discovered on arrival, not an empty world |
 
@@ -159,19 +160,38 @@ cannot carry:
 
 ---
 
-## 3. `finalizing` means something narrower than it looks
+## 3. `finalizing` means two things, and the payload says which
 
-Tower has **no** `finalizing` lifecycle state, deliberately: a build rewrites
-several files before its manifest lands, and those writes are indistinguishable
-from a build that made them and then died. The writer lock is already released,
-so nothing on disk says "a process is working right now".
+Since 2026-09-06 the live builder **keeps the writer lock** through the final
+solve and the final build and records a `finalization` block on the session.
+`lifecycle.state: "finalizing"` therefore means a live process is finishing
+(`build_in_progress: true`, evidence names the pid), and the phone may say
+"The Tower is finishing this world." with a progress indicator.
 
-`model_state: "finalizing"` is projected from `lifecycle: stopped_unbuilt`, and
-means **"the stored figures are not the final figures"** — not "a process is
-working". iOS renders `.finalizing` with a progress indicator and the sentence
-"Capture has ended. The Tower is still working, so these figures may still
-change." The second half of that sentence is the claim the Tower can support;
-the spinner is the part to revisit if this ever misleads.
+On records older than that change the old projection remains:
+`model_state: "finalizing"` from `lifecycle: stopped_unbuilt` means only **"the
+stored figures are not the final figures"**, `build_in_progress` is `null`, and
+the phone keeps the guarded sentence. `WorldModelState.finalizing` carries
+`buildInProgress: Bool?` so the two copies are chosen from the payload, not
+guessed.
+
+## 3.1 `selection`: whose world is on the wire
+
+An unpinned subscription is answered with a live world if one exists, else
+the most recently updated world on disk. Until 2026-09-06 nothing said which,
+and a phone opening World Builder with nothing live drew the newest saved
+world — fragments and all — as the live world. The payload now carries
+`selection.mode`: `pinned` (the client named it), `live`, `finalizing`,
+`latest` (**nothing is live; this is history**), `none`.
+
+The phone's rule: following live, a `latest` selection is **not** the live
+world. `TowerWorldBuilderClient` presents it as `.idle` and publishes it as
+`recentWorld` — a reference the canvas shows as "Last saved world … Open",
+which pins it (History). Geometry coordinates are emitted only for a report
+presented with a snapshot, and the view model clears its gallery whenever the
+world identity changes, so no earlier world's fragments survive a switch.
+`WorldSessionGate` (§9) still applies on top for the DEBUG capture bracket;
+an older Tower with no `selection` block keeps the gate-only behaviour.
 
 ---
 
@@ -238,9 +258,12 @@ turn every WiFi blip into "this will never work" when the truthful reading is
 **Starting capture is not starting a build.** The Tower web process writes
 frames to a capture and answers `frame_result`. Reconstruction runs in a
 **separate process** (`scripts/world_build_session.py --follow-capture`) reading
-that capture from disk. Nothing on the phone starts it and nothing on the phone
-can see whether it is running. Every string in the World Builder workspace was
-rewritten to stop implying otherwise.
+that capture from disk. Since 2026-09-06 that process is attached to a capture
+**only while the `world_builder` cartridge session is active** — the phone
+posts `start` when the World Builder workspace appears and `stop` when it
+leaves (`TOWER-UNIFIED-CARTRIDGES.md` §4). That is intent, not liveness: the
+status channel's `lifecycle` remains the only evidence that a builder is
+running, and every string in the workspace still says so.
 
 **Without intrinsics there is no geometry.** `select_backend` downgrades to
 `UnposedBackend` when intrinsics are unknown, and no flag invents a focal

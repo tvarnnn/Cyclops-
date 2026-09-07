@@ -83,7 +83,14 @@ RESULT_TYPE_LIVE = "live"
 # the old id would be a lie about compatibility. Adding `poses_anchor`
 # alone would not have justified this; changing what an existing figure
 # counts does.
-WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
+# `/2026-09-06` supersedes `/2026-08-25` because `model_state` gained a
+# word, `interrupted`, and the payload gained `selection` and
+# `lifecycle.finalization`. A phone that implements the older agreement
+# refuses an unknown `model_state` outright (by design: an unknown word is
+# a contract disagreement, not an empty world), so it must be told to
+# update rather than shown a decode failure -- which is exactly what the
+# dated identifier is for.
+WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-09-06"
 
 # Scene Understanding's live scene.
 #

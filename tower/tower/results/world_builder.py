@@ -80,10 +80,35 @@ LIFECYCLE_RECEIVING = "receiving"
 # .finalizing from it -- lifecycle.build_in_progress carries the caveat
 # that makes that an informed choice rather than an inherited guess.
 LIFECYCLE_STOPPED_UNBUILT = "stopped_unbuilt"
+# Since 2026-09-06 the builder KEEPS its writer lock through the final
+# solve and the final build, and writes a `finalization` block on the
+# session record when it stops. So the comment above is now history for
+# the live path: a lock held by a running process AFTER `session_stopped`
+# is a process that is finishing, and that is what this state says. The
+# old `stopped_unbuilt` remains for records written before the change.
+LIFECYCLE_FINALIZING = "finalizing"
 LIFECYCLE_READY = "ready"
+# A session that did not end the way a walk ends. The lock names a dead
+# process, or the record says `error`/`interrupted`, or finalization was
+# left pending by a process that is gone. Named for what happened to the
+# SESSION, not for what exists on disk: the geometry block beside it says
+# whether a reconstruction is there, and on the 2026-09-06 walk it was.
+LIFECYCLE_INTERRUPTED = "interrupted"
+# Kept in the vocabulary for readers; nothing on disk maps to it any more
+# -- every fact that used to be `failed` is a more specific `interrupted`.
 LIFECYCLE_FAILED = "failed"
 LIFECYCLE_IDLE = "idle"
 LIFECYCLE_UNAVAILABLE = "unavailable"
+
+# Why THIS world is the one on the wire. The unpinned default answers with
+# a live world if any, else the newest world on disk -- and until
+# 2026-09-06 nothing said which, so a phone opening World Builder with
+# nothing live drew the newest saved world as if it were the live one.
+SELECTION_PINNED = "pinned"          # the client named it
+SELECTION_LIVE = "live"              # a running builder holds its lock, session open
+SELECTION_FINALIZING = "finalizing"  # a running builder holds its lock, session stopped
+SELECTION_LATEST = "latest"          # nothing is live; this is the most recently updated
+SELECTION_NONE = "none"              # nothing to report at all
 
 # Tracking. `limited` is deliberately NEVER emitted -- see _tracking_block.
 TRACKING_GOOD = "good"
@@ -111,6 +136,11 @@ SCALE_SEMANTICS = {
 VOLATILE_PATHS = (
     "progress.mapping_seconds",
     "world_snapshot.mapping_seconds",
+    # Not volatile but not CONTENT: two subscriptions -- one pinned to the
+    # newest world, one unpinned -- describe the same bytes on disk and
+    # must agree on the revision, or a client switching between them sees
+    # a phantom change.
+    "selection",
     # Self-referential rather than volatile: `world_snapshot.revision` IS
     # the revision, so it cannot be an input to computing it. Excluded so
     # the hash stays stable when the field is filled in afterwards.
@@ -149,16 +179,27 @@ MODEL_STATE_IDLE = "idle"
 MODEL_STATE_RECEIVING = "receiving"
 MODEL_STATE_FINALIZING = "finalizing"
 MODEL_STATE_FINALIZED = "finalized"
+# New at `world_builder.status/2026-09-06`, and the reason the identifier
+# moved: a session that ended abnormally is neither `failed` (which the
+# phone drew with no world at all) nor `finalized` (which would present a
+# half-built walk as a finished one). The snapshot and the geometry travel
+# with it, so the phone can show what exists and say what happened.
+MODEL_STATE_INTERRUPTED = "interrupted"
 MODEL_STATE_FAILED = "failed"
 
 _MODEL_STATE_BY_LIFECYCLE = {
     LIFECYCLE_RECEIVING: MODEL_STATE_RECEIVING,
+    # A live process is finishing; `lifecycle.build_in_progress` is True on
+    # the evidence of the lock.
+    LIFECYCLE_FINALIZING: MODEL_STATE_FINALIZING,
     # "capture ended, Tower still working; figures may change" is exactly
     # what `stopped_unbuilt` means -- the stored figures are not the final
-    # figures. Tower still cannot see whether a build is RUNNING, and
-    # lifecycle.build_in_progress carries that caveat unchanged.
+    # figures. On a pre-finalization record Tower still cannot see whether
+    # a build is RUNNING, and lifecycle.build_in_progress carries that
+    # caveat unchanged.
     LIFECYCLE_STOPPED_UNBUILT: MODEL_STATE_FINALIZING,
     LIFECYCLE_READY: MODEL_STATE_FINALIZED,
+    LIFECYCLE_INTERRUPTED: MODEL_STATE_INTERRUPTED,
     LIFECYCLE_FAILED: MODEL_STATE_FAILED,
     LIFECYCLE_IDLE: MODEL_STATE_IDLE,
 }
@@ -268,6 +309,9 @@ class WorldBuilderStatusProducer:
     def resolve(self, world_id: str | None, session_id: str | None):
         """Pick which world and session to report on.
 
+        Returns `(world_id, session_id, problem)`; `resolve_with_selection`
+        adds WHY that world was picked, which the payload now carries.
+
         An explicit world_id is iOS's inspection mode
         (`WorldInspectionMode.inspecting(worldID:)`, 1.7), where "there is
         no capture to start, and a counter that moved would be a bug".
@@ -275,22 +319,28 @@ class WorldBuilderStatusProducer:
         recently updated world, because a client that did not name one is
         asking about now.
         """
+        chosen, session, problem, _ = self.resolve_with_selection(world_id, session_id)
+        return chosen, session, problem
+
+    def resolve_with_selection(self, world_id: str | None, session_id: str | None):
+        """`resolve`, plus the `selection` block for the payload."""
         store = WorldStore(self._root)
         try:
             world_ids = store.list_world_ids()
         except OSError:
-            return None, None, "world root is not readable"
+            return None, None, "world root is not readable", None
         if not world_ids:
-            return None, None, "no worlds exist under this Tower's world root"
+            return None, None, "no worlds exist under this Tower's world root", None
 
         if world_id is not None:
             if world_id not in world_ids:
-                return None, None, f"no world with id {world_id!r}"
+                return None, None, f"no world with id {world_id!r}", None
             chosen = world_id
+            mode, reason = SELECTION_PINNED, "the client named this world"
         else:
-            chosen = self._most_relevant(store, world_ids)
+            chosen, mode, reason = self._most_relevant(store, world_ids)
             if chosen is None:
-                return None, None, "no world could be read"
+                return None, None, "no world could be read", None
 
         if session_id is not None:
             if session_id not in store.list_session_ids(chosen):
@@ -298,27 +348,42 @@ class WorldBuilderStatusProducer:
                     None,
                     None,
                     f"world {chosen!r} has no session with id {session_id!r}",
+                    None,
                 )
-            return chosen, session_id, None
-
-        sessions = store.list_session_ids(chosen)
-        if not sessions:
-            return chosen, None, None
-        return chosen, self._latest_session(store, chosen, sessions), None
+            resolved_session = session_id
+        else:
+            sessions = store.list_session_ids(chosen)
+            resolved_session = (
+                self._latest_session(store, chosen, sessions) if sessions else None
+            )
+        selection = {
+            "mode": mode,
+            "world_id": chosen,
+            "session_id": resolved_session,
+            "reason": reason,
+        }
+        return chosen, resolved_session, None, selection
 
     def _most_relevant(self, store, world_ids):
         """A LIVE world if one exists, else the most recently updated.
+
+        Returns `(world_id, selection_mode, reason)`.
 
         "Live" means a lock held by a process that is still running. An
         earlier version accepted the mere existence of a lock file, so one
         leftover lock from a crashed builder permanently hijacked every
         default subscription -- an adversarial review demonstrated a
         stale-locked world outranking a newer, cleanly stopped one.
+
+        A live lock on a STOPPED session is a builder finalizing, and it
+        still outranks every saved world: it is what "now" looks like in
+        the two minutes after Stop. The selection names it `finalizing`
+        so a client can say so.
         """
         live = [
             wid
             for wid in world_ids
-            if (holder := _lock_holder(store, wid)) is not None
+            if (holder := store.lock_holder(wid)) is not None
             and holder.get("alive")
         ]
         candidates = live or world_ids
@@ -330,7 +395,32 @@ class WorldBuilderStatusProducer:
                 continue
             if world.updated_at > best_at:
                 best, best_at = wid, world.updated_at
-        return best
+        if best is None:
+            return None, SELECTION_NONE, "no world could be read"
+        if not live:
+            return (
+                best,
+                SELECTION_LATEST,
+                "nothing is live; this is the most recently updated world",
+            )
+        if self._newest_session_is_stopped(store, best):
+            return (
+                best,
+                SELECTION_FINALIZING,
+                "a live builder holds this world's writer lock and its session has stopped",
+            )
+        return best, SELECTION_LIVE, "a live builder holds this world's writer lock"
+
+    def _newest_session_is_stopped(self, store, world_id) -> bool:
+        sessions = store.list_session_ids(world_id)
+        if not sessions:
+            return False
+        latest = self._latest_session(store, world_id, sessions)
+        summary = self._files.read(
+            store.events_path(world_id, latest),
+            lambda: _summarise_events(*read_raw_jsonl(store.events_path(world_id, latest))),
+        )
+        return bool(summary["stopped"])
 
     def _latest_session(self, store, world_id, session_ids):
         best, best_at = session_ids[0], -math.inf
@@ -347,11 +437,13 @@ class WorldBuilderStatusProducer:
 
     def snapshot(self, world_id: str | None, session_id: str | None) -> Snapshot:
         """One complete status payload. Never partial, never a delta."""
-        resolved_world, resolved_session, problem = self.resolve(world_id, session_id)
+        resolved_world, resolved_session, problem, selection = (
+            self.resolve_with_selection(world_id, session_id)
+        )
         if problem is not None:
             return self._unavailable(problem)
         try:
-            return self._snapshot(resolved_world, resolved_session)
+            return self._snapshot(resolved_world, resolved_session, selection)
         except (WorldStoreError, KeyError, ValueError, OSError) as exc:
             # A world this build cannot read is a real answer, not a
             # crash. Refusing to interpret an unknown schema is the store's
@@ -395,13 +487,16 @@ class WorldBuilderStatusProducer:
         )
         payload["model_state_reason"] = reason
         payload["world_snapshot"] = None
+        payload["selection"] = {
+            "mode": SELECTION_NONE, "world_id": None, "session_id": None, "reason": reason,
+        }
         return Snapshot(
             payload=payload,
             revision=compute_revision(payload, VOLATILE_PATHS),
             volatile_fields=VOLATILE_PATHS,
         )
 
-    def _snapshot(self, world_id: str, session_id: str | None) -> Snapshot:
+    def _snapshot(self, world_id: str, session_id: str | None, selection=None) -> Snapshot:
         store = WorldStore(self._root)
         world = store.read_world(world_id)
 
@@ -409,6 +504,10 @@ class WorldBuilderStatusProducer:
             payload = self._payload_no_session(store, world)
         else:
             payload = self._payload(store, world, session_id)
+        payload["selection"] = selection or {
+            "mode": SELECTION_PINNED, "world_id": world_id, "session_id": session_id,
+            "reason": "the client named this world",
+        }
 
         _attach_ios_projection(payload)
 
@@ -464,7 +563,7 @@ class WorldBuilderStatusProducer:
                 *read_raw_jsonl(store.events_path(world.world_id, session_id))
             ),
         )
-        holder = _lock_holder(store, world.world_id)
+        holder = store.lock_holder(world.world_id)
         manifest = self._files.read(
             store.derived_manifest_path(world.world_id),
             lambda: _read_manifest(store, world.world_id),
@@ -772,16 +871,30 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
     This is `IOS-to-Tower.md` 1.1's central ask -- "a start/stop/failed
     signal **distinct from 'frames are arriving'**" -- and the writer lock
     answers it exactly, because it is held for the lifetime of a mapping
-    session and by nothing else (engine.start_session acquires it,
-    stop_session releases it).
+    session and by nothing else. Since 2026-09-06 the live builder keeps
+    it through finalization too (`engine.stop_session(hold_lock=True)`),
+    and writes a `finalization` block on the record, so five states are
+    now distinguishable on disk:
 
-    A lock held by a pid that is no longer running is a genuine, visible
-    failure: a builder process died mid-session. That is worth reporting
-    as `failed` with the pid, because the alternative -- reporting
-    `receiving` forever -- would be a stale observation presented as
-    current state.
+        lock alive, not stopped                 -> receiving
+        lock alive, stopped                     -> finalizing
+        lock dead                               -> interrupted
+        stopped by error/interrupted, or a
+          finalization left pending/interrupted -> interrupted
+        stopped, finalization complete          -> ready
+        stopped, no finalization record (older
+          builder), geometry current / behind  -> ready / stopped_unbuilt
+
+    `interrupted` is deliberately NOT `failed`. On the 09-06 walk the
+    process died mid-walk and left 463 keyframes of geometry; the state
+    describes the session, and the geometry block beside it describes
+    what exists.
     """
-    if holder is not None and holder["alive"] and not stopped:
+    finalization = session.finalization
+    alive = holder is not None and holder["alive"]
+    lock_dead = holder is not None and not holder["alive"]
+
+    if alive and not stopped:
         return {
             "state": LIFECYCLE_RECEIVING,
             "evidence": (
@@ -790,10 +903,29 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             "reason": None,
             "build_in_progress": False,
             "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
-    if holder is not None and not holder["alive"] and not stopped:
+    if alive and stopped:
         return {
-            "state": LIFECYCLE_FAILED,
+            "state": LIFECYCLE_FINALIZING,
+            "evidence": (
+                f"a live process (pid {holder['pid']}) holds the writer lock and "
+                "session_stopped was written"
+            ),
+            "reason": (
+                "the builder is finishing this world: the final solve and the "
+                "final build run after the session stops, and the lock is "
+                "released when they are done"
+            ),
+            # True on the evidence of the lock: the process that finishes a
+            # world is the process holding it, and it is alive.
+            "build_in_progress": True,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if lock_dead and not stopped:
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
             "evidence": (
                 "a writer lock exists but names no readable process id"
                 if holder.get("unreadable")
@@ -807,14 +939,37 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
                 "session; its keyframes are persisted but the session was "
                 "never closed"
             ),
-            **_BUILD_UNOBSERVABLE,
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if lock_dead and stopped:
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                f"the writer lock is held by pid {holder['pid']}, which is no "
+                "longer running, and session_stopped was written"
+            ),
+            "reason": (
+                "the process finalizing this world exited before it finished; "
+                "the geometry stored is the last build it completed"
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
     if session.end_reason in ("error", "interrupted"):
+        detail = (finalization or {}).get("detail")
         return {
-            "state": LIFECYCLE_FAILED,
+            "state": LIFECYCLE_INTERRUPTED,
             "evidence": f"the session recorded end_reason={session.end_reason!r}",
-            "reason": f"the mapping session ended with {session.end_reason!r}",
-            **_BUILD_UNOBSERVABLE,
+            "reason": (
+                f"the mapping session ended with {session.end_reason!r}"
+                + (f": {detail}" if detail else "")
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
     if not stopped:
         return {
@@ -825,6 +980,38 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             ),
             "reason": None,
             **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
+        }
+    if finalization is not None and finalization.get("state") != "complete":
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                f"session_stopped was written and the finalization record is "
+                f"{finalization.get('state')!r} with no process holding the lock"
+            ),
+            "reason": (
+                "finalization did not complete; the geometry stored is the last "
+                "build that finished"
+                + (f": {finalization.get('detail')}" if finalization.get("detail") else "")
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if finalization is not None:
+        # A finished record from a builder that keeps the lock through
+        # finalization: the lock is gone because it was RELEASED, and the
+        # record says the build completed.
+        return {
+            "state": LIFECYCLE_READY,
+            "evidence": (
+                "session_stopped was written, the finalization record is complete "
+                "and the lock was released"
+            ),
+            "reason": None,
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
     if not has_manifest:
         return {
@@ -832,6 +1019,7 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             "evidence": "capture ended and no build output exists for this session",
             "reason": "no geometry has been built for this session yet",
             **_BUILD_UNOBSERVABLE,
+            "finalization": None,
         }
     if not geometry_current:
         return {
@@ -845,6 +1033,7 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
                 "figures these keyframes would produce"
             ),
             **_BUILD_UNOBSERVABLE,
+            "finalization": None,
         }
     return {
         "state": LIFECYCLE_READY,
@@ -852,6 +1041,7 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
         "reason": None,
         "build_in_progress": None,
         "build_in_progress_unavailable_reason": _BUILD_UNOBSERVABLE_REASON,
+        "finalization": None,
     }
 
 
@@ -1343,38 +1533,6 @@ def _attach_ios_projection(payload: dict) -> None:
 
 
 # -- disk helpers -------------------------------------------------------
-
-
-def _lock_holder(store, world_id):
-    """Who holds the writer lock, and is that process still alive?
-
-    Returns None when no lock file exists. The lock is the ONLY live
-    signal the web process has, because the builder runs elsewhere.
-    """
-    path = store.lock_path(world_id)
-    try:
-        if not path.exists():
-            return None
-        holder = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    pid = holder.get("pid")
-    if not isinstance(pid, int):
-        # A lock file exists but names no usable pid. NOT the same as "no
-        # lock": reporting `idle` with "no writer lock is held" would be a
-        # false statement about a file that is right there, and would
-        # downgrade a crashed builder to a healthy-looking idle world.
-        return {"pid": None, "alive": False, "unreadable": True}
-    return {"pid": pid, "alive": _pid_is_running(pid), "unreadable": False}
-
-
-def _pid_is_running(pid: int) -> bool:
-    try:
-        import psutil
-
-        return psutil.pid_exists(pid)
-    except Exception:  # pragma: no cover - psutil is a hard dependency
-        return False
 
 
 # Keys a manifest must carry before it counts as evidence of geometry.
