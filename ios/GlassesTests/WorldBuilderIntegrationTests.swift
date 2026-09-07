@@ -3404,12 +3404,42 @@ final class WorldBuilderViewModelOwnershipTests: XCTestCase {
     }
 
     /// Another session of the same world is another gallery.
+    ///
+    /// The evidence is the REFETCH, not an empty gallery, and the difference
+    /// is why this test never passed as first written. It asserted
+    /// `segments.isEmpty` after the switch, which is true in the sibling test
+    /// above only because the stub has no route for world `w-b` and its
+    /// manifest fails. The stub's routes are keyed by PATH, and the session is
+    /// a query parameter, so `w-a`/`s-a2` hits the same route as `w-a`/`s-a`,
+    /// answers 200, and the gallery is legitimately refilled with the new
+    /// owner's fetch. Demanding emptiness there was demanding that a session
+    /// switch leave the screen blank.
+    ///
+    /// What "another gallery" actually means is that the old owner's segments
+    /// were dropped and the new owner's were fetched, and a second request for
+    /// the manifest is exactly that. Without the clear, `clearGeometry()` would
+    /// not have moved the revision marker, the unchanged revision `g1` would
+    /// have returned early at the guard, and the manifest would have been
+    /// requested once in total -- with `s-a`'s segments still on screen under
+    /// `s-a2`'s name, which is the defect this guard exists to prevent.
     func testGeometryFromAnotherSessionOfTheSameWorldAlsoClearsTheGallery() async {
         let viewModel = makeViewModel(client: UnavailableWorldBuilderClient())
         await populate(viewModel)
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: "/worlds/w-a/geometry/manifest"), 1
+        )
+
         await viewModel.geometryDidChange(worldID: "w-a", sessionID: "s-a2", revision: "g1")
-        XCTAssertTrue(viewModel.fragmentsModel.segments.isEmpty)
+
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: "/worlds/w-a/geometry/manifest"), 2,
+            "the gallery was not cleared: the revision marker survived, the "
+                + "unchanged revision returned early, and the previous session's "
+                + "segments are still on screen under this session's name"
+        )
         XCTAssertEqual(viewModel.renderTarget, WorldRenderTarget(worldID: "w-a", sessionID: "s-a2"))
+        // Replaced, not joined: one segment, the new owner's.
+        XCTAssertEqual(viewModel.fragmentsModel.segments.count, 1)
     }
 
     /// The same world under a heartbeat keeps everything.
