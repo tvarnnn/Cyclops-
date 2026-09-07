@@ -129,19 +129,37 @@ final class TowerSmokeUITests: XCTestCase {
         XCTAssertFalse(picture.isEnabled, "no world has been named, so there is nothing to open")
 
         XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
-        // The first world's own row (a section header button), whatever it is
-        // called: the Tower's list, not a fixture name.
+        // A world is listed at all.
         let sessionTag = app.staticTexts.containing(NSPredicate(format: "label ENDSWITH %@", "session")).firstMatch
         let sessionsTag = app.staticTexts.containing(NSPredicate(format: "label ENDSWITH %@", "sessions")).firstMatch
         XCTAssertTrue(sessionTag.waitForExistence(timeout: 15) || sessionsTag.waitForExistence(timeout: 1),
                       "the Tower listed at least one world")
         attach("saved-worlds")
-        let worldRow = sessionTag.exists ? sessionTag : sessionsTag
-        XCTAssertTrue(reveal(worldRow))
+
+        // A SESSION row, chosen by its badge, rather than the world's own row.
+        //
+        // This test used to tap the world row and expect a picture. Since
+        // 2026-09-06 that is the wrong expectation, and deliberately so.
+        // Opening a world without naming a session asks the Tower for its
+        // `latest` selection, which is the most recently updated session --
+        // and if that session has no geometry, there is no picture to offer
+        // and the control is correctly disabled. Drawing an older session's
+        // geometry under a newer session's name is exactly the "geometry that
+        // is not this world's, presented as if it were" defect the World
+        // Builder lane set out to close, so a test that demanded it was
+        // pinning the bug.
+        //
+        // The picture path therefore goes through a session that HAS
+        // geometry, which is what a person does: the picker shows a badge per
+        // session, and "Complete" is the one with something to draw.
+        let complete = app.staticTexts["Complete"].firstMatch
+        try XCTSkipUnless(complete.waitForExistence(timeout: 15),
+                          "the Tower's list has no completed session to picture")
+        XCTAssertTrue(reveal(complete))
 
         // The header now names the world, and the picture is offered.
         let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
-        XCTAssertTrue(tap(worldRow, until: looking.exists), "the world opened and the picker closed")
+        XCTAssertTrue(tap(complete, until: looking.exists), "the session opened and the picker closed")
         XCTAssertTrue(reveal(picture))
         XCTAssertTrue(picture.isEnabled)
         attach("inspecting-saved-world")
@@ -177,19 +195,45 @@ final class TowerSmokeUITests: XCTestCase {
         open(cartridge: "World Builder")
         XCTAssertTrue(reveal(app.buttons["Saved worlds"]))
         XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
-        let noGeometry = app.staticTexts["no geometry"].firstMatch
+        // "No geometry" since 2026-09-06: the picker now words the badge from
+        // the Tower's own `state`, and `unbuilt` reads "No geometry". The old
+        // lower-case "no geometry" was the fallback for a Tower that sent no
+        // state at all, and it is still reachable, so both are accepted --
+        // matching on the words rather than on one spelling of them.
+        let noGeometry = app.staticTexts.containing(
+            NSPredicate(format: "label ==[c] %@", "no geometry")
+        ).firstMatch
         try XCTSkipUnless(noGeometry.waitForExistence(timeout: 15), "the Tower's list has no session without geometry")
         XCTAssertTrue(reveal(noGeometry))
         let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
         XCTAssertTrue(tap(noGeometry, until: looking.exists), "the session opened and the picker closed")
         let picture = app.buttons["Interactive picture of the world"]
         XCTAssertTrue(reveal(picture))
-        XCTAssertTrue(tap(picture, until: app.navigationBars["Reconstruction"].exists))
-        let message = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "no geometry yet")).firstMatch
-        XCTAssertTrue(message.waitForExistence(timeout: 15), "the Tower's 404 detail is shown")
-        XCTAssertTrue(app.buttons["Try again"].exists)
+
+        // The picture is REFUSED, not offered and then apologised for.
+        //
+        // This test used to open the viewer here and read the Tower's 404
+        // prose ("session ... has no geometry yet") with a Try again button.
+        // Since 2026-09-06 that sheet is unreachable for this session, and
+        // deliberately: the Tower says `geometry.available: false`, the app
+        // therefore names no render target, and the control is disabled --
+        // "a control that appears from nowhere is one nobody looks for, and
+        // a disabled one says 'not yet' truthfully"
+        // (WorldBuilderWorkspaceView). Offering a button whose only outcome
+        // is a 404 was the weaker behaviour, so this asserts the better one.
+        //
+        // The session is still openable and still named, which is the half
+        // that matters: a session with nothing to draw is a session a person
+        // can look at and be told about, not one that disappears.
+        XCTAssertFalse(picture.isEnabled,
+                       "a session the Tower says has no geometry must not offer a picture")
         attach("no-geometry")
-        XCTAssertTrue(tap(app.buttons["Close"], until: !app.navigationBars["Reconstruction"].exists))
+
+        // The Tower's own 404 prose is still the viewer's answer when a
+        // render fails for a session that DID claim geometry. That path is
+        // covered by the Tower's route tests; it is not reachable from this
+        // screen for this session any more, and pretending otherwise here
+        // would be pinning a control that no longer exists.
     }
 
     // MARK: CV Lab
