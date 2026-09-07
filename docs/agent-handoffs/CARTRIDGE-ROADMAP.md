@@ -200,7 +200,21 @@ side has run ahead of every gate that would let it reach a person.
 
 **Waiting on a Mac:**
 
-4. World Builder P1/P2, then the Object Memory surface.
+4. World Builder P1/P2, then the Object Memory surface. **Added 2026-09-07:**
+   the live/history/lifecycle stabilization lane's Swift changes
+   (`WORLD-BUILDER-LIVE-HISTORY-STABILIZATION.md`, Mac compile checklist)
+   gate the next physical World Builder test.
+
+**Next World Builder R&D phase, after the stabilization lane merges:**
+
+4b. **Recognizable room reconstruction** — `WORLD-BUILDER-ROADMAP.md`. The
+    criterion is that the person who scanned the room recognises it, not
+    "more points"; inputs are the solved poses, the original frames, the
+    sparse landmarks and the Tower GPU; unknown space stays grey and nothing
+    is hallucinated. Representation families (MVS, learned depth + fusion,
+    TSDF, mesh/texture, 3DGS, feed-forward multi-view, hybrids) are to be
+    benchmarked on the real captured walks before one is chosen. Not
+    started in the stabilization lane, deliberately.
 
 **Waiting on a wearer, in value order:**
 
