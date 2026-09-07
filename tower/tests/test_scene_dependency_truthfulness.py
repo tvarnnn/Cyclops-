@@ -158,11 +158,15 @@ class TestTheReasonNamesWhatIsActuallyWrong:
         assert "torch" in reason
 
     def test_configured_off_keeps_the_pinned_wording(self, monkeypatch):
-        """The common case must not move. Only a FAILURE replaces it."""
+        """Switched off must say so. Only a FAILURE replaces that sentence.
+
+        Set explicitly to "off": since 2026-09-07 an UNSET variable means
+        auto, and on this host auto offers the cartridge.
+        """
         from tower.config import get_settings
         from tower.cartridge_runtime import build_live_cartridges
 
-        monkeypatch.delenv("TOWER_SCENE_UNDERSTANDING", raising=False)
+        monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "off")
         live = build_live_cartridges(get_settings())
         declaration = registry.declare(
             None,

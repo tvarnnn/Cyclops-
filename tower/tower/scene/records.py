@@ -22,8 +22,14 @@ from dataclasses import dataclass, field, replace
 
 from tower.confidence import Confidence
 
-# Coarse facing states. Derived from which facial keypoints are VISIBLE,
-# which is orientation evidence and nothing more.
+# Coarse facing states. Since 2026-09-07 only two are ever PRODUCED --
+# `toward_wearer`, when the front of a head is visible inside a person's
+# box, and `unknown`, which means "not established" and covers facing
+# away, side-on, too small and never measured alike. `away_from_wearer`
+# and `profile` remain defined so a consumer that pinned the vocabulary
+# keeps decoding, and so the reason they are not produced can be stated:
+# nothing measured on this platform produces them with usable precision
+# (`tower/scene/orientation.py`).
 #
 # There is deliberately no state meaning "looking at you". Head
 # orientation is not eye direction: a person squarely facing the wearer
@@ -32,6 +38,14 @@ FACING_UNKNOWN = "unknown"
 FACING_TOWARD = "toward_wearer"
 FACING_AWAY = "away_from_wearer"
 FACING_PROFILE = "profile"
+
+# Where in the view a thing is, horizontally. Assigned with hysteresis
+# by the engine (`state.assign_side`) so a thing near a boundary does
+# not flicker between two words while nothing moved.
+SIDE_LEFT = "left"
+SIDE_CENTRE = "centre"
+SIDE_RIGHT = "right"
+SIDE_UNKNOWN = "unknown"
 
 # Relationships this cartridge is willing to assert from 2-D boxes. The
 # ones it REFUSES -- on, inside, near, in_front_of, behind, and
@@ -118,22 +132,23 @@ class Detection:
 
 @dataclass(frozen=True)
 class FacingEstimate:
-    """Coarse head/body orientation, and how stale it is.
+    """Whether the front of a person's head is visible, and how stale that is.
 
-    `age_seconds` is not optional decoration. Estimating this costs
-    ~956 ms on CPU and ~43 ms on CUDA, so it runs at a bounded cadence
-    rather than per frame, and a consumer that cannot see the age would
-    treat a stale answer as current. The gap between those two numbers is
-    why the field cannot be dropped now that a fast device exists: the
-    same payload crosses the wire from both, and only the age says which
-    one produced it.
+    `age_seconds` is not optional decoration. Estimating this runs at a
+    bounded cadence rather than per frame, so a consumer that cannot see
+    the age would treat a stale answer as current.
+
+    `evidence` says why the state is what it is -- a face was visible, no
+    face was found, the face was too weak, the box was too small -- and
+    stays on this side of the wire. It exists so a test and a log can
+    tell "unknown because nobody looked" from "unknown because we looked
+    and could not tell".
     """
 
     state: str = FACING_UNKNOWN
     confidence: Confidence = Confidence.UNKNOWN
     age_seconds: float | None = None
-    visible_eyes: int = 0
-    visible_ears: int = 0
+    evidence: str = "none"
 
     @property
     def appears_facing_wearer(self) -> bool:
@@ -145,8 +160,7 @@ class FacingEstimate:
             "state": self.state,
             "confidence": self.confidence.value,
             "age_seconds": self.age_seconds,
-            "visible_eyes": self.visible_eyes,
-            "visible_ears": self.visible_ears,
+            "evidence": self.evidence,
             "note": "orientation evidence, not gaze; the camera cannot see attention",
         }
 
@@ -186,6 +200,13 @@ class Track:
     # estimate's age, or a reading from ten seconds ago reports as one
     # second old and never expires.
     facing_estimated_at: float | None = None
+    # The last few RAW facing states, oldest first, that the published
+    # `facing` was voted from. A tuple, so `snapshot()`'s shallow copy
+    # cannot share a list with the tracker.
+    facing_history: tuple = ()
+    # Which side of the view this track was last placed on, with
+    # hysteresis. None until the engine has learned the frame size.
+    side: str | None = None
 
     def snapshot(self) -> "Track":
         """A copy that will still be true in a second's time.
@@ -199,8 +220,9 @@ class Track:
 
         Shallow is deep enough, and that is a property worth stating
         rather than assuming: `BoundingBox` and `FacingEstimate` are both
-        frozen, so the only mutable thing reachable from a track is the
-        track. If either ever stops being frozen this must copy it too.
+        frozen and `facing_history` is a tuple, so the only mutable thing
+        reachable from a track is the track. If any of those ever stops
+        being immutable this must copy it too.
 
         Not `copy()`: the name says WHY. This is the moment the state is
         cut loose from the tracker, and it is the only place that
@@ -222,6 +244,17 @@ class Track:
         """
         return self.is_confirmed or self.streak >= min_hits
 
+    def counted(self, min_hits: int, max_count_misses: int) -> bool:
+        """Confirmed AND seen recently enough to be counted as present.
+
+        A track outlives its last detection for a while so the same
+        thing coming back from behind a doorframe keeps its id; that is
+        continuity. Being COUNTED is a stronger claim -- "this is in
+        view now" -- and stops sooner. The two bounds are separate on
+        purpose (`tracking.TrackerPolicy`).
+        """
+        return self.confirmed(min_hits) and self.misses <= max_count_misses
+
     def to_json_dict(self) -> dict:
         return {
             "track_id": self.track_id,
@@ -234,6 +267,7 @@ class Track:
             "confirmed": self.is_confirmed,
             "age_seconds": round(self.age_seconds, 3),
             "facing": self.facing.to_json_dict(),
+            "side": self.side,
         }
 
 

@@ -17,7 +17,7 @@ import pytest
 from tower.confidence import Confidence
 from tower.scene.detect import FixedDetector
 from tower.scene.engine import SceneEngine
-from tower.scene.orientation import FixedPoseEstimator
+from tower.scene.orientation import FixedFacingEstimator, estimate_from_face
 from tower.scene.query import SceneQuery
 from tower.scene.records import (
     FACING_AWAY,
@@ -39,11 +39,12 @@ def _det(label, box, score=0.9) -> Detection:
 
 
 def _run(detections_per_frame, frames=8, pose=None, **kwargs):
+    kwargs.setdefault("orientation_interval_s", 0.5)
     engine = SceneEngine(
         FixedDetector([detections_per_frame] * frames),
         POLICY,
         clock=lambda: 0.0,
-        pose_estimator=pose,
+        facing_estimator=pose,
         **kwargs,
     )
     engine.load()
@@ -148,12 +149,14 @@ class TestHowManyAreFacingMe:
     def test_it_answers_when_orientation_is_enabled(self):
         """Two people: one facing the camera, one facing away.
 
-        The keypoint VISIBILITY pattern is chosen here, so the correct
-        answer is known independently.
+        The face-visibility estimate is chosen here, so the correct
+        answer is known independently. Two agreeing runs are needed
+        before a facing is published, which the 0.5 s interval over
+        eight frames at 0.3 s provides.
         """
-        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
-        away = {"left_ear": 7.0, "right_ear": 7.0}
-        pose = FixedPoseEstimator(
+        facing = estimate_from_face(0.95)
+        away = estimate_from_face(None)
+        pose = FixedFacingEstimator(
             [
                 [
                     (BoundingBox(60, 80, 160, 300), facing),
@@ -170,8 +173,8 @@ class TestHowManyAreFacingMe:
 
     def test_the_answer_denies_being_gaze(self):
         """The camera cannot see attention, and the answer must say so."""
-        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
-        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
+        facing = estimate_from_face(0.95)
+        pose = FixedFacingEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
 
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
         answer = SceneQuery(state).facing_wearer()
@@ -186,8 +189,8 @@ class TestHowManyAreFacingMe:
         the pose model. The second must be reported as UNKNOWN, not
         quietly folded into "not facing".
         """
-        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
-        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
+        facing = estimate_from_face(0.95)
+        pose = FixedFacingEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
 
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
         answer = SceneQuery(state).facing_wearer()
@@ -211,7 +214,7 @@ class TestHowManyAreFacingMe:
             def load(self):
                 return None
 
-            def estimate(self, frame_bgr):
+            def estimate(self, frame_bgr, boxes):
                 raise RuntimeError("bad weights")
 
             def release(self):
@@ -227,17 +230,32 @@ class TestHowManyAreFacingMe:
     def test_the_oldest_estimate_is_none_rather_than_zero_when_absent(self):
         """`or 0.0` folded "no estimate" into "zero seconds old", which
         read as corroborating a freshness nobody measured."""
-        facing = {"nose": 9.0, "left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0}
-        pose = FixedPoseEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
+        facing = estimate_from_face(0.95)
+        pose = FixedFacingEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
 
         _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose)
         detail = SceneQuery(state).facing_wearer().detail
 
         oldest = detail["oldest_estimate_seconds"]
         assert oldest is not None and oldest >= 0.0
-        assert detail["states"][2]["age_seconds"] is None, (
-            "the unestimated person must report no age, not zero"
-        )
+        # The second person WAS asked about -- every tracked person is --
+        # and the answer was "no face", which is an estimate with an age
+        # and an evidence, not a missing one.
+        assert detail["states"][2]["age_seconds"] is not None
+        assert detail["states"][2]["state"] == FACING_UNKNOWN
+        assert detail["states"][2]["evidence"] == "no-face-found"
+
+    def test_a_person_never_asked_about_reports_no_age(self):
+        """`or 0.0` folded "no estimate" into "zero seconds old". A track
+        that appeared after the last orientation run has no estimate and
+        must say so with None, never 0."""
+        facing = estimate_from_face(0.95)
+        pose = FixedFacingEstimator([[(BoundingBox(60, 80, 160, 300), facing)]])
+        # A huge interval: the estimator runs once, on the first frame,
+        # before the tracks are even confirmed; nobody is asked again.
+        _, state = _run(TWO_PEOPLE_AND_A_CHAIR, pose=pose, orientation_interval_s=1000.0)
+        for track in state.of_class("person"):
+            assert track.facing.age_seconds is None or track.facing.age_seconds >= 0.0
 
 
 class TestRelationships:
@@ -358,60 +376,37 @@ class TestRefusalsExplainThemselves:
 
 
 class TestOrientationEvidence:
-    """The visibility patterns, checked against what each one means."""
+    """What one face detection means, checked against what it may claim."""
 
-    @staticmethod
-    def _facing(scores):
-        from tower.scene.orientation import facing_from_keypoints
-
-        return facing_from_keypoints(scores)
-
-    def test_both_eyes_and_an_ear_means_facing_toward(self):
-        estimate = self._facing(
-            {"left_eye": 8.0, "right_eye": 8.0, "left_ear": 6.0, "nose": 9.0}
-        )
+    def test_a_strong_face_means_facing_toward(self):
+        estimate = estimate_from_face(0.95)
 
         assert estimate.state == FACING_TOWARD
         assert estimate.appears_facing_wearer is True
 
-    def test_both_ears_and_no_eyes_means_facing_away(self):
-        estimate = self._facing({"left_ear": 7.0, "right_ear": 7.0})
-
-        assert estimate.state == FACING_AWAY
-        assert estimate.appears_facing_wearer is False
-
-    def test_one_ear_means_profile(self):
-        estimate = self._facing({"left_ear": 7.0, "left_eye": 6.0})
-
-        assert estimate.state == FACING_PROFILE
-
-    def test_no_facial_keypoints_means_unknown_not_away(self):
+    def test_no_face_means_unknown_not_away(self):
         """The difference that matters: not seeing a face is not seeing a
-        back of a head."""
-        estimate = self._facing({"left_shoulder": 9.0, "right_shoulder": 9.0})
+        back of a head. `away_from_wearer` is never produced; nothing
+        measured on this platform can say it with usable precision."""
+        estimate = estimate_from_face(None)
 
         assert estimate.state == FACING_UNKNOWN
+        assert estimate.state not in (FACING_AWAY, FACING_PROFILE)
         assert estimate.confidence is Confidence.UNKNOWN
 
-    def test_low_scoring_keypoints_do_not_count_as_visible(self):
-        """A keypoint model emits a coordinate for every joint whether or
-        not it can see it. Without a threshold, everyone faces the camera."""
-        estimate = self._facing(
-            {"left_eye": 0.2, "right_eye": 0.1, "left_ear": 0.3, "right_ear": 0.2}
-        )
+    def test_a_weak_face_does_not_count(self):
+        """A face detector emits a score for anything face-like. Without
+        a threshold, every reflection and poster faces the camera."""
+        estimate = estimate_from_face(0.5)
 
         assert estimate.state == FACING_UNKNOWN
 
     def test_confidence_never_reaches_high(self):
-        """A visibility heuristic over an inference is two steps from a
-        measurement, and the brief forbids claiming this from weak
-        evidence."""
-        for scores in (
-            {"left_eye": 9.0, "right_eye": 9.0, "left_ear": 9.0, "right_ear": 9.0},
-            {"left_ear": 9.0, "right_ear": 9.0},
-            {"left_ear": 9.0},
-        ):
-            assert self._facing(scores).confidence is not Confidence.HIGH
+        """A detector's score over a crop, validated on stills from a
+        different camera, is two steps from a measurement, and the brief
+        forbids claiming this from weak evidence."""
+        for score in (0.9, 0.99, 1.0):
+            assert estimate_from_face(score).confidence is not Confidence.HIGH
 
 
 class TestAnUnknownFrameSizeAssertsNothing:

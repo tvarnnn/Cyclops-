@@ -453,13 +453,26 @@ class TestThePayloadSaysWhatItMayNotSay:
         assert people["facing_answered"] is False
         assert "observation gap" in people["facing_unavailable_reason"]
 
-    def test_position_is_reported_for_objects_and_refused_for_people(self, payload):
-        assert "person" not in payload["where"]
-        assert payload["where_excludes"] == ["person"]
+    def test_position_is_reported_for_objects_and_for_people_as_counts(self, payload):
+        """"Is there a person on my left" is answered with a count of
+        people on the left -- never a row, never a handle."""
+        assert payload["where_excludes"] == []
         # Two objects placed on opposite sides of the frame by the
         # fixture, so the side counts are known independently of the code.
         assert payload["where"]["chair"]["right"] == 1
         assert payload["where"]["laptop"]["left"] == 1
+        # Both fixture people sit in the left third of a 640-wide frame.
+        assert payload["where"]["person"]["left"] == 2
+        assert set(payload["where"]["person"]) == {"left", "centre", "right", "unknown"}
+
+    def test_people_carry_sizes_and_a_partial_bucket_never_rows(self, payload):
+        people = payload["people"]
+        assert set(people["by_apparent_size"]) == {"large", "medium", "small", "unknown"}
+        assert sum(people["by_apparent_size"].values()) == people["count"]
+        assert people["partial_bottom_edge"] == 0
+        assert people["orientation_status"] == "experimental"
+        assert "never" in people["orientation_validation"]
+        assert "distance" in people["apparent_size_note"]
 
     def test_every_count_declares_itself_a_lower_bound(self, payload):
         assert payload["count_is_lower_bound"] is True
@@ -609,7 +622,9 @@ class TestTheSessionIsNotRunningUnlessSomebodySaidSo:
         """
         from tower.main import create_app
 
-        monkeypatch.delenv("TOWER_SCENE_UNDERSTANDING", raising=False)
+        # "off" explicitly: since 2026-09-07 an unset variable means auto,
+        # and on a host with the [ml] extra auto offers the cartridge.
+        monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "off")
         monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
         off = TestClient(create_app())
         off.__enter__()

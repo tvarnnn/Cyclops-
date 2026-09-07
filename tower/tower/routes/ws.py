@@ -526,8 +526,26 @@ async def _close_cartridge_streams(websocket, owner) -> None:
     third place the rule applies and the one that had it wrong.
 
     `stream_opened` stays inline: it starts a thread and returns.
+
+    Started on a plain thread and then awaited, rather than `to_thread`
+    alone: this runs in the connection's `finally`, and when the handler
+    task is being cancelled (app shutdown, a test client's teardown) a
+    second cancellation can arrive before `to_thread` has even started
+    its work, leaving a stream open in a live cartridge's book for ever.
+    The thread guarantees the close happens; the await is best effort.
     """
-    await asyncio.to_thread(_tell_cartridges_the_stream_closed, websocket, owner)
+    import threading
+
+    done = threading.Event()
+
+    def run():
+        try:
+            _tell_cartridges_the_stream_closed(websocket, owner)
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="tower-stream-teardown", daemon=True).start()
+    await asyncio.to_thread(done.wait, 30.0)
 
 
 def _tell_cartridges_the_stream_closed(websocket, owner) -> None:

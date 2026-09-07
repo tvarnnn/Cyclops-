@@ -294,28 +294,42 @@ def _scene_session(settings):
     import torch  # noqa: F401
     import torchvision  # noqa: F401
 
-    from tower.scene.detect import TorchvisionDetector
+    from tower.scene.detect import detector_for
     from tower.scene.engine import SceneEngine
     from tower.scene.live import SceneLive
+    from tower.scene.orientation import FaceVisibilityEstimator, model_path
 
     device = _resolve_device(settings.scene_device)
     _cap_torch_threads(settings)
+    detector_choice = getattr(settings, "scene_detector", "auto")
+    # Resolved once, here, so a bad choice fails at boot where an
+    # operator sees it and not on the first frame of a physical test.
+    detector_for(device, detector_choice)
+
+    # The face model is a file; either it is vendored or it is not, and
+    # that is decided once too. Without it there is no orientation stage
+    # and the wire says `orientation_enabled: false` with a reason
+    # rather than guessing.
+    face_model = model_path() if settings.scene_orientation else None
+    if settings.scene_orientation and face_model is None:
+        logger.warning(
+            "[Tower][Config] TOWER_SCENE_ORIENTATION is on but no face model "
+            "was found; Scene Understanding will run without orientation"
+        )
 
     def make_engine():
-        pose = None
-        if settings.scene_orientation:
-            from tower.scene.orientation import TorchvisionPoseEstimator
-
-            pose = TorchvisionPoseEstimator(device=device)
+        facing = None if face_model is None else FaceVisibilityEstimator(face_model)
         return SceneEngine(
-            TorchvisionDetector(device=device), pose_estimator=pose
+            detector_for(device, detector_choice), facing_estimator=facing
         )
 
     logger.info(
-        "[Tower][Config] Scene Understanding enabled on %s (orientation %s); "
-        "no session is running until one is started",
+        "[Tower][Config] Scene Understanding enabled on %s (detector %s, "
+        "orientation %s); no session is running until a client watches a "
+        "stream",
         device,
-        "on" if settings.scene_orientation else "off",
+        detector_choice,
+        "on" if face_model is not None else "off",
     )
     return SceneLive(make_engine, follow_stream=settings.scene_autostart)
 
@@ -340,6 +354,35 @@ def _document_session(settings):
     )
 
 
+# Why Scene Understanding is unavailable in auto mode on a host without
+# the [ml] extra. Module constants, like `SCENE_DISABLED_REASON`, so the
+# route and the declaration cannot drift into two sentences.
+SCENE_ML_EXTRA_MISSING_REASON = (
+    "Scene Understanding is not available on this Tower because the "
+    "optional [ml] extra (torch and torchvision) is not installed, so no "
+    "session can be started and there is no live scene to read. It is "
+    "offered automatically once the extra is installed; set "
+    "TOWER_SCENE_UNDERSTANDING=off to stop offering it. This build "
+    "implements the contract"
+)
+
+
+def _scene_construction_failed(mode: str, reason: str) -> str:
+    if mode == "on":
+        return (
+            "Scene Understanding is enabled on this Tower but could not "
+            f"be constructed, so no session can be started: {reason}. "
+            "This build implements the contract"
+        )
+    return (
+        "Scene Understanding is not available on this Tower: it could not "
+        f"be constructed, so no session can be started: {reason}. It is "
+        "offered automatically when the optional [ml] extra (torch and "
+        "torchvision) works; set TOWER_SCENE_UNDERSTANDING=off to stop "
+        "offering it. This build implements the contract"
+    )
+
+
 def build_live_cartridges(settings) -> LiveCartridges:
     """Everything this configuration turns on. Often nothing.
 
@@ -356,14 +399,22 @@ def build_live_cartridges(settings) -> LiveCartridges:
     document = None
     scene_unavailable_reason = None
 
+    mode = getattr(settings, "scene_understanding_mode", None)
+    if mode is None:
+        # A settings object built by hand, without the tri-state. The
+        # boolean is the whole truth for it, exactly as before.
+        mode = "on" if settings.scene_understanding else "off"
+
     if settings.scene_understanding:
         try:
             scene = _scene_session(settings)
             consumers.append(scene)
         except Exception as exc:
             logger.exception(
-                "[Tower][Config] Scene Understanding is enabled but could "
-                "not be constructed; this Tower will report it unavailable"
+                "[Tower][Config] Scene Understanding could not be "
+                "constructed (mode %s); this Tower will report it "
+                "unavailable",
+                mode,
             )
             scene = None
             # `client_safe_reason` rather than `str(exc)`, and it is the
@@ -374,12 +425,14 @@ def build_live_cartridges(settings) -> LiveCartridges:
             # the OS username. This repository's own exceptions are
             # written to be read by a person and pass through; everything
             # else reduces to its type name.
-            scene_unavailable_reason = (
-                "Scene Understanding is enabled on this Tower but could "
-                "not be constructed, so no session can be started: "
-                f"{client_safe_reason(exc)}. This build implements the "
-                "contract"
+            scene_unavailable_reason = _scene_construction_failed(
+                mode, client_safe_reason(exc)
             )
+    elif mode == "auto":
+        # Auto, and the [ml] extra is not installed. Not "off": nobody
+        # switched anything, and the sentence has to send an operator to
+        # the install step rather than to a variable.
+        scene_unavailable_reason = SCENE_ML_EXTRA_MISSING_REASON
 
     if settings.document_capture and settings.document_root is not None:
         try:

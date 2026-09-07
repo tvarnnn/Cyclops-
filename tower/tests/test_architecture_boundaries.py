@@ -591,6 +591,15 @@ def test_importing_the_lab_does_not_import_torch():
     inside a function, and this is the only way to check that -- an
     in-process assertion would pass merely because some earlier test in
     the same session had already imported it.
+
+    Scene Understanding is switched OFF for the probe, deliberately. Since
+    2026-09-07 it is offered automatically on a host that has the [ml]
+    extra, and offering it means constructing its session at boot, which
+    imports torch on purpose (`cartridge_runtime._scene_session` explains
+    why that import is eager). That is the cartridge's decision, not the
+    Lab's, and this test is about the Lab. A host WITHOUT the extra is
+    covered by `tests/test_scene_capability.py`, which blocks torch and
+    asserts the Tower still builds and says what is missing.
     """
     import subprocess
     import sys
@@ -599,11 +608,13 @@ def test_importing_the_lab_does_not_import_torch():
         "import sys, tower.main, tower.experiments; "
         "print([m for m in ('torch','torchvision','timm') if m in sys.modules])"
     )
+    env = _env_without_tower_settings()
+    env["TOWER_SCENE_UNDERSTANDING"] = "off"
     result = subprocess.run(
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
-        env=_env_without_tower_settings(),
+        env=env,
     )
 
     assert result.returncode == 0, result.stderr

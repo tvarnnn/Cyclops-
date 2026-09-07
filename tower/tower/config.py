@@ -1,6 +1,9 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # The tower project root -- the directory holding `scripts/`, `models/`
 # and, by default, `data/`. Resolved from this file rather than from the
@@ -289,9 +292,28 @@ class Settings:
     observation_keep_imagery: bool = True
     # Whether Scene Understanding may run at all on this Tower.
     #
-    # OFF by default, and the default is a resource decision rather than
-    # caution -- MEASURED, and the measurement is worse than the estimate
-    # that first stood here.
+    # PRODUCT-MANAGED SINCE 2026-09-07. `scene_understanding_mode` is the
+    # tri-state a person may set -- "auto" (the default when the variable
+    # is unset), "on", or "off" -- and this boolean is what that resolves
+    # to: True for "on", False for "off", and for "auto" whether the
+    # optional [ml] extra LOOKS installed (`find_spec` on torch and
+    # torchvision, which locates without importing). The real decision is
+    # still made by CONSTRUCTING the session in `cartridge_runtime`, which
+    # imports torch for real and reports a failure with its reason; the
+    # spec check only stops a Tower without the extra from paying for an
+    # import that would fail, and lets the reason say "not installed"
+    # rather than "could not be constructed". Nobody using the product
+    # has to know this variable exists; an operator who wants the old
+    # behaviour sets it off.
+    #
+    # It used to default OFF, and the default was a resource decision
+    # rather than caution -- MEASURED, and the measurement is worse than
+    # the estimate that first stood here. That measurement still holds
+    # for a session that is RUNNING; what changed is when one runs. A
+    # session now runs only while a client is subscribed to the live
+    # scene AND a stream is open (`tower/scene/live.py`, WHEN IT RUNS),
+    # so a Tower that offers the cartridge and is not showing it to
+    # anyone pays nothing for it beyond the import at boot.
     #
     # `scripts/cartridge_live_benchmark.py`, real corpus frames fed at the
     # delivered 12.0 fps, CPU, with torch capped at 2 threads: **1.4
@@ -311,15 +333,24 @@ class Settings:
     # unavailable, naming this variable. It never means the Tower is
     # silent about the cartridge.
     scene_understanding: bool = False
+    scene_understanding_mode: str = "auto"
     # Which device the scene detector loads onto.
     #
-    # "cpu" by default, unlike TOWER_CV_DEVICE's "auto", and measured
-    # rather than assumed: ssdlite320 is 30.4 ms on CUDA against 32.9 ms
-    # on CPU -- an 8% gain, because MobileNetV3 at an internal 320 px is
-    # bound by kernel-launch overhead and not arithmetic. Taking a GPU
-    # for 2.5 ms a frame while World Builder wants it would be a bad
-    # trade made silently.
-    scene_device: str = "cpu"
+    # "auto" since 2026-09-07: CUDA when it is there, CPU when it is not,
+    # resolved once at construction by `_resolve_device`. It used to be
+    # "cpu", on the measurement that ssdlite320 gains only 8% from the
+    # GPU; that measurement is still true of ssdlite320 and is no longer
+    # the deciding one, because the detector this cartridge runs is now
+    # chosen by the device (`tower/scene/detect.py`): a stronger model on
+    # CUDA where it is affordable, the light one on CPU where it is the
+    # only one that keeps up. A person should not have to know which GPU
+    # the Tower has to get the detector that fits it.
+    scene_device: str = "auto"
+    # Which detector the scene session runs. "auto" picks by device:
+    # RT-DETRv2-R18 on CUDA, SSDLite320 on CPU (`tower/scene/detect.py`
+    # has the measurements). The others are named so an operator can
+    # trade speed for accuracy deliberately.
+    scene_detector: str = "auto"
     # Whether the session estimates coarse facing.
     #
     # OFF by default, and this one is not close. The pose model is 956.4
@@ -328,7 +359,7 @@ class Settings:
     # for facing exists on this host. Enabling it on a CPU Tower would
     # convert the cartridge from "cheap and honest" into "wrong and
     # slow".
-    scene_orientation: bool = False
+    scene_orientation: bool = True
     # Cap torch's intra-op thread pool, or 0 to leave its default.
     #
     # PROCESS-GLOBAL. `torch.set_num_threads` has no per-model scope, so
@@ -459,6 +490,7 @@ class Settings:
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
+    scene_mode = _scene_mode(os.environ.get("TOWER_SCENE_UNDERSTANDING"))
     return Settings(
         host=os.environ.get("TOWER_HOST", "0.0.0.0"),
         port=int(os.environ.get("TOWER_PORT", "8000")),
@@ -500,9 +532,11 @@ def get_settings() -> Settings:
         ),
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
-        scene_understanding=_flag("TOWER_SCENE_UNDERSTANDING", default=False),
-        scene_device=os.environ.get("TOWER_SCENE_DEVICE", "cpu"),
-        scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=False),
+        scene_understanding=_scene_enabled(scene_mode),
+        scene_understanding_mode=scene_mode,
+        scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),
+        scene_orientation=_flag("TOWER_SCENE_ORIENTATION", default=True),
+        scene_detector=_scene_detector(os.environ.get("TOWER_SCENE_DETECTOR")),
         scene_torch_threads=_non_negative_int(
             os.environ.get("TOWER_SCENE_TORCH_THREADS"), default=0
         ),
@@ -626,6 +660,63 @@ def _non_negative_float(value: str | None, *, default: float) -> float:
     except ValueError:
         return default
     return parsed if parsed >= 0 else default
+
+
+def _scene_detector(value: str | None) -> str:
+    """One of `tower.scene.detect.DETECTOR_CHOICES`, or "auto". Not
+    imported from there -- config must not import a cartridge -- so the
+    list is checked at construction, where a bad name fails loudly."""
+    if value is None or not value.strip():
+        return "auto"
+    return value.strip().lower()
+
+
+def _scene_mode(value: str | None) -> str:
+    """"auto", "on" or "off". Unset is auto; garbage is OFF, and logged.
+
+    Garbage is off rather than auto for the same reason `_flag` reads
+    garbage as false: a typo must never switch a people detector on.
+    """
+    if value is None or not value.strip():
+        return "auto"
+    word = value.strip().lower()
+    if word == "auto":
+        return "auto"
+    if word in ("1", "true", "yes", "on"):
+        return "on"
+    if word in ("0", "false", "no", "off"):
+        return "off"
+    logger.warning(
+        "[Tower][Config] TOWER_SCENE_UNDERSTANDING=%r is not auto, on or "
+        "off; treating it as off",
+        value,
+    )
+    return "off"
+
+
+def _scene_enabled(mode: str) -> bool:
+    """What the mode resolves to before anything is constructed.
+
+    "auto" looks for the [ml] extra with `find_spec`, which locates a
+    package without importing it. That is deliberately NOT the probe the
+    declaration trusts -- 2026-08-27 measured `find_spec` reporting a
+    package whose loader raises as present -- it is only what decides
+    whether construction is attempted at all, so a Tower with no extra
+    boots without paying for an import that would fail, and the reason
+    it publishes can say "not installed" instead of "could not be
+    constructed". Construction, which imports for real, is still where
+    availability is decided.
+    """
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("torch") is not None and find_spec("torchvision") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _flag(name: str, *, default: bool) -> bool:

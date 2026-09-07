@@ -387,6 +387,36 @@ def _declaration_inputs(websocket) -> dict:
     return registry.declaration_inputs(websocket.app.state)
 
 
+async def _off_loop_even_if_cancelled(function, *args, **kwargs) -> None:
+    """Run `function` on a thread; if this task is cancelled meanwhile,
+    let the thread finish on its own and re-raise.
+
+    A connection teardown must complete whether or not the handler task
+    survives it. `to_thread` alone abandons the await on cancellation and
+    the work with it -- the thread keeps running, but a SECOND
+    cancellation (a test client's teardown delivers several) can land
+    before the thread was even started. Starting a plain thread first
+    guarantees the work happens; awaiting its completion is best effort.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def run():
+        try:
+            function(*args, **kwargs)
+        except Exception:
+            logger.exception("[Tower][Results] teardown hook failed")
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="tower-results-teardown", daemon=True).start()
+    try:
+        await asyncio.to_thread(done.wait, 30.0)
+    except asyncio.CancelledError:
+        raise
+
+
 class ChannelHolder:
     """Lazily creates one ConnectionChannel per WebSocket.
 
@@ -471,4 +501,6 @@ class ChannelHolder:
             # session kept running for a subscription whose socket is
             # closed would be the leak this method exists to prevent.
             if self._live is not None:
-                await asyncio.to_thread(self._live.watchers_left, owner=self.owner)
+                await _off_loop_even_if_cancelled(
+                    self._live.watchers_left, owner=self.owner
+                )

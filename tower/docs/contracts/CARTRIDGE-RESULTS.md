@@ -1159,7 +1159,7 @@ any large display. The list is fixed at build time and is what keeps
 | `counts` | `{label: int}` or null | one entry per `reported_classes`, present at `0` rather than omitted |
 | `count_basis` | `"confirmed-tracks"` | counts come from the tracker, never from raw detections |
 | `count_is_lower_bound` | bool, always `true` | see §14.4 |
-| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `noise-classes`, `departure-lag`, `field-of-view` |
+| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `people-count-accuracy`, `departure-lag`, `field-of-view` |
 
 > **All five ship, unconditionally.** This row listed three until
 > 2026-08-27, omitted the noise-class disclosure entirely, and described
@@ -1248,6 +1248,18 @@ remainder rather than a fifth category. `away_from_wearer` and `profile`
 are withheld with a reason (`facing_states_withheld_reason`): a
 per-person facing state narrows to one person's orientation the moment
 only one person is in view.
+
+**People, since 2026-09-07.** `people` also carries
+`partial_bottom_edge` (int) with `partial_bottom_edge_note` — person
+boxes cut off by the bottom edge with no head region, most often the
+wearer's own body, kept out of `count`; `by_apparent_size` with buckets
+`large`, `medium`, `small`, `unknown` and `apparent_size_note` — sizes
+in the picture, never distances; and `orientation_method` (string or
+null), `orientation_status` (`"experimental"`) and
+`orientation_validation` (prose) — the facing stage is a face detector
+on each tracked person's box, validated only on COCO stills.
+`where` now includes `person` as side counts, and `where_excludes` is
+empty.
 
 **`lifecycle.follows_stream`** — whether a stream together with a
 watcher starts this session. See §14.2. **`lifecycle.demand`** — the

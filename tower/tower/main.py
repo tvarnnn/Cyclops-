@@ -340,8 +340,16 @@ def _log_effective_configuration(
 
     if settings.scene_understanding:
         logger.info(
-            "[Tower][Config] Scene Understanding is enabled; it observes "
-            "nothing until a session is started and persists nothing ever"
+            "[Tower][Config] Scene Understanding is enabled (mode %s); it "
+            "observes nothing until a client subscribes to the live scene "
+            "while a stream is open, and persists nothing ever",
+            settings.scene_understanding_mode,
+        )
+    elif settings.scene_understanding_mode == "auto":
+        logger.info(
+            "[Tower][Config] Scene Understanding is unavailable: the "
+            "optional [ml] extra is not installed. The contract is "
+            "declared and reported unavailable"
         )
     else:
         logger.info(

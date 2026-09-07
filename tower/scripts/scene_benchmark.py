@@ -87,16 +87,17 @@ def bench_detection(repeat: int) -> list[dict]:
 
 def bench_orientation(repeat: int) -> dict:
     """The 23x that decides the default."""
-    from tower.scene.orientation import TorchvisionPoseEstimator
+    from tower.scene.orientation import FaceVisibilityEstimator, model_path
+    from tower.scene.records import BoundingBox
 
-    estimator = TorchvisionPoseEstimator()
+    estimator = FaceVisibilityEstimator(model_path())
     start = time.perf_counter()
     with contextlib.redirect_stdout(sys.stderr):
         estimator.load()
     load_seconds = time.perf_counter() - start
     frame = _room(640, 360)
     try:
-        timing = _timed(lambda: estimator.estimate(frame), max(repeat // 6, 1))
+        timing = _timed(lambda: estimator.estimate(frame, [BoundingBox(40, 40, 200, 320)]), max(repeat // 6, 1))
     finally:
         estimator.release()
     return {"load_seconds": round(load_seconds, 2), "estimate": timing}

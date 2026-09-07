@@ -152,6 +152,22 @@ semantic = [
     "transformers>=5.16,<6",
 ]
 
+scene = [
+    # Scene Understanding's CUDA detector. RT-DETRv2-R18
+    # (`PekingU/rtdetr_v2_r18vd`, Apache-2.0, ~80 MB of weights fetched
+    # from the Hugging Face hub on first load) runs through the same
+    # `transformers` the `semantic` extra already pins, so a host that
+    # installed that extra needs nothing more. Without it Scene
+    # Understanding still runs, on the torchvision SSDLite320 detector
+    # the `ml` extra carries, and the wire names which detector counted.
+    #
+    # Measured 2026-09-07 on 700 human-labelled COCO val2017 images at
+    # this camera's 640 px long side: mAP50 0.669 against SSDLite320's
+    # 0.367, person AP50 0.856 against 0.604, at 17 ms a frame on the
+    # RTX 5070 against 30 ms. See tower/scene/detect.py.
+    "transformers>=5.16,<6",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
