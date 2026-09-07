@@ -1188,7 +1188,7 @@ final class TowerClientTests: XCTestCase {
                     {"type":"cartridges",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
                      "cartridges":[{"cartridge":"world_builder","result_type":"status",
-                        "contract":"world_builder.status/2026-08-25","available":true,
+                        "contract":"world_builder.status/2026-09-06","available":true,
                         "unavailable_reason":null,"snapshot_only":true}],
                      "not_offered":[]}
                     """)
@@ -1593,7 +1593,7 @@ final class TowerClientTests: XCTestCase {
 
     // MARK: - 20. The result channel
 
-    private static let worldBuilderContract = "world_builder.status/2026-08-25"
+    private static let worldBuilderContract = "world_builder.status/2026-09-06"
     private static let experimentalCVContract = "experimental_cv.status/2026-08-27"
 
     /// The declaration a **live** Tower sends, byte for byte in shape.

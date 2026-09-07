@@ -196,7 +196,10 @@ enum WorldSessionGate {
         switch state {
         case .unsupported, .failed:
             return state
-        case .idle, .awaitingFirstUpdate, .receiving, .finalizing, .finalized:
+        // `.interrupted` is a world state like `.finalized` and is gated like
+        // one: an interrupted walk from another capture is not this session's
+        // result either.
+        case .idle, .awaitingFirstUpdate, .receiving, .finalizing, .finalized, .interrupted:
             switch binding {
             case .none, .bound:
                 return state

@@ -81,18 +81,50 @@ def test_sources_are_written_before_the_child_starts(solver, tmp_path):
     solver.wait(10.0)
 
 
-def test_wait_reports_an_abandoned_child(tmp_path, monkeypatch):
+def test_wait_terminates_a_child_that_outlives_its_bound(tmp_path, monkeypatch):
+    """Until 2026-09-06 `wait()` ABANDONED a slow child and the final solve
+    then reused its workspace underneath it. It now terminates the child:
+    the builder owns every solve process it starts, and leaves none behind
+    (the 09-06 walk left one writing a solution nobody merged)."""
     stub = tmp_path / "slow.py"
-    stub.write_text("import time\ntime.sleep(3)\n")
+    stub.write_text("import time\ntime.sleep(30)\n")
     solver = BackgroundSolver(root=tmp_path, world_id="w", session_id="s", every=1, capture_dirs=[])
     import subprocess
 
-    solver._child = subprocess.Popen([sys.executable, str(stub)])
+    child = subprocess.Popen([sys.executable, str(stub)])
+    solver._child = child
     started = time.perf_counter()
     assert solver.wait(0.2) is False
-    assert time.perf_counter() - started < 2.5
-    solver._child.kill()
-    solver._child.wait()
+    assert time.perf_counter() - started < 10.0
+    assert child.poll() is not None, "the child must be gone, not abandoned"
+    assert solver.running is False
+
+
+def test_close_leaves_no_child_behind(tmp_path):
+    stub = tmp_path / "slow.py"
+    stub.write_text("import time\ntime.sleep(30)\n")
+    solver = BackgroundSolver(root=tmp_path, world_id="w", session_id="s", every=1, capture_dirs=[])
+    import subprocess
+
+    child = subprocess.Popen([sys.executable, str(stub)])
+    solver._child = child
+    solver.close()
+    assert child.poll() is not None
+    assert solver.child_pid is None
+
+
+def test_wait_ends_early_on_a_stop_request(tmp_path):
+    stub = tmp_path / "slow.py"
+    stub.write_text("import time\ntime.sleep(30)\n")
+    solver = BackgroundSolver(root=tmp_path, world_id="w", session_id="s", every=1, capture_dirs=[])
+    import subprocess
+
+    child = subprocess.Popen([sys.executable, str(stub)])
+    solver._child = child
+    started = time.perf_counter()
+    assert solver.wait(60.0, should_stop=lambda: True) is False
+    assert time.perf_counter() - started < 10.0
+    assert child.poll() is not None
 
 
 def test_a_missing_solver_is_reported_not_raised(tmp_path):
@@ -114,3 +146,42 @@ def test_a_missing_solver_is_reported_not_raised(tmp_path):
         builtins.__import__ = real_import
     assert summary["solved"] is False
     assert "pycolmap" in summary["reason"]
+
+
+def test_solve_children_are_spawned_as_one_owned_process(tmp_path):
+    """The solve child must be ONE process, the pid the builder holds.
+
+    On Windows `sys.executable` inside the venv is a launcher that spawns
+    the real interpreter underneath it with silent breakaway, so a child
+    started that way is two processes and the builder's `terminate()`
+    reaches only the outer one. The 2026-09-06 walk's orphaned solver was
+    that grandchild. The recipe in `tower.process_ownership` gives one
+    process, and the builder must use both halves of it: the executable
+    AND the environment that makes it venv-aware.
+    """
+    from scripts.world_build_session import python_executable
+    from tower.process_ownership import interpreter_environment, interpreter_executable
+
+    spawned = []
+
+    class _Child:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def spawn(argv, **kwargs):
+        spawned.append((list(argv), kwargs))
+        return _Child()
+
+    solver = BackgroundSolver(
+        root=tmp_path, world_id="w", session_id="s", every=1, capture_dirs=[],
+        spawn=spawn,
+    )
+    solver.maybe_launch(_Store(tmp_path), accepted=5, sources={})
+
+    assert python_executable() == interpreter_executable()
+    argv, kwargs = spawned[0]
+    assert argv[0] == interpreter_executable()
+    assert kwargs.get("env") == interpreter_environment()
+    solver.close()

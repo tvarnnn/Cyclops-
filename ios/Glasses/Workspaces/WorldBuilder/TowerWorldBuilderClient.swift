@@ -37,7 +37,16 @@ nonisolated enum WorldBuilderResultContract {
     /// understand"* on the phone. `WorldTrajectoryReport` is where the new
     /// meaning is honoured; adopting the string without that would be the
     /// silent widening the refusal existed to prevent.
-    static let identifier = "world_builder.status/2026-08-25"
+    ///
+    /// `world_builder.status/2026-09-06` supersedes `.../2026-08-25` because
+    /// `model_state` gained a word. `interrupted` is what a builder that died
+    /// mid-walk now reports, with the snapshot and the geometry beside it;
+    /// under the old identifier this build refused any word it did not know
+    /// as `.undecodableResponse`, and an older app must be told to update
+    /// rather than shown that. The same payload also gained `selection` —
+    /// why this world is on the wire — and `lifecycle.finalization`, both
+    /// additive; the new word is what earned the bump.
+    static let identifier = "world_builder.status/2026-09-06"
 }
 
 // MARK: - Where the geometry lives
@@ -147,16 +156,40 @@ enum WorldBuilderResultDecoder {
             return .receiving(snapshot)
 
         case "finalizing":
-            // The Tower's own caveat, carried as-is: this state means "the
-            // stored figures are not the final figures", **not** "a process is
-            // working right now". Tower cannot observe the latter — the writer
-            // lock is released before the build starts — and `WorldModelState`
-            // documents `.finalizing` as the case where the world on screen is
-            // not yet the world that will be stored, which is the same claim.
-            return .finalizing(snapshot ?? WorldSnapshot())
+            // Two Tower facts share this word, and `lifecycle.build_in_progress`
+            // tells them apart. Since 2026-09-06 the live builder keeps the
+            // writer lock through finalization, so `true` means a live
+            // process is finishing this world — evidence, not inference. On a
+            // record from before that, the Tower still cannot see whether a
+            // build is running, sends `null`, and the state means only "the
+            // stored figures are not the final figures". Carried as-is either
+            // way; the canvas words the two differently.
+            let lifecycle = payload["lifecycle"] as? [String: Any] ?? [:]
+            return .finalizing(
+                snapshot ?? WorldSnapshot(),
+                buildInProgress: lifecycle["build_in_progress"] as? Bool
+            )
 
         case "finalized":
             return .finalized(snapshot ?? WorldSnapshot())
+
+        case "interrupted":
+            // The session ended abnormally and the Tower can still describe
+            // the world: `world_snapshot`, `geometry`, `session` and
+            // `trajectory` all travel with this word. The reason is the
+            // Tower's prose ("the process building this world exited without
+            // stopping its session; …") and is shown verbatim.
+            //
+            // Without a snapshot there is nothing to draw, and a report about
+            // a session that ended badly with no world to show is, for the
+            // screen, a failure the Tower reported. That branch is not
+            // produced by today's Tower and exists so an empty payload cannot
+            // become an empty world.
+            let interruption = reason ?? Self.unexplainedInterruption
+            guard let snapshot else {
+                return .failed(CartridgeFailure(kind: .towerReportedFailure, message: interruption))
+            }
+            return .interrupted(snapshot, reason: interruption)
 
         case "failed":
             return .failed(
@@ -177,6 +210,78 @@ enum WorldBuilderResultDecoder {
     static let unexplainedUnsupported = """
         This Tower cannot serve World Builder, and did not say why.
         """
+
+    static let unexplainedInterruption = """
+        The Tower reported that this world's session was interrupted, and did not say how.
+        """
+
+    /// The `model_state` word itself, or `nil` when the payload has none.
+    ///
+    /// Read beside `modelState(from:)` rather than recovered from the decoded
+    /// case, because the decoded case is the phone's reading and this is the
+    /// Tower's word — and `WorldRecentReference` labels a world with the
+    /// Tower's word deliberately.
+    static func modelStateWord(from payload: [String: Any]) -> String? {
+        payload["model_state"] as? String
+    }
+
+    /// The `selection` block → `WorldSelection`, or `.unknown` when the block
+    /// is absent or carries no `mode`.
+    ///
+    /// `.unknown`, not `.none`: an older Tower that sends no block has not
+    /// said nothing is live, it has said nothing about how it chose — and the
+    /// client keeps its pre-2026-09-06 behaviour under `.unknown` for exactly
+    /// that reason. A `mode` this build does not know survives as its own
+    /// word; see `WorldSelectionMode`.
+    static func selection(from payload: [String: Any]) -> WorldSelection {
+        guard
+            let json = payload["selection"] as? [String: Any],
+            let mode = json["mode"] as? String
+        else { return .unknown }
+        return WorldSelection(
+            mode: WorldSelectionMode(rawValue: mode),
+            worldID: json["world_id"] as? String,
+            sessionID: json["session_id"] as? String,
+            reason: json["reason"] as? String
+        )
+    }
+
+    /// `lifecycle.finalization` → `WorldFinalizationReport`, or `nil` for
+    /// `null`, for an absent key, and for a payload with no `lifecycle` block
+    /// at all. A record written before the builder kept this report has none,
+    /// and that is a fact rather than an error.
+    static func finalization(from payload: [String: Any]) -> WorldFinalizationReport? {
+        let lifecycle = payload["lifecycle"] as? [String: Any] ?? [:]
+        return WorldFinalizationReport(json: lifecycle["finalization"])
+    }
+
+    /// `world.updated_at`, when the payload carries the Tower-native `world`
+    /// block. Read for the "last saved world" line only — it is a clock
+    /// reading, not a figure, and it is never drawn as a duration.
+    static func worldUpdatedAt(from payload: [String: Any]) -> Double? {
+        let world = payload["world"] as? [String: Any] ?? [:]
+        return world["updated_at"] as? Double
+    }
+
+    /// The stored world a `latest` selection offered, as a reference the
+    /// person can follow. `nil` when the payload names no world — which is
+    /// the `none` selection, and has nothing to offer.
+    static func recentReference(from payload: [String: Any]) -> WorldRecentReference? {
+        let snapshot = payload["world_snapshot"] as? [String: Any] ?? [:]
+        let session = payload["session"] as? [String: Any] ?? [:]
+        let selection = self.selection(from: payload)
+        guard
+            let worldID = (snapshot["world_id"] as? String) ?? selection.worldID,
+            let word = modelStateWord(from: payload)
+        else { return nil }
+        return WorldRecentReference(
+            worldID: worldID,
+            sessionID: (session["session_id"] as? String) ?? selection.sessionID,
+            name: snapshot["name"] as? String,
+            modelState: word,
+            updatedAt: worldUpdatedAt(from: payload)
+        )
+    }
 
     /// Where the geometry this payload describes can be fetched, or `nil` when
     /// the payload does not carry all three parts of the address.
@@ -440,6 +545,35 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         inspectionSubject.eraseToAnyPublisher()
     }
 
+    /// The stored world the Tower offered in place of a live one, while
+    /// following live, or `nil`.
+    ///
+    /// Set when an unpinned report carries a `latest` selection — nothing is
+    /// live and the Tower answered with the newest world on disk. That report
+    /// is presented as `.idle` rather than as the stored world's own state,
+    /// and this is what remains of it: a name, a state word and an Open
+    /// action, so the person can choose to look at history rather than have
+    /// it drawn under the Live heading. Cleared by any report that is not
+    /// that, and whenever `lastReport` is.
+    private(set) var recentWorld: WorldRecentReference? {
+        didSet {
+            guard recentWorld != oldValue else { return }
+            recentWorldSubject.send(recentWorld)
+        }
+    }
+
+    var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> {
+        recentWorldSubject.eraseToAnyPublisher()
+    }
+
+    /// Why the Tower served the world in the last report, or `nil` before the
+    /// first one. Read-only, for the log line and for tests; the decision it
+    /// drives is in `publishLastReport()`.
+    var selection: WorldSelection? { lastReport?.selection }
+
+    /// The builder's account of finalization from the last report, or `nil`.
+    var finalization: WorldFinalizationReport? { lastReport?.finalization }
+
     /// The pin the next `result_subscribe` carries, or `nil` to follow the
     /// live world. Kept across reconnects on purpose: a reader looking at a
     /// stored world who loses WiFi is still looking at that world when it
@@ -449,6 +583,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
     private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
+    private let recentWorldSubject = PassthroughSubject<WorldRecentReference?, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -459,6 +594,14 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// separately-wrong opinion about the same revision. What is sent here is a
     /// fact — "the Tower says its geometry is at this address, under this
     /// identity" — and the reader decides whether that is news.
+    ///
+    /// **Gated on presentation, though.** An address is emitted only when the
+    /// state this client just presented carries a snapshot. A report the gate
+    /// refused (foreign, awaiting) or the ownership rule set aside (`latest`
+    /// while live) names a world this screen is not showing, and an address
+    /// for it would still fetch its fragments and name it for the picture
+    /// button — which is how a previous walk's gallery came to sit under the
+    /// next walk's "Building" heading.
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> {
         geometrySubject.eraseToAnyPublisher()
     }
@@ -467,14 +610,38 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let tower: TowerClient
     private var cancellables: Set<AnyCancellable> = []
 
+    /// One decoded status payload, before the gate.
+    ///
+    /// `state` and `session` are what the gate reads; `selection` is what the
+    /// ownership rule reads; the identity fields and `finalization` are kept
+    /// for the log line, the "last saved world" reference and tests.
+    struct StatusReport: Equatable, Sendable {
+        var state: WorldModelState
+        var session: WorldSessionReport?
+        var selection: WorldSelection
+        var finalization: WorldFinalizationReport?
+        /// `world_snapshot.world_id` / `session.session_id`, as decoded — the
+        /// same two strings `WorldGeometryCoordinates` is addressed by.
+        var worldID: String?
+        var sessionID: String?
+        /// The stored world this report offered instead of a live one, when
+        /// its selection was `latest`; `nil` otherwise.
+        var recentWorld: WorldRecentReference?
+    }
+
     /// The last thing the Tower said, before the gate.
     ///
     /// Kept because the binding has two inputs and only one of them arrives on
     /// the result channel: the phone's bracket opens and closes on its own
     /// clock, and when it does the same payload has to be re-judged. Storing
-    /// the decoded pair rather than the raw dictionary keeps the decode on the
-    /// arrival path, where a failure is still attributable to a message.
-    private var lastReport: (state: WorldModelState, session: WorldSessionReport?)?
+    /// the decoded report rather than the raw dictionary keeps the decode on
+    /// the arrival path, where a failure is still attributable to a message.
+    private var lastReport: StatusReport? {
+        didSet {
+            // Nothing offered stands once the report that offered it is gone.
+            if lastReport == nil { recentWorld = nil }
+        }
+    }
 
     /// The open subscription on the **current** socket, or `nil`. Cleared on
     /// every disconnect because the Tower's ids are per connection.
@@ -489,6 +656,20 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// declaration republished while the ack is in flight would open a second
     /// subscription for the same cartridge.
     private var isSubscribing = false
+    /// Subscribes sent on the current socket that the Tower has not yet
+    /// answered — with a `result_subscribed`, or with an error in its place.
+    ///
+    /// `isSubscribing` cannot count. A pin change (`inspect`, `followLive`)
+    /// legitimately sends a second subscribe while the first is still
+    /// unanswered, because the new pin has to go out now; and the Tower opens
+    /// **both**. Its acks arrive in the order the subscribes were sent, on one
+    /// ordered channel, so an ack that lands while a newer subscribe is still
+    /// pending belongs to an attempt this client has already superseded. That
+    /// subscription is closed and retired on the spot rather than becoming
+    /// `subscriptionID` for the instant before the next ack overwrites it —
+    /// which used to leave it open and delivering the world just left, every
+    /// heartbeat, for the life of the socket.
+    private var pendingSubscribeAcks = 0
     /// Bounds the wait for a `result_subscribed`. See `armSubscribeTimeout`.
     private var subscribeTimeout: Task<Void, Never>?
     /// Which subscribe attempt a timeout belongs to. Without it, a timeout
@@ -589,6 +770,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             subscriptionID = nil
             retiredSubscriptionIDs = []
             isSubscribing = false
+            pendingSubscribeAcks = 0
             // The socket that the subscribe was sent on is gone, so the bound
             // has nothing left to bound. Leaving it armed would report a
             // timeout against a connection the reconnect path already owns.
@@ -630,6 +812,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         }
 
         isSubscribing = true
+        pendingSubscribeAcks += 1
         // A new subscription is answered with a complete snapshot, so whatever
         // was held describes a socket that is gone. Cleared together with the
         // state it produced, so a bracket opening in the window before that
@@ -764,6 +947,18 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
         case .subscribed(let ack):
             guard ack.cartridge == WorldBuilderResultContract.towerCartridge else { return }
+            if pendingSubscribeAcks > 1 {
+                // An ack for a subscribe this client has already superseded
+                // with a newer one — a pin changed before the Tower answered.
+                // The Tower opened it and will heartbeat the world just left
+                // on it until told otherwise; tell it now, and drop whatever
+                // it had already queued. See `pendingSubscribeAcks`.
+                pendingSubscribeAcks -= 1
+                tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
+                retiredSubscriptionIDs.insert(ack.subscriptionID)
+                return
+            }
+            pendingSubscribeAcks = 0
             subscriptionID = ack.subscriptionID
             isSubscribing = false
             disarmSubscribeTimeout()
@@ -862,7 +1057,20 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             )
             return
         }
-        lastReport = (next, WorldBuilderResultDecoder.session(from: envelope.payload))
+        let payload = envelope.payload
+        let selection = WorldBuilderResultDecoder.selection(from: payload)
+        let session = WorldBuilderResultDecoder.session(from: payload)
+        lastReport = StatusReport(
+            state: next,
+            session: session,
+            selection: selection,
+            finalization: WorldBuilderResultDecoder.finalization(from: payload),
+            worldID: (payload["world_snapshot"] as? [String: Any])?["world_id"] as? String,
+            sessionID: session?.sessionID,
+            recentWorld: selection.isHistoryOfferedAsLive
+                ? WorldBuilderResultDecoder.recentReference(from: payload)
+                : nil
+        )
         publishLastReport()
 
         // Sent whether or not the state changed, and whether or not the
@@ -873,7 +1081,15 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         // Here rather than in `publishLastReport()` because this is a fact the
         // Tower just stated, and `publishLastReport()` also runs on a
         // *bracket* change, where the Tower has said nothing new.
-        if let coordinates = WorldBuilderResultDecoder.geometryCoordinates(from: envelope.payload) {
+        //
+        // And only when what was just presented carries a snapshot. A report
+        // the gate turned into "waiting", or the ownership rule turned into
+        // `.idle`, names a world this screen is not showing; emitting its
+        // address anyway would fetch that world's fragments into the cache
+        // and name it for the picture button, to be drawn the moment the
+        // state next became a world state — for a *different* world.
+        guard state.snapshot != nil else { return }
+        if let coordinates = WorldBuilderResultDecoder.geometryCoordinates(from: payload) {
             geometrySubject.send(coordinates)
         }
     }
@@ -920,6 +1136,32 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
     private func publishLastReport() {
         guard let report = lastReport else { return }
+
+        // ## Live versus History
+        //
+        // Following live, a report whose selection is `latest` is **not** the
+        // live world: the Tower has said nothing is live and it answered with
+        // the most recently updated world on disk. That is history, and
+        // history is reached by pinning (`inspect`), never by arriving on the
+        // unpinned subscription. So the report is presented as the empty
+        // state — `.idle`, or "waiting" if this phone has a capture open and
+        // the Tower has simply not attached a builder yet — and what it
+        // offered is kept as `recentWorld`, for an Open action to pin.
+        //
+        // `live` and `finalizing` selections are the current world and go
+        // through the gate as before. `.unknown` — an older Tower, no block —
+        // keeps the gate as the only judge, because a Tower that has not said
+        // how it chose has not said the world is stored, either. A pinned
+        // report is history by construction and the selection is not read.
+        if pinned == nil, report.selection.isHistoryOfferedAsLive {
+            recentWorld = report.recentWorld
+            let binding = bindingWithNoReport
+            sessionBinding = binding
+            state = WorldSessionGate.presented(.idle, binding: binding)
+            return
+        }
+        recentWorld = nil
+
         let binding = WorldSessionGate.binding(
             isCaptureBracketOpen: isCaptureBracketOpen,
             session: report.session,
@@ -951,12 +1193,20 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             detail = "idle"
         case .awaitingFirstUpdate:
             detail = "awaitingFirstUpdate"
-        case .receiving(let snapshot), .finalizing(let snapshot), .finalized(let snapshot):
+        case .receiving(let snapshot),
+             .finalizing(let snapshot, _),
+             .finalized(let snapshot),
+             .interrupted(let snapshot, _):
             let name: String
             switch state {
-            case .receiving: name = "receiving"
-            case .finalizing: name = "finalizing"
-            default: name = "finalized"
+            case .receiving:
+                name = "receiving"
+            case .finalizing(_, let building):
+                name = "finalizing(building=\(building.map { String($0) } ?? "unknown"))"
+            case .interrupted(_, let reason):
+                name = "interrupted(\(reason))"
+            default:
+                name = "finalized"
             }
             detail = "\(name) keyframes=\(snapshot.keyframeCount.map(String.init) ?? "-")"
                 + " tracking=\(snapshot.tracking.displayName)"
@@ -973,8 +1223,15 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         case .failed(let failure):
             detail = "failed(\(failure.kind.rawValue)) — \(failure.message)"
         }
-        print("[Glasses][WorldBuilder] \(detail) binding=\(bindingDescription)")
+        print("[Glasses][WorldBuilder] \(detail) binding=\(bindingDescription) selection=\(selectionDescription)")
         #endif
+    }
+
+    /// The Tower's selection, for the log line: the one word that says
+    /// whether a world arrived because it is live or because it was newest.
+    private var selectionDescription: String {
+        guard let selection = lastReport?.selection else { return "-" }
+        return "\(selection.mode.rawValue)(\(selection.worldID ?? "no world"))"
     }
 
     /// One line per binding change, beside the one per state change.
@@ -1024,6 +1281,15 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             resubscribesUsed += 1
             subscribeIfPossible()
             return
+        }
+
+        // A reply to a subscribe names the cartridge and no subscription id
+        // (none was opened). It answers one pending subscribe the way an ack
+        // would have, and the count has to say so, or the next real ack is
+        // taken for a superseded one. `unknown_subscription`, which answers an
+        // unsubscribe, names only the id and does not reach here.
+        if error.cartridge != nil, error.subscriptionID == nil, pendingSubscribeAcks > 0 {
+            pendingSubscribeAcks -= 1
         }
 
         switch error.reason {

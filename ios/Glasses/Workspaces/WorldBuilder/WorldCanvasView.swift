@@ -79,6 +79,13 @@ struct WorldCanvasView: View {
     var fragments = WorldFragmentsModel(segments: [])
     var geometryChunks: [String: WorldSegmentChunk] = [:]
 
+    /// The stored world the Tower offered in place of a live one, when
+    /// following live and nothing is live. Drawn in `.idle` as one line with
+    /// an Open action and nowhere else — its rows and gallery arrive only
+    /// after `openRecent` pins it, under the "Saved world" heading.
+    var recentWorld: WorldRecentReference? = nil
+    var openRecent: ((WorldRecentReference) -> Void)? = nil
+
     var body: some View {
         if let forcedPhase = availability.forcedPhase {
             CartridgeStatePanel(
@@ -130,7 +137,10 @@ struct WorldCanvasView: View {
             // separate Tower process reading the capture from disk, which
             // this app can neither start nor see. Promising a world in
             // exchange for a tap would be a claim about the other machine.
-            detailText("The Tower has not reported a world. Frames from a capture session reach it; what it builds from them is its own to start.")
+            detailText(idleDetail)
+            if let recent = recentWorld, !inspection.isInspecting {
+                recentWorldLine(recent)
+            }
 
         case .awaitingFirstUpdate:
             // The one honest use of a progress indicator: frames really are
@@ -150,34 +160,38 @@ struct WorldCanvasView: View {
             WorldSummaryView(snapshot: snapshot, isLive: true)
             fragmentGallery
 
-        case .finalizing(let snapshot):
-            // ## No spinner here, and the reason is not style
+        case .finalizing(let snapshot, let buildInProgress):
+            // ## A spinner only on evidence
             //
-            // This drew a `ProgressView` beside "Finishing the world…" under a
-            // comment reading *"Progress is honest here — the Tower is
-            // genuinely working"*. **The Tower says it cannot know that.**
+            // This once drew a `ProgressView` beside "Finishing the world…"
+            // under a comment reading *"Progress is honest here — the Tower
+            // is genuinely working"*, and the Tower of the day said it could
+            // not know that: the writer lock was released before `build()`
+            // ran, so *"a build in progress is indistinguishable on disk from
+            // one that never started and from one that crashed"*. If the
+            // builder crashed, the spinner span forever. It was removed.
             //
-            // `tower/tower/results/world_builder.py` is explicit: the writer
-            // lock is released before `build()` is called, and `build()` emits
-            // no event and writes nothing until it finishes, so *"a build in
-            // progress is indistinguishable on disk from one that never started
-            // and from one that crashed"*. Its `build_in_progress` field is
-            // `null` for exactly that reason, and the Tower spells out that
-            // `null` is not `False` because `False` would itself be a claim.
-            //
-            // This app's own client already knew. `TowerWorldBuilderClient`
-            // says this state means *"the stored figures are not the final
-            // figures", **not** "a process is working right now"*. Two comments
-            // in this repo contradicted each other and the pixels followed the
-            // wrong one — an animating spinner is the strongest possible
-            // assertion that work is underway, made from a fact that cannot
-            // support it. If the builder crashed, this span forever.
-            //
-            // What is true and worth saying is the staleness, which is what the
-            // state actually means.
+            // Since 2026-09-06 the live builder keeps the lock through
+            // finalization and the Tower sends `build_in_progress: true` on
+            // the evidence of a live process holding it. That is the one case
+            // where an indicator is a report rather than an assertion, and it
+            // is drawn for that case alone. `null` — an older record — keeps
+            // the staleness sentence, which is what that state means.
             headline(snapshot.name ?? "World", systemImage: "cube")
+            if buildInProgress == true {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("The Tower is finishing this world.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
+            if buildInProgress == true {
+                detailText("A live process holds this world's writer lock and its session has stopped: the final solve and the final build are running, and these figures are not final.")
+            } else {
+                detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
+            }
             fragmentGallery
 
         case .finalized(let snapshot):
@@ -185,9 +199,50 @@ struct WorldCanvasView: View {
             WorldSummaryView(snapshot: snapshot, isLive: false)
             fragmentGallery
 
+        case .interrupted(let snapshot, let reason):
+            // Its own state, never "failed" and never a finished world. The
+            // Tower's reason is the detail, verbatim; the rows, the gallery
+            // and — through `renderTarget`, which the coordinates for this
+            // snapshot still earn — the picture button all stay, because the
+            // geometry exists whatever happened to the process.
+            headline("Interrupted", systemImage: "exclamationmark.triangle")
+            detailText(reason)
+            WorldSummaryView(snapshot: snapshot, isLive: false)
+            fragmentGallery
+
         case .failed(let failure):
             headline("World building failed", systemImage: "exclamationmark.triangle.fill")
             detailText(failure.message)
+        }
+    }
+
+    /// The `.idle` sentence. With a stored world on offer the second half is
+    /// dropped: "what it builds is its own to start" is true but the line
+    /// under it is about to say what it *did* build.
+    private var idleDetail: String {
+        if recentWorld != nil, !inspection.isInspecting {
+            return "Nothing is being built right now."
+        }
+        return "The Tower has not reported a world. Frames from a capture session reach it; what it builds from them is its own to start."
+    }
+
+    /// One line, one action. `Last saved world: <title> · <state>` names what
+    /// the Tower offered without drawing any of it; Open pins it, and the
+    /// canvas then says "Saved world" over everything it shows.
+    private func recentWorldLine(_ recent: WorldRecentReference) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("Last saved world: \(recent.title) · \(recent.stateLabel)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            if let openRecent {
+                Button("Open") { openRecent(recent) }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Open the last saved world")
+            }
         }
     }
 
@@ -235,7 +290,7 @@ struct WorldCanvasView: View {
     /// reader who scrolls past a picture should still find the counts that
     /// picture came from.
     ///
-    /// Shown in the three states that carry a snapshot and in no others.
+    /// Shown in the four states that carry a snapshot and in no others.
     /// `.idle` and `.failed` have no world to have geometry for, and drawing an
     /// empty gallery under them would offer a container where there is not even
     /// a world.
@@ -279,8 +334,8 @@ struct WorldCanvasView: View {
 /// drawn as "—". That is the difference between a panel that is early and a
 /// panel that looks broken.
 ///
-/// Reached from `.receiving`, `.finalizing` and `.finalized`, all three of
-/// which `TowerWorldBuilderClient` now produces from real Tower snapshots.
+/// Reached from `.receiving`, `.finalizing`, `.finalized` and `.interrupted`,
+/// all of which `TowerWorldBuilderClient` produces from real Tower snapshots.
 struct WorldSummaryView: View {
     let snapshot: WorldSnapshot
     let isLive: Bool

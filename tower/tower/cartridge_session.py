@@ -96,6 +96,22 @@ ACTIONS = (START, PAUSE, RESUME, STOP)
 # terminated, and the log says so and says what was lost.
 DETACH_GRACE_SECONDS = 3.0
 
+# What Stop (and Pause) do to a running producer.
+#
+# `terminate`: ask, wait DETACH_GRACE_SECONDS, terminate -- Object Memory's
+# contract, where "stop recording NOW" is the whole point of the button.
+#
+# `request`: close the producer's stdin and return. The producer stays
+# registered with the supervisor until it exits on its own and is reaped.
+# World Builder's contract since 2026-09-06: a builder that is still
+# observing ends its session and writes one final build within seconds; a
+# builder already finalizing (30-135 s of solving after the wearer's Stop)
+# is allowed to finish, because terminating it would turn "I looked at
+# another tab" into an interrupted world. The hard path is `shutdown()`.
+STOP_POLICY_TERMINATE = "terminate"
+STOP_POLICY_REQUEST = "request"
+STOP_POLICIES = (STOP_POLICY_TERMINATE, STOP_POLICY_REQUEST)
+
 
 class SessionRefused(Exception):
     """An action this session cannot honour from the state it is in.
@@ -132,12 +148,18 @@ class CartridgeSession:
         open_capture,
         clock,
         detach_grace_seconds: float = DETACH_GRACE_SECONDS,
+        stop_policy: str = STOP_POLICY_TERMINATE,
     ) -> None:
+        if stop_policy not in STOP_POLICIES:
+            raise ValueError(
+                f"unknown stop policy {stop_policy!r}; expected one of {STOP_POLICIES}"
+            )
         self._cartridge = cartridge
         self._worker = worker
         self._supervisor = supervisor
         self._open_capture = open_capture
         self._clock = clock
+        self._stop_policy = stop_policy
         # A reading of the SUPERVISOR's clock, taken when this session
         # last went active. See `_go_active` and `mark`.
         self._attached_since: float | None = None
@@ -395,6 +417,10 @@ class CartridgeSession:
             "worker": self._worker,
             "supported": self.supported,
             "state": self._state,
+            # How Stop treats a running producer (see STOP_POLICY_*). A
+            # client showing "stopped" must know whether that meant "the
+            # process is gone" or "the process was asked and is finishing".
+            "stop_policy": self._stop_policy,
             "session_id": self._session_id,
             "started_at": self._started_at,
             "changed_at": self._changed_at,
@@ -502,6 +528,15 @@ class CartridgeSession:
 
     def _detach(self) -> None:
         try:
+            if self._stop_policy == STOP_POLICY_REQUEST:
+                asked = self._supervisor.request_stop(self._worker)
+                logger.info(
+                    "[Tower][Session] %s asked %s worker(s) to stop; they finish "
+                    "on their own and stay visible until they do",
+                    self._cartridge,
+                    asked,
+                )
+                return
             self._supervisor.detach(
                 self._worker, grace_seconds=self._detach_grace_seconds
             )

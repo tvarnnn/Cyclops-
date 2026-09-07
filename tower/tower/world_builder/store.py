@@ -587,28 +587,60 @@ class WorldStore:
     def acquire_writer_lock(self, world_id: str) -> None:
         """Take the single-writer lock, reclaiming it from a dead process.
 
-        Liveness by pid rather than by timeout. A stale-lock timer has to
-        guess how long a legitimate writer might pause; asking the OS
-        whether the pid is still running does not guess, and psutil is
-        already a dependency.
+        Liveness by pid AND process start time rather than by timeout. A
+        stale-lock timer has to guess how long a legitimate writer might
+        pause; asking the OS whether the pid is still running does not
+        guess, and psutil is already a dependency. The start time is
+        there because Windows recycles pids aggressively: a lock left by a
+        builder that died could otherwise name a pid that now belongs to
+        an unrelated process, and the next session would be refused for
+        as long as that stranger lived (see `lock_holder`).
         """
         path = self.lock_path(world_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            try:
-                holder = read_json_closed(path)
-            except json.JSONDecodeError:
-                holder = {}
-            pid = holder.get("pid")
-            if isinstance(pid, int) and _pid_is_running(pid) and pid != os.getpid():
+        holder = self.lock_holder(world_id)
+        if holder is not None:
+            if holder["alive"] and holder["pid"] != os.getpid():
                 raise WorldLockedError(
-                    f"world {world_id} is locked by live pid {pid}; refusing a "
-                    "second writer"
+                    f"world {world_id} is locked by live pid {holder['pid']}; "
+                    "refusing a second writer"
                 )
             logger.warning(
-                "world builder: reclaiming lock on %s held by pid %r", world_id, pid
+                "world builder: reclaiming lock on %s held by pid %r",
+                world_id,
+                holder["pid"],
             )
-        write_json_atomic(path, {"pid": os.getpid()})
+        write_json_atomic(path, _lock_record(os.getpid()))
+
+    def lock_holder(self, world_id: str) -> dict | None:
+        """Who holds the writer lock, and whether that process is alive.
+
+        None when no readable lock exists. Otherwise
+        `{"pid": int|None, "alive": bool, "unreadable": bool}`:
+        `unreadable` is a lock file that names no usable pid, which is NOT
+        "no lock" -- reporting a healthy idle world over a file that is
+        right there would downgrade a crashed builder to nothing at all.
+
+        One answer for the store, the status producer and the listing, so
+        the three cannot disagree about whether a world is live.
+        """
+        path = self.lock_path(world_id)
+        try:
+            if not path.exists():
+                return None
+            holder = read_json_closed(path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(holder, dict):
+            return {"pid": None, "alive": False, "unreadable": True}
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return {"pid": None, "alive": False, "unreadable": True}
+        return {
+            "pid": pid,
+            "alive": _holder_is_running(pid, holder.get("created_at")),
+            "unreadable": False,
+        }
 
     def release_writer_lock(self, world_id: str) -> None:
         self.lock_path(world_id).unlink(missing_ok=True)
@@ -687,10 +719,51 @@ def _parse_all(raw_records: list[dict], parser, what: str) -> list:
     return parsed
 
 
-def _pid_is_running(pid: int) -> bool:
+# How far apart two readings of one process's start time may be and still
+# name the same process. psutil reports the value at millisecond precision
+# on Windows and the two readings here are taken by different processes.
+_CREATE_TIME_TOLERANCE_S = 1.0
+
+
+def _lock_record(pid: int) -> dict:
+    """What a writer puts in its lock: the pid, and when that pid started.
+
+    The start time is what makes the pid mean one process rather than
+    whichever process the OS next hands that number to.
+    """
+    record = {"pid": pid}
     try:
         import psutil
 
-        return psutil.pid_exists(pid)
+        record["created_at"] = float(psutil.Process(pid).create_time())
+    except Exception:  # pragma: no cover - a lock without a start time still works
+        pass
+    return record
+
+
+def _pid_is_running(pid: int) -> bool:
+    return _holder_is_running(pid, None)
+
+
+def _holder_is_running(pid: int, created_at) -> bool:
+    """Whether the process a lock names is the process that is running.
+
+    With a start time on the lock, a running pid whose start time differs
+    is a DIFFERENT process -- the builder that wrote the lock is dead and
+    its number was recycled. Without one (a lock written before start
+    times were recorded) the pid alone decides, as it always did.
+    """
+    try:
+        import psutil
+
+        if not psutil.pid_exists(pid):
+            return False
+        if created_at is None:
+            return True
+        try:
+            actual = psutil.Process(pid).create_time()
+        except psutil.Error:
+            return False
+        return abs(float(actual) - float(created_at)) <= _CREATE_TIME_TOLERANCE_S
     except Exception:  # pragma: no cover - psutil is a hard dependency
         return False

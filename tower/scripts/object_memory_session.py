@@ -75,6 +75,7 @@ Measured at ~11.7 KB a record, about 4.3 MB an hour of walking.
 import argparse
 import json
 import signal
+import os
 import sys
 import threading
 import time
@@ -411,14 +412,23 @@ class _StopRequest:
         """
 
         def wait_for_close() -> None:
+            # The RAW descriptor, never `sys.stdin.buffer.read(1)`. A read
+            # through the buffered object holds that object's lock for as
+            # long as it blocks, and when this process exits NORMALLY --
+            # the capture closed, the supervisor still holding the pipe --
+            # interpreter shutdown tries to take the same lock to close
+            # stdin and aborts: "Fatal Python error: _enter_buffered_busy:
+            # could not acquire lock for <_io.BufferedReader name='<stdin>'>",
+            # a non-zero exit for a run that succeeded. `os.read` takes no
+            # Python lock; the pending ReadFile dies with the process.
             try:
-                stream = sys.stdin.buffer if sys.stdin is not None else None
-            except (AttributeError, ValueError):
+                fd = sys.stdin.fileno() if sys.stdin is not None else None
+            except (AttributeError, ValueError, OSError):
                 return
-            if stream is None:
+            if fd is None:
                 return
             try:
-                stream.read(1)
+                os.read(fd, 1)
             except Exception:
                 # A closed or unreadable pipe is itself the request. The
                 # alternative -- treating an unreadable stdin as "keep

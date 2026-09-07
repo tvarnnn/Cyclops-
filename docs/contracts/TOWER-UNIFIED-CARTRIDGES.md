@@ -170,14 +170,18 @@ like another's.
 | Cartridge | Controlled by | States |
 |---|---|---|
 | Object Memory | `POST /cartridges/object_memory/session/{action}` | `stopped` / `active` / `paused` |
+| World Builder (since 2026-09-06) | `POST /cartridges/world_builder/session/{action}` — **intent to build**, sent by the phone when the World Builder workspace appears (`start`) and leaves (`stop`). A builder attaches to a camera capture only while `active`. `stop_policy: "request"`: Stop closes the builder's stdin and returns; a builder still observing ends its session (`interrupted`) and writes its final build; one already finalizing is allowed to finish. `following` stays truthful until it exits | `stopped` / `active` / `paused` |
 | Scene Understanding | `POST /scene/{start,pause,resume,stop}` *and* `stream_start`/`stream_stop` | `stopped` / `starting` / `running` / `paused` / `failed` |
 | Document Memory | `POST /documents-session/{start,pause,resume,stop}` | as Scene, plus `unavailable` |
 | Experimental CV Lab | socket `cv_lab_start` / `pause` / `resume` / `stop` | `unavailable` / `idle` / `starting` / `running` / `paused` / `stopped` / `failed` |
 
 **The generic session surface** — `cartridge_session.control/2026-08-27` —
 is keyed by cartridge id and knows no cartridge, so the next producer that
-needs a button gets one for free. Today only `object_memory` answers it;
-any other name is a **404**, which is a configuration answer.
+needs a button gets one for free. `object_memory` and, since 2026-09-06,
+`world_builder` answer it; any other name is a **404**, which is a
+configuration answer. The payload now also carries `stop_policy`
+(`"terminate"` for Object Memory, `"request"` for World Builder) so a client
+knows whether "stopped" meant the process is gone or was asked to finish.
 
 ```
 GET  /cartridges/{cartridge}/session
@@ -277,8 +281,10 @@ contract.**
 
 **Stream-bound lifecycle.** `stream_start` starts a Scene session and
 `stream_stop` or a disconnect ends it — which is the normal case for a
-wearable. The phone sends **nothing** to open a cartridge; a test asserts
-the wire stays silent. `lifecycle.follows_stream` reports whether that is
+wearable. The phone sends **nothing on the socket** to open a cartridge; a
+test asserts the wire stays silent. (World Builder's activation is the HTTP
+session above, not a socket message, and it is intent to build rather than
+a stream boundary.) `lifecycle.follows_stream` reports whether that is
 on. Ownership is a **set of connection tokens**, so with two phones
 streaming the first to drop does not stop the session out from under the
 second.

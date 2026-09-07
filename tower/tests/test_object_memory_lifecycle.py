@@ -147,13 +147,26 @@ def test_starting_mid_walk_attaches_to_the_capture_already_recording(app, client
 # -- the gate: a stopped cartridge remembers nothing -------------------
 
 
-def test_a_capture_opening_with_no_session_attaches_no_producer(app):
+WORLD_BUILDER_SESSION_URL = "/cartridges/world_builder/session"
+
+
+def test_a_capture_opening_with_no_session_attaches_nothing(app):
     """Armed is not recording, and the default is armed.
 
-    The builder still attaches: a world is geometry and this Tower is
-    configured to build one. The memory of which objects were around is
-    the one that waits to be asked for.
+    Since 2026-09-06 the builder is gated too: a world is geometry, but a
+    builder with its background solves attached to every capture -- a CV
+    Lab camera session included -- and the only way to run another
+    cartridge without it was a Tower restart. Each cartridge's producer
+    now waits to be asked for.
     """
+    _open_capture(app)
+
+    assert _producers(app) == []
+    assert _builders(app) == []
+
+
+def test_a_capture_opening_with_world_builder_active_attaches_only_a_builder(app, client):
+    client.post(f"{WORLD_BUILDER_SESSION_URL}/start")
     _open_capture(app)
 
     assert _producers(app) == []
@@ -161,6 +174,7 @@ def test_a_capture_opening_with_no_session_attaches_no_producer(app):
 
 
 def test_pausing_stops_the_producer_and_leaves_the_builder_alone(app, client):
+    client.post(f"{WORLD_BUILDER_SESSION_URL}/start")
     client.post(f"{SESSION_URL}/start")
     _open_capture(app)
     producer = _producers(app)[0]

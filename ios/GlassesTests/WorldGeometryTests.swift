@@ -1541,15 +1541,138 @@ final class WorldListingDecoderTests: XCTestCase {
         XCTAssertFalse(done.hasGeometry)
     }
 
-    /// `display_name: null` is `nil`, and the picker falls back to the id
-    /// itself — visibly, never to an empty row.
-    func testANullDisplayNameFallsBackToTheWorldID() throws {
+    /// `display_name: null` is `nil`, and the picker falls back to a dated
+    /// title from `updated_at` — never to an empty row, and no longer to the
+    /// id, which 156 of 162 worlds on the real root would have shared the
+    /// shape of. The id stays on the entry for a caption.
+    func testANullDisplayNameFallsBackToADatedTitleAndKeepsTheID() throws {
         let listing = try XCTUnwrap(WorldListingDecoder.listing(from: listingJSON()))
         let unnamed = listing.worlds[1]
         XCTAssertNil(unnamed.displayName)
-        XCTAssertEqual(unnamed.title, "w-old")
+        XCTAssertEqual(
+            unnamed.title,
+            WorldListingPresentation.datedTitle(updatedAt: 1787400000.0)
+        )
+        XCTAssertTrue(unnamed.title.hasPrefix("Walk · "), unnamed.title)
+        XCTAssertEqual(unnamed.worldID, "w-old")
         XCTAssertFalse(unnamed.live)
         XCTAssertTrue(unnamed.sessions.isEmpty)
+        XCTAssertFalse(unnamed.hasSessions)
+    }
+
+    /// The fields an older Tower does not send decode as absent, not as
+    /// zero or `false`, and the row still reads from what it did send.
+    func testAnOldListingWithoutTheAdditiveFieldsStillDecodes() throws {
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: listingJSON()))
+        let open = listing.worlds[0].sessions[0]
+        XCTAssertNil(open.state)
+        XCTAssertNil(open.abandoned)
+        XCTAssertNil(open.keyframesAccepted)
+        XCTAssertNil(open.keyframesJournaled)
+        XCTAssertNil(open.finalization)
+        XCTAssertNil(open.keyframeCount)
+        // With no `abandoned` to say otherwise, an open record is all that
+        // is known, and "still open" is what an old Tower's row says.
+        XCTAssertTrue(open.isStillOpen)
+        XCTAssertEqual(WorldListingPresentation.stateBadge(for: open), "still open")
+        XCTAssertNil(WorldListingPresentation.keyframeCaption(for: open))
+    }
+
+    /// The additive fields of `world_builder.worlds/2026-09-06`, as the Tower
+    /// sends them: `state`, `keyframes_accepted`, `keyframes_journaled`,
+    /// `abandoned`, `finalization`. Through `JSONSerialization`, so the
+    /// integers arrive as the `NSNumber`s they will be on the phone.
+    func testANewListingDecodesItsAdditiveFields() throws {
+        let text = """
+            {"contract":"world_builder.worlds/2026-09-06",
+             "worlds":[{"world_id":"fcbca9e90b244785bdb671530b33c6a5","display_name":null,
+                        "created_at":1788894856,"updated_at":1788895032,
+                        "live":false,
+                        "sessions":[{"session_id":"158ef0efb5e5416b87d6faa8f5c28e55",
+                                     "started_at":1788894857,
+                                     "ended_at":null,"end_reason":null,
+                                     "frame_source":"live-capture",
+                                     "capture_id":"7febdae8",
+                                     "keyframes_accepted":0,
+                                     "keyframes_journaled":467,
+                                     "has_geometry":true,
+                                     "abandoned":true,
+                                     "state":"interrupted",
+                                     "finalization":null},
+                                    {"session_id":"s-done","started_at":1788895100,
+                                     "ended_at":1788895400,"end_reason":"stop",
+                                     "frame_source":"live-capture","capture_id":"c2",
+                                     "keyframes_accepted":120,"keyframes_journaled":120,
+                                     "has_geometry":true,"abandoned":false,
+                                     "state":"complete",
+                                     "finalization":{"state":"complete","final_solve":"solved",
+                                                     "started_at":1788895400.5,
+                                                     "updated_at":1788895460.0,
+                                                     "detail":null}}]}]}
+            """
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        )
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: json))
+        let world = try XCTUnwrap(listing.worlds.first)
+        XCTAssertEqual(world.sessions.count, 2)
+
+        let interrupted = world.sessions[0]
+        XCTAssertEqual(interrupted.state, .interrupted)
+        XCTAssertEqual(interrupted.abandoned, true)
+        XCTAssertEqual(interrupted.keyframesAccepted, 0)
+        XCTAssertEqual(interrupted.keyframesJournaled, 467)
+        XCTAssertNil(interrupted.finalization)
+        XCTAssertNil(interrupted.endedAt)
+
+        let complete = world.sessions[1]
+        XCTAssertEqual(complete.state, .complete)
+        XCTAssertEqual(complete.abandoned, false)
+        let finalization = try XCTUnwrap(complete.finalization)
+        XCTAssertEqual(finalization.state, .complete)
+        XCTAssertEqual(finalization.finalSolve, "solved")
+        XCTAssertEqual(finalization.startedAt, 1788895400.5)
+        XCTAssertEqual(finalization.updatedAt, 1788895460.0)
+        XCTAssertNil(finalization.detail)
+    }
+
+    /// The 2026-09-06 walk's own record: `ended_at: null` with a dead
+    /// builder. It is **not** "still open" — the Tower said `abandoned` — and
+    /// the keyframe figure is the journal's 467, not the record's
+    /// start-of-session zero.
+    func testAnAbandonedSessionIsNotStillOpen() throws {
+        var json = listingJSON()
+        var worlds = try XCTUnwrap(json["worlds"] as? [[String: Any]])
+        var sessions = try XCTUnwrap(worlds[0]["sessions"] as? [[String: Any]])
+        sessions[0]["abandoned"] = true
+        sessions[0]["keyframes_accepted"] = 0
+        sessions[0]["keyframes_journaled"] = 467
+        worlds[0]["sessions"] = sessions
+        json["worlds"] = worlds
+
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: json))
+        let session = listing.worlds[0].sessions[0]
+        XCTAssertNil(session.endedAt)
+        XCTAssertFalse(session.isStillOpen, "a dead builder's record read as still open")
+        XCTAssertEqual(session.keyframeCount, 467)
+        XCTAssertEqual(WorldListingPresentation.keyframeCaption(for: session), "467 keyframes")
+        // No `state` word yet, but `abandoned` is enough for the badge.
+        XCTAssertEqual(WorldListingPresentation.stateBadge(for: session), "unfinished")
+    }
+
+    /// An unknown `state` word survives as itself rather than being mapped to
+    /// the nearest known one — the Tower owns the vocabulary.
+    func testAnUnknownSessionStateWordSurvivesAsItself() throws {
+        var json = listingJSON()
+        var worlds = try XCTUnwrap(json["worlds"] as? [[String: Any]])
+        var sessions = try XCTUnwrap(worlds[0]["sessions"] as? [[String: Any]])
+        sessions[1]["state"] = "consolidating"
+        worlds[0]["sessions"] = sessions
+        json["worlds"] = worlds
+        let listing = try XCTUnwrap(WorldListingDecoder.listing(from: json))
+        let session = listing.worlds[0].sessions[1]
+        XCTAssertEqual(session.state, WorldListingSessionState(rawValue: "consolidating"))
+        XCTAssertEqual(WorldListingPresentation.stateBadge(for: session), "consolidating")
     }
 
     func testAnotherContractIsRefusedWhole() {
@@ -1612,6 +1735,187 @@ final class WorldListingDecoderTests: XCTestCase {
     }
 }
 
+// MARK: - The picker at the size of a real root
+
+/// `WorldListingPresentation` against a synthetic root shaped like the real
+/// one on 2026-09-06: 161 worlds, 96 with no sessions, 29 interrupted, 6
+/// named, the rest a mix of complete, unbuilt, finishing and building. The
+/// picker was written against two worlds and had never been asked what this
+/// looks like; these are the assertions that would have said.
+final class WorldListingPresentationTests: XCTestCase {
+
+    /// Newest first, as the Tower orders them. Worlds are dealt into the
+    /// roles by index so the mix is spread through the list rather than
+    /// clumped at one end.
+    private func syntheticRoot() throws -> WorldListing {
+        var worlds: [[String: Any]] = []
+        let base = 1788800000.0
+        var interrupted = 0, named = 0, empty = 0
+        for index in 0..<161 {
+            let updated = base - Double(index) * 600
+            let worldID = String(format: "w%03d", index)
+            var world: [String: Any] = [
+                "world_id": worldID,
+                "display_name": NSNull(),
+                "created_at": updated - 300,
+                "updated_at": updated,
+                "live": false,
+            ]
+            // 96 empty shells: every world whose index leaves 0 or 1 (mod 3)
+            // after the first 17, which lands on exactly 96 of 161.
+            let isEmpty = index >= 17 && index % 3 != 2
+            if isEmpty {
+                empty += 1
+                world["sessions"] = [[String: Any]]()
+                worlds.append(world)
+                continue
+            }
+            if named < 6 {
+                named += 1
+                world["display_name"] = "Kitchen walk \(named)"
+            }
+            var session: [String: Any] = [
+                "session_id": "s-\(worldID)",
+                "started_at": updated - 200,
+                "frame_source": "live-capture",
+                "capture_id": "c-\(worldID)",
+            ]
+            if interrupted < 29 {
+                interrupted += 1
+                session["ended_at"] = NSNull()
+                session["end_reason"] = NSNull()
+                session["has_geometry"] = true
+                session["abandoned"] = true
+                session["state"] = "interrupted"
+                session["keyframes_accepted"] = 0
+                session["keyframes_journaled"] = 467
+                session["finalization"] = NSNull()
+            } else {
+                let states = ["complete", "unbuilt", "finalizing", "receiving"]
+                let state = states[index % states.count]
+                if state == "receiving" {
+                    session["ended_at"] = NSNull()
+                    session["end_reason"] = NSNull()
+                } else {
+                    session["ended_at"] = updated - 10
+                    session["end_reason"] = "stop"
+                }
+                session["has_geometry"] = state == "complete" || state == "finalizing"
+                session["abandoned"] = false
+                session["state"] = state
+                session["keyframes_accepted"] = 120
+                session["keyframes_journaled"] = 120
+                if state == "complete" {
+                    session["finalization"] = [
+                        "state": "complete", "final_solve": "solved",
+                        "started_at": updated - 9, "updated_at": updated, "detail": NSNull(),
+                    ] as [String: Any]
+                } else {
+                    session["finalization"] = NSNull()
+                }
+                if state == "receiving" || state == "finalizing" { world["live"] = true }
+            }
+            world["sessions"] = [session]
+            worlds.append(world)
+        }
+        XCTAssertEqual(empty, 96, "the fixture did not land on 96 empty worlds")
+        XCTAssertEqual(interrupted, 29)
+        XCTAssertEqual(named, 6)
+        // Through the bytes, so integers and nulls arrive as they would from
+        // the Tower.
+        let data = try JSONSerialization.data(withJSONObject: [
+            "contract": "world_builder.worlds/2026-09-06", "worlds": worlds,
+        ])
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return try XCTUnwrap(WorldListingDecoder.listing(from: json))
+    }
+
+    func testASyntheticRootOf161WorldsCollapsesTheEmptyOnesAndBadgesTheRest() throws {
+        let listing = try syntheticRoot()
+        XCTAssertEqual(listing.worlds.count, 161)
+
+        let grouped = WorldListingPresentation.grouped(listing.worlds)
+        XCTAssertEqual(grouped.primary.count, 65)
+        XCTAssertEqual(grouped.empty.count, 96)
+        XCTAssertEqual(grouped.emptyHeading, "96 worlds with no sessions")
+        XCTAssertTrue(grouped.primary.allSatisfy(\.hasSessions))
+        XCTAssertTrue(grouped.empty.allSatisfy { !$0.hasSessions })
+
+        // The Tower's order is kept within each group.
+        let primaryIDs = grouped.primary.map(\.worldID)
+        XCTAssertEqual(primaryIDs, listing.worlds.filter(\.hasSessions).map(\.worldID))
+        XCTAssertEqual(grouped.empty.map(\.worldID), listing.worlds.filter { !$0.hasSessions }.map(\.worldID))
+
+        // Every row has a badge, and the vocabulary is the panel's.
+        let badges = grouped.primary.flatMap(\.sessions).map(WorldListingPresentation.stateBadge(for:))
+        XCTAssertEqual(badges.filter { $0 == "Interrupted" }.count, 29)
+        XCTAssertFalse(badges.contains(nil), "a session row had no state badge")
+        XCTAssertFalse(badges.contains("still open"), "a dead builder's record read as still open")
+        let known: Set<String> = ["Building", "Finishing", "Complete", "Interrupted", "No geometry"]
+        XCTAssertTrue(badges.compactMap { $0 }.allSatisfy(known.contains), "\(badges)")
+
+        // Interrupted rows count the journal, not the record's zero.
+        let interruptedRows = grouped.primary.flatMap(\.sessions).filter { $0.state == .interrupted }
+        XCTAssertTrue(interruptedRows.allSatisfy {
+            WorldListingPresentation.keyframeCaption(for: $0) == "467 keyframes"
+        })
+        XCTAssertTrue(interruptedRows.allSatisfy { !$0.isStillOpen })
+    }
+
+    func testNamedWorldsKeepTheirNamesAndUnnamedOnesGetDatedTitles() throws {
+        let listing = try syntheticRoot()
+        let titles = listing.worlds.map(\.title)
+        let named = titles.filter { $0.hasPrefix("Kitchen walk ") }
+        XCTAssertEqual(named.count, 6)
+        let dated = titles.filter { $0.hasPrefix("Walk · ") }
+        XCTAssertEqual(dated.count, 155)
+        XCTAssertFalse(titles.contains { $0.hasPrefix("w0") || $0.hasPrefix("w1") }, "a bare id was used as a title")
+        // Two unnamed worlds ten minutes apart are told apart by their titles.
+        XCTAssertNotEqual(listing.worlds[6].title, listing.worlds[7].title)
+    }
+
+    /// A dated title is stable, names the day, and does not depend on the
+    /// phone's locale — the same instant formats the same way twice.
+    func testTheDatedTitleIsStableAndNamesTheDay() {
+        let updatedAt = 1788895032.0
+        let title = WorldListingPresentation.datedTitle(updatedAt: updatedAt)
+        XCTAssertEqual(title, WorldListingPresentation.datedTitle(updatedAt: updatedAt))
+        XCTAssertTrue(title.hasPrefix("Walk · "), title)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "d MMM yyyy, HH:mm"
+        XCTAssertEqual(
+            title,
+            "Walk · " + formatter.string(from: Date(timeIntervalSince1970: updatedAt))
+        )
+    }
+
+    func testTheEmptyHeadingIsAbsentWhenNothingIsEmpty() throws {
+        let listing = try syntheticRoot()
+        let onlyPrimary = WorldListingPresentation.grouped(listing.worlds.filter(\.hasSessions))
+        XCTAssertNil(onlyPrimary.emptyHeading)
+        let one = WorldListingPresentation.grouped(Array(listing.worlds.filter { !$0.hasSessions }.prefix(1)))
+        XCTAssertEqual(one.emptyHeading, "1 world with no sessions")
+    }
+
+    /// The word for a `finalizing` row is "Finishing" and for `receiving`
+    /// "Building" — the canvas's words — and an unbuilt session says what it
+    /// lacks rather than that it failed.
+    func testTheStateWordsAreThePanels() throws {
+        let listing = try syntheticRoot()
+        let sessions = listing.worlds.flatMap(\.sessions)
+        func badge(_ state: WorldListingSessionState) -> String? {
+            sessions.first { $0.state == state }.flatMap(WorldListingPresentation.stateBadge(for:))
+        }
+        XCTAssertEqual(badge(.receiving), "Building")
+        XCTAssertEqual(badge(.finalizing), "Finishing")
+        XCTAssertEqual(badge(.complete), "Complete")
+        XCTAssertEqual(badge(.interrupted), "Interrupted")
+        XCTAssertEqual(badge(.unbuilt), "No geometry")
+    }
+}
+
 // MARK: - The contract this build adopted
 
 /// The status contract moved, and this pins which one is in force.
@@ -1623,18 +1927,14 @@ final class WorldListingDecoderTests: XCTestCase {
 final class WorldBuilderContractAdoptionTests: XCTestCase {
 
     /// Moved from `/2026-08-23` because `trajectory.pose_count` changed
-    /// **meaning**.
-    ///
-    /// It used to be `keyframes - poses_refused`, which counted a segment
-    /// anchor — identity rotation, zero translation, one per segment,
-    /// definitional rather than measured — as a camera position. That is what
-    /// displayed "Camera poses: 36" for a world whose own manifest read
-    /// `poses_solved: 0, points: 0`. It is now `poses_positioned`: solved poses
-    /// plus the anchor of each segment that actually solved something.
+    /// **meaning**, and from `/2026-08-25` because `model_state` gained the
+    /// word `interrupted` — which this build refused as undecodable under the
+    /// old identifier, and which is exactly the kind of change a dated
+    /// identifier exists to make loud.
     func testTheStatusContractIsTheOneThisTowerServes() {
         XCTAssertEqual(
             WorldBuilderResultContract.identifier,
-            "world_builder.status/2026-08-25"
+            "world_builder.status/2026-09-06"
         )
     }
 

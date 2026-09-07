@@ -83,14 +83,26 @@ struct WorldBuilderWorkspaceView: View {
     /// under the reader.
     @State private var viewerTarget: WorldRenderTarget?
 
+    /// Tells the Tower this workspace is on screen, so a builder may attach
+    /// to a capture. View-owned on purpose — see the type's own doc comment
+    /// for why it is not on the view model — and a `@StateObject` so the
+    /// `stop` on disappear comes from the same object that sent `start`.
+    @StateObject private var session: WorldBuilderSessionController
+
     /// The client is injected rather than constructed here, and owned by
     /// `ProjectManager`. See `CartridgeClients` for why: this `@StateObject` is
     /// destroyed on every cartridge switch, and a Tower-backed client holding a
     /// subscription and a partly-built world must not be.
-    init(glasses: GlassesConnection, tower: TowerClient, client: any WorldBuilderClient) {
+    init(
+        glasses: GlassesConnection,
+        tower: TowerClient,
+        client: any WorldBuilderClient,
+        session: WorldBuilderSessionController? = nil
+    ) {
         self.glasses = glasses
         self.tower = tower
         _world = StateObject(wrappedValue: WorldBuilderViewModel(client: client))
+        _session = StateObject(wrappedValue: session ?? WorldBuilderSessionController())
     }
 
     /// Connectivity reaches the view model as a value, never as an object.
@@ -122,7 +134,11 @@ struct WorldBuilderWorkspaceView: View {
                 inspection: world.inspection,
                 sessionBinding: world.sessionBinding,
                 fragments: world.fragmentsModel,
-                geometryChunks: world.geometryChunks
+                geometryChunks: world.geometryChunks,
+                recentWorld: world.recentWorld,
+                openRecent: { recent in
+                    world.open(worldID: recent.worldID, sessionID: recent.sessionID)
+                }
             )
 
             #if DEBUG
@@ -130,12 +146,27 @@ struct WorldBuilderWorkspaceView: View {
             #else
             HelperText("Capture is not available in this build.")
             #endif
+
+            // Under the capture control in both configurations: the Tower's
+            // gate applies to a Release phone's neighbour as much as to a
+            // DEBUG phone's own capture. One line, worded as what was asked
+            // for — `active` is intent, and whether a builder attached is the
+            // canvas's report, not this line's.
+            HelperText(session.footnote)
         }
         .sheet(isPresented: $isShowingWorlds) {
             WorldPickerView(world: world)
         }
         .sheet(item: $viewerTarget) { target in
             WorldRenderViewerView(target: target)
+        }
+        // The World Builder cartridge session: `start` on appearance and
+        // whenever the socket comes back while on screen, `stop` on
+        // disappearance. Nothing else on the phone starts or stops a builder.
+        .onAppear { session.workspaceDidAppear(isTowerReachable: isTowerReachable) }
+        .onDisappear { session.workspaceDidDisappear() }
+        .onChange(of: isTowerReachable) { _, isReachable in
+            session.towerReachabilityChanged(isReachable: isReachable)
         }
     }
 

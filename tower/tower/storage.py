@@ -34,12 +34,22 @@ def new_id() -> str:
 
 
 # How long a writer will keep trying to replace a destination a reader
-# momentarily has open, and how long it waits between attempts. Bounded
-# and short: this exists to ride out a reader's sub-millisecond handle,
-# not to wait out a process that has parked on the file. A writer that
-# cannot win in this budget raises, exactly as it did before.
-REPLACE_RETRIES = 12
+# has open, and how it paces the attempts. Bounded: this exists to ride
+# out a reader, not to wait out a process that has parked on the file. A
+# writer that cannot win in this budget raises, exactly as it did before.
+#
+# Until 2026-09-06 the budget was 12 x 5 ms = 60 ms, sized for "a
+# reader's sub-millisecond handle". That is the handle's length on an
+# idle box. On a live walk with the global solver's background child
+# taking 18 of 20 cores, the Tower's web thread reading a 2.2 MB
+# points.json for the phone lost the CPU mid-read, held the file past
+# 60 ms, and the BUILDER -- the process the retry exists to protect --
+# died in `write_derived` with poses.json new and points.json old. Two
+# seconds is longer than any reader this Tower has that is still making
+# progress, and still short next to a rebuild cadence of one per second.
+REPLACE_BUDGET_S = 2.0
 REPLACE_BACKOFF_S = 0.005
+REPLACE_BACKOFF_MAX_S = 0.05
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
@@ -120,14 +130,17 @@ def _replace_with_retry(temp_path: Path, path: Path) -> None:
     operation is atomic, so it either happened or it did not. There is no
     partial state to reconcile and no possibility of writing twice.
     """
-    for attempt in range(REPLACE_RETRIES):
+    deadline = time.monotonic() + REPLACE_BUDGET_S
+    backoff = REPLACE_BACKOFF_S
+    while True:
         try:
             temp_path.replace(path)
             return
         except PermissionError:
-            if attempt == REPLACE_RETRIES - 1:
+            if time.monotonic() >= deadline:
                 raise
-            time.sleep(REPLACE_BACKOFF_S)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, REPLACE_BACKOFF_MAX_S)
 
 
 def read_json_closed(path: Path) -> dict:

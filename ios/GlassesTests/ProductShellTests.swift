@@ -1874,7 +1874,11 @@ final class WorldModelIntegrationTests: XCTestCase {
             (.awaitingFirstUpdate, .waiting),
             (.receiving(snapshot), .live),
             (.finalizing(snapshot), .live),
+            (.finalizing(snapshot, buildInProgress: true), .live),
             (.finalized(snapshot), .settled),
+            // Settled, not failed: nothing more will arrive, and there is
+            // data to draw — which `.failed` may not carry.
+            (.interrupted(snapshot, reason: "the builder exited"), .settled),
             (.failed(CartridgeFailure(kind: .transport, message: "x")), .failed),
         ]
         for (state, phase) in expected {

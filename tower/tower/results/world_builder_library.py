@@ -16,30 +16,78 @@ is asked of the OS rather than of a timestamp for the same reason.
 
 from __future__ import annotations
 
-import json
 import os
 
-from tower.storage import read_json_closed
-from tower.world_builder.store import WorldStore, WorldStoreError, _pid_is_running
+from tower.world_builder.records import FINALIZATION_COMPLETE
+from tower.world_builder.store import WorldStore, WorldStoreError
 
 WORLDS_CONTRACT = "world_builder.worlds/2026-09-06"
 
+# Per-session `state`, the same vocabulary the status channel's lifecycle
+# uses (`tower/results/world_builder.py`), minus the two words that only
+# make sense against a live subscription (`idle`, `unavailable`). A row in
+# the picker and the panel it opens must not disagree about what a
+# session is.
+SESSION_RECEIVING = "receiving"
+SESSION_FINALIZING = "finalizing"
+SESSION_COMPLETE = "complete"
+SESSION_INTERRUPTED = "interrupted"
+SESSION_UNBUILT = "unbuilt"
+
 
 def _world_is_live(store: WorldStore, world_id: str) -> bool:
-    path = store.lock_path(world_id)
-    if not path.exists():
-        return False
-    try:
-        holder = read_json_closed(path)
-    except (OSError, json.JSONDecodeError):
-        return False
-    pid = holder.get("pid")
-    return isinstance(pid, int) and pid != os.getpid() and _pid_is_running(pid)
+    holder = store.lock_holder(world_id)
+    return (
+        holder is not None
+        and holder["alive"]
+        and holder["pid"] != os.getpid()
+    )
 
 
 def _has_geometry(store: WorldStore, world_id: str, session_id: str) -> bool:
     derived = store.derived_dir(world_id) / session_id
     return (derived / "poses.json").exists() and (derived / "points.json").exists()
+
+
+def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> int:
+    """How many keyframes the journal holds, whatever the record says.
+
+    `session.keyframes_accepted` is written at start (zero) and rewritten
+    at stop; a session that never stopped keeps the zero forever. The
+    journal is one line per keyframe, so counting lines is the honest
+    figure and costs one sequential read.
+    """
+    path = store.keyframes_path(world_id, session_id)
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def session_state(session, *, live: bool, has_geometry: bool) -> str:
+    """One word for what a session IS, from the record, the lock and the tree.
+
+    Mirrors `_lifecycle` in the status producer for the facts a listing
+    has (it does not compute geometry currency, so `complete` on a record
+    that predates finalization means "stopped and built", not "current").
+    """
+    finalization = session.finalization
+    stopped = session.ended_at is not None
+    if live and not stopped:
+        return SESSION_RECEIVING
+    if live and stopped:
+        return SESSION_FINALIZING
+    if not stopped:
+        # Open record, nobody writing: killed mid-walk.
+        return SESSION_INTERRUPTED
+    if session.end_reason in ("error", "interrupted"):
+        return SESSION_INTERRUPTED
+    if finalization is not None:
+        if finalization.get("state") == FINALIZATION_COMPLETE:
+            return SESSION_COMPLETE
+        return SESSION_INTERRUPTED
+    return SESSION_COMPLETE if has_geometry else SESSION_UNBUILT
 
 
 def build_world_listing(store: WorldStore) -> dict:
@@ -60,6 +108,7 @@ def build_world_listing(store: WorldStore) -> dict:
                 session = store.read_session(world_id, session_id)
             except (WorldStoreError, OSError, ValueError, KeyError):
                 continue
+            has_geometry = _has_geometry(store, world_id, session_id)
             sessions.append({
                 "session_id": session.session_id,
                 "started_at": session.started_at,
@@ -68,7 +117,11 @@ def build_world_listing(store: WorldStore) -> dict:
                 "frame_source": session.frame_source,
                 "capture_id": session.capture_id,
                 "keyframes_accepted": session.keyframes_accepted,
-                "has_geometry": _has_geometry(store, world_id, session_id),
+                # The journal's own count, beside the record's. On a record
+                # that never stopped the record says zero and the journal
+                # says what actually landed (467 on the 2026-09-06 walk).
+                "keyframes_journaled": _keyframes_journaled(store, world_id, session_id),
+                "has_geometry": has_geometry,
                 # The record is only finalised by `stop_session`; a builder
                 # killed before that (the supervisor's shutdown grace, a
                 # hard kill) leaves `ended_at: null` behind forever. Open
@@ -76,6 +129,13 @@ def build_world_listing(store: WorldStore) -> dict:
                 # would otherwise say exactly that. Counts on such a record
                 # are the start-of-session values, not the journal length.
                 "abandoned": session.ended_at is None and not live,
+                # One word, the status channel's vocabulary (additive,
+                # 2026-09-06): receiving | finalizing | complete |
+                # interrupted | unbuilt.
+                "state": session_state(session, live=live, has_geometry=has_geometry),
+                # The builder's own account of how finalization went, or
+                # null on a record written before it existed.
+                "finalization": session.finalization,
             })
         sessions.sort(key=lambda s: s["started_at"])
         worlds.append({
