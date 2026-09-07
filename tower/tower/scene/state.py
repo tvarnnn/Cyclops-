@@ -75,18 +75,30 @@ SIZE_MEDIUM = "medium"
 SIZE_SMALL = "small"
 SIZE_UNKNOWN = "unknown"
 
-# A person box that is cut off by the BOTTOM edge and holds no head
-# region -- its top starts below this fraction of the frame -- is, from a
-# camera worn at head height, most often the wearer's own body: hands,
-# forearms, lap, legs. The 2026-09-07 corpus audit found the wearer's
-# body in frame in most captures and no bystander in any. Such a box is
-# reported apart from the count, as a partial figure at the bottom edge,
+# A person box with NO HEAD REGION in view -- its top starts below this
+# fraction of the frame -- is, from a camera worn at head height, most
+# often the wearer's own body: hands, forearms, lap, legs. The 2026-09-07
+# corpus audit found the wearer's body in frame in most captures and no
+# bystander in any, and on the 49 labelled wearer-only frames the
+# detector's 53 person boxes had tops at 0.31-0.91 of the frame: 50 of
+# them at or below 0.45. A standing or seated person in front of the
+# wearer has their head in the upper half of this camera's 72-degree
+# vertical field; a "person" that starts below the middle is a part of
+# one. Such a box is reported apart from the count, as a partial figure,
 # rather than as a person in front of the wearer. A real person whose
 # only visible part is their legs under a table lands in the same bucket
 # -- and that is the honest bucket for them too: the camera did not see
 # a person, it saw part of one.
-BOTTOM_EDGE_FRACTION = 0.97
+#
+# The second shape is a box that spans nearly the whole width and
+# reaches the bottom edge with its top in the upper half: the wearer's
+# own arms and torso seen while looking down (2 of the 3 boxes the first
+# rule missed). A bystander filling 80% of the frame's width would be
+# within arm's reach, and one that close has a face the estimator sees.
 NO_HEAD_REGION_ABOVE = 0.45
+BOTTOM_EDGE_FRACTION = 0.97
+FULL_WIDTH_FRACTION = 0.8
+NOT_A_HEAD_ABOVE = 0.25
 
 # Relationships this cartridge will NOT assert, and what each would need.
 # Kept as data rather than prose so a query layer can answer "why not"
@@ -198,17 +210,27 @@ def apparent_size(track: Track, frame_height: int) -> str:
     return SIZE_MEDIUM
 
 
-def is_partial_at_bottom_edge(track: Track, frame_height: int) -> bool:
-    """A person box cut off by the bottom edge with no head region in it.
+def is_partial_at_bottom_edge(track: Track, frame_height: int, frame_width: int = 0) -> bool:
+    """A person box with no head region in view, or one that fills the
+    width down to the bottom edge.
 
     From a head-worn camera that is most often the wearer's own body.
-    See `BOTTOM_EDGE_FRACTION`.
+    See `NO_HEAD_REGION_ABOVE`. The name keeps the wire's word for the
+    bucket; the rule no longer requires the bottom edge for the first
+    shape, because a hand resting on a laptop is a "person" that touches
+    nothing.
     """
     if not frame_height or track.label != "person":
         return False
+    top = track.box.y0 / frame_height
+    if top >= NO_HEAD_REGION_ABOVE:
+        return True
+    if not frame_width:
+        return False
     return (
-        track.box.y1 >= frame_height * BOTTOM_EDGE_FRACTION
-        and track.box.y0 >= frame_height * NO_HEAD_REGION_ABOVE
+        top >= NOT_A_HEAD_ABOVE
+        and track.box.y1 >= frame_height * BOTTOM_EDGE_FRACTION
+        and track.box.width >= frame_width * FULL_WIDTH_FRACTION
     )
 
 

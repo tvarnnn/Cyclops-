@@ -179,7 +179,9 @@ class SceneEngine:
         # tests/test_scene_snapshot_isolation.py.
         counted = [track.snapshot() for track in self._tracker.counted()]
         partial = tuple(
-            track for track in counted if is_partial_at_bottom_edge(track, height)
+            track
+            for track in counted
+            if is_partial_at_bottom_edge(track, height, width)
         )
         tracks = tuple(track for track in counted if track not in partial)
         counts: dict = {}

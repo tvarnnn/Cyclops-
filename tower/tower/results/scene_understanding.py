@@ -334,11 +334,13 @@ APPARENT_SIZE_NOTE = (
 
 # What a partial figure at the bottom edge is, and why it is kept apart.
 PARTIAL_BOTTOM_EDGE_NOTE = (
-    "person boxes cut off by the bottom edge with no head region in view. "
-    "From a camera worn at head height that is most often the wearer's "
-    "own hands, arms, lap or legs; it can also be somebody's legs under a "
-    "table. Either way the camera saw part of a figure, not a person in "
-    "front of the wearer, so these are counted here and not in `count`"
+    "person boxes with no head region in view -- their top starts below "
+    "the middle of the frame -- or that span the frame's width down to "
+    "its bottom edge. From a camera worn at head height that is most "
+    "often the wearer's own hands, arms, lap or legs; it can also be "
+    "somebody's legs under a table. Either way the camera saw part of a "
+    "figure, not a person in front of the wearer, so these are counted "
+    "here and not in `count`"
 )
 
 # The states in which the scene below is being refreshed. `paused` is

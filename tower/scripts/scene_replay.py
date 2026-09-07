@@ -216,7 +216,8 @@ def run(args) -> dict:
             continue
         frames_read += 1
         span = spans.setdefault(capture_id, [received_at, received_at])
-        span[1] = received_at
+        span[0] = min(span[0], received_at)
+        span[1] = max(span[1], received_at)
         started = time.perf_counter()
         state = engine.observe(frame, received_at=received_at)
         totals.append((time.perf_counter() - started) * 1000)
@@ -284,6 +285,7 @@ def run(args) -> dict:
             "observe_total": _summary(totals),
         },
         "stability": {
+            "count_changes": count_changes,
             "count_changes_per_minute": round(count_changes / minutes, 2) if minutes else None,
             "tracks_created": len(seen_ids),
             "tracks_created_per_minute": round(len(seen_ids) / minutes, 2) if minutes else None,

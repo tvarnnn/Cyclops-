@@ -95,21 +95,38 @@ class TestApparentSize:
 
 
 class TestPartialAtBottomEdge:
-    def test_a_box_cut_off_at_the_bottom_with_no_head_region_is_partial(self):
-        # 640 high: bottom at 632 (>= 0.97), top at 320 (>= 0.45)
-        assert is_partial_at_bottom_edge(_track("person", (0, 320, 200, 632)), 640)
+    """The wearer's own body, as the detector sees it: 53 person boxes on
+    49 labelled wearer-only frames, tops at 0.31-0.91 of the frame."""
+
+    def test_a_box_with_no_head_region_is_partial(self):
+        # 640 high: top at 320 (>= 0.45). Bottom edge no longer required:
+        # a hand on a laptop is a "person" that touches nothing.
+        assert is_partial_at_bottom_edge(_track("person", (0, 320, 200, 632)), 640, 360)
+        assert is_partial_at_bottom_edge(_track("person", (0, 320, 200, 560)), 640, 360)
 
     def test_a_person_whose_head_is_in_view_is_not_partial(self):
-        assert not is_partial_at_bottom_edge(_track("person", (0, 100, 200, 632)), 640)
+        assert not is_partial_at_bottom_edge(_track("person", (0, 100, 200, 632)), 640, 360)
 
-    def test_a_box_that_stops_short_of_the_edge_is_not_partial(self):
-        assert not is_partial_at_bottom_edge(_track("person", (0, 320, 200, 560)), 640)
+    def test_a_full_width_box_to_the_bottom_edge_is_partial(self):
+        """Arms and torso seen while looking down: top in the upper half,
+        but the box spans the width and reaches the bottom."""
+        assert is_partial_at_bottom_edge(_track("person", (0, 200, 355, 636)), 640, 360)
+
+    def test_a_narrow_box_to_the_bottom_edge_with_a_head_is_a_person(self):
+        """A standing bystander at two metres: feet cut off, head in view,
+        a third of the frame wide. Counted."""
+        assert not is_partial_at_bottom_edge(_track("person", (100, 60, 220, 636)), 640, 360)
+
+    def test_the_mirror_reflection_counts_as_a_person(self):
+        """The one real figure in the corpus: top 0.37, bottom 0.88, half
+        the width. Not partial."""
+        assert not is_partial_at_bottom_edge(_track("person", (43, 237, 238, 563)), 640, 360)
 
     def test_only_people_are_ever_partial(self):
-        assert not is_partial_at_bottom_edge(_track("chair", (0, 320, 200, 632)), 640)
+        assert not is_partial_at_bottom_edge(_track("chair", (0, 320, 200, 632)), 640, 360)
 
     def test_unknown_frame_is_never_partial(self):
-        assert not is_partial_at_bottom_edge(_track("person", (0, 320, 200, 632)), 0)
+        assert not is_partial_at_bottom_edge(_track("person", (0, 320, 200, 632)), 0, 0)
 
 
 class TestAssignment:
