@@ -92,6 +92,41 @@ if sys.platform == "win32":
         Winsock error closes the listener.
         """
 
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # How many per-connection resets this loop has re-armed past.
+            # Kept so the log can say "and 400 more" rather than printing a
+            # line per reset -- a reconnect storm, or a hostile RST flood,
+            # must not be able to fill the disk through the very handler
+            # that keeps the Tower up.
+            self._transient_accept_resets = 0
+
+        def call_exception_handler(self, context):
+            # Suppress the asyncio noise that the re-arm leaves behind, and
+            # ONLY that. `IocpProactor.accept` runs a companion `accept_coro`
+            # task that awaits the same completion; when it carries a
+            # per-connection OSError, nothing retrieves that task's
+            # exception, so asyncio logs "Task exception was never
+            # retrieved" for every reset we already handled. Drop exactly
+            # that, identified by message AND a per-connection winerror.
+            #
+            # "Accept failed on a socket" is deliberately NOT suppressed: the
+            # loop emits that itself, below, for a genuinely broken listener,
+            # which is the one thing an operator must still see.
+            exc = context.get("exception")
+            if (
+                context.get("message") == "Task exception was never retrieved"
+                and isinstance(exc, OSError)
+                and getattr(exc, "winerror", None) in _PER_CONNECTION_WINERRORS
+            ):
+                logger.debug(
+                    "[Tower][Serve] suppressed unretrieved per-connection "
+                    "accept error: %s",
+                    exc,
+                )
+                return
+            super().call_exception_handler(context)
+
         def _start_serving(
             self,
             protocol_factory,
@@ -120,12 +155,30 @@ if sys.platform == "win32":
                                 in _PER_CONNECTION_WINERRORS
                                 and sock.fileno() != -1
                             ):
-                                logger.warning(
-                                    "[Tower][Serve] a queued connection was "
-                                    "reset before it was accepted (%s); the "
-                                    "listener stays up and keeps accepting",
-                                    exc,
-                                )
+                                # Throttled, because a reconnect storm can
+                                # produce these by the thousand and the log
+                                # must survive being the thing that keeps
+                                # the Tower up. First one loud, then one per
+                                # hundred with a running count; the rest at
+                                # debug. See `__init__`.
+                                self._transient_accept_resets += 1
+                                count = self._transient_accept_resets
+                                if count == 1 or count % 100 == 0:
+                                    logger.warning(
+                                        "[Tower][Serve] a queued connection "
+                                        "was reset before it was accepted "
+                                        "(%s); the listener stays up and keeps "
+                                        "accepting (%d absorbed so far)",
+                                        exc,
+                                        count,
+                                    )
+                                else:
+                                    logger.debug(
+                                        "[Tower][Serve] absorbed a per-"
+                                        "connection accept reset (%s); total %d",
+                                        exc,
+                                        count,
+                                    )
                                 conn = None
                             else:
                                 # Not this bug -- a broken listener, or an
@@ -197,14 +250,21 @@ def resilient_loop_factory(
     class -- returning the class (which is what the built-in
     `uvicorn.loops.asyncio.asyncio_loop_factory` does, because uvicorn calls
     THAT one itself first) would hand asyncio a class where it wants a loop
-    and fail at startup. The `use_subprocess` parameter exists only to match
-    the built-in's signature; the custom-loop path never passes it.
+    and fail at startup. Verified against uvicorn 0.52.4 by launching the
+    real server on this flag.
+
+    `use_subprocess` is here for signature parity with the built-in factory
+    and NOTHING more: on the custom-loop path uvicorn never passes it (it
+    calls this with no args), so it always defaults `False`. The Tower runs
+    as a single uvicorn process -- no `--workers`, and `--reload` is a
+    development convenience -- so that is correct here. The one situation it
+    does not cover is a Windows worker subprocess under `--workers`, where
+    the built-in factory would hand back a `SelectorEventLoop`; this would
+    give it a Proactor loop. If the Tower ever runs multi-process on
+    Windows, this factory needs revisiting.
 
     Off Windows there is no bug and no Proactor loop, so a plain
-    `SelectorEventLoop` is returned and this file is inert. On Windows, when
-    uvicorn is driving a worker subprocess, it also wants a selector loop
-    (the Proactor loop cannot watch a subprocess's pipes the same way);
-    `use_subprocess` carries that, exactly as the built-in factory reads it.
+    `SelectorEventLoop` is returned and this file is inert.
     """
     if sys.platform == "win32" and not use_subprocess:
         return ResilientProactorEventLoop()

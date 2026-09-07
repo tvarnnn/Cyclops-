@@ -914,7 +914,7 @@ def main(argv=None) -> int:
 
 
 def _run_and_exit() -> None:
-    """Run the producer, then leave the process HARD, once the flush is done.
+    """Run the producer, then leave the process HARD -- on EVERY path.
 
     A CLEAN FINISH THAT NO LONGER LOOKS LIKE A CRASH.
 
@@ -924,28 +924,56 @@ def _run_and_exit() -> None:
     ordinary ending, where the walk stops because the capture closed rather
     than because anyone pressed Stop. Letting the interpreter FINALIZE with
     that thread still blocked races CUDA/torch teardown and access-violates
-    (`0xC0000005`) on Windows. It does so AFTER `engine.release()` has
-    flushed and AFTER the report has printed -- so nothing is lost -- but
-    the worker then exits with a crash code, and `CaptureWorkerSupervisor.
-    reap` logs a walk that finished perfectly as `EXITED 3221225477`. That
-    was measured on this host, with the verifier OFF as well as on, so it
-    is the blocked reader and the GPU teardown, not anything this cartridge
-    computes.
+    (`0xC0000005`) on Windows, so `CaptureWorkerSupervisor.reap` logs a walk
+    that finished as `EXITED 3221225477`. Measured on this host with the
+    verifier OFF as well as on -- it is the blocked reader and the GPU
+    teardown, not anything this cartridge computes.
 
-    `os._exit` after an explicit flush is the fix: the report is on its way
-    to the parent, and the process leaves without running a finalization
-    that cannot be made safe while a thread is blocked in the kernel. The
-    GPU context and every handle are the operating system's to reclaim on
-    exit regardless; there is no cartridge cleanup left, because
-    `engine.release()` is on the normal-return path inside `main` and has
-    already run by the time this is reached.
+    `os._exit` skips that finalization, and it must be reached on EVERY exit,
+    not only success. The watcher is armed (line ~669) BEFORE `engine.load()`
+    builds the CUDA context, so an exception from `engine.load()` (a CUDA
+    OOM, a weights download that fails -- ordinary errors), from the frame
+    loop, or from building the report escapes into the SAME finalization with
+    the SAME blocked watcher, and the crash then masks the real error behind
+    exit 3221225477. An earlier version of this function only guarded the
+    success path and claimed errors "happen before a model or a watcher
+    exists"; a reviewer showed that was false. So every ending goes through
+    `os._exit` here.
 
-    Only the SUCCESS path takes this door. A `SystemExit` from argument
-    parsing, or any exception, propagates as it always did -- those happen
-    before a model or a watcher exists, so they finalize cleanly and their
-    traceback and exit code must survive.
+    The error is not lost. A real exception's traceback is printed to stderr
+    -- which the Tower console inherits -- before the hard exit, and the code
+    is a plain `1`, not a crash code. A `SystemExit` (argument parsing, or an
+    explicit one) keeps its exact code and, for a message, prints it as
+    Python would; those happen before a model or watcher exists, so a normal
+    finalize would be safe too, but a hard exit there costs nothing and keeps
+    one rule instead of two. The report and flush are unchanged: by the time
+    a clean `main()` returns, `finally: engine.release()` has already flushed.
     """
-    code = main()
+    try:
+        code = main()
+    except SystemExit as exc:
+        # Preserve SystemExit semantics without running finalization.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        value = exc.code
+        if isinstance(value, int):
+            os._exit(value)
+        if value is None:
+            os._exit(0)
+        # A string (or other) code: Python's default handler prints it to
+        # stderr and exits 1. Do the same, since catching it skipped that.
+        print(value, file=sys.stderr, flush=True)
+        os._exit(1)
+    except BaseException:  # noqa: BLE001
+        # Any real failure after the watcher and the CUDA context exist.
+        # Show it -- masking it behind the teardown crash is the whole
+        # defect -- then leave hard so the crash cannot happen at all.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code if isinstance(code, int) else 0)

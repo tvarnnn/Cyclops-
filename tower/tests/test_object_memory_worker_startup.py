@@ -164,6 +164,77 @@ class TestTheProcessLeavesHard:
             module._run_and_exit()
         assert exited == [0]
 
+    def test_an_error_after_the_watcher_still_hard_exits(self, monkeypatch, capsys):
+        """The reviewer's finding: the error path must not finalize either.
+
+        `engine.load()` failing (CUDA OOM, a weights download that fails)
+        raises AFTER the stdin watcher is armed and the CUDA context is
+        built, so a normal finalize would race the same teardown crash and
+        MASK the real error behind exit 3221225477. It must hard-exit 1, and
+        the traceback must still be shown.
+        """
+        module = _load_worker_module()
+
+        def _boom():
+            raise RuntimeError("engine.load blew up")
+
+        monkeypatch.setattr(module, "main", _boom)
+        exited = []
+        monkeypatch.setattr(
+            module.os,
+            "_exit",
+            lambda code: (exited.append(code), (_ for _ in ()).throw(SystemExit))[1],
+        )
+
+        with pytest.raises(SystemExit):
+            module._run_and_exit()
+
+        assert exited == [1]
+        # The real error is shown, not swallowed.
+        assert "engine.load blew up" in capsys.readouterr().err
+
+    def test_a_systemexit_keeps_its_code(self, monkeypatch):
+        """argparse errors and explicit SystemExit keep their exit code."""
+        module = _load_worker_module()
+
+        def _argparse_error():
+            raise SystemExit(2)
+
+        monkeypatch.setattr(module, "main", _argparse_error)
+        exited = []
+        monkeypatch.setattr(
+            module.os,
+            "_exit",
+            lambda code: (exited.append(code), (_ for _ in ()).throw(SystemExit))[1],
+        )
+
+        with pytest.raises(SystemExit):
+            module._run_and_exit()
+
+        assert exited == [2]
+
+    def test_a_systemexit_message_is_printed_then_exits_one(
+        self, monkeypatch, capsys
+    ):
+        module = _load_worker_module()
+
+        def _message():
+            raise SystemExit("no capture directory at /nope")
+
+        monkeypatch.setattr(module, "main", _message)
+        exited = []
+        monkeypatch.setattr(
+            module.os,
+            "_exit",
+            lambda code: (exited.append(code), (_ for _ in ()).throw(SystemExit))[1],
+        )
+
+        with pytest.raises(SystemExit):
+            module._run_and_exit()
+
+        assert exited == [1]
+        assert "no capture directory at /nope" in capsys.readouterr().err
+
 
 # The load-bearing case, opt-in: it needs the real ssdlite weights and the
 # ~1.2 GB OWLv2 weights, and it is the only test that actually forms (and

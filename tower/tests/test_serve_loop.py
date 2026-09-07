@@ -115,13 +115,34 @@ def _listener_survives(make_loop, *, rounds: int = 4, burst: int = 200) -> bool:
         loop.close()
 
 
-def test_the_resilient_loop_keeps_its_listener_through_a_reset_burst():
-    """The guarantee: the fixed loop stays up and keeps accepting."""
+def test_the_resilient_loop_keeps_its_listener_through_a_reset_burst(caplog):
+    """The guarantee: the fixed loop stays up and keeps accepting.
+
+    Asserts BOTH that the listener survived AND that the per-connection
+    re-arm branch actually fired (it logs a warning the first time). Without
+    the second check the test could pass on a run where the attack never
+    landed -- the same race that makes the stock-loop test a non-strict
+    xfail -- and would then not catch a regression that broke the re-arm.
+    """
+    import logging
+
     from tower.serve_loop import ResilientProactorEventLoop
 
-    assert _listener_survives(ResilientProactorEventLoop) is True, (
+    with caplog.at_level(logging.WARNING, logger="tower.serve_loop"):
+        survived = _listener_survives(ResilientProactorEventLoop)
+
+    assert survived is True, (
         "the resilient listener died under a reset-in-backlog burst -- the "
         "re-arm in tower/serve_loop.py has regressed"
+    )
+    rearmed = [
+        r for r in caplog.records if "reset before it was accepted" in r.message
+    ]
+    assert rearmed, (
+        "the listener survived but the per-connection re-arm branch never "
+        "fired -- the attack did not land, so this run proves nothing. If "
+        "this is persistent, the burst/stall in _listener_survives needs to "
+        "be stronger."
     )
 
 
