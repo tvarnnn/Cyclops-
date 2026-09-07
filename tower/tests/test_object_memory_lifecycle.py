@@ -379,3 +379,63 @@ def test_the_session_handlers_are_sync_so_a_pause_cannot_stall_the_frame_path():
 
     for handler in (sessions.read_session, sessions.apply_session_action):
         assert not inspect.iscoroutinefunction(handler), handler.__name__
+
+
+class TestASessionDoesNotOutliveEveryClient:
+    """A phone that goes away for good takes its cartridge sessions with it.
+
+    A `CartridgeSession` is INTENT and lives only in this process's memory.
+    Until 2026-09-07 nothing ended one when the phone that opened it went
+    away: a wearer who pressed Start and whose phone then crashed left the
+    gate open for as long as the Tower ran, and the next capture -- from any
+    cartridge, days later -- attached a producer with nobody having asked
+    for it. For Object Memory that is a recorder starting itself on somebody
+    else's walk.
+
+    `main.py` already states the rule these tests restore: cartridge sessions
+    are "deliberately NOT persisted anywhere. A Tower that restarts comes
+    back with every cartridge stopped, because resuming a memory of what a
+    camera sees without anybody asking again is the wrong default."
+
+    The second test is the other half, and is why this is gated on the LAST
+    connection rather than on the closing one: iOS reconnects in about half
+    a second while uvicorn can take 20-40 s to notice the old socket died,
+    so a superseded connection's teardown runs while the new one is already
+    live. A WiFi hiccup must not end a walk.
+    """
+
+    def test_the_session_stops_when_the_last_connection_closes(self, app, client):
+        assert client.post(f"{SESSION_URL}/start").json()["state"] == "active"
+
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            ws.receive_json()
+
+        assert client.get(SESSION_URL).json()["state"] == "stopped", (
+            "a session nobody is connected to any more must not stay active: "
+            "the next capture would attach a producer with nobody asking"
+        )
+
+    def test_a_reconnect_does_not_end_the_session(self, app, client):
+        assert client.post(f"{SESSION_URL}/start").json()["state"] == "active"
+
+        # The new connection is already live when the old one tears down --
+        # the ordering `ConnectionTracker` was written for.
+        with client.websocket_connect("/ws") as first:
+            first.send_json({"type": "ping"})
+            first.receive_json()
+            with client.websocket_connect("/ws") as second:
+                second.send_json({"type": "ping"})
+                second.receive_json()
+                # The first socket closes here, inside the second's lifetime.
+            assert client.get(SESSION_URL).json()["state"] == "active", (
+                "a superseded connection's teardown must not end a session "
+                "another connection is still holding"
+            )
+
+    def test_a_stopped_session_is_left_alone(self, app, client):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            ws.receive_json()
+
+        assert client.get(SESSION_URL).json()["state"] == "stopped"

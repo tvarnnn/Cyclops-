@@ -548,6 +548,32 @@ async def _close_cartridge_streams(websocket, owner) -> None:
     await asyncio.to_thread(done.wait, 30.0)
 
 
+def _stop_cartridge_sessions(websocket) -> None:
+    """Stop every cartridge session that is not already stopped. Never raises.
+
+    Called only once the last client connection has gone. A session already
+    stopped is left alone, so the log names only sessions that really were
+    open.
+    """
+    sessions = getattr(websocket.app.state, "cartridge_sessions", None) or {}
+    for name, session in sessions.items():
+        try:
+            if session.state == "stopped":
+                continue
+            session.stop()
+            logger.info(
+                "[Tower][Cartridge] %s stopped: the last client connection "
+                "closed, so nobody is asking for it any more",
+                name,
+            )
+        except Exception:
+            logger.exception(
+                "[Tower][Cartridge] %s did not stop when its last client "
+                "went away",
+                name,
+            )
+
+
 def _tell_cartridges_the_stream_closed(websocket, owner) -> None:
     for consumer in _frame_consumers(websocket):
         try:
@@ -891,3 +917,39 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # park a worker, and -- worse -- keep serving a scene of a
             # room whose wearer walked out of range.
             await _close_cartridge_streams(websocket, connection_token)
+            # And the cartridge SESSIONS, when nobody is left to have asked
+            # for them.
+            #
+            # A `CartridgeSession` is intent -- "the World Builder workspace
+            # is on the phone's screen", "I am remembering objects" -- and it
+            # lives only in this process's memory, with no owner and no
+            # expiry. Nothing ended one when the phone that opened it went
+            # away, so a phone that crashed mid-session left the gate open
+            # for as long as the Tower ran, and the NEXT capture, from any
+            # cartridge, attached that worker again with nobody having asked.
+            # For Object Memory that is a recorder starting itself on
+            # somebody else's later walk.
+            #
+            # main.py already states the rule this restores: the sessions are
+            # "deliberately NOT persisted anywhere. A Tower that restarts
+            # comes back with every cartridge stopped, because resuming a
+            # memory of what a camera sees without anybody asking again is
+            # the wrong default." A session that outlives every client is the
+            # same thing without the restart.
+            #
+            # Gated on the LAST connection rather than on this one, and that
+            # is what makes it safe for a wearable. `ConnectionTracker` exists
+            # because iOS reconnects in about half a second while uvicorn
+            # takes 20-40 s to notice the old socket died, so a superseded
+            # connection's teardown runs while the new one is already live;
+            # there `live_connections` is still non-zero and nothing is
+            # stopped. A WiFi hiccup does not end a walk. Only "there is no
+            # phone any more" does.
+            #
+            # Off the event loop, like the stream teardown above and for the
+            # same reason: Object Memory's detach flushes and then terminates
+            # under its grace, and World Builder's `stop_policy: "request"`
+            # asks its builder to finish and returns at once, so a walk
+            # already in finalization still completes.
+            if session.live_connections == 0:
+                await asyncio.to_thread(_stop_cartridge_sessions, websocket)
