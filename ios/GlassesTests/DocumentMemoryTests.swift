@@ -1066,14 +1066,27 @@ final class DocumentSessionTests: XCTestCase {
     /// A record seen once decodes as such; a record with sightings carries
     /// them, and the first observation's `observed_at` is untouched.
     func testSightingsDecodeOnADocument() throws {
+        // A LISTING that actually carries a row. `DocumentFixtures.recent`
+        // is the empty library -- `document_count: 0`, `documents: []` --
+        // and `oneDocument` puts its record under the singular `document`
+        // key, which the decoder reads into `single` rather than into
+        // `documents`. Neither can answer a question about a row, so this
+        // test builds the listing it needs from the shared record.
+        var listing = DocumentFixtures.recent
+        listing["document_count"] = 1
+        listing["documents_in_memory"] = 1
+        listing["documents"] = [DocumentFixtures.record]
+
         let response = try XCTUnwrap(
-DocumentMemoryDecoder.library(from: DocumentFixtures.recent)
+            DocumentMemoryDecoder.library(from: listing)
         )
         let first = try XCTUnwrap(response.documents.first)
+        // A record with no sightings block reads as seen once, at the time
+        // of its first observation. That default is the claim here.
         XCTAssertEqual(first.sightingCount, 1)
         XCTAssertEqual(first.lastObservedAt, first.time.observedAt)
 
-        var payload = DocumentFixtures.recent
+        var payload = listing
         var documents = payload["documents"] as! [[String: Any]]
         documents[0]["sighting_count"] = 3
         documents[0]["last_observed_at"] = 1_700_000_900.0

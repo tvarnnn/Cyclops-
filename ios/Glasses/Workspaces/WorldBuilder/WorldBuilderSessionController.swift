@@ -3,6 +3,11 @@
 //  Glasses
 //
 
+// Combine, explicitly: `ObservableObject` and `@Published` are declared
+// there, and this project's build settings require the import rather than
+// inheriting it through SwiftUI. Every other ObservableObject in the app
+// imports it the same way.
+import Combine
 import Foundation
 import os
 

@@ -1098,6 +1098,12 @@ final class SceneUnderstandingClientTests: XCTestCase {
 
 // MARK: - 2026-09-07 additions
 
+// @MainActor, like every other test class in this file. The app target
+// sets SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor, so the decoder, the
+// view and the client this class drives are all main-actor isolated at
+// their declaration, and a test class with no annotation cannot call
+// them synchronously.
+@MainActor
 final class SceneUnderstandingAdditionsTests: XCTestCase {
     private func people(_ extra: [String: Any]) -> ScenePeople {
         var json: [String: Any] = ["count": 2, "facing_wearer": 1, "facing_answered": true]
@@ -1146,5 +1152,43 @@ final class SceneUnderstandingAdditionsTests: XCTestCase {
         client.workspaceVisibilityChanged(isVisible: true)
         client.workspaceVisibilityChanged(isVisible: false)
         if case .unsupported = client.state {} else { XCTFail("the stub's state must not move") }
+    }
+
+    /// Visibility must reach the CONFORMER through an existential.
+    ///
+    /// This is the one thing about `workspaceVisibilityChanged` that a
+    /// compiler cannot tell you. If the method is declared only in the
+    /// protocol extension and not in the protocol's requirement list, a
+    /// call through `any SceneUnderstandingClient` -- which is how
+    /// `SceneUnderstandingViewModel` holds its client -- is dispatched
+    /// STATICALLY to the extension's no-op default. It compiles, every
+    /// other test passes, and the screen silently stops opening and
+    /// closing the live subscription. Since the Tower runs a scene session
+    /// only while somebody streams AND somebody watches, the detector then
+    /// runs for as long as the socket lives.
+    ///
+    /// The lane shipped it in that state. This test fails if it returns:
+    /// it calls through the existential and asserts the override ran.
+    func testVisibilityReachesTheConformerThroughAnExistential() {
+        final class Recorder: SceneUnderstandingClient {
+            var seen: [Bool] = []
+            let cartridgeID = "scene-understanding"
+            let state: SceneUnderstandingState = .unsupported(reason: "a test double")
+            func workspaceVisibilityChanged(isVisible: Bool) { seen.append(isVisible) }
+        }
+
+        let recorder = Recorder()
+        let erased: any SceneUnderstandingClient = recorder
+        erased.workspaceVisibilityChanged(isVisible: true)
+        erased.workspaceVisibilityChanged(isVisible: false)
+
+        XCTAssertEqual(
+            recorder.seen,
+            [true, false],
+            "workspaceVisibilityChanged must be a protocol REQUIREMENT. Declared "
+                + "only in the extension it dispatches statically through an "
+                + "existential, the no-op default runs, and the Scene screen "
+                + "never opens or closes its subscription."
+        )
     }
 }

@@ -29,6 +29,23 @@ protocol SceneUnderstandingClient: CartridgeClient {
     /// `revision` so an unchanged scene coalesces on the wire. What arrives
     /// here is therefore already at a rate a `@Published` property can carry.
     var stateUpdates: AnyPublisher<SceneUnderstandingState, Never> { get }
+
+    /// The Scene screen appeared or disappeared.
+    ///
+    /// A REQUIREMENT, not only an extension default, and the distinction is
+    /// the whole feature. The view model holds its client as
+    /// `any SceneUnderstandingClient`. A method that lives only in a
+    /// protocol extension is dispatched STATICALLY through an existential,
+    /// so `client.workspaceVisibilityChanged(isVisible:)` would always run
+    /// the no-op default below and never reach
+    /// `TowerSceneUnderstandingClient`'s override -- which compiles, and
+    /// silently means the live subscription is never opened or closed by
+    /// the screen appearing or disappearing. Since the Tower runs a scene
+    /// session only while somebody streams AND somebody watches, that
+    /// leaves the detector running for as long as the socket lives, which
+    /// is exactly what "the phone watches only while the Scene screen is
+    /// open" exists to prevent.
+    func workspaceVisibilityChanged(isVisible: Bool)
 }
 
 extension SceneUnderstandingClient {
