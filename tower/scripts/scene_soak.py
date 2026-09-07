@@ -73,6 +73,23 @@ def _sample() -> dict:
             out["vram_reserved_mb"] = round(torch.cuda.memory_reserved() / 1e6, 1)
     except Exception:
         pass
+    # Python-visible threads by name prefix, so a growth in `threads` can
+    # be attributed: `asyncio_` is the default executor filling toward
+    # its bound, `tower-Scene-session` is the reused worker, and anything
+    # else is news. Native OpenMP threads are invisible here.
+    import threading
+    from collections import Counter
+
+    names = Counter()
+    for thread in threading.enumerate():
+        name = thread.name
+        for prefix in ("asyncio_", "tower-Scene", "tower-results", "tower-stream", "ThreadPoolExecutor", "AnyIO"):
+            if name.startswith(prefix):
+                name = prefix
+                break
+        names[name] += 1
+    out["python_threads"] = threading.active_count()
+    out["python_threads_by_name"] = dict(names)
     return out
 
 
