@@ -348,3 +348,83 @@ class TestTheStatusSaysWhy:
         session.stop()
         assert not errors
         assert session.state == STATE_STOPPED
+
+
+class TestDemandEventsNeverWaitOnAStop:
+    """A reviewer's SEV-1: `stream_opened` and `watcher_joined` run on the
+    event loop, and a stop joins its worker for up to 5 s. The demand lock
+    must not be held across that join."""
+
+    def test_stream_opened_returns_while_a_stop_is_joining(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _SlowEngine(_Engine):
+            def observe(self, frame, received_at=None, source_seq=None):
+                entered.set()
+                release.wait(10)
+                return None
+
+        session = _session(_SlowEngine, stop_join_timeout_s=3.0)
+        session.stream_opened(owner="phone")
+        session.watcher_joined("phone:sub-1", owner="phone")
+        assert _await_state(session, STATE_RUNNING)
+        session.offer_frame(b"frame")
+        assert entered.wait(5), "the worker never took the frame"
+
+        # A stop that will block on the join until `release` is set.
+        stopper = threading.Thread(target=session.watcher_left, args=("phone:sub-1",))
+        stopper.start()
+        time.sleep(0.1)
+
+        started = time.monotonic()
+        session.stream_opened(owner="phone-2")
+        session.watcher_joined("mac:sub-1", owner="mac")
+        elapsed = time.monotonic() - started
+
+        release.set()
+        stopper.join(10)
+        assert elapsed < 0.5, f"a demand event waited {elapsed:.2f}s on a stop"
+        # And the facts still say run: a watcher and a stream exist.
+        assert _await_state(session, STATE_RUNNING, timeout=10.0)
+
+    def test_a_watcher_joining_during_a_stop_ends_up_running(self):
+        """The race the lock used to prevent, closed by reconciling after
+        the stop instead."""
+        session = _session()
+        session.stream_opened(owner="phone")
+        session.watcher_joined("phone:sub-1", owner="phone")
+        assert _await_state(session, STATE_RUNNING)
+        session.watcher_left("phone:sub-1")
+        session.watcher_joined("phone:sub-2", owner="phone")
+        assert _await_state(session, STATE_RUNNING)
+
+
+class TestAFailingDetectorDoesNotFloodTheLog:
+    def test_the_failure_is_logged_once_then_by_decade(self, caplog):
+        import logging
+
+        import numpy as np
+
+        from tower.scene.engine import SceneEngine
+
+        class _Exploding:
+            name = "exploding"
+            score_threshold = 0.5
+
+            def load(self):
+                return None
+
+            def detect(self, frame):
+                raise RuntimeError("poisoned")
+
+            def release(self):
+                return None
+
+        engine = SceneEngine(_Exploding(), clock=lambda: 0.0)
+        engine.load()
+        with caplog.at_level(logging.ERROR, logger="tower.scene.engine"):
+            for index in range(120):
+                engine.observe(np.zeros((8, 8, 3), np.uint8), received_at=index * 0.1)
+        assert engine.detect_failures == 120
+        assert len(caplog.records) == 3  # 1st, 10th, 100th

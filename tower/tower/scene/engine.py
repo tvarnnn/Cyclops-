@@ -106,12 +106,17 @@ class SceneEngine:
         # exists to prevent, one layer further down.
         self._orientation_succeeded = False
         self._frames_observed = 0
+        self._detect_failures = 0
         self._frame_size = (0, 0)
         self._loaded = False
 
     @property
     def frames_observed(self) -> int:
         return self._frames_observed
+
+    @property
+    def detect_failures(self) -> int:
+        return self._detect_failures
 
     @property
     def orientation_enabled(self) -> bool:
@@ -223,13 +228,28 @@ class SceneEngine:
         answer is the same: an empty result is honest, a crash is not.
         """
         try:
-            return self._detector.detect(frame_bgr)
+            detections = self._detector.detect(frame_bgr)
         except Exception:
-            logger.exception(
-                "scene: detection failed on a frame; treating it as empty "
-                "and continuing"
-            )
+            self._detect_failures += 1
+            # The first failure gets its traceback; after that, one line
+            # per decade. A detector that has gone wrong for good -- a
+            # poisoned CUDA context after an OOM -- fails at frame rate,
+            # and a traceback twelve times a second is a disk-filling
+            # failure of its own (a reviewer's finding, 2026-09-07). The
+            # count is on the engine for anyone who wants to know.
+            if self._detect_failures == 1:
+                logger.exception(
+                    "scene: detection failed on a frame; treating it as "
+                    "empty and continuing"
+                )
+            elif self._detect_failures in (10, 100, 1000) or self._detect_failures % 10000 == 0:
+                logger.error(
+                    "scene: detection has failed on %d frames this session; "
+                    "still treating each as empty",
+                    self._detect_failures,
+                )
             return []
+        return detections
 
     def _place(self, width: int) -> None:
         """Give every live track a side, with hysteresis against its last."""

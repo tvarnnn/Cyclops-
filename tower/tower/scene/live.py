@@ -171,18 +171,30 @@ class SceneLive(LiveSession):
             return (self._latest, self._latest_observed_at, self._latest_computed_at)
 
     # -- demand --------------------------------------------------------
+    #
+    # `_demand` guards the three facts and the DECISION. It is never held
+    # across `super().stop()`: a stop joins its worker for up to
+    # `STOP_JOIN_TIMEOUT_S`, and `stream_opened` / `watcher_joined` are
+    # called inline on the event loop -- so a lock held across the join
+    # would freeze every connection's frames, pings and `/health` while
+    # one phone's session wound down (a reviewer's SEV-1, 2026-09-07).
+    # The price is a small race: a watcher joining while a stop it did
+    # not ask for is in flight can see its start undone. So every stop
+    # is followed by `_reconcile()` under the lock, which starts a fresh
+    # session if the facts still say so. The final state is right; at
+    # worst one session churns.
 
     def start(self, *, resume_paused: bool = True) -> dict:
         """The operator's Start. Runs at once, stream or no stream."""
         with self._demand:
             self._operator_hold = True
-            return super().start(resume_paused=resume_paused)
+        return super().start(resume_paused=resume_paused)
 
     def stop(self) -> dict:
         """The operator's Stop, and every other stop. Releases the hold."""
         with self._demand:
             self._operator_hold = False
-            return super().stop()
+        return super().stop()
 
     def stream_opened(self, owner=None) -> None:
         """A connection began streaming frames. Run if somebody is watching."""
@@ -202,8 +214,9 @@ class SceneLive(LiveSession):
         with self._demand:
             was_streaming = owner in self._open_streams
             self._open_streams.discard(owner)
-            if was_streaming and not self._open_streams:
-                super().stop()
+            last_one_out = was_streaming and not self._open_streams
+        if last_one_out:
+            self._stop_then_reconcile()
 
     def watcher_joined(self, token, *, owner=None) -> None:
         """A client subscribed to the live scene. Run if a stream is open."""
@@ -219,33 +232,40 @@ class SceneLive(LiveSession):
         """
         with self._demand:
             self._watchers.pop(token, None)
-            self._stop_if_unwatched()
+            unwatched = not self._operator_hold and not self._watchers
+        if unwatched:
+            self._stop_then_reconcile()
 
     def watchers_left(self, *, owner) -> None:
         """A connection closed; every watcher it held leaves with it."""
         with self._demand:
             for token in [t for t, o in self._watchers.items() if o == owner]:
                 del self._watchers[token]
-            self._stop_if_unwatched()
+            unwatched = not self._operator_hold and not self._watchers
+        if unwatched:
+            self._stop_then_reconcile()
+
+    def _stop_then_reconcile(self) -> None:
+        """Stop OUTSIDE the demand lock, then re-ask the facts under it."""
+        super().stop()
+        with self._demand:
+            self._reconcile()
 
     def _reconcile(self) -> None:
-        """Start if the two facts are both true. Under `_demand`.
+        """Start if the facts say so. Under `_demand`.
 
         `resume_paused=False`: a demand event is a socket or a screen, not
         a person, and must not undo a Pause. Starting from FAILED is
         allowed because each call here is one discrete request -- a new
         watcher, a new stream -- and gets one new attempt; nothing here
         loops, so a load that keeps failing fails once per request.
+        `start()` itself returns at once (the load is off-thread), so
+        holding the lock across it costs nothing.
         """
         if not self._follow_stream:
             return
         if self._open_streams and self._watchers:
             super().start(resume_paused=False)
-
-    def _stop_if_unwatched(self) -> None:
-        if self._operator_hold or self._watchers:
-            return
-        super().stop()
 
     # -- hooks ---------------------------------------------------------
 
