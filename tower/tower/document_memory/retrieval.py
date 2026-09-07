@@ -92,6 +92,21 @@ def tokenise(text: str) -> list[str]:
     return [token for token in _TOKEN.findall(text.lower()) if token not in STOPWORDS]
 
 
+# The confusions a Latin-script recogniser makes most, folded to one
+# form before the edit-distance test. "rn" read as "m" is two edits and
+# the single most common OCR error in body text; "vv" as "w" the next.
+# Applied only on the fuzzy path, to terms long enough to use it.
+_OCR_FOLDS = (("rn", "m"), ("vv", "w"), ("ii", "u"))
+
+
+def ocr_fold(token: str) -> str:
+    for source, target in _OCR_FOLDS:
+        token = token.replace(source, target)
+    if any(character.isalpha() for character in token):
+        token = token.replace("0", "o").replace("1", "l")
+    return token
+
+
 def within_one_edit(left: str, right: str) -> bool:
     """Levenshtein distance <= 1, without building the matrix.
 
@@ -125,6 +140,10 @@ class Match:
     page_score: float = 0.0
     # Whether any matched term was a near-miss rather than the word.
     fuzzy: bool = False
+    # How many query terms this page contains EXACTLY. The primary sort
+    # key: a page that says the word outranks one that nearly says it,
+    # whatever BM25's length normalisation makes of their lengths.
+    exact_terms: int = 0
 
     @property
     def document_id(self) -> str:
@@ -225,6 +244,7 @@ class _Corpus:
             for token in set(page.tokens):
                 self.page_frequency[token] = self.page_frequency.get(token, 0) + 1
         self.vocabulary = list(self.page_frequency)
+        self.folded_vocabulary = [ocr_fold(token) for token in self.vocabulary]
 
     def expand(self, term: str) -> dict[str, float]:
         """The corpus tokens a query term matches, each with its weight.
@@ -239,10 +259,15 @@ class _Corpus:
             matches[term] = 1.0
         if len(term) < FUZZY_MIN_TERM_LENGTH:
             return matches
-        for token in self.vocabulary:
+        folded_term = ocr_fold(term)
+        for token, folded in zip(self.vocabulary, self.folded_vocabulary):
             if token == term:
                 continue
-            if token.startswith(term) or within_one_edit(term, token):
+            if (
+                token.startswith(term)
+                or within_one_edit(term, token)
+                or within_one_edit(folded_term, folded)
+            ):
                 matches[token] = max(matches.get(token, 0.0), FUZZY_WEIGHT)
         return matches
 
@@ -351,12 +376,15 @@ class DocumentMemory:
         expansions = {term: corpus.expand(term) for term in set(query_terms)}
         best_per_document: dict[int, Match] = {}
         for page in corpus.pages:
-            score, matched, fuzzy = _bm25(expansions, corpus, page)
+            score, matched, fuzzy, exact = _bm25(expansions, corpus, page)
             if score < min_score:
                 continue
             document = documents[page.document_index]
             current = best_per_document.get(page.document_index)
-            if current is not None and current.page_score >= score:
+            if current is not None and (current.exact_terms, current.page_score) >= (
+                exact,
+                score,
+            ):
                 continue
             best_per_document[page.document_index] = Match(
                 document=document,
@@ -367,10 +395,13 @@ class DocumentMemory:
                 page_index=page.page_index,
                 page_score=score,
                 fuzzy=fuzzy,
+                exact_terms=exact,
             )
 
         scored = sorted(
-            best_per_document.values(), key=lambda match: match.score, reverse=True
+            best_per_document.values(),
+            key=lambda match: (match.exact_terms, match.score),
+            reverse=True,
         )
         if not scored:
             return QueryResult(
@@ -426,16 +457,17 @@ class DocumentMemory:
         }
 
 
-def _bm25(expansions, corpus: _Corpus, page: _Page) -> tuple[float, set[str], bool]:
+def _bm25(expansions, corpus: _Corpus, page: _Page) -> tuple[float, set[str], bool, int]:
     tokens = page.tokens
     if not tokens:
-        return 0.0, set(), False
+        return 0.0, set(), False, 0
 
     length = len(tokens)
     total_pages = len(corpus.pages)
     score = 0.0
     matched = set()
     fuzzy = False
+    exact = 0
     for term, candidates in expansions.items():
         # The best-weighted corpus token this term matches on this page.
         best_weight = 0.0
@@ -448,6 +480,8 @@ def _bm25(expansions, corpus: _Corpus, page: _Page) -> tuple[float, set[str], bo
         matched.add(best_token)
         if best_weight < 1.0:
             fuzzy = True
+        else:
+            exact += 1
         term_frequency = page.frequencies[best_token]
         containing = corpus.page_frequency.get(best_token, 0)
         # The +0.5/+0.5 smoothing keeps IDF positive on a tiny corpus. On
@@ -459,7 +493,7 @@ def _bm25(expansions, corpus: _Corpus, page: _Page) -> tuple[float, set[str], bo
             1 - BM25_B + BM25_B * length / max(corpus.average_length, 1.0)
         )
         score += best_weight * idf * (term_frequency * (BM25_K1 + 1)) / denominator
-    return score, matched, fuzzy
+    return score, matched, fuzzy, exact
 
 
 def _snippet(text: str, matched_terms, width: int = 160) -> str:

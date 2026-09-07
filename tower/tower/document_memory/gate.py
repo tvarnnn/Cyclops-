@@ -116,6 +116,8 @@ class FrameGate:
         self._policy = policy or GatePolicy()
         self._previous: np.ndarray | None = None
         self._window: np.ndarray | None = None
+        self._shape: tuple | None = None
+        self._probe_scale = 1.0
         self._recent = deque(maxlen=self._policy.sharpness_window)
 
     @property
@@ -128,6 +130,13 @@ class FrameGate:
 
     def observe(self, gray: np.ndarray) -> GateVerdict:
         policy = self._policy
+        shape = tuple(gray.shape[:2])
+        if shape != self._shape:
+            # A rung change. Regions and shifts are in pixels of a frame
+            # that no longer exists; start over rather than compare.
+            self._shape = shape
+            self._previous = None
+            self._recent.clear()
         sharpness = measure_sharpness(gray)
         baseline = median(self._recent) if self._recent else sharpness
         self._recent.append(sharpness)
@@ -140,7 +149,16 @@ class FrameGate:
         height, width = gray.shape[:2]
         diagonal = float(np.hypot(height, width))
         small_shift = shift_px < policy.max_shift_fraction * diagonal
-        content_changed = small_shift and response < policy.content_change_response
+        # A sharp frame that does not correlate with the last one is a
+        # picture that changed. The shift estimate is meaningless when
+        # the content differs -- the peak lands anywhere -- so it is not
+        # consulted here; sharpness is, because a frame smeared by motion
+        # also fails to correlate and is a different case.
+        content_changed = (
+            response < policy.content_change_response
+            and sharpness >= policy.min_sharpness
+            and ratio >= policy.min_sharpness_ratio
+        )
         stable = (
             small_shift
             and response >= policy.min_response

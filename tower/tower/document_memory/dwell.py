@@ -366,10 +366,13 @@ class DwellTracker:
         if crop.size == 0:
             return None
         width = self._policy.content_probe_width
-        height = max(8, int(round(crop.shape[0] * width / max(crop.shape[1], 1))))
-        # A fixed probe size, so a region that grows as the wearer leans
-        # in still compares against its own reference.
-        small = cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+        # A FIXED probe size, square, whatever the crop's aspect: a region
+        # that grows as the wearer leans in, or whose text block is a
+        # different shape after a page turn, still compares against its
+        # own reference. An aspect-preserving probe changed shape on a
+        # page turn and was silently adopted as the new reference, so no
+        # turn was ever detected -- found by the test written for it.
+        small = cv2.resize(crop, (width, width), interpolation=cv2.INTER_AREA)
         return np.float32(small)
 
     def _miss(self, at: float) -> Dwell | None:

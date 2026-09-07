@@ -660,12 +660,21 @@ GET  /documents-session                     the capture session
 POST /documents-session/{start,pause,resume,stop}
 ```
 
-`/documents*` answer **404** when `TOWER_DOCUMENT_ROOT` is unset.
+`/documents*` answer **404** when `TOWER_DOCUMENT_ENABLED` is off, which
+since 2026-09-07 is the only way to have no root: the default is
+`tower/data/document_memory`, and `TOWER_DOCUMENT_ROOT` overrides it.
 `/documents-session*` answer **404** when `TOWER_DOCUMENT_CAPTURE` is off
-**even with a root set** — a root with capture off is a Tower that serves
-a library recorded elsewhere and records nothing itself. Both 404s name
-the variable, and **neither is ever the answer to a query about a
+(it is on by default) or the session could not be constructed — the
+`[ocr]` extra not installed, most likely, and the body says so. A root
+with capture off is a Tower that serves a library recorded elsewhere and
+records nothing itself. Both 404 bodies still name `TOWER_DOCUMENT_ROOT`
+and `TOWER_DOCUMENT_CAPTURE` respectively, because the phone
+string-matches them, and **neither is ever the answer to a query about a
 document**, which is answered with `answer: "no_observation"`.
+
+The session verbs answer **200 with the full envelope** from any state;
+a verb that does not apply leaves `session.state` unchanged. The phone
+renders any other status as a transport failure.
 
 ### 8.1 The three answers — a closed vocabulary on every response
 
@@ -681,7 +690,13 @@ document**, which is answered with `answer: "no_observation"`.
 
 - `claim: "a-page-was-in-view-and-was-ocred"`. Not "was read" — the
   camera cannot establish that.
-- `identity: "no-document-identity-across-sightings"`.
+- `identity: "same-page-by-text-and-look-within-library"` — a later
+  dwell whose first readable page has the same words AND the same look
+  as a record becomes a **sighting** of it (`sighting_count`,
+  `last_observed_at`, `total_observed_seconds`); anything weaker is a
+  separate record. The first observation's fields are never rewritten.
+- `library.revision` on the status payload is the **live-update
+  trigger**: re-fetch the listing when it changes, never on a timer.
 - `text_availability.state` — `unknown` (no pages), `not_readable`
   (**a real answer**: we looked and found no readable text), `extracted`.
 - `title_is_derived`; a null title renders as "Untitled document", **never
@@ -704,27 +719,34 @@ document**, which is answered with `answer: "no_observation"`.
 
 ### 8.3 The limitation you must not hide
 
-> **The premise is untested, not proven.** On 9,199 frames of real
-> first-person footage the page detector fired **six times and every one
-> was a false positive** — a venetian blind and a backlit laptop keyboard.
-> After the gate was re-derived it fires **zero** times. No capture on
-> this platform has ever contained a sheet of paper.
+> **The premise is untested on a physical page.** No capture on this
+> platform has ever contained a sheet of paper: a visual review of one
+> sharp frame from each of 71 captures and a text-detector sweep of every
+> tenth frame of 97 captures (4,599 frames) found none, and found zero
+> confident text boxes. The contour-quad detector that shipped on
+> 2026-08-27 fired six times on 9,199 of those frames, all false; it was
+> replaced on 2026-09-07 by a steadiness gate plus the OCR engine's own
+> text detector, validated on rendered pages with known text.
 >
 > Separately, at the 360×640 the glasses deliver, EasyOCR returned **zero
 > dictionary words** across 919 sampled real frames dense with screen
-> text, at median confidence 0.056.
+> text, at median confidence 0.056. On rendered pages at that geometry
+> word recall is 0.98 with the page filling the frame, 0.74 at 60% of
+> the frame height and 0.02 at 40%.
 >
-> **An empty library is the expected result today.** Every response
-> carries `recording_limitations` saying so. A client that renders an
-> empty library as "no documents yet" is inviting a person to wait for
-> something that is not coming.
+> **An empty library on existing footage is the expected result.** Every
+> response carries `recording_limitations` saying so. A client that
+> renders an empty library as "no documents yet" is inviting a person to
+> wait for something that is not coming; what is coming requires a page
+> held close.
 
-The measured remedy is a **high-resolution still, not a higher stream**:
-504×896 buys 0.886–1.000 word recall against 0.343–1.000 at the delivered
-rung, and raising the stream would break World Builder's tracking (at 720p
-**73.3%** of frames fall below `min_sharpness` and are rejected as
-blurred). Detection needs its gate re-derived at any new geometry, which
-nobody has done. That is iOS/DAT work and is not in this contract.
+Resolution remains a cross-cartridge choice the phone makes: raising
+the stream to 720×1280 breaks World Builder's tracking (**73.3%** of
+frames rejected as blurred), 504×896 is the unmeasured middle rung, and
+at 504×896 recall on rendered pages is 1.00 / 0.98 / 0.66 at the three
+fills above. The DEBUG-only Capture Resolution picker on the phone is
+the lever for a physical test. That is iOS/DAT work and is not in this
+contract.
 
 ### 8.4 Provenance — and the deliberate contrast
 
