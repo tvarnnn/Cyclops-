@@ -919,7 +919,24 @@ def main(argv=None) -> int:
             solve_landed and accepted >= 2
         ):
             rebuild_started = time.perf_counter()
-            interim = engine.build(world_id, session_id)
+            try:
+                interim = engine.build(world_id, session_id)
+            except OSError as exc:
+                # An interim rebuild is a best-effort view for the wearer;
+                # the next one rewrites every derived file. Windows refuses
+                # the atomic replace while any reader holds the destination
+                # (the Tower's web thread reading points.json for the
+                # phone, descheduled under solver load), and on 2026-09-06
+                # that exception ended a live session mid-walk: no
+                # session_stopped, a LOCK with a dead pid, a torn derived
+                # tree. Say so, and try again at the next rebuild.
+                since_rebuild = 0
+                logger.warning(
+                    "[Tower][WorldBuilder] rebuild %s failed and will be retried "
+                    "at the next one: %s: %s",
+                    rebuilds + 1, type(exc).__name__, exc,
+                )
+                continue
             rebuilds += 1
             since_rebuild = 0
             # One line per rebuild, not per frame. Over a 15-minute walk
