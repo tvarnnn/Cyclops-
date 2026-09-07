@@ -25,16 +25,59 @@ nonisolated struct WorldListingSession: Equatable, Sendable {
     let sessionID: String
     /// The Tower's clock, seconds.
     let startedAt: Double
-    /// `nil` while the session is still open. **`nil` is the live signal**, as
-    /// on the status channel; it is never read as zero.
+    /// `nil` while the record is open. **Not** the live signal on its own any
+    /// more: a builder killed mid-walk leaves `ended_at: null` behind forever,
+    /// and 29 such records on the real root read as "still open". `abandoned`
+    /// and `state` say which kind of open this is.
     let endedAt: Double?
     let endReason: String?
     let frameSource: String
     let captureID: String?
     let hasGeometry: Bool
 
-    /// The Tower has not closed this session.
-    var isStillOpen: Bool { endedAt == nil }
+    // Additive since 2026-09-06, all optional: an older Tower omits them and
+    // the row is drawn from what it did send.
+
+    /// The record's own count — written at start (zero) and rewritten at
+    /// stop, so a session that never stopped keeps the zero.
+    let keyframesAccepted: Int?
+    /// The journal's count: one line per keyframe, whatever the record says.
+    /// 467 on the walk whose record said 0.
+    let keyframesJournaled: Int?
+    /// `ended_at` is null **and** nobody is writing. The Tower's judgment,
+    /// carried rather than recomputed.
+    let abandoned: Bool?
+    /// One word from the status channel's vocabulary: `receiving`,
+    /// `finalizing`, `complete`, `interrupted`, `unbuilt`.
+    let state: WorldListingSessionState?
+    /// The builder's account of finalization, or `nil` on an older record.
+    let finalization: WorldFinalizationReport?
+
+    /// The record is open and the Tower did **not** call it abandoned. On a
+    /// Tower that does not send `abandoned`, the record being open is all
+    /// that is known and is what this reports.
+    var isStillOpen: Bool { endedAt == nil && abandoned != true }
+
+    /// The keyframe count worth showing: the record's, unless it is the
+    /// start-of-session zero (or absent) and the journal knows better.
+    var keyframeCount: Int? {
+        if let accepted = keyframesAccepted, accepted > 0 { return accepted }
+        if let journaled = keyframesJournaled { return journaled }
+        return keyframesAccepted
+    }
+}
+
+/// A session's state word, as the Tower lists it. A `RawRepresentable` struct
+/// so a sixth word survives as itself; see `WorldSelectionMode`.
+nonisolated struct WorldListingSessionState: RawRepresentable, Equatable, Sendable, Hashable {
+    let rawValue: String
+    init(rawValue: String) { self.rawValue = rawValue }
+
+    static let receiving = WorldListingSessionState(rawValue: "receiving")
+    static let finalizing = WorldListingSessionState(rawValue: "finalizing")
+    static let complete = WorldListingSessionState(rawValue: "complete")
+    static let interrupted = WorldListingSessionState(rawValue: "interrupted")
+    static let unbuilt = WorldListingSessionState(rawValue: "unbuilt")
 }
 
 // In an extension so the memberwise initialiser survives.
@@ -53,6 +96,11 @@ nonisolated extension WorldListingSession {
         self.frameSource = frameSource
         self.captureID = json["capture_id"] as? String
         self.hasGeometry = hasGeometry
+        self.keyframesAccepted = json["keyframes_accepted"] as? Int
+        self.keyframesJournaled = json["keyframes_journaled"] as? Int
+        self.abandoned = json["abandoned"] as? Bool
+        self.state = (json["state"] as? String).map(WorldListingSessionState.init(rawValue:))
+        self.finalization = WorldFinalizationReport(json: json["finalization"])
     }
 }
 
@@ -68,8 +116,17 @@ nonisolated struct WorldListingEntry: Equatable, Sendable {
     let live: Bool
     let sessions: [WorldListingSession]
 
-    /// What the picker calls it.
-    var title: String { displayName ?? worldID }
+    /// What the picker calls it: the Tower's name, or a dated title from
+    /// `updatedAt` when it has none. Never the bare id — 156 of the 162
+    /// worlds on the real root are unnamed, and a column of 32-character
+    /// hex strings distinguishes nothing. The id stays available as
+    /// `worldID` for a monospaced caption.
+    var title: String { WorldListingPresentation.title(for: self) }
+
+    /// A world with no sessions has nothing to open: the Tower answers a pin
+    /// on it with "the world exists and has no sessions" and the picture
+    /// 404s. 96 of 162 on the real root are such shells.
+    var hasSessions: Bool { !sessions.isEmpty }
 }
 
 // In an extension so the memberwise initialiser survives.

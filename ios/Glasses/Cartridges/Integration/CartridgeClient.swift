@@ -66,7 +66,7 @@ enum TowerCapabilities {
     /// Kept separate from `declared` because they answer different questions
     /// about different machines, and because their disagreement is exactly what
     /// `CartridgeAvailability.unsupportedContract` exists to represent. A Tower
-    /// offering `world_builder.status/2026-09-…` would land there rather than
+    /// offering `world_builder.status/2026-10-…` would land there rather than
     /// being decoded on a guess.
     ///
     /// ## Why this went from one entry to five

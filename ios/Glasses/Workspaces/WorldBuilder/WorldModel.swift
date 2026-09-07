@@ -464,9 +464,34 @@ enum WorldModelState: Equatable, Sendable {
     /// screen is not yet the world that will be stored, and separate from
     /// `.receiving` because no new observations are arriving. Both distinctions
     /// change what the UI may claim, which is what earns the case.
-    case finalizing(WorldSnapshot)
+    ///
+    /// `buildInProgress` is the Tower's `lifecycle.build_in_progress`, carried
+    /// rather than assumed. Since `world_builder.status/2026-09-06` the live
+    /// builder keeps the writer lock through finalization, so `true` here is
+    /// evidence — a live process holds the lock and the session has stopped.
+    /// `nil` is the older record: the Tower cannot see whether a build is
+    /// running, and says so. `false` is not sent for this state today and
+    /// is drawn like `nil`, because "not building" is a claim this app
+    /// cannot check either.
+    case finalizing(WorldSnapshot, buildInProgress: Bool? = nil)
     /// Capture ended and the world is final and inspectable.
     case finalized(WorldSnapshot)
+    /// The session ended abnormally — the builder died mid-walk, was killed
+    /// while finalizing, or recorded an error — and the Tower can say so.
+    ///
+    /// **Not `.failed`, and not `.finalized`.** The 2026-09-06 walk left 463
+    /// keyframes of derived geometry and a working render behind a builder
+    /// that exited without closing its session; drawn as "failed" the phone
+    /// showed none of it, and drawn as "finished" it would have presented a
+    /// half-built walk as a complete one. The snapshot travels with the
+    /// state so the rows, the gallery and the picture can be shown, and the
+    /// Tower's own reason travels beside it so the headline can say what
+    /// happened without this app composing a sentence about the other
+    /// machine.
+    ///
+    /// Nothing more will arrive for this world — that is what makes it a
+    /// settled state rather than a live one.
+    case interrupted(WorldSnapshot, reason: String)
     /// Carries `CartridgeFailure` rather than a bare string, matching the other
     /// three cartridges. A `reason: String` cannot distinguish a dropped socket
     /// from a payload this build could not decode from the Tower reporting its
@@ -477,7 +502,10 @@ enum WorldModelState: Equatable, Sendable {
     /// The snapshot to draw metrics from, when there is one.
     var snapshot: WorldSnapshot? {
         switch self {
-        case .receiving(let snapshot), .finalizing(let snapshot), .finalized(let snapshot):
+        case .receiving(let snapshot),
+             .finalizing(let snapshot, _),
+             .finalized(let snapshot),
+             .interrupted(let snapshot, _):
             return snapshot
         case .unsupported, .idle, .awaitingFirstUpdate, .failed:
             return nil
@@ -490,7 +518,8 @@ enum WorldModelState: Equatable, Sendable {
     ///
     /// False in `.finalizing`: the Tower is working, but it is not observing,
     /// and a badge that says "live" while the camera is off is a lie about the
-    /// sensor rather than about the compute.
+    /// sensor rather than about the compute. False in `.interrupted` for the
+    /// stronger reason that nothing is working at all.
     var isReceivingUpdates: Bool {
         if case .receiving = self { return true }
         return false
@@ -499,7 +528,7 @@ enum WorldModelState: Equatable, Sendable {
     /// Whether a world exists to look at, mapped or finished.
     var hasWorld: Bool {
         switch self {
-        case .receiving, .finalizing, .finalized: return true
+        case .receiving, .finalizing, .finalized, .interrupted: return true
         case .unsupported, .idle, .awaitingFirstUpdate, .failed: return false
         }
     }
@@ -514,7 +543,10 @@ enum WorldModelState: Equatable, Sendable {
         case .awaitingFirstUpdate: return .waiting
         // Both are the Tower doing work that may still change the answer.
         case .receiving, .finalizing: return .live
-        case .finalized: return .settled
+        // Both are worlds nothing will add to. An interrupted world is not
+        // `.failed`: that phase draws no data, and the whole point of the
+        // case is that there is data to draw.
+        case .finalized, .interrupted: return .settled
         case .failed: return .failed
         }
     }
