@@ -442,7 +442,17 @@ the first build.
    one person in view the aggregates describe that person — and the acceptance
    rested on the Tower saying so in `single_person_note`. Nothing on the phone
    read it. Now decoded and shown, at a count of one, verbatim.
-5. Two Swift compile errors and one impossible Swift test (§5.5, §8).
+5. **Two Swift compile errors** (§8) and **three Swift tests that had never
+   passed**, all of them written on Windows without a compiler and run here for
+   the first time: Document Memory's sightings test unwrapped a row from the
+   *empty* library fixture (§5.5); the Scene additions class had no
+   `@MainActor` and could not call anything it drove; and World Builder's
+   session-switch guard demanded an empty gallery after a switch that
+   legitimately refetches, so it asserted that changing session leaves the
+   screen blank. The last of these is worth its own note, because the
+   production code was right and the test was wrong about its own stub — what
+   "another gallery" means is that the old owner's segments were dropped and
+   the new owner's fetched, and the second manifest request is that evidence.
 
 **Accepted, not fixed, with reasons.**
 
@@ -523,13 +533,18 @@ Stated plainly, because a test that did not run is not evidence.
 
 ## 20. Final Git HEAD
 
-`b6bb37a` on `integration/all-cartridges-v1`, plus the commit that adds
-this file.
+`b6bb37a` on `integration/all-cartridges-v1` is the last commit that changes
+code or tests; the commits after it add and correct this file. Every number in
+§21 was re-verified at the final HEAD after the handoff landed, and none moved.
 
-Four `--no-ff` merge commits preserving all four lane histories, plus eleven
-integration commits. 150 files changed, +22,535 / −2,234 against `b10ab36`.
-Nothing squashed, no lane rebased, no published history rewritten. Nothing was
-pushed and nothing was merged onward: this branch is the candidate.
+Four `--no-ff` merge commits preserving all four lane histories, and fourteen
+commits of this lane's own: one plan, nine integration fixes and tests, and
+the handoff. 151 files changed against `b10ab36`.
+
+Nothing squashed, no lane rebased, no published history rewritten. All four
+lane tips are ancestors of this HEAD and all four source branches still point
+where they did (`087dcaa`, `70fade7`, `beadb56`, `6cfe1d5`). Nothing was
+pushed and nothing was merged onward: **this branch is the candidate**.
 
 No model weights, dataset, replay corpus, cache, virtual environment,
 machine-local log or user data is committed — checked by extension and by
