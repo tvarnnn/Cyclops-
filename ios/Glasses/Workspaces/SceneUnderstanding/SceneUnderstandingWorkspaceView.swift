@@ -328,10 +328,38 @@ struct SceneReadingView: View {
     /// not a footnote: an undercount published without disclosure looks exactly
     /// like a quiet room, and a footnote below three limitation paragraphs is
     /// the same as no disclosure at all.
+    /// The Tower's single-person note, shown only when it applies.
+    ///
+    /// The privacy review accepted one limitation: with exactly one person in
+    /// view, the side, size and facing aggregates describe that person for as
+    /// long as they are in view. The Tower publishes the sentence that says
+    /// so in `single_person_note`, and until now nothing on this side read
+    /// it, so the disclosure the acceptance rested on reached nobody.
+    ///
+    /// Shown only at a count of one, because that is the case it is about;
+    /// beside a count of four it would be noise, and noise is how a
+    /// disclosure stops being read. Verbatim, because it is the Tower's claim
+    /// about its own payload.
+    @ViewBuilder
+    private var singlePersonDisclosure: some View {
+        if reading.describesOnePerson, let note = reading.singlePersonNote {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("One person in view", systemImage: "person.fill.viewfinder")
+                    .font(.subheadline.weight(.medium))
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
     @ViewBuilder
     private var lowerBoundDisclosure: some View {
         if reading.countIsLowerBound {
             VStack(alignment: .leading, spacing: 6) {
+                singlePersonDisclosure
                 Label("A floor, not a total", systemImage: "arrow.down.to.line")
                     .font(.subheadline.weight(.medium))
                 Text(SceneReading.countCaveat)

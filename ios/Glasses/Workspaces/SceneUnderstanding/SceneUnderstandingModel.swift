@@ -631,6 +631,26 @@ struct SceneReading: Equatable, Sendable {
     /// exists — it is more specific than any headline this app can write.
     let unavailableReasonText: String?
 
+    /// The Tower's disclosure for the case where the aggregate IS a person.
+    ///
+    /// `single_person_note` has been on the wire since 2026-09-07 and nothing
+    /// on this side read it, which made the sentence the design depends on
+    /// dead code on the only client there is. It is the answer to the privacy
+    /// reviewer's accepted limitation: with exactly one person in view, "1 on
+    /// your left, 1 large, 1 appears to be facing your direction" is an
+    /// aggregate of one, and therefore a description of that person for as
+    /// long as they stand there. The Tower says so; the phone has to show it,
+    /// because the wearer is the only one who can see both the sentence and
+    /// the person.
+    ///
+    /// Optional because an older Tower does not send it, and carried
+    /// verbatim rather than restated: it is the Tower's claim about its own
+    /// payload, and this app must not soften it.
+    let singlePersonNote: String?
+
+    /// Whether this reading is the single-person case the note is about.
+    var describesOnePerson: Bool { observation?.people.count == 1 }
+
     /// The disclosure that must appear wherever a count does.
     ///
     /// Two sentences, and both are load-bearing. The first is Core Principle 3:

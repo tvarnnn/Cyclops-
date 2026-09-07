@@ -201,7 +201,8 @@ enum SceneUnderstandingDecoder {
             refusals: refusals(from: payload),
             observation: observation,
             unavailableReason: unavailableReason,
-            unavailableReasonText: unavailableText
+            unavailableReasonText: unavailableText,
+            singlePersonNote: payload["single_person_note"] as? String
         )
     }
 
