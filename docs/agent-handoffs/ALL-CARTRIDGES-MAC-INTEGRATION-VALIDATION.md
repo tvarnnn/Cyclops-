@@ -293,7 +293,7 @@ what the numbers mean.
 |---|---|
 | **Baseline, unmerged `b10ab36`**, no torch | 2446 passed, **90 failed**, 93 skipped, 1 xfailed, 2 errors |
 | Merged, no torch | 2796 passed, 25 failed, 99 skipped |
-| **Merged, with CPU torch + torchvision + transformers + EasyOCR** | **2837 passed, 14 failed, 84 skipped** |
+| **Merged, with CPU torch + torchvision + transformers + EasyOCR** | **2836 passed, 15 failed, 84 skipped** |
 
 The baseline was run **first**, on the unmerged base, precisely so that every
 later failure could be attributed rather than argued about. The 90 baseline
@@ -302,7 +302,7 @@ torch, no EasyOCR, no world corpus, and World Builder pose numerics. The
 previous Mac lane recorded 89 of the same on the same base.
 
 **Against that baseline, the merged branch with torch introduced exactly one
-new failure** — the thread-count assertion in §5.4 — which is fixed. In the
+new failure at any point** — the thread-count assertion in §5.4 — which is fixed. In the
 torchless environment two further failures appear
 (`test_scene_capability::test_a_host_with_the_ml_extra_offers_it_by_default`
 and one Document Memory privacy test) and both are the absence of torch
@@ -560,7 +560,7 @@ Every number in this section was produced at the final commit.
 | iOS **Release** build (Simulator) | **clean**, 0 errors, 8 warnings — all pre-existing on the base, none new |
 | **Swift unit tests** (`GlassesTests`) | ****873 passed, 0 failed**** |
 | **UI smoke** (`GlassesUITests`, live Tower from this branch) | **3 passed, 0 failed** |
-| **Tower full suite**, with torch | **2837 passed, 14 failed, 84 skipped** |
+| **Tower full suite**, with torch | **2836 passed, 15 failed, 84 skipped** |
 | — new failures vs the unmerged baseline | **0** |
 | `unified_cartridge_smoke.py` | **71 of 71 checks passed** (with models) |
 | `all_cartridge_switch_soak.py`, 4 cycles | **STABLE**, 0 findings, 0 leftovers |
@@ -568,11 +568,20 @@ Every number in this section was produced at the final commit.
 | `cross-stack-constants-check.py` | **agreement** |
 | `swift-structure-check.py` | clean |
 
-**All 14 Tower failures are in the baseline set** taken on the unmerged
+**All 15 Tower failures are in the baseline set** taken on the unmerged
 `b10ab36` before any merge, and every one is macOS-environmental: World
 Builder pose-accuracy and point-quality numerics (7 + 1), the PowerShell
 startup scripts (3), the NTFS junction and one geometry-transport case (2),
-and one recovery-safety numeric. **The merge introduced none.**
+one recovery-safety numeric, and one Document Memory provenance test. **The
+merge introduced none.**
+
+The count moved between two runs of the same tree — 14 then 15 — and the
+difference is one baseline test that fails intermittently under load
+(`test_live_cartridge_regressions.py::…::test_a_reading_that_spans_a_switch_is_split_rather_than_mislabelled`).
+It is reported rather than smoothed over, because a number that moves is a
+fact about this suite that the next person should know before they chase it.
+The set-difference against the baseline is **empty in both runs**, which is
+the claim that matters and the one that does not move.
 
 **The final soak, per cartridge, over four cycles — the assertions no lane
 could make:**
