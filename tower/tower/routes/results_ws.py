@@ -17,6 +17,7 @@ swallowed here and re-surfacing as an uncaught `RuntimeError` from the next
 `receive_json`. See `handle`.
 """
 
+import asyncio
 import logging
 
 from fastapi import WebSocketDisconnect
@@ -299,7 +300,6 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # up to a poll interval to learn anything would make reconnection feel
     # broken, and the whole contract rests on "a subscription always
     # begins with a complete snapshot".
-    import asyncio
 
     try:
         snapshot = await asyncio.to_thread(
@@ -348,6 +348,11 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # first snapshot is not a special case a client has to decode twice.
     subscription.offer(snapshot)
     channel._wakeup.set()
+    # AFTER the subscription exists, so the session it may start is one
+    # somebody is already listening to. This is the phone saying "show
+    # me the scene", and for Scene Understanding it is what starts the
+    # detector -- see `tower/scene/live.py`, WHEN IT RUNS.
+    channel_holder.watcher_joined(cartridge, subscription.subscription_id)
 
 
 async def _unsubscribe(message, sender, channel_holder) -> None:
@@ -363,7 +368,10 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
     subscription_id = _echo_safe(subscription_id)
     channel = channel_holder.existing()
     removed = False
+    cartridge = None
     if channel is not None:
+        existing = channel.get(subscription_id)
+        cartridge = None if existing is None else existing.cartridge
         removed = await channel.remove(subscription_id)
     if not removed:
         await _error(
@@ -376,6 +384,8 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
     await sender.send(
         {"type": MSG_UNSUBSCRIBED, "subscription_id": subscription_id}
     )
+    if cartridge is not None:
+        await channel_holder.watcher_left(cartridge, subscription_id)
 
 
 async def _error(sender, reason: str, message: str, **extra) -> None:
@@ -400,6 +410,36 @@ def _declaration_inputs(websocket) -> dict:
     return registry.declaration_inputs(websocket.app.state)
 
 
+async def _off_loop_even_if_cancelled(function, *args, **kwargs) -> None:
+    """Run `function` on a thread; if this task is cancelled meanwhile,
+    let the thread finish on its own and re-raise.
+
+    A connection teardown must complete whether or not the handler task
+    survives it. `to_thread` alone abandons the await on cancellation and
+    the work with it -- the thread keeps running, but a SECOND
+    cancellation (a test client's teardown delivers several) can land
+    before the thread was even started. Starting a plain thread first
+    guarantees the work happens; awaiting its completion is best effort.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def run():
+        try:
+            function(*args, **kwargs)
+        except Exception:
+            logger.exception("[Tower][Results] teardown hook failed")
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="tower-results-teardown", daemon=True).start()
+    try:
+        await asyncio.to_thread(done.wait, 30.0)
+    except asyncio.CancelledError:
+        raise
+
+
 class ChannelHolder:
     """Lazily creates one ConnectionChannel per WebSocket.
 
@@ -409,11 +449,19 @@ class ChannelHolder:
     task, no event, no registration with the shared reader.
     """
 
-    __slots__ = ("_channel", "_clock")
+    __slots__ = ("_channel", "_clock", "owner", "_live")
 
-    def __init__(self, clock) -> None:
+    def __init__(self, clock, *, owner=None, live=None) -> None:
         self._channel = None
         self._clock = clock
+        # The connection's identity, the same token `ws.py` hands the
+        # recorder and the live cartridges. Demand is reported per
+        # subscription and released per connection, so both need it.
+        self.owner = owner
+        # The `LiveCartridges` demand surface, or None on a Tower with
+        # no live cartridge. Handed in rather than read off `app.state`
+        # so a test can construct a holder without an app.
+        self._live = live
 
     def ensure(self, websocket, sender) -> ConnectionChannel:
         if self._channel is None:
@@ -438,7 +486,44 @@ class ChannelHolder:
     def existing(self):
         return self._channel
 
+    def watcher_token(self, subscription_id: str) -> tuple:
+        return (self.owner, subscription_id)
+
+    def watcher_joined(self, cartridge: str, subscription_id: str) -> None:
+        if self._live is not None:
+            self._live.watcher_joined(
+                cartridge, self.watcher_token(subscription_id), owner=self.owner
+            )
+
+    async def watcher_left(self, cartridge: str, subscription_id: str) -> None:
+        # OFF the event loop: the last watcher leaving reaches
+        # `LiveSession.stop()` and its bounded join, for the same reason
+        # `ws.py` runs `stream_closed` through `to_thread`.
+        if self._live is not None:
+            await asyncio.to_thread(
+                self._live.watcher_left,
+                cartridge,
+                self.watcher_token(subscription_id),
+            )
+
     async def close(self) -> None:
         channel, self._channel = self._channel, None
-        if channel is not None:
+        if channel is None:
+            # Never subscribed, so never a watcher. Returning without an
+            # await keeps this connection's teardown synchronous, which
+            # `ConnectionTracker` relies on: a superseded connection's
+            # teardown must finish before the next one is measured.
+            return
+        try:
             await channel.close()
+        finally:
+            # In a `finally`, because `ConnectionChannel.close` re-raises
+            # a cancellation that is aimed at the connection handler
+            # itself -- and a connection that is being cancelled has
+            # still gone. Its watchers leave with it either way; a
+            # session kept running for a subscription whose socket is
+            # closed would be the leak this method exists to prevent.
+            if self._live is not None:
+                await _off_loop_even_if_cancelled(
+                    self._live.watchers_left, owner=self.owner
+                )

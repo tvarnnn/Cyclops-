@@ -87,10 +87,14 @@ def test_cartridges_without_a_contract_are_not_offered(monkeypatch, built):
     test is really for.
     """
     root, _, _ = built
-    # Document Memory has a managed root since 2026-09-07, so "offered
-    # and unavailable" is reachable only by switching it off. The
-    # three-state pairing this test pins is unchanged.
+    # BOTH, for the same reason and from the same date. Document Memory
+    # gained a managed root and Scene Understanding's unset variable now
+    # means auto, so "offered and unavailable" is reachable for either one
+    # only by switching it off. Each lane switched off its own cartridge
+    # without seeing the other's flip. The three-state pairing this test
+    # pins is unchanged.
     monkeypatch.setenv("TOWER_DOCUMENT_ENABLED", "false")
+    monkeypatch.setenv("TOWER_SCENE_UNDERSTANDING", "off")
     client = make_client(monkeypatch, root)
     declaration = client.get("/cartridges").json()
 

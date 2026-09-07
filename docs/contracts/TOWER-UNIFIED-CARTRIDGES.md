@@ -116,7 +116,7 @@ is the designated answer for a failure only a load can discover.
 |---|---|---|---|
 | `world_builder` | `status` | `world_builder.status/2026-08-25` | `TOWER_WORLD_ROOT` is set |
 | `experimental_cv` | `status` | `experimental_cv.status/2026-08-27` | a CV Lab module exists (normally always) |
-| `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | `TOWER_SCENE_UNDERSTANDING` is on **and** the session constructs (needs `torch`/`torchvision`, the `[ml]` extra) |
+| `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | the session constructs (needs `torch`/`torchvision`, the `[ml]` extra). `TOWER_SCENE_UNDERSTANDING` is `auto` when unset (since 2026-09-07); `off` withdraws it |
 | `document_memory` | `status` | `document_memory.status/2026-09-07` | `TOWER_DOCUMENT_ENABLED` is on (the default since 2026-09-07; the root has a managed default under `tower/data/document_memory`, `TOWER_DOCUMENT_ROOT` overrides it) |
 
 `http_contracts` carries one entry — `document_memory.library/2026-09-07`
@@ -279,27 +279,51 @@ deliberately rather than harmonised during integration. Unifying them is a
 contract change and belongs to a human. Until then, **this table is the
 contract.**
 
-**Stream-bound lifecycle.** `stream_start` starts a Scene session and
-`stream_stop` or a disconnect ends it — which is the normal case for a
-wearable. The phone sends **nothing on the socket** to open a cartridge; a
-test asserts the wire stays silent. (World Builder's activation is the HTTP
-session above, not a socket message, and it is intent to build rather than
-a stream boundary.) `lifecycle.follows_stream` reports whether that is
-on. Ownership is a **set of connection tokens**, so with two phones
-streaming the first to drop does not stop the session out from under the
-second.
+**Demand-bound lifecycle (2026-09-07).** A Scene session runs while
+**somebody is streaming AND somebody is watching**, or while an operator
+holds it open by hand. The two facts are tracked apart:
 
-> ⚠️ **It does NOT protect a session an operator started by hand.** An
-> earlier draft of this paragraph claimed it did; that was wrong, and a
-> reviewer reproduced the opposite on the shipped default. `stream_opened`
-> adds a connection to the owner set **whether or not it started
-> anything**, so a phone that sends `stream_start` is adopted as an owner
-> of an already-running session — and when it disconnects it is the last
-> owner out, and the operator's session stops.
->
-> The protection covers only a connection that **never sent
-> `stream_start`**. During a physical test, drive Scene from the routes
-> and do not stream from a phone at the same time.
+- the **stream** is the feed. `stream_start` opens it, `stream_stop` or a
+  disconnect closes it. The **last open stream closing stops the session
+  whoever started it** — frames come from nowhere else, and a scene kept
+  past its feed is a claim about a room the wearer has left. This closes
+  the "owned by nobody after Stop → Start" defect the earlier draft of this
+  paragraph described.
+- a **watcher** is a `result_subscribe` to `scene_understanding/live`. It is
+  the phone saying "a person is looking at this". A phone streaming for
+  World Builder or the CV Lab is *not* a request to detect people in the
+  room, so a stream with no watcher leaves the session `stopped` and its
+  frames counted in `frames_dropped_not_running`. When the last watcher
+  leaves (`result_unsubscribe`, or its socket closing) the detector is
+  released and the GPU handed back.
+- the **operator** path is `POST /scene/start`: it runs at once, with or
+  without a stream, so a physical test can be driven from a Mac or curl
+  without a phone build. `POST /scene/stop` ends that hold. The operator's
+  session survives watchers leaving; it does not survive its last stream
+  closing.
+
+Two things the earlier stream-bound wording said that are still true, and
+are not about Scene Understanding. **The phone sends nothing on the socket
+to open a cartridge**, and a test asserts the wire stays silent: World
+Builder's activation is the HTTP session above, which is intent to build
+rather than a stream boundary. And stream ownership is a **set of
+connection tokens**, so with two phones streaming the first to drop does
+not close the stream out from under the second.
+
+No demand event ever resumes a Pause. `lifecycle.follows_stream` reports
+whether the stream-and-watcher rule is on (`TOWER_SCENE_AUTOSTART`, default
+on); off leaves only the operator path. `lifecycle.demand` reports the
+rule's inputs as counts — `streams`, `watchers`, `operator_hold` — and the
+rule itself as `runs_when: "stream-and-watcher-or-operator"`, so a client
+can tell "stopped because nobody is streaming" from "stopped because nobody
+is watching". The counts are volatile (excluded from the revision) and
+never carry a token or a subscription id.
+
+> A phone build that subscribes at connection time rather than when the
+> Scene screen is open will keep the detector running for as long as it is
+> connected and streaming. That is the 2026-08-27 behaviour, not a
+> regression, and the fix is on the phone: subscribe on appear, unsubscribe
+> on disappear.
 
 Document Memory's
 `follows_stream` defaults **false** — that cartridge writes, and a session
@@ -578,7 +602,8 @@ Constant self-description, safe to assert against: `claim:
 `lifecycle` carries `state`, `states`, `session_id` (int, increments per
 Start), `scene_is_current`, `failure_reason`, `started_at`, `ready_at`,
 `loading_seconds`, `load_overdue`, `load_overdue_after_seconds` (120.0),
-`follows_stream`.
+`follows_stream`, and `demand` (`streams`, `watchers`, `operator_hold`,
+`runs_when` — see *Demand-bound lifecycle*).
 
 > **Two payloads with different `session_id` came from different tracking
 > sessions and must not be compared.**
@@ -595,32 +620,46 @@ rather than omitted** — a class silently absent would be
 indistinguishable from one looked for and not seen.
 
 `where` carries **per-label side counts** (`left`/`centre`/`right`/
-`unknown`) for non-person labels only, because one side cannot describe a
-chair on the left and a chair on the right. `where_excludes: ["person"]` —
-a per-person position, sampled repeatedly, is a movement trace.
-`side_convention` is declared on the payload: the wearer's own left and
-right as the camera sees them, thresholds at 0.45 and 0.55 of frame width,
-stream assumed unmirrored and nothing verifies that.
+`unknown`) for every reported label **including `person`** (since
+2026-09-07), because one side cannot describe a chair on the left and a
+chair on the right, and "is there a person on my left" is a count of
+people on the left. `where_excludes` is empty. `side_convention` is
+declared on the payload: the wearer's own left and right as the camera
+sees them, thresholds at 0.35 and 0.65 of frame width (14° of the
+camera's 45°) with 0.03 of hysteresis, stream assumed unmirrored and
+nothing verifies that.
 
 `people` is a count and an aggregate, **never a list**:
 `may_include_wearer` is **true**, `validated` is **false**, and
-`facing_wearer` is **null, never 0, when unmeasured.**
+`facing_wearer` is **null, never 0, when unmeasured.** Since 2026-09-07 it
+also carries `partial_bottom_edge` — person boxes cut off by the bottom
+edge with no head region, kept out of `count` because from a head-worn
+camera they are most often the wearer's own body (`partial_bottom_edge_
+note` says it can be somebody's legs too); `by_apparent_size`
+(`large`/`medium`/`small`/`unknown`, box height as a fraction of the
+frame — **sizes in the picture, never distances**, per
+`apparent_size_note`); and `orientation_method`, `orientation_status:
+"experimental"` and `orientation_validation`.
 
 ### 7.2 Truthfulness — the fields you are obliged to render
 
-- **`count_is_lower_bound` is `true` on every payload.** Measured against
-  an oracle over 14,128 real frames: recall **0.306** for `person`,
-  **0.497** for `cell phone`, **0.209** for `tv`, **0.161** chair,
-  **0.108** couch, and effectively **blind below ~2% of frame area**
-  (0.000 under 1%). The oracle shares COCO training data with the shipped
-  model, so **0.306 is an upper bound.**
+- **`count_is_lower_bound` is `true` on every payload.** Measured on 700
+  human-labelled COCO images at this camera's 640 px long side (the
+  corpus has no bystander): the CUDA detector (RT-DETRv2-R18 at 0.5)
+  reaches person AP50 **0.86**, chair **0.54**, laptop **0.83**, tv
+  **0.82**, book **0.35**, with recall **0.40** under 1% of frame area
+  rising to 0.88 above 20%; the CPU detector (SSDLite320 at 0.4) reaches
+  0.60 / 0.20 / 0.55 / 0.56 / 0.09 and is blind under 2%. `detector` on
+  the payload says which one counted. Those are stills of other people's
+  photographs, never a person seen through these glasses.
 
   > **An undercount published without disclosure looks exactly like a
   > quiet room.** Render this somewhere a person will see it.
 
-- `count_limitations` — slugs `size-floor`, `recall`, `field-of-view`, and
-  `departure-lag` when frames are being skipped.
-- `count_measurement` carries `measured_at` and `is_current: false`.
+- `count_limitations` — slugs `size-floor`, `recall`,
+  `people-count-accuracy`, `departure-lag`, `field-of-view`.
+- `count_measurement` carries `measured_at`, the labelled-image count and
+  a note naming what was and was not measured.
 - **`scene_available: false` in four distinct situations**, told apart by
   `scene_unavailable_reason`: stopped / still loading / failed /
   running-but-no-frame-yet. All zero counts with `scene_available: true`
@@ -632,10 +671,12 @@ stream assumed unmirrored and nothing verifies that.
 ### 7.3 Privacy
 
 `persistence: "none"` — enforced, not intended. **No face recognition:**
-no detector exists on this platform, keypoints locate eyes and ears as
-anonymous landmarks producing no descriptor and supporting no matching.
-**No identity persistence:** track ids are session-scoped integers, never
-published, and named explicitly in `refused_entity_fields`.
+the facing stage runs a face *detector* (the vendored YuNet) on each
+tracked person's box and keeps one boolean per box — no crop, no
+landmark, no score and no descriptor survives the call, and nothing
+supports matching. **No identity persistence:** track ids are
+session-scoped integers, never published, and named explicitly in
+`refused_entity_fields`.
 
 The reasoning is **not** "minimise disclosure" — the phone sent the
 pixels, so a count discloses strictly less than the frame the phone

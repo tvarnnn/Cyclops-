@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 r"""What is around the wearer, from a frame stream.
 
-Runs in a SEPARATE PROCESS from the Tower. Detection costs ~30 ms and the
-optional orientation stage 43 ms on CUDA or 956 ms on CPU; neither
-belongs on the frame path, and the second belongs there least of all on
-the device it defaults to.
+Runs in a SEPARATE PROCESS from the Tower. Detection costs ~17 ms on CUDA
+(RT-DETRv2-R18) or ~30 ms on CPU (SSDLite320); the optional orientation
+stage ~9 ms per tracked person on CPU.
 
 Frame sources:
 
@@ -40,7 +39,7 @@ from tower.scene.detect import (  # noqa: E402
     TorchvisionDetector,
 )
 from tower.scene.engine import ORIENTATION_INTERVAL_S, SceneEngine  # noqa: E402
-from tower.scene.orientation import TorchvisionPoseEstimator  # noqa: E402
+from tower.scene.orientation import FaceVisibilityEstimator, model_path  # noqa: E402
 from tower.scene.query import SceneQuery  # noqa: E402
 from tower.scene.tracking import TrackerPolicy  # noqa: E402
 
@@ -83,9 +82,9 @@ def main(argv=None) -> int:
         "--facing",
         action="store_true",
         help=(
-            "Estimate coarse head orientation. OFF by default: ~956 ms per "
-            "call on CPU (11.5x the measured 83.5 ms frame interval) and "
-            "~43 ms on CUDA, and the default device is CPU. It is "
+            "Estimate whether each tracked person appears to face the wearer, "
+            "from a face detector on their box (~9 ms a face, CPU). "
+            "Orientation evidence, never gaze."
             "orientation evidence, never gaze."
         ),
     )
@@ -150,12 +149,12 @@ def main(argv=None) -> int:
         if args.detector == "ssdlite320"
         else FixedDetector()
     )
-    pose = TorchvisionPoseEstimator() if args.facing else None
+    pose = FaceVisibilityEstimator(model_path()) if args.facing else None
 
     engine = SceneEngine(
         detector,
         TrackerPolicy(min_hits=args.min_hits, max_misses=args.max_misses),
-        pose_estimator=pose,
+        facing_estimator=pose,
         orientation_interval_s=args.facing_interval,
         score_threshold=args.score_threshold,
     )

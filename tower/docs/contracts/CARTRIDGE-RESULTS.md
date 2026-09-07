@@ -1075,15 +1075,27 @@ asserts the wire stays silent. Sessions are driven over HTTP:
 | `POST /scene/stop` | end the session and **discard** the scene |
 
 **A phone does not call any of them.** `IOS-to-Tower.md` §6.2 is
-explicit that opening a cartridge on the phone sends nothing, so the
-session follows the STREAM: `stream_start` starts it and `stream_stop`
-ends it, as does a disconnect — which is the normal case for a wearable.
-`lifecycle.follows_stream` reports whether that is on, and
-`TOWER_SCENE_AUTOSTART=false` turns it off for an operator who wants
-manual control.
+explicit that opening a cartridge on the phone sends no verb. What it
+does send is a `result_subscribe` for `scene_understanding/live`, and
+since 2026-09-07 the session runs while **somebody is streaming AND
+somebody is watching**:
 
-A stop only ever ends what the stream started. A connection that never
-sent `stream_start` cannot end a session an operator began by hand.
+- the **stream** (`stream_start` … `stream_stop` or a disconnect) is the
+  feed. The last open stream closing stops the session **whoever started
+  it** — frames come from nowhere else.
+- a **watcher** (a live subscription) is the demand. A stream with no
+  watcher — a phone using World Builder's or the CV Lab's camera — leaves
+  the session `stopped`. The last watcher leaving (`result_unsubscribe`
+  or its socket closing) stops the session and releases the detector.
+- `POST /scene/start` is the **operator** path: it runs at once with or
+  without a stream, survives watchers leaving, and ends on
+  `POST /scene/stop` or on its last stream closing.
+
+`lifecycle.follows_stream` reports whether the stream-and-watcher rule is
+on; `TOWER_SCENE_AUTOSTART=false` leaves only the operator path.
+`lifecycle.demand` reports the rule's inputs as counts. No demand event
+resumes a Pause. A connection that never sent `stream_start` cannot end
+anything.
 
 All five answer `404` when the cartridge is not enabled. A `POST` that
 returned `200` and did nothing is how an operator comes to believe a
@@ -1131,6 +1143,8 @@ to tell "zero of these" from "this Tower did not say".
 | `loading_seconds` | float or null | non-null only while still loading |
 | `load_overdue` | bool | the load has exceeded `load_overdue_after_seconds`. **Not a failure** — nothing can interrupt a blocking model load, and a first-run weight download is slow and still correct |
 | `load_overdue_after_seconds` | float | `120.0` |
+| `follows_stream` | bool | whether the stream-and-watcher rule is on (§14.2) |
+| `demand` | object | why the session is or is not running: `demand.streams` (int, connections streaming frames), `demand.watchers` (int, live subscriptions), `demand.operator_hold` (bool, started by `POST /scene/start`), `demand.runs_when` (`"stream-and-watcher-or-operator"`). Counts only, never a token; volatile, so a subscriber joining does not mint an envelope |
 
 **Freshness and flow**
 
@@ -1164,7 +1178,7 @@ any large display. The list is fixed at build time and is what keeps
 | `counts` | `{label: int}` or null | one entry per `reported_classes`, present at `0` rather than omitted |
 | `count_basis` | `"confirmed-tracks"` | counts come from the tracker, never from raw detections |
 | `count_is_lower_bound` | bool, always `true` | see §14.4 |
-| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `noise-classes`, `departure-lag`, `field-of-view` |
+| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `people-count-accuracy`, `departure-lag`, `field-of-view` |
 
 > **All five ship, unconditionally.** This row listed three until
 > 2026-08-27, omitted the noise-class disclosure entirely, and described
@@ -1254,8 +1268,25 @@ are withheld with a reason (`facing_states_withheld_reason`): a
 per-person facing state narrows to one person's orientation the moment
 only one person is in view.
 
-**`lifecycle.follows_stream`** — whether `stream_start` starts this
-session and `stream_stop` ends it. See §14.2.
+**People, since 2026-09-07.** `people` also carries
+`partial_bottom_edge` (int) with `partial_bottom_edge_note` — person
+boxes cut off by the bottom edge with no head region, most often the
+wearer's own body, kept out of `count`; `by_apparent_size` with buckets
+`large`, `medium`, `small`, `unknown` and `apparent_size_note` — sizes
+in the picture, never distances; and `orientation_method` (string or
+null), `orientation_status` (`"experimental"`) and
+`orientation_validation` (prose) — the facing stage is a face detector
+on each tracked person's box, validated only on COCO stills.
+`where` now includes `person` as side counts, and `where_excludes` is
+empty. `single_person_note` (top level, constant prose) states the one
+thing the aggregates cannot hide: with one person in view they describe
+that person while they are in view; a client must not store a sequence
+of payloads.
+
+**`lifecycle.follows_stream`** — whether a stream together with a
+watcher starts this session. See §14.2. **`lifecycle.demand`** — the
+counts that rule is evaluated over, so a client can tell "nobody is
+streaming" from "nobody is watching".
 
 **`relations`** — always `null`
 

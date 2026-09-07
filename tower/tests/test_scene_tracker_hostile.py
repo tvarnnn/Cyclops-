@@ -231,7 +231,7 @@ class TestOrientationMustHaveActuallyRun:
             def load(self):
                 return None
 
-            def estimate(self, frame_bgr):
+            def estimate(self, frame_bgr, boxes):
                 raise RuntimeError("bad weights")
 
             def release(self):
@@ -241,7 +241,7 @@ class TestOrientationMustHaveActuallyRun:
             FixedDetector([[_person((100, 80, 220, 320))]] * 20),
             TrackerPolicy(min_hits=2),
             clock=lambda: 0.0,
-            pose_estimator=_AlwaysFails(),
+            facing_estimator=_AlwaysFails(),
         )
         engine.load()
 

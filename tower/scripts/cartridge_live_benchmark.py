@@ -174,18 +174,18 @@ def _drive(session, frames, *, paced: bool, settle_s: float) -> dict:
     }
 
 
-def _scene_session(device: str, orientation: bool):
-    from tower.scene.detect import TorchvisionDetector
+def _scene_session(device: str, orientation: bool, detector: str = "auto"):
+    from tower.scene.detect import detector_for
     from tower.scene.engine import SceneEngine
     from tower.scene.live import SceneLive
 
     def make_engine():
         pose = None
         if orientation:
-            from tower.scene.orientation import TorchvisionPoseEstimator
+            from tower.scene.orientation import FaceVisibilityEstimator, model_path
 
-            pose = TorchvisionPoseEstimator(device=device)
-        return SceneEngine(TorchvisionDetector(device=device), pose_estimator=pose)
+            pose = FaceVisibilityEstimator(model_path())
+        return SceneEngine(detector_for(device, detector), facing_estimator=pose)
 
     return SceneLive(make_engine)
 
@@ -237,9 +237,14 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--device", default="cpu", help="scene detector device")
     parser.add_argument(
+        "--detector",
+        default="auto",
+        help="scene detector: auto (by device), ssdlite320, rtdetr_v2_r18, dfine_s, dfine_m",
+    )
+    parser.add_argument(
         "--orientation",
         action="store_true",
-        help="enable coarse facing (956 ms/call on CPU; off by default)",
+        help="enable coarse facing (face visibility on person boxes, ~9 ms a face)",
     )
     parser.add_argument(
         "--document-root",
@@ -318,7 +323,7 @@ def main(argv=None) -> int:
     }
 
     if args.cartridge in ("scene", "both"):
-        session = _scene_session(args.device, args.orientation)
+        session = _scene_session(args.device, args.orientation, args.detector)
         session.start()
         load_seconds = _await_running(session, args.load_timeout)
         try:

@@ -102,10 +102,9 @@ NOT_OFFERED: tuple[dict, ...] = ()
 # refusal on the socket cannot drift into two different explanations of
 # one configuration.
 SCENE_DISABLED_REASON = (
-    "Scene Understanding is not enabled on this Tower "
-    "(TOWER_SCENE_UNDERSTANDING is unset or off), so no session can be "
-    "started and there is no live scene to read. This build implements "
-    "the contract"
+    "Scene Understanding is switched off on this Tower "
+    "(TOWER_SCENE_UNDERSTANDING is off), so no session can be started and "
+    "there is no live scene to read. This build implements the contract"
 )
 
 # Names TOWER_DOCUMENT_ROOT even though the root has had a managed

@@ -1,177 +1,190 @@
-"""Which way is that person facing -- and never, which way are they looking.
+"""Does that person appear to be facing the wearer -- and never, are they looking.
 
 `07-PLATFORM-CONSTRAINTS.md` Limitation 8: the camera cannot establish
 that anyone looked at, noticed or read anything, and there is no eye
-tracking on this hardware. What it CAN see is coarse orientation, and the
-two are not the same. A person squarely facing the wearer may be reading
-something over their shoulder.
+tracking on this hardware. What it CAN see is whether the front of a
+person's head is visible, and that is the whole claim this module makes.
 
-So the state is `toward_wearer`, the property is
-`appears_facing_wearer`, and there is deliberately no value meaning
-"looking at you".
+So the state is `toward_wearer`, the property is `appears_facing_wearer`,
+and there is deliberately no value meaning "looking at you".
 
-**The evidence.** COCO keypoints include `left_eye`, `right_eye`,
-`left_ear`, `right_ear`, and their VISIBILITY pattern is genuine
-orientation evidence:
+THE SIGNAL IS A FACE, VISIBLE, INSIDE A PERSON BOX
 
-    both ears + both eyes visible   -> facing toward the camera
-    both ears, neither eye          -> facing away
-    one ear                         -> profile
-    nothing                         -> unknown, and say so
+A face detector (`cv2.FaceDetectorYN`, the vendored YuNet model that
+World Builder already uses for redaction) is run on the upper part of
+each tracked person's box. A face found with a high score means the
+front of that head is towards the camera; anything else -- no face, a
+weak face, a box too small to hold one -- means the orientation is
+**not established**, and is published as `unknown`.
 
-**The cost, measured on real frames, and why the device is the whole
-story.** Warm medians over 754 corpus frames at 360x640, decode excluded,
-`torch.cuda.synchronize()` bracketing every CUDA call
-(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
+There are deliberately only two answers. "Facing away" and "side-on" are
+not produced, because nothing measured here can produce them with usable
+precision (see below), and a positive claim with 0.02-0.34 precision is
+worse than no claim.
 
-                              CUDA        CPU
-    ssdlite320 detection     30.4 ms    32.9 ms
-    keypointrcnn_resnet50    43.4 ms   956.4 ms      <- 22.0x
-    keypointrcnn p95         50.6 ms  1112.8 ms
+WHY NOT KEYPOINTS. The first version of this module inferred facing from
+which COCO keypoints a `keypointrcnn_resnet50_fpn` reported as visible
+(both eyes and an ear -> toward, both ears and no eye -> away, one ear ->
+profile). Validated on 2026-09-07 against 966 human-labelled persons
+from COCO val2017 (`Glasses-scratch/scene-understanding-v1/orientation/`,
+GT derived from the annotators' own visibility flags) it called 220 of
+228 true-profile people `toward`: the keypoint model reports a confident
+score and a plausible coordinate for an OCCLUDED eye, so score-thresholded
+"visibility" does not track human visibility exactly where it matters.
+`toward` precision was 0.56-0.62 across every threshold swept, and the
+`away`/`profile` states were 0.02-0.34 precise -- wrong more often than
+right. The same evaluation gave YuNet-in-person-box, at a face score of
+0.9, **0.83 precision / 0.64 recall for `toward`**, at 9 ms per face on
+CPU with no VRAM against 43 ms per frame on CUDA (956 ms on CPU) for the
+keypoint model. A landmark-yaw refinement and a keypoint+face AND
+combination were both measured and added nothing over raising YuNet's
+own threshold.
 
-    delivered frame interval 83.5 ms (12.0 fps, from the corpus journals)
-    orientation / interval      0.52x     11.5x
+WHAT THAT VALIDATION IS NOT. COCO stills are third-party photography:
+front-lit, in focus, no motion blur, and 47% of eligible people face the
+camera because photographers point cameras at faces. The precision above
+is anchored to that base rate and is an UPPER BOUND for a glasses camera
+in a room where most people are not looking at the wearer. The corpus on
+this host contains no bystander at all (2026-09-07 audit, 45,594 frames),
+so nothing here is validated on this camera. The feature ships as
+EXPERIMENTAL, its confidence is capped at MEDIUM, and the wire says so.
 
-**Every figure this module used to quote was wrong**, and wrong in a way
-that mattered: 744 ms (here and in five other files), 798 ms (in the
-module doc), "23x the detector", "2.5x the ~300 ms interval". They were
-CPU numbers from synthetic input, none of them named a device, and the
-real interval is 83.5 ms rather than 300 ms. On CUDA the detector is
-launch-bound and gains almost nothing from the GPU, so orientation is
-**1.43x** the detector, not 24x; on CPU it is 29.1x. The ratio inverts
-entirely depending on where it runs, which is why the device is now
-stated everywhere the cost is.
+PRIVACY. The face detector's output -- a box, a score and five landmark
+coordinates -- is read, reduced to one boolean per person box, and
+discarded. No crop is kept, no embedding is computed, and the score
+itself never reaches a track or the wire. `test_scene_understanding_
+persists_nothing` walks this file.
 
-Cost is flat in the number of people -- ~1 ms each, 40.0 ms at zero to
-44.3 ms at four -- because the ResNet-50 + FPN backbone runs once
-regardless. A crowded room does not change the budget.
-
-**So it still runs at a cadence**, now ~250 ms rather than 2.0 s (see
-`engine.ORIENTATION_INTERVAL_S` for the arithmetic), and **every estimate
-still carries its age**. The age is not cadence bookkeeping that CUDA
-made redundant: `TorchvisionPoseEstimator` defaults to `device="cpu"`,
-where a call is 11.5x the frame interval and every word of the original
-argument still holds, and `age_estimate`'s clamp guards a clock bug that
-has nothing to do with speed at all.
-
-**The old unblocker is spent.** This module used to say torch was
-CPU-only on this host and that a restored CUDA build was what would
-change the decision. That build exists -- `torch 2.13.0+cu132`, verified
-executing on an RTX 5070 (Blackwell, sm_120), 988 MB reserved of 12 GB --
-and the numbers above are from it. The question is measured and closed.
-
-**What is still NOT measured is accuracy.** There is no bystander footage
-on this host; the corpus's person boxes are almost certainly the wearer's
-own torso (median 21.5% of frame, bottom edge 0.939, 43% frame-clipped).
-`facing_from_keypoints` remains entirely unvalidated against ground
-truth. Nothing above is evidence that orientation *works* -- only that it
-costs 43 ms.
+TEMPORAL VOTING. One frame's face detection is one vote. The engine
+publishes `toward_wearer` for a track only when a majority of its last
+`VOTE_WINDOW` estimates agree (see `vote`), so a single flash of a face
+in one frame is not a claim, and a person turning away stops being
+"facing" within two estimates rather than one. Every estimate still
+carries its age and expires (`age_estimate`): a person who turned around
+six seconds ago is not described by a six-second-old reading.
 """
 
 import logging
+from dataclasses import replace
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from tower.confidence import Confidence
 from tower.scene.records import (
-    FACING_AWAY,
-    FACING_PROFILE,
     FACING_TOWARD,
     FACING_UNKNOWN,
+    BoundingBox,
     FacingEstimate,
 )
 
 logger = logging.getLogger(__name__)
 
-# torchvision's COCO keypoint order.
-KEYPOINT_NAMES = (
-    "nose",
-    "left_eye",
-    "right_eye",
-    "left_ear",
-    "right_ear",
-    "left_shoulder",
-    "right_shoulder",
-    "left_elbow",
-    "right_elbow",
-    "left_wrist",
-    "right_wrist",
-    "left_hip",
-    "right_hip",
-    "left_knee",
-    "right_knee",
-    "left_ankle",
-    "right_ankle",
-)
+# The vendored YuNet weights. The same file World Builder's redaction
+# loads, resolved the same way, so a Tower has one face model or none.
+DEFAULT_MODEL_PATH = Path("models") / "face_detection_yunet_2023mar.onnx"
 
-# A keypoint below this score is not visible. Keypoint models emit a
-# coordinate for every joint whether or not they can see it, so without a
-# threshold "visible" would mean "predicted", which is not the same thing
-# at all and would make every person appear to be facing the camera.
-MIN_KEYPOINT_SCORE = 3.0
+# A face scoring below this is not evidence the front of the head is
+# visible. 0.9, from the 2026-09-07 sweep: 0.6 gives 0.63 precision, 0.8
+# gives 0.69, 0.9 gives 0.83 -- and recall falls from 0.94 to 0.64 over
+# the same range. The product says "facing your direction" out loud, so
+# it buys precision with recall, and says `unknown` for the rest.
+FACE_SCORE_THRESHOLD = 0.9
+
+# YuNet's own NMS and candidate cap. The candidate cap is small because
+# one person box holds at most a face or two.
+NMS_THRESHOLD = 0.3
+TOP_K = 50
+
+# Only the top of a person box can hold that person's head. Cropping to
+# it halves the pixels the detector sees and, more importantly, keeps a
+# second person's face lower in a tall overlapping box from being
+# counted as this one's.
+HEAD_REGION_FRACTION = 0.6
+
+# YuNet is trained for faces larger than a distant head at 360x640. A
+# crop shorter than this is upscaled by `UPSCALE` before detection, which
+# is what World Builder's redaction measured as the difference between
+# finding and missing a 20-32 px face.
+UPSCALE_BELOW_PX = 160
+UPSCALE = 2
+
+# A person box shorter than this cannot hold a face the detector can
+# resolve even upscaled. Its orientation is unknown, and the estimate
+# says why.
+MIN_PERSON_HEIGHT_PX = 48
 
 # How stale an estimate may be before it is reported as unknown rather
 # than as an answer. Generous, because orientation is slow-moving -- but
 # finite, because a person who turned around ten seconds ago is not
-# described by a ten-second-old estimate. Unchanged by the CUDA
-# measurement: expiry is about how fast a PERSON turns, not how fast the
-# model runs, and 6.0 s is ~24 cadence windows either way.
+# described by a ten-second-old estimate. 6.0 s is ~24 cadence windows.
 MAX_ESTIMATE_AGE_S = 6.0
 
+# Temporal voting: `toward` needs at least `VOTE_NEEDED` of the last
+# `VOTE_WINDOW` per-track estimates to be `toward`. 2 of 3 at the
+# engine's ~250 ms cadence means a claim needs about half a second of
+# agreeing evidence and drops about half a second after it stops.
+VOTE_WINDOW = 3
+VOTE_NEEDED = 2
 
-def facing_from_keypoints(scores_by_name: dict) -> FacingEstimate:
-    """Coarse facing from which facial keypoints are visible.
+# Why an estimate is what it is. On the estimate, never on the wire.
+EVIDENCE_FACE = "face-visible"
+EVIDENCE_NO_FACE = "no-face-found"
+EVIDENCE_WEAK_FACE = "face-below-threshold"
+EVIDENCE_TOO_SMALL = "box-too-small"
+EVIDENCE_NONE = "none"
 
-    Confidence is deliberately never HIGH. This is a visibility heuristic
-    over an inference, two layers away from a measurement, and the brief
-    is explicit that "looking at me" must not be claimed from weak
-    evidence. MEDIUM is the ceiling.
+
+def estimate_from_face(
+    face_score: float | None,
+    *,
+    too_small: bool = False,
+    threshold: float = FACE_SCORE_THRESHOLD,
+) -> FacingEstimate:
+    """One person box's estimate, from whether a face was found in it.
+
+    Confidence is deliberately never HIGH. This is a detector's score
+    over a crop, two layers away from a measurement, validated on stills
+    from a different camera; MEDIUM is the ceiling.
     """
-    eyes = sum(
-        1
-        for name in ("left_eye", "right_eye")
-        if scores_by_name.get(name, 0.0) >= MIN_KEYPOINT_SCORE
-    )
-    ears = sum(
-        1
-        for name in ("left_ear", "right_ear")
-        if scores_by_name.get(name, 0.0) >= MIN_KEYPOINT_SCORE
-    )
-    nose_visible = scores_by_name.get("nose", 0.0) >= MIN_KEYPOINT_SCORE
-
-    if eyes == 0 and ears == 0:
-        return FacingEstimate(state=FACING_UNKNOWN, confidence=Confidence.UNKNOWN)
-
-    if eyes == 2 and ears >= 1:
-        # Both eyes AND an ear: the front of the head is toward us.
+    if too_small:
         return FacingEstimate(
-            state=FACING_TOWARD,
-            confidence=Confidence.MEDIUM,
-            visible_eyes=eyes,
-            visible_ears=ears,
+            state=FACING_UNKNOWN,
+            confidence=Confidence.UNKNOWN,
+            evidence=EVIDENCE_TOO_SMALL,
         )
-    if eyes == 0 and ears == 2:
-        # Both ears, neither eye, no nose: the back of the head.
+    if face_score is None:
         return FacingEstimate(
-            state=FACING_AWAY,
-            confidence=Confidence.MEDIUM if not nose_visible else Confidence.LOW,
-            visible_eyes=eyes,
-            visible_ears=ears,
+            state=FACING_UNKNOWN,
+            confidence=Confidence.UNKNOWN,
+            evidence=EVIDENCE_NO_FACE,
         )
-    if ears == 1:
+    if face_score < threshold:
         return FacingEstimate(
-            state=FACING_PROFILE,
-            confidence=Confidence.LOW,
-            visible_eyes=eyes,
-            visible_ears=ears,
+            state=FACING_UNKNOWN,
+            confidence=Confidence.UNKNOWN,
+            evidence=EVIDENCE_WEAK_FACE,
         )
-    # One eye and two ears, or two eyes and no ear: real but ambiguous.
-    # LOW rather than a coin flip between toward and away.
     return FacingEstimate(
-        state=FACING_PROFILE if eyes <= 1 else FACING_TOWARD,
-        confidence=Confidence.LOW,
-        visible_eyes=eyes,
-        visible_ears=ears,
+        state=FACING_TOWARD,
+        confidence=Confidence.MEDIUM,
+        evidence=EVIDENCE_FACE,
     )
+
+
+def vote(history: tuple, latest: FacingEstimate) -> FacingEstimate:
+    """The estimate a track may publish, from its recent raw estimates.
+
+    `history` is the track's last raw states, oldest first, NOT including
+    `latest`. Returns `toward` if a majority of the window (latest
+    included) is `toward`; otherwise an unknown estimate that keeps the
+    latest evidence, so a consumer can still see why.
+
+    A single `toward` in a window of unknowns is a flash, not a claim.
+    """
+    window = (*history, latest.state)[-VOTE_WINDOW:]
+    if window.count(FACING_TOWARD) >= VOTE_NEEDED:
+        return replace(latest, state=FACING_TOWARD, confidence=Confidence.MEDIUM)
+    return replace(latest, state=FACING_UNKNOWN, confidence=Confidence.UNKNOWN)
 
 
 def age_estimate(estimate: FacingEstimate, seconds: float) -> FacingEstimate:
@@ -184,141 +197,170 @@ def age_estimate(estimate: FacingEstimate, seconds: float) -> FacingEstimate:
     Clamped at zero, matching `Track.age_seconds`. Timestamps come from
     the capture journal and are wall clock: a backward NTP step produced a
     NEGATIVE age, which quietly pushed the expiry deadline further into
-    the future -- the one direction it must never move.
-
-    That clamp is a CLOCK guard, not a latency guard. It is the reason
-    this function survives independently of how fast the pose model is:
-    a GPU that made orientation free would not make a backward NTP step
-    any less able to defer an expiry forever.
+    the future -- the one direction it must never move. That clamp is a
+    CLOCK guard, not a latency guard, and survives any change of model.
     """
-    from dataclasses import replace
-
     seconds = max(seconds, 0.0)
     if seconds > MAX_ESTIMATE_AGE_S:
         return FacingEstimate(
             state=FACING_UNKNOWN,
             confidence=Confidence.UNKNOWN,
             age_seconds=seconds,
+            evidence=estimate.evidence,
         )
     return replace(estimate, age_seconds=seconds)
 
 
 @runtime_checkable
-class PoseEstimator(Protocol):
-    """Anything that can produce per-person keypoint scores for a frame."""
+class FacingEstimator(Protocol):
+    """Anything that can say, per person box, whether a face is visible.
+
+    `estimate` takes the frame and the boxes the TRACKER is asking about,
+    and returns one `FacingEstimate` per box in the same order. The
+    detector decides what exists; this stage only describes it. Boxes
+    are asked for rather than discovered so two models cannot disagree
+    about how many people there are.
+    """
 
     name: str
 
     def load(self) -> None: ...
 
-    def estimate(self, frame_bgr) -> list[tuple]: ...
+    def estimate(self, frame_bgr, boxes: list) -> list: ...
 
     def release(self) -> None: ...
 
 
-class FixedPoseEstimator:
-    """Returns keypoint scores the caller chose. For tests.
+class FixedFacingEstimator:
+    """Returns the estimates the caller chose, matched to boxes by IoU.
 
-    Each entry is `(BoundingBox, {keypoint_name: score})`, which is the
-    same shape the real estimator produces -- so a test asserts against
-    visibility patterns it wrote down rather than against a model's
-    opinion.
+    Each entry in `frames` is one call's answer: a list of
+    `(BoundingBox, FacingEstimate)`. A requested box takes the estimate
+    of the first entry overlapping it at IoU >= 0.25, else an unknown
+    with `EVIDENCE_NO_FACE` -- the same shape the real estimator
+    produces, so a test asserts against a state it wrote down rather
+    than a model's opinion. The last entry repeats once exhausted.
     """
 
     name = "fixed"
 
     def __init__(self, frames=None) -> None:
-        self._frames = list(frames or [])
+        self._frames = [list(frame) for frame in (frames or [])]
         self.calls = 0
+        self.asked: list = []
 
     def load(self) -> None:
         return None
 
-    def estimate(self, frame_bgr) -> list[tuple]:
+    def estimate(self, frame_bgr, boxes: list) -> list:
         self.calls += 1
+        self.asked.append(list(boxes))
         if not self._frames:
-            return []
-        return list(self._frames[min(self.calls - 1, len(self._frames) - 1)])
+            answers = []
+        else:
+            answers = self._frames[min(self.calls - 1, len(self._frames) - 1)]
+        out = []
+        for box in boxes:
+            found = None
+            for answer_box, estimate in answers:
+                if box.iou(answer_box) >= 0.25:
+                    found = estimate
+                    break
+            out.append(found if found is not None else estimate_from_face(None))
+        return out
 
     def release(self) -> None:
         return None
 
 
-class TorchvisionPoseEstimator:
-    """`keypointrcnn_resnet50_fpn`, and its cost is the device.
+class FaceVisibilityEstimator:
+    """YuNet, on the head region of each person box. CPU, ~9 ms a face.
 
-    43.4 ms warm median on CUDA, 956.4 ms on CPU, over real corpus
-    frames. **The default is `cpu`**, so the default is the expensive
-    one -- deliberately, because a caller that wants the GPU should have
-    to say so rather than discover it is holding one.
-
-    The first call costs 623.5 ms on CUDA, 14x the warm median, while
-    kernels compile and autotune. Anything that times a single call to
-    decide whether orientation is affordable will be wrong by an order
-    of magnitude, in the same direction this module's documentation was
-    wrong for months.
+    Loads lazily, from the vendored model file, and refuses to construct
+    without it: a Tower with no face model has no orientation stage, and
+    the engine reports `orientation_enabled: false` rather than guessing.
     """
 
-    name = "keypointrcnn"
+    name = "yunet-face-visibility"
 
-    def __init__(self, min_person_score: float = 0.7, device: str = "cpu") -> None:
-        self._min_person_score = min_person_score
-        self._device = device
-        self._model = None
-        self._transform = None
+    def __init__(
+        self,
+        path=None,
+        *,
+        score_threshold: float = FACE_SCORE_THRESHOLD,
+        min_person_height_px: int = MIN_PERSON_HEIGHT_PX,
+    ) -> None:
+        self._path = Path(path) if path is not None else DEFAULT_MODEL_PATH
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"no face model at {self._path.as_posix()}; orientation "
+                "needs the vendored YuNet weights"
+            )
+        self._score_threshold = score_threshold
+        self._min_height = min_person_height_px
+        self._detector = None
+        self._size = None
 
     def load(self) -> None:
-        import torch
-        from torchvision.models.detection import keypointrcnn_resnet50_fpn
-        from torchvision.models.detection.keypoint_rcnn import (
-            KeypointRCNN_ResNet50_FPN_Weights,
+        import cv2
+
+        # Constructed at a nominal size; every call re-sizes to its crop.
+        # YuNet's own score floor is set low here and the threshold is
+        # applied in `estimate_from_face`, so the constant that decides
+        # the claim is the one this module documents.
+        self._detector = cv2.FaceDetectorYN.create(
+            str(self._path), "", (320, 320), 0.5, NMS_THRESHOLD, TOP_K
         )
+        self._size = (320, 320)
 
-        weights = KeypointRCNN_ResNet50_FPN_Weights.COCO_V1
-        model = keypointrcnn_resnet50_fpn(weights=weights)
-        model.eval()
-        self._torch_device = torch.device(self._device)
-        model.to(self._torch_device)
-        self._model = model
-        self._transform = weights.transforms()
-
-    def estimate(self, frame_bgr) -> list[tuple]:
-        import numpy as np
-        import torch
-
-        from tower.scene.records import BoundingBox
-
-        if self._model is None:
+    def estimate(self, frame_bgr, boxes: list) -> list:
+        if self._detector is None:
             self.load()
+        height, width = frame_bgr.shape[:2]
+        return [self._one(frame_bgr, width, height, box) for box in boxes]
 
-        rgb = frame_bgr[:, :, ::-1]
-        tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)
-        batch = [self._transform(tensor).to(self._torch_device)]
-        with torch.inference_mode():
-            prediction = self._model(batch)[0]
+    def _one(self, frame_bgr, width: int, height: int, box: BoundingBox) -> FacingEstimate:
+        import cv2
 
-        boxes = prediction["boxes"].detach().cpu().numpy()
-        scores = prediction["scores"].detach().cpu().numpy()
-        keypoint_scores = prediction["keypoints_scores"].detach().cpu().numpy()
+        x0 = int(max(box.x0, 0))
+        x1 = int(min(box.x1, width))
+        y0 = int(max(box.y0, 0))
+        y1 = int(min(box.y0 + box.height * HEAD_REGION_FRACTION, height))
+        if box.height < self._min_height or x1 - x0 < 8 or y1 - y0 < 8:
+            return estimate_from_face(None, too_small=True)
 
-        people = []
-        for box, score, per_keypoint in zip(boxes, scores, keypoint_scores):
-            if score < self._min_person_score:
-                continue
-            named = {
-                name: float(value)
-                for name, value in zip(KEYPOINT_NAMES, per_keypoint)
-            }
-            people.append(
-                (BoundingBox(*(float(value) for value in box)), named)
+        crop = frame_bgr[y0:y1, x0:x1]
+        if crop.shape[0] < UPSCALE_BELOW_PX:
+            crop = cv2.resize(
+                crop,
+                (crop.shape[1] * UPSCALE, crop.shape[0] * UPSCALE),
+                interpolation=cv2.INTER_CUBIC,
             )
-        return people
+        size = (crop.shape[1], crop.shape[0])
+        if size != self._size:
+            self._detector.setInputSize(size)
+            self._size = size
+
+        _, faces = self._detector.detect(crop)
+        if faces is None or len(faces) == 0:
+            return estimate_from_face(None)
+        # The strongest face in this head region, and only its score.
+        # Landmarks and box are discarded here; nothing below this line
+        # ever sees them.
+        best = max(float(face[14]) for face in faces)
+        return estimate_from_face(best, threshold=self._score_threshold)
 
     def release(self) -> None:
-        was_cuda = self._device.startswith("cuda")
-        self._model = None
-        self._transform = None
-        if was_cuda:
-            import torch
+        self._detector = None
+        self._size = None
 
-            torch.cuda.empty_cache()
+
+def model_path() -> Path | None:
+    """Where the face model is, or None. The same rule as redaction."""
+    import os
+
+    override = os.environ.get("TOWER_FACE_REDACTION_MODEL")
+    if override:
+        path = Path(override)
+        return path if path.exists() else None
+    return DEFAULT_MODEL_PATH if DEFAULT_MODEL_PATH.exists() else None
