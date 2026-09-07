@@ -433,7 +433,24 @@ config, gate, identity, segments, live, search, dwell, engine, hostile,
 retrieval, store, wire e2e, privacy, CLI, contracts-documented, result
 channel protocol/hostile, architecture boundaries — **all pass**. The opt-in
 real-OCR suite (`TOWER_RUN_MODEL_TESTS=1 tests/test_document_ocr_integration.py`)
-passes, 14 tests, now on CUDA. Full suite: FULL_SUITE_RESULT.
+passes, 14 tests, now on CUDA.
+
+**Full suite.** One pytest process over `tests/` is killed by this
+machine's memory guard partway through (three attempts, each stopped by
+the harness at "low memory" or stalled), so it was run as eleven
+eight-file chunks and then one process per file for the remainder,
+`-m "not slow"`, `test_document_ocr_integration.py` deselected (opt-in).
+Result across every file: **3,554 passed, 52 skipped, 11 failed, 1
+timed out** — and every one of the twelve was this lane's doing and is
+fixed in `7ba52b3` and `10edccb`: nine wire/privacy/contract tests wrote
+a fixture stamped in 1970 that the now-honoured 30-day window correctly
+hid (fixture records at the current time); one torchless-host test found
+a Document Memory session constructed on a host that could not run it
+(the capability check now wants torch too); one isolation test
+subscribed to Document Memory expecting "unavailable" and waited forever
+because a stock Tower now offers it (the test switches the cartridge
+off). Each of those files re-run green afterwards; no failure outside
+this lane's own changes was found.
 
 **Skipped and why:** `test_document_detect_corpus.py` (24) needs
 `tower/data/captures/` which lives only in the canonical checkout, so it is
@@ -509,11 +526,16 @@ and conformance as far as reading can establish.
   the concurrent `fix/object-memory-runtime-v1` lane uses; the two lanes
   touch no common file except `docs/contracts/TOWER-UNIFIED-CARTRIDGES.md`
   and `tower/tower/main.py`, both in disjoint hunks)
-- **Final HEAD:** FINAL_HEAD
+- **Final HEAD:** the commit that adds this file, on top of `10edccb`
+  (the last code commit). `git log --oneline 6beaf57..feature/document-memory-v1`
+  lists them all.
 - **Commits:** `8c909c1` foundation (root, gate, GPU OCR, sightings, search,
   contracts); `cf99b05` tests and the two defects they found; `baced41`
   replay benchmark and its refinements; `f728e88` iOS [BUILD UNVERIFIED];
-  plus the review follow-up and this handoff.
+  `218fa23` the review's findings, fixed; `7ba52b3` the wire fixture
+  records under the retention window; `10edccb` the capability check
+  wants torch, the isolation test switches the cartridge off; then this
+  handoff.
 - **Major files:** `tower/tower/document_memory/{gate,identity}.py` (new),
   `{dwell,engine,live,ocr,records,store,retrieval}.py`,
   `tower/tower/results/{document_memory,contracts,registry,__init__}.py`,
