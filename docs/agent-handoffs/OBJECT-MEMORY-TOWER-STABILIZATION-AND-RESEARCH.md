@@ -269,17 +269,72 @@ fix merely made this path reachable for owlv2 workers.
 
 ## 5. Custom / user-teachable object research
 
-**In progress.** A research+prototype agent is building an evidence-backed
-architecture recommendation and a prototype benchmarked on real crops
-extracted (read-only) from the canonical captures, under
-`Glasses-scratch\om-runtime\teachable\`. This section will be completed
-from its findings: the embedding/instance-recognition approach chosen and
-why, the rejected alternatives, the same-instance-vs-different-instance
-separation measured on our footage (clearly split into labelled and
-exploratory results), enrollment/persistence/privacy design, and the
-honest limits. Ground-truth discipline is a hard constraint: no instance-
-identity labels exist in the data, so any identity claim states how it was
-established.
+Full record: `tower/docs/superpowers/research/2026-09-07-teachable-object-
+instance-recognition.md` (in-tree, carries the decision); runnable prototype
+and raw artifacts in `Glasses-scratch\om-runtime\teachable\`.
+
+**Architecture selected** (evidence-backed, on our footage): `existing
+ssdlite320 detector → crop (face-filtered) → frozen DINOv2-small 384-d
+embedding → multi-view prototype gallery (3–5 pose-diverse enrollment views)
+→ nearest-prototype cosine match → calibrated distance threshold (~0.48) → a
+confidence-scored, human-confirmed claim`. Enrollment encodes a few crops
+(no retrain); a profile is embeddings + a mean prototype + optional owned
+crops; deletion drops the vectors. Persistence is a new `identity/` sibling
+to `object_memory/` under its own dated contract that does not touch
+`object_memory.observations/2026-08-26`, so the observation stream stays
+`category-not-instance` and identity is added only as a probabilistic
+association. It is few-shot, incremental, and cheap: 1.5 KB/vector, 2.1
+ms/crop GPU / 17.5 ms/crop CPU, 331 MB VRAM — it fits Tower's budget on CPU
+alone.
+
+**Rejected, with measured reasons:** OWLv2 image embeddings (the vision
+pooler COLLAPSES — mean pairwise cosine distance 9.6e-6 over 531 crops — and
+is 50× slower / 20× more VRAM; OWLv2 stays a category verifier); full
+fine-tuning / per-object heads (breaks incremental add, too few examples);
+pure local-feature matching as the recall engine (precise when it fires,
+45-vs-4 median good matches, but misses 25% of same-object pairs and is ~0
+on textureless objects — right role is an optional geometric verifier for an
+auto-confirm band); CLIP backbone (semantic-category bias, the wrong axis);
+open-vocab-only for identity.
+
+**Benchmark on real crops (531 crops from the 116 records; labels assigned
+by eye from montage sheets, tiered by identity-evidence and flagged):**
+
+| Measurement (DINOv2-small) | Value |
+|---|---|
+| CLEAN same-sighting vs different-object AUC | 0.81 |
+| Held-out enrolled view, 1 → 3 views AUC | 0.94 → 0.97 |
+| Cross-session re-ID (same device, different capture) AUC | ~0.69–0.80 |
+| macbook-laptop vs external monitor (genuine two-display) AUC | 0.89 |
+| 3-class device leave-one-out 1-NN purity | 0.85 |
+| Operating point at threshold ~0.48 (k=3) | TPR 0.80 @ FPR 0.34 |
+
+Labelled-vs-exploratory is kept strict: the same-sighting tier is verified
+(temporal continuity of one recording); the cross-session re-ID tier is
+inferred from one-home/one-device continuity and flagged as such; negatives
+are always a different true-object across categories, so the embedding
+cannot key on "is this a glowing dark screen".
+
+**Honest limits (the three that matter most):**
+1. **Cross-session re-ID is only moderate** (AUC ~0.80; one in three
+   different objects crosses the threshold). Viable as suggest-and-confirm /
+   retrieval, NOT silent auto-identity. Small mass-produced look-alikes
+   (a phone, AirPods, a black Yeti) are the worst case — the product's own
+   examples.
+2. **The corpus has one laptop and one phone**, so "tell two similar
+   laptops apart" — the core promise — is untestable here; the 0.89
+   macbook-vs-monitor figure is a proxy, not proof for same-model
+   distractors. This is the production gate.
+3. **Small, blurry, screen-dominated 360×640 crops:** the "object" is often
+   a glowing screen whose content changes between sightings, so the
+   embedding partly keys on transient screen content; ~30% of `laptop`
+   detector boxes were not laptops, so a crop-quality/category gate is
+   mandatory upstream.
+
+Ground-truth discipline held throughout: no instance-identity labels exist
+in the data; every identity claim states how it was established, and no
+visually-similar crop was asserted to be the same physical object without
+evidence.
 
 ---
 
@@ -339,22 +394,49 @@ labels are 94 positional *category* crop verdicts in an older benchmark
 passed + 1 gated; serve_loop 1 passed + 1 xfail; transport 34 passed;
 lifecycle/capture-worker/graceful-stop 101 passed; result-channel + startup
 103 passed). The gated owlv2 test passes in ~18 s and was proven to fail
-without the fix. The full `tower/` suite was run at the end (see the commit
-trail / final verification); it must be run with a **short `--basetemp`**
-(`C:\Users\tvllo\AppData\Local\Temp\gf`) or World Builder's nested UUID
-tmp paths trip Windows MAX_PATH and manufacture phantom failures.
+without the fix. **The full `tower/` suite passes: 2586 passed, 75 skipped,
+2 xfailed, 0 failed in 502 s** (excluding the opt-in gated owlv2 test). It
+must be run with a **short `--basetemp`** (`C:\Users\tvllo\AppData\Local\
+Temp\gf`) or World Builder's nested UUID tmp paths trip Windows MAX_PATH and
+manufacture phantom failures.
 
 ---
 
 ## 10. Independent review
 
-Pending. Review perspectives to run before declaring complete: a Tower
-reviewer (can a client reset still poison the loop; is shutdown bounded on
-every path; is the copied accept closure faithful to 3.12), an Object
-Memory reviewer (can Start claim success before a consumer attaches; can
-Stop lose observations; can history masquerade as current), and an ML
-reviewer for the §5 lane (are instance labels valid; is the benchmark free
-of enrollment leakage). Findings and fixes will be recorded here.
+**An independent adversarial review of the three production commits ran and
+found four real issues, all fixed in `3435bdc`; the rest of the review
+confirmed the changes hold** (the copied accept closure is faithful to
+CPython 3.12.5, the `WebSocketDisconnect` fix matches Starlette's actual
+send-raises behaviour, `since` cannot hit a null `recorded_at`, the prewarm
+adds no BLAS/OpenMP risk, and the fast tests genuinely pin their contracts).
+
+The four findings and their fixes:
+1. **The exit-crash fix covered only the success path** — an exception from
+   `engine.load()` (CUDA OOM, a failed weights download) or the frame loop
+   finalized with the watcher still blocked, re-triggering the `0xC0000005`
+   and masking the real error; the docstring's justification was factually
+   wrong. `_run_and_exit` now hard-exits on every path (traceback + exit 1
+   on a real error, SystemExit code preserved, success unchanged), with
+   four new tests.
+2. **The resilient-loop test could pass vacuously** if the reset never
+   landed. It now also asserts the per-connection re-arm warning fired.
+3. **The re-arm logged per reset** (plus asyncio's "Task exception was never
+   retrieved" per reset), which a reconnect storm would flood. The warning
+   is throttled and the specific asyncio noise is suppressed narrowly.
+4. **A misleading `use_subprocess` docstring** was corrected.
+
+The ML-review lens for the §5 research (label validity, enrollment leakage,
+similar-instance negatives) was folded into synthesis rather than run as a
+separate agent (budget): labels are inspection-based and tiered with the
+inferred tier flagged, negatives are cross-category, and held-out-view AUC
+is reported apart from cross-session re-ID AUC. The one unresolved review
+point is that the hardest, most product-relevant case (similar same-category
+instances) is unmeasured because the corpus has one instance per category —
+which is stated as the production gate, §5.
+
+**Not reviewed:** the iOS composed lifecycle (unbuilt source), which the
+device run (§12) covers.
 
 ---
 
@@ -451,5 +533,15 @@ lines and any `asyncio`/traceback), the worker's stderr report block,
   ships upstream), and the field shutdown hang's exact stuck connection is
   proven by mechanism but not uniquely identified (both candidates take the
   same fix). The full multi-cartridge switch soak is owed to the device run.
-- **USER-TEACHABLE OBJECT MEMORY: IN PROGRESS** (§5) — architecture and
-  prototype under evaluation on real footage; verdict to follow.
+- **USER-TEACHABLE OBJECT MEMORY: PROTOTYPE ONLY (productionization
+  deferred, on the evidence).** The architecture is chosen and validated on
+  real footage — DINOv2-small crop embeddings + multi-view prototype +
+  calibrated threshold, with a working enroll/identify/delete prototype and
+  a full persistence/privacy design (§5). It is not wired into V1 and adds
+  no runtime dependency, deliberately: cross-session re-ID is only moderate
+  (AUC ~0.80, one-in-three false crossings), and the single-instance corpus
+  cannot test the core "tell two similar objects apart" promise at all. The
+  gate to production is a multi-instance, multi-home, ground-truthed eval
+  set plus a local-feature auto-confirm verifier; until then it would ship,
+  if built, as suggest-and-confirm, never silent auto-identity. This is a
+  decision on the evidence, not a deferral for want of one.
