@@ -118,11 +118,15 @@ def _await(client, want: str, timeout_s: float) -> tuple[dict, float]:
 
 
 def _drain(ws, until_type: str, limit: int = 200) -> dict:
+    seen = []
     for _ in range(limit):
         message = ws.receive_json()
         if message["type"] == until_type:
             return message
-    raise RuntimeError(f"no {until_type} in {limit} messages")
+        seen.append(message.get("type"))
+    from collections import Counter
+
+    raise RuntimeError(f"no {until_type} in {limit} messages; saw {dict(Counter(seen))}")
 
 
 def _drain_any(ws, until_types, limit: int = 200) -> dict:

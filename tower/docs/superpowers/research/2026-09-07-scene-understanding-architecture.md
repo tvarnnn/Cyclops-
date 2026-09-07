@@ -235,9 +235,16 @@ CUDA, RT-DETRv2-R18 + YuNet): decode 0.44 ms, **detector 14.9 ms median /
 reserved after the run (peak 217 MB allocated), 16.3 CPU cores (same
 OpenMP spin as the baseline; `TOWER_SCENE_TORCH_THREADS` still applies).
 
-Full-corpus replay and soak: see the handoff
-(`docs/agent-handoffs/SCENE-UNDERSTANDING-V1-RESEARCH-IMPLEMENTATION.md`),
-which carries the final numbers.
+Full-corpus replay (`results/replay_full_cuda_v2`, 45,594 frames, 74.1
+min): detector 18.0 ms med / 20.5 p95, observe 18.2 / 20.9, 51.7 fps
+unpaced, 14 CPU cores, VRAM 217 MB peak allocated; frames with a counted
+person 7,408 (15,957 before the v2 partial rule), count changes 100/min,
+tracks created 46/min, facing claims 0. Labelled fixture: person exact
+0.88, wearer-only frames still counting a person 7 of 49.
+
+Soak (`results/soak_20`, 20 cycles): STABLE — RSS +0.5 MB between thirds,
+VRAM 115 MB running / 34 MB stopped, stop ≤ 2.2 ms, warm start 488 ms.
+The handoff carries the cartridge-switch soak and the final suite.
 
 ## 8. What was rejected, and why
 
