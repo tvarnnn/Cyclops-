@@ -175,11 +175,28 @@ Every observation still within the retention window, **newest first** by
 | Query parameter | Type | Default | Meaning |
 |---|---|---|---|
 | `object_class` | string | *(none)* | Narrow to one class. Absent means all classes. |
+| `since` | float ≥ 0 | *(none)* | Only records the Tower **wrote** at or after this moment (`recorded_at >= since`). See below. |
 | `retention_days` | float ≥ 0 | *(none)* | Narrow the window this read may see. See §5. |
 
 `retention_days` below 0 is refused with **422** by the route rather than
 reaching the store, which raises `ValueError` on a negative window and would
-surface as a 500.
+surface as a 500. `since` below 0 is refused the same way.
+
+**`since` is how a client tells THIS recording's memories from history, and
+it exists because a physical run once recorded zero observations while the
+app kept showing 116 old ones — "nothing happened" and "everything is fine"
+were indistinguishable.** It is a Tower-receipt epoch second, the same clock
+a session's `started_at` is on (`GET /cartridges/object_memory/session`), so
+a client stamps the session start and passes it here to get exactly the
+records that recording created; an empty answer is then an honest empty
+answer. Omitting it returns the whole store, which is the historical view a
+wearer opts into separately. It filters on `recorded_at` (when the memory
+was written), never `observed_at` (capture-journal receipt time), because
+the former shares the session's clock and the latter would answer a subtly
+different question at the edge. The chosen value is **echoed** as `since` in
+the payload (`null` when absent), so the answer states which claim it is.
+This is an additive parameter and an additive field: the contract identifier
+is **unchanged**.
 
 ### 3.2 `GET /object-memory/last-seen/{object_class}`
 
@@ -213,7 +230,8 @@ class — see §1.
 
 | Field | Type | Notes |
 |---|---|---|
-| `observation_count` | integer | Length of `observations`. Counts what is **served**, which is what is within the clamped window — not what is on disk. |
+| `since` | float \| **null** | The `since` the request was filtered to, echoed. `null` means the whole store (history); a value means "records written at or after this", which is how a recording's own memories are told from history. §3.1. |
+| `observation_count` | integer | Length of `observations`. Counts what is **served**, which is what is within the clamped window and at or after `since` — not what is on disk. |
 | `observations` | array of observation | Newest first by `observed_at`. |
 
 ### 4.3 `GET /object-memory/last-seen/{object_class}` adds
