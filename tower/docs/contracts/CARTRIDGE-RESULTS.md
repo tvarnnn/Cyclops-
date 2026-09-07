@@ -1692,10 +1692,14 @@ something that is not a page.
 
 **`idle_stop_seconds` / `idle_stop_pending`.** A running session whose
 stream closed starts a timer; if no stream reopens within
-`idle_stop_seconds` the session stops itself, flushing as any Stop does,
-so a phone that disconnected for good does not leave ~1.4 GB of OCR
-model resident on a Tower whose next cartridge wants it. `idle_stop_pending`
-is true while that timer runs; a reconnect or a frame cancels it.
+`idle_stop_seconds` the session stops itself, so a phone that
+disconnected for good does not leave ~1.4 GB of OCR model resident on a
+Tower whose next cartridge wants it. Unlike a Stop a person presses, an
+idle stop does NOT read a dwell that was still open: that dwell ended
+when the stream did, and the Tower logs that it was dropped.
+`idle_stop_pending` is true while that timer runs; a reconnect or a
+frame cancels it. A Stop or Pause a person presses reads at most four
+frames of an open dwell, newest first.
 
 **`retention_incomplete`** is reported rather than logged: a deletion that
 quietly failed looks exactly like one that was kept.

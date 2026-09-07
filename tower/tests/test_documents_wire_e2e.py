@@ -56,9 +56,15 @@ def _write_one_document(root, lines=None, *, capture_id="capture-abc"):
     below assert on -- provenance, timing, confidence, page text -- is
     produced by the code that produces it in production.
     """
+    import time
+
     lines = lines or fx.TRANSFORMER_PAPER
     store = DocumentStore(root)
-    now = [1000.0]
+    # Recorded NOW, not at epoch 1000 s: since 2026-09-07 a read with no
+    # window of its own honours the Tower's 30-day retention, and a
+    # record from 1970 is, correctly, expired.
+    start = time.time() - 60.0
+    now = [start]
     engine = DocumentMemoryEngine(
         store,
         FixedTextRecogniser(pages=[fx.page_regions(lines)]),
@@ -67,7 +73,7 @@ def _write_one_document(root, lines=None, *, capture_id="capture-abc"):
         capture_id=capture_id,
     )
     for index, frame in enumerate(fx.document_frames(lines, 8)):
-        now[0] = 1000.0 + index * 0.3
+        now[0] = start + index * 0.3
         engine.observe(frame, received_at=now[0], source_seq=index)
     engine.flush()
     return store
