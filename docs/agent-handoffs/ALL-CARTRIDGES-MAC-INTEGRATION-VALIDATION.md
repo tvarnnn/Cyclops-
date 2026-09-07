@@ -634,7 +634,9 @@ this Tower.
 
 1. Start the Tower **once**, from the canonical checkout, with **no
    `TOWER_*` variables set beyond the existing `.env`:
-   `cd tower; .\scripts\start_tower.ps1`. Do not restart it again until step 40.
+   `cd tower; .\scripts\start_tower.ps1`. **Do not restart it again until
+   step 45**, which is the deliberate shutdown. Every step between here and
+   there runs on this one process: that is the product claim under test.
 2. Confirm in the boot log: the uvicorn line carries
    `--loop tower.serve_loop:resilient_loop_factory` and
    `--timeout-graceful-shutdown 10`; the world root prints **absolute** with no
@@ -763,11 +765,18 @@ this Tower.
     within a few seconds `GET /cartridges/object_memory/session` reads
     `stopped`, and starting a camera session from another cartridge attaches
     **no** object-memory producer. **This is §17.3 under test.**
-44. Stop the Tower with Ctrl-Break during a walk. **PASS:** the builder exits
-    within ~30 s with the session `interrupted`, and no `world_solve` process
-    is orphaned.
-45. Final: `/health` 200, port 8000 still listening, `Get-Process python`
-    shows no leftover worker, `nvidia-smi` back at the CUDA-context baseline.
+44. **The Tower is still healthy after all of it, and this is checked BEFORE
+    it is stopped.** `/health` 200; port 8000 still listening; `Get-Process
+    python` shows no leftover worker; `nvidia-smi` back at the CUDA-context
+    baseline; threads and working set not climbed across the whole campaign.
+    This is the "Tower starts once" claim, and it is the last thing that can
+    be asked of a running process.
+45. **Only now**, stop the Tower with Ctrl-Break, during a walk, so the
+    shutdown path is exercised rather than a quiet one. **PASS:** the builder
+    exits within ~30 s with its session `interrupted`, no `world_solve`
+    process is orphaned, and the shutdown does not hang — the bounded
+    graceful-shutdown timeout is under test here, and a hang is the failure it
+    was added to prevent.
 
 ### Telling a blocker from a V1 limitation
 
