@@ -247,6 +247,22 @@ VOLATILE_PATHS = (
     "lifecycle.demand.operator_hold",
 )
 
+# The one thing the aggregates cannot hide, stated rather than left to
+# be discovered. With exactly one person in view, `where.person`,
+# `by_apparent_size` and `facing_wearer` describe that one person --
+# which is the product question ("is there a person on my left, facing
+# me") and is what the wearer's own camera preview already shows. What
+# stays refused is what would make it a RECORD: no handle to join two
+# payloads, nothing persisted, a session-scoped `session_id` that
+# forbids comparison across sessions, and the client obligation
+# (§12 of the contract) never to store a sequence of these.
+SINGLE_PERSON_NOTE = (
+    "with one person in view the side, size and facing counts describe "
+    "that person for as long as they are in view. Nothing here is kept, "
+    "nothing joins two payloads, and a client must not store a sequence "
+    "of them; the phone's own camera preview shows the same and more"
+)
+
 # Why there is no entity list, as a value rather than an absence.
 #
 # `IOS-to-Tower.md` 4.1 asks for a session-scoped anonymous track handle
@@ -421,22 +437,21 @@ def _people_block(state) -> dict:
         ]
         oldest = max(ages) if ages else None
     elif state.orientation_enabled:
-        # Enabled, and every estimate has expired. `orientation_enabled`
-        # latches on ONE lifetime success, and an estimate ages out to
-        # unknown after 6 s -- so a pose model that succeeded once and
-        # then failed for good would have taken the branch above forever
-        # and published `facing_wearer: 0` while measuring nothing.
+        # Enabled, and no person currently has an established orientation.
+        # `orientation_enabled` latches on ONE lifetime success and an
+        # estimate ages out to unknown after 6 s -- so an estimator that
+        # succeeded once and then failed for good would have taken the
+        # branch above forever and published `facing_wearer: 0` while
+        # measuring nothing.
         #
-        # Zero is an answer. "Every estimate has expired" is not, and
-        # this is the one field on this payload where the difference is
-        # most likely to be mistaken for data.
+        # Zero is an answer. "Nothing is established" is not, and this is
+        # the one field on this payload where the difference is most
+        # likely to be mistaken for data. The reason says WHICH kind of
+        # not-established it is -- a reviewer found the first version
+        # asserting an expiry that had not happened for a person whose
+        # face was simply not found.
         facing = None
-        reason = (
-            "every person's orientation estimate has expired -- none was "
-            "refreshed within the 6 s the estimator's own staleness bound "
-            "allows. Reporting 0 would be an observation gap presented as "
-            "an observation of absence"
-        )
+        reason = _not_established_reason(people)
         oldest = max(
             (
                 track.facing.age_seconds
@@ -509,6 +524,33 @@ def _people_block(state) -> dict:
             "the wearer"
         ),
     }
+
+
+def _not_established_reason(people) -> str:
+    """Why no person has an established orientation, from their evidence."""
+    expired = sum(
+        1
+        for track in people
+        if track.facing.age_seconds is not None and track.facing.age_seconds > 6.0
+    )
+    never = sum(1 for track in people if track.facing_estimated_at is None)
+    looked = len(people) - expired - never
+    parts = []
+    if looked:
+        parts.append(
+            f"{looked} looked at and no face established (none found, too "
+            "weak, or the box too small)"
+        )
+    if never:
+        parts.append(f"{never} not yet estimated")
+    if expired:
+        parts.append(f"{expired} with an estimate older than the 6 s bound")
+    return (
+        "no person currently has an established orientation: "
+        + ", ".join(parts)
+        + ". Reporting 0 would be an observation gap presented as an "
+        "observation of absence"
+    )
 
 
 def _lifecycle_block(status: dict) -> dict:
@@ -637,6 +679,7 @@ def live_payload(status: dict, state) -> dict:
         # has to interpret.
         "tracks": None,
         "tracks_absent_reason": TRACKS_ABSENT_REASON,
+        "single_person_note": SINGLE_PERSON_NOTE,
         "refused_entity_fields": [dict(entry) for entry in REFUSED_ENTITY_FIELDS],
         "side_convention": SIDE_CONVENTION,
         "relations": None,

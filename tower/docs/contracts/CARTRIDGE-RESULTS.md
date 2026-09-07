@@ -1259,7 +1259,10 @@ null), `orientation_status` (`"experimental"`) and
 `orientation_validation` (prose) — the facing stage is a face detector
 on each tracked person's box, validated only on COCO stills.
 `where` now includes `person` as side counts, and `where_excludes` is
-empty.
+empty. `single_person_note` (top level, constant prose) states the one
+thing the aggregates cannot hide: with one person in view they describe
+that person while they are in view; a client must not store a sequence
+of payloads.
 
 **`lifecycle.follows_stream`** — whether a stream together with a
 watcher starts this session. See §14.2. **`lifecycle.demand`** — the

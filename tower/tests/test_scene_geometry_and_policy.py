@@ -199,3 +199,22 @@ class TestTheEnginePublishesTheDetectorsThreshold:
 
         state = engine.observe(np.zeros((360, 640, 3), np.uint8), received_at=0.0)
         assert state.score_threshold == 0.5
+
+
+class TestThePerEntityQueryLayerNeverReachesTheWire:
+    def test_no_route_or_result_module_imports_the_query_layer(self):
+        """`tower/scene/query.py` answers questions with track ids and
+        boxes -- the per-entity shape the wire refuses. It exists for the
+        CLI and for tests; a route that imported it would be the debug
+        endpoint that publishes a movement trace."""
+        import pathlib
+
+        offenders = []
+        for path in pathlib.Path("tower").rglob("*.py"):
+            if "scene" in path.parts and path.name == "query.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "tower.scene.query" in text or "from tower.scene import query" in text:
+                if path.parts[1] in ("routes", "results") or path.name == "main.py":
+                    offenders.append(path.as_posix())
+        assert offenders == []
