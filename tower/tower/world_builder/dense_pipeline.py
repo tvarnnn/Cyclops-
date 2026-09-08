@@ -77,6 +77,18 @@ def _pid_is_running(pid: int) -> bool:
         return True
 
 
+
+# Parameters that do not change a single point of the output. Comparing them
+# when deciding whether an artifact is already what was asked for made
+# `--keep-intermediates` -- the flag the operations doc calls the one for the
+# development loop -- miss the short-circuit every time.
+_NON_OUTPUT_PARAMS = frozenset({"keep_intermediates"})
+
+
+def _output_params(params: dict) -> dict:
+    return {k: v for k, v in (params or {}).items() if k not in _NON_OUTPUT_PARAMS}
+
+
 def _depth_cache_key(digest, params: DenseParams) -> str:
     """Everything the DEPTH stage reads.
 
@@ -120,12 +132,26 @@ def _status(root: Path, **fields) -> None:
     pid, a run killed mid-stage leaves `state: "running"` on disk forever and
     nothing can tell that from a run that is genuinely still going.
     """
-    _write_json(root / "status.json", {
+    # CARRY THE DIGEST FORWARD. `status.json` is one file and every later run
+    # overwrites it, so a failed or interrupted re-run used to erase the
+    # `input_digest` the completing run wrote -- and that value is what arms
+    # the BEHIND caption for any artifact whose manifest predates the key.
+    # Losing it silently disables a correctness signal, so a write that does
+    # not know the digest inherits the one already on disk.
+    payload = {
         "schema_version": DENSE_SCHEMA_VERSION,
         "pid": os.getpid(),
         "updated_at": time.time(),
         **fields,
-    })
+    }
+    if payload.get("input_digest") is None:
+        try:
+            prior = json.loads((root / "status.json").read_text())
+        except (OSError, ValueError):
+            prior = {}
+        if prior.get("input_digest"):
+            payload["input_digest"] = prior["input_digest"]
+    _write_json(root / "status.json", payload)
 
 
 def status_is_stale(status: dict) -> bool:
@@ -202,6 +228,11 @@ class _DenseLock:
 
 
 # ---------------------------------------------------------------------------
+
+
+# The label `FaceRedactor` returns when nothing was applied -- including
+# when it returned the ORIGINAL bytes because the detector threw.
+from tower.world_builder.redaction import REDACTION_NONE  # noqa: E402
 
 
 class DenseInputsPruned(DenseUnavailable):
@@ -305,7 +336,16 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
             # cloud ever exposed.
             if redactor is None or not getattr(redactor, "available", False):
                 return None, "refused-unredacted-keyframe", None
-            filled = redactor.redact(data).image_bytes
+            result = redactor.redact(data)
+            if result.label == REDACTION_NONE:
+                # `redact` NEVER RAISES: it returns the ORIGINAL bytes, labelled
+                # `none`, when the detector throws on this particular image.
+                # `available` is a load-time property and cannot see that. An
+                # earlier version of this check tested the redactor and then
+                # used whatever came back, which is the same mistake one level
+                # down from the one it was written to fix.
+                return None, "refused-redaction-failed", None
+            filled = result.image_bytes
             return filled, "world-keyframe-redacted-here", _fill_mask_for(filled, data)
         except OSError:
             pass
@@ -313,7 +353,12 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
         return None, ("absent" if not source_path else "unreadable"), None
     if redactor is None or not getattr(redactor, "available", False):
         return None, "refused-no-redactor", None
-    data = redactor.redact(raw_bytes).image_bytes
+    result = redactor.redact(raw_bytes)
+    if result.label == REDACTION_NONE:
+        # Same trap on the fallback path, and this is the path the migrated
+        # worlds actually take -- 506 of the corpus's frames went through it.
+        return None, "refused-redaction-failed", None
+    data = result.image_bytes
     return data, "raw-source-rereducted", _fill_mask_for(data, raw_bytes)
 
 
@@ -788,6 +833,43 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
     return {"levels": levels, "points": levels[0]["points"]}
 
 
+
+# `solution.json` carries every keyframe id and every pose, so it is hundreds
+# of kilobytes and json.loads on it costs milliseconds. `GET /worlds` asks for
+# one field of it once per dense session, and a gallery walks every session of
+# every world -- measured at 1.6-1.9 ms per session against 0.14 ms before the
+# currency check existed, which is about a third of a second on a 200-session
+# library and grows with adoption.
+#
+# The file only changes when a world is re-solved, so the answer is cached on
+# (path, mtime, size). A rewritten solve changes at least one of the three, and
+# an entry whose file has changed is simply recomputed. Bounded, because a
+# library has finitely many sessions and the key set only grows with them.
+_SOLVE_DIGEST_CACHE: dict = {}
+_SOLVE_DIGEST_CACHE_MAX = 4096
+
+
+def _solve_input_digest(solve_path: Path) -> str | None:
+    """The `input_digest` of a persisted solve, cached on the file's identity."""
+    try:
+        st = solve_path.stat()
+    except OSError:
+        return None
+    key = str(solve_path)
+    stamp = (st.st_mtime_ns, st.st_size)
+    hit = _SOLVE_DIGEST_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        digest = json.loads(solve_path.read_text()).get("input_digest")
+    except (OSError, ValueError):
+        return None
+    if len(_SOLVE_DIGEST_CACHE) >= _SOLVE_DIGEST_CACHE_MAX:
+        _SOLVE_DIGEST_CACHE.clear()
+    _SOLVE_DIGEST_CACHE[key] = (stamp, digest)
+    return digest
+
+
 def dense_currency(store, world_id: str, session_id: str,
                    manifest: dict | None = None, *,
                    include_derived: bool = True) -> dict:
@@ -828,7 +910,7 @@ def dense_currency(store, world_id: str, session_id: str,
         from tower.world_builder.global_solve import workspace_for  # noqa: PLC0415
 
         solve_path = workspace_for(store, world_id, session_id).solution_path
-        current = json.loads(solve_path.read_text()).get("input_digest")
+        current = _solve_input_digest(solve_path)
     except Exception:  # noqa: BLE001 -- unreadable is "unknown", not "stale"
         current = None
     out["solve_digest"] = current
@@ -942,7 +1024,14 @@ def densify(
     lock = _DenseLock(root)
     if not lock.acquire():
         detail = "another densify of this session is already running"
-        _status(root, state=STATE_UNAVAILABLE, detail=detail)
+        # DO NOT WRITE status.json HERE. It is shared with the run that holds
+        # the lock, so the loser of the race would stamp "unavailable" over a
+        # perfectly healthy densify's record -- and, before the digest was
+        # carried forward, erase the value that arms the BEHIND caption. The
+        # loser has nothing to report about the session; it has something to
+        # report about ITSELF, and that is the return value.
+        logger.info("[Tower][WorldBuilder][dense] %s/%s: %s",
+                    world_id, session_id, detail)
         return DenseResult(state=STATE_UNAVAILABLE, detail=detail)
 
     # From here to the `finally` at the end, every exit path is inside the
@@ -992,8 +1081,21 @@ def densify(
                 existing = json.loads(manifest_path.read_text())
             except (OSError, ValueError):
                 existing = None
-            if existing and existing.get("input_digest") == digest \
-                    and (existing.get("params") or {}) == params.as_dict():
+            # The digest may be absent from the manifest -- artifacts packed
+            # before that key existed -- and those are precisely the ones that
+            # cannot short-circuit and therefore fall into the pruned-inputs
+            # path. `status.json` has recorded it since the first version, so
+            # ask there too, the way `dense_currency` already does.
+            existing_digest = (existing or {}).get("input_digest")
+            if existing_digest is None:
+                try:
+                    existing_digest = json.loads(
+                        (root / "status.json").read_text()).get("input_digest")
+                except (OSError, ValueError):
+                    existing_digest = None
+            same_params = (_output_params(existing.get("params") if existing else {})
+                           == _output_params(params.as_dict()))
+            if existing and existing_digest == digest and same_params:
                 levels = existing.get("levels") or []
                 if levels and all((root / f"points_l{i}.bin").exists()
                                   for i in range(len(levels))):

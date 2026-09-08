@@ -358,20 +358,36 @@ class _StubStore:
 
 
 class _StubRedactor:
-    def __init__(self, available=True):
+    """Stands in for FaceRedactor, INCLUDING its failure shape.
+
+    `FaceRedactor.redact` never raises: when the detector throws on a
+    particular image it returns the ORIGINAL bytes labelled `none`. A stub that
+    always succeeds cannot catch a boundary that trusts `available` and ignores
+    the label, which is exactly the bug this shape exists to expose.
+    """
+
+    def __init__(self, available=True, fails=False):
         self.available = available
         self.unavailable_reason = None if available else "no model"
         self.label = "stub@0.30"
+        self.fails = fails
         self.calls = 0
 
     def redact(self, image_bytes):
+        from tower.world_builder.redaction import REDACTION_NONE
+
         self.calls += 1
 
         class R:
             pass
 
         r = R()
-        r.image_bytes = b"REDACTED:" + image_bytes
+        if self.fails or not self.available:
+            r.image_bytes = image_bytes          # the ORIGINAL, unchanged
+            r.label = REDACTION_NONE
+        else:
+            r.image_bytes = b"REDACTED:" + image_bytes
+            r.label = self.label
         return r
 
 
@@ -1349,17 +1365,38 @@ def test_thinning_to_a_budget_keeps_the_whole_room_not_the_best_lit_corner():
     assert 0.25 < near / far < 4.0, (near, far)
 
 
-def test_thinning_reports_that_it_thinned():
+def test_the_confidence_report_names_a_confidence_cut_and_nothing_else():
+    """It used to return `int(Fr.min())` unconditionally, so a page that had
+    had NO confidence cut applied announced "thinned to confidence >= 3" --
+    which is just the cloud's floor. Two different facts, and the viewer says
+    different things about them."""
     from tower.world_builder.dense import POINT_STRIDE_BYTES
     from tower.world_builder.dense_render import thin_to_budget
 
     X, C, F = _two_room_cloud()
-    _, _, _, min_conf = thin_to_budget(X, C, F, 8000 * POINT_STRIDE_BYTES)
-    assert min_conf is not None, "the page has to be able to say it was thinned"
+    Xr, _, _, min_conf = thin_to_budget(X, C, F, 8000 * POINT_STRIDE_BYTES)
+    assert len(Xr) < len(X)          # it did thin
+    assert min_conf is None          # but not by confidence
 
-    # And a cloud that fits is not thinned, and says so with None.
+    # A cloud that fits is not touched at all.
     _, _, _, untouched = thin_to_budget(X, C, F, 10_000_000 * POINT_STRIDE_BYTES)
     assert untouched is None
+
+
+def test_thinning_actually_spends_the_budget_it_was_given():
+    """The reason this test exists. The first voxel implementation stopped at
+    the first count under the budget, which cannot correct an undershoot, and
+    it shipped 2.7% of the budget on its default path while four tests passed
+    because they only asserted "not more than".
+    """
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import thin_to_budget
+
+    X, C, F = _two_room_cloud()
+    for n in (100, 1000, 8000, 50000):
+        Xr, _, _, _ = thin_to_budget(X, C, F, n * POINT_STRIDE_BYTES)
+        assert len(Xr) <= n, (n, len(Xr))
+        assert len(Xr) >= n * 0.8, (n, len(Xr), "under-spent the budget")
 
 
 def test_thinning_is_deterministic():
@@ -1503,3 +1540,144 @@ def test_the_completed_check_runs_before_the_first_status_write():
     guard = body.index("A COMPLETED ARTIFACT IS COMPLETE")
     first_status = body.index("_status(root, state=STATE_RUNNING")
     assert guard < first_status
+
+
+def test_a_frame_whose_redaction_FAILED_is_refused_rather_than_published(tmp_path):
+    """`FaceRedactor.redact` returns the ORIGINAL bytes, labelled `none`, when
+    the detector throws on a particular image -- it never raises, so that a
+    keyframe is still persisted. `available` is a load-time property and cannot
+    see that. The dense stage republishes these pixels at roughly fifty times
+    the density the sparse cloud ever exposed, so it checks the outcome."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(b"RAW-WITH-A-FACE")
+    red = _StubRedactor(fails=True)
+
+    # the migrated-world path: no keyframe image, redact the raw frame
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", str(raw), red,
+        keyframes_are_redacted=True,
+    )
+    assert red.calls == 1
+    assert data is None
+    assert origin == "refused-redaction-failed"
+
+    # the unredacted-keyframe path
+    (images / "00000042.jpg").write_bytes(b"UNREDACTED-KEYFRAME")
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", None, _StubRedactor(fails=True),
+        keyframes_are_redacted=False,
+    )
+    assert data is None
+    assert origin == "refused-redaction-failed"
+
+
+def test_a_successful_redaction_with_no_faces_is_still_used():
+    """The refusal above must key on the LABEL, not on whether pixels changed.
+    A frame with no face in it is redacted successfully and comes back
+    identical; refusing those would silently drop most of the corpus."""
+    from tower.world_builder.redaction import REDACTION_NONE
+
+    ok = _StubRedactor().redact(b"CLEAN")
+    assert ok.label != REDACTION_NONE
+
+
+# --------------------------------------------------------------------------
+# The status file is shared, and losing what it holds disables a correctness
+# signal rather than raising anything.
+# --------------------------------------------------------------------------
+
+
+def test_a_status_write_that_does_not_know_the_digest_inherits_it(tmp_path):
+    """`status.json` is one file every later run overwrites. A failed or
+    interrupted re-run used to erase the input_digest the completing run wrote,
+    and for artifacts whose manifest predates that key it is the only copy --
+    so losing it permanently disarms the BEHIND caption."""
+    import json
+
+    from tower.world_builder.dense_pipeline import _status
+
+    root = tmp_path / "dense"
+    root.mkdir()
+    _status(root, state="ok", input_digest="DIGEST-A")
+    _status(root, state="failed", detail="something broke")
+    after = json.loads((root / "status.json").read_text())
+    assert after["state"] == "failed"
+    assert after["input_digest"] == "DIGEST-A"
+
+
+def test_the_lock_loser_does_not_write_the_shared_status_file():
+    """It shares status.json with the run that HOLDS the lock, so writing
+    'unavailable' there reports on somebody else's healthy densify."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.densify)
+    head = body[:body.index("try:")]
+    assert "lock.acquire()" in head
+    assert "_status(" not in head, "the losing racer must not write status.json"
+
+
+def test_keep_intermediates_does_not_defeat_the_completed_artifact_check():
+    """It changes no point of the output, and the operations doc calls it the
+    flag for the development loop -- so comparing it made every development
+    re-run miss the short circuit."""
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _output_params
+
+    a = DenseParams().as_dict()
+    b = DenseParams(keep_intermediates=True).as_dict()
+    assert a != b
+    assert _output_params(a) == _output_params(b)
+    # and a real difference still differs
+    c = DenseParams(tau=0.09).as_dict()
+    assert _output_params(a) != _output_params(c)
+
+
+def test_the_solve_digest_is_cached_on_the_files_identity(tmp_path):
+    """`GET /worlds` asks for one field of a file holding every pose, once per
+    dense session, and a gallery walks every session of every world."""
+    import json
+
+    from tower.world_builder.dense_pipeline import _solve_input_digest
+
+    p = tmp_path / "solution.json"
+    p.write_text(json.dumps({"input_digest": "A"}))
+    assert _solve_input_digest(p) == "A"
+
+    # A rewrite changes mtime or size, so the cache must not serve the old one.
+    import os
+    import time
+
+    time.sleep(0.01)
+    p.write_text(json.dumps({"input_digest": "BB"}))
+    os.utime(p, None)
+    assert _solve_input_digest(p) == "BB"
+
+    # A missing file is None, not an exception.
+    assert _solve_input_digest(tmp_path / "gone.json") is None
+
+
+def test_max_points_is_honoured_on_the_dense_page(tmp_path):
+    """The route validates it (422 outside 1..200000) and the worlds contract
+    calls it a point budget. It was then dropped on the dense path, so
+    max_points=1 returned a six-megabyte page."""
+    import inspect
+
+    from tower.results import world_builder_render
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import build_dense_payload
+
+    store, *_ = _fake_dense(tmp_path, n=4000)
+    _, cfg, _ = build_dense_payload(store, "w1", "s1",
+                                    budget_bytes=200 * POINT_STRIDE_BYTES)
+    assert cfg["points"] <= 200
+
+    # and the route turns max_points into that budget rather than dropping it
+    body = inspect.getsource(world_builder_render.build_world_render)
+    assert "budget_bytes=budget" in body
+    assert "POINT_STRIDE_BYTES" in body

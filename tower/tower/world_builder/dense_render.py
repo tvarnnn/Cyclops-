@@ -107,6 +107,24 @@ def has_dense(store, world_id: str, session_id: str) -> bool:
     return read_dense_manifest(store, world_id, session_id) is not None
 
 
+
+def _voxel_count(X, voxel: float) -> int:
+    """How many points `voxel_reduce` would return, without building them.
+
+    Same key packing as `voxel_reduce`, so the count it predicts is the count
+    that comes out. Roughly half the cost of the reduction, which is what makes
+    it affordable to probe several cell sizes on a request path.
+    """
+    g = np.floor(X / voxel).astype(np.int64) + (1 << 20)
+    if g.min() < 0 or g.max() >= (1 << 21):
+        # Outside the packing's range the key would collide and undercount.
+        # Rare -- it needs a cell finer than the extent / 2 million -- and the
+        # honest answer is the slow one rather than a wrong number.
+        return int(np.unique(g, axis=0).shape[0])
+    key = (g[:, 0] << 42) | (g[:, 1] << 21) | g[:, 2]
+    return int(np.unique(key).size)
+
+
 def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = None):
     """Make the buffer fit by making the picture COARSER, not smaller.
 
@@ -127,18 +145,26 @@ def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = Non
     the density everywhere equally. `voxel_reduce` keeps the best confidence in
     each cell, so the confidence channel still means what it meant.
 
-    The voxel size is solved for rather than searched. These points lie on
-    surfaces, so their count scales as roughly `voxel ** -2`; one step of that
-    law lands within a few percent and a second corrects it. Two passes cost
-    about 0.9 s on 2.6 M points, which is why this is done here, on request,
-    rather than baked into a ladder that cannot know the client's budget.
+    The cell size is solved for and then CHECKED. These points lie on surfaces,
+    so their count scales as roughly `voxel ** -2`, and one step of that law
+    lands close -- but only if it is fed the count at the CURRENT cell, and the
+    first step is fed the unreduced count, so the first answer is always short.
+    An earlier version stopped there, which is why it shipped 75% of the budget
+    with a size hint and 23% without one while four tests passed. The loop now
+    probes until the count is inside 85-100% of the budget or the step stops
+    moving, keeping the best result seen.
 
-    Any residue after four passes -- overshoot from a scene that is not
-    surface-like -- is trimmed by confidence, which at a few percent is the
-    thing that trim is actually safe for.
+    Probing is cheap because `_voxel_count` predicts the count without building
+    the reduction, so only the winning cell is ever materialised.
 
-    Returns (X, C, F, thinned_to_confidence). The last value stays non-None
-    whenever anything was dropped, because the page has to say so.
+    Any residue -- overshoot from a scene that is not surface-like -- is
+    trimmed by confidence, which at a few percent is the size of cut that trim
+    is actually safe for.
+
+    Returns (X, C, F, thinned_to_confidence), where the last value is the
+    confidence floor of a CONFIDENCE cut and None when none was applied, which
+    is now the normal case. Whether the picture is coarser than the artifact is
+    a separate fact and the config reports it separately.
     """
     max_points = max(1, budget_bytes // POINT_STRIDE_BYTES)
     if len(X) <= max_points:
@@ -148,23 +174,46 @@ def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = Non
     if not np.isfinite(span) or span <= 0:
         span = 1.0
     # A starting cell: the level's own voxel when the caller knows it, else the
-    # extent divided by the cube root of the count, which is the right order of
-    # magnitude for anything.
-    voxel = float(voxel_hint) if voxel_hint else span / max(len(X) ** (1 / 3), 1.0)
+    # extent over the square root of the count, because these points lie on
+    # SURFACES -- the cube root treats them as a solid and starts an order of
+    # magnitude too coarse.
+    voxel = float(voxel_hint) if voxel_hint else span / max(len(X) ** 0.5, 1.0)
+    # Only a guard against a degenerate cell. An earlier version floored the
+    # search at the STARTING cell, which meant a coarse first guess could never
+    # be refined downwards and the no-hint path spent 23% of its budget.
+    floor_voxel = span / 1e6
 
-    # Aim slightly under the budget. The scaling law is good to a few percent,
-    # and landing 3% over costs a whole extra pass -- or, worse, falls through
-    # to the confidence trim this exists to avoid.
-    target = max(1.0, max_points * 0.95)
-    Xr, Cr, Fr = X, C, F
-    for _ in range(6):
-        voxel *= float(np.sqrt(len(Xr) / target))
-        if not np.isfinite(voxel) or voxel <= 0:
+    # Solve for the voxel, then CHECK, and keep going while the answer is
+    # outside the band. The first version stopped at the first count under the
+    # budget, which cannot correct an UNDERSHOOT -- and the first step is
+    # always an undershoot, because it feeds the unreduced count into a law
+    # about the count at `voxel`. Measured on the three-room chain that spent
+    # 75% of the budget with a hint and 2.7% without one, and four tests
+    # passed on 21 points out of 8,000 because they only asserted "not more".
+    target = max(1.0, max_points * 0.92)
+    best = None
+    probe = voxel
+    for _ in range(8):
+        if not np.isfinite(probe) or probe <= 0:
             break
-        Xr, Cr, Fr = voxel_reduce(X, C, F, voxel)
-        if len(Xr) <= max_points:
+        n = _voxel_count(X, probe)
+        if n <= max_points and (best is None or n > best[1]):
+            best = (probe, n)
+        if max_points * 0.85 <= n <= max_points:
+            break
+        # Surfaces: count scales as voxel ** -2, so this step is a solve and
+        # not a bisection, and it converges from either side.
+        probe = max(floor_voxel, probe * float(np.sqrt(n / target)))
+        if best is not None and abs(probe - best[0]) < best[0] * 1e-3:
             break
 
+    if best is None:
+        # Never got under the budget. Take the largest cell tried and let the
+        # confidence trim below finish the job.
+        best = (probe, 0)
+    Xr, Cr, Fr = voxel_reduce(X, C, F, best[0])
+
+    trimmed_at = None
     if len(Xr) > max_points:
         # Did not converge. Fall back rather than blow the budget, and say so:
         # this is the branch whose spatial bias the docstring warns about.
@@ -176,8 +225,12 @@ def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = Non
         order = np.argsort(-Fr.astype(np.int32), kind="stable")[:max_points]
         order.sort()
         Xr, Cr, Fr = Xr[order], Cr[order], Fr[order]
+        trimmed_at = int(Fr.min()) if len(Fr) else 0
 
-    return Xr, Cr, Fr, int(Fr.min()) if len(Fr) else 0
+    # What was actually done, not what the minimum confidence happens to be.
+    # `int(Fr.min())` was reported as "thinned to confidence >= 3" on a cloud
+    # whose floor is 3 and where no confidence cut was applied at all.
+    return Xr, Cr, Fr, trimmed_at
 
 
 MAX_VIEWPOINTS = 240
@@ -269,7 +322,11 @@ def build_dense_payload(store, world_id: str, session_id: str, *,
         "stride": POINT_STRIDE_BYTES,
         "level": idx,
         "level_voxel": levels[idx].get("voxel"),
+        # A confidence cut, and ONLY a confidence cut. None is the normal
+        # answer now: the budget is met by a coarser grid.
         "thinned_to_confidence": min_conf,
+        # Whether the served cloud is coarser than the level on disk.
+        "coarsened": bool(len(X) < int(levels[idx].get("points") or 0)),
         "source_points": int(levels[idx].get("points") or 0),
         "bbox_min": manifest.get("bbox_min"),
         "bbox_max": manifest.get("bbox_max"),

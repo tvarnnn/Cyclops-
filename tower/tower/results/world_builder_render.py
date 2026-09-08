@@ -125,11 +125,25 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     # every world built before this stage -- falls through to it unchanged.
     if representation != REPRESENTATION_SPARSE:
         try:
+            from tower.world_builder.dense import (  # noqa: PLC0415
+                POINT_STRIDE_BYTES,
+            )
             from tower.world_builder.dense_render import (  # noqa: PLC0415
-                DenseViewerUnavailable, build_dense_page,
+                MOBILE_BYTE_BUDGET,
+                DenseViewerUnavailable,
+                build_dense_page,
             )
 
-            return build_dense_page(store, world_id, chosen)
+            # `max_points` is validated by the route and must not then be
+            # ignored: the worlds contract calls it "point budget", and a
+            # client that asks for fewer points has to get fewer. It was
+            # dropped on this path, so `max_points=1` returned 295,000 points
+            # and a 6 MB page. Converted to the byte budget this viewer speaks,
+            # and only ever downwards -- the phone default stays the default.
+            budget = MOBILE_BYTE_BUDGET
+            if max_points is not None:
+                budget = min(budget, max(1, int(max_points)) * POINT_STRIDE_BYTES)
+            return build_dense_page(store, world_id, chosen, budget_bytes=budget)
         except DenseViewerUnavailable as exc:
             if representation == REPRESENTATION_DENSE:
                 raise WorldRenderUnavailable(exc.reason) from None

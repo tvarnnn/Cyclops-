@@ -2,9 +2,15 @@
   World Builder dense viewer.
 
   One self-contained page. No external script, no external style, no font, no
-  image, no fetch: the route serves it under `default-src 'none'` with only
-  'unsafe-inline' for script and style, so anything fetched would be blocked.
-  The points arrive base64 inside this file and go straight into a GPU buffer.
+  image, no fetch. In a BROWSER that is enforced: the route serves it under
+  `default-src 'none'` with only 'unsafe-inline' for script and style.
+  ON THE PHONE IT IS NOT. iOS fetches this page with URLSession, drops the
+  response headers, and calls loadHTMLString with a null baseURL, so no CSP
+  applies at all -- what blocks a fetch there is the navigation delegate and
+  the unresolvable relative URLs, which this file does not control. Inline is
+  still the only shape that works in both, and the server-side escaping is the
+  only defence against a closing script tag smuggled through the config.
+  See dense_render.py.
 
   Up on screen is -y. The world's up_axis is "unknown" and the cameras are
   OpenCV's (x right, y DOWN, z forward), so assuming +y or +z is up would stand
