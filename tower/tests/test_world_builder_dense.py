@@ -1793,3 +1793,20 @@ def test_the_page_says_it_is_coarser_whenever_it_is(tmp_path):
                       .replace(chr(92) + "u003c", "<"))
     assert cfg2["coarsened"] is False
     assert cfg2["thinned_to_confidence"] is None
+
+
+def test_two_absent_digests_do_not_count_as_a_match():
+    """The completed-artifact check compares the manifest's input_digest with
+    the current solve's. A solve without one and a manifest without one would
+    otherwise compare equal, and a rebuild nothing has established is
+    unnecessary would be skipped -- the same "None matches everything" bug the
+    depth cache key had, in a place where the cost is silently serving a stale
+    artifact instead of rebuilding it."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.densify)
+    guard = body[body.index("A COMPLETED ARTIFACT IS COMPLETE"):]
+    guard = guard[:guard.index("levels = existing.get")]
+    assert "digest is not None" in guard

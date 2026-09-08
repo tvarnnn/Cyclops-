@@ -1102,7 +1102,13 @@ def densify(
                     existing_digest = None
             same_params = (_output_params(existing.get("params") if existing else {})
                            == _output_params(params.as_dict()))
-            if existing and existing_digest == digest and same_params:
+            # A digest of None must not match another None. A solve
+            # without an input_digest and a manifest without one would
+            # otherwise compare equal and short-circuit a rebuild that
+            # nothing has established is unnecessary -- the same
+            # "None matches everything" bug the depth cache key had.
+            if (existing and digest is not None
+                    and existing_digest == digest and same_params):
                 levels = existing.get("levels") or []
                 if levels and all((root / f"points_l{i}.bin").exists()
                                   for i in range(len(levels))):
