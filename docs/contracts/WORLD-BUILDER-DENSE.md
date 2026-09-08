@@ -160,17 +160,32 @@ holes must break this format identifier rather than quietly relax it.
 
 `engine.py` redacts faces **before** persisting a keyframe image, so the bytes
 any later reconstruction reads are the redacted ones rather than raw frames
-behind a display filter. The dense stage keeps that boundary:
+behind a display filter.
 
-1. It reads the world's own redacted keyframe image when it exists.
-2. When a world has lost its `images/` directory, it reads the raw capture frame
-   and **re-applies the same redaction** before anything looks at it.
-3. When no redactor is available it **refuses the frame** rather than using it
-   raw.
-4. It never reads the solve workspace's `images/`, which on some workspaces are
+**That is a property of the session, not of the directory, and the dense stage
+checks it.** `FaceRedactor.redact` returns the ORIGINAL bytes when the redactor
+is unavailable or throws, labelled `none`, and `engine._persist_keyframe`
+persists whatever comes back — so `<world>/sessions/<s>/images/` can legitimately
+hold raw frames, and `session.redaction` is the only record that says which. An
+earlier version of this stage asserted the boundary in a docstring and read the
+directory unconditionally.
+
+1. It reads `session.redaction` first. Anything absent, unreadable or `none`
+   means the stored keyframes are **not** trusted as redacted.
+2. When the session says they were redacted, it reads the world's own keyframe
+   image.
+3. When the session says they were not, it **applies the redaction itself**
+   before any pixel is read, and refuses the frame when no redactor is
+   available.
+4. When a world has lost its `images/` directory, it reads the raw capture frame
+   and **re-applies the same redaction** before anything looks at it; again it
+   refuses rather than using it raw.
+5. It never reads the solve workspace's `images/`, which on some workspaces are
    the raw frames COLMAP was fed.
 
-`align.json` records, per frame, which of those paths was taken.
+`align.json` records, per frame, which of those paths was taken, and per run it
+records what the **session** said about redaction rather than the label of the
+redactor that happened to be loaded at densify time.
 
 ## 8. `GET /worlds` — the `dense` object
 
@@ -227,3 +242,34 @@ exceeds it, **thins by confidence**: the points several cameras agreed on
 survive and the weakest go first, so the picture gets sparser rather than less
 trustworthy. `thinned_to_confidence` in the page's config records the cut, and
 `null` means none was needed.
+
+## 10. Currency, and what the page must say
+
+`WORLD-BUILDER-WORLDS.md` requires the render page to carry a caption saying
+what it is, and a BEHIND line when what it draws is not current. The dense page
+is what that route serves when a dense artifact exists, so both obligations are
+this format's.
+
+**The caption.** The dense page carries its own sentence, because the sparse
+page's would be false here: *"Dense reconstruction: per-pixel depth from a
+neural network, anchored to the structure-from-motion solve and kept only where
+several cameras agreed. Not a surface, not a mesh, not metric scale."* It is
+printed first, before every qualification, and rule 2 of the worlds contract
+applies unchanged: the page never claims more than it says.
+
+**Two things can be behind, and they are reported separately.**
+
+| condition | how it is decided | caption |
+| --- | --- | --- |
+| the dense cloud was fused against an older solve | `manifest.input_digest` (or, for artifacts packed before that key existed, `status.json`'s) against `solve/solution.json`'s | *"This reconstruction is BEHIND the world: it was built from an earlier solve, and the world has been solved again since."* |
+| the derived tree is behind the newest keyframes | `render.derived_current`, unchanged | the sparse page's BEHIND sentence |
+
+Either may be **unknowable** — a missing digest, an unreadable solve — and
+unknowable is not stale: no BEHIND claim is made from it. A stale reconstruction
+is still served rather than suppressed, because the points in it are real
+observations of a superseded pose graph, and hiding them would be a different
+dishonesty from mislabelling them.
+
+`manifest.input_digest` is additive; a reader that does not know the key behaves
+exactly as before, and the format identifier does not move for it.
+

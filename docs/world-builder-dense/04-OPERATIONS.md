@@ -26,7 +26,7 @@ Useful knobs, all recorded into the manifest:
 
 | flag | default | what it changes |
 | --- | --- | --- |
-| `--backend` | `depth-anything-v2-small` | the depth model. Only permissively licensed checkpoints are registered |
+| `--backend` | `moge2-vitl` | the depth model (MIT). Chosen by a 24-model bake-off, D15. Only permissively licensed checkpoints are reachable |
 | `--gate-rel` | `0.08` | reject a frame whose held-out alignment residual exceeds this |
 | `--tau` | `0.05` | how closely a neighbouring camera must agree. Measured optimum; 0.03 and 0.08 are both worse |
 | `--min-views` | `3` | how many other cameras must agree |
@@ -107,8 +107,18 @@ meaningless on the next.
 
 **A low frames-used ratio is usually the data, not a bug.** The alignment gate
 drops frames whose predicted depth cannot be reconciled with the sparse points
-the solve already placed. On the corpus's blurriest walk that is nearly half the
-frames. `align.json` records why each frame was dropped.
+the solve already placed. Across the seven worlds it drops **30-50% of posed
+frames**, and on the tight bathroom walk it drops half. `align.json` records
+why each frame was dropped. This is the number to quote when someone asks how
+much of the walk the reconstruction actually uses; "spends the evidence" spends
+between half and two thirds of it.
+
+**Tight rooms are the weakest case, and it is structural.** The closet and the
+bathroom cover 60-67% of a held-out frame where every other world covers 96-98%,
+and the bathroom's depth error p90 is 58% against a 4.4% median. Consensus needs
+baseline between cameras and a small room does not offer any. The confidence
+channel is what separates the good part from the bad; a viewer that ignores it
+will show the tail as if it were the median.
 
 **Heavy face-redaction fill wrecks a frame.** The detector fires on hands and on
 carpet. `align.json` records `redaction_fill_fraction` per frame; frames above
@@ -126,20 +136,36 @@ RTX 5070, a stage that takes 90 s alone can take many minutes. Check
 
 Measured, per world, on the datasets used here:
 
+All seven worlds, densified with the shipped configuration. `01-EVIDENCE.md`
+§11 carries the same run with its accuracy tails and its gate sensitivity;
+this is the operator's view of it.
+
 | world | frames used / posed | held-out residual | L0 points | L0 size | wall clock |
 | --- | --- | --- | --- | --- | --- |
-| `7d31e8d7` (desk and shelf) | 345 / 429 | 3.0% | 11.9 M | 190 MB | ~4 min |
-| `1b8812b1` (widest traverse) | 247 / 438 | 5.0% | 5.8 M | 93 MB | 7 min |
-| `672578d0` (bedroom, closet, desk) | 218 / 425 | 6.7% | 5.7 M | 92 MB | 8 min |
-| `ecc02df1` (dresser) | 40 / 77 | 7.6% | 1.0 M | 16 MB | ~1.5 min |
-| `be36bd70` (replay, end to end) | 26 / 58 | 8.7% | 0.7 M | 12 MB | 105 s |
+| `7d31e8d7` (desk and shelf) | 316 / 429 | 2.6% | 8.2 M | 132 MB | 230 s |
+| `1b8812b1` (widest traverse) | 303 / 438 | 2.9% | 8.7 M | 139 MB | 206 s |
+| `37e497f8` (bedroom) | 134 / 196 | 3.4% | 4.8 M | 78 MB | 96 s |
+| `672578d0` (bedroom, closet, desk) | 298 / 425 | 3.8% | 14.8 M | 236 MB | 210 s |
+| `a378331a` (closet) | 117 / 201 | 4.9% | 5.0 M | 81 MB | 92 s |
+| `ecc02df1` (dresser) | 50 / 77 | 5.3% | 2.1 M | 33 MB | 51 s |
+| `6427900d` (bathroom, tight) | 132 / 266 | 5.4% | 3.6 M | 57 MB | 108 s |
 
-Peak VRAM for the depth stage is **0.85 GB**; everything else is CPU and RAM.
+Peak VRAM for the depth stage is **2.4 GB**; everything else is CPU and RAM.
+A 12 GB card runs this comfortably; a 4 GB one will not.
+
+**The residual column is gate-conditioned and the gate is 8%.** It is the median
+over the frames that PASSED, so it improves as the gate tightens and the
+reconstruction gets worse. `01-EVIDENCE.md` §11.3 prints both ends. Do not
+quote a single figure from this column as the pipeline's accuracy.
 
 ### Footprint, and why a successful run cleans up after itself
 
 A 438-keyframe world leaves **601 MB** if nothing is pruned, and only about
-130 MB of that is the artifact:
+130 MB of that is the artifact. Every artifact produced before the pruning
+landed still has the intermediates beside it -- 318-703 MB per session across
+the corpus, of which 220-474 MB is `work/`. `--force` on an old artifact
+re-runs and prunes; nothing sweeps them otherwise, and nothing in this stage
+deletes anything a human has not asked it to.
 
 | | |
 | --- | --- |

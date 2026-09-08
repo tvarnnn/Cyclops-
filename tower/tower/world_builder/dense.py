@@ -114,11 +114,21 @@ class DenseParams:
     #
     # It also beats the CC-BY-NC checkpoints this lane refused to ship, so
     # there is no accuracy being traded away for the licence -- only gained.
+    #
+    # The margin over `da3mono-large` (Apache-2.0) is NOT robust across rooms:
+    # scored on two held-out solves the two are indistinguishable, and DA3-mono
+    # is 2.7x faster in two thirds of the VRAM. MoGe stays the default because
+    # it is never worse and this stage runs off the interactive path. On a
+    # smaller card, switch. D15 carries the table.
     backend: str = "moge2-vitl"
     # Reject a frame whose HELD-OUT relative depth residual exceeds this.
-    # 0.08 keeps 346 of 425 frames on the reference world; a regularised refit
-    # rescued only one of the rejects, which is the evidence that the rejects
-    # are genuinely unreliable rather than merely ill-conditioned.
+    # Across the seven worlds 0.08 keeps 50-74% of posed frames; a regularised
+    # refit rescued only one of the rejects, which is the evidence that the
+    # rejects are genuinely unreliable rather than merely ill-conditioned.
+    # NOTE the metric it gates is also the metric this lane reports: the
+    # residual quoted anywhere is the median of the frames that PASSED, so it
+    # improves as this number falls and the reconstruction gets worse.
+    # 01-EVIDENCE.md section 11.3 prints both ends.
     gate_rel: float = 0.08
     min_sparse_points: int = 20
 

@@ -197,6 +197,33 @@ compares against something outside the depth pipeline.
 The cost is stated rather than hidden: roughly nine points of coverage, and
 `--gate-rel` is on the CLI for an operator who wants the other end of the trade.
 
+### The gate also determines the number this lane reports as accuracy
+
+An adversarial review found this and it is the most important sentence in the
+document. The held-out alignment residual quoted everywhere in this lane is the
+median **of the frames that passed the gate** -- the median of a distribution
+truncated at the threshold. So it improves as the gate tightens, and the gate
+tightening makes the reconstruction WORSE: fewer frames, more holes.
+
+`proto/gate_sensitivity.py` prints both ends for every shipped artifact, and the
+table lives in `01-EVIDENCE.md` §"What the gate does to the number". Read it
+before quoting any residual. A metric that improves as the product degrades is
+not measuring the product, and this one does that; what it is actually good for
+is comparing two configurations at the SAME gate, which is the only way it is
+used to make a decision here.
+
+Two consequences follow, both stated rather than fixed:
+
+* Every accuracy figure in this lane is gate-conditioned unless it says
+  otherwise, and the pre-gate figure is always the larger one.
+* The reference is not independent. Every residual is `|z_pred - z_sfm|/z_sfm`
+  at SIFT keypoints of the same triangulation the affine was fitted to, so it
+  cannot see SfM error, and it is evaluated only where the sparse cloud is --
+  textured corners, which are the network's easiest pixels. There is no external
+  metric ground truth anywhere in this lane. That is a defensible position for a
+  system with no depth sensor; it is not "geometric accuracy", and calling it
+  that was wrong.
+
 ---
 
 ## D12. The consensus tolerance is 0.05, and tightening it makes things worse
@@ -327,10 +354,136 @@ frames where that fit is worst conditioned.
 
 ---
 
+---
+
+## D15. The depth network is MoGe-2 ViT-L, chosen by a 24-model bake-off, and the permissive licence cost nothing
+
+The stage shipped its first working version on Depth Anything V2 **Small**,
+which was picked for a bad reason: it was the first permissively licensed
+checkpoint that ran. So 24 checkpoints were scored on the same 214 frames of
+`7d31e8d7`, against the same held-out sparse points the pipeline itself fits to,
+with each model's output tried in BOTH affine families (`p ~= a/z + b` and
+`p ~= a*z + b`) and the better one recorded.
+
+| model | licence | held-out median | frames passing the 8% gate |
+| --- | --- | --- | --- |
+| **`moge2-vitl`** (shipped) | **MIT** | **2.38%** | **84.6%** |
+| `distill-any-depth-large` | MIT | 2.98% | 80.4% |
+| `dav2-large` | CC-BY-NC-4.0 | 3.05% | 80.8% |
+| `da3mono-large` | Apache-2.0 | 3.16% | 83.2% |
+| `dav2-small` (previous default) | Apache-2.0 | 5.87% | 62.1% |
+| `da3-small` | Apache-2.0 | 10.92% | 35.0% |
+| `zoedepth-nyu-kitti` | MIT | 20.58% | 12.6% |
+
+Three things came out of it, and only the first is about accuracy.
+
+**The permissive/non-permissive trade did not exist.** The bake-off was framed
+as "how much do we lose by refusing CC-BY-NC weights?", with `dav2-large` as the
+labelled ceiling. The answer is that we lose nothing: the MIT model beats the
+non-commercial one by 0.67 points of residual and 3.8 points of coverage. The
+CC-BY-NC checkpoints are registered in `dense.py` and deliberately unreachable
+from the default path, and after this they are not even the tempting choice.
+
+**It wins where the pipeline actually fails.** On the textureless quartile --
+blank shelving and painted wall, which is the single largest source of dropped
+frames in this corpus -- MoGe scores 5.9% with 61% passing where V2-Small
+manages 9.9% with 31%. It is better on 89.7% of individual frames, so this is a
+distribution shift and not two outliers moving a median.
+
+**It forced a change in the fit.** MoGe emits a point map, not disparity, so the
+alignment fits `p ~= a*z + b` and inverts as `z = (p - b)/a`. Keeping the
+disparity form costs MoGe 0.63 points -- 3.01% instead of 2.38% -- and throws
+away a third of its advantage. `dense.py` therefore carries the model's output
+KIND alongside its name, and `depth_from_prediction` branches on it. A backend
+registered with the wrong kind is a silent 25% accuracy loss, which is why the
+kind is a property of the registration and not a flag.
+
+**What it costs.** 761 ms/frame against V2-Small's 17 ms, and 2.4 GB peak VRAM
+against 0.13 GB. On a 429-keyframe world that is minutes, not hours, and the
+stage already runs last and off the interactive path -- so the trade is bought
+with wall clock the wearer never waits on. The 761 ms was measured on a
+contended GPU and is an upper bound.
+
+**The ranking rested on one room, and the cross-check narrows the margin.** The
+table above is one solve of one room -- white shelving, a desk, two monitors --
+so a model that happened to suit that room would look better than it is. Two
+held-out solves were prepped at the time and not scored; they have been scored
+since, on the five models that mattered:
+
+| model | licence | `7d31e8d7` (214 fr) | `ecc02df1` (76 fr) | `c2e3cb8a` (106 fr) |
+| --- | --- | --- | --- | --- |
+| **`moge2-vitl`** | MIT | **2.38% / 84.6%** | **4.24% / 71.1%** | 1.98% / **90.6%** |
+| `da3mono-large` | Apache-2.0 | 3.16% / 83.2% | 4.87% / **73.7%** | **1.89%** / 89.6% |
+| `distill-any-depth-large` | MIT | 2.98% / 80.4% | 4.70% / 69.7% | 2.25% / 66.0% |
+| `dav2-large` | CC-BY-NC-4.0 | 3.05% / 80.8% | 4.71% / 72.4% | 2.26% / 65.1% |
+| `dav2-small` (previous default) | Apache-2.0 | 5.87% / 62.1% | 6.12% / 64.5% | 3.18% / 82.1% |
+
+Read honestly, this says three things.
+
+The choice survives: MoGe wins the median on two of three solves and is second
+by 0.09 points on the third, wins or ties the pass rate on two of three, and
+beats the CC-BY-NC ceiling on all three. The permissive-licence conclusion is
+the most robust part of the result.
+
+**The margin over `da3mono-large` is not real.** 2.38 vs 3.16, 4.24 vs 4.87,
+1.98 vs 1.89 -- it leads on the room it was selected on and the two of them are
+indistinguishable elsewhere. And `da3mono-large` is **2.7x faster** (53 ms
+against 145 ms) in **1.6 GB against 2.4 GB**. MoGe stays the default because it
+is never worse and the stage runs off the interactive path, where 90 ms a frame
+buys nothing the wearer waits on -- but on a smaller card, or if this stage ever
+moves onto a path someone waits on, `da3mono-large` is the switch to make and
+this table is the evidence for making it. It is registered and reachable today.
+
+The 2.5x headline in the table above shrinks to about 1.4x off its own room.
+That is what one solve of one room is worth as evidence, and it is why the
+seven-world re-measurement in `01-EVIDENCE.md` §11 exists.
+
+**Nothing here validates the reference.** Every number in this table is
+`|z_pred - z_sfm| / z_sfm` at SIFT keypoints of the same triangulation the
+affine was fitted to. A model that fails the way COLMAP fails would score too
+well, and no monocular bake-off against SfM points can detect that. It needs a
+depth sensor. See D16.
+
+---
+
+## D16. Depth Anything 3 is registered, is not the default, and the reason is instructive
+
+DA3 is pose-conditioned: given several views and their poses it predicts depth
+that is already consistent between them, which is exactly the property this
+pipeline builds by hand out of a per-frame affine fit and a consensus test. It
+should have won.
+
+It did not. The `da3-*` checkpoints score 8.30% (base) and 10.92% (small) in the
+table above, worse than the incumbent V2-Small; only `da3mono-large` -- the
+MONOCULAR variant, the one that does not use the poses -- is competitive at
+3.16%. `da3-large` is CC-BY-NC and scores 5.36%.
+
+The windowed backend interface in `dense.py` exists because of this: DA3 needs a
+window of neighbouring frames and their poses rather than one image, and that is
+a different shape of backend. It was built, it is tested, and it is not on the
+default path. Keeping it is cheap and the interface is the part worth keeping:
+the next pose-conditioned model that does win will need exactly it.
+
+The lesson recorded rather than the result: a model whose architecture matches
+the problem is not thereby better at the problem, and the only way to find that
+out was to measure it.
+
 ## Open, being decided by measurement
 
-| decision | options | metric |
+Two of the three questions this section opened with have been answered by
+measurement and moved into decisions of their own. What remains open is listed
+after them.
+
+| decision | options | metric | outcome |
+| --- | --- | --- | --- |
+| depth model | 24 checkpoints, permissive and not | held-out relative residual, and how many frames pass the gate | **closed: MoGe-2 ViT-L, D15** |
+| depth source | SfM-anchored monocular vs COLMAP CUDA PatchMatch vs DA3 pose-conditioned | same, plus completeness, runtime, VRAM | **closed: monocular, D14 and D16** |
+| appearance layer | point cloud alone vs adding a Gaussian splat | whether a splat invents geometry off the capture path | **closed: point cloud alone, D13** |
+
+Still open, and honestly open:
+
+| question | why it is not answered here | what would answer it |
 | --- | --- | --- |
-| depth model | Depth Anything V2 Small (Apache-2.0) vs MoGe-2 (MIT) vs Metric3D v2 (BSD-2), against the CC-BY-NC V2 Large as a labelled ceiling | held-out relative residual, and how many frames pass the gate |
-| depth source | SfM-anchored monocular vs COLMAP CUDA PatchMatch vs Depth Anything 3 pose-conditioned | same relative-depth metric, plus completeness, runtime, VRAM |
-| appearance layer | point cloud alone vs adding a Gaussian splat | whether a splat trained with no CUDA compiler produces a recognizable room, and whether it invents geometry off the capture path |
+| Is the reconstruction accurate, as opposed to self-consistent? | Every number in this lane is measured against the same triangulation the pipeline fits to. It cannot see SfM error. | A depth sensor, or a survey-grade scan of one of these rooms. |
+| Does the gate drop frames that carry the geometry nothing else covers? | `frames_dropped` counts frames, not the coverage they would have added. | Fuse with the gate disabled and diff the coverage, not the accuracy. |
+| Does it hold on a room this corpus does not contain? | Seven worlds, one dwelling. | A capture somewhere else. |

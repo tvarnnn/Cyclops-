@@ -9,6 +9,14 @@
 Everything here was measured on this machine. Where a figure came from a
 subagent, the report it came from is named.
 
+> **Sections 1-10 are a build log and their numbers are dated.** They record
+> what was measured while the stage was being designed, under whatever
+> configuration was current at the time -- including a different depth network.
+> **Section 11 is the shipped configuration, re-measured on all seven worlds
+> after the branch stopped moving.** Quote section 11. Where an earlier section
+> conflicts with it, section 11 is right and the earlier one is kept because the
+> reasoning it supports is still the reasoning that was used.
+
 ---
 
 ## 1. The baseline, and the two separate reasons it is not recognizable
@@ -290,3 +298,115 @@ Section 3 says `world.json`'s `pose_convention` block does not describe
 right: it annotates the field as `R_cw` and computes `centre = -r_wc @ t_cw`.
 The mismatch is between `world.json`, which describes the derived tree, and the
 solve artifact. It is a documentation gap, not a solver bug.
+
+
+---
+
+## 11. The shipped configuration, measured on all seven worlds
+
+**Read this section before quoting any number from this lane.** Everything above
+it was measured while the stage was being built, on whatever configuration was
+current that hour, and the default depth network changed late. An adversarial
+review made that its blocking finding, and it was right: a table describing a
+model the product no longer runs is worse than no table.
+
+So every world in the corpus was densified again, from scratch, with the
+configuration that is actually on the branch -- MoGe-2 ViT-L, `tau` 0.05, the
+exact redaction fill mask, bounded extrapolation, `gate_rel` 0.08 -- and scored
+the same way each time. These are those numbers.
+
+### 11.1 Per world
+
+| world | what it is | posed | used | held-out residual | L0 points | L0 size | wall clock |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `7d31e8d7` | desk and shelf | 429 | 316 | 2.6% | 8.22 M | 132 MB | 230 s |
+| `1b8812b1` | widest traverse | 438 | 303 | 2.9% | 8.65 M | 139 MB | 206 s |
+| `37e497f8` | bedroom | 196 | 134 | 3.4% | 4.85 M | 78 MB | 96 s |
+| `672578d0` | bedroom, closet, desk | 425 | 298 | 3.8% | 14.75 M | 236 MB | 210 s |
+| `a378331a` | closet | 201 | 117 | 4.9% | 5.05 M | 81 MB | 92 s |
+| `ecc02df1` | dresser | 77 | 50 | 5.3% | 2.09 M | 33 MB | 51 s |
+| `6427900d` | bathroom, tight | 266 | 132 | 5.4% | 3.57 M | 57 MB | 108 s |
+
+Peak VRAM for the depth stage is **2.4 GB**, up from 0.85 GB, and that is the
+price of the model change. Everything else is CPU and RAM.
+
+### 11.2 The fused cloud, rendered at held-out cameras
+
+Not the per-frame residual above. This is the whole cloud re-rendered from
+cameras the fusion did not privilege, and depth read out of the render.
+
+| world | depth error, median | depth error, p90 | pixel coverage, median |
+| --- | --- | --- | --- |
+| `7d31e8d7` | 2.3% | 12.7% | 97.9% |
+| `ecc02df1` | 3.3% | 5.4% | 97.1% |
+| `1b8812b1` | 3.3% | 6.6% | 96.8% |
+| `6427900d` | 4.4% | **57.6%** | 67.5% |
+| `a378331a` | 4.6% | 5.6% | 60.1% |
+| `672578d0` | 5.3% | **40.3%** | 97.9% |
+| `37e497f8` | 5.4% | 7.2% | 96.2% |
+
+**The p90 column is the honest part of this table.** Two worlds carry a tail an
+order of magnitude worse than their own median. `6427900d` is the tight
+bathroom, where the walk never gets far enough from a surface for two cameras to
+disagree usefully, and `672578d0` is the three-room chain, where the far end of
+a long room is reconstructed from a handful of distant frames. In both, the
+median says the reconstruction is good and the p90 says part of it is not, and
+the confidence channel is what a viewer has to separate them with.
+
+Coverage tells the same story from the other side: `a378331a` (closet) and
+`6427900d` (bathroom) cover 60-67% of the held-out frame where every other world
+covers 96-98%. Tight spaces are this pipeline's weakest case, and they are
+weakest for a structural reason rather than a tuning one -- multi-view consensus
+needs baseline, and a closet does not offer any.
+
+### 11.3 What the gate does to the number
+
+The held-out residual quoted in 11.1 is the median **of the frames that passed
+the 8% gate**. It is therefore a property of the gate as much as of the
+reconstruction, and it improves as the gate tightens while the reconstruction
+gets worse. Both ends, from `proto/gate_sensitivity.py` over the shipped
+artifacts (bracketed count is frames surviving that gate):
+
+| world | posed | all frames | gate 0.16 | **gate 0.08 (shipped)** | gate 0.04 | gate 0.02 |
+|---|---|---|---|---|---|---|
+| `7d31e8d7` | 429 | 2.6% (399) | 2.3% (342) | **2.2% (317)** | 1.9% (262) | 1.3% (139) |
+| `1b8812b1` | 438 | 2.9% (373) | 2.5% (330) | **2.4% (303)** | 2.0% (227) | 1.4% (114) |
+| `37e497f8` | 196 | 3.4% (170) | 3.2% (154) | **3.0% (134)** | 2.6% (99) | 1.7% (29) |
+| `672578d0` | 425 | 3.8% (374) | 3.5% (337) | **3.2% (300)** | 2.8% (201) | 1.7% (28) |
+| `a378331a` | 201 | 4.9% (153) | 4.7% (139) | **4.4% (117)** | 3.3% (49) | 1.6% (1) |
+| `ecc02df1` | 77 | 5.3% (74) | 4.2% (61) | **3.7% (50)** | 2.8% (27) | 1.8% (2) |
+| `6427900d` | 266 | 5.4% (215) | 4.8% (179) | **3.8% (132)** | 2.5% (69) | 1.2% (22) |
+
+Tighten to 2% and the "accuracy" becomes 1.2-1.8% while `a378331a` keeps ONE
+frame. So: quote the all-frames column when describing the pipeline, quote a
+gate column only when comparing two configurations at the same gate, and never
+quote the best world as the pipeline's figure. Under the shipped model the gate
+moves the number by 0.2-1.6 points depending on the world; under the previous
+one it moved it by up to 3.4, which is most of what the earlier tables were
+reporting as quality.
+
+### 11.4 What changed against the previous default, and what did not
+
+The seven-world run above is the same seven worlds the stage had already
+produced with Depth Anything V2 Small, so the comparison is like for like.
+
+| | V2-Small | MoGe-2 ViT-L |
+| --- | --- | --- |
+| held-out residual, best world | 3.0% | 2.6% |
+| held-out residual, worst world | 8.7% | 5.4% |
+| frames passing the gate, `1b8812b1` | 247 / 438 | 303 / 438 |
+| frames passing the gate, `672578d0` | 218 / 425 | 298 / 425 |
+| L0 points, `1b8812b1` | 5.80 M | 8.65 M |
+| peak VRAM | 0.85 GB | 2.4 GB |
+| wall clock, `1b8812b1` | 7 min | 3.4 min |
+
+More frames survive, so more of the room is reconstructed, and the frames that
+survive are better aligned. The wall clock fell despite a 45x slower network
+because the earlier figure was measured on a contended GPU; treat both as
+upper bounds.
+
+**What did not change: the gate still drops 30-50% of posed frames.** 303 of
+438, 132 of 266, 50 of 77. That is disclosed in `frames_dropped`, in the
+manifest and in the CLI's own output, and it is the number to quote when
+someone asks how much of the walk the reconstruction uses. It is better than
+the 43-64% the previous model dropped, and it is still most of a third.

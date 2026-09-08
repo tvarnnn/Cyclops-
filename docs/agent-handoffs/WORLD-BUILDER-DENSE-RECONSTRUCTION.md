@@ -123,26 +123,58 @@ that as a live filter.
 
 ## 6. Quantitative results
 
-**Geometric accuracy**, measured against the sparse points, which come from
-triangulating SIFT correspondences and are therefore independent of the depth
-network:
+All seven worlds were densified again from scratch after the branch stopped
+moving, so every figure below describes the configuration that is on the branch.
+An earlier version of this section quoted a single headline number taken from a
+different world's parameter sweep; it is corrected here, and the correction
+matters more than the numbers.
 
-| | |
-|---|---|
-| per-frame aligned depth vs SfM, held out | **3.0% median** |
-| per-frame aligned depth, signed bias | **+0.03%** (unbiased) |
-| fused cloud rendered at held-out cameras (closet walk) | **3.74% median, 5.83% p90** |
-| pixel coverage at a viewer's splat radius | **47.7%** |
+**What the reference is, first.** Every accuracy figure in this lane is
+`|z_pred − z_sfm| / z_sfm` at SIFT keypoints of the same triangulation the
+per-frame affine was fitted to. It cannot see SfM error, and it is evaluated
+only where the sparse cloud is, which is the textured corners a depth network
+finds easiest. **There is no external metric ground truth anywhere in this
+lane.** That is a defensible position for a system with no depth sensor. It is
+not "geometric accuracy", and this document used to call it that.
 
-**Appearance, at genuinely held-out cameras** (those frames excluded from the
-fusion): PSNR 15.2 median, SSIM 0.485, completeness 98.4%. PSNR is depressed by
-auto-exposure drift between frames and should not be read as a geometry figure —
-that is what the depth numbers above are for.
+**Per-frame alignment residual, held out** (fit on even-indexed sparse points,
+scored on odd), across the seven worlds:
 
-**Cost.** Peak VRAM for the depth stage is **0.85 GB**; everything else is CPU
-and RAM. A 438-keyframe world takes about seven minutes end to end. The
-end-to-end replay measured 327 frames staged, 105 s of dense work inside a 144 s
-total.
+| | all posed frames | frames passing the 8% gate |
+|---|---|---|
+| best world (`7d31e8d7`) | 2.6% | 2.2% |
+| worst world (`6427900d`) | 5.4% | 3.8% |
+| signed bias, per frame | +0.03% (unbiased) | — |
+
+**The right-hand column is a property of the gate.** It is the median of a
+distribution truncated at the threshold, so it improves as the gate tightens and
+the reconstruction gets worse. Tighten it to 2% and the closet walk reports 1.6%
+on ONE surviving frame. `01-EVIDENCE.md` §11.3 prints the full sweep; quote the
+left column when describing the pipeline.
+
+**Fused cloud, re-rendered at held-out cameras**, across the same seven worlds:
+
+| | median | p90 | pixel coverage |
+|---|---|---|---|
+| best (`7d31e8d7`) | 2.3% | 12.7% | 97.9% |
+| worst median (`37e497f8`) | 5.4% | 7.2% | 96.2% |
+| worst tail (`6427900d`, tight bathroom) | 4.4% | **57.6%** | 67.5% |
+
+The tail is the finding, not the median. Two worlds — the tight bathroom and the
+three-room chain — carry a p90 an order of magnitude above their own median,
+because consensus needs baseline between cameras and a small room does not offer
+any. The confidence channel is what separates the good part of those clouds from
+the bad, and a viewer that ignores it will present the tail as if it were the
+median.
+
+**Appearance, at genuinely held-out cameras**: PSNR 15.2 median, SSIM 0.485,
+completeness 98.4% on the closet walk. PSNR is depressed by auto-exposure drift
+between frames and should not be read as a geometry figure.
+
+**Cost.** Peak VRAM for the depth stage is **2.4 GB**, up from 0.85 GB with the
+previous network; everything else is CPU and RAM. A 438-keyframe world takes
+about 3.5 minutes. The end-to-end replay measured 327 frames staged, 105 s of
+dense work inside a 144 s total.
 
 ## 7. Visual inspection
 
@@ -258,7 +290,8 @@ The dense field is not a meaningful part of it.
 
 1. **Coverage.** Roughly half a typical view is filled. Textureless walls and
    ceilings are genuinely unreconstructable at this resolution and stay empty.
-2. **Frames used.** 45-56% on walk data. `align.json` records why each frame was
+2. **Frames used.** 50-74% across the seven worlds — so the gate drops between a
+   quarter and half of every walk. `align.json` records why each frame was
    dropped; the dominant causes are blur and heavy redaction fill.
 3. **Points, not surfaces.** There is no mesh, so occlusion is imperfect and you
    can see through a wall's holes. Meshing was deliberately not done: the
@@ -267,7 +300,14 @@ The dense field is not a meaningful part of it.
 4. **Confidence has a short dynamic range** on this data, mostly 3-6, so the
    honesty slider saturates quickly.
 5. **Scale remains unknown**, unchanged and explicitly so.
-6. **The corpus limits the claim.** Only a handful of captures are true walks.
+6. **The corpus limits the claim.** Only a handful of captures are true walks,
+   and all seven worlds are one dwelling. Nothing here shows the pipeline holds
+   in a room this corpus does not contain.
+7. **Tight rooms are the weakest case and it is structural.** The closet and the
+   bathroom reconstruct 60-67% of a held-out frame where every other world
+   reaches 96-98%. More tuning will not fix it; consensus needs baseline.
+8. **The reference is not independent** — see the top of §6. Every number in
+   this lane is measured against the solve the pipeline is anchored to.
 
 ## 11. Exact reproduction
 
