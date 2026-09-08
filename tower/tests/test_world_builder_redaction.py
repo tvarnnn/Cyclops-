@@ -284,3 +284,40 @@ def test_the_persisted_image_is_the_redacted_one(tmp_path):
         )
         region = stored[70:160, 200:290]
         assert int(region.min()) == 0, f"{path.name} kept an unfilled face"
+
+
+def test_the_model_is_found_from_any_working_directory(tmp_path, monkeypatch):
+    """It used to be `Path("models")/...`, resolved against the cwd. A Tower or
+    a script started from anywhere but `tower/` therefore found no model, and
+    the consequence is not an error: `engine.py` logs a warning and persists
+    the keyframe UNREDACTED. A privacy transformation was silently conditional
+    on where a caller happened to be standing.
+
+    Found when a batch script run from a scratch directory refused 429 of 429
+    frames -- refusing is the safe direction, and only the dense stage's own
+    outcome check made it visible at all.
+    """
+    from tower.world_builder.redaction import FaceRedactor, model_path
+
+    monkeypatch.delenv("TOWER_FACE_REDACTION_MODEL", raising=False)
+    monkeypatch.chdir(tmp_path)              # no models/ here
+    found = model_path()
+    assert found is not None, "the vendored model must be found from any cwd"
+    assert found.is_absolute()
+    assert found.exists()
+    assert FaceRedactor().available is True
+
+
+def test_the_environment_override_still_wins_and_a_missing_one_is_absent(tmp_path, monkeypatch):
+    """The override is how a deployment points at its own weights, and an
+    override naming a file that is not there must be reported as absent rather
+    than silently falling back to a different model."""
+    from tower.world_builder.redaction import model_path
+
+    monkeypatch.setenv("TOWER_FACE_REDACTION_MODEL", str(tmp_path / "nope.onnx"))
+    assert model_path() is None
+
+    real = tmp_path / "mine.onnx"
+    real.write_bytes(b"not really a model")
+    monkeypatch.setenv("TOWER_FACE_REDACTION_MODEL", str(real))
+    assert model_path() == real
