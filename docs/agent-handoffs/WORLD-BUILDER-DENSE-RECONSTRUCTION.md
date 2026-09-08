@@ -271,27 +271,29 @@ inspection.
 
 ### Regression evidence
 
-The whole Tower suite, on this branch, in one run at the final HEAD:
+The whole Tower suite, on this branch, at the final HEAD:
 
 ```
-2964 passed, 1 failed, 76 skipped, 1 xfailed          595.86s
+2974 passed, 76 skipped, 1 xfailed, 0 failed          589.59s
 ```
 
-**The one failure is not this lane's, and that was checked rather than
-assumed.** It is
-`test_object_memory_lifecycle.py::TestASessionDoesNotOutliveEveryClient::test_the_session_stops_when_the_last_connection_closes`.
-It fails deterministically here, three times out of three in isolation — and it
-fails the same way in a clean worktree checked out at
-`integration/all-cartridges-v1` (`9e939a3`), which contains none of this work.
-It is a pre-existing failure on the base branch, it belongs to Object Memory's
-session lifecycle, and it is reported here rather than fixed: this lane is not
-authorised to change that subsystem, and a green number that hid it would be
-worth less than an honest red one.
+**One test in this suite is intermittent, and it is not this lane's.** It is
+`test_object_memory_lifecycle.py::TestASessionDoesNotOutliveEveryClient::test_the_session_stops_when_the_last_connection_closes`,
+which asserts a session stops when its last client disconnects.
 
-An earlier run of the same suite, split in halves while six research agents
-shared the machine, reported 2918 passed and zero failures — that split simply
-never reached the failing test's deselection boundary the same way. The single
-run above supersedes it.
+The honest history, because an earlier version of this section got it wrong.
+It failed in two full-suite runs while the machine was also running research
+agents and GPU jobs, and three times out of three in isolation under that load,
+and it failed the same way in a clean worktree at
+`integration/all-cartridges-v1` (`9e939a3`) containing none of this work — so
+it is not a regression from here. On a quiet machine it passed in the full run
+above and in two of three isolated runs. **It is load-sensitive and flaky, not
+deterministic, and this document previously called it deterministic on the
+strength of three failures under load.**
+
+It belongs to Object Memory's session lifecycle and is reported rather than
+fixed: this lane is not authorised to change that subsystem. Expect it to fail
+occasionally on a busy machine.
 
 The first half covers CV Lab, Object Memory, Document Memory, Scene
 Understanding, the shared camera transport, session lifecycle, listener
