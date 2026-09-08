@@ -234,7 +234,8 @@ def _fill_mask_for(redacted: bytes, raw: bytes | None):
 
 
 def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str,
-                         source_path: str | None, redactor
+                         source_path: str | None, redactor, *,
+                         keyframes_are_redacted: bool,
                          ) -> tuple[bytes | None, str, "np.ndarray | None"]:
     """The pixels the dense stage is allowed to read, and where they came from.
 
@@ -246,11 +247,24 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
     pixels the privacy transformation removed, at far higher density than the
     sparse cloud ever exposed.
 
-    So: the world's own redacted keyframe image is used when it exists. When it
-    does not -- worlds migrated between roots lost their `images/` directory --
-    the raw frame is read and THE SAME REDACTION IS RE-APPLIED before anything
-    looks at it. If the redactor is unavailable, the frame is refused rather
-    than used raw.
+    So: the world's own redacted keyframe image is used when it exists AND the
+    session record says it was redacted. That second condition is not
+    decoration. `FaceRedactor.redact` returns the original bytes unchanged when
+    the redactor is unavailable or throws, labelled `none`, and
+    `engine._persist_keyframe` persists whatever comes back -- so `images/` can
+    legitimately hold raw frames, and `session.redaction` is the only record
+    that says which. An earlier version of this function asserted the boundary
+    in this docstring and then read that directory unconditionally.
+
+    `keyframes_are_redacted` is that record, resolved by the caller from
+    `store.read_session(...).redaction`. When it is false the stored keyframe is
+    treated exactly like a raw frame: THE REDACTION IS APPLIED HERE before
+    anything looks at it, and the frame is refused if no redactor is available.
+
+    When the keyframe image is missing entirely -- worlds migrated between roots
+    lost their `images/` directory -- the raw source frame is read and the same
+    redaction applied. If the redactor is unavailable, the frame is refused
+    rather than used raw.
 
     Returns (image_bytes, origin, fill_mask). The mask is computed inside this
     function, from the difference against the raw frame, and the raw bytes are
@@ -273,7 +287,15 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
             # image alone runs at 36.2% precision, which means two thirds of
             # what it deletes is real scene.
             data = p.read_bytes()
-            return data, "world-keyframe", _fill_mask_for(data, raw_bytes)
+            if keyframes_are_redacted:
+                return data, "world-keyframe", _fill_mask_for(data, raw_bytes)
+            # The session record says these pixels were never redacted. Do it
+            # now rather than republish faces at ~50x the density the sparse
+            # cloud ever exposed.
+            if redactor is None or not getattr(redactor, "available", False):
+                return None, "refused-unredacted-keyframe", None
+            filled = redactor.redact(data).image_bytes
+            return filled, "world-keyframe-redacted-here", _fill_mask_for(filled, data)
         except OSError:
             pass
     if raw_bytes is None:
@@ -367,7 +389,27 @@ def run_depth_stage(
     # keyframes, so the dense stage deliberately does not read them.
     from tower.world_builder.redaction import FaceRedactor
 
+    from tower.world_builder.redaction import REDACTION_NONE
+
+    # What the SESSION says about the pixels already on disk, not what a
+    # redactor loaded now would do to them. `engine.py` persists whatever
+    # `redact` returns, including the original bytes when redaction was
+    # unavailable at capture time, so `images/` is only trustworthy when this
+    # says so. Anything unrecognised is treated as unredacted.
+    try:
+        session_redaction = store.read_session(world_id, session_id).redaction
+    except Exception:
+        session_redaction = None
+    keyframes_are_redacted = bool(session_redaction) and session_redaction != REDACTION_NONE
+
     redactor = FaceRedactor()
+    if not keyframes_are_redacted:
+        logger.warning(
+            "[Tower][WorldBuilder][dense] session %s records redaction=%r; its "
+            "stored keyframes are NOT trusted as redacted and will be redacted "
+            "here before any pixel is read",
+            session_id, session_redaction,
+        )
     if not redactor.available:
         logger.warning(
             "[Tower][WorldBuilder][dense] face redaction unavailable (%s); frames "
@@ -425,7 +467,8 @@ def run_depth_stage(
             progress(STAGE_DEPTH, n, len(targets))
 
         data, origin, exact_fill = keyframe_image_bytes(
-            store, world_id, session_id, kid, sources.get(kid), redactor
+            store, world_id, session_id, kid, sources.get(kid), redactor,
+            keyframes_are_redacted=keyframes_are_redacted,
         )
         origins[origin] = origins.get(origin, 0) + 1
         if data is None:
@@ -516,7 +559,10 @@ def run_depth_stage(
                "backend_licence": backend.licence, "kind": backend.kind,
                "stopped_after": None,
                "image_origins": origins,
-               "redaction": getattr(redactor, "label", None) if redactor.available else None}
+               "redaction": session_redaction,
+               "keyframes_were_redacted_at_capture": keyframes_are_redacted,
+               "redactor_applied_here": (
+                   getattr(redactor, "label", None) if redactor.available else None)}
     _write_json(root / "align.json", payload)
     return payload
 
@@ -672,7 +718,8 @@ def run_fuse_stage(
     }
 
 
-def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
+def run_pack_stage(params: DenseParams, root: Path, scale: dict,
+                   input_digest: str | None = None) -> dict:
     """The LOD ladder plus the manifest a viewer reads."""
     with np.load(root / "fused.npz") as z:
         X = z["xyz"].astype(np.float32)
@@ -711,9 +758,70 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
         "scale": dict(scale),
         "levels": levels,
         "params": params.as_dict(),
+        # The solve this cloud was built from. Without it nothing at serve
+        # time can tell that the world has since been re-solved, and the
+        # phone is handed a reconstruction of a superseded geometry with no
+        # way to say so. `status.json` carries the same value for artifacts
+        # written before this key existed.
+        "input_digest": input_digest,
     }
     _write_json(root / "manifest.json", manifest)
     return {"levels": levels, "points": levels[0]["points"]}
+
+
+def dense_currency(store, world_id: str, session_id: str,
+                   manifest: dict | None = None) -> dict:
+    """Whether the dense artifact still describes the geometry on disk.
+
+    Contract `WORLD-BUILDER-WORLDS.md` rule 2 -- "the page never claims more
+    than the caption says" -- and its BEHIND obligation apply to whatever the
+    render route serves, and the dense page is now what it serves. Two
+    different things can be behind, and they are reported separately:
+
+    `solve_current`   the dense cloud was fused against THIS solve. False after
+                      a re-solve or a second session: the points are real
+                      observations, but of a superseded pose graph.
+    `derived_current` `render.derived_current`'s answer, unchanged -- the
+                      derived tree versus the newest keyframes.
+
+    Either may be None, which means unknowable rather than stale, and an
+    unknowable one never produces a BEHIND claim. Cheap on purpose: the solve
+    digest is read from `solution.json` alone, never by loading the arrays.
+    """
+    out = {"solve_current": None, "derived_current": None,
+           "artifact_digest": None, "solve_digest": None}
+    if manifest is None:
+        manifest = read_dense_manifest(store, world_id, session_id)
+    artifact = (manifest or {}).get("input_digest")
+    if artifact is None:
+        # Artifacts packed before the manifest carried it; status.json has
+        # recorded it since the first version of this stage.
+        try:
+            status = json.loads(
+                (dense_dir(store, world_id, session_id) / "status.json").read_text())
+            artifact = status.get("input_digest")
+        except (OSError, ValueError):
+            artifact = None
+    out["artifact_digest"] = artifact
+
+    try:
+        from tower.world_builder.global_solve import workspace_for  # noqa: PLC0415
+
+        solve_path = workspace_for(store, world_id, session_id).solution_path
+        current = json.loads(solve_path.read_text()).get("input_digest")
+    except Exception:  # noqa: BLE001 -- unreadable is "unknown", not "stale"
+        current = None
+    out["solve_digest"] = current
+    if artifact is not None and current is not None:
+        out["solve_current"] = bool(artifact == current)
+
+    try:
+        from tower.world_builder.render import derived_current  # noqa: PLC0415
+
+        out["derived_current"] = derived_current(store, world_id, session_id)
+    except Exception:  # noqa: BLE001
+        out["derived_current"] = None
+    return out
 
 
 def prune_intermediates(root: Path) -> int:
@@ -866,7 +974,7 @@ def densify(
 
         _status(root, state=STATE_RUNNING, stage=STAGE_PACK, input_digest=digest)
         t = time.time()
-        pack = run_pack_stage(params, root, scale)
+        pack = run_pack_stage(params, root, scale, input_digest=digest)
         seconds[STAGE_PACK] = time.time() - t
 
         result = DenseResult(

@@ -66,11 +66,20 @@
   function die(msg) { failwhy.textContent = msg; fail.className = "on"; }
 
   // ---- decode -----------------------------------------------------------
+  // Peak heap matters more here than anywhere else on the page: a 6 MB buffer
+  // arrives as 8 MB of base64, atob makes an 8 MB binary string out of that,
+  // and WKWebView kills the content process rather than paging. So both
+  // intermediates are released as soon as the typed array exists -- the
+  // decoded bytes are the only copy kept, and they are kept on purpose (see
+  // the context-restore handler, which rebuilds the GPU buffer from them
+  // rather than reloading a document that has no URL to reload).
   var bytes;
   try {
     var bin = atob(B64), n = bin.length;
+    B64 = null;
     bytes = new Uint8Array(n);
     for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+    bin = null;
   } catch (e) { die("The point data could not be decoded."); return; }
 
   var STRIDE = CONFIG.stride || 16;
@@ -125,15 +134,12 @@
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
     return s;
   }
-  var prog;
-  try {
-    prog = gl.createProgram();
-    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
-    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
-  } catch (e) { die("Shader compilation failed: " + e); return; }
-  gl.useProgram(prog);
+
+  // Everything below is GPU state, and ALL of it dies with the context. It is
+  // built by a function rather than inline so the restore handler can build it
+  // again -- see the handler for why reloading is not an option on the phone.
+  var prog, vbo, uMVP, uSize, uMinConf, uByConf, uMaxConf, uSizeCap;
+  var sizeCap = 64;
 
   function attrib(name, size, type, norm, offset) {
     var loc = gl.getAttribLocation(prog, name);
@@ -141,50 +147,76 @@
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, size, type, !!norm, STRIDE, offset);
   }
-  var vbo = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
-  gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.STATIC_DRAW);
-  // bufferData does NOT throw when the GPU cannot allocate -- it sets
-  // OUT_OF_MEMORY and carries on, so a try/catch here would never fire.
-  var allocErr = gl.getError();
-  if (allocErr === gl.OUT_OF_MEMORY) {
-    die("The GPU could not allocate a buffer for " + N.toLocaleString() +
-        " points. Another tab or application may be holding video memory.");
-    return;
-  }
-  attrib("aPos", 3, gl.FLOAT, false, 0);
-  attrib("aCol", 3, gl.UNSIGNED_BYTE, true, 12);
-  attrib("aConf", 1, gl.UNSIGNED_BYTE, false, 15);
 
-  var uMVP = gl.getUniformLocation(prog, "uMVP"),
-      uSize = gl.getUniformLocation(prog, "uSize"),
-      uMinConf = gl.getUniformLocation(prog, "uMinConf"),
-      uByConf = gl.getUniformLocation(prog, "uByConf"),
-      uMaxConf = gl.getUniformLocation(prog, "uMaxConf"),
-      uSizeCap = gl.getUniformLocation(prog, "uSizeCap");
-  // GLES clamps gl_PointSize to a driver-reported range, and the cap on a
-  // phone is often far lower than on desktop -- 64 where Chrome allows 1024.
-  // Writing past it is undefined rather than merely ignored, so the shader is
-  // told the real limit instead of discovering it.
-  var sizeCap = 64;
-  try {
-    var range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
-    if (range && range.length === 2 && range[1] > 1) sizeCap = range[1];
-  } catch (e) { /* keep the conservative default */ }
-  gl.enable(gl.DEPTH_TEST);
-  gl.clearColor(0.055, 0.059, 0.071, 1);
+  function buildGL() {
+    try {
+      prog = gl.createProgram();
+      gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+      gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+    } catch (e) { die("Shader compilation failed: " + e); return false; }
+    gl.useProgram(prog);
+
+    vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
+    gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.STATIC_DRAW);
+    // bufferData does NOT throw when the GPU cannot allocate -- it sets
+    // OUT_OF_MEMORY and carries on, so a try/catch here would never fire.
+    if (gl.getError() === gl.OUT_OF_MEMORY) {
+      die("The GPU could not allocate a buffer for " + N.toLocaleString() +
+          " points. Another tab or application may be holding video memory.");
+      return false;
+    }
+    attrib("aPos", 3, gl.FLOAT, false, 0);
+    attrib("aCol", 3, gl.UNSIGNED_BYTE, true, 12);
+    attrib("aConf", 1, gl.UNSIGNED_BYTE, false, 15);
+
+    uMVP = gl.getUniformLocation(prog, "uMVP");
+    uSize = gl.getUniformLocation(prog, "uSize");
+    uMinConf = gl.getUniformLocation(prog, "uMinConf");
+    uByConf = gl.getUniformLocation(prog, "uByConf");
+    uMaxConf = gl.getUniformLocation(prog, "uMaxConf");
+    uSizeCap = gl.getUniformLocation(prog, "uSizeCap");
+    // GLES clamps gl_PointSize to a driver-reported range, and the cap on a
+    // phone is often far lower than on desktop -- 64 where Chrome allows 1024.
+    // Writing past it is undefined rather than merely ignored, so the shader is
+    // told the real limit instead of discovering it.
+    sizeCap = 64;
+    try {
+      var range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+      if (range && range.length === 2 && range[1] > 1) sizeCap = range[1];
+    } catch (e) { /* keep the conservative default */ }
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0.055, 0.059, 0.071, 1);
+    return true;
+  }
+  if (!buildGL()) return;
 
   // The observed field failure. Without this the canvas simply freezes and the
   // page looks broken with no explanation.
   var lost = false;
   cv.addEventListener("webglcontextlost", function (e) {
+    // preventDefault is what makes a restore possible at all; without it the
+    // browser never fires webglcontextrestored.
     e.preventDefault(); lost = true;
-    die("The browser dropped the graphics context, usually because another " +
-        "application needed the video memory. Reload to try again.");
+    die("The graphics context was dropped, usually because another application "
+        + "needed the video memory. Waiting for it to come back\u2026");
   }, false);
   cv.addEventListener("webglcontextrestored", function () {
-    location.reload();
+    // NOT a page reload. On the phone the page is handed to WKWebView by
+    // loadHTMLString with a null baseURL, so the document URL is about:blank
+    // and the app's navigation delegate refuses a second navigation to it --
+    // a reload there is a no-op at best and a refused navigation at worst,
+    // and either way strands the wearer on an error screen with no control
+    // that could clear it. Losing the context on backgrounding is the
+    // ORDINARY WKWebView case, so this path has to actually work: the point
+    // bytes were kept in JS for exactly this, and every GPU object is built
+    // from them again.
+    if (!buildGL()) return;
+    fail.className = ""; lost = false;
+    requestAnimationFrame(frame);
   }, false);
 
   // ---- camera -----------------------------------------------------------
@@ -341,7 +373,10 @@
   // Saying "the capture did not support geometry there" while the page is
   // showing a fifth of the points, thinned to fit the device, blames the
   // capture for a choice this page made.
-  var parts = ["Confidence is how many cameras agreed on a point."];
+  // The caption the worlds contract requires, first and always: what this
+  // picture IS. Everything after it qualifies it; none of it replaces it.
+  var parts = [CONFIG.caption || "",
+               "Confidence is how many cameras agreed on a point."];
   var full = CONFIG.source_points || CONFIG.points;
   if (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined) {
     parts.push("This view shows " + CONFIG.points.toLocaleString() + " of " +
@@ -353,6 +388,15 @@
   parts.push("Scale is " + (sc === "unknown"
              ? "unknown, so distances here are not metres." : String(sc) + "."));
   note.textContent = parts.join(" ");
+  // BEHIND lines are emphasised the way the sparse page emphasises its own,
+  // and appended rather than substituted: a stale reconstruction is still a
+  // reconstruction, and hiding it would be a different dishonesty.
+  (CONFIG.caption_behind || []).forEach(function (line) {
+    var b = document.createElement("b");
+    b.style.color = "#f80";
+    b.textContent = " " + line;
+    note.appendChild(b);
+  });
 
   // ---- draw -------------------------------------------------------------
   var last = performance.now(), fps = 0;

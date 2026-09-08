@@ -388,7 +388,8 @@ def test_dense_prefers_the_worlds_redacted_keyframe_over_the_raw_capture(tmp_pat
     red = _StubRedactor()
 
     data, origin, fill = keyframe_image_bytes(
-        _StubStore(images), "w", "s", "s:00000042", str(raw), red
+        _StubStore(images), "w", "s", "s:00000042", str(raw), red,
+        keyframes_are_redacted=True,
     )
     assert data == b"REDACTED-KEYFRAME"
     assert origin == "world-keyframe"
@@ -410,7 +411,8 @@ def test_dense_re_redacts_when_the_worlds_keyframe_image_is_missing(tmp_path):
     red = _StubRedactor()
 
     data, origin, fill = keyframe_image_bytes(
-        _StubStore(images), "w", "s", "s:00000042", str(raw), red
+        _StubStore(images), "w", "s", "s:00000042", str(raw), red,
+        keyframes_are_redacted=True,
     )
     assert red.calls == 1
     assert fill is None or getattr(fill, "dtype", None) == bool
@@ -429,13 +431,15 @@ def test_dense_refuses_a_raw_frame_when_redaction_is_unavailable(tmp_path):
     raw.write_bytes(b"RAW-WITH-A-FACE")
 
     data, origin, _ = keyframe_image_bytes(
-        _StubStore(images), "w", "s", "s:00000042", str(raw), _StubRedactor(available=False)
+        _StubStore(images), "w", "s", "s:00000042", str(raw),
+        _StubRedactor(available=False), keyframes_are_redacted=True,
     )
     assert data is None
     assert origin == "refused-no-redactor"
 
     data, origin, _ = keyframe_image_bytes(
-        _StubStore(images), "w", "s", "s:00000042", str(raw), None
+        _StubStore(images), "w", "s", "s:00000042", str(raw), None,
+        keyframes_are_redacted=True,
     )
     assert data is None
 
@@ -446,7 +450,8 @@ def test_dense_reports_an_absent_image_rather_than_inventing_one(tmp_path):
     images = tmp_path / "images"
     images.mkdir()
     data, origin, _ = keyframe_image_bytes(
-        _StubStore(images), "w", "s", "s:00000042", None, _StubRedactor()
+        _StubStore(images), "w", "s", "s:00000042", None, _StubRedactor(),
+        keyframes_are_redacted=True,
     )
     assert data is None
     assert origin == "absent"
@@ -1109,3 +1114,178 @@ def test_no_backend_assumes_a_gpu_is_present():
         src = inspect.getsource(cls._load)
         assert "is_available()" in src, cls.__name__
         assert ".cuda()" not in src, cls.__name__
+
+
+def test_dense_does_not_trust_a_keyframe_the_session_says_was_never_redacted(tmp_path):
+    """`FaceRedactor.redact` returns the ORIGINAL bytes when the redactor is
+    unavailable or throws, labelled `none`, and `engine._persist_keyframe`
+    persists whatever comes back. So `images/` can hold raw frames, and
+    `session.redaction` is the only record that says which. An earlier version
+    of this boundary asserted the guarantee in a docstring and then read that
+    directory unconditionally."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "00000042.jpg").write_bytes(b"UNREDACTED-KEYFRAME")
+    red = _StubRedactor()
+
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", None, red,
+        keyframes_are_redacted=False,
+    )
+    assert red.calls == 1
+    assert data == b"REDACTED:UNREDACTED-KEYFRAME"
+    assert origin == "world-keyframe-redacted-here"
+    assert b"UNREDACTED-KEYFRAME" != data
+
+
+def test_dense_refuses_an_unredacted_keyframe_when_no_redactor_is_available(tmp_path):
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "00000042.jpg").write_bytes(b"UNREDACTED-KEYFRAME")
+
+    for redactor in (_StubRedactor(available=False), None):
+        data, origin, _ = keyframe_image_bytes(
+            _StubStore(images), "w", "s", "s:00000042", None, redactor,
+            keyframes_are_redacted=False,
+        )
+        assert data is None
+        assert origin == "refused-unredacted-keyframe"
+
+
+def test_the_depth_stage_reads_the_sessions_redaction_record():
+    """The check has to be wired, not merely available: the finding was that
+    `session.redaction` appeared nowhere in this module."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    assert "read_session" in body
+    assert "REDACTION_NONE" in body
+    assert "keyframes_are_redacted=keyframes_are_redacted" in body
+
+
+def test_align_records_the_sessions_redaction_not_the_loaded_redactors_label():
+    """`align.json` used to record the label of the redactor loaded NOW, which
+    says nothing about the pixels that were read."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    assert '"redaction": session_redaction' in body
+    assert '"keyframes_were_redacted_at_capture"' in body
+
+
+# --------------------------------------------------------------------------
+# The caption obligation, and staleness. `WORLD-BUILDER-WORLDS.md` requires the
+# render page to carry a caption saying what it is, plus a BEHIND line when the
+# derived tree is behind; the dense page is now what that route serves, and it
+# used to carry neither.
+# --------------------------------------------------------------------------
+
+
+def test_the_dense_caption_says_what_the_picture_is_and_refuses_the_word_scan():
+    from tower.world_builder.dense_render import CAPTION
+
+    lowered = CAPTION.lower()
+    assert "not a surface" in lowered
+    assert "not a mesh" in lowered
+    assert "not metric scale" in lowered
+    assert "scan" not in lowered
+
+
+def test_the_viewer_prints_the_caption_first_and_the_behind_lines_after():
+    from tower.world_builder.dense_render import viewer_template_path
+
+    html = viewer_template_path().read_text(encoding="utf-8")
+    assert "CONFIG.caption" in html
+    assert "CONFIG.caption_behind" in html
+    # The caption leads. A qualification printed before the thing it qualifies
+    # is not a caption.
+    assert html.index("CONFIG.caption") < html.index("Confidence is how many")
+
+
+def test_dense_currency_calls_a_matching_digest_current_and_a_changed_one_behind(tmp_path):
+    import json
+
+    from tower.world_builder.dense_pipeline import dense_currency
+
+    class _Store:
+        def __init__(self, root):
+            self.root = root
+
+        def world_dir(self, world_id):
+            return self.root / world_id
+
+    world = tmp_path / "w"
+    (world / "dense" / "s").mkdir(parents=True)
+    solve = world / "solve" / "s"
+    solve.mkdir(parents=True)
+    (solve / "solution.json").write_text(json.dumps({"input_digest": "AAA"}))
+    store = _Store(tmp_path)
+
+    assert dense_currency(store, "w", "s", {"input_digest": "AAA"})["solve_current"] is True
+    assert dense_currency(store, "w", "s", {"input_digest": "BBB"})["solve_current"] is False
+    # Unknowable is not stale: a manifest with no digest and no status.json
+    # must not produce a BEHIND claim.
+    assert dense_currency(store, "w", "s", {})["solve_current"] is None
+
+    # An artifact packed before the manifest carried the digest falls back to
+    # status.json, which has recorded it since the first version of the stage.
+    (world / "dense" / "s" / "status.json").write_text(json.dumps({"input_digest": "AAA"}))
+    assert dense_currency(store, "w", "s", {})["solve_current"] is True
+
+
+def test_the_manifest_records_the_solve_it_was_built_from():
+    """Without it nothing at serve time can tell that the world was re-solved."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    assert '"input_digest": input_digest' in inspect.getsource(dense_pipeline.run_pack_stage)
+    assert "input_digest=digest" in inspect.getsource(dense_pipeline.densify)
+
+
+# --------------------------------------------------------------------------
+# WKWebView specifics. The phone loads this page with loadHTMLString and a null
+# baseURL, so its URL is about:blank and the app refuses a second navigation to
+# it -- location.reload() there is at best a no-op.
+# --------------------------------------------------------------------------
+
+
+def test_the_viewer_rebuilds_gl_state_instead_of_reloading_a_urlless_document():
+    from tower.world_builder.dense_render import viewer_template_path
+
+    html = viewer_template_path().read_text(encoding="utf-8")
+    restored = html.index("webglcontextrestored")
+    handler = html[restored:restored + 1400]
+    assert "location.reload()" not in handler
+    assert "buildGL()" in handler
+    assert "requestAnimationFrame(frame)" in handler
+
+
+def test_the_viewer_releases_the_base64_and_the_binary_string_after_decoding():
+    """8 MB of base64 plus an 8 MB binary string, alive for the life of the
+    page beside the 6 MB typed array they produced. WKWebView kills the content
+    process rather than paging."""
+    from tower.world_builder.dense_render import viewer_template_path
+
+    html = viewer_template_path().read_text(encoding="utf-8")
+    assert "B64 = null" in html
+    assert "bin = null" in html
+
+
+def test_the_inline_payload_rationale_does_not_claim_a_csp_the_phone_never_sees():
+    """iOS discards the response headers and calls loadHTMLString, so no CSP
+    applies on the device the product ships on. The escaping is therefore the
+    sole defence, and the module must say so rather than the opposite."""
+    from tower.world_builder import dense_render
+
+    doc = dense_render.__doc__ or ""
+    assert "loadHTMLString" in doc
+    assert "SOLE defence" in doc

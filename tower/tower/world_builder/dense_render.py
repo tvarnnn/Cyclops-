@@ -2,15 +2,30 @@
 
 WHY THE PAYLOAD IS INLINE
 
-`GET /worlds/{id}/render` returns HTML that iOS shows in a `WKWebView`, under
+`GET /worlds/{id}/render` returns HTML under
 
     Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'
 
-With no `connect-src`, `fetch` and `XMLHttpRequest` are blocked outright. That
-is deliberate -- the contract's promise is a page that loads nothing from
-anywhere -- so the points travel inside the page rather than beside it. Base64
-costs a third more bytes and buys a page that needs no second request, no
-relaxed policy and no new route on the phone's path.
+so in a BROWSER `fetch` and `XMLHttpRequest` are blocked outright by the
+absent `connect-src`, and a page that fetched its points beside itself would
+simply not work.
+
+THE PHONE DOES NOT SEE THAT HEADER, and an earlier version of this note
+claimed it did. iOS fetches the page with `URLSession`, keeps the body, drops
+the response headers, and hands the string to
+`WKWebView.loadHTMLString(_:baseURL:nil)` (`WorldRenderViewer.swift`). No CSP
+applies there at all. What blocks a network fetch on the phone is the
+navigation delegate refusing every navigation but the first, plus the null
+`baseURL` that leaves relative URLs unresolvable -- a different mechanism with
+the same effect, and one this module does not control.
+
+Two consequences, both deliberate:
+
+* Inline is still right. It is the only shape that works in BOTH clients, and
+  it needs no second request, no relaxed policy and no new route.
+* `js_object_literal`'s escaping is the SOLE defence against a `</script>` in
+  the config, not the second one. There is no browser-enforced policy behind
+  it on the device the product ships on. Treat it accordingly.
 
 WHY THERE IS A BYTE BUDGET AND NOT JUST AN LOD
 
@@ -34,7 +49,11 @@ from pathlib import Path
 import numpy as np
 
 from tower.world_builder.dense import POINT_STRIDE_BYTES, read_points_bin
-from tower.world_builder.dense_pipeline import dense_dir, read_dense_manifest
+from tower.world_builder.dense_pipeline import (
+    dense_currency,
+    dense_dir,
+    read_dense_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +70,23 @@ VIEWER_FILENAME = "dense_viewer.html"
 # test failure rather than a blank page.
 TOKEN_CONFIG = "__WB_CONFIG__"
 TOKEN_POINTS = "__WB_POINTS_B64__"
+
+
+# What the picture IS, in one sentence, always shown. `WORLD-BUILDER-WORLDS.md`
+# requires the render page to carry it, and rule 2 says the page never claims
+# more than it does. The dense page is now what that route serves, so the
+# obligation is this module's. The sparse page's sentence would be a lie here
+# and this one would be a lie there, so they are different sentences with the
+# same job: name the thing, and refuse the word "scan".
+CAPTION = ("Dense reconstruction: per-pixel depth from a neural network, "
+           "anchored to the structure-from-motion solve and kept only where "
+           "several cameras agreed. Not a surface, not a mesh, not metric scale.")
+CAPTION_BEHIND_SOLVE = ("This reconstruction is BEHIND the world: it was built "
+                        "from an earlier solve, and the world has been solved "
+                        "again since.")
+CAPTION_BEHIND_KEYFRAMES = ("This picture is BEHIND the newest keyframes: the "
+                            "Tower has accepted keyframes it has not yet built "
+                            "into geometry.")
 
 
 class DenseViewerUnavailable(Exception):
@@ -157,7 +193,15 @@ def build_dense_payload(store, world_id: str, session_id: str, *,
     centre = X.mean(0)
     viewpoints = capture_viewpoints(store, world_id, session_id,
                                     (manifest.get("params") or {}).get("component", 0))
+    currency = dense_currency(store, world_id, session_id, manifest)
+    behind = []
+    if currency.get("solve_current") is False:
+        behind.append(CAPTION_BEHIND_SOLVE)
+    if currency.get("derived_current") is False:
+        behind.append(CAPTION_BEHIND_KEYFRAMES)
     config = {
+        "caption": CAPTION,
+        "caption_behind": behind,
         "viewpoints": viewpoints,
         "world_id": world_id,
         "session_id": session_id,
