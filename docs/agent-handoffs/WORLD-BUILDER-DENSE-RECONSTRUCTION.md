@@ -451,12 +451,28 @@ coverage, served to a phone as a self-contained WebGL page at 41-72 fps with
 orbit, pan, fly and per-capture-spot navigation. Every number has an
 `eval.json` beside the artifact it describes.
 
-**What two independent adversarial reviews changed:** the first found nine
-defects and one blocker; the second found fifteen more, including that the
-budget thinner was delivering 2.7% of the phone's budget and that the privacy
-check verified a redactor existed rather than that a redaction happened. Both
-sets are fixed and each has a test that fails without the fix. A third review
-should be run against a frozen branch, because neither of the first two was.
+**What three independent adversarial reviews changed.** The first found nine
+defects and one blocker. The second found fifteen more, including a budget
+thinner delivering 2.7% of the phone's budget and a privacy check that verified
+a redactor existed rather than that a redaction happened. The third ran against
+a genuinely frozen branch -- HEAD identical at its start and end, which neither
+of the first two had -- and found twelve, of which one was the most serious
+defect in the lane.
+
+That one, D21: the per-frame affine fit was anchored partly on pixels an
+inpainter produced, and the held-out gate could not see it BECAUSE the gate is
+scored on the same anchors. Fixing it made the reconstruction bigger rather
+than smaller, on every world, and every number in this document is re-derived
+from the artifacts that fix produced.
+
+Three of the twelve were about my own analysis rather than the code: two
+sections written to answer a visual reviewer had been measured in the direction
+of their conclusion, and one plane count was inflated by asking RANSAC for more
+planes than a simple scene contains. All three are corrected in place rather
+than quietly dropped.
+
+Every finding has a test that fails without its fix, except where the fix is a
+retraction.
 
 **What an independent visual reviewer changed:** three claims. The enclosure
 one survived immediately and is the real limitation. The other two were
@@ -472,11 +488,18 @@ establish. What survives is real: 26-30% of a cloud in large planes against
 7.5-8.4% for noise, and plane points better supported than non-plane points.
 What does not is the claim that either question is settled.
 
-**The single most valuable next measurement** is the one that would close it.
-`neighbours` is the only consensus parameter with no measurement behind it, and
-it is the only lever that can add coverage without weakening the rule: raising
-it searches more cameras for witnesses that already meet the bar, rather than
-lowering the bar. `scripts/neighbours_sweep.sh` is written and ready to run.
+**The single most valuable next thing is not a parameter.** `neighbours` was
+the last untested lever and D20 measured it on both a well-covered world and
+the one with the gap: widening the search returns fewer points on the world
+that needs them, and the curve flattens, which is the signature of a limit that
+is not in the search. No width of search finds a camera that does not exist.
+
+What would close the enclosure is more observation of the surfaces that have
+none, and the wearer is the only one who can supply it. D19 and D20 arrived at
+the same feature from opposite directions: tell the wearer what has not been
+covered, while they are still in the room. That is a live coverage cue over the
+sparse geometry that already exists during a walk, and it needs no dense
+reconstruction at all.
 
 ## 15. The verdict, and what it rests on
 
