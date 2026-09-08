@@ -525,6 +525,42 @@ and was found by a reviewer measuring the function rather than reading it. Both
 failures have the same shape: an assertion that bounds the answer on one side
 only. If a value has a target, test the target.
 
+---
+
+## D18. The LOD gauge is a DEPTH statistic used as a SPATIAL one, and on a tight room the two diverge
+
+D5 fixed the right bug: absolute voxel sizes are meaningless in a gauge-free
+solve, so the ladder is expressed as a fraction of the scene's own
+`median_scene_depth`. That is still right. What it does not account for is that
+median depth and scene EXTENT are different quantities, and their ratio is not
+stable across this corpus.
+
+| world | median depth | L0 voxel | camera extent | L0 points | L1 points |
+| --- | --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk) | 7.02 | 0.0211 | 15 x 17 x 11 | 8.22 M | 1.48 M |
+| `6427900d` (bathroom) | **1.12** | **0.0034** | 30 x 36 x 29 | 3.57 M | 1.86 M |
+
+The bathroom walk is a tight room the wearer never gets far from, so its median
+depth is a sixth of the desk world's while its extent is twice as large. The
+ladder therefore lays a cell six times finer over a scene twice as big, and the
+levels stop separating: the desk world's ladder thins by 5.5x per step, the
+bathroom's by 1.9x. Its mobile level lands at 1.22 M points, three times the
+phone's budget, where the desk world's lands under it.
+
+**Not changed, and the reason matters.** The obvious fix -- gauge on the extent,
+or on the larger of the two -- would change the voxel size of every level of
+every world, and therefore every artifact, every point count and every number in
+`01-EVIDENCE.md`, to fix a symptom that the serve-time budget already handles
+correctly now that it spends its budget (D17). A finer L0 stores more noise but
+loses nothing; it costs disk, and disk is the cheapest thing here.
+
+What is wrong is the CLAIM, not the ladder: `dense.py` says L0 is "already at
+the edge of what the evidence supports", and on a tight room it is well past
+that edge. Recorded here rather than papered over. The fix, when someone takes
+it, is to gauge on `max(median_depth * k, extent * j)` and to re-measure the
+whole corpus rather than assume the ratio holds -- which is the same mistake in
+a new place if it is not measured.
+
 ## Open, being decided by measurement
 
 Two of the three questions this section opened with have been answered by
