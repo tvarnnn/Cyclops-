@@ -745,6 +745,7 @@ which covers 60%:
 | --- | --- | --- | --- | --- |
 | **10 (shipped)** | 5.11 M | **4.57%** | **5.62%** | 60.1% |
 | 16 | 4.96 M (**-3%**) | 4.96% | 5.71% | 60.9% |
+| 24 | 4.77 M (**-7%**) | 4.59% | 6.08% | 61.0% |
 
 **On the world with the coverage gap it is worse in every column but one.**
 Fewer points, not more; accuracy down four tenths of a point; and eight tenths
@@ -753,9 +754,12 @@ from a scene that already had witnesses everywhere; the closet has a coverage
 gap because nothing looked at those surfaces twice, and no width of search finds
 a camera that does not exist.
 
-(The 24- and 32-neighbour rows were still fusing when this was written. The
-trend across six measured configurations on two worlds is one-directional and
-the decision does not wait on them; `sweep-closet/` holds them when they land.)
+The point count falls monotonically as the search widens -- 5.11 M, 4.96 M,
+4.77 M -- while coverage creeps up nine tenths of a point and the p90 error
+climbs from 5.62% to 6.08%. (The 32-neighbour row was still fusing when this was
+written; `sweep-closet/` holds it when it lands. Seven measured configurations
+across two worlds all point the same way and the decision does not wait on an
+eighth.)
 
 **What this rules out, and it is the useful part.** It rules out the cheap fix
 for the incomplete enclosure. The walls that are missing are not missing because
