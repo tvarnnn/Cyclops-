@@ -58,18 +58,27 @@ Of 162 saved worlds, **only 7 held a real global solve**, and they were mostly
 seated desk scenes. So twelve further solves were produced from historical
 captures — no new physical capture was needed at any point in this work.
 
-**Densified and evaluated (8 worlds, materially different environments):**
+**Densified and evaluated (8 worlds, materially different environments).**
+These are the artifacts on disk at the current HEAD, re-derived from their own
+`manifest.json` and `align.json`. An earlier version of this table described
+the previous depth network and was wrong on every row while §6 of this same
+document described the current one:
 
 | world | environment | posed | frames used | held-out align residual | L0 points |
 |---|---|---|---|---|---|
-| `7d31e8d7` | desk and shelf | 429 | 345 | 3.0% | 11.9 M |
-| `1b8812b1` | widest traverse | 438 | 247 | 5.0% | 5.8 M |
-| `672578d0` | bedroom, closet, desk | 425 | 218 | 6.7% | 5.7 M |
-| `a378331a` | closet walk | 201 | 91 | 6.9% | 2.3 M |
-| `37e497f8` | bedroom walk | 196 | 92 | 7.0% | 2.1 M |
-| `6427900d` | bathroom, tight | 266 | 97 | 8.3% | 1.0 M |
-| `ecc02df1` | dresser | 77 | 40 | 7.6% | 1.0 M |
-| `be36bd70` | end-to-end replay | 58 | 26 | 8.7% | 0.7 M |
+| `7d31e8d7` | desk and shelf | 429 | 316 | 2.6% | 8.22 M |
+| `1b8812b1` | widest traverse | 438 | 303 | 2.9% | 8.65 M |
+| `37e497f8` | bedroom walk | 196 | 134 | 3.4% | 4.85 M |
+| `672578d0` | bedroom, closet, desk | 425 | 298 | 3.8% | 14.75 M |
+| `a378331a` | closet walk | 201 | 117 | 4.9% | 5.05 M |
+| `ecc02df1` | dresser | 77 | 50 | 5.3% | 2.09 M |
+| `6427900d` | bathroom, tight | 266 | 132 | 5.4% | 3.57 M |
+| `fc58a64d` | end-to-end replay | 198 | 169 | 4.1% | 8.43 M |
+
+The residual column is gate-conditioned; §6 and `01-EVIDENCE.md` §11.3 say what
+that means and print the other end. The eighth row replaces an older replay
+(`be36bd70`) that was never re-densified and therefore no longer describes
+anything the branch does.
 
 ## 4. Data-quality findings that constrain the result
 
@@ -97,10 +106,10 @@ capture → keyframes → GLOMAP global solve            (unchanged)
               │  DENSE FINALIZATION (new)    │
               │  1 redacted keyframe → undistort with the SOLVE's own maps
               │  2 monocular depth per keyframe
-              │  3 fit disparity = a/z + b to the sparse points (IRLS, Huber)
+              │  3 fit the network output to the sparse points, p ~ a*z + b (IRLS/Huber)
               │  4 gate on the HELD-OUT residual
               │  5 mask depth edges, grazing angles, redaction fill
-              │  6 keep only where ≥3 other cameras agree within 3%
+              │  6 keep only where ≥3 other cameras agree within 5%
               │  7 average the agreeing positions, voxel-reduce, LOD ladder
               └──────────────────────────────┘
                             ▼
@@ -167,9 +176,16 @@ any. The confidence channel is what separates the good part of those clouds from
 the bad, and a viewer that ignores it will present the tail as if it were the
 median.
 
-**Appearance, at genuinely held-out cameras**: PSNR 15.2 median, SSIM 0.485,
-completeness 98.4% on the closet walk. PSNR is depressed by auto-exposure drift
-between frames and should not be read as a geometry figure.
+**Appearance was NOT re-measured at this configuration, and the figures that
+used to sit here have been removed.** They were PSNR 15.2 / SSIM 0.485 /
+completeness 98.4%, and they are `run1/evalC`'s, exactly: the desk-and-shelf
+world, the previous depth network, `tau` 0.03. An earlier edit of this document
+attributed them to the closet walk, which is a different world whose coverage
+§11.2 gives as 60.1%. Quoting a superseded measurement is bad; giving it
+another world's name while claiming to have re-measured is worse, and it is
+what happened. Nothing replaces the figures until they are re-derived at this
+configuration; the geometry numbers above are the ones with artifacts behind
+them.
 
 **Cost.** Peak VRAM for the depth stage is **2.4 GB**, up from 0.85 GB with the
 previous network; everything else is CPU and RAM. A 438-keyframe world takes
