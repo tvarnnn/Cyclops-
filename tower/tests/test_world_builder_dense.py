@@ -1681,3 +1681,84 @@ def test_max_points_is_honoured_on_the_dense_page(tmp_path):
     body = inspect.getsource(world_builder_render.build_world_render)
     assert "budget_bytes=budget" in body
     assert "POINT_STRIDE_BYTES" in body
+
+
+# --------------------------------------------------------------------------
+# Behavioural cover for the privacy boundary. A reviewer pointed out that the
+# test asserting raw pixels never leave it was a search for the string
+# "raw_bytes" -- which passed while a redaction failure was returning raw
+# pixels one level down. A grep for an identifier is not a test of an outcome.
+# --------------------------------------------------------------------------
+
+
+def test_the_boundary_returns_a_mask_and_never_the_raw_pixels(tmp_path):
+    """Whatever comes back, on every path, must not be the raw frame, and the
+    third value must be a MASK -- not bytes a caller could reconstruct from."""
+    import numpy as _np
+
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    RAW = b"RAW-WITH-A-FACE"
+    images = tmp_path / "images"
+    images.mkdir()
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(RAW)
+
+    cases = [
+        # (keyframe on disk, session says redacted, redactor)
+        (None, True, _StubRedactor()),                 # migrated world
+        (b"UNREDACTED", False, _StubRedactor()),       # session says raw
+        (b"REDACTED-ALREADY", True, _StubRedactor()),  # the ordinary path
+        (None, True, _StubRedactor(fails=True)),       # redaction threw
+        (None, True, _StubRedactor(available=False)),  # no detector
+        (None, True, None),                            # no redactor at all
+    ]
+    for on_disk, redacted, redactor in cases:
+        kf = images / "00000042.jpg"
+        if on_disk is None:
+            kf.unlink(missing_ok=True)
+        else:
+            kf.write_bytes(on_disk)
+        data, origin, mask = keyframe_image_bytes(
+            _StubStore(images), "w", "s", "s:00000042", str(raw), redactor,
+            keyframes_are_redacted=redacted,
+        )
+        # The stub's success output is "REDACTED:" + the input, so a
+        # containment check would fail on the stub rather than on the code.
+        # What is checkable here is that the bytes returned are never the raw
+        # bytes themselves, on any of the six paths.
+        assert data != RAW, (origin, "the raw frame left the boundary")
+        assert mask is None or isinstance(mask, _np.ndarray), origin
+        assert mask is None or mask.dtype == bool, origin
+
+
+def test_every_refusal_names_itself(tmp_path):
+    """The origin string is the only record of which path a frame took, and
+    `align.json` counts them. A refusal that reported the same origin as a
+    success would make the count meaningless."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(b"RAW")
+
+    seen = set()
+    for on_disk, redacted, redactor in [
+        (None, True, None),
+        (None, True, _StubRedactor(fails=True)),
+        (b"X", False, _StubRedactor(available=False)),
+    ]:
+        kf = images / "00000042.jpg"
+        if on_disk is None:
+            kf.unlink(missing_ok=True)
+        else:
+            kf.write_bytes(on_disk)
+        data, origin, _ = keyframe_image_bytes(
+            _StubStore(images), "w", "s", "s:00000042", str(raw), redactor,
+            keyframes_are_redacted=redacted,
+        )
+        assert data is None
+        assert origin.startswith("refused-"), origin
+        seen.add(origin)
+    assert len(seen) == 3, seen
