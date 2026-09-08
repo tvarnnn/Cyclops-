@@ -22,6 +22,27 @@ dependencies = [
 sfm = [
     "pycolmap==4.2.0",
 ]
+
+# The World Builder's dense stage (tower/world_builder/dense.py). Optional in
+# exactly the same way `sfm` is: without it a world simply has no dense
+# reconstruction and says so, and the sparse viewer is served unchanged.
+#
+# LICENCES, because this was the deciding factor and not an afterthought:
+#   moge                 MIT        -- the default backend, moge2-vitl
+#   depth-anything-3     Apache-2.0 (code)
+#
+# The permissively licensed checkpoints are the ONLY ones the registry offers.
+# Depth Anything V2 Base and Large, every DA3 GIANT/NESTED variant, and DA3's
+# own DEFAULT_MODEL are CC-BY-NC and are deliberately unreachable.
+#
+# `moge` declares `numpy<2`; it runs correctly against the numpy 2.5.2 this
+# project pins, so install it with --no-deps under a constraints file rather
+# than letting it downgrade numpy for everything else.
+dense = [
+    "moge>=3.0",
+    "torch>=2.4",
+    "transformers>=4.44",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a

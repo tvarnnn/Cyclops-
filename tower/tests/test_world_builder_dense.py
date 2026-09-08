@@ -1044,3 +1044,44 @@ def test_raw_pixels_never_leave_the_privacy_boundary():
     body = inspect.getsource(dense_pipeline.run_depth_stage)
     assert "raw_bytes" not in body
     assert "exact_fill" in body
+
+
+def test_the_dense_dependencies_are_declared():
+    """The default backend imports `moge`, which for a while appeared in no
+    dependency list at all -- so a fresh checkout would have failed at
+    finalization rather than at install."""
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    meta = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = meta["project"]["optional-dependencies"]
+    assert "dense" in extras
+    assert any(d.startswith("moge") for d in extras["dense"])
+
+
+def test_a_backend_whose_package_is_missing_refuses_by_name():
+    """A finalization step must not raise a bare ImportError from inside the
+    model loader; it must say which package and which flag."""
+    import inspect
+
+    from tower.world_builder import dense
+
+    for cls in (dense.MoGeBackend, dense.DepthAnything3Backend):
+        src = inspect.getsource(cls._load)
+        assert "DenseUnavailable" in src, cls.__name__
+        assert "--backend" in src, cls.__name__
+
+
+def test_no_backend_assumes_a_gpu_is_present():
+    """A Tower without a GPU should fall back, not raise a CUDA error from
+    inside finalization."""
+    import inspect
+
+    from tower.world_builder import dense
+
+    for cls in (dense.MoGeBackend, dense.DepthAnything3Backend,
+                dense.TransformersDepthBackend):
+        src = inspect.getsource(cls._load)
+        assert "is_available()" in src, cls.__name__
+        assert ".cuda()" not in src, cls.__name__

@@ -321,17 +321,27 @@ class MoGeBackend(DepthBackend):
         if self._model is not None:
             return
         import torch
-        from moge.model.v2 import MoGeModel
 
-        self._model = MoGeModel.from_pretrained(self.model_id).cuda().eval()
+        try:
+            from moge.model.v2 import MoGeModel
+        except ImportError as exc:
+            raise DenseUnavailable(
+                f"backend {self.name!r} needs the `moge` package, which is not "
+                f"installed ({exc}). Install it, or pass a different --backend"
+            ) from None
+
+        # The device is chosen, never assumed: a Tower without a GPU should fall
+        # back rather than raise a CUDA error from inside a finalization step.
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = MoGeModel.from_pretrained(self.model_id).to(self._device).eval()
         self._torch = torch
-        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s)",
-                    self.name, self.licence)
+        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s) on %s",
+                    self.name, self.licence, self._device)
 
     def predict(self, rgb: np.ndarray) -> np.ndarray:
         self._load()
         t = self._torch.tensor(rgb / 255.0, dtype=self._torch.float32,
-                               device="cuda").permute(2, 0, 1)
+                               device=self._device).permute(2, 0, 1)
         with self._torch.no_grad():
             out = self._model.infer(t, resolution_level=self.resolution_level,
                                     apply_mask=False)
@@ -372,11 +382,20 @@ class DepthAnything3Backend(DepthBackend):
         if self._model is not None:
             return
         import torch
-        from depth_anything_3.api import DepthAnything3
 
-        self._model = DepthAnything3.from_pretrained(self.model_id).to("cuda").eval()
-        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s), window %d",
-                    self.name, self.licence, self.window_size)
+        try:
+            from depth_anything_3.api import DepthAnything3
+        except ImportError as exc:
+            raise DenseUnavailable(
+                f"backend {self.name!r} needs the `depth-anything-3` package, "
+                f"which is not installed ({exc}). Install it, or pass a "
+                "different --backend"
+            ) from None
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = DepthAnything3.from_pretrained(self.model_id).to(self._device).eval()
+        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s) on %s, window %d",
+                    self.name, self.licence, self._device, self.window_size)
         self._torch = torch
 
     def predict_window(self, images, R=None, t=None, K=None):
