@@ -1384,3 +1384,19 @@ def test_thinning_never_exceeds_the_budget():
     for n in (100, 1000, 8000, 50000):
         Xr, _, _, _ = thin_to_budget(X, C, F, n * POINT_STRIDE_BYTES)
         assert len(Xr) <= n, (n, len(Xr))
+
+
+def test_the_worlds_listing_says_whether_the_dense_cloud_is_current(tmp_path):
+    """So a gallery can mark a stale world without fetching an 8 MB page.
+    Additive: the contract identifier does not move for it."""
+    import json
+
+    from tower.results.world_builder_library import _dense_summary
+
+    store, *_ = _fake_dense(tmp_path)
+    summary = _dense_summary(store, "w1", "s1")
+    assert "solve_current" in summary
+    # No solve on disk in the fixture, so the answer is "unknowable", which is
+    # None -- never False. Reporting unknowable as stale would put a BEHIND
+    # marker on every world whose solve could not be read.
+    assert summary["solve_current"] is None

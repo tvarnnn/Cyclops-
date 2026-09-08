@@ -59,7 +59,10 @@ def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | 
     bumping that would empty the gallery on every older build. A world with no
     dense artifact reports `null` and behaves exactly as it does today.
     """
-    from tower.world_builder.dense_pipeline import read_dense_manifest  # noqa: PLC0415
+    from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+        dense_currency,
+        read_dense_manifest,
+    )
 
     manifest = read_dense_manifest(store, world_id, session_id)
     if not manifest:
@@ -76,6 +79,13 @@ def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | 
         # Repeated from the manifest rather than re-derived. The dense stage
         # makes no scale claim the sparse solve did not already make.
         "scale": manifest.get("scale"),
+        # Whether this cloud was fused against the solve now on disk. False
+        # after a re-solve; None when it cannot be known, which is not the
+        # same thing and must not be shown as staleness. The render page
+        # carries the same fact as a caption; this is so a gallery can mark it
+        # without fetching an 8 MB page.
+        "solve_current": dense_currency(
+            store, world_id, session_id, manifest).get("solve_current"),
     }
 
 

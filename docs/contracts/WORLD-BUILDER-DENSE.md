@@ -198,6 +198,7 @@ Additive, per session, `null` on every world built before the dense stage.
 | `canonical_points` | int \| null | Point count at the canonical level |
 | `mobile_points` | int \| null | Point count at the mobile level |
 | `scale` | object | As in the manifest |
+| `solve_current` | bool or null | Whether this cloud was fused against the solve now on disk. `false` after a re-solve or a second session: the points are real observations of a superseded pose graph. **`null` means unknowable, not stale**, and must not be shown as staleness. Additive; §10 has the same fact as the page's caption |
 
 `null` means this session has no dense reconstruction — which is not an error,
 and is the state of every world that predates this work.
