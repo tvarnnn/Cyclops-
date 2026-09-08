@@ -229,6 +229,7 @@ def run_depth_stage(
         targets.append((i, kid, pose))
 
     maps = None
+    map_shape = None
     records: list[dict] = []
     t0 = time.time()
     obs_kf = solution.observations[:, 0]
@@ -255,6 +256,16 @@ def run_depth_stage(
         if maps is None:
             m1, m2, roi, _pin = _undistort_maps(intrinsics, raw.shape[1], raw.shape[0])
             maps = (m1, m2, roi)
+            map_shape = raw.shape[:2]
+        elif raw.shape[:2] != map_shape:
+            # DAT can change resolution mid-stream. The rectification maps are
+            # built once, for one size; remapping a different one would
+            # silently reconstruct in the wrong camera.
+            records.append({"ki": int(ki), "ok": False,
+                            "why": f"frame is {raw.shape[1]}x{raw.shape[0]}, "
+                                   f"the session's maps are for "
+                                   f"{map_shape[1]}x{map_shape[0]}"})
+            continue
         m1, m2, (x0, y0, rw, rh) = maps
         if (rw, rh) != (W, H):
             raise DenseUnavailable(
