@@ -707,6 +707,50 @@ throughout) at the cost of the one contended resource the survey says to keep
 clear. It is written down here so the next person does not have to rediscover
 that it is arithmetically fine and strategically wrong.
 
+---
+
+## D20. `neighbours` stays at 10: more witnesses buy coverage and cost the tail
+
+`neighbours` -- how many nearby cameras the consensus test even consults -- was
+the only parameter in the consensus block with no measurement behind it. It was
+also the most promising lever for the one limitation an independent visual
+review left standing, which is that the enclosure does not close: raising it
+does not lower the bar the way a smaller `min_views` or a looser `tau` would.
+It just looks harder for witnesses that already meet it. A wall the wearer
+walked past may well have three cameras that saw it, none of them among the ten
+nearest.
+
+Measured by re-fusing the desk world from its cached depth maps, so the only
+thing that changes between rows is the neighbour search:
+
+| neighbours | L0 points | depth error, median | depth error, p90 | coverage |
+| --- | --- | --- | --- | --- |
+| **10 (shipped)** | 8.22 M | **2.31%** | **12.7%** | 97.9% |
+| 16 | 8.72 M (+6%) | 2.35% | 17.2% | 98.5% |
+| 24 | 9.04 M (+10%) | 2.43% | 17.7% | 98.6% |
+| 32 | 9.12 M (+11%) | 2.32% | 17.4% | 98.8% |
+
+**It works, and it is not worth it here.** Ten to eleven percent more points and
+about one point of coverage, against a **p90 depth error that rises 37%**, from
+12.7% to 17.4%. The mechanism is visible in the numbers: a more distant camera
+is a weaker witness, so the points that only a wider search can rescue are
+systematically the worse ones, and the median -- which they do not reach --
+barely moves while the tail they land in gets heavier.
+
+That is a bad trade for a world already at 98% coverage. Whether it is a bad
+trade for the closet and the bathroom, which cover 60-67%, is a different
+question with a different answer, and it is the sweep worth running next:
+`scripts/neighbours_sweep_closet.sh`. The parameter stays at 10 until that
+measurement exists, because the honest reason for a default is a measurement
+and not a plausible story.
+
+**What this rules out.** It rules out the cheap fix for the incomplete
+enclosure. The walls that are missing are not missing because the search was
+too narrow; a search three times wider finds ten percent more points and puts
+most of them in the error tail. Closing the enclosure honestly needs more
+observations, not more searching -- which is a capture problem, not a fusion
+one.
+
 ## Open, being decided by measurement
 
 Two of the three questions this section opened with have been answered by

@@ -154,6 +154,13 @@ class DenseParams:
     inpaint_redaction_fill: bool = True
 
     # -- consensus --------------------------------------------------------
+    # How many nearby cameras the agreement test consults. Raising it does
+    # NOT lower the bar -- it looks harder for witnesses that already meet
+    # it -- so it was the obvious lever for coverage. Measured on the desk
+    # world by re-fusing from cached depth: 16/24/32 buy 6-11% more points
+    # and about a point of coverage, and cost 37% on the p90 depth error
+    # (12.7% -> 17.4%). A more distant camera is a weaker witness, so the
+    # points only a wider search rescues are the worse ones. D20.
     neighbours: int = 10
     # How closely a neighbouring camera must agree, as a fraction of depth.
     # 0.05 rather than the obvious 0.03, measured on two independent walks:
