@@ -45,6 +45,7 @@ from tower.world_builder.dense import (
     DenseUnavailable,
     align_frame,
     camera_centre,
+    depth_from_prediction,
     make_backend,
     project,
     unproject,
@@ -333,7 +334,8 @@ def run_depth_stage(
     for n, (ki, kid, pose) in enumerate(targets):
         if _stopped(should_stop):
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
-                    "camera": cam, "targets": len(targets), "image_origins": origins}
+                    "camera": cam, "targets": len(targets), "image_origins": origins,
+                    "kind": backend.kind}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
@@ -407,7 +409,7 @@ def run_depth_stage(
             continue
         ui = np.clip(np.rint(uv[g, 0]).astype(int), 0, W - 1)
         vi = np.clip(np.rint(uv[g, 1]).astype(int), 0, H - 1)
-        a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc[g])
+        a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc[g], backend.kind)
         # float16: the depth values run 0.2-40 in world units and the pipeline's
         # own error is a few percent, so three significant digits is far more
         # than the evidence supports -- and it halves the largest thing this
@@ -422,7 +424,8 @@ def run_depth_stage(
         progress(STAGE_DEPTH, len(targets), len(targets))
     payload = {"records": records, "seconds": time.time() - t0, "camera": cam,
                "targets": len(targets), "backend": backend.name,
-               "backend_licence": backend.licence, "stopped_after": None,
+               "backend_licence": backend.licence, "kind": backend.kind,
+               "stopped_after": None,
                "image_origins": origins,
                "redaction": getattr(redactor, "label", None) if redactor.available else None}
     _write_json(root / "align.json", payload)
@@ -462,12 +465,14 @@ def run_fuse_stage(
                      np.asarray(p["translation"], float))
 
     D, VALID = {}, {}
+    kind = align.get("kind", "disparity")
     for ki in kept:
         r = recs[ki]
-        disp = np.load(work / "depth" / f"{ki:05d}.npy").astype(np.float32)
-        den = disp - r["b"]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            z = np.where(den > 1e-6, r["a"] / den, np.nan).astype(np.float32)
+        pred = np.load(work / "depth" / f"{ki:05d}.npy").astype(np.float32)
+        # One function decides what a stored map means, shared with the
+        # alignment and the scoring, so the three cannot drift apart.
+        z = depth_from_prediction(pred, r["a"], r["b"], kind).astype(np.float32)
+        z = np.where(np.isfinite(z) & (z > 1e-6), z, np.nan).astype(np.float32)
         D[ki] = z
         ok = validity_mask(z, K, edge_rel=params.edge_rel,
                            max_grazing_deg=params.max_grazing_deg,

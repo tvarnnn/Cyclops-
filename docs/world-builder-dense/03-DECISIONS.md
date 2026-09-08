@@ -238,6 +238,95 @@ Two parameters were entangled and only measurement separated them.
 
 ---
 
+## D13. Gaussian splatting is rejected, and the reason is not quality
+
+**Decided against** adopting 3D Gaussian Splatting as the appearance layer,
+after actually training it on our data rather than reasoning about it.
+
+**It worked, and it worked well.** Brush v0.3.0 (Apache-2.0) runs from a
+prebuilt Windows binary on wgpu — no Rust, no MSVC, no CUDA toolkit — read our
+COLMAP workspaces directly, and reached **23.9 dB / 0.867 SSIM** on held-out
+views of the 77-image world and **24.3 dB** on the 429-image one. Dresser grain,
+record sleeves, monitors: plainly the room. Off-path translation to about a
+quarter of the trajectory extent holds with correct parallax.
+
+**It is rejected for what it does to objects that moved.** The splat *silently
+deletes* every object that moved during the capture and paints in a sharp,
+correctly-lit reconstruction of what it believes was behind:
+
+- An open laptop, in use, occupying a third of the frame, becomes a hoodie and a
+  metal flask on the dresser — clean, consistent with its neighbours, and not
+  what was there.
+- A hand holding a phone becomes tidy carpet.
+- A PC case lit green in the real frame renders blue, because the lighting
+  changed mid-capture and the model committed to one colour.
+
+**71% of all held-out squared error lives in the worst 5% of pixels**, and those
+pixels are precisely the objects a person was interacting with — which is to say
+precisely what a memory product exists to remember. Nothing in the output marks
+them.
+
+**And opacity cannot be used to gate it.** The obvious mitigation is to treat low
+accumulated alpha as "I do not know here". Measured, it inverts: the view that
+looks *worst*, an unreadable smear at 30 degrees off the captured cone, is
+rendered **most** opaquely (alpha 0.982, zero under-covered pixels), while a
+clean but entirely unsupported fabrication from half a trajectory away sits at
+0.908. Alpha tracks "are there Gaussians along this ray", which is trivially
+true once splats have been stretched across the scene. **Any gate built on splat
+opacity passes the worst renders through.**
+
+This is intrinsic to fitting a static radiance field to a moving scene, not a
+coverage problem more capture would fix. The point cloud's confidence channel is
+the opposite: it counts independent cameras that agreed, so an object that moved
+fails consensus and leaves a hole.
+
+The one salvageable idea, recorded for later: splats as *texture*, clipped to
+regions the point cloud already supports.
+
+---
+
+## D14. COLMAP CUDA MVS is a measuring instrument, not the product path
+
+**Decided against** putting real multi-view stereo on the critical path, and
+**for** keeping it as an independent accuracy reference.
+
+**It runs, and the Blackwell trap was real but is fixed.** `colmap-x64-windows-cuda`
+4.2.0 needs no CUDA toolkit and no MSVC — it statically links cudart. Four checks
+ruled out the documented silent-garbage failure on compute >= 10.0: normal maps
+are unit length rather than zero, depth maps show scene structure aligned to the
+photo, `gpu_mat_test` passes, and depths agree with the SfM points to 0.69%.
+
+| | median relative depth error | pixel coverage |
+| --- | --- | --- |
+| **MVS, geometric (filtered)** | **0.69%** | **31.9%** |
+| MVS, photometric (unfiltered) | 1.09% | 99.9% |
+| Monocular, after its own validity mask | 2.58% | 88.5% |
+
+**MVS is three to four times more accurate and covers a third of the pixels.**
+Its filtered depth keeps furniture, boxes and record sleeves, and deletes
+carpet, painted wall and moving hands entirely — which is the correct behaviour
+for a photometric matcher on a corpus that is 83–93% untextured, and exactly why
+it cannot be the product path on its own.
+
+Cost settles it independently: **46.4 s per image**, about **5.5 hours** for a
+429-frame world, against ten minutes for the monocular path.
+
+So: **monocular produces the better reconstruction; MVS produces the better
+measurement.** MVS is now the independent yardstick this lane's accuracy claims
+are checked against.
+
+Two things found while establishing that, worth carrying: `colmap.exe
+image_undistorter` crashes with `STATUS_STACK_BUFFER_OVERRUN` on models of 400+
+images (use `pycolmap.undistort_images`), and COLMAP runs every photometric
+problem before any geometric one, so an interrupted dense pass yields no
+filtered maps at all.
+
+**The hybrid worth building later:** MVS geometric depth on a subset of frames
+as high-confidence anchors conditioning the per-frame fit, attacking exactly the
+frames where that fit is worst conditioned.
+
+---
+
 ## Open, being decided by measurement
 
 | decision | options | metric |

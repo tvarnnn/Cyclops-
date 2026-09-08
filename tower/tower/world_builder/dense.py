@@ -212,12 +212,33 @@ class DepthBackend:
     decision that is expected to be revisited, and because licence terms differ
     between checkpoints of the same family. Only permissively licensed defaults
     are wired in.
+
+    Some models are not per-image at all: they take a WINDOW of frames and,
+    optionally, the poses the solve already recovered, and reason across them.
+    Those override `predict_window` and declare `windowed = True`; the caller
+    then feeds whole windows instead of single frames. What comes back is still
+    per-frame inverse depth, so everything downstream -- the per-frame fit to
+    the sparse points, the gate, the mask, the consensus -- is unchanged. In
+    particular the per-frame fit absorbs any window-to-window scale
+    disagreement, which is the failure mode windowed models are prone to.
     """
 
     name = "abstract"
     licence = "unknown"
+    windowed = False
+    window_size = 0
+    # What `predict` returns, which decides the shape of the per-frame fit.
+    #   "disparity" -- affine-invariant INVERSE depth (Depth Anything family)
+    #   "depth"     -- affine-invariant depth, e.g. the z of a point map (MoGe)
+    # Fitting a point map as though it were disparity costs real accuracy, so
+    # this is not cosmetic.
+    kind = "disparity"
 
     def predict(self, rgb: np.ndarray) -> np.ndarray:  # pragma: no cover
+        raise NotImplementedError
+
+    def predict_window(self, images, R=None, t=None, K=None):  # pragma: no cover
+        """A window of HxWx3 RGB images -> a list of inverse-depth maps."""
         raise NotImplementedError
 
 
@@ -268,6 +289,123 @@ class TransformersDepthBackend(DepthBackend):
         return pred.cpu().numpy().astype(np.float32)
 
 
+class MoGeBackend(DepthBackend):
+    """MoGe, which predicts a point map rather than a disparity image.
+
+    The z channel of that point map is affine-invariant DEPTH, so the per-frame
+    fit is `pred ~= a*z + b` rather than `pred ~= a/z + b`. Fitting it as
+    disparity anyway is not free: it costs about a third of the model's
+    advantage, which is why `kind` exists at all.
+    """
+
+    kind = "depth"
+
+    def __init__(self, model_id: str, name: str, licence: str,
+                 resolution_level: int = 9) -> None:
+        self.model_id = model_id
+        self.name = name
+        self.licence = licence
+        self.resolution_level = resolution_level
+        self._model = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+        from moge.model.v2 import MoGeModel
+
+        self._model = MoGeModel.from_pretrained(self.model_id).cuda().eval()
+        self._torch = torch
+        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s)",
+                    self.name, self.licence)
+
+    def predict(self, rgb: np.ndarray) -> np.ndarray:
+        self._load()
+        t = self._torch.tensor(rgb / 255.0, dtype=self._torch.float32,
+                               device="cuda").permute(2, 0, 1)
+        with self._torch.no_grad():
+            out = self._model.infer(t, resolution_level=self.resolution_level,
+                                    apply_mask=False)
+        pts = out["points"].float().cpu().numpy()
+        z = np.ascontiguousarray(pts[..., 2]).astype(np.float32)
+        mask = out.get("mask")
+        if mask is not None:
+            z = np.where(mask.cpu().numpy().astype(bool), z, np.nan).astype(np.float32)
+        return z
+
+
+class DepthAnything3Backend(DepthBackend):
+    """Depth Anything 3, pose-conditioned, over a window of frames.
+
+    Unlike a per-image model this one is told where the cameras are, so it
+    reasons across the window and returns depth already in the solve's frame.
+    We still run the per-frame fit against the sparse points on top of it: that
+    is what absorbs the window-to-window scale disagreement DA3 is prone to,
+    and it is the configuration that measured best.
+
+    Licence care: DA3's own `DEFAULT_MODEL` is `DA3NESTED-GIANT-LARGE-1.1`,
+    which is CC-BY-NC. It is never used here -- the checkpoint is always passed
+    explicitly, and only Apache-2.0 ones are registered.
+    """
+
+    windowed = True
+
+    def __init__(self, model_id: str, name: str, licence: str,
+                 window_size: int = 60, process_res: int = 640) -> None:
+        self.model_id = model_id
+        self.name = name
+        self.licence = licence
+        self.window_size = window_size
+        self.process_res = process_res
+        self._model = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+        from depth_anything_3.api import DepthAnything3
+
+        self._model = DepthAnything3.from_pretrained(self.model_id).to("cuda").eval()
+        logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s), window %d",
+                    self.name, self.licence, self.window_size)
+        self._torch = torch
+
+    def predict_window(self, images, R=None, t=None, K=None):
+        import cv2
+        import numpy as _np
+
+        self._load()
+        ext = ixt = None
+        if R is not None and t is not None and K is not None:
+            n = len(images)
+            ext = _np.repeat(_np.eye(4, dtype=_np.float64)[None], n, axis=0)
+            for i in range(n):
+                ext[i, :3, :3] = R[i]
+                ext[i, :3, 3] = t[i]
+            ixt = _np.repeat(_np.asarray(K, dtype=_np.float64)[None], n, axis=0)
+        with self._torch.no_grad():
+            pred = self._model.inference(
+                image=[_np.ascontiguousarray(im) for im in images],
+                extrinsics=ext, intrinsics=ixt,
+                align_to_input_ext_scale=True,
+                process_res=self.process_res,
+                process_res_method="upper_bound_resize",
+                export_dir=None,
+            )
+        depth = _np.asarray(pred.depth, dtype=_np.float32)
+        out = []
+        for i, im in enumerate(images):
+            h, w = im.shape[:2]
+            d = depth[i]
+            if d.shape != (h, w):
+                d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
+            # Hand back INVERSE depth, so the per-frame fit downstream is the
+            # same fit it performs for every other backend.
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                out.append(_np.where(d > 1e-6, 1.0 / d, _np.nan).astype(_np.float32))
+        return out
+
+
 # Only permissively licensed checkpoints are registered. Depth Anything V2
 # Base and Large are CC-BY-NC-4.0 and are deliberately absent: this is a
 # product, and a non-commercial weight cannot ship in one.
@@ -276,6 +414,21 @@ _BACKENDS: dict[str, Callable[[], DepthBackend]] = {
         "depth-anything/Depth-Anything-V2-Small-hf",
         "depth-anything-v2-small",
         "Apache-2.0",
+    ),
+    "moge2-vitl": lambda: MoGeBackend(
+        "Ruicheng/moge-2-vitl", "moge2-vitl", "MIT",
+    ),
+    "moge2-vits": lambda: MoGeBackend(
+        "Ruicheng/moge-2-vits-normal", "moge2-vits", "MIT",
+    ),
+    "da3-base": lambda: DepthAnything3Backend(
+        "depth-anything/DA3-BASE", "da3-base", "Apache-2.0",
+    ),
+    "da3-large": lambda: DepthAnything3Backend(
+        "depth-anything/DA3-LARGE-1.1", "da3-large", "Apache-2.0",
+    ),
+    "da3-small": lambda: DepthAnything3Backend(
+        "depth-anything/DA3-SMALL", "da3-small", "Apache-2.0",
     ),
 }
 
@@ -357,21 +510,42 @@ def robust_affine(disp: np.ndarray, inv_z: np.ndarray, iters: int = 12):
     return a, b
 
 
-def _relative_residual(disp: np.ndarray, z_true: np.ndarray, a: float, b: float):
+def depth_from_prediction(pred, a: float, b: float, kind: str = "disparity"):
+    """Turn a model's affine-invariant output into depth, given the frame's fit.
+
+    One function, used by the alignment, the scoring and the fusion, so the
+    three can never disagree about what a stored map means.
+    """
+    if kind == "depth":
+        # pred ~= a * z + b   ->   z = (pred - b) / a
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (pred - b) / a
+    # pred ~= a / z + b   ->   z = a / (pred - b)
+    den = pred - b
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 1e-6, a / den, np.nan)
+
+
+def fit_target(z_true: np.ndarray, kind: str = "disparity"):
+    """The regressor the model's output is linear in."""
+    return z_true if kind == "depth" else 1.0 / z_true
+
+
+def _relative_residual(pred: np.ndarray, z_true: np.ndarray, a: float, b: float,
+                       kind: str = "disparity"):
     """Relative depth error of an (a, b) fit, or None if it is infeasible."""
     if a <= 0:
         return None
-    den = disp - b
-    ok = den > 1e-6
+    z = depth_from_prediction(pred, a, b, kind)
+    ok = np.isfinite(z) & (z > 1e-6)
     if ok.sum() < 5:
         return None
-    z = a / den[ok]
-    rel = np.abs(z - z_true[ok]) / z_true[ok]
+    rel = np.abs(z[ok] - z_true[ok]) / z_true[ok]
     rel = rel[np.isfinite(rel)]
     return rel if len(rel) else None
 
 
-def align_frame(disp_at_points: np.ndarray, z_sfm: np.ndarray):
+def align_frame(disp_at_points: np.ndarray, z_sfm: np.ndarray, kind: str = "disparity"):
     """Fit one frame, and score it on sparse points the fit never saw.
 
     The held-out split is the whole point. An in-sample residual measures how
@@ -379,16 +553,16 @@ def align_frame(disp_at_points: np.ndarray, z_sfm: np.ndarray):
     the depth between the sparse points can be trusted, which is exactly what
     the dense stage is about to rely on.
     """
-    inv_z = 1.0 / z_sfm
-    idx = np.arange(len(inv_z))
+    x = fit_target(z_sfm, kind)
+    idx = np.arange(len(x))
     fit_m, ho_m = idx % 2 == 0, idx % 2 == 1
     ho_med = None
     if fit_m.sum() >= 10 and ho_m.sum() >= 10:
-        ha, hb = robust_affine(disp_at_points[fit_m], inv_z[fit_m])
-        rel = _relative_residual(disp_at_points[ho_m], z_sfm[ho_m], ha, hb)
+        ha, hb = robust_affine(disp_at_points[fit_m], x[fit_m])
+        rel = _relative_residual(disp_at_points[ho_m], z_sfm[ho_m], ha, hb, kind)
         if rel is not None:
             ho_med = float(np.median(rel))
-    a, b = robust_affine(disp_at_points, inv_z)
+    a, b = robust_affine(disp_at_points, x)
     return a, b, ho_med
 
 
