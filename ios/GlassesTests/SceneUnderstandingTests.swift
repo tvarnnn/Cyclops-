@@ -1192,3 +1192,107 @@ final class SceneUnderstandingAdditionsTests: XCTestCase {
         )
     }
 }
+
+// MARK: - The subscribe/leave race
+
+/// A `result_subscribed` that arrives after the screen has gone must be
+/// closed, not adopted.
+///
+/// Driven against a real socket rather than a stub, because the defect lives
+/// in the gap between two wire messages and nothing smaller than the wire can
+/// reproduce it: `TowerSceneUnderstandingClient` holds a concrete
+/// `TowerClient`, and the window under test is the one where a
+/// `result_subscribe` is out and its ack has not come back.
+@MainActor
+final class SceneSubscribeRaceTests: XCTestCase {
+
+    private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return condition()
+    }
+
+    /// Answers the handshake ping and the capability request, records the rest,
+    /// and deliberately does **not** answer `result_subscribe` — the ack is
+    /// sent by hand, after the screen has gone.
+    private func serve(_ server: MockTowerServer, _ recorder: MessageRecorder) {
+        server.onText = { text in
+            recorder.record(text)
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let type = json["type"] as? String
+            else { return }
+            switch type {
+            case "ping":
+                server.send(text: #"{"type":"pong"}"#)
+            case "cartridges":
+                server.send(text: #"{"type":"cartridges","envelope_contract":"cartridge_results.envelope/2026-08-23","cartridges":[{"cartridge":"scene_understanding","result_type":"live","contract":"scene_understanding.live/2026-08-27","available":true,"unavailable_reason":null,"snapshot_only":true}],"not_offered":[],"http_contracts":[]}"#)
+            default:
+                break
+            }
+        }
+    }
+
+    /// Leave the screen while the subscribe is still in flight, then let the
+    /// ack land.
+    ///
+    /// `workspaceVisibilityChanged(false)` can only unsubscribe an id it
+    /// holds, and in this window there is no id yet — so it sends nothing.
+    /// Before the fix the ack handler then assigned `subscriptionID`, opening
+    /// a subscription for a screen that no longer existed. Nothing could close
+    /// it afterwards: the visibility call is guarded on a *change*, so it will
+    /// not fire again, and `subscribeIfPossible` is the only other path. The
+    /// watcher lived as long as the socket, and on this cartridge a watcher is
+    /// what keeps a people detector running.
+    func testAnAckArrivingAfterTheScreenIsGoneIsClosedRatherThanAdopted() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient()
+        tower.connect(to: url(port: port))
+        let online = await waitUntil { tower.status == .online }
+        XCTAssertTrue(online, "the socket came up")
+
+        let scene = TowerSceneUnderstandingClient(tower: tower)
+        let declared = await waitUntil { tower.cartridgeDeclaration != nil }
+        XCTAssertTrue(declared, "the Tower declared its cartridges")
+
+        // The screen appears: a `result_subscribe` goes out and is left
+        // unanswered, which is the window under test.
+        scene.workspaceVisibilityChanged(isVisible: true)
+        let subscribed = await waitUntil {
+            recorder.all.contains { $0.contains("result_subscribe") }
+        }
+        XCTAssertTrue(subscribed, "the subscribe reached the wire")
+
+        // The wearer leaves before the ack.
+        scene.workspaceVisibilityChanged(isVisible: false)
+
+        // Only now does the Tower answer.
+        server.send(text: #"{"type":"result_subscribed","subscription_id":"sub-1","cartridge":"scene_understanding","result_type":"live","contract":"scene_understanding.live/2026-08-27"}"#)
+
+        let closed = await waitUntil {
+            recorder.all.contains { $0.contains("result_unsubscribe") && $0.contains("sub-1") }
+        }
+        XCTAssertTrue(
+            closed,
+            "an ack for a screen that has gone must be unsubscribed. Adopting it "
+                + "leaves a watcher nothing can retract, and the Tower keeps a "
+                + "people detector running for as long as the socket lives."
+        )
+
+        tower.disconnect()
+    }
+}

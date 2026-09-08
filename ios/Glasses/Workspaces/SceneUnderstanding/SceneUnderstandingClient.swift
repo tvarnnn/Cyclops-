@@ -347,6 +347,37 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
 
         case .subscribed(let ack):
             guard ack.cartridge == SceneUnderstandingContract.towerCartridge else { return }
+            // An ack that arrives after the screen has gone must be closed,
+            // not adopted.
+            //
+            // `workspaceVisibilityChanged(false)` can only send an unsubscribe
+            // for an id it has, and between the subscribe and its ack there is
+            // no id yet — so leaving in that window sends nothing and clears
+            // flags that were already clear. Adopting the ack here then opened
+            // a subscription belonging to a screen that no longer exists.
+            // Nothing closed it until the wearer next opened this screen and
+            // left it again: the visibility call is guarded on a change, so
+            // leaving twice in a row does nothing, and `subscribeIfPossible`
+            // is the only other path. A wearer who did not come back left the
+            // watcher running for the life of the socket.
+            //
+            // That is the whole point of the cartridge undone by a race: the
+            // Tower runs its detector while somebody streams AND somebody
+            // watches, so a watcher nobody has retracted keeps a people
+            // detector running for the rest of the walk.
+            //
+            // **Not closed by this guard**, and recorded rather than fixed
+            // here: appear, leave, and return *before* the first ack, and two
+            // subscribes are outstanding. Both acks now arrive while visible,
+            // both are adopted, and the second overwrites `subscriptionID` —
+            // orphaning the first. The durable answer is a generation token on
+            // the outstanding subscribe rather than the `isSubscribing`
+            // boolean, which is a wider change than this lane should make.
+            guard workspaceVisible else {
+                tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
+                isSubscribing = false
+                return
+            }
             subscriptionID = ack.subscriptionID
             isSubscribing = false
 
