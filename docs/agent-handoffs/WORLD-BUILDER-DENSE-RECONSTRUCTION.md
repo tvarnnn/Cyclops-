@@ -408,7 +408,7 @@ write it to a file, and serve the directory with `python -m http.server`.
 | Prototypes and analysis | `...\wb-dense\proto\`. The measuring instruments, each written for a claim somebody made: `gate_sensitivity.py` (what the gate does to the number, 11.3), `seethrough.py` (a wrong pose or a hole you see through, 11.5), `planarity.py` (a wall or an invention, 11.6), `mask_breakdown.py` (which refusal removes what), `live_budget.py` (could the dense stage keep up with a walk), `score_cloud.py --out` (the per-world eval.json every accuracy row cites) |
 | Audits and research | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\reports\` — `14-` and `15-` are the two adversarial reviews |
 | Depth-model bake-off | `...\wb-dense\bakeoff\` — `main\` is the 24-model run, `cross\` and `cross2\` the two held-out solves, `tbl_cross_final.md` the result |
-| Rendered comparisons, final | `...\wb-dense\renders\final\` — re-rendered from the shipped artifacts |
+| Rendered comparisons, final | `...\wb-dense\renders\final-h1\` — re-rendered after the fit stopped using invented pixels (D21). `renders\final\` is the same sheets from before it, kept so the difference is checkable |
 | Rendered comparisons, historical | `...\wb-dense\walk1_views\`, `walk2_views\`, `run1\` |
 | Viewer pages built for inspection | `...\wb-dense\viewer-pages\` — `mobile-*.html` are what the phone receives |
 
