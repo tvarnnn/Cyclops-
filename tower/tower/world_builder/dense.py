@@ -110,6 +110,14 @@ class DenseParams:
     edge_rel: float = 0.03
     max_grazing_deg: float = 80.0
     erode_px: int = 1
+    # Inpaint redaction fill before the depth network sees it. A solid black
+    # rectangle does not merely lose its own pixels: it drags the network's
+    # estimate for the WHOLE frame. Measured on one capture, frames with over
+    # 30% filled had a 34.8% held-out residual and not one passed the 8% gate,
+    # while frames under 10% filled sat near 6%. The inpainted pixels are still
+    # masked out of the reconstruction afterwards -- this exists to protect the
+    # rest of the frame, not to recover the hole.
+    inpaint_redaction_fill: bool = True
 
     # -- consensus --------------------------------------------------------
     neighbours: int = 10

@@ -274,6 +274,13 @@ def run_depth_stage(
                            cv2.INTER_NEAREST)[y0:y0 + rh, x0:x0 + rw] > 0
         np.save(work / "depth" / f"{ki:05d}_fill.npy", fill_u)
         fill_fraction = float(fill_u.mean())
+        if params.inpaint_redaction_fill and fill_u.any():
+            # Give the network a continuous image instead of a hole. What
+            # comes back inside the hole is invention and is thrown away by
+            # the mask above; what this buys is the REST of the frame.
+            img = cv2.inpaint(img, fill_u.astype(np.uint8), 5, cv2.INPAINT_TELEA)
+            cv2.imwrite(str(work / "undist" / f"{ki:05d}.jpg"), img,
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         disp = backend.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 

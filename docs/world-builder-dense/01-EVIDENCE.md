@@ -145,10 +145,14 @@ From report 01 (all 97 captures) and report 03 (all 162 worlds):
   laptop screen**, across two environments. Only about 8,000–12,000 frames in
   8–10 captures carry real translation, and none of those captures had been
   solved before this lane started.
-- Scale is arbitrary **and separately normalised per component**: COLMAP's
-  `Normalize()` puts every model at extent about 10, so two components of one
-  world are not in the same unit. **Use component 0 only**, and express every
-  threshold relative to that component's median scene depth.
+- Scale is arbitrary, and **the gauge is not normalised at all**. An early
+  reading attributed the reference world's tidy 10 x 8 x 14 extent to COLMAP's
+  `Normalize()`. That was wrong: `global_solve.py` never calls it. Solving eight
+  further captures produced gauges from a ten-unit extent to a **340 x 70 x 175**
+  one for the same kind of walk, so the reference world's tidy numbers were luck.
+  Two consequences: **use component 0 only**, since components are solved
+  independently and share no unit; and express **every** length as a fraction of
+  that component's own median scene depth, never in absolute world units.
 
 ## 8. iOS reality — the viewer is ours to change
 
@@ -190,3 +194,99 @@ From report 02:
 - **There is no migration machinery**: `require_schema` refuses any version but
   1. A dense artifact must therefore be **additive and optional**, following the
   existing `support.json` and `placements.json` precedent.
+
+---
+
+## 10. Corrections and later findings
+
+Recorded separately because each overturned something believed earlier in this
+lane, and in every case the wrong version was the more tempting one.
+
+### 10.1 The gauge is not normalised
+
+See section 7. Believed normalised to extent 10; it is not normalised at all.
+
+### 10.2 Most of the apparent "fusion error" was the evaluation renderer
+
+Held-out rendered depth from the fused cloud missed the sparse points by 6.3%,
+against 3.0% for the per-frame depth feeding it. That looked like fusion
+doubling the error. It was not:
+
+| what was measured | signed relative error |
+| --- | --- |
+| per-frame aligned depth, 345 frames | **+0.03% median** (mean -0.45%, 45% near) |
+| fused cloud rendered with 0.5 px splats | -2.9% |
+| fused cloud rendered with 1.0 px splats | -5.6% |
+| fused cloud rendered with 1.6 px splats | -6.0% |
+| fused cloud rendered with 2.5 px splats | -6.4% |
+
+The per-frame depth is **unbiased**. The bias is a function of splat radius, and
+its sign is toward the camera in 100% of frames, because a fat splat spills onto
+neighbouring pixels and a z-buffer keeps the nearest of them, which on any
+slanted surface is nearer than the truth. The geometry is about as good as the
+depth maps feeding it. The evaluator now measures depth from a separate
+near-point render, while appearance keeps the fat splat it needs for coverage.
+
+The lesson worth keeping: the evaluation renderer is part of the measurement
+apparatus, and it can be the thing that is wrong.
+
+### 10.3 Averaging agreeing cameras genuinely helps
+
+On identical held-out views:
+
+| | reference camera only | averaged over agreeing cameras |
+| --- | --- | --- |
+| rendered depth error, median | 7.42% | **6.32%** |
+| rendered depth error, p90 | 10.24% | **8.23%** |
+| PSNR | 14.87 | **15.22** |
+| voxels from the same 35.2 M points | 10.63 M | **8.73 M** |
+
+18% of the points were redundant surface thickness. Fewer points AND better
+depth is the signature of a real improvement rather than a trade.
+
+### 10.4 The face redactor fires on hands, and it is expensive here
+
+`redaction.py` runs YuNet at confidence 0.30, a documented compromise: below 0.2
+it fires on face-free frames, above 0.4 it misses small faces and faces on
+screens. On this corpus that compromise is costly. Over 77 frames of one
+capture, the filled area was:
+
+| | fraction of frame filled |
+| --- | --- |
+| median | 0.4% |
+| mean | 8.6% |
+| p90 | 33.0% |
+| worst | 57.8% |
+
+22 of 77 frames lose more than a tenth of the image, and inspection shows the
+boxes sitting on **the wearer's hands and on carpet**, not on faces.
+
+This is pre-existing rather than caused by the dense work: the same fill is
+baked into the keyframe images the sparse solve already used, and an earlier
+handoff measured it costing about 100 solved poses. But it hurts a dense stage
+far more, and the damage is not confined to the filled pixels:
+
+| redaction fill | frames | held-out residual, median | pass the 8% gate |
+| --- | --- | --- | --- |
+| under 1% | 37 | 6.9% | 65% |
+| 1-10% | 16 | 6.1% | 62% |
+| 10-30% | 13 | 10.3% | 46% |
+| over 30% | 7 | 34.8% | **0%** |
+
+A solid black rectangle drags the network's depth estimate for the whole frame,
+not only its own region. So the dense stage does two separate things: it
+**inpaints** the fill before the network sees it, to protect the rest of the
+frame, and it still **masks the fill out** of the reconstruction afterwards,
+because whatever the network puts there is invention. The region stays a hole.
+
+Worth doing properly later: have the redactor persist its boxes alongside the
+keyframe, so consumers read what was removed instead of re-deriving it from the
+pixels.
+
+### 10.5 The solver's own convention documentation is correct
+
+Section 3 says `world.json`'s `pose_convention` block does not describe
+`solve/solution.json`. That stands, but `global_solve.py` itself is explicit and
+right: it annotates the field as `R_cw` and computes `centre = -r_wc @ t_cw`.
+The mismatch is between `world.json`, which describes the derived tree, and the
+solve artifact. It is a documentation gap, not a solver bug.
