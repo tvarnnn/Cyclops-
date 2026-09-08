@@ -888,3 +888,19 @@ def test_a_cached_depth_stage_is_not_reused_across_a_backend_change():
     src = inspect.getsource(dense_pipeline.densify)
     assert "same_backend" in src
     assert 'cached.get("backend")' in src
+
+
+def test_a_run_killed_mid_stage_is_distinguishable_from_one_still_going():
+    """The dense stage deliberately outlives the world lock, so the supervisor
+    can kill it after finalization is already marked complete. Without a pid on
+    the status, that leaves `running` on disk forever and nothing can tell it
+    from a run that is genuinely still going."""
+    import os as _os
+
+    from tower.world_builder.dense_pipeline import STATE_RUNNING, status_is_stale
+
+    assert not status_is_stale({"state": STATE_RUNNING, "pid": _os.getpid()})
+    assert status_is_stale({"state": STATE_RUNNING, "pid": 0x7FFFFFFE})
+    assert status_is_stale({"state": STATE_RUNNING})          # no pid at all
+    assert not status_is_stale({"state": "ok", "pid": 0x7FFFFFFE})
+    assert not status_is_stale({})

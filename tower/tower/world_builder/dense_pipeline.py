@@ -72,7 +72,36 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def _status(root: Path, **fields) -> None:
-    _write_json(root / "status.json", {"schema_version": DENSE_SCHEMA_VERSION, **fields})
+    """Write the stage's state where a cold reader can find it.
+
+    `pid` is recorded on every state, not only the running one, because the
+    supervisor can kill this process after finalization is already marked
+    complete -- the dense stage deliberately outlives the world lock. Without a
+    pid, a run killed mid-stage leaves `state: "running"` on disk forever and
+    nothing can tell that from a run that is genuinely still going.
+    """
+    _write_json(root / "status.json", {
+        "schema_version": DENSE_SCHEMA_VERSION,
+        "pid": os.getpid(),
+        "updated_at": time.time(),
+        **fields,
+    })
+
+
+def status_is_stale(status: dict) -> bool:
+    """True when a status says `running` but its process is gone."""
+    if not status or status.get("state") != STATE_RUNNING:
+        return False
+    pid = status.get("pid")
+    if not isinstance(pid, int):
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 
 
 def _stopped(should_stop) -> bool:
