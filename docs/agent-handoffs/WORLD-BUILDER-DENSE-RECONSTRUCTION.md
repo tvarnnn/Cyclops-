@@ -324,7 +324,14 @@ The dense field is not a meaningful part of it.
    reaches 96-98%. More tuning will not fix it; consensus needs baseline.
 8. **The reference is not independent** — see the top of §6. Every number in
    this lane is measured against the solve the pipeline is anchored to.
-9. **You can see through missing walls.** On 13% of sampled capture poses the
+9. **The enclosure is incomplete.** Walls, floors and ceilings ARE
+   reconstructed -- about a third of each cloud lies in six planes a fifth to
+   a half of the room across, flat to one part in a thousand, carried by more
+   cameras than the average point (§11.6). What is missing is closure: three
+   walls of four, corners absent, so from outside it reads as no walls at all.
+   A wearer walking through a room does not point the camera at every wall
+   from two angles, and consensus needs two angles.
+10. **You can see through missing walls.** On 13% of sampled capture poses the
    render shows the room BEHIND a surface that was dropped, because a point
    cloud occludes only where it has points. The poses are right — sub-pixel
    reprojection everywhere — so nothing is misplaced; what is missing is the

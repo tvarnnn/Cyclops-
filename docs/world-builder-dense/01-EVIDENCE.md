@@ -441,6 +441,59 @@ why the surface options were rejected. What can be done is to say so, which is
 what this section is for, and the diagnostic is in the tree so the next person
 can re-measure rather than re-argue.
 
+
+### 11.6 The walls are there, and they are not invented
+
+The same independent visual reviewer made two claims that cannot both be true
+of the same surfaces, and measuring them settles both.
+
+> *"No world has a ceiling, a complete wall, a corner, or a closed floor plan.
+> Not one."*
+
+> *"The giant smooth sheets ... huge, smoothly-curved cream and white planes
+> that are several times larger than any wall in any photograph, and they curve
+> -- real walls do not. This looks like depth-map extrapolation off a blown-out
+> overexposed wall, spraying a plausible-looking smooth surface into space that
+> was never observed."*
+
+`proto/planarity.py` RANSACs the largest planar structures out of the fused
+cloud and reports, for each, how thick it really is and what confidence its
+points carry. Confidence is the number of independent cameras that agreed on a
+point's depth, which is the discriminator: **a fabricated surface cannot carry a
+high one, because the mechanism that would have to invent it is the same one
+that counts agreements.**
+
+The six largest planes, on the two worlds the claims were made about:
+
+| world | plane share of cloud | thickness, RMS / extent | thickness, p95 / extent | width / extent | confidence, median | share at 5+ cameras |
+| --- | --- | --- | --- | --- | --- | --- |
+| `672578d0` (three rooms) | 30.0% in six planes | 0.0011-0.0012 | 0.0035-0.0038 | 0.18-0.50 | 6-8 | 72-92% |
+| `7d31e8d7` (desk) | 32.1% in six planes | 0.0011-0.0012 | 0.0037-0.0038 | 0.23-0.36 | 6-8 | 67-87% |
+
+Against a whole-cloud confidence median of 6 with 16% of points sitting at the
+floor of 3.
+
+**So: about a third of each cloud lies in six structures that are between a
+fifth and a half of the room across, flat to about one part in a thousand of
+the scene, and supported by more cameras than the average point in the same
+cloud.** Those are walls, floors and ceilings. They are not curved, they are not
+extrapolated, and they are better evidenced than the furniture.
+
+The first claim is therefore wrong, and the second claim is wrong about the same
+surfaces the first claim says are missing. What is true is the thing underneath
+both: **the enclosure is incomplete.** Planes exist but do not close; corners
+are frequently absent; and a room with three of its four walls reads to a viewer
+as no walls at all, especially from outside, where you see the backs of them.
+
+A separate measurement rules out the obvious explanation. On 30 frames of the
+desk world, wall-facing pixels survive the validity mask at **78.8%**, against
+80.0% for all pixels -- the mask is not what removes walls. Floor and ceiling
+pixels do worse, at 70.9%, losing 12.8% to the grazing-angle test, which is
+exactly what a floor seen from standing height should lose. The gate refused 4
+of 429 frames at alignment. Neither mechanism explains an incomplete enclosure;
+what does is that a wearer walking through a room does not point the camera at
+every wall from two angles, and consensus needs two angles.
+
 ### 11.4 What changed against the previous default, and what did not
 
 The seven-world run above is the same seven worlds the stage had already
