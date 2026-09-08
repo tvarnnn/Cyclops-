@@ -154,8 +154,13 @@ def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = Non
     probes until the count is inside 85-100% of the budget or the step stops
     moving, keeping the best result seen.
 
-    Probing is cheap because `_voxel_count` predicts the count without building
-    the reduction, so only the winning cell is ever materialised.
+    `_voxel_count` predicts the count without building the reduction, so only
+    the winning cell is ever materialised -- but probing is not free, and the
+    honest figure is that this costs about **2.6 s on 2.6 M points with a size
+    hint and 3.9 s without one**, against 0.9 s for the version that stopped at
+    the first answer. That is the price of spending the budget instead of a
+    quarter of it, on a page that is 8 MB anyway, composed on request and cached
+    nowhere by contract.
 
     Any residue -- overshoot from a scene that is not surface-like -- is
     trimmed by confidence, which at a few percent is the size of cut that trim
