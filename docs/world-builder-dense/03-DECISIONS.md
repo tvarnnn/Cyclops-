@@ -488,27 +488,42 @@ it deletes the parts of it that were seen from fewer angles.
 Measured on `672578d0`, the three-room chain, whose mobile level is 2.60 M
 points against a 393 k budget:
 
-| | old rule | new rule |
-| --- | --- | --- |
-| points shipped | 393,216 | 313,539 |
-| confidence floor | **9** | 3 |
-| what the phone showed | isolated slabs of wall and ceiling; two of three rooms absent | the whole dwelling, coarser |
+| | old rule | first fix | shipped |
+| --- | --- | --- | --- |
+| points shipped | 393,216 | 295,480 | **373,252** |
+| share of the byte budget | 100% | 75% | **94.9%** |
+| confidence floor | **9** | 3 | 3 |
+| what the phone showed | isolated slabs of wall and ceiling; two of three rooms absent | the whole dwelling, coarser | the whole dwelling, coarser |
 
 The fix is to meet the budget the way the LOD ladder meets it: a coarser voxel
-over the whole extent, keeping the best confidence in each cell. The voxel size
-is solved rather than searched — these points lie on surfaces, so the count
-scales as `voxel ** -2`, and one step of that law lands within a few percent.
-Two passes cost about 0.9 s on 2.6 M points, which is why it is done at serve
-time rather than baked into a ladder that cannot know the client's budget.
+over the whole extent, keeping the best confidence in each cell.
 
-**What this cost.** Slightly fewer points (313 k against 393 k) because a voxel
-grid cannot hit an exact count. That is the entire cost.
+**The middle column is the more interesting failure.** The first fix solved for
+the cell size from the scaling law and then took the first count under the
+budget. That cannot correct an UNDERSHOOT, and the first step is always an
+undershoot, because it feeds the count at NO reduction into a law about the
+count at the current cell. With a size hint it spent 75% of the budget. Without
+one, which is what all four of its new tests did, it spent **2.7%** and every
+test passed, because they asserted only that the result was not LARGER than the
+budget. 21 points out of 8,000 satisfies that.
 
-**What it says about the rest of this lane.** The defect shipped, was covered by
-four passing tests, survived one adversarial review, and was found in about
-thirty seconds by building the page the phone actually gets and looking at it.
-Every number in `01-EVIDENCE.md` is measured on the artifact on disk, and the
-artifact on disk was never the problem.
+So the loop now probes until the count is inside 85-100% of the budget, keeping
+the best result seen, and a test asserts the budget is SPENT. Probing is cheap
+because a helper predicts the count of a reduction without building it, so only
+the winning cell is materialised. Measured across budgets from 100 to 50,000
+points on a spatially split cloud: 88-98% of budget, both halves equally
+represented.
+
+**What this cost.** About 5% of the budget, because a voxel grid cannot hit an
+exact count. That is the entire cost.
+
+**What it says about the rest of this lane.** The original defect shipped, was
+covered by four passing tests, survived one adversarial review, and was found in
+about thirty seconds by building the page the phone actually gets and looking at
+it. Its replacement then shipped a 37x undershoot with four NEW tests passing,
+and was found by a reviewer measuring the function rather than reading it. Both
+failures have the same shape: an assertion that bounds the answer on one side
+only. If a value has a target, test the target.
 
 ## Open, being decided by measurement
 
