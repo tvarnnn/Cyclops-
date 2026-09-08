@@ -21,6 +21,7 @@ as it ignores `solve/`.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -201,6 +202,16 @@ class _DenseLock:
 
 
 # ---------------------------------------------------------------------------
+
+
+class DenseInputsPruned(DenseUnavailable):
+    """Asked to run from intermediates that a successful run removed.
+
+    A DenseUnavailable rather than a bug: the artifact is complete, its
+    intermediates were pruned on purpose, and the caller wants a stage that
+    consumes them. The answer is --force, and saying so beats a traceback
+    ending in `depth/00081.npy`.
+    """
 
 
 def _source_paths(workspace_root: Path) -> dict[str, str]:
@@ -603,7 +614,15 @@ def run_fuse_stage(
     kind = align.get("kind", "disparity")
     for ki in kept:
         r = recs[ki]
-        pred = np.load(work / "depth" / f"{ki:05d}.npy").astype(np.float32)
+        depth_path = work / "depth" / f"{ki:05d}.npy"
+        if not depth_path.exists():
+            # Pruned, or hand-deleted. Either way the depth stage's output is
+            # gone and fusing without it would silently drop the frame.
+            raise DenseInputsPruned(
+                "the per-frame depth maps for this session are not on disk "
+                "(a successful run prunes them). Re-run with --force."
+            )
+        pred = np.load(depth_path).astype(np.float32)
         # One function decides what a stored map means, shared with the
         # alignment and the scoring, so the three cannot drift apart.
         z = depth_from_prediction(pred, r["a"], r["b"], kind).astype(np.float32)
@@ -829,6 +848,55 @@ def dense_currency(store, world_id: str, session_id: str,
     return out
 
 
+def _result_from_manifest(root: Path, manifest: dict) -> "DenseResult":
+    """Report a finished artifact without re-deriving it.
+
+    `status.json` holds the result the completing run wrote, and pruning keeps
+    it precisely so that a completed run stays explainable after its
+    intermediates are gone. Re-deriving the counts from `align.json` instead
+    would get `frames_used` wrong: `align.json` records which frames ALIGNED,
+    and the frames the fusion dropped are a different, smaller set.
+    """
+    stored = {}
+    try:
+        stored = (json.loads((root / "status.json").read_text()).get("result") or {})
+    except (OSError, ValueError):
+        stored = {}
+    if not stored:
+        # `status.json` is a single file that every later run overwrites, so a
+        # failed or interrupted re-run can erase the completing run's record.
+        # `align.json` and `fuse.json` are per-stage and survive, and between
+        # them they hold the same counts. `align.json` alone would not: it
+        # records which frames ALIGNED, and the frames fusion kept are fewer.
+        try:
+            align = json.loads((root / "align.json").read_text())
+            records = align.get("records") or []
+            ok = [r for r in records if r.get("ok")]
+            hos = [r["held_out_rel"] for r in ok if r.get("held_out_rel") is not None]
+            stored = {
+                "frames_total": int(align.get("targets") or len(records)),
+                "frames_aligned": len(ok),
+                "align_rel_median": float(np.median(hos)) if hos else None,
+            }
+            fuse = json.loads((root / "fuse.json").read_text())
+            stored["frames_used"] = int(fuse.get("frames_used") or 0)
+            stored["frames_dropped"] = int(fuse.get("frames_dropped") or 0)
+        except (OSError, ValueError, KeyError):
+            pass
+    levels = manifest.get("levels") or []
+    fields = {f.name for f in dataclasses.fields(DenseResult)}
+    kwargs = {k: v for k, v in stored.items() if k in fields}
+    kwargs.update(
+        state=STATE_OK,
+        levels=levels,
+        points=int(levels[0]["points"]) if levels else kwargs.get("points", 0),
+        seconds={},
+        stopped_after=None,
+        reused=True,
+    )
+    return DenseResult(**kwargs)
+
+
 def prune_intermediates(root: Path) -> int:
     """Remove what a successful run no longer needs, and report the bytes.
 
@@ -904,8 +972,49 @@ def densify(
                          "makes no new scale claim")
 
         digest = solution.input_digest
-        _status(root, state=STATE_RUNNING, stage=STAGE_DEPTH, input_digest=digest,
-                params=params.as_dict())
+
+        # A COMPLETED ARTIFACT IS COMPLETE, and this is decided before the
+        # first status write as well as before any stage runs -- an early
+        # return that had already stamped `state: running` over the
+        # completing run's record would destroy the frame counts it is
+        # about to report. `prune_intermediates` deletes the
+        # per-frame depth maps and `fused.npz` after a successful pack -- that
+        # is the whole point of it -- so on a re-run the depth stage found its
+        # cache key intact and reused it, the fuse stage found no `fused.npz`
+        # and re-ran, and then died on the first `depth/00081.npy` that pruning
+        # had removed. Every successfully densified world was in that state,
+        # because pruning is the default, so `world_densify.py --world X` twice
+        # raised FileNotFoundError the second time and the documented "a re-run
+        # resumes" was false in exactly the ordinary case.
+        manifest_path = root / "manifest.json"
+        if manifest_path.exists() and not force:
+            try:
+                existing = json.loads(manifest_path.read_text())
+            except (OSError, ValueError):
+                existing = None
+            if existing and existing.get("input_digest") == digest \
+                    and (existing.get("params") or {}) == params.as_dict():
+                levels = existing.get("levels") or []
+                if levels and all((root / f"points_l{i}.bin").exists()
+                                  for i in range(len(levels))):
+                    logger.info(
+                        "[Tower][WorldBuilder][dense] %s/%s is already densified "
+                        "from this solve with these parameters; nothing to do "
+                        "(--force rebuilds it)", world_id, session_id,
+                    )
+                    done = _result_from_manifest(root, existing)
+                    # Repair the record while we are here. A run that crashed
+                    # against this complete artifact left `state: running` over
+                    # the completing run's result, and a cold reader cannot
+                    # tell that from a densify still in progress. The counts
+                    # were recovered above from the per-stage files, so write
+                    # them back rather than leave the lie in place.
+                    _status(root, state=STATE_OK, input_digest=digest,
+                            params=params.as_dict(), result=done.as_dict())
+                    return done
+
+        _status(root, state=STATE_RUNNING, stage=STAGE_DEPTH,
+                input_digest=digest, params=params.as_dict())
 
         align_path = root / "align.json"
         align = None

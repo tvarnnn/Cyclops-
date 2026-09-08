@@ -1400,3 +1400,106 @@ def test_the_worlds_listing_says_whether_the_dense_cloud_is_current(tmp_path):
     # None -- never False. Reporting unknowable as stale would put a BEHIND
     # marker on every world whose solve could not be read.
     assert summary["solve_current"] is None
+
+
+# --------------------------------------------------------------------------
+# Re-running densify on a world that is already densified. Pruning is the
+# default, so this is the ordinary case, and it used to raise FileNotFoundError
+# on a depth map that pruning had deliberately removed.
+# --------------------------------------------------------------------------
+
+
+def test_a_completed_artifact_is_reported_not_rebuilt_and_not_crashed_into(tmp_path):
+    """`world_densify.py --world X` twice used to fail the second time.
+
+    The depth stage found its cache key intact and reused it, the fuse stage
+    found no fused.npz and re-ran, and the re-run died on the first per-frame
+    depth map -- which a successful run removes on purpose."""
+    import json
+
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _result_from_manifest
+
+    root = tmp_path / "dense"
+    root.mkdir()
+    params = DenseParams()
+    (root / "manifest.json").write_text(json.dumps({
+        "format": "wb-dense-points/1",
+        "input_digest": "DIGEST",
+        "params": params.as_dict(),
+        "levels": [{"level": 0, "points": 1234, "voxel": 0.1}],
+    }))
+    (root / "status.json").write_text(json.dumps({
+        "state": "ok",
+        "result": {"frames_total": 198, "frames_used": 169, "frames_dropped": 29,
+                   "align_rel_median": 0.041},
+    }))
+    result = _result_from_manifest(root, json.loads((root / "manifest.json").read_text()))
+    assert result.state == "ok"
+    assert result.reused is True
+    assert (result.frames_used, result.frames_dropped) == (169, 29)
+    assert result.points == 1234
+    # It did no work, and must not claim to have.
+    assert result.seconds == {}
+
+
+def test_the_completed_report_survives_a_later_run_overwriting_status(tmp_path):
+    """`status.json` is one file that every later run overwrites, so a failed
+    re-run erases the completing run's record. The per-stage files do not
+    overwrite each other and hold the same counts between them -- and
+    align.json ALONE would be wrong, because the frames that aligned are more
+    than the frames fusion kept."""
+    import json
+
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _result_from_manifest
+
+    root = tmp_path / "dense"
+    root.mkdir()
+    (root / "manifest.json").write_text(json.dumps({
+        "format": "wb-dense-points/1",
+        "input_digest": "DIGEST",
+        "params": DenseParams().as_dict(),
+        "levels": [{"level": 0, "points": 999, "voxel": 0.1}],
+    }))
+    # What a crashed re-run leaves behind: running, and no result.
+    (root / "status.json").write_text(json.dumps({"state": "running"}))
+    (root / "align.json").write_text(json.dumps({
+        "targets": 198,
+        "records": ([{"ki": i, "ok": True, "held_out_rel": 0.04} for i in range(180)]
+                    + [{"ki": 900 + i, "ok": False} for i in range(18)]),
+    }))
+    (root / "fuse.json").write_text(json.dumps({"frames_used": 169, "frames_dropped": 29}))
+
+    result = _result_from_manifest(root, json.loads((root / "manifest.json").read_text()))
+    assert result.frames_total == 198
+    assert result.frames_aligned == 180        # from align.json
+    assert result.frames_used == 169           # from fuse.json, and NOT 180
+    assert result.frames_dropped == 29
+    assert result.align_rel_median is not None
+
+
+def test_the_fuse_stage_says_the_inputs_were_pruned_instead_of_dying_on_a_path():
+    """The user-facing difference between a traceback ending in
+    `depth\\00081.npy` and a sentence naming the flag that fixes it."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_fuse_stage)
+    assert "DenseInputsPruned" in body
+    assert issubclass(dense_pipeline.DenseInputsPruned,
+                      dense_pipeline.DenseUnavailable)
+
+
+def test_the_completed_check_runs_before_the_first_status_write():
+    """An early return that had already stamped `state: running` over the
+    completing run's record would destroy the counts it is about to report."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.densify)
+    guard = body.index("A COMPLETED ARTIFACT IS COMPLETE")
+    first_status = body.index("_status(root, state=STATE_RUNNING")
+    assert guard < first_status

@@ -225,6 +225,10 @@ class DenseResult:
     seconds: dict = field(default_factory=dict)
     align_rel_median: float | None = None
     stopped_after: str | None = None
+    # True when this run found a complete artifact from the same solve and the
+    # same parameters and did nothing. Additive, and worth reporting: a caller
+    # that sees zero seconds and thousands of points should be told why.
+    reused: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
