@@ -183,6 +183,24 @@ def build_dense_payload(store, world_id: str, session_id: str, *,
     return raw, config, manifest
 
 
+
+def js_object_literal(obj) -> str:
+    """JSON, safe to paste into a <script> body.
+
+    The config becomes a JS source literal inside the page, so three
+    characters that are legal in JSON are not legal there: LESS-THAN can
+    end the script tag, and U+2028 and U+2029 are line terminators in
+    JavaScript but ordinary characters in JSON. Each is replaced by its own
+    six-character escape, which JS reads back as the original character.
+    """
+    return (
+        json.dumps(obj)
+        .replace(chr(0x3C), chr(92) + 'u003c')
+        .replace(chr(0x3E), chr(92) + 'u003e')
+        .replace(chr(0x2028), chr(92) + 'u2028')
+        .replace(chr(0x2029), chr(92) + 'u2029')
+    )
+
 def build_dense_page(store, world_id: str, session_id: str, *,
                      budget_bytes: int = MOBILE_BYTE_BUDGET,
                      level: int | None = None) -> str:
@@ -197,7 +215,7 @@ def build_dense_page(store, world_id: str, session_id: str, *,
     raw, config, _ = build_dense_payload(
         store, world_id, session_id, budget_bytes=budget_bytes, level=level
     )
-    page = template.replace(TOKEN_CONFIG, json.dumps(config))
+    page = template.replace(TOKEN_CONFIG, js_object_literal(config))
     page = page.replace(TOKEN_POINTS, base64.b64encode(raw).decode("ascii"))
     logger.info(
         "[Tower][WorldBuilder][dense] viewer for %s/%s: %s points, %.1f MB of page",

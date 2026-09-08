@@ -848,3 +848,30 @@ def test_a_points_file_is_never_visible_half_written(tmp_path):
 
     src = inspect.getsource(dense.write_points_bin)
     assert ".tmp" in src and "replace(" in src
+
+
+def test_the_config_cannot_break_out_of_the_script_tag(tmp_path):
+    """The config is substituted into a JS literal inside <script>.
+
+    A world id cannot carry "<" -- Windows will not create the directory and
+    `contained_world_id` guards the route -- but the config also copies the
+    manifest's `scale` block through verbatim, and that is a file. Escaping
+    costs nothing and means no future field can end the tag and turn the rest
+    of the page into markup.
+    """
+    from tower.world_builder.dense_render import build_dense_page
+
+    store, *_ = _fake_dense(tmp_path)
+    man = tmp_path / "worlds" / "w1" / "dense" / "s1" / "manifest.json"
+    payload = json.loads(man.read_text())
+    payload["scale"]["note"] = "</script><img src=x onerror=alert(1)>"
+    man.write_text(json.dumps(payload))
+
+    page = build_dense_page(store, "w1", "s1")
+    # What matters is that no LESS-THAN survives to end the tag. The text
+    # "onerror=alert(1)" does survive, escaped, inside a JS string value -- and
+    # that is fine: a string is not markup, and asserting its absence would be
+    # asserting the wrong thing.
+    assert "</script><img" not in page
+    assert "u003c/script" in page
+    assert page.count("</script>") == page.count("<script>")

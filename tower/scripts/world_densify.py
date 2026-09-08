@@ -77,6 +77,11 @@ def main(argv=None) -> int:
     ap.add_argument("--neighbours", type=int, default=DenseParams.neighbours)
     ap.add_argument("--stride", type=int, default=DenseParams.stride)
     ap.add_argument("--component", type=int, default=DenseParams.component)
+    ap.add_argument("--keep-intermediates", action="store_true",
+                    help="keep the per-frame depth maps, the undistorted frames and "
+                         "fused.npz. About 470 MB on a 438-keyframe world, and what "
+                         "makes re-fusing with different parameters fast -- so this "
+                         "is the flag for the development loop")
     ap.add_argument("--format", choices=("text", "json"), default="text")
     a = ap.parse_args(argv)
 
@@ -104,6 +109,7 @@ def main(argv=None) -> int:
     params = DenseParams(
         backend=a.backend, gate_rel=a.gate_rel, tau=a.tau, min_views=a.min_views,
         neighbours=a.neighbours, stride=a.stride, component=a.component,
+        keep_intermediates=a.keep_intermediates,
     )
 
     targets: list[tuple[str, str]] = []

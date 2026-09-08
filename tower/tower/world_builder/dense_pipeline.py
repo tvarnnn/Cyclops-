@@ -379,7 +379,11 @@ def run_depth_stage(
         ui = np.clip(np.rint(uv[g, 0]).astype(int), 0, W - 1)
         vi = np.clip(np.rint(uv[g, 1]).astype(int), 0, H - 1)
         a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc[g])
-        np.save(work / "depth" / f"{ki:05d}.npy", disp)
+        # float16: the depth values run 0.2-40 in world units and the pipeline's
+        # own error is a few percent, so three significant digits is far more
+        # than the evidence supports -- and it halves the largest thing this
+        # stage writes.
+        np.save(work / "depth" / f"{ki:05d}.npy", disp.astype(np.float16))
         records.append({"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
                         "n_points": int(g.sum()), "held_out_rel": ho,
                         "redaction_fill_fraction": fill_fraction,
@@ -583,6 +587,33 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
     return {"levels": levels, "points": levels[0]["points"]}
 
 
+def prune_intermediates(root: Path) -> int:
+    """Remove what a successful run no longer needs, and report the bytes.
+
+    Only ever the stage's OWN intermediates, inside its own subtree, and only
+    after `pack` has succeeded: the per-frame depth maps, the undistorted
+    frames, and fused.npz, whose points points_l0.bin already holds. The
+    manifest, the point levels, align.json and status.json all stay, so the
+    artifact remains complete and the run remains explainable.
+    """
+    import shutil
+
+    freed = 0
+    for path in (root / "work", root / "fused.npz"):
+        if not path.exists():
+            continue
+        try:
+            if path.is_dir():
+                freed += sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+                shutil.rmtree(path)
+            else:
+                freed += path.stat().st_size
+                path.unlink()
+        except OSError:
+            logger.warning("[Tower][WorldBuilder][dense] could not prune %s", path)
+    return freed
+
+
 def densify(
     store, world_id: str, session_id: str, *,
     params: DenseParams | None = None,
@@ -680,6 +711,11 @@ def densify(
             seconds=seconds,
             align_rel_median=float(np.median(hos)) if hos else None,
         )
+        if not params.keep_intermediates:
+            freed = prune_intermediates(root)
+            if freed:
+                logger.info("[Tower][WorldBuilder][dense] pruned %.0f MB of intermediates",
+                            freed / 1e6)
         _status(root, state=STATE_OK, input_digest=digest, result=result.as_dict())
         logger.info(
             "[Tower][WorldBuilder][dense] world %s session %s: %s of %s frames used, "

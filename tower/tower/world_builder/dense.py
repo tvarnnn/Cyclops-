@@ -147,6 +147,16 @@ class DenseParams:
     mobile_level: int = 2
     min_confidence: int = 2
 
+    # -- housekeeping ------------------------------------------------------
+    # A 438-keyframe world leaves 601 MB behind, of which about 470 MB is
+    # regenerable intermediate: the per-frame depth maps, the undistorted
+    # frames, and fused.npz, which holds the same points points_l0.bin already
+    # holds. Keeping all of that on every world forever is not a reasonable
+    # default for a product. It IS the right default for the development loop,
+    # where re-fusing with different parameters off cached depth is the whole
+    # iteration, so world_densify.py exposes --keep-intermediates.
+    keep_intermediates: bool = False
+
     # -- scope ------------------------------------------------------------
     component: int = 0
 
