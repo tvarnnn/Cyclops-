@@ -60,6 +60,22 @@ logger = logging.getLogger(__name__)
 DENSE_SCHEMA_VERSION = 1
 
 
+def _pid_is_running(pid: int) -> bool:
+    """The store's own liveness probe, not os.kill.
+
+    The signal-based probe is a console-signal call on Windows and reported a
+    freshly dead process as still alive in testing, which would strand a lock
+    forever. On any failure this answers "running", because refusing to start
+    is recoverable and stealing a live lock is not.
+    """
+    from tower.world_builder.store import _pid_is_running as _probe  # noqa: PLC0415
+
+    try:
+        return bool(_probe(pid))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def dense_dir(store, world_id: str, session_id: str) -> Path:
     """`<world>/dense/<session>` -- beside `solve/`, never inside `derived/`."""
     return store.world_dir(world_id) / "dense" / session_id
@@ -96,13 +112,7 @@ def status_is_stale(status: dict) -> bool:
     pid = status.get("pid")
     if not isinstance(pid, int):
         return True
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-    return False
+    return not _pid_is_running(pid)
 
 
 def _stopped(should_stop) -> bool:
@@ -131,19 +141,13 @@ class _DenseLock:
             pid = int(json.loads(self.path.read_text()).get("pid", -1))
         except (OSError, ValueError, AttributeError):
             return True
-        # Deliberately NOT treating our own pid as stale. Doing that lets a
-        # second lock object in the same process steal the first one's lock,
-        # which defeats the whole point -- and in-process concurrency is the
-        # likeliest way to hit this at all. The cost is that a densify which
-        # somehow escapes its own `finally` holds the lock for the life of the
-        # process; the `finally` is what stops that.
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-        return False
+        # Deliberately NOT treating our own pid as stale: that would let a
+        # second lock object in the same process steal the first one's, which
+        # defeats the point. The probe is the store's own, because
+        # the signal-based probe is a console-signal call on Windows and reports a
+        # freshly dead process as still alive -- which would strand the lock
+        # for good.
+        return not _pid_is_running(pid)
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -669,31 +673,36 @@ def densify(
         _status(root, state=STATE_UNAVAILABLE, detail=detail)
         return DenseResult(state=STATE_UNAVAILABLE, detail=detail)
 
-    solution = load_solution(store, world_id, session_id)
-    if solution is None:
-        _status(root, state=STATE_UNAVAILABLE, detail="no global solution for this session")
-        return DenseResult(state=STATE_UNAVAILABLE,
-                           detail="no global solution for this session")
-
-    session = store.read_session(world_id, session_id)
-    intrinsics = session.intrinsics
-    if intrinsics is None or getattr(intrinsics, "fx", None) is None:
-        _status(root, state=STATE_UNAVAILABLE, detail="session has no intrinsics")
-        return DenseResult(state=STATE_UNAVAILABLE, detail="session has no intrinsics")
-
-    world = store.read_world(world_id)
-    scale = getattr(world, "scale", None) or {"state": "unknown", "meters_per_unit": None}
-    if hasattr(scale, "to_json_dict"):
-        scale = scale.to_json_dict()
-    scale = dict(scale)
-    scale["note"] = ("inherited unchanged from the sparse solve; the dense stage "
-                     "makes no new scale claim")
-
-    digest = solution.input_digest
-    _status(root, state=STATE_RUNNING, stage=STAGE_DEPTH, input_digest=digest,
-            params=params.as_dict())
-
+    # From here to the `finally` at the end, every exit path is inside the
+    # lock. The three "unavailable" returns below used to sit OUTSIDE it, so
+    # densifying a session with no solve -- the most ordinary failure there is
+    # -- left the lock file behind and bricked that session permanently.
     try:
+        solution = load_solution(store, world_id, session_id)
+        if solution is None:
+            _status(root, state=STATE_UNAVAILABLE,
+                    detail="no global solution for this session")
+            return DenseResult(state=STATE_UNAVAILABLE,
+                               detail="no global solution for this session")
+
+        session = store.read_session(world_id, session_id)
+        intrinsics = session.intrinsics
+        if intrinsics is None or getattr(intrinsics, "fx", None) is None:
+            _status(root, state=STATE_UNAVAILABLE, detail="session has no intrinsics")
+            return DenseResult(state=STATE_UNAVAILABLE, detail="session has no intrinsics")
+
+        world = store.read_world(world_id)
+        scale = getattr(world, "scale", None) or {"state": "unknown", "meters_per_unit": None}
+        if hasattr(scale, "to_json_dict"):
+            scale = scale.to_json_dict()
+        scale = dict(scale)
+        scale["note"] = ("inherited unchanged from the sparse solve; the dense stage "
+                         "makes no new scale claim")
+
+        digest = solution.input_digest
+        _status(root, state=STATE_RUNNING, stage=STAGE_DEPTH, input_digest=digest,
+                params=params.as_dict())
+
         align_path = root / "align.json"
         align = None
         if align_path.exists() and not force:

@@ -967,3 +967,39 @@ def test_every_registered_backend_declares_a_kind_the_pipeline_understands():
         b = make_backend(name)
         assert b.kind in {"disparity", "depth"}, name
         assert "NC" not in b.licence and "NonCommercial" not in b.licence, name
+
+
+def test_a_session_with_no_solve_does_not_leave_its_lock_behind(tmp_path):
+    """The most ordinary failure there is. The early `unavailable` returns used
+    to sit outside the lock's finally, so densifying a session with no solve
+    bricked that session permanently -- every later attempt refused with
+    "another densify is already running"."""
+    from tower.world_builder.dense_pipeline import densify, dense_dir
+    from tower.world_builder.records import Session, World
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    store.write_world(World(world_id="w1", created_at=1.0, updated_at=1.0,
+                            session_ids=("s1",)))
+    store.write_session(Session(session_id="s1", world_id="w1", started_at=1.0))
+
+    first = densify(store, "w1", "s1")
+    assert first.state == "unavailable"
+    assert not (dense_dir(store, "w1", "s1") / ".densify.lock").exists()
+
+    # and a second attempt reaches the same honest answer rather than the lock
+    second = densify(store, "w1", "s1")
+    assert second.state == "unavailable"
+    assert "solution" in (second.detail or "")
+
+
+def test_liveness_uses_the_stores_probe_not_os_kill():
+    """os.kill(pid, 0) is a console-signal call on Windows and reported a
+    freshly dead process as still alive in testing, which strands a lock."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    assert "os.kill" not in inspect.getsource(dense_pipeline._DenseLock)
+    assert "os.kill" not in inspect.getsource(dense_pipeline.status_is_stale)
+    assert "_pid_is_running" in inspect.getsource(dense_pipeline._DenseLock._stale)
