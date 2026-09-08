@@ -403,7 +403,7 @@ build, run, test or serve a world.
 apart from copying two worlds into a scratch root for testing. The 97 source
 captures are byte-identical to how they started.
 
-## 11. What still requires physical validation
+## 13. What still requires physical validation
 
 - **Nothing on iOS was compiled or run.** There is no Mac in this environment.
   No Swift file was changed, and the integration is deliberately arranged so
@@ -415,3 +415,41 @@ captures are byte-identical to how they started.
   the same code.
 - The hard-stop skip path is implemented and reasoned about but was not
   exercised by actually killing a live session mid-finalization.
+- **The dense stage is not wired into the served product.** `main.py` never
+  passes `--densify` and no setting turns it on, so a capture through the Tower
+  produces a solved world and no dense artifact until somebody runs
+  `scripts/world_densify.py`. That is a deliberate state -- the stage is
+  additive and optional by design -- but it means "a wearer's capture becomes a
+  dense world by itself" has never happened and is one config flag away from
+  being true.
+
+## 14. The state this lane is being left in
+
+**Branch** `world-builder/dense-reconstruction-v1`, 50-plus commits on top of
+`integration/all-cartridges-v1`. **Not merged, and merging is not recommended
+without a fresh review** -- the branch moved substantially after the last one.
+
+**What works, measured, on eight worlds:** a dense reconstruction anchored to
+the sparse solve, 2.3-5.4% median depth error at held-out cameras, 60-98% pixel
+coverage, served to a phone as a self-contained WebGL page at 41-72 fps with
+orbit, pan, fly and per-capture-spot navigation. Every number has an
+`eval.json` beside the artifact it describes.
+
+**What two independent adversarial reviews changed:** the first found nine
+defects and one blocker; the second found fifteen more, including that the
+budget thinner was delivering 2.7% of the phone's budget and that the privacy
+check verified a redactor existed rather than that a redaction happened. Both
+sets are fixed and each has a test that fails without the fix. A third review
+should be run against a frozen branch, because neither of the first two was.
+
+**What an independent visual reviewer changed:** two claims that looked
+devastating -- that the reconstruction shows a different room from a capture
+pose, and that the large smooth surfaces are invented -- were both measured and
+both turned out to be something else (§11.5, §11.6). One claim survived and is
+the real limitation: **the enclosure is incomplete.**
+
+**The single most valuable next measurement** is the one that would close it.
+`neighbours` is the only consensus parameter with no measurement behind it, and
+it is the only lever that can add coverage without weakening the rule: raising
+it searches more cameras for witnesses that already meet the bar, rather than
+lowering the bar. `scripts/neighbours_sweep.sh` is written and ready to run.
