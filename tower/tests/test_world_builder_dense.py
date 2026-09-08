@@ -875,3 +875,16 @@ def test_the_config_cannot_break_out_of_the_script_tag(tmp_path):
     assert "</script><img" not in page
     assert "u003c/script" in page
     assert page.count("</script>") == page.count("<script>")
+
+
+def test_a_cached_depth_stage_is_not_reused_across_a_backend_change():
+    """Reusing depth maps from a different network while the manifest records
+    the new one makes the artifact unreproducible from its own params -- and
+    everything still runs, so nothing says so."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    src = inspect.getsource(dense_pipeline.densify)
+    assert "same_backend" in src
+    assert 'cached.get("backend")' in src

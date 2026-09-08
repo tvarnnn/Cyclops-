@@ -665,9 +665,23 @@ def densify(
         if align_path.exists() and not force:
             try:
                 cached = json.loads(align_path.read_text())
-                if cached.get("digest") in (None, digest) and cached.get("stopped_after") is None:
+                # The depth stage is only reusable if it was produced from the
+                # same solve AND by the same network. Reusing depth maps from a
+                # different backend while the manifest records the new one
+                # would make the artifact unreproducible from its own params --
+                # the most expensive kind of wrong, because everything still
+                # runs and the numbers still look reasonable.
+                same_solve = cached.get("digest") in (None, digest)
+                same_backend = cached.get("backend") in (None, params.backend)
+                if same_solve and same_backend and cached.get("stopped_after") is None:
                     align = cached
                     logger.info("[Tower][WorldBuilder][dense] reusing depth stage")
+                elif not same_backend:
+                    logger.info(
+                        "[Tower][WorldBuilder][dense] depth stage was run with %s, "
+                        "now asked for %s: recomputing",
+                        cached.get("backend"), params.backend,
+                    )
             except (OSError, ValueError):
                 align = None
         if align is None:
