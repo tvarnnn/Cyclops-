@@ -103,14 +103,14 @@
     "precision highp float;",
     "attribute vec3 aPos; attribute vec3 aCol; attribute float aConf;",
     "uniform mat4 uMVP; uniform float uSize; uniform float uMinConf; uniform float uByConf;",
-    "uniform float uMaxConf;",
+    "uniform float uMaxConf; uniform float uSizeCap;",
     "varying vec3 vCol; varying float vDrop;",
     "void main(){",
     "  vDrop = aConf < uMinConf ? 1.0 : 0.0;",
     "  vec4 p = uMVP * vec4(aPos,1.0);",
     "  gl_Position = p;",
     // Scale with 1/w so points do not turn into confetti as you approach.
-    "  gl_PointSize = max(1.0, uSize * 2.0 / max(p.w, 0.05));",
+    "  gl_PointSize = clamp(uSize * 2.0 / max(p.w, 0.05), 1.0, uSizeCap);",
     "  float t = clamp(aConf/uMaxConf, 0.0, 1.0);",
     "  vec3 heat = vec3(0.15+0.85*t, 0.35*t+0.1, 1.0-0.85*t);",
     "  vCol = mix(aCol/255.0, heat, uByConf);",
@@ -154,7 +154,17 @@
       uSize = gl.getUniformLocation(prog, "uSize"),
       uMinConf = gl.getUniformLocation(prog, "uMinConf"),
       uByConf = gl.getUniformLocation(prog, "uByConf"),
-      uMaxConf = gl.getUniformLocation(prog, "uMaxConf");
+      uMaxConf = gl.getUniformLocation(prog, "uMaxConf"),
+      uSizeCap = gl.getUniformLocation(prog, "uSizeCap");
+  // GLES clamps gl_PointSize to a driver-reported range, and the cap on a
+  // phone is often far lower than on desktop -- 64 where Chrome allows 1024.
+  // Writing past it is undefined rather than merely ignored, so the shader is
+  // told the real limit instead of discovering it.
+  var sizeCap = 64;
+  try {
+    var range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+    if (range && range.length === 2 && range[1] > 1) sizeCap = range[1];
+  } catch (e) { /* keep the conservative default */ }
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.055, 0.059, 0.071, 1);
 
@@ -346,6 +356,7 @@
     gl.uniform1f(uMinConf, parseFloat(elConf.value));
     gl.uniform1f(uByConf, byConf ? 1 : 0);
     gl.uniform1f(uMaxConf, Math.max(1, cr[1]));
+    gl.uniform1f(uSizeCap, sizeCap);
     gl.drawArrays(gl.POINTS, 0, N);
     elStat.textContent =
       N.toLocaleString() + " points · level " + CONFIG.level + " · " +
