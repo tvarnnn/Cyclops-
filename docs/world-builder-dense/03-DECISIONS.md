@@ -561,6 +561,152 @@ it, is to gauge on `max(median_depth * k, extent * j)` and to re-measure the
 whole corpus rather than assume the ratio holds -- which is the same mistake in
 a new place if it is not measured.
 
+---
+
+## D19. Live progressive reconstruction: the sparse world goes live, the dense world stays at Stop
+
+**The question.** Could the reconstruction appear while the wearer is still
+walking, so that Stop is not the first moment a 3-D world exists? Four
+independent investigations answered it: a technique survey of the online
+reconstruction field, an audit of which stages of this pipeline are actually
+incremental, an analysis of what the iOS client and the transport can carry,
+and an adversarial reviewer briefed to argue against. Reports 16-19.
+
+**The answer in one line: most of it already ships, the expensive half should
+not, and the missing piece is a rendering and a criterion rather than a
+technique.**
+
+### What was already true before anyone started
+
+The audit found this and it reframes the question. A global solve **already runs
+during the walk**, every 50 accepted keyframes; `engine.build()` rewrites the
+derived tree **every 4 keyframes**; the status snapshot carries
+`geometry.revision` on a 0.5 s poll; and the phone already refetches only the
+segments whose `content_hash` or `placement_hash` moved. Segments visibly snap
+together mid-walk today. What the wearer sees while this happens is a **2-D
+top-down canvas**. The 3-D viewer is a one-shot page for saved worlds.
+
+So "Stop is the first moment a meaningful world exists" was not accurate. Stop
+is the first moment a **3-D** world exists.
+
+### Why the dense stage does not move into the walk
+
+Not because it is too slow. Measured against real capture durations rather than
+replay clocks -- `proto/live_budget.py`, and this correction mattered, because
+one investigation divided by the replay clock and overstated the load by 2.3 to
+3.6x:
+
+| world | keyframes/s of walking | depth | fuse | together | together with `da3mono-large` |
+| --- | --- | --- | --- | --- | --- |
+| `7d31e8d7` | 2.18 | 0.50x | 0.59x | **1.09x** | **0.77x** |
+| `1b8812b1` | 2.22 | 0.51x | 0.51x | **1.02x** | **0.70x** |
+| `a378331a` | 1.27 | 0.28x | 0.25x | **0.53x** | **0.35x** |
+| `37e497f8` | 1.26 | 0.29x | 0.28x | **0.57x** | **0.38x** |
+| `fc58a64d` | 1.25 | 0.28x | 0.38x | **0.66x** | **0.48x** |
+
+Seconds of work per second of walking. **Both expensive stages could keep up**,
+and with the cheaper backend D15 keeps registered they keep up comfortably. The
+consensus rule survives causality too: restricted to cameras that already
+existed, 47-59% of today's points survive at the capturing instant, and choosing
+the ten nearest EARLIER cameras recovers 69-88% of the final yield, with a
+median wait of 2 keyframes -- about 0.17 s. The affine fit's support is already
+94% causal, and the depth network takes an image and nothing else, so its output
+is final the moment a keyframe is accepted.
+
+Three things stop it anyway, and only the third is fatal.
+
+**The GPU is shared and the contention penalty is measured.** MoGe-2 costs 145 ms
+on a quiet card and **761 ms median with a 5,251 ms p90** when another job is on
+the same device -- 5x on the median, 36x on the tail, from this lane's own
+bake-off. Four other cartridges use that card. A live loop with a GPU deadline
+is a promise this machine cannot keep, and the failure would be blamed on
+whichever cartridge noticed first.
+
+**The gauge is the genuinely batch part.** `median_scene_depth` on a prefix of a
+three-room walk is **+352% wrong at 10% of the walk** and still +104% at half of
+it; the far clip swings -95% to +132% between consecutive checkpoints. Every
+voxel size derives from it, and `run_pack_stage` discards points outside a
+percentile box that a later gauge would keep. A live ladder means repeated
+rebuilds, and it is only affordable if the per-point accumulator is retained --
+which is exactly what `prune_intermediates` deletes.
+
+**And the pre-solve geometry is not a room.** This is the fatal one, and this
+system has already measured it on itself. `bundle.py` records the live
+incremental backend drifting **18.2% of path length by 40 keyframes** on
+synthetic data with nothing going wrong, with the recovered scale collapsing
+3.1x over the same span. On the real 438-keyframe walk the forward chain
+produced **34 segments**, one of which loses a factor of ten of scale along its
+own length, and gluing them pairwise placed 58 keyframes in a common frame. The
+same keyframes through GLOMAP: 428 of 438, one component, 0.84 px.
+
+Walks average **34 segments and the largest holds 13.6% of one**. Assembling
+them without a solve would not invent a chair. It would invent the floor plan,
+which is the thing every honest chair hangs on -- and the rule this lane is held
+to says an honest hole beats a convincing invention.
+
+### What the field offers, and why almost none of it is available
+
+The survey is worth reading for the disqualifications, because they are not
+about quality. This machine has **no Visual Studio and no MSVC**, and a CUDA
+11.8 toolkit against an `sm_120` card. Nothing that compiles a CUDA or C++
+extension can be installed, and no published wheel matches this
+Python/torch/CUDA combination. That removes DROID-SLAM, DPVO/DPV-SLAM, every
+online Gaussian-splatting system (the only permissive rasteriser JIT-compiles
+and disables itself without a toolkit; the newest Windows wheel is Python 3.10
+and CUDA 12.4), nvblox, which does not support Windows at all, and Open3D's GPU
+path, whose Windows CUDA wheel has not shipped. Of what remains, the classical
+SLAM systems are GPLv3, the good fusion systems are non-commercial, and every
+confirmed streaming pointmap model but one is CC-BY-NC -- including several
+whose permissive top-level licence sits on a non-commercial CUDA core, which a
+repository-level scan does not catch.
+
+There is also no IMU and no shutter-accurate timestamp, which removes every
+visual-inertial system and with it the entire published route to metric scale.
+And the camera has a rolling shutter, which the direct-VO family explicitly
+warns against. **The shipped design sidesteps that last one for free**: global
+SfM over parallax-selected keyframes never assumes a rigid instantaneous
+projection, it just refuses the bad frames. That is an unremarked advantage of
+what is already here over every live alternative.
+
+### The decision
+
+**Nothing about the dense stage changes.** It stays at Stop, unchanged, and the
+saved world keeps the quality this lane measured. That is the load-bearing half
+of the answer: the reconstruction people will look at is not made worse.
+
+**The live half is a cadence and a rendering, not a technique.** The pieces are
+already built: frozen segments in local frames, mutable Sim3 placements, a
+manifest diff the phone already honours, a `--solve-every` flag that already
+exists, and a contract that already says *"loop closure moves placements rather
+than points"*. Re-running the existing solve on the existing persistent feature
+database costs **zero VRAM and under 2 GB of RAM**, entirely on the CPU, and
+gives a genuinely bundle-adjusted world every 15-60 s of walking -- three to
+eight real updates per walk, each one a solve rather than an estimate.
+
+**The one thing that must be added is honesty about motion.** A re-placed
+segment is geometrically correct and perceptually a teleport. Before any of this
+reaches a wearer, measure how far segments actually move between successive
+solves, and gate what is shown on a *settled* threshold derived from that
+measurement rather than guessed. Apple's answer to the identical problem is
+instructive: while tracking is relocalising, ARKit withholds plane anchors and
+hit-test results entirely, and its guidance is to show content only once
+tracking returns to normal. Showing nothing beats showing something about to
+jump.
+
+That measurement is `reports/20-segment-settling.md`, and the criterion is not
+committed to until its numbers are in.
+
+### What is explicitly NOT decided here
+
+Live depth precompute is the one tempting middle path: the network is
+future-independent, its output is final at capture, and caching it would remove
+0.21-0.30 s per keyframe from the wait at Stop -- about 95 s of the desk world's
+230. It is not adopted, because it buys latency the wearer does not experience
+(the dense stage already runs after the world is released and reports `ready`
+throughout) at the cost of the one contended resource the survey says to keep
+clear. It is written down here so the next person does not have to rediscover
+that it is arithmetically fine and strategically wrong.
+
 ## Open, being decided by measurement
 
 Two of the three questions this section opened with have been answered by
