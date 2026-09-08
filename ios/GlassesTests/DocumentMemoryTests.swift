@@ -475,8 +475,13 @@ enum DocumentFixtures {
         document["summary_is_verbatim_excerpt"] = true
         document["summary_is_model_output"] = true
         document["word_count"] = 8
-        payload["document"] = document
-        payload["pages"] = [[
+        // Nested inside the document, which is where the Tower puts it:
+        // `payload["document"] = dict(_summary_view(...), pages=[...])`.
+        // This fixture used to set `payload["pages"]` at the top level, which
+        // no Tower has ever sent -- it was written to match the decoder, and
+        // the decoder was reading the wrong level, so the two agreed and the
+        // page text never arrived on a device.
+        document["pages"] = [[
             "page_index": 0,
             // Empty text with zero regions is the readable-nothing case, which
             // is a real answer and not a missing page.
@@ -494,6 +499,7 @@ enum DocumentFixtures {
             "image_kept": false,
             "image_served": false,
         ]]
+        payload["document"] = document
         payload["coverage"] = [
             "pages_observed": 1,
             "pages_total": NSNull(),
@@ -796,6 +802,38 @@ final class DocumentFieldTests: XCTestCase {
         XCTAssertEqual(response.pages[0].observationCount, 2)
         XCTAssertNil(response.coverage?.pagesTotal)
         XCTAssertNotNil(response.coverage?.pagesTotalNote)
+    }
+
+    /// Pages are read from inside the document, and nowhere else.
+    ///
+    /// The Tower builds the single-document payload as
+    /// `payload["document"] = dict(_summary_view(...), pages=[...])`, and its
+    /// own wire test asserts `payload["document"]["pages"][0]["text"]`. This
+    /// decoder read `payload["pages"]`, a level up, where no Tower has ever
+    /// put it -- so `pages` was always empty on a device and the page text,
+    /// the only thing `GET /documents/{id}` exists to carry, never arrived.
+    ///
+    /// It survived because the fixture had been written to match the decoder
+    /// rather than the Tower: both were wrong in the same direction, so the
+    /// test agreed with the bug. This one fails in both directions -- a
+    /// top-level `pages` must be ignored, and a nested one must be read.
+    func testPagesAreReadFromInsideTheDocumentAndNotFromTheTopLevel() throws {
+        // The shape the Tower has never sent must yield nothing.
+        var topLevelOnly = DocumentFixtures.recent
+        topLevelOnly["answer"] = "matched"
+        topLevelOnly["query"] = ["kind": "document", "document_id": "doc-1"]
+        topLevelOnly["document"] = DocumentFixtures.record
+        topLevelOnly["pages"] = [["page_index": 0, "text": "top level", "text_source": "ocr"]]
+        let wrong = try XCTUnwrap(DocumentMemoryDecoder.library(from: topLevelOnly))
+        XCTAssertTrue(
+            wrong.pages.isEmpty,
+            "a page beside the document is not a page the Tower sent"
+        )
+
+        // The shape the Tower does send must be read.
+        let right = try XCTUnwrap(DocumentMemoryDecoder.library(from: DocumentFixtures.oneDocument))
+        XCTAssertEqual(right.pages.count, 1)
+        XCTAssertEqual(right.pages[0].pageIndex, 0)
     }
 
     /// A duration from an assumed frame interval is a **reconstruction** and
@@ -1145,6 +1183,104 @@ final class DocumentSessionTests: XCTestCase {
             camera.stops, 1,
             "Stop after a cartridge switch must still stop the camera this app started"
         )
+        XCTAssertFalse(claim.startedByThisApp)
+    }
+
+    /// A capture this screen started, ended by somebody else, is no longer
+    /// this screen's to stop.
+    ///
+    /// The claim outliving the view model is what
+    /// `testTheCameraClaimSurvivesACartridgeSwitch` fixed, and it is right.
+    /// But a fact that survives a cartridge switch also survives the capture
+    /// it describes, and nothing was dropping it. `captureClaimUpdates` was
+    /// subscribed only to re-render the note:
+    ///
+    ///     .sink { [weak self] _ in self?.updateCameraNote() }
+    ///
+    /// So: Start here, walk to CV Lab or Home, press Stop camera there, press
+    /// Start camera there again, and come back. The claim still says this
+    /// screen started the capture, because the only thing that ever cleared
+    /// it was this screen's own Stop. Two things then go wrong, and the
+    /// second is the serious one:
+    ///
+    /// 1. `cameraNote` is `nil` at `.running` when `startedTheCamera` — so
+    ///    the panel silently claims a capture it does not own, rather than
+    ///    saying "The camera is streaming from another screen".
+    /// 2. Stop calls `stopCameraSession()` on a capture another screen
+    ///    started.
+    ///
+    /// `ObjectMemoryRecordingCoordinator.cameraClaimChanged` has dropped
+    /// ownership on `.unclaimed` since it shipped, with a comment naming this
+    /// exact failure. Document Memory is documented as "Modelled on
+    /// `ObjectMemoryRecordingCoordinator`" and copied the branch structure
+    /// without the invalidation.
+    func testACaptureEndedElsewhereIsNoLongerThisScreensToStop() async {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+        let model = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+
+        model.send(.start)
+        XCTAssertEqual(camera.starts, 1)
+        XCTAssertTrue(claim.startedByThisApp)
+
+        // Stopped from another screen -- Home, or the CV Lab's camera card.
+        // `captureClaimUpdates` is delivered with `.receive(on: .main)`, so
+        // the drop lands on the next main-queue turn rather than inside
+        // `publish`. Awaited exactly as Object Memory's sibling test does.
+        camera.publish(.unclaimed)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(
+            claim.startedByThisApp,
+            "a capture that ended is not still this screen's to stop"
+        )
+
+        // Started again from that other screen. This screen did not do it.
+        camera.publish(.running)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(
+            claim.startedByThisApp,
+            "somebody else's capture must not be adopted by this screen"
+        )
+        XCTAssertEqual(
+            model.cameraNote,
+            "The camera is streaming from another screen; the recorder reads those frames.",
+            "the panel must not claim a capture it did not start"
+        )
+
+        // And Stop leaves it alone.
+        model.send(.stop)
+        XCTAssertEqual(
+            camera.stops, 0,
+            "Stop must not end a capture another screen started"
+        )
+    }
+
+    /// The wearer's own Stop still works, which is what stops the fix above
+    /// from being "never stop anything".
+    ///
+    /// `stopCameraSession()` moves the fake's claim to `.unclaimed` but does
+    /// not publish it, exactly as a real Stop is observed a beat later. The
+    /// ordering matters: the branch reads `startedTheCamera` before the
+    /// publication that clears it, so a claim dropped on `.unclaimed` must
+    /// not make this screen's own Stop a no-op.
+    func testThisScreensOwnStopStillStopsTheCameraItStarted() {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+        let model = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+
+        model.send(.start)
+        XCTAssertTrue(claim.startedByThisApp)
+
+        model.send(.stop)
+        XCTAssertEqual(camera.stops, 1, "this screen's Stop still stops its own capture")
+        XCTAssertFalse(claim.startedByThisApp)
+
+        // The claim change arrives afterwards, as it does on a device.
+        camera.publish(.unclaimed)
         XCTAssertFalse(claim.startedByThisApp)
     }
 

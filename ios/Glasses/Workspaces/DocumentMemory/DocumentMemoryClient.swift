@@ -677,8 +677,34 @@ final class DocumentMemoryViewModel: ObservableObject {
 
         camera?.captureClaimUpdates
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.updateCameraNote() }
+            .sink { [weak self] claim in self?.cameraClaimChanged(claim) }
             .store(in: &cancellables)
+        updateCameraNote()
+    }
+
+    /// The camera's claim changed underneath this screen.
+    ///
+    /// Ownership is dropped when the capture ends, whoever ended it — the
+    /// same rule, for the same reason, as
+    /// `ObjectMemoryRecordingCoordinator.cameraClaimChanged`. This type is
+    /// documented as "Modelled on `ObjectMemoryRecordingCoordinator`" and
+    /// copied the branch structure of `send(_:)` without this half of it.
+    ///
+    /// The memory of having started the camera now lives on a
+    /// `CartridgeCameraClaim` that `ProjectManager` owns, so that a cartridge
+    /// switch cannot lose it and strand a running capture. That is right, and
+    /// it is exactly what makes dropping it here necessary rather than
+    /// optional: a fact that outlives the screen also outlives the capture it
+    /// describes. Without this, a Stop pressed on Home followed by a Start
+    /// pressed on Home leaves this screen believing it owns a capture it
+    /// never started — so `cameraNote` goes quiet where it should say the
+    /// camera belongs to another screen, and Stop reaches for
+    /// `stopCameraSession()` on somebody else's session.
+    ///
+    /// This screen's own Stop is unaffected: it reads the flag and clears it
+    /// in the same turn, before the `.unclaimed` that follows arrives here.
+    private func cameraClaimChanged(_ claim: CaptureClaim) {
+        if claim == .unclaimed { startedTheCamera = false }
         updateCameraNote()
     }
 
