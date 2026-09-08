@@ -433,13 +433,13 @@ captures are byte-identical to how they started.
   the same code.
 - The hard-stop skip path is implemented and reasoned about but was not
   exercised by actually killing a live session mid-finalization.
-- **The dense stage is not wired into the served product.** `main.py` never
-  passes `--densify` and no setting turns it on, so a capture through the Tower
-  produces a solved world and no dense artifact until somebody runs
-  `scripts/world_densify.py`. That is a deliberate state -- the stage is
-  additive and optional by design -- but it means "a wearer's capture becomes a
-  dense world by itself" has never happened and is one config flag away from
-  being true.
+- **A capture has never produced a dense world by itself.** It now CAN:
+  `TOWER_WORLD_DENSIFY=true` makes the Tower pass `--densify` to every builder
+  it spawns, and the setting is verified to reach the child's argv. But the
+  default is off, deliberately -- 2.4 GB of VRAM and minutes of GPU per world
+  on a shared card -- so nobody has yet run a live capture with it on, and the
+  path from "wearer stops walking" to "dense world exists without anyone typing
+  a command" is implemented and unexercised.
 
 ## 14. The state this lane is being left in
 
