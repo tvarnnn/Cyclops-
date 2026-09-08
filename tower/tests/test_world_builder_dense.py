@@ -568,3 +568,164 @@ def test_a_manifest_with_an_unknown_format_is_ignored_rather_than_guessed_at(tmp
             return tmp_path / world_id
 
     assert _dense_summary(_S(), "w", "s") is None
+
+
+# ---------------------------------------------------------------------------
+# the orchestrator's refusals
+#
+# Every one of these is a world that legitimately cannot be densified. None of
+# them may raise, because this runs inside a capture's finalization: a dense
+# stage that threw would turn "no dense reconstruction" into "the session ended
+# badly", and the sparse world is complete and correct either way.
+# ---------------------------------------------------------------------------
+
+
+def test_densify_reports_unavailable_when_there_is_no_global_solve(tmp_path):
+    from tower.world_builder.dense_pipeline import densify
+    from tower.world_builder.records import Session, World
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    store.write_world(World(world_id="w1", created_at=1.0, updated_at=1.0,
+                            session_ids=("s1",)))
+    store.write_session(Session(session_id="s1", world_id="w1", started_at=1.0))
+
+    result = densify(store, "w1", "s1")
+    assert result.state == "unavailable"
+    assert "solution" in (result.detail or "")
+    # and it says so on disk, so an operator can see it without a live session
+    status = json.loads((tmp_path / "worlds" / "w1" / "dense" / "s1" / "status.json").read_text())
+    assert status["state"] == "unavailable"
+
+
+def test_densify_writes_its_status_where_a_cold_reader_can_find_it(tmp_path):
+    from tower.world_builder.dense_pipeline import dense_dir
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    d = dense_dir(store, "w1", "s1")
+    # Beside solve/, never inside derived/: derived is the published output the
+    # store digests and serves, and a reader that does not know about dense/
+    # must be able to ignore it exactly as it ignores solve/.
+    assert d.parent.name == "dense"
+    assert "derived" not in d.parts
+
+
+def test_read_dense_manifest_survives_a_truncated_file(tmp_path):
+    """A manifest half-written by an interrupted run must read as absent."""
+    from tower.world_builder.dense_pipeline import read_dense_manifest
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    d = tmp_path / "worlds" / "w1" / "dense" / "s1"
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text('{"format": "wb-dense-poi')
+    assert read_dense_manifest(store, "w1", "s1") is None
+
+
+# ---------------------------------------------------------------------------
+# serving it: the page carries its own points, because fetch is blocked
+# ---------------------------------------------------------------------------
+
+
+def _fake_dense(tmp_path, n=1000, conf=None):
+    """A world with a dense artifact on disk, and the store that reads it."""
+    from tower.world_builder.dense import write_points_bin
+    from tower.world_builder.store import WorldStore
+
+    rng = np.random.default_rng(21)
+    X = rng.uniform(-2, 2, size=(n, 3)).astype(np.float32)
+    C = rng.integers(0, 256, size=(n, 3)).astype(np.uint8)
+    F = (rng.integers(2, 12, size=n) if conf is None else conf).astype(np.uint8)
+    d = tmp_path / "worlds" / "w1" / "dense" / "s1"
+    d.mkdir(parents=True)
+    size = write_points_bin(d / "points_l0.bin", X, C, F)
+    (d / "manifest.json").write_text(json.dumps({
+        "schema_version": 1, "format": DENSE_FORMAT, "stride_bytes": 16,
+        "canonical_level": 0, "mobile_level": 0,
+        "median_scene_depth": 3.0,
+        "bbox_min": X.min(0).tolist(), "bbox_max": X.max(0).tolist(),
+        "scale": {"state": "unknown", "meters_per_unit": None},
+        "levels": [{"level": 0, "voxel": 0.02, "points": n, "bytes": size}],
+    }))
+    return WorldStore(tmp_path), X, C, F
+
+
+def test_the_page_embeds_its_points_because_the_route_forbids_fetch(tmp_path):
+    """The render route sets `default-src 'none'` with no `connect-src`, so
+    fetch and XHR are blocked outright. A page that asked for its data would
+    show nothing, silently."""
+    from tower.world_builder.dense_render import build_dense_page
+
+    store, *_ = _fake_dense(tmp_path)
+    page = build_dense_page(store, "w1", "s1")
+    assert "__WB_POINTS_B64__" not in page and "__WB_CONFIG__" not in page
+    for forbidden in ("fetch(", "XMLHttpRequest", "<script src", "<link rel=\"stylesheet\"",
+                      "https://", "http://"):
+        assert forbidden not in page, f"the page reaches for {forbidden!r}"
+
+
+def test_the_page_is_thinned_by_confidence_not_at_random(tmp_path):
+    """When a level exceeds the byte budget the geometry several cameras agreed
+    on must survive and the weakest must go, so the picture gets sparser rather
+    than less trustworthy."""
+    from tower.world_builder.dense_render import build_dense_payload
+
+    n = 4000
+    conf = np.concatenate([np.full(n // 2, 2), np.full(n // 2, 9)])
+    store, *_ = _fake_dense(tmp_path, n=n, conf=conf)
+    raw, cfg, _ = build_dense_payload(store, "w1", "s1", budget_bytes=16 * (n // 2))
+    assert cfg["points"] == n // 2
+    kept = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 16)[:, 15]
+    assert kept.min() == 9                       # every survivor is well supported
+    assert cfg["thinned_to_confidence"] == 9
+
+
+def test_an_unthinned_level_says_so_rather_than_implying_a_cut(tmp_path):
+    from tower.world_builder.dense_render import build_dense_payload
+
+    store, *_ = _fake_dense(tmp_path, n=100)
+    _, cfg, _ = build_dense_payload(store, "w1", "s1")
+    assert cfg["thinned_to_confidence"] is None
+    assert cfg["points"] == 100
+
+
+def test_the_page_never_claims_metres_when_scale_is_unknown(tmp_path):
+    from tower.world_builder.dense_render import build_dense_page
+
+    store, *_ = _fake_dense(tmp_path)
+    page = build_dense_page(store, "w1", "s1")
+    assert "not metres" in page
+    assert '"state": "unknown"' in page or '"state":"unknown"' in page
+
+
+def test_the_viewer_does_not_assume_which_way_is_up(tmp_path):
+    """up_axis is `unknown` and the cameras are OpenCV's, y DOWN. A viewer that
+    assumed +y or +z was up would stand the room on its side."""
+    from tower.world_builder.dense_render import build_dense_payload
+
+    store, *_ = _fake_dense(tmp_path)
+    _, cfg, _ = build_dense_payload(store, "w1", "s1")
+    assert cfg["up_axis"] == "unknown"
+    assert cfg["screen_up"] == [0, -1, 0]
+
+
+def test_a_world_without_a_dense_artifact_is_refused_by_name(tmp_path):
+    from tower.world_builder.dense_render import DenseViewerUnavailable, build_dense_page
+    from tower.world_builder.store import WorldStore
+
+    with pytest.raises(DenseViewerUnavailable):
+        build_dense_page(WorldStore(tmp_path), "w1", "s1")
+
+
+def test_the_viewer_template_is_installed_beside_the_code():
+    """It is package data, not a build artifact: a Tower that can import the
+    module can serve the page."""
+    from tower.world_builder.dense_render import (
+        TOKEN_CONFIG, TOKEN_POINTS, viewer_template_path,
+    )
+
+    p = viewer_template_path()
+    assert p.exists()
+    text = p.read_text(encoding="utf-8")
+    assert TOKEN_CONFIG in text and TOKEN_POINTS in text

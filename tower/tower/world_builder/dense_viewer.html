@@ -1,0 +1,320 @@
+<!--
+  World Builder dense viewer.
+
+  One self-contained page. No external script, no external style, no font, no
+  image, no fetch: the route serves it under `default-src 'none'` with only
+  'unsafe-inline' for script and style, so anything fetched would be blocked.
+  The points arrive base64 inside this file and go straight into a GPU buffer.
+
+  Up on screen is -y. The world's up_axis is "unknown" and the cameras are
+  OpenCV's (x right, y DOWN, z forward), so assuming +y or +z is up would stand
+  the room on its side.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>World Builder — dense</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0e0f12; color:#e8eaed;
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    overflow:hidden; -webkit-text-size-adjust:100%; }
+  #gl { display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
+  #gl.drag { cursor:grabbing; }
+  #panel { position:fixed; top:0; left:0; right:0; padding:8px 10px;
+    background:linear-gradient(#0e0f12ee,#0e0f1200); pointer-events:none; }
+  #panel .row { pointer-events:auto; display:flex; flex-wrap:wrap; gap:10px;
+    align-items:center; margin-bottom:6px; }
+  label { display:flex; align-items:center; gap:5px; white-space:nowrap; }
+  input[type=range] { width:104px; }
+  button { background:#22252b; color:#e8eaed; border:1px solid #3a3f47;
+    border-radius:5px; padding:4px 9px; font:inherit; }
+  button[aria-pressed=true] { background:#2f6ee0; border-color:#2f6ee0; }
+  #stat { color:#9aa2ad; font-variant-numeric:tabular-nums; }
+  #note { position:fixed; left:10px; bottom:8px; color:#7d8590; max-width:80ch; }
+  #fail { position:fixed; inset:0; display:none; place-content:center;
+    padding:24px; text-align:center; }
+  #fail.on { display:grid; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="panel">
+  <div class="row">
+    <label>size <input id="size" type="range" min="1" max="12" step="0.5" value="3"></label>
+    <label>confidence &ge; <input id="conf" type="range" min="2" max="16" step="1" value="2">
+      <span id="confv">2</span></label>
+    <button id="bycolor" aria-pressed="false">colour by confidence</button>
+    <button id="fly" aria-pressed="false">fly (WASD)</button>
+    <button id="reset">reset view</button>
+  </div>
+  <div class="row"><span id="stat">loading…</span></div>
+</div>
+<div id="note"></div>
+<div id="fail"><div><h2>This view needs WebGL</h2><p id="failwhy"></p></div></div>
+<script>
+(function () {
+  "use strict";
+  var CONFIG = __WB_CONFIG__;
+  var B64 = "__WB_POINTS_B64__";
+
+  var fail = document.getElementById("fail"), failwhy = document.getElementById("failwhy");
+  function die(msg) { failwhy.textContent = msg; fail.className = "on"; }
+
+  // ---- decode -----------------------------------------------------------
+  var bytes;
+  try {
+    var bin = atob(B64), n = bin.length;
+    bytes = new Uint8Array(n);
+    for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+  } catch (e) { die("The point data could not be decoded."); return; }
+
+  var STRIDE = CONFIG.stride || 16;
+  if (bytes.byteLength % STRIDE !== 0 || bytes.byteLength / STRIDE !== CONFIG.points) {
+    // Loud, because a stride mismatch does not look like a parsing bug -- it
+    // shears the scene and reads as broken geometry.
+    die("Point buffer is " + bytes.byteLength + " bytes, which is not " +
+        CONFIG.points + " x " + STRIDE + ".");
+    return;
+  }
+  var N = CONFIG.points;
+  var dv = new DataView(bytes.buffer);
+  var pos = new Float32Array(N * 3), col = new Uint8Array(N * 3), cf = new Float32Array(N);
+  for (var k = 0; k < N; k++) {
+    var o = k * STRIDE;
+    pos[k*3] = dv.getFloat32(o, true);
+    pos[k*3+1] = dv.getFloat32(o+4, true);
+    pos[k*3+2] = dv.getFloat32(o+8, true);
+    col[k*3] = bytes[o+12]; col[k*3+1] = bytes[o+13]; col[k*3+2] = bytes[o+14];
+    cf[k] = bytes[o+15];
+  }
+
+  // ---- gl ---------------------------------------------------------------
+  var cv = document.getElementById("gl");
+  var gl = cv.getContext("webgl2", {antialias:false, alpha:false}) ||
+           cv.getContext("webgl", {antialias:false, alpha:false});
+  if (!gl) { die("This browser did not provide a WebGL context."); return; }
+
+  var VS = [
+    "precision highp float;",
+    "attribute vec3 aPos; attribute vec3 aCol; attribute float aConf;",
+    "uniform mat4 uMVP; uniform float uSize; uniform float uMinConf; uniform float uByConf;",
+    "uniform float uMaxConf;",
+    "varying vec3 vCol; varying float vDrop;",
+    "void main(){",
+    "  vDrop = aConf < uMinConf ? 1.0 : 0.0;",
+    "  vec4 p = uMVP * vec4(aPos,1.0);",
+    "  gl_Position = p;",
+    // Scale with 1/w so points do not turn into confetti as you approach.
+    "  gl_PointSize = max(1.0, uSize * 2.0 / max(p.w, 0.05));",
+    "  float t = clamp(aConf/uMaxConf, 0.0, 1.0);",
+    "  vec3 heat = vec3(0.15+0.85*t, 0.35*t+0.1, 1.0-0.85*t);",
+    "  vCol = mix(aCol/255.0, heat, uByConf);",
+    "}"
+  ].join("\n");
+  var FS = [
+    "precision mediump float; varying vec3 vCol; varying float vDrop;",
+    "void main(){ if (vDrop > 0.5) discard; gl_FragColor = vec4(vCol,1.0); }"
+  ].join("\n");
+
+  function sh(t, src) {
+    var s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+    return s;
+  }
+  var prog;
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+  } catch (e) { die("Shader compilation failed: " + e); return; }
+  gl.useProgram(prog);
+
+  function buf(data, size, name, type, norm) {
+    var b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    var loc = gl.getAttribLocation(prog, name);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, type, !!norm, 0, 0);
+  }
+  try {
+    buf(pos, 3, "aPos", gl.FLOAT, false);
+    buf(col, 3, "aCol", gl.UNSIGNED_BYTE, false);
+    buf(cf, 1, "aConf", gl.FLOAT, false);
+  } catch (e) { die("The GPU refused a buffer of " + N + " points."); return; }
+
+  var uMVP = gl.getUniformLocation(prog, "uMVP"),
+      uSize = gl.getUniformLocation(prog, "uSize"),
+      uMinConf = gl.getUniformLocation(prog, "uMinConf"),
+      uByConf = gl.getUniformLocation(prog, "uByConf"),
+      uMaxConf = gl.getUniformLocation(prog, "uMaxConf");
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0.055, 0.059, 0.071, 1);
+
+  // ---- camera -----------------------------------------------------------
+  var C = CONFIG.centre || [0,0,0];
+  var lo = CONFIG.bbox_min || [-1,-1,-1], hi = CONFIG.bbox_max || [1,1,1];
+  var span = Math.max(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) || 1;
+  var target, yaw, pitch, dist, flying = false;
+  function reset() {
+    target = [C[0], C[1], C[2]];
+    yaw = 0.6; pitch = 0.5; dist = span * 1.1;
+  }
+  reset();
+
+  function eyePos() {
+    return [
+      target[0] + dist * Math.cos(pitch) * Math.sin(yaw),
+      target[1] - dist * Math.sin(pitch),          // -y is up on screen
+      target[2] + dist * Math.cos(pitch) * Math.cos(yaw)
+    ];
+  }
+  function mvp(w, h) {
+    var e = eyePos();
+    var f = [target[0]-e[0], target[1]-e[1], target[2]-e[2]];
+    var fl = Math.hypot(f[0],f[1],f[2]) || 1; f = [f[0]/fl, f[1]/fl, f[2]/fl];
+    var up = [0,-1,0];
+    var s = [f[1]*up[2]-f[2]*up[1], f[2]*up[0]-f[0]*up[2], f[0]*up[1]-f[1]*up[0]];
+    var sl = Math.hypot(s[0],s[1],s[2]) || 1; s = [s[0]/sl, s[1]/sl, s[2]/sl];
+    var u = [s[1]*f[2]-s[2]*f[1], s[2]*f[0]-s[0]*f[2], s[0]*f[1]-s[1]*f[0]];
+    var V = [ s[0],u[0],-f[0],0,  s[1],u[1],-f[1],0,  s[2],u[2],-f[2],0,
+      -(s[0]*e[0]+s[1]*e[1]+s[2]*e[2]),
+      -(u[0]*e[0]+u[1]*e[1]+u[2]*e[2]),
+       (f[0]*e[0]+f[1]*e[1]+f[2]*e[2]), 1 ];
+    var fov = 1.05, near = Math.max(span*0.0008, 1e-4), far = span*24;
+    var t = 1/Math.tan(fov/2), a = w/h;
+    var P = [t/a,0,0,0, 0,t,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0];
+    var M = new Float32Array(16);
+    for (var r=0;r<4;r++) for (var c2=0;c2<4;c2++) {
+      var v=0; for (var i2=0;i2<4;i2++) v += V[i2*4+r]*P[c2*4+i2];
+      M[c2*4+r]=v;
+    }
+    return M;
+  }
+
+  // ---- input ------------------------------------------------------------
+  var drag=null, keys={};
+  function down(x,y,btn){ drag={x:x,y:y,btn:btn}; cv.className="drag"; }
+  function move(x,y,shift){
+    if(!drag) return;
+    var dx=x-drag.x, dy=y-drag.y; drag.x=x; drag.y=y;
+    if(drag.btn===2||shift){
+      var e=eyePos(), f=[target[0]-e[0],target[1]-e[1],target[2]-e[2]];
+      var fl=Math.hypot(f[0],f[1],f[2])||1; f=[f[0]/fl,f[1]/fl,f[2]/fl];
+      var up=[0,-1,0];
+      var s=[f[1]*up[2]-f[2]*up[1],f[2]*up[0]-f[0]*up[2],f[0]*up[1]-f[1]*up[0]];
+      var sl=Math.hypot(s[0],s[1],s[2])||1; s=[s[0]/sl,s[1]/sl,s[2]/sl];
+      var u=[s[1]*f[2]-s[2]*f[1],s[2]*f[0]-s[0]*f[2],s[0]*f[1]-s[1]*f[0]];
+      var k2=dist*0.0016;
+      for(var i=0;i<3;i++) target[i] += -s[i]*dx*k2 + u[i]*dy*k2;
+    } else { yaw -= dx*0.006; pitch = Math.max(-1.5, Math.min(1.5, pitch - dy*0.006)); }
+  }
+  function up_(){ drag=null; cv.className=""; }
+  cv.addEventListener("mousedown", function(e){ down(e.clientX,e.clientY,e.button); });
+  window.addEventListener("mousemove", function(e){ move(e.clientX,e.clientY,e.shiftKey); });
+  window.addEventListener("mouseup", up_);
+  cv.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+  cv.addEventListener("wheel", function(e){
+    e.preventDefault(); dist *= Math.exp(e.deltaY*0.0012);
+    dist = Math.max(span*0.002, Math.min(span*12, dist));
+  }, {passive:false});
+  var pinch=null;
+  cv.addEventListener("touchstart", function(e){
+    if(e.touches.length===1) down(e.touches[0].clientX,e.touches[0].clientY,0);
+    else if(e.touches.length===2){
+      pinch=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                       e.touches[0].clientY-e.touches[1].clientY);
+      drag={x:(e.touches[0].clientX+e.touches[1].clientX)/2,
+            y:(e.touches[0].clientY+e.touches[1].clientY)/2, btn:2};
+    }
+  }, {passive:true});
+  cv.addEventListener("touchmove", function(e){
+    e.preventDefault();
+    if(e.touches.length===1) move(e.touches[0].clientX,e.touches[0].clientY,false);
+    else if(e.touches.length===2){
+      var d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                       e.touches[0].clientY-e.touches[1].clientY);
+      if(pinch) dist=Math.max(span*0.002, Math.min(span*12, dist*pinch/d));
+      pinch=d;
+      move((e.touches[0].clientX+e.touches[1].clientX)/2,
+           (e.touches[0].clientY+e.touches[1].clientY)/2, true);
+    }
+  }, {passive:false});
+  cv.addEventListener("touchend", function(){ pinch=null; up_(); }, {passive:true});
+  window.addEventListener("keydown", function(e){ keys[e.key.toLowerCase()]=1; });
+  window.addEventListener("keyup", function(e){ keys[e.key.toLowerCase()]=0; });
+
+  var elSize=document.getElementById("size"), elConf=document.getElementById("conf"),
+      elConfV=document.getElementById("confv"), elStat=document.getElementById("stat"),
+      elByC=document.getElementById("bycolor"), elFly=document.getElementById("fly");
+  var cr = CONFIG.confidence_range || [2,16];
+  elConf.min = cr[0]; elConf.max = Math.max(cr[0]+1, cr[1]); elConf.value = cr[0];
+  elConfV.textContent = cr[0];
+  elConf.addEventListener("input", function(){ elConfV.textContent = elConf.value; });
+  var byConf = false;
+  elByC.addEventListener("click", function(){
+    byConf = !byConf; elByC.setAttribute("aria-pressed", byConf ? "true" : "false");
+  });
+  elFly.addEventListener("click", function(){
+    flying = !flying; elFly.setAttribute("aria-pressed", flying ? "true" : "false");
+  });
+  document.getElementById("reset").addEventListener("click", reset);
+
+  var note = document.getElementById("note");
+  var sc = (CONFIG.scale || {}).state;
+  note.textContent =
+    "Confidence is how many cameras agreed on a point. Empty space means the "
+    + "capture did not support geometry there — nothing is filled in. Scale is "
+    + (sc === "unknown" ? "unknown, so distances here are not metres." : String(sc) + ".");
+
+  // ---- draw -------------------------------------------------------------
+  var last = performance.now(), fps = 0;
+  function frame(now) {
+    var dt = Math.min(0.1, (now - last) / 1000); last = now;
+    fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
+    if (flying) {
+      var e = eyePos(), f=[target[0]-e[0],target[1]-e[1],target[2]-e[2]];
+      var fl=Math.hypot(f[0],f[1],f[2])||1; f=[f[0]/fl,f[1]/fl,f[2]/fl];
+      var up=[0,-1,0];
+      var s=[f[1]*up[2]-f[2]*up[1],f[2]*up[0]-f[0]*up[2],f[0]*up[1]-f[1]*up[0]];
+      var sl=Math.hypot(s[0],s[1],s[2])||1; s=[s[0]/sl,s[1]/sl,s[2]/sl];
+      var v = span * dt * 0.45 * (keys["shift"] ? 3 : 1);
+      var mv = [0,0,0];
+      if (keys["w"]) { mv[0]+=f[0]*v; mv[1]+=f[1]*v; mv[2]+=f[2]*v; }
+      if (keys["s"]) { mv[0]-=f[0]*v; mv[1]-=f[1]*v; mv[2]-=f[2]*v; }
+      if (keys["d"]) { mv[0]+=s[0]*v; mv[1]+=s[1]*v; mv[2]+=s[2]*v; }
+      if (keys["a"]) { mv[0]-=s[0]*v; mv[1]-=s[1]*v; mv[2]-=s[2]*v; }
+      if (keys["q"]) mv[1]-=v;
+      if (keys["e"]) mv[1]+=v;
+      target[0]+=mv[0]; target[1]+=mv[1]; target[2]+=mv[2];
+    }
+    var w = cv.clientWidth || 1, h = cv.clientHeight || 1;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (cv.width !== (w*dpr|0) || cv.height !== (h*dpr|0)) {
+      cv.width = w*dpr|0; cv.height = h*dpr|0;
+    }
+    gl.viewport(0, 0, cv.width, cv.height);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniformMatrix4fv(uMVP, false, mvp(cv.width, cv.height));
+    gl.uniform1f(uSize, parseFloat(elSize.value) * dpr * span);
+    gl.uniform1f(uMinConf, parseFloat(elConf.value));
+    gl.uniform1f(uByConf, byConf ? 1 : 0);
+    gl.uniform1f(uMaxConf, Math.max(1, cr[1]));
+    gl.drawArrays(gl.POINTS, 0, N);
+    elStat.textContent =
+      N.toLocaleString() + " points · level " + CONFIG.level + " · " +
+      Math.round(fps) + " fps" +
+      (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined
+        ? " · thinned to confidence ≥ " + CONFIG.thinned_to_confidence : "");
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

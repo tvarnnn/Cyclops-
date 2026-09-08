@@ -166,6 +166,39 @@ is recorded here because the failure mode is a silent one.
 
 ---
 
+## D11. Keep the alignment gate strict at 8%, and expose it
+
+**Decided against** loosening it to buy coverage, and against removing it on the
+theory that multi-view consensus already does the job.
+
+**Evidence**, sweeping the gate on the closet walk (201 posed frames), scored
+against the sparse points — which are independent of the depth pipeline — with
+near-point splats:
+
+| gate | frames used | points | depth error, median | pixel coverage |
+| --- | --- | --- | --- | --- |
+| **0.08** | 91 / 201 | 2.32 M | **3.74%** | 47.7% |
+| 0.15 | 133 / 201 | 3.36 M | 5.01% | 56.3% |
+| 0.25 | 136 / 201 | 3.34 M | 4.51% | 56.2% |
+
+Two things to read out of that. Loosening buys about **nine points of coverage
+for roughly one point of extra depth error**, so it is a real trade rather than
+a free lunch. And past 0.15 almost nothing changes — 0.25 admits three more
+frames and produces slightly *fewer* points — which says the consensus filter is
+already rejecting what the looser gate lets in.
+
+Strict wins on principle rather than on the margin. The gate exists to catch the
+one failure consensus cannot: a frame whose entire depth field is mis-scaled.
+When several such frames are adjacent — a blurry stretch of a walk — they agree
+with **each other**, and three agreeing cameras is exactly the evidence
+consensus is looking for. Only the gate sees that, because only the gate
+compares against something outside the depth pipeline.
+
+The cost is stated rather than hidden: roughly nine points of coverage, and
+`--gate-rel` is on the CLI for an operator who wants the other end of the trade.
+
+---
+
 ## Open, being decided by measurement
 
 | decision | options | metric |
