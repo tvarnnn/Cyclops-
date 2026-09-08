@@ -502,3 +502,69 @@ def test_redaction_fill_ignores_merely_dark_scene_content():
     dark[dark < 3] = 12                          # dark, but textured, not flat zero
     mask = redaction_fill_mask(dark, None, dilate_px=0)
     assert mask.mean() < 0.05
+
+
+# ---------------------------------------------------------------------------
+# the listing's dense capability flag
+# ---------------------------------------------------------------------------
+
+
+def test_worlds_listing_contract_identifier_did_not_move():
+    """iOS equality-tests `contract` on the first line of every guard. Bumping
+    it empties the gallery on every build that predates the change, so the
+    dense field had to be additive and this string had to stay put."""
+    from tower.results.world_builder_library import WORLDS_CONTRACT
+
+    assert WORLDS_CONTRACT == "world_builder.worlds/2026-09-06"
+
+
+def test_dense_summary_is_none_when_a_world_has_no_dense_artifact(tmp_path):
+    """Every world built before this work is in exactly this state, and it must
+    read as absent rather than as an error."""
+    from tower.results.world_builder_library import _dense_summary
+
+    class _S:
+        def world_dir(self, world_id):
+            return tmp_path / world_id
+
+    assert _dense_summary(_S(), "w", "s") is None
+
+
+def test_dense_summary_reports_counts_and_repeats_the_scale(tmp_path):
+    from tower.results.world_builder_library import _dense_summary
+
+    d = tmp_path / "w" / "dense" / "s"
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({
+        "format": DENSE_FORMAT,
+        "canonical_level": 1, "mobile_level": 2,
+        "scale": {"state": "unknown", "meters_per_unit": None},
+        "levels": [{"level": 0, "voxel": 0.02, "points": 900, "bytes": 14400},
+                   {"level": 1, "voxel": 0.045, "points": 300, "bytes": 4800},
+                   {"level": 2, "voxel": 0.09, "points": 90, "bytes": 1440}],
+    }))
+
+    class _S:
+        def world_dir(self, world_id):
+            return tmp_path / world_id
+
+    out = _dense_summary(_S(), "w", "s")
+    assert out["levels"] == 3
+    assert out["canonical_points"] == 300
+    assert out["mobile_points"] == 90
+    # Repeated, never re-derived: the dense stage makes no new scale claim.
+    assert out["scale"] == {"state": "unknown", "meters_per_unit": None}
+
+
+def test_a_manifest_with_an_unknown_format_is_ignored_rather_than_guessed_at(tmp_path):
+    from tower.results.world_builder_library import _dense_summary
+
+    d = tmp_path / "w" / "dense" / "s"
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({"format": "wb-dense-points/99"}))
+
+    class _S:
+        def world_dir(self, world_id):
+            return tmp_path / world_id
+
+    assert _dense_summary(_S(), "w", "s") is None

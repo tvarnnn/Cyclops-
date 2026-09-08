@@ -49,6 +49,36 @@ def _has_geometry(store: WorldStore, world_id: str, session_id: str) -> bool:
     return (derived / "poses.json").exists() and (derived / "points.json").exists()
 
 
+def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """What dense reconstruction this session has, or None.
+
+    ADDITIVE, and the contract identifier deliberately does not move. iOS
+    parses these payloads with `JSONSerialization` into `[String: Any]` and
+    reads them key by key, so a key it does not know is a key it never looks
+    at -- but it equality-tests `contract` on the first line of every guard, so
+    bumping that would empty the gallery on every older build. A world with no
+    dense artifact reports `null` and behaves exactly as it does today.
+    """
+    from tower.world_builder.dense_pipeline import read_dense_manifest  # noqa: PLC0415
+
+    manifest = read_dense_manifest(store, world_id, session_id)
+    if not manifest:
+        return None
+    levels = manifest.get("levels") or []
+    canonical = manifest.get("canonical_level", 0)
+    mobile = manifest.get("mobile_level", len(levels) - 1)
+    return {
+        "format": manifest.get("format"),
+        "levels": len(levels),
+        "canonical_points": (levels[canonical]["points"]
+                             if canonical < len(levels) else None),
+        "mobile_points": (levels[mobile]["points"] if mobile < len(levels) else None),
+        # Repeated from the manifest rather than re-derived. The dense stage
+        # makes no scale claim the sparse solve did not already make.
+        "scale": manifest.get("scale"),
+    }
+
+
 def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> int:
     """How many keyframes the journal holds, whatever the record says.
 
@@ -136,6 +166,9 @@ def build_world_listing(store: WorldStore) -> dict:
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.
                 "finalization": session.finalization,
+                # Additive, and null on every world built before the dense
+                # stage existed: what dense reconstruction this session holds.
+                "dense": _dense_summary(store, world_id, session_id),
             })
         sessions.sort(key=lambda s: s["started_at"])
         worlds.append({
