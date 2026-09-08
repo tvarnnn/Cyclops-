@@ -189,9 +189,12 @@
     var fov = 1.05, near = Math.max(span*0.0008, 1e-4), far = span*24;
     var t = 1/Math.tan(fov/2), a = w/h;
     var P = [t/a,0,0,0, 0,t,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0];
+    // M = P * V, in column-major storage where A[col*4+row]. Writing the
+    // operands the other way round yields V * P, which compiles, links, runs
+    // at full frame rate and draws absolutely nothing.
     var M = new Float32Array(16);
     for (var r=0;r<4;r++) for (var c2=0;c2<4;c2++) {
-      var v=0; for (var i2=0;i2<4;i2++) v += V[i2*4+r]*P[c2*4+i2];
+      var v=0; for (var i2=0;i2<4;i2++) v += P[i2*4+r]*V[c2*4+i2];
       M[c2*4+r]=v;
     }
     return M;
