@@ -48,7 +48,11 @@ from pathlib import Path
 
 import numpy as np
 
-from tower.world_builder.dense import POINT_STRIDE_BYTES, read_points_bin
+from tower.world_builder.dense import (
+    POINT_STRIDE_BYTES,
+    read_points_bin,
+    voxel_reduce,
+)
 from tower.world_builder.dense_pipeline import (
     dense_currency,
     dense_dir,
@@ -103,22 +107,77 @@ def has_dense(store, world_id: str, session_id: str) -> bool:
     return read_dense_manifest(store, world_id, session_id) is not None
 
 
-def thin_to_budget(X, C, F, budget_bytes: int):
-    """Drop the least-supported points until the buffer fits.
+def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = None):
+    """Make the buffer fit by making the picture COARSER, not smaller.
 
-    Confidence first, then a deterministic stride inside the surviving band, so
-    the same world always produces the same page. Thinning by confidence rather
-    than at random means the points that go are the ones fewest cameras agreed
-    on -- the picture gets sparser, not less trustworthy.
+    This used to sort by confidence and keep the best N, which sounds honest and
+    is not. Confidence is not distributed evenly through a room: it is high
+    where the wearer stood still and low at the far end of every space they
+    walked past once. A global confidence threshold therefore does not thin the
+    room, it DELETES the parts of it that were seen from fewer angles. Measured
+    on the three-room chain, whose mobile level is 2.6 M points against a
+    393 k budget: the old code shipped `confidence >= 9`, kept 15% of the cloud,
+    and what reached the phone was a scatter of isolated wall and ceiling slabs
+    with two of the three rooms simply gone. The caption said "some gaps are
+    thinning", which was true and no help -- the wearer opens their room and
+    does not recognise it.
+
+    So the budget is met the same way the LOD ladder meets it: a coarser voxel
+    grid over the WHOLE extent, which keeps every part of the room and lowers
+    the density everywhere equally. `voxel_reduce` keeps the best confidence in
+    each cell, so the confidence channel still means what it meant.
+
+    The voxel size is solved for rather than searched. These points lie on
+    surfaces, so their count scales as roughly `voxel ** -2`; one step of that
+    law lands within a few percent and a second corrects it. Two passes cost
+    about 0.9 s on 2.6 M points, which is why this is done here, on request,
+    rather than baked into a ladder that cannot know the client's budget.
+
+    Any residue after four passes -- overshoot from a scene that is not
+    surface-like -- is trimmed by confidence, which at a few percent is the
+    thing that trim is actually safe for.
+
+    Returns (X, C, F, thinned_to_confidence). The last value stays non-None
+    whenever anything was dropped, because the page has to say so.
     """
-    keep = len(X)
     max_points = max(1, budget_bytes // POINT_STRIDE_BYTES)
-    if keep <= max_points:
+    if len(X) <= max_points:
         return X, C, F, None
-    order = np.argsort(-F.astype(np.int32), kind="stable")
-    order = order[:max_points]
-    order.sort()
-    return X[order], C[order], F[order], int(F[order].min())
+
+    span = float(np.max(X.max(axis=0) - X.min(axis=0)))
+    if not np.isfinite(span) or span <= 0:
+        span = 1.0
+    # A starting cell: the level's own voxel when the caller knows it, else the
+    # extent divided by the cube root of the count, which is the right order of
+    # magnitude for anything.
+    voxel = float(voxel_hint) if voxel_hint else span / max(len(X) ** (1 / 3), 1.0)
+
+    # Aim slightly under the budget. The scaling law is good to a few percent,
+    # and landing 3% over costs a whole extra pass -- or, worse, falls through
+    # to the confidence trim this exists to avoid.
+    target = max(1.0, max_points * 0.95)
+    Xr, Cr, Fr = X, C, F
+    for _ in range(6):
+        voxel *= float(np.sqrt(len(Xr) / target))
+        if not np.isfinite(voxel) or voxel <= 0:
+            break
+        Xr, Cr, Fr = voxel_reduce(X, C, F, voxel)
+        if len(Xr) <= max_points:
+            break
+
+    if len(Xr) > max_points:
+        # Did not converge. Fall back rather than blow the budget, and say so:
+        # this is the branch whose spatial bias the docstring warns about.
+        logger.warning(
+            "[Tower][WorldBuilder][dense] voxel thinning did not reach the "
+            "budget (%d > %d); trimming by confidence",
+            len(Xr), max_points,
+        )
+        order = np.argsort(-Fr.astype(np.int32), kind="stable")[:max_points]
+        order.sort()
+        Xr, Cr, Fr = Xr[order], Cr[order], Fr[order]
+
+    return Xr, Cr, Fr, int(Fr.min()) if len(Fr) else 0
 
 
 MAX_VIEWPOINTS = 240
@@ -181,7 +240,8 @@ def build_dense_payload(store, world_id: str, session_id: str, *,
     X, C, F = read_points_bin(path)
     if len(X) == 0:
         raise DenseViewerUnavailable("the dense level holds no points")
-    X, C, F, min_conf = thin_to_budget(X, C, F, budget_bytes)
+    X, C, F, min_conf = thin_to_budget(
+        X, C, F, budget_bytes, voxel_hint=levels[idx].get("voxel"))
 
     buf = np.zeros(len(X), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
                                   ("r", "u1"), ("g", "u1"), ("b", "u1"), ("c", "u1")])

@@ -468,6 +468,48 @@ The lesson recorded rather than the result: a model whose architecture matches
 the problem is not thereby better at the problem, and the only way to find that
 out was to measure it.
 
+---
+
+## D17. The phone's byte budget is met by a coarser grid, not by a confidence cut
+
+**Reversal, found by opening the phone's own page and looking at it.** Nothing
+in the test suite caught this, because every test asserted the behaviour that
+was wrong.
+
+The rule was: when a level exceeds the byte budget, sort by confidence and keep
+the best N. It reads as the honest choice — the geometry several cameras agreed
+on survives, the weakest goes — and the caption said exactly that.
+
+It is not honest, because **confidence is not distributed evenly through a
+room.** It is high where the wearer stood still and low at the far end of every
+space they walked past once. A global threshold therefore does not thin a room;
+it deletes the parts of it that were seen from fewer angles.
+
+Measured on `672578d0`, the three-room chain, whose mobile level is 2.60 M
+points against a 393 k budget:
+
+| | old rule | new rule |
+| --- | --- | --- |
+| points shipped | 393,216 | 313,539 |
+| confidence floor | **9** | 3 |
+| what the phone showed | isolated slabs of wall and ceiling; two of three rooms absent | the whole dwelling, coarser |
+
+The fix is to meet the budget the way the LOD ladder meets it: a coarser voxel
+over the whole extent, keeping the best confidence in each cell. The voxel size
+is solved rather than searched — these points lie on surfaces, so the count
+scales as `voxel ** -2`, and one step of that law lands within a few percent.
+Two passes cost about 0.9 s on 2.6 M points, which is why it is done at serve
+time rather than baked into a ladder that cannot know the client's budget.
+
+**What this cost.** Slightly fewer points (313 k against 393 k) because a voxel
+grid cannot hit an exact count. That is the entire cost.
+
+**What it says about the rest of this lane.** The defect shipped, was covered by
+four passing tests, survived one adversarial review, and was found in about
+thirty seconds by building the page the phone actually gets and looking at it.
+Every number in `01-EVIDENCE.md` is measured on the artifact on disk, and the
+artifact on disk was never the problem.
+
 ## Open, being decided by measurement
 
 Two of the three questions this section opened with have been answered by

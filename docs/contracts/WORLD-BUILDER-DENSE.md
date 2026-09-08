@@ -235,13 +235,28 @@ Two behaviours matter more than the parameter:
 ### Payload budget
 
 The LOD ladder is a fraction of each scene's median depth, so its point count
-follows the size of the room rather than the size of the payload — measured
-across five real worlds the mobile level ranges from 39k points to 1.45 M, which
-is 0.6 MB to 23 MB. The page therefore enforces a byte budget and, when a level
-exceeds it, **thins by confidence**: the points several cameras agreed on
-survive and the weakest go first, so the picture gets sparser rather than less
-trustworthy. `thinned_to_confidence` in the page's config records the cut, and
-`null` means none was needed.
+follows the size of the room rather than the size of the payload — across the
+corpus the mobile level ranges from 39 k points to 2.6 M, which is 0.6 MB to
+42 MB. The page therefore enforces a byte budget.
+
+**It meets that budget by making the picture coarser, never by keeping a
+subset of the room.** A coarser voxel grid is applied over the whole extent and
+the best confidence in each cell survives, which is the same operation the LOD
+ladder itself performs — the phone gets a lower-resolution room, not a fraction
+of one.
+
+This reverses the previous rule, and the reversal is the point. Thinning by a
+global confidence threshold sounds like the honest choice and is not:
+confidence is high where the wearer stood still and low at the far end of any
+space walked past once, so a threshold does not thin a room, it deletes the
+parts of it seen from fewer angles. On the three-room chain the old rule shipped
+`confidence >= 9`, kept 15% of 2.6 M points, and what reached the phone was a
+scatter of isolated wall and ceiling slabs with two of the three rooms gone.
+
+`thinned_to_confidence` in the page's config still records that a cut happened,
+and `null` still means none was needed. The caption says the picture is coarser
+than the artifact and that nothing was dropped from one part of the room and
+kept in another.
 
 ## 10. Currency, and what the page must say
 

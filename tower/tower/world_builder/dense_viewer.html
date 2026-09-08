@@ -380,8 +380,10 @@
   var full = CONFIG.source_points || CONFIG.points;
   if (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined) {
     parts.push("This view shows " + CONFIG.points.toLocaleString() + " of " +
-               full.toLocaleString() + " points, the best-supported ones, to fit " +
-               "this device — so some gaps are thinning, not missing geometry.");
+               full.toLocaleString() + " points, spread evenly over the whole " +
+               "reconstruction, to fit this device — so the picture is coarser " +
+               "here than it is on disk, but nothing has been dropped from one " +
+               "part of the room and kept in another.");
   }
   parts.push("Elsewhere, empty means the cameras did not agree on geometry there, " +
              "or the region was removed by face redaction. Nothing is filled in.");

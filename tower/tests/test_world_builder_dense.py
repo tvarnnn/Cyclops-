@@ -672,20 +672,28 @@ def test_the_page_embeds_its_points_because_the_route_forbids_fetch(tmp_path):
         assert forbidden not in page, f"the page reaches for {forbidden!r}"
 
 
-def test_the_page_is_thinned_by_confidence_not_at_random(tmp_path):
-    """When a level exceeds the byte budget the geometry several cameras agreed
-    on must survive and the weakest must go, so the picture gets sparser rather
-    than less trustworthy."""
+def test_a_level_over_the_byte_budget_is_made_coarser_and_stays_whole(tmp_path):
+    """REVERSAL. This test used to assert the opposite: that the highest
+    confidences survive and the rest go. That is what shipped, and on the
+    three-room chain it sent the phone 15% of the cloud at `confidence >= 9`,
+    which deleted two of the three rooms -- because confidence is high where
+    the wearer stood still and low at the far end of anything walked past once.
+
+    The budget is now met by a coarser voxel grid over the whole extent. The
+    page gets a lower-resolution room instead of a fraction of one.
+    """
     from tower.world_builder.dense_render import build_dense_payload
 
     n = 4000
     conf = np.concatenate([np.full(n // 2, 2), np.full(n // 2, 9)])
     store, *_ = _fake_dense(tmp_path, n=n, conf=conf)
     raw, cfg, _ = build_dense_payload(store, "w1", "s1", budget_bytes=16 * (n // 2))
-    assert cfg["points"] == n // 2
+    assert cfg["points"] <= n // 2
     kept = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 16)[:, 15]
-    assert kept.min() == 9                       # every survivor is well supported
-    assert cfg["thinned_to_confidence"] == 9
+    # The weakly supported half is still represented. Under the old rule its
+    # count here was exactly zero.
+    assert (kept < 9).sum() > 0
+    assert cfg["thinned_to_confidence"] is not None
 
 
 def test_an_unthinned_level_says_so_rather_than_implying_a_cut(tmp_path):
@@ -704,9 +712,10 @@ def test_the_page_never_claims_metres_when_scale_is_unknown(tmp_path):
     page = build_dense_page(store, "w1", "s1")
     assert "not metres" in page
     # Empty space has three causes and the caption must not blame only the
-    # capture: thinning for the device and face redaction are the other two.
+    # capture: fitting the device and face redaction are the other two.
     assert "redaction" in page
-    assert "thinning" in page
+    assert "coarser" in page
+    assert "nothing has been dropped from one" in page
     assert '"state": "unknown"' in page or '"state":"unknown"' in page
 
 
@@ -1289,3 +1298,89 @@ def test_the_inline_payload_rationale_does_not_claim_a_csp_the_phone_never_sees(
     doc = dense_render.__doc__ or ""
     assert "loadHTMLString" in doc
     assert "SOLE defence" in doc
+
+
+# --------------------------------------------------------------------------
+# Fitting the phone's byte budget. Confidence is not distributed evenly through
+# a room -- it is high where the wearer stood and low at the far end of a space
+# they walked past once -- so a global confidence threshold does not thin a
+# room, it deletes the parts of it seen from fewer angles.
+# --------------------------------------------------------------------------
+
+
+def _two_room_cloud(n_per_room=40000):
+    """Two slabs of surface. One was seen by many cameras, one by few, which is
+    exactly what a walk through two rooms produces."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    near = np.column_stack([rng.uniform(0, 1, n_per_room),
+                            rng.uniform(0, 1, n_per_room),
+                            np.zeros(n_per_room)])
+    far = np.column_stack([rng.uniform(4, 5, n_per_room),
+                           rng.uniform(0, 1, n_per_room),
+                           np.zeros(n_per_room)])
+    X = np.vstack([near, far]).astype(np.float32)
+    C = np.full((len(X), 3), 128, np.uint8)
+    F = np.concatenate([np.full(n_per_room, 12, np.uint8),
+                        np.full(n_per_room, 3, np.uint8)])
+    return X, C, F
+
+
+def test_thinning_to_a_budget_keeps_the_whole_room_not_the_best_lit_corner():
+    """The defect this replaced: the three-room chain shipped `confidence >= 9`
+    to the phone, kept 15% of its cloud, and two of the three rooms vanished."""
+    import numpy as np
+
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import thin_to_budget
+
+    X, C, F = _two_room_cloud()
+    budget = 8000 * POINT_STRIDE_BYTES
+    Xr, Cr, Fr, min_conf = thin_to_budget(X, C, F, budget)
+
+    assert len(Xr) <= 8000
+    near = (Xr[:, 0] < 2).sum()
+    far = (Xr[:, 0] > 3).sum()
+    assert near > 0 and far > 0, "a whole room was deleted"
+    # Both rooms are the same area, so a spatially even thinning keeps roughly
+    # the same number from each. The old code kept 100% of one and 0% of the
+    # other; anything past 4:1 here is that failure coming back.
+    assert 0.25 < near / far < 4.0, (near, far)
+
+
+def test_thinning_reports_that_it_thinned():
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import thin_to_budget
+
+    X, C, F = _two_room_cloud()
+    _, _, _, min_conf = thin_to_budget(X, C, F, 8000 * POINT_STRIDE_BYTES)
+    assert min_conf is not None, "the page has to be able to say it was thinned"
+
+    # And a cloud that fits is not thinned, and says so with None.
+    _, _, _, untouched = thin_to_budget(X, C, F, 10_000_000 * POINT_STRIDE_BYTES)
+    assert untouched is None
+
+
+def test_thinning_is_deterministic():
+    """The same world must produce the same page."""
+    import numpy as np
+
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import thin_to_budget
+
+    X, C, F = _two_room_cloud()
+    a = thin_to_budget(X, C, F, 8000 * POINT_STRIDE_BYTES)
+    b = thin_to_budget(X, C, F, 8000 * POINT_STRIDE_BYTES)
+    assert np.array_equal(a[0], b[0])
+    assert np.array_equal(a[2], b[2])
+
+
+def test_thinning_never_exceeds_the_budget():
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import thin_to_budget
+
+    X, C, F = _two_room_cloud()
+    for n in (100, 1000, 8000, 50000):
+        Xr, _, _, _ = thin_to_budget(X, C, F, n * POINT_STRIDE_BYTES)
+        assert len(Xr) <= n, (n, len(Xr))
