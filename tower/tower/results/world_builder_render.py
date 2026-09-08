@@ -124,6 +124,15 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     # forces the old page, and a session with no dense artifact -- which is
     # every world built before this stage -- falls through to it unchanged.
     if representation != REPRESENTATION_SPARSE:
+        # THE IMPORT IS OUTSIDE THE try THAT CATCHES ITS EXCEPTION.
+        #
+        # `DenseViewerUnavailable` used to be bound by an import inside the
+        # same `try` whose first `except` names it. If that import raised --
+        # the one class of bug the fallback below exists for, a broken dense
+        # module -- Python evaluated the first except clause, hit a NameError
+        # on the unbound name, and propagated THAT. Later clauses of the same
+        # try are not tried, so the "never lose the sparse page to a dense bug"
+        # fallback never ran and the route returned 500.
         try:
             from tower.world_builder.dense import (  # noqa: PLC0415
                 POINT_STRIDE_BYTES,
@@ -133,6 +142,16 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
                 DenseViewerUnavailable,
                 build_dense_page,
             )
+        except Exception:  # noqa: BLE001 -- a dense module that will not import
+            logger.exception(
+                "[Tower][WorldBuilder] the dense viewer module did not import "
+                "for %s; serving sparse", world_id,
+            )
+            DenseViewerUnavailable = build_dense_page = None  # noqa: N806
+
+        try:
+            if build_dense_page is None:
+                raise RuntimeError("dense viewer unavailable")
 
             # `max_points` is validated by the route and must not then be
             # ignored: the worlds contract calls it "point budget", and a

@@ -142,8 +142,14 @@ def thin_to_budget(X, C, F, budget_bytes: int, *, voxel_hint: float | None = Non
 
     So the budget is met the same way the LOD ladder meets it: a coarser voxel
     grid over the WHOLE extent, which keeps every part of the room and lowers
-    the density everywhere equally. `voxel_reduce` keeps the best confidence in
-    each cell, so the confidence channel still means what it meant.
+    the density everywhere equally.
+
+    `voxel_reduce` keeps the MAXIMUM confidence in each merged cell, so after
+    coarsening the channel means "the most cameras that agreed on any point
+    merged into this one" rather than "the cameras that agreed on this point".
+    Measured, the difference is small -- mean confidence moves 6.20 to 6.35,
+    6.18 to 6.24, and on one world 3.89 DOWN to 3.83 -- but it is not the same
+    quantity, and an earlier version of this docstring claimed it was.
 
     The cell size is solved for and then CHECKED. These points lie on surfaces,
     so their count scales as roughly `voxel ** -2`, and one step of that law

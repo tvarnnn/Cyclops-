@@ -863,6 +863,13 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
         inb = np.all((X >= lo) & (X <= hi), 1)
         dropped_outside_box = int(len(X) - int(inb.sum()))
         X, C, F = X[inb], C[inb], F[inb]
+    else:
+        # Disabling the filter must not crash the stage. `lo` and `hi` were
+        # bound only inside the branch and then read unconditionally below, so
+        # `pack_percentile = 0` -- the natural way to turn off a filter this
+        # code documents as removing REAL observations -- raised
+        # UnboundLocalError. The parameter was declared so it could be changed.
+        lo, hi = X.min(0), X.max(0)
 
     levels = []
     for i, v in enumerate(voxels):

@@ -691,7 +691,17 @@ def validity_mask(
 def voxel_reduce(X: np.ndarray, C: np.ndarray, F: np.ndarray, voxel: float):
     """Average positions and colours inside each voxel; keep the best confidence."""
     g = np.floor(X / voxel).astype(np.int64) + (1 << 20)
-    key = (g[:, 0] << 42) | (g[:, 1] << 21) | g[:, 2]
+    if g.min() < 0 or g.max() >= (1 << 21):
+        # Outside the packing's range two different cells share a key and the
+        # reduction silently MERGES them -- points from opposite ends of a
+        # scene averaged into one. Demonstrated on a two-cluster cloud three
+        # million units apart: 329 distinct cells, 231 returned. The predictor
+        # in `dense_render` guarded this and the function that actually does
+        # the work did not, which is the wrong way round.
+        uniq, inverse = np.unique(g, axis=0, return_inverse=True)
+        key = inverse.astype(np.int64)
+    else:
+        key = (g[:, 0] << 42) | (g[:, 1] << 21) | g[:, 2]
     order = np.argsort(key, kind="stable")
     uniq, counts = np.unique(key[order], return_counts=True)
     grp = np.repeat(np.arange(len(uniq)), counts)

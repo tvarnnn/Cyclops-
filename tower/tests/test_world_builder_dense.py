@@ -1937,3 +1937,51 @@ def test_the_voxel_counter_predicts_exactly_what_the_reduction_produces():
 
     for voxel in (1.0, 0.1, 0.01, 10.0 / 3e6):
         assert _voxel_count(X, voxel) == len(voxel_reduce(X, C, F, voxel)[0]), voxel
+
+
+def test_disabling_the_pack_box_does_not_crash_the_stage():
+    """`lo` and `hi` were bound only inside the branch and read unconditionally
+    afterwards, so setting the parameter to its disabling value raised
+    UnboundLocalError. It was declared precisely so it could be changed."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_pack_stage)
+    box = body.index("pack_percentile > 0")
+    tail = body[box:]
+    assert "else:" in tail
+    assert "lo, hi = X.min(0), X.max(0)" in tail
+
+
+def test_the_voxel_grid_refuses_to_merge_cells_it_cannot_distinguish():
+    """The 21-bit key packing collides outside its range and the reduction
+    silently merges points from opposite ends of a scene. The counter guarded
+    this and the function doing the work did not, which is the wrong way round.
+    """
+    import numpy as _np
+
+    from tower.world_builder.dense import voxel_reduce
+    from tower.world_builder.dense_render import _voxel_count
+
+    X = _np.array([[0, 0, 0], [1, 0, 0], [3e6, 0, 0], [3e6 + 1, 0, 0]], _np.float64)
+    C = _np.full((4, 3), 128, _np.uint8)
+    F = _np.full(4, 4, _np.uint8)
+    assert len(voxel_reduce(X, C, F, 0.5)[0]) == 4
+    assert _voxel_count(X, 0.5) == 4
+
+
+def test_a_dense_module_that_will_not_import_still_serves_the_sparse_page():
+    """The exception class was bound by an import inside the same try whose
+    first except clause names it, so a broken dense module raised NameError out
+    of the handler and the route 500ed -- failing for the one class of bug the
+    fallback is named after."""
+    import inspect
+
+    from tower.results import world_builder_render
+
+    body = inspect.getsource(world_builder_render.build_world_render)
+    imp = body.index("from tower.world_builder.dense_render import")
+    after = body[imp:]
+    # the import has its own handler, before the try that uses the name
+    assert "except Exception" in after[:after.index("build_dense_page(store")]
