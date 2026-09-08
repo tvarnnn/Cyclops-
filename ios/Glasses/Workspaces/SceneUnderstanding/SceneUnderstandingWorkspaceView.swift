@@ -44,6 +44,28 @@ struct SceneUnderstandingWorkspaceView: View {
 
     @StateObject private var scene: SceneUnderstandingViewModel
 
+    /// Watched because `.onDisappear` does not fire on backgrounding, and this
+    /// app goes on running when it is backgrounded.
+    ///
+    /// `Info.plist` declares `bluetooth-central`, `bluetooth-peripheral` and
+    /// `external-accessory`, so with glasses connected the socket stays up and
+    /// the camera keeps streaming after the wearer pockets the phone. Watching
+    /// only `onAppear`/`onDisappear` therefore leaves this screen "visible"
+    /// for the rest of the walk — and on this cartridge being visible is what
+    /// *watching* means, so the Tower keeps a people detector running over a
+    /// walk nobody is looking at, with no control on screen to stop it. That
+    /// is the failure the visibility gate exists to prevent, reached through
+    /// the one lifecycle event the gate could not see.
+    ///
+    /// `.background`, not `.inactive` — unlike `CVLivePreviewPanel`, and the
+    /// difference is deliberate. That panel is hiding a *picture* from the
+    /// app-switcher snapshot, which is taken during `.inactive`, so it has to
+    /// act early. This screen holds no imagery; what it releases is a
+    /// Tower-side model. Dropping the watcher on `.inactive` would unload and
+    /// reload a detector every time a notification banner or Control Centre
+    /// passed over the screen the wearer is still on.
+    @Environment(\.scenePhase) private var scenePhase
+
     /// The client is injected and owned by `ProjectManager`; see
     /// `CartridgeClients`.
     init(isTowerReachable: Bool, client: any SceneUnderstandingClient) {
@@ -77,6 +99,14 @@ struct SceneUnderstandingWorkspaceView: View {
         // `TowerSceneUnderstandingClient.workspaceVisible`.
         .onAppear { scene.workspaceVisibilityChanged(isVisible: true) }
         .onDisappear { scene.workspaceVisibilityChanged(isVisible: false) }
+        // Backgrounding is leaving, for this purpose. See `scenePhase`.
+        // `workspaceVisibilityChanged` is idempotent — it returns early unless
+        // the value actually changed — so returning to the foreground on the
+        // same screen re-subscribes exactly once, and a phase change that does
+        // not cross the background boundary does nothing at all.
+        .onChange(of: scenePhase) { _, phase in
+            scene.workspaceVisibilityChanged(isVisible: phase != .background)
+        }
     }
 
     // MARK: Header
