@@ -904,3 +904,66 @@ def test_a_run_killed_mid_stage_is_distinguishable_from_one_still_going():
     assert status_is_stale({"state": STATE_RUNNING})          # no pid at all
     assert not status_is_stale({"state": "ok", "pid": 0x7FFFFFFE})
     assert not status_is_stale({})
+
+
+# ---------------------------------------------------------------------------
+# two output kinds: a point map is not a disparity image
+# ---------------------------------------------------------------------------
+
+
+def test_depth_from_prediction_inverts_both_fit_forms():
+    """One function decides what a stored map means, shared by the alignment,
+    the scoring and the fusion, so the three cannot drift apart."""
+    from tower.world_builder.dense import depth_from_prediction, fit_target
+
+    rng = np.random.default_rng(41)
+    z = rng.uniform(0.8, 9.0, size=500)
+
+    a, b = 2700.0, -215.0
+    disp = a * fit_target(z, "disparity") + b
+    assert np.allclose(depth_from_prediction(disp, a, b, "disparity"), z, rtol=1e-9)
+
+    a2, b2 = 1.37, -0.42
+    pts = a2 * fit_target(z, "depth") + b2
+    assert np.allclose(depth_from_prediction(pts, a2, b2, "depth"), z, rtol=1e-9)
+
+
+def test_a_point_map_fitted_as_disparity_is_measurably_worse():
+    """This is why `kind` exists. A point map's z is affine-invariant DEPTH;
+    fitting it with the disparity form still converges, and still returns a
+    plausible-looking residual, while being wrong."""
+    from tower.world_builder.dense import align_frame
+
+    rng = np.random.default_rng(42)
+    z = rng.uniform(1.0, 8.0, size=400)
+    pointmap_z = 1.37 * z - 0.42                      # affine-invariant depth
+
+    _, _, right = align_frame(pointmap_z, z, "depth")
+    _, _, wrong = align_frame(pointmap_z, z, "disparity")
+
+    assert right is not None and right < 1e-6
+
+    # The wrong form does not merely fit worse. It fits an INFEASIBLE model --
+    # a point map is monotonically increasing in depth, a disparity image is
+    # monotonically decreasing -- so the slope comes out non-positive and the
+    # frame is scored as unusable and dropped. Either outcome is a loss; this
+    # one at least fails loudly.
+    assert wrong is None or wrong > 100 * right
+
+
+def test_the_default_backend_is_the_measured_winner_and_permissive():
+    from tower.world_builder.dense import DenseParams, make_backend
+
+    b = make_backend(DenseParams().backend)
+    assert b.name == "moge2-vitl"
+    assert b.licence == "MIT"
+    assert b.kind == "depth"
+
+
+def test_every_registered_backend_declares_a_kind_the_pipeline_understands():
+    from tower.world_builder.dense import available_backends, make_backend
+
+    for name in available_backends():
+        b = make_backend(name)
+        assert b.kind in {"disparity", "depth"}, name
+        assert "NC" not in b.licence and "NonCommercial" not in b.licence, name

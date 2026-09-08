@@ -98,7 +98,16 @@ class DenseParams:
     """
 
     # -- depth ------------------------------------------------------------
-    backend: str = "depth-anything-v2-small"
+    # MoGe-2 ViT-L (MIT). Chosen from a 24-model bake-off on identical frames,
+    # then re-measured through this pipeline on the reference world:
+    #
+    #     backend                held-out median   frames past the 8% gate
+    #     depth-anything-v2-small     6.50%              235 / 395
+    #     moge2-vitl                  2.60%              317 / 399
+    #
+    # It also beats the CC-BY-NC checkpoints this lane refused to ship, so
+    # there is no accuracy being traded away for the licence -- only gained.
+    backend: str = "moge2-vitl"
     # Reject a frame whose HELD-OUT relative depth residual exceeds this.
     # 0.08 keeps 346 of 425 frames on the reference world; a regularised refit
     # rescued only one of the rejects, which is the evidence that the rejects
