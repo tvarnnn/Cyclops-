@@ -770,7 +770,8 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
 
 
 def dense_currency(store, world_id: str, session_id: str,
-                   manifest: dict | None = None) -> dict:
+                   manifest: dict | None = None, *,
+                   include_derived: bool = True) -> dict:
     """Whether the dense artifact still describes the geometry on disk.
 
     Contract `WORLD-BUILDER-WORLDS.md` rule 2 -- "the page never claims more
@@ -815,12 +816,16 @@ def dense_currency(store, world_id: str, session_id: str,
     if artifact is not None and current is not None:
         out["solve_current"] = bool(artifact == current)
 
-    try:
-        from tower.world_builder.render import derived_current  # noqa: PLC0415
+    # `derived_current` re-reads and re-digests the whole keyframe journal, so
+    # a caller that only needs the solve answer -- the worlds listing, which
+    # walks every session of every world -- can say so and skip it.
+    if include_derived:
+        try:
+            from tower.world_builder.render import derived_current  # noqa: PLC0415
 
-        out["derived_current"] = derived_current(store, world_id, session_id)
-    except Exception:  # noqa: BLE001
-        out["derived_current"] = None
+            out["derived_current"] = derived_current(store, world_id, session_id)
+        except Exception:  # noqa: BLE001
+            out["derived_current"] = None
     return out
 
 

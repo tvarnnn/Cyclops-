@@ -85,7 +85,8 @@ def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | 
         # carries the same fact as a caption; this is so a gallery can mark it
         # without fetching an 8 MB page.
         "solve_current": dense_currency(
-            store, world_id, session_id, manifest).get("solve_current"),
+            store, world_id, session_id, manifest,
+            include_derived=False).get("solve_current"),
     }
 
 
