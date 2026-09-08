@@ -433,13 +433,18 @@ captures are byte-identical to how they started.
   the same code.
 - The hard-stop skip path is implemented and reasoned about but was not
   exercised by actually killing a live session mid-finalization.
-- **A capture has never produced a dense world by itself.** It now CAN:
+- **A capture now produces a dense world by itself, and that was exercised.**
   `TOWER_WORLD_DENSIFY=true` makes the Tower pass `--densify` to every builder
-  it spawns, and the setting is verified to reach the child's argv. But the
-  default is off, deliberately -- 2.4 GB of VRAM and minutes of GPU per world
-  on a shared card -- so nobody has yet run a live capture with it on, and the
-  path from "wearer stops walking" to "dense world exists without anyone typing
-  a command" is implemented and unexercised.
+  it spawns. Run end to end on capture `22e9d428` -- a capture no world in this
+  corpus had been densified from -- through the Tower's own configuration
+  rather than a hand-typed flag: 1,848 frames staged, 181 of 347 keyframes
+  used, 4,687,889 points, 4.0% held-out residual, 207 s wall clock of which 68 s
+  was depth and 52 s fusion. The artifact carries the input digest, the packing
+  parameter and its dropped count, and pruned its own intermediates. Status
+  `ok`.
+  What remains untested is the same thing on GLASSES rather than a replay, and
+  with the Tower serving other cartridges at the same time -- which is where the
+  GPU contention this default exists to avoid would actually show up.
 
 ## 14. The state this lane is being left in
 
