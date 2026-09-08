@@ -1810,3 +1810,130 @@ def test_two_absent_digests_do_not_count_as_a_match():
     guard = body[body.index("A COMPLETED ARTIFACT IS COMPLETE"):]
     guard = guard[:guard.index("levels = existing.get")]
     assert "digest is not None" in guard
+
+
+# --------------------------------------------------------------------------
+# H1: the per-frame fit must not be anchored on pixels an inpainter invented.
+# --------------------------------------------------------------------------
+
+
+def test_the_fit_excludes_anchors_inside_the_redaction_fill():
+    """The fill mask was applied to the CLOUD and not to the FIT, so the
+    invented points were removed and the invented scale-and-offset they
+    produced was kept -- and (a, b) is global to the frame, so it was applied
+    to every real pixel that survived.
+
+    On the widest traverse, 25.3% of anchors landed in inpainted pixels on
+    average and 30 gate-passing frames had over half of theirs there. The gate
+    could not see it and preferred it: a TELEA inpaint is a smooth interpolant
+    an affine fits very well, so more invention scored better."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    fit = body.index("align_frame(")
+    head = body[:fit]
+    # the mask has to be consulted BEFORE the fit, not only in fusion
+    assert "clean = ~fill_u[vi, ui]" in head
+    assert "n_clean < params.min_sparse_points" in head
+
+
+def test_a_frame_with_too_few_clean_anchors_is_refused_not_fitted():
+    """Nine gate-passing frames of the flagship world had essentially every
+    anchor inside invented pixels, and one had no clean anchor at all. There is
+    no honest way to fit those; they have to be refused."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    assert "sparse anchors outside the" in body
+    # and the extrapolation bound comes from the same clean anchors
+    assert '"z_sparse_min": float(np.min(zc_fit))' in body
+
+
+# --------------------------------------------------------------------------
+# H2: a new parameter must not invalidate every artifact already on disk.
+# --------------------------------------------------------------------------
+
+
+def test_a_parameter_added_later_does_not_unrecognise_older_artifacts():
+    """Whole-dict comparison meant `pack_percentile` -- added after seven of
+    the eight corpus artifacts were packed -- stopped all seven from being
+    recognised as complete. Re-running densify on a finished, current world
+    then reported `unavailable` and overwrote its status with no result: the
+    exact destruction the completed-artifact guard exists to prevent, by a
+    different door."""
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _params_match
+
+    wanted = DenseParams().as_dict()
+
+    # An artifact packed before a parameter existed.
+    older = {k: v for k, v in wanted.items() if k != "pack_percentile"}
+    assert _params_match(older, wanted) is True
+
+    # A parameter that really differs still refuses.
+    changed = dict(older)
+    changed["tau"] = 0.09
+    assert _params_match(changed, wanted) is False
+
+    # keep_intermediates changes no output and never refuses.
+    kept = dict(older)
+    kept["keep_intermediates"] = not kept.get("keep_intermediates", False)
+    assert _params_match(kept, wanted) is True
+
+    # Nothing in common is not a match.
+    assert _params_match({}, wanted) is False
+
+
+def test_densify_twice_on_a_complete_artifact_reports_reuse_and_keeps_the_record(tmp_path):
+    """Behavioural, because the guard's previous test asserted the ORDER OF TWO
+    STRING LITERALS in the source and passed while the guard was broken."""
+    import json
+
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _result_from_manifest
+
+    root = tmp_path / "dense"
+    root.mkdir()
+    params = DenseParams().as_dict()
+    params.pop("pack_percentile", None)          # an artifact from before it existed
+    (root / "manifest.json").write_text(json.dumps({
+        "format": "wb-dense-points/1", "input_digest": "D",
+        "params": params,
+        "levels": [{"level": 0, "points": 4242, "voxel": 0.1}],
+    }))
+    (root / "status.json").write_text(json.dumps({
+        "state": "ok",
+        "result": {"frames_total": 77, "frames_used": 50, "frames_dropped": 27},
+    }))
+    done = _result_from_manifest(root, json.loads((root / "manifest.json").read_text()))
+    assert done.reused is True
+    assert (done.frames_used, done.frames_total) == (50, 77)
+    assert done.points == 4242
+
+
+def test_the_voxel_counter_predicts_exactly_what_the_reduction_produces():
+    """The budget search picks a cell by asking how many points a reduction
+    WOULD return, without building it. If that prediction and the reduction
+    ever disagree, the page silently misses its budget in whichever direction
+    the disagreement runs -- and the whole point of the search is to hit it.
+
+    The out-of-range branch is covered too: it needs a cell finer than the
+    extent over two million, where the key packing would collide and
+    undercount, and it had no test at all.
+    """
+    import numpy as _np
+
+    from tower.world_builder.dense import voxel_reduce
+    from tower.world_builder.dense_render import _voxel_count
+
+    rng = _np.random.default_rng(0)
+    X = (rng.random((5000, 3)) * 10).astype(_np.float32)
+    C = _np.full((5000, 3), 128, _np.uint8)
+    F = _np.full(5000, 4, _np.uint8)
+
+    for voxel in (1.0, 0.1, 0.01, 10.0 / 3e6):
+        assert _voxel_count(X, voxel) == len(voxel_reduce(X, C, F, voxel)[0]), voxel

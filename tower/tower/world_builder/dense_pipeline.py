@@ -89,6 +89,30 @@ def _output_params(params: dict) -> dict:
     return {k: v for k, v in (params or {}).items() if k not in _NON_OUTPUT_PARAMS}
 
 
+def _params_match(stored: dict, wanted: dict) -> bool:
+    """Do a stored artifact's parameters agree with the ones being asked for?
+
+    OVER THE KEYS BOTH SIDES KNOW, and that is the whole point. Comparing whole
+    dicts means every parameter ever added silently invalidates every artifact
+    already on disk: `pack_percentile` was added and seven of the eight worlds
+    in this corpus stopped being recognised as complete, so re-running densify
+    on a finished, current world reported `unavailable` and overwrote its
+    status with no result -- exactly the destruction the completed-artifact
+    guard was written to prevent, arriving by a different door.
+
+    A key the stored artifact does not carry is a key that did not exist when
+    it was packed. It cannot have changed the output, because the code that
+    produced the output never read it. A key whose value differs is a real
+    difference and still refuses.
+    """
+    stored = _output_params(stored)
+    wanted = _output_params(wanted)
+    shared = stored.keys() & wanted.keys()
+    if not shared:
+        return False
+    return all(stored[k] == wanted[k] for k in shared)
+
+
 def _depth_cache_key(digest, params: DenseParams) -> str:
     """Everything the DEPTH stage reads.
 
@@ -595,7 +619,40 @@ def run_depth_stage(
             continue
         ui = np.clip(np.rint(uv[g, 0]).astype(int), 0, W - 1)
         vi = np.clip(np.rint(uv[g, 1]).astype(int), 0, H - 1)
-        a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc[g], backend.kind)
+        # THE FIT MUST NOT BE ANCHORED ON PIXELS NOBODY OBSERVED.
+        #
+        # `fill_u` marks what the face redactor blacked out and what this stage
+        # then handed to an inpainter. Masking those pixels out of the CLOUD
+        # afterwards -- which `run_fuse_stage` does -- removes the invented
+        # points but not the invented FIT they produced, and (a, b) is a global
+        # per-frame scale and offset applied to every surviving pixel. A fit
+        # derived from invention was being applied to the real scene.
+        #
+        # It was not rare. On the widest traverse, 25.3% of fit anchors landed
+        # in inpainted pixels on average, 30 gate-passing frames had over half
+        # their anchors there, and nine had essentially all of them -- one at
+        # 1.000, whose stored keyframe is entirely black, and which scored a
+        # 1.88% held-out residual against the world's 2.9% median.
+        #
+        # THE GATE COULD NOT SEE IT, AND PREFERRED IT. Both halves of the
+        # held-out split come from the same anchors in the same invented
+        # region, and a TELEA inpaint is a smooth interpolant that an affine
+        # model fits very well -- so more invention scored better. Re-anchoring
+        # those 30 frames on clean points alone moves the depth by a median
+        # 12.8% and a maximum of 467%, and three of them flip to a negative `a`,
+        # the value the fusion stage explicitly refuses.
+        clean = ~fill_u[vi, ui].astype(bool)
+        n_clean = int(clean.sum())
+        if n_clean < params.min_sparse_points:
+            records.append({"ki": int(ki), "ok": False,
+                            "why": (f"only {n_clean} sparse anchors outside the "
+                                    "redaction fill"),
+                            "anchors_total": int(g.sum()),
+                            "redaction_fill_fraction": fill_fraction})
+            continue
+        ui, vi = ui[clean], vi[clean]
+        zc_fit = zc[g][clean]
+        a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc_fit, backend.kind)
         # float16: the depth values run 0.2-40 in world units and the pipeline's
         # own error is a few percent, so three significant digits is far more
         # than the evidence supports -- and it halves the largest thing this
@@ -603,8 +660,13 @@ def run_depth_stage(
         np.save(work / "depth" / f"{ki:05d}.npy", disp.astype(np.float16))
         records.append({"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
                         "n_points": int(g.sum()), "held_out_rel": ho,
-                        "z_sparse_min": float(np.min(zc[g])),
-                        "z_sparse_max": float(np.max(zc[g])),
+                        # From the CLEAN anchors, for the same reason the fit
+                        # is: a bound computed from invented pixels bounds
+                        # nothing.
+                        "z_sparse_min": float(np.min(zc_fit)),
+                        "z_sparse_max": float(np.max(zc_fit)),
+                        "anchors_used": int(len(zc_fit)),
+                        "anchors_in_fill": int(g.sum()) - int(len(zc_fit)),
                         "redaction_fill_fraction": fill_fraction,
                         "image_origin": origin})
 
@@ -1100,8 +1162,8 @@ def densify(
                         (root / "status.json").read_text()).get("input_digest")
                 except (OSError, ValueError):
                     existing_digest = None
-            same_params = (_output_params(existing.get("params") if existing else {})
-                           == _output_params(params.as_dict()))
+            same_params = _params_match(
+                (existing or {}).get("params") or {}, params.as_dict())
             # A digest of None must not match another None. A solve
             # without an input_digest and a manifest without one would
             # otherwise compare equal and short-circuit a rebuild that
