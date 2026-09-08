@@ -252,6 +252,63 @@ dense stage itself is a new module, a new script, and two opt-in flags.
 5. **Scale remains unknown**, unchanged and explicitly so.
 6. **The corpus limits the claim.** Only a handful of captures are true walks.
 
+## 11. Exact reproduction
+
+Python is `C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe`,
+called `%PY%` below. `PYTHONPATH` must point at this worktree's `tower` so the
+new modules are the ones imported.
+
+```
+set PYTHONPATH=C:\Users\tvllo\Projects\Glasses-worktrees\wb-dense\tower
+cd C:\Users\tvllo\Projects\Glasses-worktrees\wb-dense\tower
+
+:: the dense unit tests
+%PY% -m pytest tests/test_world_builder_dense.py -q
+
+:: regression: everything outside World Builder
+%PY% -m pytest tests/ -q -p no:randomly -k "not world"
+
+:: densify one of the walk worlds solved during this work
+%PY% scripts/world_densify.py ^
+    --world-root C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\worlds\single-7febdae8-widest-traverse ^
+    --world 1b8812b1102543eabb559241c32a4ef0 --keep-intermediates
+
+:: score it against the sparse points, which are independent evidence
+%PY% C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\proto\score_cloud.py ^
+    --npz <world>\dense\<session>\fused.npz --solve <world>\solve\<session>
+
+:: the whole lifecycle from a stored capture, including densify
+%PY% scripts/world_replay.py --captures 0bbc2b7e4540436fbc7018e8ae05cc37 ^
+    --capture-root C:\Users\tvllo\Projects\Glasses\tower\data\captures ^
+    --root C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\e2e ^
+    --intrinsics-from C:\Users\tvllo\Projects\Glasses-scratch\wbrecon\live\0906\intrinsics ^
+    --solve --densify --format json
+```
+
+To look at a world in a browser, build its page with
+`tower.world_builder.dense_render.build_dense_page(store, world_id, session_id)`,
+write it to a file, and serve the directory with `python -m http.server`.
+`file://` will not do: Chrome refuses to treat it as a page.
+
+## 12. Where things are
+
+| what | where |
+| --- | --- |
+| Branch | `world-builder/dense-reconstruction-v1` |
+| Worktree | `C:\Users\tvllo\Projects\Glasses-worktrees\wb-dense` |
+| New Tower code | `tower/tower/world_builder/dense.py`, `dense_pipeline.py`, `dense_render.py`, `dense_viewer.html` |
+| New script | `tower/scripts/world_densify.py` |
+| Changed | `world_build_session.py`, `world_replay.py` (`--densify`), `world_builder_library.py`, `world_builder_render.py`, `routes/geometry.py` |
+| Tests | `tower/tests/test_world_builder_dense.py` |
+| Twelve new solves | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\worlds\` |
+| Prototypes and analysis | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\proto\` |
+| Audits and research | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\reports\` |
+| Rendered comparisons | `...\wb-dense\walk1_views\`, `walk2_views\`, `run1\` |
+
+**Nothing under `C:\Users\tvllo\Projects\Glasses\tower\data` was modified**,
+apart from copying two worlds into a scratch root for testing. The 97 source
+captures are byte-identical to how they started.
+
 ## 11. What still requires physical validation
 
 - **Nothing on iOS was compiled or run.** There is no Mac in this environment.
