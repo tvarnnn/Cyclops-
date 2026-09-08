@@ -357,10 +357,16 @@ write it to a file, and serve the directory with `python -m http.server`.
 | New script | `tower/scripts/world_densify.py` |
 | Changed | `world_build_session.py`, `world_replay.py` (`--densify`), `world_builder_library.py`, `world_builder_render.py`, `routes/geometry.py` |
 | Tests | `tower/tests/test_world_builder_dense.py` |
-| Twelve new solves | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\worlds\` |
-| Prototypes and analysis | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\proto\` |
-| Audits and research | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\reports\` |
-| Rendered comparisons | `...\wb-dense\walk1_views\`, `walk2_views\`, `run1\` |
+| Twelve new solves | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\worlds\`, plus `testroot\` (two migrated worlds) |
+| Prototypes and analysis | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\proto\` — including `gate_sensitivity.py`, which prints the gate sweep §6 refers to |
+| Audits and research | `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense\reports\` — `14-` and `15-` are the two adversarial reviews |
+| Depth-model bake-off | `...\wb-dense\bakeoff\` — `main\` is the 24-model run, `cross\` and `cross2\` the two held-out solves, `tbl_cross_final.md` the result |
+| Rendered comparisons, final | `...\wb-dense\renders\final\` — re-rendered from the shipped artifacts |
+| Rendered comparisons, historical | `...\wb-dense\walk1_views\`, `walk2_views\`, `run1\` |
+| Viewer pages built for inspection | `...\wb-dense\viewer-pages\` — `mobile-*.html` are what the phone receives |
+
+Everything in that scratch tree is disposable. Nothing in it is required to
+build, run, test or serve a world.
 
 **Nothing under `C:\Users\tvllo\Projects\Glasses\tower\data` was modified**,
 apart from copying two worlds into a scratch root for testing. The 97 source
