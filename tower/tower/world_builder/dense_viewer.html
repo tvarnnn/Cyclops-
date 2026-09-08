@@ -82,16 +82,10 @@
     return;
   }
   var N = CONFIG.points;
-  var dv = new DataView(bytes.buffer);
-  var pos = new Float32Array(N * 3), col = new Uint8Array(N * 3), cf = new Float32Array(N);
-  for (var k = 0; k < N; k++) {
-    var o = k * STRIDE;
-    pos[k*3] = dv.getFloat32(o, true);
-    pos[k*3+1] = dv.getFloat32(o+4, true);
-    pos[k*3+2] = dv.getFloat32(o+8, true);
-    col[k*3] = bytes[o+12]; col[k*3+1] = bytes[o+13]; col[k*3+2] = bytes[o+14];
-    cf[k] = bytes[o+15];
-  }
+  // The 16-byte record is already a legal interleaved vertex layout, so it goes
+  // to the GPU as-is. De-interleaving it into three typed arrays first cost a
+  // six-million-iteration JS loop and roughly doubled peak heap at its worst
+  // moment, for nothing.
 
   // ---- gl ---------------------------------------------------------------
   var cv = document.getElementById("gl");
@@ -104,21 +98,26 @@
     "attribute vec3 aPos; attribute vec3 aCol; attribute float aConf;",
     "uniform mat4 uMVP; uniform float uSize; uniform float uMinConf; uniform float uByConf;",
     "uniform float uMaxConf; uniform float uSizeCap;",
-    "varying vec3 vCol; varying float vDrop;",
+    "varying vec3 vCol;",
     "void main(){",
-    "  vDrop = aConf < uMinConf ? 1.0 : 0.0;",
     "  vec4 p = uMVP * vec4(aPos,1.0);",
+    "  if (aConf < uMinConf) {",
+    // Cull HERE, not with a discard in the fragment shader. A discarded point
+    // has already been rasterised into a full sprite, so at a high threshold on
+    // a phone the filter can cost more than not filtering at all.
+    "    gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return;",
+    "  }",
     "  gl_Position = p;",
     // Scale with 1/w so points do not turn into confetti as you approach.
     "  gl_PointSize = clamp(uSize * 2.0 / max(p.w, 0.05), 1.0, uSizeCap);",
     "  float t = clamp(aConf/uMaxConf, 0.0, 1.0);",
     "  vec3 heat = vec3(0.15+0.85*t, 0.35*t+0.1, 1.0-0.85*t);",
-    "  vCol = mix(aCol/255.0, heat, uByConf);",
+    "  vCol = mix(aCol, heat, uByConf);",
     "}"
   ].join("\n");
   var FS = [
-    "precision mediump float; varying vec3 vCol; varying float vDrop;",
-    "void main(){ if (vDrop > 0.5) discard; gl_FragColor = vec4(vCol,1.0); }"
+    "precision mediump float; varying vec3 vCol;",
+    "void main(){ gl_FragColor = vec4(vCol,1.0); }"
   ].join("\n");
 
   function sh(t, src) {
@@ -136,19 +135,27 @@
   } catch (e) { die("Shader compilation failed: " + e); return; }
   gl.useProgram(prog);
 
-  function buf(data, size, name, type, norm) {
-    var b = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, b);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  function attrib(name, size, type, norm, offset) {
     var loc = gl.getAttribLocation(prog, name);
+    if (loc < 0) return;
     gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, size, type, !!norm, 0, 0);
+    gl.vertexAttribPointer(loc, size, type, !!norm, STRIDE, offset);
   }
-  try {
-    buf(pos, 3, "aPos", gl.FLOAT, false);
-    buf(col, 3, "aCol", gl.UNSIGNED_BYTE, false);
-    buf(cf, 1, "aConf", gl.FLOAT, false);
-  } catch (e) { die("The GPU refused a buffer of " + N + " points."); return; }
+  var vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
+  gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.STATIC_DRAW);
+  // bufferData does NOT throw when the GPU cannot allocate -- it sets
+  // OUT_OF_MEMORY and carries on, so a try/catch here would never fire.
+  var allocErr = gl.getError();
+  if (allocErr === gl.OUT_OF_MEMORY) {
+    die("The GPU could not allocate a buffer for " + N.toLocaleString() +
+        " points. Another tab or application may be holding video memory.");
+    return;
+  }
+  attrib("aPos", 3, gl.FLOAT, false, 0);
+  attrib("aCol", 3, gl.UNSIGNED_BYTE, true, 12);
+  attrib("aConf", 1, gl.UNSIGNED_BYTE, false, 15);
 
   var uMVP = gl.getUniformLocation(prog, "uMVP"),
       uSize = gl.getUniformLocation(prog, "uSize"),
@@ -168,6 +175,18 @@
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.055, 0.059, 0.071, 1);
 
+  // The observed field failure. Without this the canvas simply freezes and the
+  // page looks broken with no explanation.
+  var lost = false;
+  cv.addEventListener("webglcontextlost", function (e) {
+    e.preventDefault(); lost = true;
+    die("The browser dropped the graphics context, usually because another " +
+        "application needed the video memory. Reload to try again.");
+  }, false);
+  cv.addEventListener("webglcontextrestored", function () {
+    location.reload();
+  }, false);
+
   // ---- camera -----------------------------------------------------------
   var C = CONFIG.centre || [0,0,0];
   var lo = CONFIG.bbox_min || [-1,-1,-1], hi = CONFIG.bbox_max || [1,1,1];
@@ -182,7 +201,7 @@
     // and solving the angles back out of it.
     var n = Math.hypot(fx, fy, fz) || 1;
     fx /= n; fy /= n; fz /= n;
-    dist = Math.max(span * 0.03, span * 0.10);
+    dist = span * 0.10;
     target = [cx + fx * dist, cy + fy * dist, cz + fz * dist];
     pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, fy)))));
     yaw = Math.atan2(-fx, -fz);
@@ -344,6 +363,7 @@
       if (keys["e"]) mv[1]+=v;
       target[0]+=mv[0]; target[1]+=mv[1]; target[2]+=mv[2];
     }
+    if (lost) return;
     var w = cv.clientWidth || 1, h = cv.clientHeight || 1;
     var dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (cv.width !== (w*dpr|0) || cv.height !== (h*dpr|0)) {
