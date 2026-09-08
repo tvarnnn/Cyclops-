@@ -852,6 +852,70 @@ fusion parameter afterwards. That is the one place where the live investigation
 (D19) and this measurement point at the same feature: a live coverage cue is
 worth more than any offline parameter in this block.
 
+---
+
+## D21. The fit is anchored only on observed pixels, and cleaning it up made the reconstruction bigger
+
+**The defect.** The face redactor blacks out regions; this stage inpaints them
+so the blackness does not drag the network's estimate for the whole frame; and
+`run_fuse_stage` masks the inpainted pixels out of the cloud, so nothing
+invented is published. That was the story, and it had a hole in the middle:
+**the per-frame affine fit was never told about the mask.**
+
+The fit matches network output to the sparse points the solve placed, at those
+points' pixels. Some of those pixels are inside the inpainted region. The
+resulting `(a, b)` is a single scale and offset for the WHOLE frame, so a fit
+derived from invented pixels was applied to every real pixel that survived.
+Masking the cloud removes the invented points; it cannot remove the invented
+fit they produced.
+
+**How common.** On the widest traverse, measured against the retained per-frame
+fill masks: 25.3% of fit anchors inside inpainted pixels on average, median
+8.1%, p90 83.8%. Thirty gate-passing frames had over half their anchors there
+and nine had essentially all -- one at 1.000, whose stored keyframe is entirely
+black.
+
+**Why the gate could not catch it, and preferred it.** Both halves of the
+held-out split are drawn from the same anchors in the same invented region, and
+a TELEA inpaint is a smooth interpolant that an affine model fits very well. So
+more invention scored BETTER. The 1.000 frame scored a 1.88% held-out residual
+against that world's 2.9% median. Re-anchoring those thirty frames on clean
+points alone moves their depth by a median 12.8% and a maximum of 467%, and
+three flip to a negative scale -- the value the fusion stage explicitly refuses.
+
+**The fix** is to exclude anchors inside the fill before fitting, refuse a frame
+with fewer than `min_sparse_points` clean ones, and take the extrapolation bound
+from the same clean set. The mask was already in scope four lines above.
+
+**The result was the opposite of what I expected, and that is the interesting
+part.** Refusing evidence should shrink the reconstruction. It grew:
+
+| world | frames used, before -> after | held-out residual | L0 points |
+| --- | --- | --- | --- |
+| `7d31e8d7` | 316 -> **344** of 429 | 2.6% -> **2.4%** | 8.22 -> **8.48 M** |
+| `1b8812b1` | 303 -> **314** of 438 | 2.9% -> **2.7%** | 8.65 -> **9.35 M** |
+| `672578d0` | 298 -> **306** of 425 | 3.8% -> **3.5%** | 14.75 -> **14.96 M** |
+| `6427900d` | 132 -> **139** of 266 | 5.4% -> **5.0%** | 3.57 -> **3.89 M** |
+| `ecc02df1` | 50 -> **55** of 77 | 5.3% -> **4.3%** | 2.09 -> **2.21 M** |
+
+More frames pass, residuals fall, clouds grow, and coverage rises on the two
+worst worlds (bathroom 67.5% to 71.4%, replay 82.1% to 83.8%). The explanation
+is that the corrupted anchors were not only flattering the frames they rescued
+-- they were also pushing OTHER frames' fits far enough off to fail the gate
+honestly. Removing them costs a handful of frames that had nothing real to fit
+and rescues rather more that did.
+
+The fused-cloud depth error is close to unchanged -- 2.3% to 2.5% on the desk
+world, 5.3% to 5.1% on the chain -- so this is coverage bought at the same
+accuracy, on a more defensible fit.
+
+**The lesson.** The pipeline's honesty rests on two mechanisms, an anchor and a
+gate. This defect corrupted the anchor and was invisible to the gate BECAUSE
+the gate is scored on the same anchors. A check that draws its evidence from
+the thing it is checking cannot see that thing being wrong -- which is the same
+shape as the finding in §11.6, arrived at from a completely different
+direction on the same day.
+
 ## Open, being decided by measurement
 
 Two of the three questions this section opened with have been answered by

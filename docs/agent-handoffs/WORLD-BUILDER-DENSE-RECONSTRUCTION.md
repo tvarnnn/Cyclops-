@@ -66,14 +66,14 @@ document described the current one:
 
 | world | environment | posed | frames used | held-out align residual | L0 points |
 |---|---|---|---|---|---|
-| `7d31e8d7` | desk and shelf | 429 | 316 | 2.6% | 8.22 M |
-| `1b8812b1` | widest traverse | 438 | 303 | 2.9% | 8.65 M |
-| `37e497f8` | bedroom walk | 196 | 134 | 3.4% | 4.85 M |
-| `672578d0` | bedroom, closet, desk | 425 | 298 | 3.8% | 14.75 M |
-| `a378331a` | closet walk | 201 | 117 | 4.9% | 5.05 M |
-| `ecc02df1` | dresser | 77 | 50 | 5.3% | 2.09 M |
-| `6427900d` | bathroom, tight | 266 | 132 | 5.4% | 3.57 M |
-| `fc58a64d` | end-to-end replay | 198 | 169 | 4.1% | 8.43 M |
+| `7d31e8d7` | desk and shelf | 429 | 344 | 2.4% | 8.48 M |
+| `1b8812b1` | widest traverse | 438 | 314 | 2.7% | 9.35 M |
+| `672578d0` | bedroom, closet, desk | 425 | 306 | 3.5% | 14.96 M |
+| `37e497f8` | bedroom walk | 196 | 139 | 3.5% | 5.23 M |
+| `fc58a64d` | end-to-end replay | 198 | 175 | 4.0% | 8.81 M |
+| `ecc02df1` | dresser | 77 | 55 | 4.3% | 2.21 M |
+| `a378331a` | closet walk | 201 | 114 | 4.9% | 5.31 M |
+| `6427900d` | bathroom, tight | 266 | 139 | 5.0% | 3.89 M |
 
 The residual column is gate-conditioned; §6 and `01-EVIDENCE.md` §11.3 say what
 that means and print the other end. The eighth row replaces an older replay
@@ -151,8 +151,8 @@ scored on odd), across the seven worlds:
 
 | | all posed frames | frames passing the 8% gate |
 |---|---|---|
-| best world (`7d31e8d7`) | 2.6% | 2.2% |
-| worst world (`6427900d`) | 5.4% | 3.8% |
+| best world (`7d31e8d7`) | 2.4% | 2.1% |
+| worst world (`6427900d`) | 5.0% | 3.9% |
 | signed bias, per frame | +0.03% (unbiased) | — |
 
 **The right-hand column is a property of the gate.** It is the median of a
@@ -165,9 +165,9 @@ left column when describing the pipeline.
 
 | | median | p90 | pixel coverage |
 |---|---|---|---|
-| best (`7d31e8d7`) | 2.3% | 12.7% | 97.9% |
-| worst median (`37e497f8`) | 5.4% | 7.2% | 96.2% |
-| worst tail (`6427900d`, tight bathroom) | 4.4% | **57.6%** | 67.5% |
+| best (`7d31e8d7`) | 2.5% | 16.5% | 98.1% |
+| worst median (`37e497f8`) | 5.6% | 7.6% | 96.2% |
+| worst tail (`6427900d`, tight bathroom) | 4.4% | **59.9%** | 71.4% |
 
 The tail is the finding, not the median. Two worlds — the tight bathroom and the
 three-room chain — carry a p90 an order of magnitude above their own median,
@@ -318,7 +318,7 @@ The dense field is not a meaningful part of it.
 
 1. **Coverage.** Roughly half a typical view is filled. Textureless walls and
    ceilings are genuinely unreconstructable at this resolution and stay empty.
-2. **Frames used.** 50-74% across the seven worlds — so the gate drops between a
+2. **Frames used.** 52-88% across the eight worlds — so the gate drops between a
    quarter and half of every walk. `align.json` records why each frame was
    dropped; the dominant causes are blur and heavy redaction fill.
 3. **Points, not surfaces.** There is no mesh, so occlusion is imperfect and you

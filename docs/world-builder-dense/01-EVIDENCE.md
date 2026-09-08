@@ -322,53 +322,60 @@ the same way each time. These are those numbers.
 
 ### 11.1 Per world
 
-| world | what it is | posed | used | held-out residual | L0 points | L0 size | wall clock |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `7d31e8d7` | desk and shelf | 429 | 316 | 2.6% | 8.22 M | 132 MB | 230 s |
-| `1b8812b1` | widest traverse | 438 | 303 | 2.9% | 8.65 M | 139 MB | 206 s |
-| `37e497f8` | bedroom | 196 | 134 | 3.4% | 4.85 M | 78 MB | 96 s |
-| `672578d0` | bedroom, closet, desk | 425 | 298 | 3.8% | 14.75 M | 236 MB | 210 s |
-| `a378331a` | closet | 201 | 117 | 4.9% | 5.05 M | 81 MB | 92 s |
-| `ecc02df1` | dresser | 77 | 50 | 5.3% | 2.09 M | 33 MB | 51 s |
-| `6427900d` | bathroom, tight | 266 | 132 | 5.4% | 3.57 M | 57 MB | 108 s |
+Re-derived after the fit stopped being anchored on inpainted pixels (D21).
+Every row is that world's own `manifest.json` and `align.json`.
 
-Peak VRAM for the depth stage is **2.4 GB**, up from 0.85 GB, and that is the
-price of the model change. Everything else is CPU and RAM.
+| world | what it is | posed | used | held-out residual | L0 points | L0 size |
+| --- | --- | --- | --- | --- | --- | --- |
+| `7d31e8d7` | desk and shelf | 429 | 344 | 2.4% | 8.48 M | 136 MB |
+| `1b8812b1` | widest traverse | 438 | 314 | 2.7% | 9.35 M | 150 MB |
+| `672578d0` | bedroom, closet, desk | 425 | 306 | 3.5% | 14.96 M | 239 MB |
+| `37e497f8` | bedroom | 196 | 139 | 3.5% | 5.23 M | 84 MB |
+| `fc58a64d` | end-to-end replay | 198 | 175 | 4.0% | 8.81 M | 141 MB |
+| `ecc02df1` | dresser | 77 | 55 | 4.3% | 2.21 M | 35 MB |
+| `a378331a` | closet | 201 | 114 | 4.9% | 5.31 M | 85 MB |
+| `6427900d` | bathroom, tight | 266 | 139 | 5.0% | 3.89 M | 62 MB |
+
+Peak VRAM for the depth stage is **2.4 GB**. Everything else is CPU and RAM.
+
+**The residual column is gate-conditioned** -- it is the median over the frames
+that PASSED, so it improves as the gate tightens and the reconstruction gets
+worse. §11.3 prints both ends.
 
 ### 11.2 The fused cloud, rendered at held-out cameras
 
-Not the per-frame residual above. This is the whole cloud re-rendered from
-cameras the fusion did not privilege, and depth read out of the render.
+The whole cloud re-rendered from cameras the fusion did not privilege, with
+depth read out of the render. Every row is an `eval.json` beside the artifact,
+written by `proto/score_cloud.py --out`.
 
-**Every row is an `eval.json` beside the artifact it describes**, written by
-`proto/score_cloud.py --out`. An adversarial review found that this table's
-first version cited nothing on disk: the numbers were real but had only ever
-been printed to a terminal, and a number nobody can re-derive is not evidence.
+**All eight rows now score the same object.** An earlier version of this table
+scored `fused.npz` on six worlds and `points_l0.bin` on the two that had been
+pruned -- an accident of which runs used `--keep-intermediates`, not a choice.
+The two clouds differ by the packing stage's percentile trim, about 1.2%, so
+the mixed rows were not comparable to each other.
 
-| world | points | depth error, median | depth error, p90 | pixel coverage, median |
+| world | points scored | depth error, median | depth error, p90 | pixel coverage |
 | --- | --- | --- | --- | --- |
-| `7d31e8d7` (desk and shelf) | 8.32 M | 2.3% | 12.7% | 97.9% |
-| `ecc02df1` (dresser) | 2.09 M | 3.3% | 5.4% | 97.0% |
-| `1b8812b1` (widest traverse) | 8.76 M | 3.3% | 6.6% | 96.8% |
-| `fc58a64d` (end-to-end replay) | 8.43 M | 4.2% | 6.0% | 82.1% |
-| `6427900d` (bathroom, tight) | 3.62 M | 4.4% | **57.6%** | 67.5% |
-| `a378331a` (closet) | 5.11 M | 4.6% | 5.6% | 60.1% |
-| `672578d0` (bedroom, closet, desk) | 14.93 M | 5.3% | **40.3%** | 97.9% |
-| `37e497f8` (bedroom) | 4.91 M | 5.4% | 7.2% | 96.2% |
+| `7d31e8d7` (desk and shelf) | 8.58 M | 2.5% | 16.5% | 98.1% |
+| `ecc02df1` (dresser) | 2.23 M | 3.2% | 5.2% | 96.8% |
+| `1b8812b1` (widest traverse) | 9.47 M | 3.6% | 6.0% | 97.2% |
+| `fc58a64d` (end-to-end replay) | 8.92 M | 4.3% | 5.4% | 83.8% |
+| `a378331a` (closet) | 5.38 M | 4.4% | 5.5% | 60.7% |
+| `6427900d` (bathroom, tight) | 3.94 M | 4.4% | **59.9%** | 71.4% |
+| `672578d0` (bedroom, closet, desk) | 15.14 M | 5.1% | **47.4%** | 97.9% |
+| `37e497f8` (bedroom) | 5.29 M | 5.6% | 7.6% | 96.2% |
 
-**The p90 column is the honest part of this table.** Two worlds carry a tail an
-order of magnitude worse than their own median. `6427900d` is the tight
-bathroom, where the walk never gets far enough from a surface for two cameras
-to disagree usefully, and `672578d0` is the three-room chain, where the far end
-of a long room is reconstructed from a handful of distant frames. In both, the
-median says the reconstruction is good and the p90 says part of it is not, and
-the confidence channel is what a viewer has to separate them with.
+**The p90 column is the honest part.** Two worlds carry a tail an order of
+magnitude above their own median: the tight bathroom, where the walk never gets
+far enough from a surface for two cameras to disagree usefully, and the
+three-room chain, where the far end of a long room is reconstructed from a
+handful of distant frames. The median says the reconstruction is good and the
+p90 says part of it is not; the confidence channel is what separates them.
 
-Coverage tells the same story from the other side: `a378331a` (closet) and
-`6427900d` (bathroom) cover 60-67% of the held-out frame where every other
-world covers 82-98%. Tight spaces are this pipeline's weakest case, and they
-are weakest for a structural reason rather than a tuning one -- multi-view
-consensus needs baseline, and a closet does not offer any.
+Coverage says the same from the other side. The closet and the bathroom cover
+61-71% of a held-out frame where every other world covers 84-98%. Tight spaces
+are the weakest case and the reason is structural: consensus needs baseline
+between cameras and a small room does not offer any.
 
 ### 11.3 What the gate does to the number
 
@@ -376,26 +383,27 @@ The held-out residual quoted in 11.1 is the median **of the frames that passed
 the 8% gate**. It is therefore a property of the gate as much as of the
 reconstruction, and it improves as the gate tightens while the reconstruction
 gets worse. Both ends, from `proto/gate_sensitivity.py` over the shipped
-artifacts (bracketed count is frames surviving that gate):
+artifacts; the bracketed count is frames surviving that gate.
 
 | world | posed | all frames | gate 0.16 | **gate 0.08 (shipped)** | gate 0.04 | gate 0.02 |
 |---|---|---|---|---|---|---|
-| `7d31e8d7` | 429 | 2.6% (399) | 2.3% (342) | **2.2% (317)** | 1.9% (262) | 1.3% (139) |
-| `1b8812b1` | 438 | 2.9% (373) | 2.5% (330) | **2.4% (303)** | 2.0% (227) | 1.4% (114) |
-| `37e497f8` | 196 | 3.4% (170) | 3.2% (154) | **3.0% (134)** | 2.6% (99) | 1.7% (29) |
-| `672578d0` | 425 | 3.8% (374) | 3.5% (337) | **3.2% (300)** | 2.8% (201) | 1.7% (28) |
-| `a378331a` | 201 | 4.9% (153) | 4.7% (139) | **4.4% (117)** | 3.3% (49) | 1.6% (1) |
-| `ecc02df1` | 77 | 5.3% (74) | 4.2% (61) | **3.7% (50)** | 2.8% (27) | 1.8% (2) |
-| `6427900d` | 266 | 5.4% (215) | 4.8% (179) | **3.8% (132)** | 2.5% (69) | 1.2% (22) |
+| `7d31e8d7` | 429 | 2.4% (407) | 2.2% (358) | **2.1% (344)** | 1.9% (290) | 1.3% (154) |
+| `1b8812b1` | 438 | 2.7% (369) | 2.5% (342) | **2.4% (314)** | 2.1% (248) | 1.4% (112) |
+| `672578d0` | 425 | 3.5% (359) | 3.3% (329) | **3.2% (307)** | 2.7% (211) | 1.7% (30) |
+| `37e497f8` | 196 | 3.5% (171) | 3.4% (159) | **3.1% (139)** | 2.5% (98) | 1.7% (26) |
+| `fc58a64d` | 198 | 4.0% (187) | 4.0% (184) | **3.9% (175)** | 3.3% (92) | 1.9% (4) |
+| `ecc02df1` | 77 | 4.3% (75) | 4.0% (63) | **3.7% (55)** | 2.8% (31) | 1.9% (4) |
+| `a378331a` | 201 | 4.9% (150) | 4.7% (136) | **4.4% (114)** | 3.3% (47) | 1.6% (1) |
+| `6427900d` | 266 | 5.0% (203) | 4.7% (184) | **3.9% (140)** | 2.5% (73) | 1.2% (21) |
 
-Tighten to 2% and the "accuracy" becomes 1.2-1.8% while `a378331a` keeps ONE
+Tighten to 2% and the "accuracy" becomes 1.2-1.9% while the closet keeps ONE
 frame. So: quote the all-frames column when describing the pipeline, quote a
 gate column only when comparing two configurations at the same gate, and never
-quote the best world as the pipeline's figure. Under the shipped model the gate
-moves the number by 0.2-1.6 points depending on the world; under the previous
-one it moved it by up to 3.4, which is most of what the earlier tables were
-reporting as quality.
+quote the best world as the pipeline's figure.
 
+The gate now moves the number by 0.1-1.1 points depending on the world, against
+0.2-1.6 before the fit was cleaned up (D21) and up to 3.4 under the previous
+depth network. As the fit gets more honest, the gate has less to do.
 
 ### 11.4 What changed against the previous default, and what did not
 
