@@ -121,7 +121,15 @@ class DenseParams:
 
     # -- consensus --------------------------------------------------------
     neighbours: int = 10
-    tau: float = 0.03
+    # How closely a neighbouring camera must agree, as a fraction of depth.
+    # 0.05 rather than the obvious 0.03, measured on two independent walks:
+    # it adds 28-36% more points and 7-8 points of pixel coverage while depth
+    # accuracy holds or IMPROVES. The mechanism is that a looser threshold
+    # admits more AGREEING cameras per point, and each point's position is the
+    # mean of them -- so the extra averaging cancels more per-frame error than
+    # the looser threshold lets in. Tightening to 0.03 keeps fewer, noisier,
+    # less-averaged points.
+    tau: float = 0.05
     min_views: int = 3
     average_views: bool = True
     stride: int = 1

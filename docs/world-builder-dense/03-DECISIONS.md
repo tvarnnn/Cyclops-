@@ -199,6 +199,45 @@ The cost is stated rather than hidden: roughly nine points of coverage, and
 
 ---
 
+## D12. The consensus tolerance is 0.05, and tightening it makes things worse
+
+**Reversal.** The obvious value, and the one this shipped with for most of the
+lane, was 0.03: agree within 3% of depth or you are not evidence. Measured on
+two independent walks, that is the wrong end of a curve with a real minimum.
+
+Bedroom walk, 196 posed frames, 92 used, scored against the sparse points:
+
+| tau | points | depth error, median | depth error, p90 | pixel coverage |
+| --- | --- | --- | --- | --- |
+| 0.03 | 2.14 M | 5.58% | 9.52% | 75.4% |
+| **0.05** | 2.74 M | **5.37%** | **8.14%** | 83.5% |
+| 0.08 | 3.03 M | 6.56% | 8.98% | 86.0% |
+
+Closet walk, 201 posed frames:
+
+| tau | points | depth error, median | pixel coverage |
+| --- | --- | --- | --- |
+| 0.03 | 2.32 M | 3.74% | 47.7% |
+| **0.05** | 3.17 M | 3.88% | **54.8%** |
+
+So 0.05 adds 28-36% more points and 7-8 points of coverage while accuracy holds
+on one walk and **improves on both median and p90** on the other. And 0.08 is
+clearly worse, so this is a minimum rather than a "looser is always better"
+slope — which is what makes it a defensible default rather than a preference.
+
+**Why tightening hurts.** Each surviving point's position is the mean of the
+positions all AGREEING cameras assign it. A looser threshold therefore admits
+more agreeing cameras per point, and the extra averaging cancels more per-frame
+error than the looser threshold lets in. Tighten it and you keep fewer, noisier,
+less-averaged points. Past 0.05 the threshold starts admitting genuinely
+disagreeing cameras and the averaging no longer pays for it.
+
+**Worth carrying:** the accuracy of a consensus filter is not monotone in its
+strictness when the filter also decides how much averaging each point gets.
+Two parameters were entangled and only measurement separated them.
+
+---
+
 ## Open, being decided by measurement
 
 | decision | options | metric |

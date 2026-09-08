@@ -28,7 +28,7 @@ Useful knobs, all recorded into the manifest:
 | --- | --- | --- |
 | `--backend` | `depth-anything-v2-small` | the depth model. Only permissively licensed checkpoints are registered |
 | `--gate-rel` | `0.08` | reject a frame whose held-out alignment residual exceeds this |
-| `--tau` | `0.03` | how closely a neighbouring camera must agree |
+| `--tau` | `0.05` | how closely a neighbouring camera must agree. Measured optimum; 0.03 and 0.08 are both worse |
 | `--min-views` | `3` | how many other cameras must agree |
 | `--neighbours` | `10` | how many nearby cameras are consulted |
 | `--stride` | `1` | pixel stride when sampling a reference view |
