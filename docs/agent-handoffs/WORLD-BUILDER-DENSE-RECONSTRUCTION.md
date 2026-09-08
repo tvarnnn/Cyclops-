@@ -237,6 +237,18 @@ That is the result that matters most for a change like this, because the only
 shared surface it touches is one additive key in the `GET /worlds` listing. The
 dense stage itself is a new module, a new script, and two opt-in flags.
 
+That one shared surface was also measured rather than assumed, since it adds a
+file read per session. Against the real store — 162 worlds, 66 sessions:
+
+| | |
+| --- | --- |
+| `GET /worlds` total | 512.9 ms |
+| of which the dense lookup | **2.6 ms (0.5%)** |
+| per session | 38.9 us |
+
+The 513 ms is pre-existing and is dominated by counting keyframe journal lines.
+The dense field is not a meaningful part of it.
+
 ## 10. Known weaknesses
 
 1. **Coverage.** Roughly half a typical view is filled. Textureless walls and
