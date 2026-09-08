@@ -3,10 +3,17 @@
 
 WHY THIS EXISTS
 
-The dense stage also runs automatically after a capture stops, but the whole
-development loop depends on being able to re-run it on worlds that already
-exist, with different parameters, without a new physical capture. That is the
-regression laboratory: seven solved worlds on disk, replayed as often as needed.
+**THIS IS THE ONLY WAY THE DENSE STAGE RUNS IN THE SERVED PRODUCT TODAY.**
+`world_build_session.py` accepts `--densify` and honours it, but `main.py`
+never passes it and no setting turns it on -- `config.py` has `world_autobuild`,
+`world_rebuild_every`, `world_register` and `world_solve`, and nothing dense. So
+a capture through the Tower produces a solved world and no dense artifact until
+somebody runs this. An earlier version of this docstring said the opposite.
+
+Beyond that, the whole development loop depends on being able to re-run it on
+worlds that already exist, with different parameters, without a new physical
+capture. That is the regression laboratory: seven solved worlds on disk,
+replayed as often as needed.
 
 It is also the migration path. Worlds solved before the dense stage existed get
 their dense artifact by running this; nothing about them is rewritten, and a

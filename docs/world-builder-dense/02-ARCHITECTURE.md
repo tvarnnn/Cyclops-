@@ -133,8 +133,14 @@ L0 is kept as an optional export for engineering, not as the product default.
 
 **Scale semantics are inherited unchanged and stated explicitly.** The manifest
 repeats `state: "unknown"`, `meters_per_unit: null`. The dense stage introduces
-no new scale claim, and because COLMAP normalises each component separately,
-only component 0 is densified.
+no new scale claim.
+
+Only component 0 is densified, and the reason stated here used to be wrong.
+It is not that COLMAP normalises each component separately: `global_solve.py`
+never calls `normalize()` at all, which `01-EVIDENCE.md` §10.1 records as an
+overturned belief. The real reason is the same fact from the other side --
+**nothing normalises anything**, so two components share no unit and no origin,
+and composing them into one cloud would put two different scales in one room.
 
 ## 5. Serving it — and the CSP constraint that decides the design
 
@@ -185,9 +191,17 @@ kills the whole process tree**, so this cannot simply be run inline at Stop.
 
 The design therefore is:
 
-- The dense stage runs **after the final build**, inside the existing
-  finalization block in `scripts/world_build_session.py`, where the writer lock
-  is already held and `finalization` is already `pending` on disk.
+- The dense stage runs **after the final build**, and — this sentence used to
+  say the opposite — **after the writer lock is released and after
+  `finalization` is already `complete` on disk**. `world_build_session.py`
+  marks finalization complete and releases the world in its `finally:` block,
+  and calls densify afterwards. That is deliberate: holding the writer lock for
+  the minutes this takes would block a new capture on the same world, and
+  `dense_pipeline.py`'s own `_DenseLock` docstring says so. The consequence to
+  know is that for the whole dense run the world reports `ready` and the
+  session reports `complete`, so a reader that treats those as "nothing is
+  running" is wrong; `dense/status.json` is the only record that a dense stage
+  is in progress.
 - It is **skipped entirely on a hard stop**, exactly as the final solve is, and
   records that it was skipped rather than failing.
 - It is **staged and resumable**: alignment, fusion and packing each write their

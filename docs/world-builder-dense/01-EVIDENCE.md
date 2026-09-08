@@ -193,9 +193,14 @@ From report 02:
   contains zero references to `world_builder`.
 - **`build()` is not Stop-only — it runs every 4 keyframes.** A dense stage must
   not hook there.
-- The hook point is `scripts/world_build_session.py`, between the final solve and
-  the final build: the writer lock is held and `finalization` is already
-  `pending` on disk.
+- The hook point is `scripts/world_build_session.py`, after the final build.
+  **This bullet used to say the writer lock is held and `finalization` is still
+  `pending`, and that describes a design that was not built.** What shipped
+  runs densify AFTER the `finally:` block that marks finalization complete and
+  releases the world -- deliberately, because holding the writer lock for the
+  minutes this takes would block a new capture on the same world. For the whole
+  dense run the world reports `ready` and the session `complete`, and
+  `dense/status.json` is the only record that anything is still running.
 - **`stop_grace_seconds = 30.0`** plus a Windows Job Object kills the whole
   process tree. A minutes-long dense job needs a raised grace, checkpointing, or
   an explicit skip-on-hard-stop.
