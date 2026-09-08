@@ -134,6 +134,19 @@ An interrupted run resumes with `scripts/world_densify.py`.
 RTX 5070, a stage that takes 90 s alone can take many minutes. Check
 `nvidia-smi` before concluding something is stuck.
 
+## 5b. Two things the manifest now records, and why you want them
+
+`input_digest` names the solve the cloud was fused from, so a world re-solved
+since it was densified is served with a BEHIND caption instead of silently.
+Artifacts packed before that key existed fall back to `status.json`.
+
+`dropped_outside_pack_box` counts the real observations the packing stage's
+percentile trim removed -- 98,652 of 8.2 M on the desk world, about 1.2%. It
+exists because a handful of points at extreme depth survive consensus (several
+nearby frames making the same error) and otherwise stretch the bounding box and
+with it the viewer's opening framing. It is the one mechanism in this pipeline
+that discards real observations, so it is counted where anyone can see it.
+
 ## 6. What the artifact costs
 
 Measured, per world, on the datasets used here:
