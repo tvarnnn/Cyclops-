@@ -215,6 +215,28 @@ matrix multiplied view by projection instead of projection by view. That
 compiles, links, uploads 393,216 points, reports 69 fps, and paints an entirely
 black canvas.
 
+**And one was caught by a test of the fix rather than of the code:** an escaping
+change written through a shell heredoc had its escape sequences collapsed, so it
+became a no-op that *also* replaced every space in the JSON config with a
+JavaScript line terminator. Worse than doing nothing, and invisible on
+inspection.
+
+### Regression evidence
+
+Every test outside World Builder, on this branch:
+
+```
+2163 passed, 59 skipped, 771 deselected, 1 xfailed in 537.76s
+```
+
+That covers CV Lab, Object Memory, Document Memory, Scene Understanding, the
+shared camera transport, session lifecycle, listener resilience and process
+cleanup. **No failures.**
+
+That is the result that matters most for a change like this, because the only
+shared surface it touches is one additive key in the `GET /worlds` listing. The
+dense stage itself is a new module, a new script, and two opt-in flags.
+
 ## 10. Known weaknesses
 
 1. **Coverage.** Roughly half a typical view is filled. Textureless walls and
