@@ -74,8 +74,33 @@ final class TowerSmokeUITests: XCTestCase {
     /// Swipe the screen up until `element` is on it and can be hit. The
     /// workspaces are long scroll views and the drawer is a half-height
     /// sheet, so most of what these tests touch starts below the fold.
+    ///
+    /// **Settle before swiping.** This used to swipe the moment the first
+    /// hittability check failed, and that is a trap for anything near the top
+    /// of a workspace. A sheet dismissing over the target reads as
+    /// not-hittable for a few hundred milliseconds; one `swipeUp` then scrolls
+    /// a control that was already on screen up past the top, and because this
+    /// only ever swipes *up* it can never come back — so the loop spends its
+    /// whole timeout scrolling away from the thing it is looking for.
+    ///
+    /// That is not hypothetical: it is what made
+    /// `testASavedWorldsPictureOpensInsideTheApp` fail at `reveal(picture)`
+    /// straight after the picker closed. Instrumenting the same step showed
+    /// the button `exists`, `isEnabled` and `isHittable` once the dismissal
+    /// animation had finished — the product was right and the helper was
+    /// racing it. The swipe loop below is unchanged, so nothing that was
+    /// asserted is weakened: an element that is absent, disabled or genuinely
+    /// occluded still fails. The cost is a flat `settle` seconds on any call
+    /// where the element really is below the fold, which raises this helper's
+    /// worst case from `timeout` to `timeout + settle`.
     @discardableResult
-    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 10) -> Bool {
+    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 10,
+                        settle: TimeInterval = 2) -> Bool {
+        let settleDeadline = Date().addingTimeInterval(settle)
+        while Date() < settleDeadline {
+            if element.exists && element.isHittable { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if element.exists && element.isHittable { return true }
