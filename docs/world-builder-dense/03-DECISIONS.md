@@ -737,19 +737,35 @@ is a weaker witness, so the points that only a wider search can rescue are
 systematically the worse ones, and the median -- which they do not reach --
 barely moves while the tail they land in gets heavier.
 
-That is a bad trade for a world already at 98% coverage. Whether it is a bad
-trade for the closet and the bathroom, which cover 60-67%, is a different
-question with a different answer, and it is the sweep worth running next:
-`scripts/neighbours_sweep_closet.sh`. The parameter stays at 10 until that
-measurement exists, because the honest reason for a default is a measurement
-and not a plausible story.
+That is a bad trade for a world already at 98% coverage. **The world that
+matters is the one with the gap**, so the same sweep was run on the closet walk,
+which covers 60%:
 
-**What this rules out.** It rules out the cheap fix for the incomplete
-enclosure. The walls that are missing are not missing because the search was
-too narrow; a search three times wider finds ten percent more points and puts
-most of them in the error tail. Closing the enclosure honestly needs more
-observations, not more searching -- which is a capture problem, not a fusion
-one.
+| neighbours | L0 points | depth error, median | depth error, p90 | coverage |
+| --- | --- | --- | --- | --- |
+| **10 (shipped)** | 5.11 M | **4.57%** | **5.62%** | 60.1% |
+| 16 | 4.96 M (**-3%**) | 4.96% | 5.71% | 60.9% |
+
+**On the world with the coverage gap it is worse in every column but one.**
+Fewer points, not more; accuracy down four tenths of a point; and eight tenths
+of a point of coverage bought with all of it. The desk world's extra points came
+from a scene that already had witnesses everywhere; the closet has a coverage
+gap because nothing looked at those surfaces twice, and no width of search finds
+a camera that does not exist.
+
+(The 24- and 32-neighbour rows were still fusing when this was written. The
+trend across six measured configurations on two worlds is one-directional and
+the decision does not wait on them; `sweep-closet/` holds them when they land.)
+
+**What this rules out, and it is the useful part.** It rules out the cheap fix
+for the incomplete enclosure. The walls that are missing are not missing because
+the search was too narrow: on the world that has them, widening the search
+returns *fewer* points. Closing the enclosure honestly needs more observations
+of the surfaces that have none -- which is a capture problem, and the product
+answer is to tell the wearer while they are still in the room, not to tune a
+fusion parameter afterwards. That is the one place where the live investigation
+(D19) and this measurement point at the same feature: a live coverage cue is
+worth more than any offline parameter in this block.
 
 ## Open, being decided by measurement
 
