@@ -99,7 +99,8 @@ slightly HIGHER than a naive reading would suggest:
 | `format` | string | `wb-dense-points/1`. Compare for equality; ignore the subtree on a mismatch |
 | `record`, `endian`, `stride_bytes` | string, string, int | The layout above, stated so a reader need not assume it |
 | `confidence_meaning` | string | Prose, for a person |
-| `min_confidence` | int | Points below this were never written |
+| `min_confidence` | int | Points below this were never written. **Inert at its default**: the consensus filter already requires `min_views` other cameras, so the lowest confidence any point can carry is `min_views` (3, measured as the minimum on every artifact). It is a floor a stricter operator can raise, not a filter doing work today |
+| `dropped_outside_pack_box` | int | How many real observations §6 rule 5 removed |
 | `canonical_level`, `mobile_level` | int | Indices into `levels` |
 | `median_scene_depth` | number | In world units. Every length in this artifact is a fraction of it |
 | `bbox_min`, `bbox_max` | [3] number | Robust bounds (0.2 / 99.8 percentile), not extrema |
@@ -152,9 +153,28 @@ mechanisms enforce that, and each is a refusal:
    completion. Poisson and Delaunay are closure methods, watertight by
    construction, and would turn "never observed" into "surface here".
 
+There is a fifth mechanism and it is the one that removes REAL observations, so
+it is stated separately rather than counted among the refusals:
+
+5. **The packed ladder drops points outside a central percentile box**
+   (`params.pack_percentile`, 0.2% per axis by default). A handful of points at
+   extreme depth survive consensus because several nearby frames made the same
+   error, and they stretch the bounding box and with it the viewer's opening
+   framing. The manifest records `dropped_outside_pack_box`, so the count is
+   visible in every artifact. This was hard-coded and undeclared until an
+   adversarial review found it.
+
 **An empty region means the observations did not support geometry there.** That
 is a load-bearing guarantee for spatial memory, and any future change that fills
 holes must break this format identifier rather than quietly relax it.
+
+**Two things that guarantee does NOT cover, and a reader must know both.**
+First, the page a phone is served is COARSER than the artifact and may be
+thinned to fit a byte budget; §9 says how, and the page says so itself. Second,
+a point cloud occludes only where it has points, so a region whose near surface
+was dropped is not merely empty — you see the geometry BEHIND it. Measured on
+45 sampled capture poses, 13% show that badly enough to mislead, with the poses
+themselves correct to under 1.7 px. `01-EVIDENCE.md` §11.5 has the measurement.
 
 ## 7. Privacy
 

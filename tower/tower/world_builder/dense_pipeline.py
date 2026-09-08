@@ -793,10 +793,14 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
     voxels = params.voxels_for(median_depth)
     m = F >= params.min_confidence
     X, C, F = X[m], C[m], F[m]
-    lo = np.percentile(X, 0.2, 0)
-    hi = np.percentile(X, 99.8, 0)
-    inb = np.all((X >= lo) & (X <= hi), 1)
-    X, C, F = X[inb], C[inb], F[inb]
+    # A declared parameter, recorded in the manifest below. See DenseParams.
+    dropped_outside_box = 0
+    if params.pack_percentile > 0:
+        lo = np.percentile(X, params.pack_percentile, 0)
+        hi = np.percentile(X, 100.0 - params.pack_percentile, 0)
+        inb = np.all((X >= lo) & (X <= hi), 1)
+        dropped_outside_box = int(len(X) - int(inb.sum()))
+        X, C, F = X[inb], C[inb], F[inb]
 
     levels = []
     for i, v in enumerate(voxels):
@@ -813,6 +817,9 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
         "confidence_meaning":
             "number of independent cameras whose depth agreed with this point",
         "min_confidence": params.min_confidence,
+        # How many real observations the percentile box removed. A filter that
+        # drops points has to be visible in the artifact it produced.
+        "dropped_outside_pack_box": dropped_outside_box,
         "canonical_level": params.canonical_level,
         "mobile_level": params.mobile_level,
         "median_scene_depth": median_depth,

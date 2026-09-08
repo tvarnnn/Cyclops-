@@ -187,7 +187,22 @@ class DenseParams:
     lod_depth_fractions: tuple[float, ...] = (0.003, 0.0065, 0.013)
     canonical_level: int = 1
     mobile_level: int = 2
+    # Every point below this is dropped before the ladder is written. The
+    # consensus filter already requires `min_views` OTHER cameras, so the
+    # lowest confidence any surviving point can carry is `min_views`, which is
+    # 3 -- measured as the minimum on all eight artifacts. This threshold is
+    # therefore INERT at its default and kept as a floor a stricter operator
+    # can raise, not as a filter that is doing work today. The contract used to
+    # advertise it as one.
     min_confidence: int = 2
+    # The packed ladder also drops points outside this central percentile box
+    # on each axis. It exists because a handful of points at extreme depth,
+    # surviving consensus because several nearby frames made the SAME error,
+    # otherwise stretch the bounding box and with it the viewer's whole opening
+    # framing. It was hard-coded and undeclared, which meant a filter that
+    # removes real observations did not appear in the manifest, in the params,
+    # or in the format's list of the four things it refuses.
+    pack_percentile: float = 0.2
 
     # -- housekeeping ------------------------------------------------------
     # A 438-keyframe world leaves 601 MB behind, of which about 470 MB is
