@@ -60,8 +60,10 @@ cd tower
 `--densify` requires `--solve`; the dense stage is anchored to the global
 solution and there is nothing to anchor to without one.
 
-Measured on capture `0bbc2b7e…`: 327 frames staged, 58 keyframes, 26 used,
-730,426 points, dense stage 105 s inside a 144 s total.
+Measured on capture `20ce3c23…`, replayed at the shipped configuration:
+1709 frames staged, 198 posed keyframes, 169 used, 8.43 M points,
+45 s of depth and 67 s of fusion inside a 188 s total. The intermediates
+were pruned on success and the artifact left is 167 MB.
 
 ## 3. After a live capture
 
