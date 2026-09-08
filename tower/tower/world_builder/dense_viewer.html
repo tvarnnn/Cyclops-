@@ -337,10 +337,22 @@
 
   var note = document.getElementById("note");
   var sc = (CONFIG.scale || {}).state;
-  note.textContent =
-    "Confidence is how many cameras agreed on a point. Empty space means the "
-    + "capture did not support geometry there — nothing is filled in. Scale is "
-    + (sc === "unknown" ? "unknown, so distances here are not metres." : String(sc) + ".");
+  // Empty space has THREE causes and it would be dishonest to name only one.
+  // Saying "the capture did not support geometry there" while the page is
+  // showing a fifth of the points, thinned to fit the device, blames the
+  // capture for a choice this page made.
+  var parts = ["Confidence is how many cameras agreed on a point."];
+  var full = CONFIG.source_points || CONFIG.points;
+  if (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined) {
+    parts.push("This view shows " + CONFIG.points.toLocaleString() + " of " +
+               full.toLocaleString() + " points, the best-supported ones, to fit " +
+               "this device — so some gaps are thinning, not missing geometry.");
+  }
+  parts.push("Elsewhere, empty means the cameras did not agree on geometry there, " +
+             "or the region was removed by face redaction. Nothing is filled in.");
+  parts.push("Scale is " + (sc === "unknown"
+             ? "unknown, so distances here are not metres." : String(sc) + "."));
+  note.textContent = parts.join(" ");
 
   // ---- draw -------------------------------------------------------------
   var last = performance.now(), fps = 0;

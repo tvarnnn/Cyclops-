@@ -387,13 +387,15 @@ def test_dense_prefers_the_worlds_redacted_keyframe_over_the_raw_capture(tmp_pat
     raw.write_bytes(b"RAW-WITH-A-FACE")
     red = _StubRedactor()
 
-    data, origin, raw_bytes = keyframe_image_bytes(
+    data, origin, fill = keyframe_image_bytes(
         _StubStore(images), "w", "s", "s:00000042", str(raw), red
     )
     assert data == b"REDACTED-KEYFRAME"
     assert origin == "world-keyframe"
-    assert red.calls == 0                      # the raw frame was never opened
-    assert raw_bytes is None                   # and is not handed on either
+    assert red.calls == 0                      # no re-redaction was needed
+    # The third value is a MASK, never pixels. Raw bytes do not leave the
+    # boundary function, so a caller cannot reconstruct from them by mistake.
+    assert fill is None or getattr(fill, "dtype", None) == bool
 
 
 def test_dense_re_redacts_when_the_worlds_keyframe_image_is_missing(tmp_path):
@@ -407,11 +409,11 @@ def test_dense_re_redacts_when_the_worlds_keyframe_image_is_missing(tmp_path):
     raw.write_bytes(b"RAW-WITH-A-FACE")
     red = _StubRedactor()
 
-    data, origin, raw_bytes = keyframe_image_bytes(
+    data, origin, fill = keyframe_image_bytes(
         _StubStore(images), "w", "s", "s:00000042", str(raw), red
     )
     assert red.calls == 1
-    assert raw_bytes == b"RAW-WITH-A-FACE"     # returned only so the fill can be differenced
+    assert fill is None or getattr(fill, "dtype", None) == bool
     assert data == b"REDACTED:RAW-WITH-A-FACE"
     assert origin == "raw-source-rereducted"
     assert b"RAW-WITH-A-FACE" != data
@@ -696,6 +698,10 @@ def test_the_page_never_claims_metres_when_scale_is_unknown(tmp_path):
     store, *_ = _fake_dense(tmp_path)
     page = build_dense_page(store, "w1", "s1")
     assert "not metres" in page
+    # Empty space has three causes and the caption must not blame only the
+    # capture: thinning for the device and face redaction are the other two.
+    assert "redaction" in page
+    assert "thinning" in page
     assert '"state": "unknown"' in page or '"state":"unknown"' in page
 
 
@@ -1003,3 +1009,38 @@ def test_liveness_uses_the_stores_probe_not_os_kill():
     assert "os.kill" not in inspect.getsource(dense_pipeline._DenseLock)
     assert "os.kill" not in inspect.getsource(dense_pipeline.status_is_stale)
     assert "_pid_is_running" in inspect.getsource(dense_pipeline._DenseLock._stale)
+
+
+def test_the_fill_fallback_requires_a_rectangle_not_merely_darkness():
+    """Measured against the exact difference over 120 real frames, the
+    near-black test alone ran at 36.2% precision -- two thirds of what it
+    deleted was real scene, 3.6 million pixels of it, including an entire bed.
+    Redaction fills an axis-aligned rectangle; a bed is not one. Requiring the
+    component to fill its own bounding box took precision to 88.2%."""
+    from tower.world_builder.dense_pipeline import redaction_fill_mask
+
+    rng = np.random.default_rng(51)
+    img = rng.integers(60, 240, size=(240, 200, 3)).astype(np.uint8)
+
+    # a genuine fill: a solid rectangle
+    img[40:140, 30:110] = 0
+    # a dark, irregular object: a blob that is near-black but not a rectangle
+    yy, xx = np.mgrid[0:240, 0:200]
+    blob = ((yy - 200) ** 2 / 30.0 + (xx - 40) ** 2 / 120.0) < 12
+    img[blob] = 2
+
+    mask = redaction_fill_mask(img, None, dilate_px=0)
+    assert mask[50:130, 40:100].mean() > 0.98      # the rectangle goes
+    assert mask[blob].mean() < 0.05                # the dark object stays
+
+
+def test_raw_pixels_never_leave_the_privacy_boundary():
+    """The mask is differenced inside `keyframe_image_bytes` and the raw bytes
+    are dropped there, so no caller can reconstruct from them by accident."""
+    import inspect
+
+    from tower.world_builder import dense_pipeline
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    assert "raw_bytes" not in body
+    assert "exact_fill" in body
