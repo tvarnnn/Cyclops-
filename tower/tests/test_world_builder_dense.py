@@ -729,3 +729,76 @@ def test_the_viewer_template_is_installed_beside_the_code():
     assert p.exists()
     text = p.read_text(encoding="utf-8")
     assert TOKEN_CONFIG in text and TOKEN_POINTS in text
+
+
+# ---------------------------------------------------------------------------
+# the route: a dense world gets the dense page, everything else is untouched
+# ---------------------------------------------------------------------------
+
+
+def _world_with_geometry(tmp_path, *, dense: bool):
+    from tower.world_builder.dense import write_points_bin
+    from tower.world_builder.records import Session, World
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    store.write_world(World(world_id="w1", created_at=1.0, updated_at=2.0,
+                            session_ids=("s1",)))
+    store.write_session(Session(session_id="s1", world_id="w1", started_at=1.0))
+    derived = store.derived_dir("w1") / "s1"
+    derived.mkdir(parents=True, exist_ok=True)
+    (derived / "poses.json").write_text(json.dumps({"poses": []}))
+    (derived / "points.json").write_text(json.dumps({"points": []}))
+    if dense:
+        rng = np.random.default_rng(31)
+        X = rng.uniform(-1, 1, size=(500, 3)).astype(np.float32)
+        C = rng.integers(0, 256, size=(500, 3)).astype(np.uint8)
+        F = rng.integers(3, 9, size=500).astype(np.uint8)
+        d = store.world_dir("w1") / "dense" / "s1"
+        d.mkdir(parents=True)
+        size = write_points_bin(d / "points_l0.bin", X, C, F)
+        (d / "manifest.json").write_text(json.dumps({
+            "schema_version": 1, "format": DENSE_FORMAT, "stride_bytes": 16,
+            "canonical_level": 0, "mobile_level": 0, "median_scene_depth": 2.0,
+            "bbox_min": X.min(0).tolist(), "bbox_max": X.max(0).tolist(),
+            "scale": {"state": "unknown", "meters_per_unit": None},
+            "levels": [{"level": 0, "voxel": 0.02, "points": 500, "bytes": size}],
+        }))
+    return store
+
+
+def test_a_world_with_a_dense_artifact_is_served_the_dense_viewer(tmp_path):
+    from tower.results.world_builder_render import build_world_render
+
+    html = build_world_render(_world_with_geometry(tmp_path, dense=True), "w1", "s1")
+    assert "World Builder — dense" in html
+    assert "500 points" not in html or "points" in html          # the config is inlined
+    assert "gl.POINTS" in html or "drawArrays" in html
+
+
+def test_a_world_without_one_still_gets_exactly_the_page_it_got_before(tmp_path):
+    """Every world built before this stage is in this state. The dense work must
+    be invisible to them."""
+    from tower.results.world_builder_render import build_world_render
+
+    html = build_world_render(_world_with_geometry(tmp_path, dense=False), "w1", "s1")
+    assert "World Builder — dense" not in html
+
+
+def test_representation_sparse_forces_the_old_page_even_when_dense_exists(tmp_path):
+    from tower.results.world_builder_render import build_world_render
+
+    store = _world_with_geometry(tmp_path, dense=True)
+    html = build_world_render(store, "w1", "s1", representation="sparse")
+    assert "World Builder — dense" not in html
+
+
+def test_a_broken_dense_artifact_never_costs_the_world_its_sparse_page(tmp_path):
+    """A dense bug must degrade to the picture that already worked, not to a
+    404. The sparse reconstruction is complete and correct either way."""
+    from tower.results.world_builder_render import build_world_render
+
+    store = _world_with_geometry(tmp_path, dense=True)
+    (store.world_dir("w1") / "dense" / "s1" / "points_l0.bin").write_bytes(b"\x00" * 7)
+    html = build_world_render(store, "w1", "s1")
+    assert "World Builder — dense" not in html

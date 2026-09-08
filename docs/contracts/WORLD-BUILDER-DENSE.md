@@ -191,3 +191,30 @@ deliberate — the documented promise is a page that loads nothing from anywhere
 so the product path **embeds the mobile level inline** in the page rather than
 fetching it. A separate desktop-only route may serve the larger levels as binary
 under a relaxed `connect-src 'self'`; the phone never uses it.
+
+The route grew one optional query parameter, and nothing else:
+
+| parameter | values | meaning |
+| --- | --- | --- |
+| `representation` | `auto` (default), `sparse`, `dense` | `auto` serves the dense viewer when the session has a dense artifact and the existing sparse page otherwise. `sparse` forces the old page. `dense` refuses with 404 rather than falling back |
+
+Two behaviours matter more than the parameter:
+
+- **A world with no dense artifact is served exactly the page it was served
+  before.** That is every world built before this stage, and the dense work is
+  invisible to them.
+- **A dense artifact that fails to load costs nothing.** The failure is logged
+  and the sparse page is served, because the sparse reconstruction is complete
+  and correct either way, and a dense bug must not turn a working world into a
+  404. Only `representation=dense` opts out of that.
+
+### Payload budget
+
+The LOD ladder is a fraction of each scene's median depth, so its point count
+follows the size of the room rather than the size of the payload — measured
+across five real worlds the mobile level ranges from 39k points to 1.45 M, which
+is 0.6 MB to 23 MB. The page therefore enforces a byte budget and, when a level
+exceeds it, **thins by confidence**: the points several cameras agreed on
+survive and the weakest go first, so the picture gets sparser rather than less
+trustworthy. `thinned_to_confidence` in the page's config records the cut, and
+`null` means none was needed.

@@ -78,6 +78,7 @@ def world_render(
     world_id: str, request: Request,
     session_id: str | None = Query(default=None),
     max_points: int | None = Query(default=None, ge=1, le=MAX_POINTS_CEILING),
+    representation: str = Query(default="auto", pattern="^(auto|sparse|dense)$"),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -93,7 +94,8 @@ def world_render(
     """
     try:
         html = build_world_render(
-            _store(request), world_id, session_id, max_points=max_points
+            _store(request), world_id, session_id, max_points=max_points,
+            representation=representation,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None

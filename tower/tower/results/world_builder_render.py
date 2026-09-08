@@ -20,9 +20,13 @@ second at the mobile point budget).
 
 from __future__ import annotations
 
+import logging
+
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import DEFAULT_MAX_POINTS, render_html
 from tower.world_builder.store import WorldStore, WorldStoreError
+
+logger = logging.getLogger(__name__)
 
 # A phone draws every point on a 2-D canvas on every gesture, so the
 # budget is lower than the operator's 200k default. Fractional-stride
@@ -93,8 +97,14 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
     return candidates[-1][1]
 
 
+REPRESENTATION_AUTO = "auto"
+REPRESENTATION_SPARSE = "sparse"
+REPRESENTATION_DENSE = "dense"
+
+
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
-                       max_points: int | None = None) -> str:
+                       max_points: int | None = None,
+                       representation: str = REPRESENTATION_AUTO) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -109,6 +119,26 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
+    # A session that has a dense reconstruction gets the dense viewer, because
+    # that is the whole point of having built one. `representation=sparse`
+    # forces the old page, and a session with no dense artifact -- which is
+    # every world built before this stage -- falls through to it unchanged.
+    if representation != REPRESENTATION_SPARSE:
+        try:
+            from tower.world_builder.dense_render import (  # noqa: PLC0415
+                DenseViewerUnavailable, build_dense_page,
+            )
+
+            return build_dense_page(store, world_id, chosen)
+        except DenseViewerUnavailable as exc:
+            if representation == REPRESENTATION_DENSE:
+                raise WorldRenderUnavailable(exc.reason) from None
+        except Exception:  # noqa: BLE001 -- never lose the sparse page to a dense bug
+            logger.exception(
+                "[Tower][WorldBuilder] dense viewer failed for %s; serving sparse",
+                world_id,
+            )
+
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
         return render_html(store, world_id, chosen, max_points=budget)
