@@ -883,17 +883,41 @@ def test_the_config_cannot_break_out_of_the_script_tag(tmp_path):
     assert page.count("</script>") == page.count("<script>")
 
 
-def test_a_cached_depth_stage_is_not_reused_across_a_backend_change():
-    """Reusing depth maps from a different network while the manifest records
-    the new one makes the artifact unreproducible from its own params -- and
-    everything still runs, so nothing says so."""
-    import inspect
+def test_the_depth_cache_key_covers_every_parameter_the_stage_reads():
+    """Reusing predictions made under different parameters, while the manifest
+    records the new ones, makes the artifact unreproducible from its own params
+    -- and everything still runs, so nothing says so. `component` is the one
+    that bit: a --component 1 run reused component 0's predictions."""
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _depth_cache_key
 
-    from tower.world_builder import dense_pipeline
+    base = DenseParams()
+    key = _depth_cache_key("digest-a", base)
+    from dataclasses import replace
 
-    src = inspect.getsource(dense_pipeline.densify)
-    assert "same_backend" in src
-    assert 'cached.get("backend")' in src
+    for field, value in [("backend", "depth-anything-v2-small"),
+                         ("component", 1),
+                         ("min_sparse_points", 40)]:
+        assert _depth_cache_key("digest-a", replace(base, **{field: value})) != key, field
+    # and a different solve is a different key
+    assert _depth_cache_key("digest-b", base) != key
+    # a missing digest must not match everything
+    assert _depth_cache_key(None, base) != key
+
+
+def test_the_fuse_cache_key_covers_every_parameter_the_stage_reads():
+    from dataclasses import replace
+
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _fuse_cache_key
+
+    base = DenseParams()
+    key = _fuse_cache_key("d", base)
+    for field, value in [("gate_rel", 0.2), ("tau", 0.09), ("min_views", 4),
+                         ("neighbours", 20), ("stride", 2), ("edge_rel", 0.1),
+                         ("max_grazing_deg", 70.0), ("erode_px", 0),
+                         ("average_views", False), ("max_extrapolation", 3.0)]:
+        assert _fuse_cache_key("d", replace(base, **{field: value})) != key, field
 
 
 def test_a_run_killed_mid_stage_is_distinguishable_from_one_still_going():

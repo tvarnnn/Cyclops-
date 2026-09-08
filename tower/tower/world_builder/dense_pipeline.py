@@ -76,6 +76,28 @@ def _pid_is_running(pid: int) -> bool:
         return True
 
 
+def _depth_cache_key(digest, params: DenseParams) -> str:
+    """Everything the DEPTH stage reads.
+
+    `component` belongs here: re-running with a different one used to reuse the
+    other component's predictions and then write a manifest claiming the new
+    one. A `digest` of None must not match every solve either.
+    """
+    return "|".join(str(x) for x in (
+        digest, params.backend, params.component, params.min_sparse_points,
+    ))
+
+
+def _fuse_cache_key(digest, params: DenseParams) -> str:
+    """Everything the FUSE stage reads."""
+    return "|".join(str(x) for x in (
+        digest, params.backend, params.component, params.gate_rel, params.tau,
+        params.min_views, params.neighbours, params.stride, params.edge_rel,
+        params.max_grazing_deg, params.erode_px, params.average_views,
+        params.max_depth_pct, params.max_extrapolation,
+    ))
+
+
 def dense_dir(store, world_id: str, session_id: str) -> Path:
     """`<world>/dense/<session>` -- beside `solve/`, never inside `derived/`."""
     return store.world_dir(world_id) / "dense" / session_id
@@ -318,6 +340,7 @@ def redaction_fill_mask(image, raw=None, fill_value: int = 0,
 def run_depth_stage(
     store, world_id: str, session_id: str, solution, intrinsics, params: DenseParams,
     root: Path, *, should_stop=None, progress: Callable[[str, int, int], None] | None = None,
+    prior: dict | None = None,
 ) -> dict:
     """Undistort, predict depth, and align every posed keyframe in the component.
 
@@ -366,12 +389,34 @@ def run_depth_stage(
 
     maps = None
     map_shape = None
+    # Per-FRAME resume. A stop halfway through a 429-frame world should cost
+    # only the frames not yet reached. The earlier version discarded a stopped
+    # stage wholesale and re-predicted every frame, with its own prediction
+    # files sitting unread on disk beside it.
+    done = {}
+    if prior:
+        for rec in prior.get('records') or []:
+            ki_prev = rec.get('ki')
+            if ki_prev is None:
+                continue
+            if not rec.get('ok'):
+                done[int(ki_prev)] = rec
+            elif (work / 'depth' / ('%05d.npy' % int(ki_prev))).exists():
+                done[int(ki_prev)] = rec
+    if done:
+        logger.info('[Tower][WorldBuilder][dense] resuming depth: %d frames already done',
+                    len(done))
     records: list[dict] = []
     t0 = time.time()
     obs_kf = solution.observations[:, 0]
     obs_pt = solution.observations[:, 2]
 
     for n, (ki, kid, pose) in enumerate(targets):
+        cached_rec = done.get(int(ki))
+        if cached_rec is not None:
+            records.append(cached_rec)
+            origins['resumed'] = origins.get('resumed', 0) + 1
+            continue
         if _stopped(should_stop):
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
                     "camera": cam, "targets": len(targets), "image_origins": origins,
@@ -459,6 +504,8 @@ def run_depth_stage(
         np.save(work / "depth" / f"{ki:05d}.npy", disp.astype(np.float16))
         records.append({"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
                         "n_points": int(g.sum()), "held_out_rel": ho,
+                        "z_sparse_min": float(np.min(zc[g])),
+                        "z_sparse_max": float(np.max(zc[g])),
                         "redaction_fill_fraction": fill_fraction,
                         "image_origin": origin})
 
@@ -519,6 +566,12 @@ def run_fuse_stage(
         ok = validity_mask(z, K, edge_rel=params.edge_rel,
                            max_grazing_deg=params.max_grazing_deg,
                            erode_px=params.erode_px)
+        # Refuse depth the frame's own sparse points never bracketed, past a
+        # stated margin. This is what makes "interpolates between points the
+        # solve earned" true rather than merely nearly true.
+        zlo, zhi = r.get("z_sparse_min"), r.get("z_sparse_max")
+        if zlo and zhi and params.max_extrapolation > 0:
+            ok &= (z >= zlo / params.max_extrapolation) & (z <= zhi * params.max_extrapolation)
         fillp = work / "depth" / f"{ki:05d}_fill.npy"
         if fillp.exists():
             # Redaction fill is unobserved, so it stays a hole.
@@ -743,6 +796,7 @@ def densify(
 
         align_path = root / "align.json"
         align = None
+        prior = None
         if align_path.exists() and not force:
             try:
                 cached = json.loads(align_path.read_text())
@@ -752,24 +806,29 @@ def densify(
                 # would make the artifact unreproducible from its own params --
                 # the most expensive kind of wrong, because everything still
                 # runs and the numbers still look reasonable.
-                same_solve = cached.get("digest") in (None, digest)
-                same_backend = cached.get("backend") in (None, params.backend)
-                if same_solve and same_backend and cached.get("stopped_after") is None:
-                    align = cached
-                    logger.info("[Tower][WorldBuilder][dense] reusing depth stage")
-                elif not same_backend:
+                want = _depth_cache_key(digest, params)
+                if cached.get("cache_key") == want:
+                    if cached.get("stopped_after") is None:
+                        align = cached
+                        logger.info("[Tower][WorldBuilder][dense] reusing depth stage")
+                    else:
+                        # Same parameters, interrupted run: resume per frame
+                        # rather than discard several hundred predictions.
+                        prior = cached
+                else:
                     logger.info(
-                        "[Tower][WorldBuilder][dense] depth stage was run with %s, "
-                        "now asked for %s: recomputing",
-                        cached.get("backend"), params.backend,
+                        "[Tower][WorldBuilder][dense] depth cache is for %r, now "
+                        "asked for %r: recomputing", cached.get("cache_key"), want,
                     )
             except (OSError, ValueError):
                 align = None
         if align is None:
             t = time.time()
             align = run_depth_stage(store, world_id, session_id, solution, intrinsics,
-                                    params, root, should_stop=should_stop, progress=progress)
+                                    params, root, should_stop=should_stop,
+                                    progress=progress, prior=prior)
             align["digest"] = digest
+            align["cache_key"] = _depth_cache_key(digest, params)
             _write_json(align_path, align)
             seconds[STAGE_DEPTH] = time.time() - t
             if align.get("stopped_after") is not None:
@@ -782,8 +841,23 @@ def densify(
 
         _status(root, state=STATE_RUNNING, stage=STAGE_FUSE, input_digest=digest)
         t = time.time()
-        fuse = run_fuse_stage(solution, align, params, root,
-                              should_stop=should_stop, progress=progress)
+        fuse_path = root / "fuse.json"
+        fuse = None
+        if (root / "fused.npz").exists() and fuse_path.exists() and not force:
+            try:
+                cached_fuse = json.loads(fuse_path.read_text())
+                if (cached_fuse.get("cache_key") == _fuse_cache_key(digest, params)
+                        and cached_fuse.get("stopped_after") is None):
+                    fuse = cached_fuse
+                    logger.info("[Tower][WorldBuilder][dense] reusing fusion")
+            except (OSError, ValueError):
+                fuse = None
+        if fuse is None:
+            fuse = run_fuse_stage(solution, align, params, root,
+                                  should_stop=should_stop, progress=progress)
+            fuse["cache_key"] = _fuse_cache_key(digest, params)
+            if fuse.get("stopped_after") is None:
+                _write_json(fuse_path, fuse)
         seconds[STAGE_FUSE] = time.time() - t
         if fuse.get("stopped_after") is not None:
             _status(root, state=STATE_STOPPED, stage=STAGE_FUSE)

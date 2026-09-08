@@ -17,9 +17,14 @@ or position. So it is never asked for either. For each keyframe we fit
 
 against the sparse points the global solve ALREADY placed in that frame, by
 iteratively reweighted least squares with a Huber loss, and then read depth back
-out as z = a / (disparity - b). Scale, position and orientation come entirely
-from multi-view triangulated geometry. The network only interpolates between
-points that the solve earned.
+out. Scale, position and orientation come entirely from multi-view triangulated
+geometry.
+
+The network interpolates between points the solve earned, and is allowed to
+extrapolate past them by at most `max_extrapolation` -- beyond that the pixel is
+refused. Without that bound the claim would be false: measured, 11-18% of
+surviving pixels per frame sat outside the range their own frame's sparse points
+bracketed, by up to 5.18x.
 
 Four things then remove what is not evidence:
 
@@ -51,10 +56,12 @@ not in the same unit.
 
 LIFECYCLE
 
-Four stages, each checkpointed to disk, so an interrupted run resumes instead of
-restarting -- Stop kills the process tree on a 30-second grace and this work
-takes minutes. `should_stop` is polled between frames and between stages, and a
-stop leaves a legible `status.json` rather than a half-written artifact.
+Three stages -- depth, fuse, pack -- checkpointed to disk so an interrupted run
+resumes rather than restarting. Depth resumes per FRAME: a frame whose
+prediction is already on disk is not predicted again, so a stop halfway through
+a 429-frame world costs the frames not yet reached, not all of them. Fusion
+resumes as a whole. `should_stop` is polled between frames and between stages,
+and a stop leaves a legible `status.json` rather than a half-written artifact.
 """
 
 from __future__ import annotations
@@ -119,6 +126,14 @@ class DenseParams:
     edge_rel: float = 0.03
     max_grazing_deg: float = 80.0
     erode_px: int = 1
+    # How far past the depth range of a frame's OWN sparse points a pixel may
+    # sit and still be used. "The network only interpolates" was an overstatement
+    # before this existed: nothing clamped a pixel to the range the solve had
+    # bracketed, and 11-18% of surviving pixels per frame fell outside it, up to
+    # 5.18x past the farthest sparse point. Consensus removed about 92% of those,
+    # but 4.4% of the shipped cloud was still geometry no solved point bracketed.
+    # 1.5 keeps honest near/far margin around the sparse hull and refuses the rest.
+    max_extrapolation: float = 1.5
     # Inpaint redaction fill before the depth network sees it. A solid black
     # rectangle does not merely lose its own pixels: it drags the network's
     # estimate for the WHOLE frame. Measured on one capture, frames with over
