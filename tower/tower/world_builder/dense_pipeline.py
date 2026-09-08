@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Callable
@@ -76,6 +77,71 @@ def _status(root: Path, **fields) -> None:
 
 def _stopped(should_stop) -> bool:
     return bool(should_stop and should_stop())
+
+
+class _DenseLock:
+    """One densify at a time per session.
+
+    The dense stage runs after `world_build_session.py` has released the world
+    writer lock -- following the `--register` precedent, and deliberately, since
+    holding it for the minutes this takes would block a new capture on the same
+    world. `dense/<session>/` is touched by nothing else, so that is safe
+    against other WRITERS but not against another densify of the same session,
+    which is easy to start by accident: run `scripts/world_densify.py` while a
+    build is finalising. Two runs interleaving their writes would leave a points
+    file of the wrong length, which does not fail loudly.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / ".densify.lock"
+        self.held = False
+
+    def _stale(self) -> bool:
+        try:
+            pid = int(json.loads(self.path.read_text()).get("pid", -1))
+        except (OSError, ValueError, AttributeError):
+            return True
+        # Deliberately NOT treating our own pid as stale. Doing that lets a
+        # second lock object in the same process steal the first one's lock,
+        # which defeats the whole point -- and in-process concurrency is the
+        # likeliest way to hit this at all. The cost is that a densify which
+        # somehow escapes its own `finally` holds the lock for the life of the
+        # process; the `finally` is what stops that.
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if not self._stale():
+                    return False
+                try:
+                    self.path.unlink()
+                except OSError:
+                    return False
+                continue
+            with os.fdopen(fd, "w") as handle:
+                json.dump({"pid": os.getpid(), "at": time.time()}, handle)
+            self.held = True
+            return True
+        return False
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+        self.held = False
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +598,12 @@ def densify(
     root.mkdir(parents=True, exist_ok=True)
     seconds: dict = {}
 
+    lock = _DenseLock(root)
+    if not lock.acquire():
+        detail = "another densify of this session is already running"
+        _status(root, state=STATE_UNAVAILABLE, detail=detail)
+        return DenseResult(state=STATE_UNAVAILABLE, detail=detail)
+
     solution = load_solution(store, world_id, session_id)
     if solution is None:
         _status(root, state=STATE_UNAVAILABLE, detail="no global solution for this session")
@@ -626,6 +698,8 @@ def densify(
         logger.exception("[Tower][WorldBuilder][dense] failed")
         return DenseResult(state=STATE_FAILED, detail=f"{type(exc).__name__}: {exc}",
                            seconds=seconds)
+    finally:
+        lock.release()
 
 
 def read_dense_manifest(store, world_id: str, session_id: str) -> dict | None:

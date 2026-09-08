@@ -450,12 +450,20 @@ assert POINT_DTYPE.itemsize == POINT_STRIDE_BYTES
 
 
 def write_points_bin(path: Path, X: np.ndarray, C: np.ndarray, F: np.ndarray) -> int:
-    """Flat interleaved buffer a browser can hand straight to the GPU."""
+    """Flat interleaved buffer a browser can hand straight to the GPU.
+
+    Written to a temporary file and renamed, so a reader never sees a partial
+    buffer. A half-written points file does not fail loudly -- it is a valid
+    file of the wrong length, and the viewer would either refuse it or shear
+    the scene.
+    """
     a = np.zeros(len(X), dtype=POINT_DTYPE)
     a["x"], a["y"], a["z"] = X[:, 0], X[:, 1], X[:, 2]
     a["r"], a["g"], a["b"] = C[:, 0], C[:, 1], C[:, 2]
     a["c"] = F
-    a.tofile(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    a.tofile(tmp)
+    tmp.replace(path)
     return path.stat().st_size
 
 

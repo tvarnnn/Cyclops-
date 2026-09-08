@@ -82,6 +82,15 @@ geometry bug rather than a parsing one.
 point**, clamped to 255. It is the honesty channel: raising a threshold on it
 removes weakly supported geometry, and a viewer should expose that.
 
+Two properties of the number worth stating exactly, because both make it read
+slightly HIGHER than a naive reading would suggest:
+
+- It is bounded above by `params.neighbours` — the number of nearby cameras
+  consulted — not by how many cameras could in principle have seen the point.
+- After voxel reduction it is the **maximum** over the points merged into that
+  voxel, not their mean. So it reads "at least one point in this voxel was
+  agreed by N cameras", not "every point here was".
+
 ## 5. `manifest.json`
 
 | Field | Type | Meaning |

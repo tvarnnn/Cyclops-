@@ -802,3 +802,49 @@ def test_a_broken_dense_artifact_never_costs_the_world_its_sparse_page(tmp_path)
     (store.world_dir("w1") / "dense" / "s1" / "points_l0.bin").write_bytes(b"\x00" * 7)
     html = build_world_render(store, "w1", "s1")
     assert "World Builder — dense" not in html
+
+
+def test_two_densify_runs_of_one_session_do_not_interleave(tmp_path):
+    """The dense stage runs after the world writer lock is released, so nothing
+    else stops a second run of the SAME session -- which is easy to start by
+    accident, e.g. world_densify.py while a build is finalising. Interleaved
+    writes would leave a points file of the wrong length, which does not fail
+    loudly."""
+    from tower.world_builder.dense_pipeline import _DenseLock
+
+    root = tmp_path / "dense" / "s1"
+    a, b = _DenseLock(root), _DenseLock(root)
+    assert a.acquire()
+    assert not b.acquire()
+    a.release()
+    assert b.acquire()
+    b.release()
+
+
+def test_a_lock_left_by_a_dead_process_is_reclaimed(tmp_path):
+    """A builder killed by the Job Object leaves its lock behind. The next run
+    must take it rather than refusing forever."""
+    import json as _json
+    import os as _os
+
+    from tower.world_builder.dense_pipeline import _DenseLock
+
+    root = tmp_path / "dense" / "s1"
+    root.mkdir(parents=True)
+    # A pid that is almost certainly not running, and is not ours.
+    (root / ".densify.lock").write_text(_json.dumps({"pid": 0x7FFFFFFE, "at": 0}))
+    lock = _DenseLock(root)
+    assert lock.acquire()
+    assert _json.loads((root / ".densify.lock").read_text())["pid"] == _os.getpid()
+    lock.release()
+
+
+def test_a_points_file_is_never_visible_half_written(tmp_path):
+    """Written to a temporary name and renamed. A partial buffer is a valid file
+    of the wrong length, so a reader cannot tell it is broken."""
+    import inspect
+
+    from tower.world_builder import dense
+
+    src = inspect.getsource(dense.write_points_bin)
+    assert ".tmp" in src and "replace(" in src
