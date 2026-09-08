@@ -340,29 +340,35 @@ price of the model change. Everything else is CPU and RAM.
 Not the per-frame residual above. This is the whole cloud re-rendered from
 cameras the fusion did not privilege, and depth read out of the render.
 
-| world | depth error, median | depth error, p90 | pixel coverage, median |
-| --- | --- | --- | --- |
-| `7d31e8d7` | 2.3% | 12.7% | 97.9% |
-| `ecc02df1` | 3.3% | 5.4% | 97.1% |
-| `1b8812b1` | 3.3% | 6.6% | 96.8% |
-| `6427900d` | 4.4% | **57.6%** | 67.5% |
-| `a378331a` | 4.6% | 5.6% | 60.1% |
-| `672578d0` | 5.3% | **40.3%** | 97.9% |
-| `37e497f8` | 5.4% | 7.2% | 96.2% |
+**Every row is an `eval.json` beside the artifact it describes**, written by
+`proto/score_cloud.py --out`. An adversarial review found that this table's
+first version cited nothing on disk: the numbers were real but had only ever
+been printed to a terminal, and a number nobody can re-derive is not evidence.
+
+| world | points | depth error, median | depth error, p90 | pixel coverage, median |
+| --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk and shelf) | 8.32 M | 2.3% | 12.7% | 97.9% |
+| `ecc02df1` (dresser) | 2.09 M | 3.3% | 5.4% | 97.0% |
+| `1b8812b1` (widest traverse) | 8.76 M | 3.3% | 6.6% | 96.8% |
+| `fc58a64d` (end-to-end replay) | 8.43 M | 4.2% | 6.0% | 82.1% |
+| `6427900d` (bathroom, tight) | 3.62 M | 4.4% | **57.6%** | 67.5% |
+| `a378331a` (closet) | 5.11 M | 4.6% | 5.6% | 60.1% |
+| `672578d0` (bedroom, closet, desk) | 14.93 M | 5.3% | **40.3%** | 97.9% |
+| `37e497f8` (bedroom) | 4.91 M | 5.4% | 7.2% | 96.2% |
 
 **The p90 column is the honest part of this table.** Two worlds carry a tail an
 order of magnitude worse than their own median. `6427900d` is the tight
-bathroom, where the walk never gets far enough from a surface for two cameras to
-disagree usefully, and `672578d0` is the three-room chain, where the far end of
-a long room is reconstructed from a handful of distant frames. In both, the
+bathroom, where the walk never gets far enough from a surface for two cameras
+to disagree usefully, and `672578d0` is the three-room chain, where the far end
+of a long room is reconstructed from a handful of distant frames. In both, the
 median says the reconstruction is good and the p90 says part of it is not, and
 the confidence channel is what a viewer has to separate them with.
 
 Coverage tells the same story from the other side: `a378331a` (closet) and
-`6427900d` (bathroom) cover 60-67% of the held-out frame where every other world
-covers 96-98%. Tight spaces are this pipeline's weakest case, and they are
-weakest for a structural reason rather than a tuning one -- multi-view consensus
-needs baseline, and a closet does not offer any.
+`6427900d` (bathroom) cover 60-67% of the held-out frame where every other
+world covers 82-98%. Tight spaces are this pipeline's weakest case, and they
+are weakest for a structural reason rather than a tuning one -- multi-view
+consensus needs baseline, and a closet does not offer any.
 
 ### 11.3 What the gate does to the number
 
