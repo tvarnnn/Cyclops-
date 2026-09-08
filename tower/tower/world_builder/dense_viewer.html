@@ -384,7 +384,12 @@
   var parts = [CONFIG.caption || "",
                "Confidence is how many cameras agreed on a point."];
   var full = CONFIG.source_points || CONFIG.points;
-  if (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined) {
+  // `coarsened` is the fact this sentence is about -- the page is showing
+  // fewer points than the artifact holds. `thinned_to_confidence` is a
+  // DIFFERENT and now rare fact, and keying this on it meant the page went
+  // silent about showing 373k of 2.6M the moment the budget stopped being
+  // met by a confidence cut.
+  if (CONFIG.coarsened) {
     parts.push("This view shows " + CONFIG.points.toLocaleString() + " of " +
                full.toLocaleString() + " points, spread evenly over the whole " +
                "reconstruction, to fit this device — so the picture is coarser " +

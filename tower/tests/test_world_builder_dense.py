@@ -1762,3 +1762,34 @@ def test_every_refusal_names_itself(tmp_path):
         assert origin.startswith("refused-"), origin
         seen.add(origin)
     assert len(seen) == 3, seen
+
+
+def test_the_page_says_it_is_coarser_whenever_it_is(tmp_path):
+    """The sentence is about `coarsened`. Keying it on
+    `thinned_to_confidence` meant the page went silent about showing 373k of
+    2.6M points the moment the budget stopped being met by a confidence cut --
+    which, after the thinning was fixed, is almost always."""
+    import re
+
+    from tower.world_builder.dense import POINT_STRIDE_BYTES
+    from tower.world_builder.dense_render import (
+        build_dense_page,
+        build_dense_payload,
+        viewer_template_path,
+    )
+
+    html = viewer_template_path().read_text(encoding="utf-8")
+    assert "if (CONFIG.coarsened)" in html
+
+    store, *_ = _fake_dense(tmp_path, n=4000)
+    _, cfg, _ = build_dense_payload(store, "w1", "s1",
+                                    budget_bytes=500 * POINT_STRIDE_BYTES)
+    assert cfg["coarsened"] is True
+    assert cfg["points"] < 4000
+
+    # and a page that fits says nothing about being coarser
+    page = build_dense_page(store, "w1", "s1")
+    cfg2 = json.loads(re.search(r"var CONFIG = (\{.*?\});", page, re.S).group(1)
+                      .replace(chr(92) + "u003c", "<"))
+    assert cfg2["coarsened"] is False
+    assert cfg2["thinned_to_confidence"] is None
