@@ -66,6 +66,13 @@ logger = logging.getLogger(__name__)
 # WKWebView content process well below that in point COUNT, and a GPU buffer is
 # far cheaper per point than the 2-D canvas it used.
 MOBILE_BYTE_BUDGET = 6 * 1024 * 1024
+# NOT REACHABLE FROM THE ROUTE, and three reviews have called it dead code.
+# It is the budget the offline inspection tooling passes to
+# `build_dense_page(budget_bytes=...)` to look at a world at full density in
+# a desktop browser -- which is how every visual check in this lane was made.
+# Kept for that, named so the next reader does not have to guess, and
+# deliberately not wired to `max_points`: the phone's budget is the one the
+# contract specifies and a client cannot ask to exceed it.
 DESKTOP_BYTE_BUDGET = 48 * 1024 * 1024
 
 VIEWER_FILENAME = "dense_viewer.html"
