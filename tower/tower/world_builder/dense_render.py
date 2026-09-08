@@ -85,6 +85,48 @@ def thin_to_budget(X, C, F, budget_bytes: int):
     return X[order], C[order], F[order], int(F[order].min())
 
 
+MAX_VIEWPOINTS = 240
+
+
+def capture_viewpoints(store, world_id: str, session_id: str, component: int = 0):
+    """Where the wearer actually stood, and which way they looked.
+
+    A room reconstructed from the inside looks its worst from the outside: you
+    see the backs of walls, through every hole, with the furniture hidden behind
+    them. Opening the viewer at an arbitrary orbit distance is therefore the
+    least flattering possible first impression of a reconstruction that is
+    perfectly good from where it was captured.
+
+    So the page opens where a camera stood, looking where it looked. Returned
+    as flat [cx, cy, cz, fx, fy, fz] rows, subsampled, in capture order, so the
+    viewer can also step through them.
+    """
+    try:
+        from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
+
+        solution = load_solution(store, world_id, session_id)
+    except Exception:  # noqa: BLE001 -- a viewpoint list is a nicety, never a blocker
+        return []
+    if solution is None:
+        return []
+    rows = []
+    for kid in solution.keyframe_ids:
+        pose = (solution.poses or {}).get(kid)
+        if not pose or pose.get("rotation") is None or pose.get("translation") is None:
+            continue
+        if int(pose.get("component", 0)) != component:
+            continue
+        R = np.asarray(pose["rotation"], float).reshape(3, 3)
+        t = np.asarray(pose["translation"], float)
+        centre = -R.T @ t
+        forward = R.T @ np.array([0.0, 0.0, 1.0])   # the optical axis, in world
+        rows.append([float(v) for v in centre] + [float(v) for v in forward])
+    if len(rows) > MAX_VIEWPOINTS:
+        step = len(rows) / MAX_VIEWPOINTS
+        rows = [rows[int(i * step)] for i in range(MAX_VIEWPOINTS)]
+    return rows
+
+
 def build_dense_payload(store, world_id: str, session_id: str, *,
                         budget_bytes: int = MOBILE_BYTE_BUDGET,
                         level: int | None = None):
@@ -113,7 +155,10 @@ def build_dense_payload(store, world_id: str, session_id: str, *,
     raw = buf.tobytes()
 
     centre = X.mean(0)
+    viewpoints = capture_viewpoints(store, world_id, session_id,
+                                    (manifest.get("params") or {}).get("component", 0))
     config = {
+        "viewpoints": viewpoints,
         "world_id": world_id,
         "session_id": session_id,
         "points": int(len(X)),

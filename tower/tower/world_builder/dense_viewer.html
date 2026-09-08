@@ -48,6 +48,8 @@
       <span id="confv">2</span></label>
     <button id="bycolor" aria-pressed="false">colour by confidence</button>
     <button id="fly" aria-pressed="false">fly (WASD)</button>
+    <button id="stand">next capture spot</button>
+    <button id="outside">see it from outside</button>
     <button id="reset">reset view</button>
   </div>
   <div class="row"><span id="stat">loading…</span></div>
@@ -160,10 +162,39 @@
   var C = CONFIG.centre || [0,0,0];
   var lo = CONFIG.bbox_min || [-1,-1,-1], hi = CONFIG.bbox_max || [1,1,1];
   var span = Math.max(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]) || 1;
+  var VP = CONFIG.viewpoints || [];
+  var vpi = 0;
   var target, yaw, pitch, dist, flying = false;
-  function reset() {
+
+  function aimFrom(cx, cy, cz, fx, fy, fz) {
+    // The orbit rig is (target, yaw, pitch, dist). Put the EYE at the capture
+    // position by placing the target one short step along the view direction
+    // and solving the angles back out of it.
+    var n = Math.hypot(fx, fy, fz) || 1;
+    fx /= n; fy /= n; fz /= n;
+    dist = Math.max(span * 0.03, span * 0.10);
+    target = [cx + fx * dist, cy + fy * dist, cz + fz * dist];
+    pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, fy)))));
+    yaw = Math.atan2(-fx, -fz);
+  }
+
+  function standAtCapture(i) {
+    var v = VP[((i % VP.length) + VP.length) % VP.length];
+    aimFrom(v[0], v[1], v[2], v[3], v[4], v[5]);
+  }
+
+  function seeFromOutside() {
     target = [C[0], C[1], C[2]];
     yaw = 0.6; pitch = 0.5; dist = span * 1.1;
+  }
+
+  function reset() {
+    // A room reconstructed from the inside looks its worst from the outside --
+    // backs of walls, every hole a window, the furniture behind them. So the
+    // page opens where the wearer stood, looking where they looked, which is
+    // the view the reconstruction is actually good from.
+    if (VP.length) { vpi = Math.floor(VP.length / 2); standAtCapture(vpi); }
+    else seeFromOutside();
   }
   reset();
 
@@ -267,6 +298,13 @@
     flying = !flying; elFly.setAttribute("aria-pressed", flying ? "true" : "false");
   });
   document.getElementById("reset").addEventListener("click", reset);
+  document.getElementById("stand").addEventListener("click", function () {
+    if (VP.length) { vpi += 1; standAtCapture(vpi); }
+  });
+  document.getElementById("outside").addEventListener("click", seeFromOutside);
+  if (!VP.length) {
+    document.getElementById("stand").disabled = true;
+  }
 
   var note = document.getElementById("note");
   var sc = (CONFIG.scale || {}).state;
@@ -312,6 +350,7 @@
     elStat.textContent =
       N.toLocaleString() + " points · level " + CONFIG.level + " · " +
       Math.round(fps) + " fps" +
+      (VP.length ? " · " + VP.length + " capture spots" : "") +
       (CONFIG.thinned_to_confidence !== null && CONFIG.thinned_to_confidence !== undefined
         ? " · thinned to confidence ≥ " + CONFIG.thinned_to_confidence : "");
     requestAnimationFrame(frame);
