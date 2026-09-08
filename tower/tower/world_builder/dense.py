@@ -120,10 +120,21 @@ class DenseParams:
     max_depth_pct: float = 97.0
 
     # -- output -----------------------------------------------------------
-    # The corpus is 0.23 MP, which gives about 6.4 mm per pixel at 3 m and
-    # 1-3 cm of depth noise. A voxel finer than that stores noise and implies
-    # detail the evidence does not support, so L1 -- not L0 -- is canonical.
-    lod_voxels: tuple[float, ...] = (0.02, 0.045, 0.09)
+    # Voxel sizes are FRACTIONS OF THE SCENE'S OWN MEDIAN DEPTH, never absolute
+    # world units. `global_solve.py` never calls COLMAP's `normalize()`, so the
+    # gauge is whatever the first baseline happened to be and it varies wildly
+    # between worlds -- solves in this corpus range from a ten-unit extent to a
+    # three-hundred-unit one for the same kind of walk. A fixed voxel would
+    # therefore mean centimetres in one world and metres in another: it would
+    # shatter one reconstruction into hundreds of millions of points and
+    # collapse another into a blob.
+    #
+    # The chosen fractions reproduce 0.021 / 0.045 / 0.091 on the reference
+    # world, whose median scene depth is 6.99. The corpus is 0.23 MP, giving
+    # about 6.4 mm per pixel at 3 m and 1-3 cm of depth noise, so the finest
+    # level is already at the edge of what the evidence supports and stores
+    # mostly noise -- which is why L1, not L0, is canonical.
+    lod_depth_fractions: tuple[float, ...] = (0.003, 0.0065, 0.013)
     canonical_level: int = 1
     mobile_level: int = 2
     min_confidence: int = 2
@@ -133,8 +144,12 @@ class DenseParams:
 
     def as_dict(self) -> dict:
         d = asdict(self)
-        d["lod_voxels"] = list(self.lod_voxels)
+        d["lod_depth_fractions"] = list(self.lod_depth_fractions)
         return d
+
+    def voxels_for(self, median_scene_depth: float) -> list[float]:
+        """The LOD ladder in this world's own units."""
+        return [f * float(median_scene_depth) for f in self.lod_depth_fractions]
 
 
 @dataclass

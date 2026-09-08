@@ -311,5 +311,194 @@ def test_canonical_level_is_not_the_finest_level():
     noise; the canonical level must sit at the resolution the evidence supports."""
     p = DenseParams()
     assert p.canonical_level > 0
-    assert p.lod_voxels[p.canonical_level] > p.lod_voxels[0]
+    assert p.lod_depth_fractions[p.canonical_level] > p.lod_depth_fractions[0]
     assert p.mobile_level >= p.canonical_level
+
+
+def test_voxel_sizes_are_relative_to_the_scene_and_not_absolute():
+    """global_solve never normalises the model, so the gauge is arbitrary and
+    differs by more than an order of magnitude between solves in this corpus.
+    A fixed voxel would shatter one world and collapse another."""
+    p = DenseParams()
+    small = p.voxels_for(7.0)
+    large = p.voxels_for(70.0)
+    assert small[0] == pytest.approx(0.021, abs=1e-6)
+    for a, b in zip(small, large):
+        assert b == pytest.approx(a * 10.0, rel=1e-9)
+    assert all(v > 0 for v in small)
+    assert small == sorted(small)
+
+
+def test_params_record_everything_that_changes_the_output():
+    """The manifest carries these so a reconstruction can be explained later."""
+    d = DenseParams().as_dict()
+    for key in ("backend", "gate_rel", "tau", "min_views", "neighbours",
+                "edge_rel", "max_grazing_deg", "lod_depth_fractions",
+                "min_confidence", "component", "average_views"):
+        assert key in d
+
+
+# ---------------------------------------------------------------------------
+# the privacy boundary
+#
+# engine.py redacts faces BEFORE persisting a keyframe image, deliberately, so
+# that the bytes any later reconstruction reads are the redacted ones. A dense
+# stage reaching past that to the original capture would rebuild the room out
+# of exactly the pixels the privacy transformation removed -- and at far higher
+# density than the sparse cloud ever exposed. These tests pin that shut.
+# ---------------------------------------------------------------------------
+
+
+class _StubStore:
+    def __init__(self, images: "pathlib.Path"):
+        self._images = images
+
+    def images_dir(self, world_id, session_id):
+        return self._images
+
+
+class _StubRedactor:
+    def __init__(self, available=True):
+        self.available = available
+        self.unavailable_reason = None if available else "no model"
+        self.label = "stub@0.30"
+        self.calls = 0
+
+    def redact(self, image_bytes):
+        self.calls += 1
+
+        class R:
+            pass
+
+        r = R()
+        r.image_bytes = b"REDACTED:" + image_bytes
+        return r
+
+
+def test_dense_prefers_the_worlds_redacted_keyframe_over_the_raw_capture(tmp_path):
+    import pathlib  # noqa: F401 -- used by the stub annotation
+
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "00000042.jpg").write_bytes(b"REDACTED-KEYFRAME")
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(b"RAW-WITH-A-FACE")
+    red = _StubRedactor()
+
+    data, origin, raw_bytes = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", str(raw), red
+    )
+    assert data == b"REDACTED-KEYFRAME"
+    assert origin == "world-keyframe"
+    assert red.calls == 0                      # the raw frame was never opened
+    assert raw_bytes is None                   # and is not handed on either
+
+
+def test_dense_re_redacts_when_the_worlds_keyframe_image_is_missing(tmp_path):
+    """Worlds migrated between roots lost their images/ directory. Falling back
+    to the raw capture is allowed only through the same transformation."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(b"RAW-WITH-A-FACE")
+    red = _StubRedactor()
+
+    data, origin, raw_bytes = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", str(raw), red
+    )
+    assert red.calls == 1
+    assert raw_bytes == b"RAW-WITH-A-FACE"     # returned only so the fill can be differenced
+    assert data == b"REDACTED:RAW-WITH-A-FACE"
+    assert origin == "raw-source-rereducted"
+    assert b"RAW-WITH-A-FACE" != data
+
+
+def test_dense_refuses_a_raw_frame_when_redaction_is_unavailable(tmp_path):
+    """The safe direction is to lose the frame, not to publish the face."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    raw = tmp_path / "raw.jpg"
+    raw.write_bytes(b"RAW-WITH-A-FACE")
+
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", str(raw), _StubRedactor(available=False)
+    )
+    assert data is None
+    assert origin == "refused-no-redactor"
+
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", str(raw), None
+    )
+    assert data is None
+
+
+def test_dense_reports_an_absent_image_rather_than_inventing_one(tmp_path):
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    images = tmp_path / "images"
+    images.mkdir()
+    data, origin, _ = keyframe_image_bytes(
+        _StubStore(images), "w", "s", "s:00000042", None, _StubRedactor()
+    )
+    assert data is None
+    assert origin == "absent"
+
+
+def test_dense_never_reads_the_solve_workspace_images():
+    """Some solve workspaces hold undistorted RAW frames that COLMAP was fed.
+    Those bypass redaction, so the dense stage must not reach for them."""
+    from tower.world_builder import dense_pipeline
+
+    src = (dense_pipeline.run_depth_stage.__doc__ or "") + \
+        dense_pipeline.keyframe_image_bytes.__doc__
+    import inspect
+
+    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    assert 'solve_images' not in body
+    assert 'keyframe_image_bytes(' in body
+
+
+def test_redaction_fill_is_excluded_exactly_when_the_raw_frame_survives():
+    """A filled rectangle is not an observation. With the raw frame in hand the
+    mask is a difference, so it is exact."""
+    from tower.world_builder.dense_pipeline import redaction_fill_mask
+
+    rng = np.random.default_rng(11)
+    raw = rng.integers(30, 220, size=(120, 90, 3)).astype(np.uint8)
+    red = raw.copy()
+    red[20:60, 10:40] = 0                       # a solid fill, as redaction.py writes
+    mask = redaction_fill_mask(red, raw, dilate_px=0)
+    assert mask[20:60, 10:40].all()
+    assert not mask[80:, 60:].any()
+
+
+def test_redaction_fill_is_found_without_the_raw_frame():
+    """Worlds keep only the redacted keyframe. A solid fill still has to be
+    recognised, or the network's invented depth across it enters the cloud."""
+    from tower.world_builder.dense_pipeline import redaction_fill_mask
+
+    rng = np.random.default_rng(12)
+    img = rng.integers(60, 240, size=(200, 160, 3)).astype(np.uint8)
+    img[40:140, 30:110] = 0
+    mask = redaction_fill_mask(img, None, dilate_px=0)
+    inner = mask[50:130, 40:100]
+    assert inner.mean() > 0.98
+    assert mask[160:, 120:].mean() < 0.02
+
+
+def test_redaction_fill_ignores_merely_dark_scene_content():
+    """A dark room is not a redaction. Only a large solid block counts, or the
+    mask would eat every night-time frame in the corpus."""
+    from tower.world_builder.dense_pipeline import redaction_fill_mask
+
+    rng = np.random.default_rng(13)
+    dark = rng.integers(0, 40, size=(200, 160, 3)).astype(np.uint8)
+    dark[dark < 3] = 12                          # dark, but textured, not flat zero
+    mask = redaction_fill_mask(dark, None, dilate_px=0)
+    assert mask.mean() < 0.05

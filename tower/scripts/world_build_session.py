@@ -1049,6 +1049,20 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
+        "--densify",
+        action="store_true",
+        help=(
+            "After the final build and the final solve, reconstruct a dense "
+            "point cloud from the solved cameras and persist it under "
+            "<world>/dense/<session>. Runs once, at the end, in this process "
+            "-- never on the frame path. It reads the world's own redacted "
+            "keyframe imagery, adds an artifact nothing else reads, and "
+            "changes neither derived/ nor the world's scale semantics, so a "
+            "failure leaves exactly the world you would have had. Costs "
+            "minutes: skipped outright on a hard stop."
+        ),
+    )
+    parser.add_argument(
         "--stop-on-stdin-close",
         action="store_true",
         help=(
@@ -1538,6 +1552,33 @@ def main(argv=None) -> int:
         report["registration"] = {
             "attempted": False, "reason": "placements come from the global solve",
         }
+
+    # Dense reconstruction last, because it is the most expensive thing here
+    # and the least load-bearing: every other artifact is already on disk and
+    # complete before it starts. It is skipped rather than truncated on a hard
+    # stop -- the Job Object kills this tree on a 30-second grace and a
+    # half-written dense tree would be worse than none. Its own stages are
+    # checkpointed, so a later `scripts/world_densify.py` resumes rather than
+    # restarting.
+    if args.densify:
+        if stop_request.hard_asked_for():
+            report["dense"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_request.source}) during finalization",
+            }
+        elif not (solve_report or {}).get("solved"):
+            report["dense"] = {
+                "attempted": False,
+                "reason": "dense reconstruction needs a global solve; there is none",
+            }
+        else:
+            from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
+
+            dense_result = densify(
+                store, world_id, session_id,
+                should_stop=stop_request.hard_asked_for,
+            )
+            report["dense"] = {"attempted": True, **dense_result.as_dict()}
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

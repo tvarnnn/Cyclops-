@@ -98,6 +98,87 @@ def _undistorted_image(ki: int, work: Path):
     return cv2.imread(str(p)) if p.exists() else None
 
 
+def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str,
+                         source_path: str | None, redactor
+                         ) -> tuple[bytes | None, str, bytes | None]:
+    """The pixels the dense stage is allowed to read, and where they came from.
+
+    THIS IS A PRIVACY BOUNDARY, not a convenience. `engine.py` redacts faces
+    BEFORE persisting a keyframe image, deliberately, so that the bytes any
+    later reconstruction reads are the redacted ones rather than raw frames
+    sitting on disk behind a display filter. A dense stage that reached past
+    that to the original capture would rebuild the room out of exactly the
+    pixels the privacy transformation removed, at far higher density than the
+    sparse cloud ever exposed.
+
+    So: the world's own redacted keyframe image is used when it exists. When it
+    does not -- worlds migrated between roots lost their `images/` directory --
+    the raw frame is read and THE SAME REDACTION IS RE-APPLIED before anything
+    looks at it. If the redactor is unavailable, the frame is refused rather
+    than used raw.
+
+    Returns (image_bytes, origin, raw_bytes_if_we_redacted_them). The third
+    value exists so the caller can difference the two and learn exactly which
+    pixels were filled -- see `redaction_fill_mask`.
+    """
+    seq = keyframe_id.rsplit(":", 1)[-1]
+    p = store.images_dir(world_id, session_id) / f"{seq}.jpg"
+    if p.exists():
+        try:
+            return p.read_bytes(), "world-keyframe", None
+        except OSError:
+            pass
+    if not source_path or not Path(source_path).exists():
+        return None, "absent", None
+    try:
+        raw = Path(source_path).read_bytes()
+    except OSError:
+        return None, "unreadable", None
+    if redactor is None or not getattr(redactor, "available", False):
+        return None, "refused-no-redactor", None
+    return redactor.redact(raw).image_bytes, "raw-source-rereducted", raw
+
+
+def redaction_fill_mask(image, raw=None, fill_value: int = 0,
+                        min_area_fraction: float = 0.0015, dilate_px: int = 3):
+    """Which pixels are redaction fill rather than scene.
+
+    A filled rectangle is not an observation. A depth network handed one will
+    happily invent a surface across it, and multi-view consensus will not
+    always catch it, because the SAME detector fires on the SAME object from
+    several nearby frames -- so several cameras agree on geometry that is
+    really a black box. This is not hypothetical: on this corpus the face
+    detector fires on the wearer's hands and on carpet, filling over 10% of
+    the frame in 22 of 77 frames and up to 58% in the worst one.
+
+    Excluding those pixels is both the honest choice and the one that recovers
+    quality: the region is unobserved, so it should be a hole.
+
+    When the raw image is available the mask is exact (a difference). When only
+    the redacted image survives, large near-`fill_value` connected regions are
+    used, which is what a solid fill leaves behind.
+    """
+    import cv2
+
+    h, w = image.shape[:2]
+    if raw is not None and raw.shape[:2] == (h, w):
+        mask = (np.abs(image.astype(np.int16) - raw.astype(np.int16)).sum(-1) > 12)
+    else:
+        flat = (image.max(-1) <= fill_value + 8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            flat.astype(np.uint8), connectivity=4
+        )
+        mask = np.zeros((h, w), bool)
+        min_area = max(64, int(min_area_fraction * h * w))
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                mask |= labels == i
+    if dilate_px:
+        mask = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                          iterations=dilate_px).astype(bool)
+    return mask
+
+
 def run_depth_stage(
     store, world_id: str, session_id: str, solution, intrinsics, params: DenseParams,
     root: Path, *, should_stop=None, progress: Callable[[str, int, int], None] | None = None,
@@ -122,7 +203,19 @@ def run_depth_stage(
     )
     W, H = int(cam["width"]), int(cam["height"])
     sources = _source_paths(store.world_dir(world_id) / "solve" / session_id)
-    solve_images = store.world_dir(world_id) / "solve" / session_id / "images"
+    # The solve workspace also holds undistorted `images/`, but those are the
+    # RAW frames COLMAP was fed by some workspaces, not the world's redacted
+    # keyframes, so the dense stage deliberately does not read them.
+    from tower.world_builder.redaction import FaceRedactor
+
+    redactor = FaceRedactor()
+    if not redactor.available:
+        logger.warning(
+            "[Tower][WorldBuilder][dense] face redaction unavailable (%s); frames "
+            "whose redacted keyframe image is missing will be REFUSED rather than "
+            "read raw", redactor.unavailable_reason,
+        )
+    origins: dict[str, int] = {}
 
     backend = make_backend(params.backend)
     kids = solution.keyframe_ids
@@ -144,39 +237,43 @@ def run_depth_stage(
     for n, (ki, kid, pose) in enumerate(targets):
         if _stopped(should_stop):
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
-                    "camera": cam, "targets": len(targets)}
+                    "camera": cam, "targets": len(targets), "image_origins": origins}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
-        img = None
-        named = solve_images / f"{ki:05d}.jpg"
-        if named.exists():
-            img = cv2.imread(str(named))
-        if img is None:
-            src = sources.get(kid)
-            if not src or not Path(src).exists():
-                records.append({"ki": int(ki), "ok": False, "why": "source image absent"})
-                continue
-            raw = cv2.imread(src)
-            if raw is None:
-                records.append({"ki": int(ki), "ok": False, "why": "source image unreadable"})
-                continue
-            if maps is None:
-                m1, m2, roi, _pin = _undistort_maps(intrinsics, raw.shape[1], raw.shape[0])
-                maps = (m1, m2, roi)
-            m1, m2, (x0, y0, rw, rh) = maps
-            if (rw, rh) != (W, H):
-                raise DenseUnavailable(
-                    f"undistorted ROI is {rw}x{rh} but the solve camera is {W}x{H}; "
-                    "the dense stage refuses to reconstruct in a camera the poses "
-                    "were not solved in"
-                )
-            img = cv2.remap(raw, m1, m2, cv2.INTER_LINEAR)[y0:y0 + rh, x0:x0 + rw]
-            cv2.imwrite(str(work / "undist" / f"{ki:05d}.jpg"), img,
-                        [cv2.IMWRITE_JPEG_QUALITY, 95])
-        else:
-            cv2.imwrite(str(work / "undist" / f"{ki:05d}.jpg"), img,
-                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+        data, origin, raw_bytes = keyframe_image_bytes(
+            store, world_id, session_id, kid, sources.get(kid), redactor
+        )
+        origins[origin] = origins.get(origin, 0) + 1
+        if data is None:
+            records.append({"ki": int(ki), "ok": False, "why": f"image {origin}"})
+            continue
+        raw = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if raw is None:
+            records.append({"ki": int(ki), "ok": False, "why": "image undecodable"})
+            continue
+        if maps is None:
+            m1, m2, roi, _pin = _undistort_maps(intrinsics, raw.shape[1], raw.shape[0])
+            maps = (m1, m2, roi)
+        m1, m2, (x0, y0, rw, rh) = maps
+        if (rw, rh) != (W, H):
+            raise DenseUnavailable(
+                f"undistorted ROI is {rw}x{rh} but the solve camera is {W}x{H}; "
+                "the dense stage refuses to reconstruct in a camera the poses "
+                "were not solved in"
+            )
+        img = cv2.remap(raw, m1, m2, cv2.INTER_LINEAR)[y0:y0 + rh, x0:x0 + rw]
+        cv2.imwrite(str(work / "undist" / f"{ki:05d}.jpg"), img,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        original = None
+        if raw_bytes is not None:
+            original = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
+        fill = redaction_fill_mask(raw, original)
+        fill_u = cv2.remap(fill.astype(np.uint8) * 255, m1, m2,
+                           cv2.INTER_NEAREST)[y0:y0 + rh, x0:x0 + rw] > 0
+        np.save(work / "depth" / f"{ki:05d}_fill.npy", fill_u)
+        fill_fraction = float(fill_u.mean())
 
         disp = backend.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
@@ -200,13 +297,17 @@ def run_depth_stage(
         a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc[g])
         np.save(work / "depth" / f"{ki:05d}.npy", disp)
         records.append({"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
-                        "n_points": int(g.sum()), "held_out_rel": ho})
+                        "n_points": int(g.sum()), "held_out_rel": ho,
+                        "redaction_fill_fraction": fill_fraction,
+                        "image_origin": origin})
 
     if progress:
         progress(STAGE_DEPTH, len(targets), len(targets))
     payload = {"records": records, "seconds": time.time() - t0, "camera": cam,
                "targets": len(targets), "backend": backend.name,
-               "backend_licence": backend.licence, "stopped_after": None}
+               "backend_licence": backend.licence, "stopped_after": None,
+               "image_origins": origins,
+               "redaction": getattr(redactor, "label", None) if redactor.available else None}
     _write_json(root / "align.json", payload)
     return payload
 
@@ -251,12 +352,21 @@ def run_fuse_stage(
         with np.errstate(divide="ignore", invalid="ignore"):
             z = np.where(den > 1e-6, r["a"] / den, np.nan).astype(np.float32)
         D[ki] = z
-        VALID[ki] = validity_mask(z, K, edge_rel=params.edge_rel,
-                                  max_grazing_deg=params.max_grazing_deg,
-                                  erode_px=params.erode_px)
+        ok = validity_mask(z, K, edge_rel=params.edge_rel,
+                           max_grazing_deg=params.max_grazing_deg,
+                           erode_px=params.erode_px)
+        fillp = work / "depth" / f"{ki:05d}_fill.npy"
+        if fillp.exists():
+            # Redaction fill is unobserved, so it stays a hole.
+            ok &= ~np.load(fillp)
+        VALID[ki] = ok
 
     sample = np.concatenate([d[np.isfinite(d)][::37] for d in D.values()])
     zmax = float(np.percentile(sample, params.max_depth_pct))
+    # Every length below is expressed against this, because the world's gauge
+    # is arbitrary and differs by more than an order of magnitude between solves.
+    median_depth = float(np.median(sample))
+    voxels = params.voxels_for(median_depth)
 
     C = np.array([camera_centre(*poses[ki]) for ki in kept])
     d2 = ((C[:, None, :] - C[None, :, :]) ** 2).sum(-1)
@@ -332,14 +442,15 @@ def run_fuse_stage(
     C_ = np.concatenate(acc_c)
     F = np.concatenate(acc_f)
     del acc_x, acc_c, acc_f
-    Xv, Cv, Fv = voxel_reduce(X, C_, F, params.lod_voxels[0])
-    np.savez_compressed(root / "fused.npz", xyz=Xv, rgb=Cv, confidence=Fv)
+    Xv, Cv, Fv = voxel_reduce(X, C_, F, voxels[0])
+    np.savez_compressed(root / "fused.npz", xyz=Xv, rgb=Cv, confidence=Fv,
+                        median_depth=np.float64(median_depth))
     if progress:
         progress(STAGE_FUSE, len(kept), len(kept))
     return {
         "frames_used": len(kept), "frames_dropped": dropped,
         "sampled": int(raw_total), "survived": int(keep_total),
-        "points": int(len(Xv)), "far_clip": zmax,
+        "points": int(len(Xv)), "far_clip": zmax, "median_depth": median_depth,
         "seconds": time.time() - t0, "stopped_after": None,
     }
 
@@ -350,6 +461,8 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
         X = z["xyz"].astype(np.float32)
         C = z["rgb"]
         F = z["confidence"]
+        median_depth = float(z["median_depth"]) if "median_depth" in z else 1.0
+    voxels = params.voxels_for(median_depth)
     m = F >= params.min_confidence
     X, C, F = X[m], C[m], F[m]
     lo = np.percentile(X, 0.2, 0)
@@ -358,7 +471,7 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
     X, C, F = X[inb], C[inb], F[inb]
 
     levels = []
-    for i, v in enumerate(params.lod_voxels):
+    for i, v in enumerate(voxels):
         Xi, Ci, Fi = (X, C, F) if i == 0 else voxel_reduce(X, C, F, v)
         size = write_points_bin(root / f"points_l{i}.bin", Xi, Ci, Fi)
         levels.append({"level": i, "voxel": v, "points": int(len(Xi)), "bytes": int(size)})
@@ -374,6 +487,7 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict) -> dict:
         "min_confidence": params.min_confidence,
         "canonical_level": params.canonical_level,
         "mobile_level": params.mobile_level,
+        "median_scene_depth": median_depth,
         "bbox_min": [float(v) for v in lo],
         "bbox_max": [float(v) for v in hi],
         # Repeated, not re-derived. The dense stage makes no new scale claim.
