@@ -385,6 +385,51 @@ moves the number by 0.2-1.6 points depending on the world; under the previous
 one it moved it by up to 3.4, which is most of what the earlier tables were
 reporting as quality.
 
+
+### 11.5 Standing where the wearer stood does not always show what they saw
+
+An independent visual reviewer, given only the comparison sheets and no
+engineering context, found columns where the reconstruction rendered from a
+capture pose shows **a different part of the dwelling** than the photograph
+taken from that pose. That is the most serious thing anyone has said about this
+artifact, so it was measured rather than argued about.
+
+`proto/seethrough.py` separates the two possible causes on 45 sampled poses
+across six worlds. The discriminator is the sparse cloud: it comes from the same
+bundle adjustment as the poses and is independent of the depth network.
+
+| | median | p90 | worst |
+| --- | --- | --- | --- |
+| reprojection error of this frame's own observed sparse points | **0.76 px** | — | **1.66 px** |
+| pixel coverage of the render | 93.5% | — | 26.5% (min) |
+| sparse points the render places at least 25% too far away | 1.5% | 11.1% | 95.4% |
+| relative depth error where the render shows anything | 5.6% | 83.6% | — |
+
+**The poses are right.** Sub-pixel reprojection on every frame sampled, worst
+1.66 px. Nothing is misplaced and nothing is in the wrong room.
+
+**What happens instead is that you see through a hole.** A point cloud occludes
+only where it has points. Where the near surface was dropped — a blank wall
+carries almost no sparse points, so the affine fit there is unanchored and the
+gate rejects the frame, or the validity mask removes it — there is nothing in
+front, and the render shows the geometry BEHIND it. On the worst frame sampled,
+95.4% of that frame's own sparse points are rendered at least a quarter too far
+away: the wall is simply absent and the room behind it is what appears.
+
+**6 of 45 sampled poses (13%) do this badly enough to be misleading.** That is
+the honest number. It is not fabrication — every point shown is a real
+observation of a real surface, just not the surface that should be in front of
+it — but a wearer cannot tell the difference, and "an empty region means the
+observations did not support geometry there" is a weaker promise than it sounds
+when the empty region is a hole in a wall you are looking through.
+
+**Nothing available fixes this within the artifact's own rules.** Filling the
+hole is exactly the fabrication the format forbids. Closing it honestly needs
+either more frames through the gate or a surface representation, and D13 records
+why the surface options were rejected. What can be done is to say so, which is
+what this section is for, and the diagnostic is in the tree so the next person
+can re-measure rather than re-argue.
+
 ### 11.4 What changed against the previous default, and what did not
 
 The seven-world run above is the same seven worlds the stage had already

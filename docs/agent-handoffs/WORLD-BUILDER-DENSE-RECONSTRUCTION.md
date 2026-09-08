@@ -324,6 +324,14 @@ The dense field is not a meaningful part of it.
    reaches 96-98%. More tuning will not fix it; consensus needs baseline.
 8. **The reference is not independent** — see the top of §6. Every number in
    this lane is measured against the solve the pipeline is anchored to.
+9. **You can see through missing walls.** On 13% of sampled capture poses the
+   render shows the room BEHIND a surface that was dropped, because a point
+   cloud occludes only where it has points. The poses are right — sub-pixel
+   reprojection everywhere — so nothing is misplaced; what is missing is the
+   thing that should be in front. `01-EVIDENCE.md` §11.5 has the measurement
+   and `proto/seethrough.py` reproduces it. An independent visual reviewer
+   found this before any instrument did, which is the argument for looking at
+   the pictures.
 
 ## 11. Exact reproduction
 
