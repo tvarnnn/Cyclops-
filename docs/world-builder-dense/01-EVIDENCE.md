@@ -397,103 +397,6 @@ one it moved it by up to 3.4, which is most of what the earlier tables were
 reporting as quality.
 
 
-### 11.5 Standing where the wearer stood does not always show what they saw
-
-An independent visual reviewer, given only the comparison sheets and no
-engineering context, found columns where the reconstruction rendered from a
-capture pose shows **a different part of the dwelling** than the photograph
-taken from that pose. That is the most serious thing anyone has said about this
-artifact, so it was measured rather than argued about.
-
-`proto/seethrough.py` separates the two possible causes on 45 sampled poses
-across six worlds. The discriminator is the sparse cloud: it comes from the same
-bundle adjustment as the poses and is independent of the depth network.
-
-| | median | p90 | worst |
-| --- | --- | --- | --- |
-| reprojection error of this frame's own observed sparse points | **0.76 px** | — | **1.66 px** |
-| pixel coverage of the render | 93.5% | — | 26.5% (min) |
-| sparse points the render places at least 25% too far away | 1.5% | 11.1% | 95.4% |
-| relative depth error where the render shows anything | 5.6% | 83.6% | — |
-
-**The poses are right.** Sub-pixel reprojection on every frame sampled, worst
-1.66 px. Nothing is misplaced and nothing is in the wrong room.
-
-**What happens instead is that you see through a hole.** A point cloud occludes
-only where it has points. Where the near surface was dropped — a blank wall
-carries almost no sparse points, so the affine fit there is unanchored and the
-gate rejects the frame, or the validity mask removes it — there is nothing in
-front, and the render shows the geometry BEHIND it. On the worst frame sampled,
-95.4% of that frame's own sparse points are rendered at least a quarter too far
-away: the wall is simply absent and the room behind it is what appears.
-
-**6 of 45 sampled poses (13%) do this badly enough to be misleading.** That is
-the honest number. It is not fabrication — every point shown is a real
-observation of a real surface, just not the surface that should be in front of
-it — but a wearer cannot tell the difference, and "an empty region means the
-observations did not support geometry there" is a weaker promise than it sounds
-when the empty region is a hole in a wall you are looking through.
-
-**Nothing available fixes this within the artifact's own rules.** Filling the
-hole is exactly the fabrication the format forbids. Closing it honestly needs
-either more frames through the gate or a surface representation, and D13 records
-why the surface options were rejected. What can be done is to say so, which is
-what this section is for, and the diagnostic is in the tree so the next person
-can re-measure rather than re-argue.
-
-
-### 11.6 The walls are there, and they are not invented
-
-The same independent visual reviewer made two claims that cannot both be true
-of the same surfaces, and measuring them settles both.
-
-> *"No world has a ceiling, a complete wall, a corner, or a closed floor plan.
-> Not one."*
-
-> *"The giant smooth sheets ... huge, smoothly-curved cream and white planes
-> that are several times larger than any wall in any photograph, and they curve
-> -- real walls do not. This looks like depth-map extrapolation off a blown-out
-> overexposed wall, spraying a plausible-looking smooth surface into space that
-> was never observed."*
-
-`proto/planarity.py` RANSACs the largest planar structures out of the fused
-cloud and reports, for each, how thick it really is and what confidence its
-points carry. Confidence is the number of independent cameras that agreed on a
-point's depth, which is the discriminator: **a fabricated surface cannot carry a
-high one, because the mechanism that would have to invent it is the same one
-that counts agreements.**
-
-The six largest planes, on the two worlds the claims were made about:
-
-| world | plane share of cloud | thickness, RMS / extent | thickness, p95 / extent | width / extent | confidence, median | share at 5+ cameras |
-| --- | --- | --- | --- | --- | --- | --- |
-| `672578d0` (three rooms) | 30.0% in six planes | 0.0011-0.0012 | 0.0035-0.0038 | 0.18-0.50 | 6-8 | 72-92% |
-| `7d31e8d7` (desk) | 32.1% in six planes | 0.0011-0.0012 | 0.0037-0.0038 | 0.23-0.36 | 6-8 | 67-87% |
-
-Against a whole-cloud confidence median of 6 with 16% of points sitting at the
-floor of 3.
-
-**So: about a third of each cloud lies in six structures that are between a
-fifth and a half of the room across, flat to about one part in a thousand of
-the scene, and supported by more cameras than the average point in the same
-cloud.** Those are walls, floors and ceilings. They are not curved, they are not
-extrapolated, and they are better evidenced than the furniture.
-
-The first claim is therefore wrong, and the second claim is wrong about the same
-surfaces the first claim says are missing. What is true is the thing underneath
-both: **the enclosure is incomplete.** Planes exist but do not close; corners
-are frequently absent; and a room with three of its four walls reads to a viewer
-as no walls at all, especially from outside, where you see the backs of them.
-
-A separate measurement rules out the obvious explanation. On 30 frames of the
-desk world, wall-facing pixels survive the validity mask at **78.8%**, against
-80.0% for all pixels -- the mask is not what removes walls. Floor and ceiling
-pixels do worse, at 70.9%, losing 12.8% to the grazing-angle test, which is
-exactly what a floor seen from standing height should lose. The gate refused 4
-of 429 frames at alignment. Neither mechanism explains an incomplete enclosure;
-what does is that a wearer walking through a room does not point the camera at
-every wall from two angles, and consensus needs two angles.
-
 ### 11.4 What changed against the previous default, and what did not
 
 The seven-world run above is the same seven worlds the stage had already
@@ -519,3 +422,119 @@ upper bounds.
 manifest and in the CLI's own output, and it is the number to quote when
 someone asks how much of the walk the reconstruction uses. It is better than
 the 43-64% the previous model dropped, and it is still most of a third.
+### 11.5 Standing where the wearer stood does not always show what they saw
+
+An independent visual reviewer, given only the comparison sheets and no
+engineering context, found columns where the reconstruction rendered from a
+capture pose shows **a different part of the dwelling** than the photograph
+taken from that pose, and read it as fabricated geometry.
+
+**An earlier version of this section claimed to refute that. It did not, and
+the way it failed is worth more than the conclusion it reached.** It measured
+exactly one of the two ways a render can be wrong, and it measured the one that
+supported the answer it wanted. What follows is both directions.
+
+`proto/seethrough.py` samples 45 poses across six worlds. Each anchor is a
+sparse point the solve says that frame observes.
+
+| | poses right? | render too FAR (a hole) | render too NEAR (occupying empty space) | no render at all |
+| --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk) | 0.76 px median | 1.5% median | 1.1% median | small |
+| `672578d0` (three rooms) | sub-pixel | 2.8% median, 7.6% p90 | **7.9% median, 86.5% p90, 100% max** | **up to 28.8%** |
+
+**The poses are right, and that part stands.** Sub-pixel reprojection on every
+frame sampled, worst 1.66 px. Nothing is in the wrong room.
+
+**But the pose test proves less than it looks.** It reprojects the exact points
+the bundle adjustment optimised, using the exact pose it produced. It cannot be
+large unless the solve failed to converge, and it is blind to gauge drift.
+Empirically it predicts nothing about the errors that matter: Spearman
+correlation with depth error **0.127 (p = 0.71)**, and with the in-front rate
+**0.109 (p = 0.75)**. The frame with 100% of its anchors occluded has the
+second-worst reprojection in the sample at 1.65 px, and a frame with none has
+1.43 px.
+
+**And on the three-room world the reviewer was closer to right than this
+section was.** Dense geometry rendered *nearer* than a triangulated point the
+solve says is directly visible is **2.8x more common at the median** than the
+see-through failure, reaches 86.5% at p90 and 100% on one sampled frame. That
+is opaque geometry standing in space the solve says is empty, which is the
+reviewer's allegation and not an honest hole.
+
+**Two further limits, stated because the earlier version did not.** Both rates
+are computed only where the render produced something, so up to 28.8% of a
+frame's anchors -- the holes the section is about -- are dropped from the
+statistic. And 6 of 45 poses has a Wilson 95% interval of **[6.3%, 26.2%]**, so
+"13%" is a point estimate from a fixed-stride sample, not a measurement of the
+poses the reviewer actually flagged.
+
+**Where that leaves it.** Nothing is misplaced. Some of what looks wrong is a
+missing near surface. Some of it, on at least one world, is dense geometry in
+front of where the solve says nothing is -- and this section does not establish
+which mechanism dominates in the frames a person objected to. It is not settled.
+
+### 11.6 The large planar surfaces are real, and the evidence for it was weaker than claimed
+
+The same reviewer made two claims that cannot both be true of the same surfaces:
+that no world has a wall or a ceiling, and that the large smooth surfaces are
+curved extrapolation sprayed into unobserved space.
+
+`proto/planarity.py` RANSACs the largest planar structures out of the fused
+cloud. **An earlier version of this section read its output as settling the
+question. A null control shows most of that reading was circular.**
+
+**What does not survive.** The script picks inliers by `|d| < 0.004 * extent`
+and then reports the RMS and p95 of `|d|` over those same inliers. Both are
+functions of the threshold. Running the identical procedure on **uniform random
+points** in each world's own bounding box:
+
+| | RMS / extent | p95 / extent | plane share of cloud |
+| --- | --- | --- | --- |
+| `672578d0` real | 0.0011-0.0012 | 0.0037-0.0038 | **28.0%** |
+| `672578d0` uniform noise | 0.0011-0.0012 | 0.0038 | 7.5% |
+| `7d31e8d7` real | 0.0011-0.0012 | 0.0038 | **26.6%** |
+| `7d31e8d7` uniform noise | 0.0011-0.0012 | 0.0038 | 8.4% |
+
+Identical to four decimal places on structureless noise. "Flat to one part in a
+thousand of the scene" was a statement about the number 0.004.
+
+"They are not curved" was **never measured at all**: a surface curving by less
+than the tolerance is admitted as a plane, and the script fits no quadric. The
+reviewer's word was *curve*, and the tolerance is exactly the band that would
+absorb it.
+
+**What does survive, and it is the part that matters.** Real clouds put
+**26-30%** of their points in large planes against **7.5-8.4%** for noise. That
+is a real signal and noise does not produce it. And the confidence separation is
+real -- corrected for a baseline error the earlier version made, which compared
+planes against a whole-cloud mean that *includes* the planes:
+
+| | plane points | non-plane points | noise control |
+| --- | --- | --- | --- |
+| `672578d0` mean confidence | **6.71** | 5.97 | 6.20 vs 6.18 |
+| `7d31e8d7` mean confidence | **6.81** | 6.25 | 6.40 vs 6.39 |
+
+**But confidence is evidence, not proof, and this lane's own source says so.**
+`redaction_fill_mask`'s comment: *"multi-view consensus will not always catch
+it, because the SAME detector fires on the SAME object from several nearby
+frames -- so several cameras agree on geometry that is really a black box."*
+`pack_percentile`'s: *"surviving consensus because several nearby frames made
+the SAME error."* And the fusion picks the ten *nearest* cameras -- the ten most
+similar viewpoints, the set most likely to share a deterministic network's
+error. The earlier version of this section argued that a fabricated surface
+cannot carry high confidence. Two comments in this repository say it can.
+
+**And six planes are not six surfaces.** Comparing the normals afterwards, four
+of the desk world's six lie within 7 degrees of each other and two of those sit
+1.7 plane-thicknesses apart -- one surface split across RANSAC rounds. The
+honest count there is about four surfaces in three orientations. The three-room
+world is genuinely diverse: 14 of its 15 plane pairs are more than 15 degrees
+apart, spread across 45% of the scene extent.
+
+**Where that leaves it.** There is real large planar structure, better supported
+than the rest of the cloud, and far more of it than noise produces. Whether any
+particular large surface is an observed wall or a consensus of correlated
+errors is **not** decided by these numbers, and the reviewer's specific claim
+about curvature is untested. The enclosure being incomplete -- the claim that
+survived -- is unaffected.
+

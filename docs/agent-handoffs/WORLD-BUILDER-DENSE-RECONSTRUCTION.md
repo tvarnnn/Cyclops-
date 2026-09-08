@@ -336,10 +336,14 @@ The dense field is not a meaningful part of it.
    reaches 96-98%. More tuning will not fix it; consensus needs baseline.
 8. **The reference is not independent** — see the top of §6. Every number in
    this lane is measured against the solve the pipeline is anchored to.
-9. **The enclosure is incomplete.** Walls, floors and ceilings ARE
-   reconstructed -- about a third of each cloud lies in six planes a fifth to
-   a half of the room across, flat to one part in a thousand, carried by more
-   cameras than the average point (§11.6). What is missing is closure: three
+9. **The enclosure is incomplete.** Real large planar structure exists --
+   26-30% of a cloud against 7.5-8.4% for uniform noise, and plane points
+   carry more agreeing cameras than non-plane points. Whether any particular
+   large surface is an observed wall or a consensus of correlated errors is
+   NOT settled by that, and §11.6 says so; the fusion picks the ten nearest
+   cameras, which is the set most likely to share a deterministic network's
+   error, and two comments in this repository say consensus can agree on
+   something that is not there. What is missing is closure: three
    walls of four, corners absent, so from outside it reads as no walls at all.
    A wearer walking through a room does not point the camera at every wall
    from two angles, and consensus needs two angles.
@@ -454,11 +458,19 @@ check verified a redactor existed rather than that a redaction happened. Both
 sets are fixed and each has a test that fails without the fix. A third review
 should be run against a frozen branch, because neither of the first two was.
 
-**What an independent visual reviewer changed:** two claims that looked
-devastating -- that the reconstruction shows a different room from a capture
-pose, and that the large smooth surfaces are invented -- were both measured and
-both turned out to be something else (§11.5, §11.6). One claim survived and is
-the real limitation: **the enclosure is incomplete.**
+**What an independent visual reviewer changed:** three claims. The enclosure
+one survived immediately and is the real limitation. The other two were
+answered in §11.5 and §11.6 -- and a third adversarial review then showed those
+answers were measured in the direction of the conclusion. §11.5 computed only
+the failure that supported it, and the omitted direction (dense geometry in
+front of points the solve says are visible, which is the reviewer's actual
+allegation) is 2.8x more common at the median on the very world it was written
+about. §11.6's flatness evidence reproduces to four decimal places on uniform
+noise, because it reports the spread of points selected by a threshold, over
+that threshold. Both sections are rewritten to say what they do and do not
+establish. What survives is real: 26-30% of a cloud in large planes against
+7.5-8.4% for noise, and plane points better supported than non-plane points.
+What does not is the claim that either question is settled.
 
 **The single most valuable next measurement** is the one that would close it.
 `neighbours` is the only consensus parameter with no measurement behind it, and
@@ -501,7 +513,8 @@ and recovers in place.
 
 The same independent reviewer's conclusion was *"those are my things" is not
 "that is my room"*, and the measurements agree with the reviewer rather than
-with me. The enclosure does not close: planes exist and do not meet, corners are
+with me -- including on two points where an earlier version of this document
+claimed otherwise. The enclosure does not close: planes exist and do not meet, corners are
 frequently absent, and a room with three walls of four reads as none, especially
 from outside where you see the backs of them. On 13% of sampled capture poses
 the render shows the geometry BEHIND a surface that was dropped, because a point
