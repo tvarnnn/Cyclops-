@@ -155,15 +155,16 @@ All seven worlds, densified with the shipped configuration. `01-EVIDENCE.md`
 §11 carries the same run with its accuracy tails and its gate sensitivity;
 this is the operator's view of it.
 
-| world | frames used / posed | held-out residual | L0 points | L0 size | wall clock |
-| --- | --- | --- | --- | --- | --- |
-| `7d31e8d7` (desk and shelf) | 316 / 429 | 2.6% | 8.2 M | 132 MB | 230 s |
-| `1b8812b1` (widest traverse) | 303 / 438 | 2.9% | 8.7 M | 139 MB | 206 s |
-| `37e497f8` (bedroom) | 134 / 196 | 3.4% | 4.8 M | 78 MB | 96 s |
-| `672578d0` (bedroom, closet, desk) | 298 / 425 | 3.8% | 14.8 M | 236 MB | 210 s |
-| `a378331a` (closet) | 117 / 201 | 4.9% | 5.0 M | 81 MB | 92 s |
-| `ecc02df1` (dresser) | 50 / 77 | 5.3% | 2.1 M | 33 MB | 51 s |
-| `6427900d` (bathroom, tight) | 132 / 266 | 5.4% | 3.6 M | 57 MB | 108 s |
+| world | frames used / posed | held-out residual | L0 points | L0 size |
+| --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk and shelf) | 344 / 429 | 2.4% | 8.5 M | 136 MB |
+| `1b8812b1` (widest traverse) | 314 / 438 | 2.7% | 9.4 M | 150 MB |
+| `672578d0` (bedroom, closet, desk) | 306 / 425 | 3.5% | 15.0 M | 239 MB |
+| `37e497f8` (bedroom) | 139 / 196 | 3.5% | 5.2 M | 84 MB |
+| `fc58a64d` (end-to-end replay) | 175 / 198 | 4.0% | 8.8 M | 141 MB |
+| `ecc02df1` (dresser) | 55 / 77 | 4.3% | 2.2 M | 35 MB |
+| `a378331a` (closet) | 114 / 201 | 4.9% | 5.3 M | 85 MB |
+| `6427900d` (bathroom, tight) | 139 / 266 | 5.0% | 3.9 M | 62 MB |
 
 Peak VRAM for the depth stage is **2.4 GB**; everything else is CPU and RAM.
 A 12 GB card runs this comfortably; a 4 GB one will not.
