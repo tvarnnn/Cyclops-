@@ -693,8 +693,88 @@ hit-test results entirely, and its guidance is to show content only once
 tracking returns to normal. Showing nothing beats showing something about to
 jump.
 
-That measurement is `reports/20-segment-settling.md`, and the criterion is not
-committed to until its numbers are in.
+### The measurement came back, and it kills the criterion I proposed
+
+Prefixes of three real walks were solved at 25, 40, 55, 70, 85 and 100% of their
+keyframes, plus the final loop-detecting solve, and every consecutive pair was
+compared segment by segment. The framing is deliberately the most generous one a
+product could claim: each prefix is re-registered into the final solve's frame
+by a trimmed Sim3 on the camera centres they share, so what is left is what a
+wearer would actually see move after the viewer had done its best. Data under
+`settle/`.
+
+**1. The live solve fragments as the walk continues. It does not converge.**
+
+| world | components, 25% -> 100% | keyframes in the largest thread | at the final solve |
+| --- | --- | --- | --- |
+| closet (205 kf) | 1 -> 2 | 51 -> 104 | 1 component |
+| chain (430 kf) | 2 -> **7** | 97 -> **104** | 1 component |
+| traverse (519 kf) | 3 -> **16** | 113 -> **281** | 7 components |
+
+The component counts are read directly from each prefix solve's own
+`solution.json`; the thread sizes are from the analysis under `settle/`.
+
+The largest thread stops growing while the wearer keeps walking. On the chain it
+sits at 104 keyframes from 55% of the walk onward, out of 430; on the traverse it
+reaches 281 of 519 and stalls there. **A live viewer would show a quarter to a
+half of the room, and a smaller FRACTION of it the longer the walk went on.**
+Only the final solve, the one with loop detection, pulls the walk into one piece.
+
+**2. Segments move, and not by a little.** Translation as a fraction of scene
+extent, and rotation, between consecutive solves:
+
+| transition | closet | chain | traverse |
+| --- | --- | --- | --- |
+| 25 -> 40 | 0.02%, 0.2 deg | 0.01%, 0.03 deg | 0.07%, 0.3 deg |
+| 40 -> 55 | 0.02%, 0.2 deg | nothing shared | **4.61%, 12 deg** |
+| 55 -> 70 | 0.01%, 0.1 deg | 0.38%, 5.9 deg | **2.02%, 12 deg** |
+| 70 -> 85 | 0.00%, 0.1 deg | 0.62%, **16 deg** | **5.90%, 36 deg** |
+| 85 -> 100 | nothing shared | 0.47%, **15 deg** | **1.67%, 11 deg** |
+| 100 -> final | 1.17%, **49 deg** | 1.19%, 4.7 deg | **6.77%, 39 deg** |
+
+Medians. The traverse's p90 at 70 -> 85 is **19.7% of scene extent**. Rotations
+of fifteen to fifty degrees are routine, both mid-walk and at the final solve,
+on every world.
+
+**3. So the criterion is unbuildable.** The fraction of shared segments moving
+less than 0.5% of extent and 0.5 degrees is 1.00 on the first transition of each
+walk and then collapses: 0.00 for chain and traverse from 40-55% onward, and
+0.00 for every world at the final solve. The question D19 left open -- *of
+segments stable across two consecutive solves, what fraction move materially
+later?* -- has the answer **effectively all of them**. A criterion that promoted
+geometry once it had held still for two solves would have promoted it and then
+rotated it by thirty-six degrees.
+
+The closet is the small-world exception, and its own final solve rotates
+everything by 49 degrees.
+
+**One nuance, because it is the only encouraging number here.** Measured in each
+solve's own frame rather than after re-registration, the settled fraction is
+0.00 everywhere including the closet -- the gauge itself moves, which D18 and the
+unnormalised solve already predicted. The 1.00 rows are after alignment. So
+*within a thread that survives*, segments are rigid relative to one another
+exactly as `WORLD-BUILDER-GEOMETRY.md` promises; what moves is which segments are
+in the thread, and where the thread sits. That distinction is real and it does
+not rescue the criterion.
+
+**Cost, for the record.** Live prefix solves ran 6.8-39 s and grew with the walk;
+the final loop-detecting solve took 24-86 s. D19's 15-60 s cadence estimate is
+right, and it buys a fragment.
+
+**What this changes.** D19's decision is unchanged and better supported: the
+dense stage stays at Stop. What is withdrawn is D19's proposed mitigation. There
+is no settled criterion to build, and a live 3-D view of the sparse world would
+have to be honest about showing part of a room that will be rearranged rather
+than a part that has stopped moving. The contract's existing vocabulary already
+says that better than a new mechanism would -- segments off the main thread are
+`unregistered`, drawn apart and labelled, never composited. The live feature
+worth building is the one D20 arrived at independently: tell the wearer what has
+not been covered, while they can still walk back to it.
+
+This also supplies a number an earlier reviewer explicitly retracted as
+unmeasurable, on the grounds that the pre-global live estimate is not retained on
+disk. It is not retained -- but it can be reconstructed by solving the prefixes,
+and the teleport is real and large.
 
 ### What is explicitly NOT decided here
 
