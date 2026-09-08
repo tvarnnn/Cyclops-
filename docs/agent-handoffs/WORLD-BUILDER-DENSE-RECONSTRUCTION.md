@@ -223,15 +223,20 @@ inspection.
 
 ### Regression evidence
 
-Every test outside World Builder, on this branch:
+The whole Tower suite, on this branch, run in two halves because the machine was
+also running six research agents:
 
 ```
-2163 passed, 59 skipped, 771 deselected, 1 xfailed in 537.76s
+-k "not world"   2163 passed, 59 skipped, 1 xfailed   537.76s
+-k "world"        755 passed, 17 skipped              541.83s
+                 ----------------------------------
+                 2918 passed, 76 skipped, 1 xfailed, ZERO FAILURES
 ```
 
-That covers CV Lab, Object Memory, Document Memory, Scene Understanding, the
-shared camera transport, session lifecycle, listener resilience and process
-cleanup. **No failures.**
+The first half covers CV Lab, Object Memory, Document Memory, Scene
+Understanding, the shared camera transport, session lifecycle, listener
+resilience and process cleanup. The second covers every World Builder test,
+including the 55 new ones.
 
 That is the result that matters most for a change like this, because the only
 shared surface it touches is one additive key in the `GET /worlds` listing. The
