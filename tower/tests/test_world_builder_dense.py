@@ -1985,3 +1985,38 @@ def test_a_dense_module_that_will_not_import_still_serves_the_sparse_page():
     after = body[imp:]
     # the import has its own handler, before the try that uses the name
     assert "except Exception" in after[:after.index("build_dense_page(store")]
+
+
+def test_the_dense_stage_is_reachable_from_configuration_and_off_by_default():
+    """Until this existed the only way to get a dense artifact was to run
+    scripts/world_densify.py by hand, which is not a supported product path --
+    main.py never passed --densify and no setting turned it on.
+
+    Off by default on purpose: about 2.4 GB of VRAM and minutes of GPU per
+    world, on a card four other cartridges share. Turning it on should be
+    somebody's decision, not a surprise."""
+    import inspect
+    import os
+
+    from tower.config import get_settings
+
+    assert get_settings().world_densify is False
+
+    prior = os.environ.get("TOWER_WORLD_DENSIFY")
+    try:
+        os.environ["TOWER_WORLD_DENSIFY"] = "true"
+        assert get_settings().world_densify is True
+    finally:
+        if prior is None:
+            os.environ.pop("TOWER_WORLD_DENSIFY", None)
+        else:
+            os.environ["TOWER_WORLD_DENSIFY"] = prior
+
+    # and it is only passed alongside --solve, because the dense stage is
+    # anchored to the global solution and there is nothing to anchor to without
+    # one -- a mistake worth catching once here rather than per session.
+    from tower import main
+
+    src = inspect.getsource(main)
+    i = src.index('densify = ("--densify",)')
+    assert "settings.world_solve" in src[i:i + 200]

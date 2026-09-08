@@ -72,6 +72,23 @@ build. It is skipped outright on a hard stop, and it is skipped when there is no
 global solution. A skip is recorded in the report and in `dense/status.json`; it
 is never reported as a failure.
 
+## 3b. Turning it on for every capture
+
+`TOWER_WORLD_DENSIFY=true` makes the Tower pass `--densify` to every builder it
+spawns, so a capture produces a dense world by itself. **It is off by default
+and that default is the decision**, not an oversight: the stage costs about
+2.4 GB of VRAM and two to four minutes of GPU per world, on a card four other
+cartridges share. It runs after the world lock is released, so it blocks no
+capture -- but it competes for the GPU with whatever the wearer does next.
+
+It is ignored unless `TOWER_WORLD_SOLVE` is also on, because the dense stage is
+anchored to the global solution's cameras and sparse points and there is
+nothing to anchor to without one.
+
+Before this setting existed the only way to get a dense artifact was to run
+`scripts/world_densify.py` by hand, and the CLI's own docstring wrongly said
+otherwise.
+
 ## 4. Look at the result
 
 ```
