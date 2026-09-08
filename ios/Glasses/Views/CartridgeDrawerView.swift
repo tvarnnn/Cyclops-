@@ -92,9 +92,48 @@ struct CartridgeDrawerView: View {
                     // this claim must never be wrong in.
                     //
                     // What survives is the true and useful half: opening a
-                    // cartridge is not itself a start. The recording verbs are
-                    // deliberate and live inside the workspace.
-                    Text("Opening a cartridge changes this app's workspace. Opening one does not start anything on the Tower by itself — but some workspaces can, and they say so where the control is. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
+                    // cartridge is not itself a *recording*. The recording
+                    // verbs are deliberate and live inside the workspace.
+                    //
+                    // Corrected again on 2026-09-08, in the same direction and
+                    // for the same reason. "Opening one does not start
+                    // anything on the Tower by itself" had become false for
+                    // two of the five, and the hedge that followed it — "but
+                    // some workspaces can, and they say so where the control
+                    // is" — pointed at the Start controls, which is not where
+                    // this happens:
+                    //
+                    //   * World Builder POSTs its cartridge session `start`
+                    //     from `.onAppear` (`WorldBuilderSessionController.
+                    //     workspaceDidAppear`). An active session is precisely
+                    //     what lets a builder attach to a capture, so opening
+                    //     the screen while a camera is streaming starts a
+                    //     world-build worker. No control was touched.
+                    //   * Scene Understanding subscribes to the live scene
+                    //     from `.onAppear`, and on this Tower a subscription
+                    //     *is* the watcher half of "somebody streams and
+                    //     somebody watches" — so opening the screen over an
+                    //     open stream loads and runs a people detector.
+                    //
+                    // **The two are not alike on retention, and an earlier
+                    // draft of this very sentence got that wrong.** It said
+                    // "neither keeps anything", generalising from the fact
+                    // that a `CartridgeSession` is not itself persisted. That
+                    // is a different fact. World Builder's session is the gate
+                    // on the world-build worker (`tower/tower/main.py`), and
+                    // that worker exists to write: it is launched with
+                    // `--root <world_root>`, opens a `WorldStore` on it, and
+                    // writes sources, placements and a solve log — the very
+                    // worlds "Saved worlds" later lists. So opening this
+                    // screen over a live capture can put a reconstruction on
+                    // the Tower's disk.
+                    //
+                    // Scene Understanding really does keep nothing, and its
+                    // own screen says so. Saying it about both would be an
+                    // active reassurance that is false, in the one direction
+                    // this claim must never be wrong in — worse than the
+                    // stale-but-conservative sentence it replaced.
+                    Text("Opening a cartridge changes this app's workspace. Two of them also set the Tower working as they open: World Builder activates its session, and Scene Understanding starts watching the scene — so if a camera is already streaming, opening those is enough. They differ in what is left behind: Scene Understanding keeps nothing, while World Builder's session is what lets the Tower build and save a world from a capture that is already running. Recording is otherwise a deliberate act, and those controls live inside the workspace. Badges describe this app: \u{201C}Ready to test\u{201D} means there is something here to try, not that the Tower you are connected to is serving it right now. Each workspace says what that Tower can actually do.")
                         .padding(.top, 4)
                 }
             }
