@@ -465,3 +465,74 @@ the real limitation: **the enclosure is incomplete.**
 it is the only lever that can add coverage without weakening the rule: raising
 it searches more cameras for witnesses that already meet the bar, rather than
 lowering the bar. `scripts/neighbours_sweep.sh` is written and ready to run.
+
+## 15. The verdict, and what it rests on
+
+**WORLD BUILDER RECOGNIZABLE-ROOM TARGET PARTIALLY ACHIEVED — the room is
+recognisable and freely navigable in 3-D, and both halves are measured; the
+enclosure does not close, 13% of capture poses show through a missing surface,
+and nothing has been verified on the phone itself.**
+
+### The half that is achieved
+
+*"I open the saved world and immediately recognize: that is my room."* The
+comparison sheets put the reconstruction beside the photograph from the same
+pose, and what survives is specific: the shelf unit with its tier spacing, the
+console on the middle shelf, the tilted second monitor keeping its tilt, the
+RGB keyboard, a small orange figurine that appears in five of six columns, the
+hanging clothes with a red-striped sleeve, the bed with its red blanket, two
+framed pictures in the right place relative to the blinds. An independent
+reviewer given no context and told to be hard said, of exactly this, *"those are
+my things — and they would be right"*.
+
+And about a third of each cloud is not things at all but structure: six planar
+regions a fifth to a half of the room across, flat to one part in a thousand of
+the scene, carrying more agreeing cameras than the average point (§11.6). Walls,
+floors and ceilings, measured rather than asserted.
+
+*"I can move around that reconstructed room in 3-D."* Verified first-hand in a
+browser, on the page the route actually serves: orbit, pan, pinch, WASD flight,
+a step to any of 240 capture positions, and an outside view, at 41-72 fps on the
+phone's own byte budget. Novel views rendered from positions no camera occupied
+hold together in most panels. A real WebGL context loss and restore was exercised
+and recovers in place.
+
+### The half that is not
+
+The same independent reviewer's conclusion was *"those are my things" is not
+"that is my room"*, and the measurements agree with the reviewer rather than
+with me. The enclosure does not close: planes exist and do not meet, corners are
+frequently absent, and a room with three walls of four reads as none, especially
+from outside where you see the backs of them. On 13% of sampled capture poses
+the render shows the geometry BEHIND a surface that was dropped, because a point
+cloud occludes only where it has points. Two of eight worlds carry a p90 depth
+error of 40-58% against medians near 5%. The tight rooms — a closet and a
+bathroom — reconstruct 60-67% of a held-out frame where every other world
+reaches 96-98%.
+
+None of that is a tuning gap. D20 measured the one lever that could have closed
+it without weakening the honesty rule, on the world that has the gap, and it
+returns fewer points. Consensus needs two viewing angles and a wearer walking
+through a room does not give every wall two.
+
+And the client is unverified. No Swift file was changed and none needed to be,
+but no iOS build was compiled, no page was loaded in a WKWebView, and the dense
+stage is not wired into the served product at all — `main.py` never passes
+`--densify`.
+
+### Why this is not "achieved"
+
+Because the acceptance test names a person opening a world and recognising it,
+and the only person-shaped judgement obtained said no. Reporting otherwise would
+require ignoring the one piece of evidence that was gathered specifically to
+test the claim, which is the failure mode this lane has spent two adversarial
+reviews correcting.
+
+### Why it is not "blocked"
+
+Because nothing about it is stuck. The pipeline runs end to end on eight worlds
+in three to four minutes each, every accuracy figure has an artifact behind it,
+the honesty guarantees are enforced rather than asserted, and the remaining gap
+has a named cause and a named next step. What would close it is more
+observations of the surfaces that have none — a capture-time coverage cue, which
+D19 and D20 arrived at independently — and a phone to test on.
