@@ -208,11 +208,27 @@ enum CartridgeAvailability: Equatable, Sendable {
     ///     `TowerCapabilities.declaredContract(for:in:)`. `nil` for every other
     ///     cartridge, because the local `TowerCapabilities.declared` table is
     ///     empty and the Tower declares nothing for them.
-    ///   - supported: the contract identifiers this build implements. One
-    ///     element today — `WorldBuilderResultContract.identifier`,
-    ///     `"world_builder.status/2026-08-25"`. Not empty, and it matches the
-    ///     identifier a live Tower offers, which is why `.available` is a
-    ///     reachable outcome rather than a theoretical one.
+    ///   - supported: the contract identifiers this build implements — the
+    ///     five in `TowerCapabilities.supported`, one each for World Builder,
+    ///     the CV Lab and Scene Understanding, and two for Document Memory.
+    ///     Four of the five are subscription contracts;
+    ///     `document_memory.library` is HTTP, so calling the set
+    ///     "the subscription contracts" would contradict the comment on
+    ///     `supported` itself, which excludes `world_builder.geometry` for
+    ///     being HTTP-only. Not empty, and every one matches what a live
+    ///     Tower offers, which is why `.available` is a reachable outcome
+    ///     rather than a theoretical one.
+    ///
+    ///     Deliberately not spelled out as literals here. This comment used to
+    ///     say "one element today" and quote `world_builder.status/2026-08-25`,
+    ///     and both halves went stale — the set grew to five, and that
+    ///     identifier was superseded by `/2026-09-06`. The quoted string was
+    ///     doing real damage rather than merely being wrong:
+    ///     `ios/scripts/contract-drift-check.py` decides what this build
+    ///     implements by sweeping *quoted* identifiers out of Swift source, so
+    ///     a dead identifier in a doc comment was reported as implemented —
+    ///     the one thing that check exists to catch. `TowerCapabilities.supported`
+    ///     is the list; naming it is enough.
     ///   - isTowerReachable: whether the connection is currently up.
     /// - Parameter knownToThisBuild: whether this build has a client and a
     ///   Tower-name mapping for the cartridge — i.e. whether a declaration for

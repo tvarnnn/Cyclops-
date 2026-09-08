@@ -10,7 +10,7 @@
 
 **Status:** implemented on both sides and exercised end to end over a real
 socket. The Tower half has met the Ray-Ban camera; the iOS half of
-`world_builder.status/2026-08-25` has not yet been walked. See
+`world_builder.status/2026-09-06` has not yet been walked. See
 `docs/agent-handoffs/WORLD-BUILDER-INTEGRATION.md` for exactly what has and
 has not met hardware.
 

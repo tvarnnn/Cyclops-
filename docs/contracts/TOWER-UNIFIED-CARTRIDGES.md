@@ -42,7 +42,7 @@ of identifier is a change of contract and is the only signal a client gets.
 | Identifier | Surface | Section |
 |---|---|---|
 | `cartridge_results.envelope/2026-08-23` | the result socket's envelope, shared by every subscription | §3 |
-| `world_builder.status/2026-08-25` | World Builder status, subscription | §5 |
+| `world_builder.status/2026-09-06` | World Builder status, subscription | §5 |
 | `world_builder.geometry/2026-08-25` | World Builder geometry, HTTP | §5 |
 | `experimental_cv.status/2026-08-27` | CV Lab status — HTTP, socket and subscription | §6 |
 | `experimental_cv.control/2026-08-27` | CV Lab command vocabulary | §6 |
@@ -114,7 +114,7 @@ is the designated answer for a failure only a load can discover.
 
 | Cartridge | `result_type` | Contract | Available when |
 |---|---|---|---|
-| `world_builder` | `status` | `world_builder.status/2026-08-25` | `TOWER_WORLD_ROOT` is set |
+| `world_builder` | `status` | `world_builder.status/2026-09-06` | `TOWER_WORLD_ROOT` is set |
 | `experimental_cv` | `status` | `experimental_cv.status/2026-08-27` | a CV Lab module exists (normally always) |
 | `scene_understanding` | `live` | `scene_understanding.live/2026-08-27` | the session constructs (needs `torch`/`torchvision`, the `[ml]` extra). `TOWER_SCENE_UNDERSTANDING` is `auto` when unset (since 2026-09-07); `off` withdraws it |
 | `document_memory` | `status` | `document_memory.status/2026-09-07` | `TOWER_DOCUMENT_ENABLED` is on (the default since 2026-09-07; the root has a managed default under `tower/data/document_memory`, `TOWER_DOCUMENT_ROOT` overrides it) |

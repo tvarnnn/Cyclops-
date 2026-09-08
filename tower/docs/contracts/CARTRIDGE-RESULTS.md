@@ -445,7 +445,7 @@ move.
 | World Builder | `status` | `world_builder.status/2026-09-06` | §10 |
 | Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 | Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
-| Document Memory | `status` | `document_memory.status/2026-08-27` | §15 |
+| Document Memory | `status` | `document_memory.status/2026-09-07` | §15 |
 
 **`not_offered` is now EMPTY, and that is a claim.** Three cartridges
 left that list on 2026-08-27 — Scene Understanding, Document Memory and
@@ -1381,8 +1381,8 @@ event as the scene having changed.
 
 ## 15. Document Memory `status` payload, and the library on HTTP
 
-Contracts: `document_memory.status/2026-08-27` (this channel) and
-`document_memory.library/2026-08-27` (HTTP).
+Contracts: `document_memory.status/2026-09-07` (this channel) and
+`document_memory.library/2026-09-07` (HTTP).
 Subscription pair: `("document_memory", "status")`.
 
 ### 15.0 Read this before building anything against it
