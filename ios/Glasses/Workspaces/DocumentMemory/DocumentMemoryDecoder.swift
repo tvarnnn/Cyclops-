@@ -74,8 +74,22 @@ enum DocumentMemoryDecoder {
             single = document(from: raw, receivedAt: receivedAt, notes: notes)
         }
 
+        // Pages live INSIDE the document, not beside it. The Tower builds the
+        // single-document payload as
+        // `payload["document"] = dict(_summary_view(...), pages=[...])`
+        // (`tower/tower/results/document_memory.py`), and its own wire test
+        // asserts `payload["document"]["pages"][0]["text"]`.
+        //
+        // This read was at the top level, where the Tower has never put it, so
+        // `pages` came back empty against a real Tower and the page text --
+        // the only thing the single-document route exists to carry -- never
+        // arrived. Two things hid it: nothing renders pages yet, and the
+        // fixture was written to match this decoder rather than the Tower, so
+        // the test agreed with the bug rather than catching it.
         var pages: [DocumentPage] = []
-        for raw in json["pages"] as? [[String: Any]] ?? [] {
+        let documentBlock = json["document"] as? [String: Any]
+        let rawPages = documentBlock?["pages"] as? [[String: Any]] ?? []
+        for raw in rawPages {
             if let page = self.page(from: raw) { pages.append(page) }
         }
 
