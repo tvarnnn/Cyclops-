@@ -134,7 +134,31 @@ Measured, per world, on the datasets used here:
 | `ecc02df1` (dresser) | 40 / 77 | 7.6% | 1.0 M | 16 MB | ~1.5 min |
 | `be36bd70` (replay, end to end) | 26 / 58 | 8.7% | 0.7 M | 12 MB | 105 s |
 
-Peak VRAM for the depth stage is **0.85 GB**; the rest is CPU and RAM. The
-intermediate `work/` and `fused.npz` are regenerable and can be removed to
-reclaim most of the footprint — but note the project's filesystem policy:
-**move to `Glasses-scratch\`, never delete without explicit approval.**
+Peak VRAM for the depth stage is **0.85 GB**; everything else is CPU and RAM.
+
+### Footprint, and why a successful run cleans up after itself
+
+A 438-keyframe world leaves **601 MB** if nothing is pruned, and only about
+130 MB of that is the artifact:
+
+| | |
+| --- | --- |
+| `points_l0/1/2.bin` + manifest + align + status | ~132 MB — **the artifact** |
+| `fused.npz` | ~76 MB — the same points `points_l0.bin` already holds |
+| `work/` (per-frame depth maps, undistorted frames) | ~393 MB |
+
+So after `pack` succeeds, `work/` and `fused.npz` are removed. That is the stage
+deleting its own intermediates, inside its own subtree, after the output they
+produced is complete — not a cleanup of anyone's artifacts, and the project's
+filesystem policy on deletion is about the latter.
+
+**`--keep-intermediates` turns it off, and that is the flag for development.**
+Re-fusing with different parameters off cached depth maps is the whole iteration
+loop; it takes about two minutes instead of eight. The depth maps are stored as
+float16, because the values run 0.2–40 world units and the pipeline's own error
+is a few percent, so three significant digits is already more than the evidence
+supports.
+
+The analysis scripts under `Glasses-scratch\wb-dense\proto\` accept either
+`fused.npz` or a `points_l0.bin` path, so a pruned artifact is still
+inspectable.
