@@ -1532,11 +1532,32 @@ def main(argv=None) -> int:
     # The Sim3 registrar places fragments against each other; when the
     # global solve produced a solution the placements already come from one
     # reconstruction and a second, weaker answer must not overwrite them.
-    if args.register and not (solve_report or {}).get("solved"):
+    #
+    # THE QUESTION IS WHO WROTE placements.json, NOT WHETHER THE FINAL SOLVE
+    # RAN. This used to read `not (solve_report or {}).get("solved")`, and
+    # `solve_report` is the FINAL solve's report -- None whenever the session
+    # did not reach finalization normally. On the 2026-09-09 walk the session
+    # died in the observe loop, so `solve_report` was None, so the guard
+    # concluded there was no solution and ran the registrar. It ran at
+    # 20:24:48.3, sixteen seconds AFTER the last build had written its
+    # placements at 20:24:32.5, and overwrote them.
+    #
+    # What it destroyed is on record in the manifest beside the file it
+    # replaced: `global_solve` reports 72 segments registered into 14
+    # components from nine successful background solves, while the
+    # `placements.json` the phone actually reads was left saying 120 refused
+    # and 2 registered. That single substitution is why a walk that
+    # reconstructed most of a room was drawn as 87 disconnected fragments.
+    #
+    # `engine.build()` now says which producer owns the file, so the guard
+    # asks the build that actually wrote it.
+    placements_source = (result.diagnostics or {}).get("placements_source")
+    if args.register and placements_source is None:
         report["registration"] = register_session(store, world_id, session_id)
     elif args.register:
         report["registration"] = {
-            "attempted": False, "reason": "placements come from the global solve",
+            "attempted": False,
+            "reason": f"placements come from the {placements_source}",
         }
 
     if args.format == "json":

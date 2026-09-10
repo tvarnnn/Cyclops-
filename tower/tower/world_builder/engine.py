@@ -919,6 +919,24 @@ class WorldBuilderEngine:
             diagnostics={
                 "points_discarded_by_segment": discards_by_segment,
                 "refusals_by_segment": refusals_by_segment,
+                # WHO OWNS placements.json after this build.
+                #
+                # "global_solve" means the merge above wrote every placement
+                # from one reconstruction. The Sim3 registrar must then not
+                # run: it answers the same question pairwise and weaker, and
+                # it OVERWRITES the same file.
+                #
+                # This is reported rather than inferred because the builder
+                # used to infer it from the wrong thing -- whether the FINAL
+                # solve had succeeded. On the 2026-09-09 walk the final solve
+                # never ran (the session died in the observe loop), so the
+                # builder concluded no solution existed and ran the
+                # registrar 16 seconds after the last build. It replaced 72
+                # segments registered into 14 components with 120 refusals
+                # and 2 registrations, and that is the world the phone then
+                # drew. Nine good background solves were discarded by a
+                # question about a tenth that never happened.
+                "placements_source": "global_solve" if placements is not None else None,
             },
         )
 

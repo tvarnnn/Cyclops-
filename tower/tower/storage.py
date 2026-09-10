@@ -17,6 +17,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import BinaryIO, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,64 @@ def _replace_with_retry(temp_path: Path, path: Path) -> None:
                 raise
             time.sleep(backoff)
             backoff = min(backoff * 2, REPLACE_BACKOFF_MAX_S)
+
+
+def write_bytes_atomic(path: Path, write: "Callable[[BinaryIO], None]") -> None:
+    """Publish a binary artifact atomically: `write` fills a temp file, and
+    the destination is replaced only once the bytes are whole and on disk.
+
+    The binary twin of `write_json_atomic`, and it exists for a measured
+    failure rather than for symmetry. `world_builder/global_solve.py` wrote
+    `solution.npz` by handing the FINAL path straight to
+    `np.savez_compressed`, while `solution.json` beside it went through the
+    atomic helper. A `.npz` is a zip, a zip is only a zip once its central
+    directory is written last, and the reader lives in a DIFFERENT PROCESS
+    -- the builder rebuilding the derived tree while the solver child it
+    launched is still writing.
+
+    On the 2026-09-09 walk that reader opened the file mid-write and got
+    `BadZipFile: File is not a zip file`, which ended a session holding 795
+    keyframes and 26,634 points. The same window is worse when the writer
+    is TERMINATED rather than merely slow (`BackgroundSolver.wait` kills a
+    child that outstays a stop): the torn file then persists, and every
+    later read of that world fails the same way.
+
+    Replacing a whole temp file closes both cases at once. A reader sees
+    the previous solution or the next one, never half of either, and a
+    killed writer leaves only a temp file that the `finally` removes.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + TEMP_SUFFIX)
+    try:
+        with temp_path.open("wb") as handle:
+            write(handle)
+            handle.flush()
+            # fsync before the replace, not after. The replace is what
+            # publishes; bytes still sitting in the OS cache at that
+            # moment are bytes a crash can take with the rename already
+            # visible, which is the one ordering that produces a file
+            # that IS published and IS torn.
+            os.fsync(handle.fileno())
+        _replace_with_retry(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_bytes_closed(path: Path) -> bytes:
+    """Read a binary artifact whole, with the handle closed before use.
+
+    The binary twin of `read_json_closed`, and for the same Windows
+    reason: a handle held across parsing is a handle that blocks a
+    writer's `os.replace` (WinError 5), so a reader that parses lazily
+    turns itself into the thing the write path has to retry around.
+
+    `np.load` on a path is exactly that lazy reader -- `NpzFile` keeps the
+    zip open until it is closed -- so callers hand these bytes to
+    `np.load(io.BytesIO(...))` instead. The arrays this Tower persists are
+    single-digit MB; the field session's `solution.npz` is 1.7 MB.
+    """
+    with path.open("rb") as handle:
+        return handle.read()
 
 
 def read_json_closed(path: Path) -> dict:

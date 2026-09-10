@@ -68,17 +68,24 @@ Builder behaves exactly as before, and the manifest says why.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import shutil
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from tower.storage import read_json_closed, write_json_atomic
+from tower.storage import (
+    read_bytes_closed,
+    read_json_closed,
+    write_bytes_atomic,
+    write_json_atomic,
+)
 from tower.world_builder.records import Keyframe, SegmentPlacement
 from tower.world_builder.schema import (
     DEGENERACY_NONE,
@@ -438,17 +445,32 @@ def _pose_matrices(entry: dict):
 
 
 def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
+    """Publish a solution: the arrays first, the metadata last.
+
+    ORDER IS LOAD-BEARING, because `load_solution` requires BOTH files and
+    the metadata is what carries `schema_version` and `solved_at`. Writing
+    the arrays first means the newest `solution.json` a reader can see
+    always has arrays at least as new behind it. The reverse order
+    publishes a claim before the evidence.
+
+    Both writes are atomic. `solution.npz` was not until 2026-09-09, and a
+    reader in the builder process caught the solver child mid-zip; see
+    `storage.write_bytes_atomic`.
+    """
     workspace.root.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    write_bytes_atomic(
         workspace.arrays_path,
-        xyz=solution.xyz.astype(np.float32),
-        rgb=solution.rgb.astype(np.uint8),
-        component=solution.component.astype(np.int32),
-        first_keyframe=solution.first_keyframe.astype(np.int32),
-        track_length=solution.track_length.astype(np.int32),
-        error=solution.error.astype(np.float32),
-        observations=solution.observations.astype(np.int32).reshape(-1, 3),
-        observation_xy=solution.observation_xy.astype(np.float32).reshape(-1, 2),
+        lambda handle: np.savez_compressed(
+            handle,
+            xyz=solution.xyz.astype(np.float32),
+            rgb=solution.rgb.astype(np.uint8),
+            component=solution.component.astype(np.int32),
+            first_keyframe=solution.first_keyframe.astype(np.int32),
+            track_length=solution.track_length.astype(np.int32),
+            error=solution.error.astype(np.float32),
+            observations=solution.observations.astype(np.int32).reshape(-1, 3),
+            observation_xy=solution.observation_xy.astype(np.float32).reshape(-1, 2),
+        ),
     )
     write_json_atomic(
         workspace.solution_path,
@@ -476,7 +498,12 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
         meta = read_json_closed(workspace.solution_path)
         if meta.get("schema_version") != SOLUTION_SCHEMA_VERSION:
             return None
-        with np.load(workspace.arrays_path) as arrays:
+        # Read the bytes with the handle closed, then parse in memory.
+        # `np.load` on a PATH keeps the zip open for the life of the
+        # NpzFile, and a held handle is what blocks a writer's os.replace
+        # on Windows -- so the lazy form would make this reader the very
+        # obstacle the write path has to retry around.
+        with np.load(io.BytesIO(read_bytes_closed(workspace.arrays_path))) as arrays:
             return Solution(
                 solver=meta["solver"],
                 solved_at=float(meta["solved_at"]),
@@ -496,8 +523,42 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
                 camera=meta.get("camera"),
                 timing=dict(meta.get("timing") or {}),
             )
-    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("global solve: solution for %s unreadable: %s", world_id, exc)
+    except Exception as exc:  # noqa: BLE001 -- see below; the narrow tuple IS the bug
+        # DELIBERATELY BROAD, and the breadth is the fix rather than a
+        # shortcut around one.
+        #
+        # This used to catch `(OSError, KeyError, ValueError,
+        # json.JSONDecodeError)`, chosen to make the docstring's "never
+        # raises" true. It did not. A `.npz` is a zip read by numpy, and a
+        # torn one raises out of two libraries whose exception types are
+        # not part of anyone's contract: measured over 15 s of a real
+        # reader/writer race, 48,854 `EOFError`, 10,295
+        # `zipfile.BadZipFile`, plus `BadZipFile: Bad magic number for
+        # central directory` and `Truncated file header`. `EOFError` --
+        # the MOST common by five to one -- descends from Exception, and
+        # `BadZipFile` from Exception alone; neither is an OSError. In the
+        # same run `load_solution` returned None exactly ZERO times.
+        #
+        # One of those escaped on the 2026-09-09 walk and ended a session
+        # holding 795 keyframes and 26,634 points: `BadZipFile: File is
+        # not a zip file` reached the builder's BaseException handler and
+        # became `finalization.interrupted`.
+        #
+        # An allowlist of exception types for a best-effort read of a
+        # foreign binary format is incomplete by construction, and the
+        # cost of being wrong is losing a capture. The write is atomic now
+        # (`storage.write_bytes_atomic`), so a torn read should not recur
+        # -- this is the second line of defence, and it must not have a
+        # gap. A solution is DERIVED: re-solving rebuilds it from the
+        # journal, so "absent" is always a survivable reading of
+        # "unreadable", and never worth ending a capture over.
+        #
+        # BaseException still propagates, so KeyboardInterrupt and the
+        # supervisor's stop still stop this process.
+        logger.warning(
+            "global solve: solution for %s unreadable (%s: %s); continuing without it",
+            world_id, type(exc).__name__, exc,
+        )
         return None
 
 
