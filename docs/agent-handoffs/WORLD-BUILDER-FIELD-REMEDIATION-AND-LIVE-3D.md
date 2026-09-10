@@ -557,6 +557,30 @@ Five review passes ran against work their authors did not write.
    frames.** 38.5% of the field capture was motion-blurred and 27.2% was more
    than 30% black. The dense lane's own recommended next step was exactly
    this cue, and it is not built.
+
+   **This is the highest-value next lane, and it is small — which is why it
+   is worth saying exactly why it was not done here.** The data already
+   exists: `WorldBuilderEngine` counts `frames_observed` and
+   `rejected_by_reason` in memory on every frame (`engine.py:292`,
+   `_note_rejected`), and both reach disk only at `stop_session`
+   (`engine.py:471`). So during a walk the phone cannot be told the
+   acceptance ratio, and `_progress_block` says so in its own comment:
+   *"`frames_observed` has no source at all"*. Publishing it needs a
+   periodic write of those two fields — naturally placed in `build()`,
+   which already writes — plus a ratio and dominant-reason line in the
+   progress block, plus one row on the phone.
+
+   It was not done in this campaign because **a new periodic write on the
+   live path is the exact failure family this campaign spent six review
+   rounds on**: a writer publishing to a file a cross-process reader polls
+   is what `BadZipFile` was. Adding one in the last hour, after every
+   recent change needed two rounds of fixes, is the wrong risk at the wrong
+   time. The next lane should do it, with the atomic-publication discipline
+   the rest of the store already has.
+
+   It matters because the field walk's real limiting factor was capture
+   quality, and this is the only change that would let the wearer correct
+   it *while walking* rather than discover it afterwards.
 7. **`shutil.rmtree(ignore_errors=True)` fails silently on Windows** at
    `store.py:343` and `global_solve.py:375`; `prepare_images` then *skips*
    surviving stale images, which could feed COLMAP two calibrations. Known,
