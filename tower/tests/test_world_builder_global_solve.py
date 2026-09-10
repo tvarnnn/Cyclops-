@@ -8,6 +8,8 @@ and a Sim3 placement into the component's reference segment that maps a
 segment-frame coordinate back onto the world-frame coordinate it came from.
 """
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -260,3 +262,57 @@ def test_solver_availability_is_reported_not_raised(monkeypatch):
     available, reason = global_solve.solver_available()
     assert available is False
     assert "pycolmap" in reason
+
+
+class TestLoopDetectionDegradesRatherThanAborting:
+    """A missing vocabulary tree must cost convergence, not the walk.
+
+    Loop detection runs on every solve now, and it needs a 72 MB vocabulary
+    tree COLMAP downloads on first use. COLMAP's failure to fetch that file
+    is a glog CHECK, so the process dies of `abort()` -- exit code 3, no
+    Python exception, nothing to catch, because `match_sequential` is
+    outside every try/except in `solve()`.
+
+    Measured end to end with an empty cache and no network, before the
+    guard existed: every solve died, the manifest carried no `global_solve`
+    at all, and the world shipped with every segment refused. That is the
+    "87 disconnected fragments" outcome again, from a machine that merely
+    has no network.
+    """
+
+    def test_the_cache_directory_is_the_one_colmap_uses(self):
+        # COLMAP caches in the USER's home, not the venv -- which is why a
+        # fresh checkout on a warm machine works and a fresh machine does
+        # not, and why this is worth a pre-flight line of its own.
+        from pathlib import Path
+
+        assert global_solve.vocabulary_tree_cache_dir() == (
+            Path.home() / ".cache" / "colmap"
+        )
+
+    def test_an_unreadable_cache_directory_reads_as_absent(self, monkeypatch, tmp_path):
+        """Being wrong in this direction is survivable; the other is not."""
+        missing = tmp_path / "nowhere"
+        monkeypatch.setattr(global_solve, "vocabulary_tree_cache_dir", lambda: missing)
+        assert global_solve.vocabulary_tree_cached() is False
+
+    def test_a_cached_tree_is_found_by_the_name_colmap_gives_it(
+        self, monkeypatch, tmp_path
+    ):
+        cache = tmp_path / "colmap"
+        cache.mkdir()
+        (cache / "96ca8ec8-vocab_tree_faiss_flickr100K_words256K.bin").write_bytes(b"x")
+        monkeypatch.setattr(global_solve, "vocabulary_tree_cache_dir", lambda: cache)
+        assert global_solve.vocabulary_tree_cached() is True
+
+    def test_the_env_check_and_the_solver_ask_the_same_question(self):
+        """A pre-flight that disagreed with the thing it checks is worse
+        than no pre-flight."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts import world_builder_env_check as env_check
+
+        source = inspect.getsource(env_check.collect_vocabulary_tree)
+        assert "vocabulary_tree_cache_dir" in source

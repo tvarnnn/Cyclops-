@@ -78,6 +78,28 @@ def world_render(
     world_id: str, request: Request,
     session_id: str | None = Query(default=None),
     max_points: int | None = Query(default=None, ge=1, le=MAX_POINTS_CEILING),
+    # DECLARED, not left to the page to read off its own URL.
+    #
+    # The viewer can open in either the world view or the diagnostic one,
+    # and it used to pick between them from `location.search`. iOS -- the
+    # only client this page has -- loads it with
+    # `loadHTMLString(_:baseURL: nil)`: no origin, no URL, so
+    # `location.search` is always empty, and its navigation policy cancels
+    # the page's own links so an in-page href could not reach the other
+    # view either. The affordance existed and did nothing on the device it
+    # was built for. Declaring it here is what makes it real.
+    #
+    # Not validated to an enum on purpose: an unrecognised value opens the
+    # world view. This is a display mode on an unauthenticated route, and
+    # the safe reading of a value nobody understands is "show the wearer
+    # their world", not a 422.
+    #
+    # `None` rather than a named default, because naming it would mean
+    # importing it, and `test_shared_code_does_not_import_a_cartridge`
+    # refuses a route that imports `tower.world_builder` -- correctly: the
+    # web process knows a world builder only through the adapter below.
+    # The adapter owns what "no view asked for" means.
+    view: str | None = Query(default=None),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -93,7 +115,8 @@ def world_render(
     """
     try:
         html = build_world_render(
-            _store(request), world_id, session_id, max_points=max_points
+            _store(request), world_id, session_id, max_points=max_points,
+            view=view,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None

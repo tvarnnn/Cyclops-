@@ -230,12 +230,19 @@ struct WorldTrajectoryReport: Equatable, Sendable {
     /// unlabelled distance is the thing WORLD-BUILD.md forbids.
     var scale: WorldScaleSemantics
 
+    // Hand-written, so every stored property above has to be added here too.
+    // `trackingRestarts` and `chainBreaks` were not, and the decoder passed
+    // them anyway: the branch did not compile from the moment they were
+    // added until an iOS review read it. That is what a Windows host costs,
+    // and it is the argument for keeping this list short.
     init(
         poseCount: Int? = nil,
         posesAnchor: Int? = nil,
         posesSolved: Int? = nil,
         posesRefused: Int? = nil,
         segments: Int? = nil,
+        trackingRestarts: Int? = nil,
+        chainBreaks: Int? = nil,
         pathLength: Double? = nil,
         pathLengthUnit: String? = nil,
         scale: WorldScaleSemantics = .unknown
@@ -245,6 +252,8 @@ struct WorldTrajectoryReport: Equatable, Sendable {
         self.posesSolved = posesSolved
         self.posesRefused = posesRefused
         self.segments = segments
+        self.trackingRestarts = trackingRestarts
+        self.chainBreaks = chainBreaks
         self.pathLength = pathLength
         self.pathLengthUnit = pathLengthUnit
         self.scale = scale

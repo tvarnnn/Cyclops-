@@ -24,6 +24,7 @@ The question that matters is who wrote the file, and only the build knows.
 """
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -97,38 +98,101 @@ def test_an_unreadable_solution_leaves_the_registrar_free_to_run(monkeypatch, tm
 # 2. The guard reads that field, not the final solve's report.
 
 
+# The PRODUCTION guard, driven directly.
+#
+# The first version of this file re-typed the condition into the test and
+# asserted the copy -- `runs_now = placements_source is None` -- which would
+# have passed against any implementation, including the broken one. An
+# adversarial review caught it. `should_register` now exists as a function so
+# there is something real to call.
+
+
 @pytest.mark.parametrize(
-    "placements_source, final_solve_ran, registrar_should_run",
+    "diagnostics, final_solve_ran, expected",
     [
-        # The field case: a solution exists, the final solve never ran.
-        # The old guard ran the registrar here and destroyed 72 placements.
-        pytest.param("global_solve", False, False, id="solution-but-no-final-solve"),
-        pytest.param("global_solve", True, False, id="solution-and-final-solve"),
-        # No solution: the registrar is the only producer, and must run.
-        pytest.param(None, False, True, id="no-solution-no-final-solve"),
-        pytest.param(None, True, True, id="no-solution-but-final-solve-ran"),
+        # THE FIELD ROW. A solution placed segments; the final solve never
+        # ran because the session died in the observe loop. The old guard
+        # asked about the final solve, ran the registrar, and destroyed 72
+        # placements.
+        pytest.param({"placements_source": "global_solve"}, False, False,
+                     id="placed-but-no-final-solve"),
+        pytest.param({"placements_source": "global_solve"}, True, False,
+                     id="placed-and-final-solve"),
+        # No solution, or one that placed nothing: the registrar is the only
+        # producer there is and must run.
+        pytest.param({"placements_source": None}, False, True,
+                     id="no-solution"),
+        pytest.param({"placements_source": None}, True, True,
+                     id="no-solution-but-final-solve-ran"),
+        pytest.param({}, False, True, id="a-build-that-reported-nothing"),
     ],
 )
-def test_the_guard_asks_who_wrote_the_file(
-    placements_source, final_solve_ran, registrar_should_run
-):
-    """The decision table, stated directly.
+def test_the_guard_asks_who_placed_the_segments(diagnostics, final_solve_ran, expected):
+    from scripts.world_build_session import should_register
 
-    The row that matters is the first one. It is the field configuration,
-    and it is the only row where the old and new guards disagree.
-    """
+    result = SimpleNamespace(diagnostics=diagnostics)
+    assert should_register(result) is expected
+
+    # And the guard it replaced, for contrast: it asked the final solve's
+    # report, which is None whenever finalization did not complete normally.
     solve_report = {"solved": True} if final_solve_ran else None
-
-    # The guard as it now stands, in `world_build_session.py`.
-    runs_now = placements_source is None
-    assert runs_now is registrar_should_run
-
-    # The guard as it stood on 2026-09-09, for contrast.
     ran_before = not (solve_report or {}).get("solved")
-    if placements_source == "global_solve" and not final_solve_ran:
-        assert ran_before is True and runs_now is False, (
-            "this is the field regression; the guards must differ here"
+    if diagnostics.get("placements_source") == "global_solve" and not final_solve_ran:
+        assert ran_before is True and should_register(result) is False, (
+            "this is the field regression; the two guards must differ here"
         )
+
+
+def test_the_guard_survives_a_build_with_no_diagnostics_at_all():
+    """`result.diagnostics` is a default_factory dict, but the guard reads it
+    defensively and must not crash if that ever changes."""
+    from scripts.world_build_session import should_register
+
+    assert should_register(SimpleNamespace(diagnostics=None)) is True
+    assert should_register(SimpleNamespace()) is True
+
+
+# ---------------------------------------------------------------------------
+# 3. "Placed something", not "merge ran".
+
+
+def test_a_merge_that_placed_nothing_leaves_the_registrar_free(monkeypatch, tmp_path):
+    """`merge()` returning only refusals must NOT stand the registrar down.
+
+    An adversarial review found the first version asking `placements is not
+    None`, which is true whenever merge ran at all -- including when every
+    segment is still pending (it returns []) and when the solve posed none of
+    their keyframes (it returns nothing but refusals). Both place zero
+    segments. Suppressing the registrar there is a new way to finish a walk
+    with no placements at all.
+    """
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    monkeypatch.setattr(global_solve, "load_solution", lambda *a, **k: object())
+    monkeypatch.setattr(global_solve, "merge", lambda *a, **k: _merged_placements(
+        states=("refused", "refused")
+    ))
+    result = engine.build(world_id, session_id)
+    assert result.diagnostics["placements_source"] is None
+
+
+def test_a_merge_that_placed_nothing_at_all_leaves_the_registrar_free(
+    monkeypatch, tmp_path
+):
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    monkeypatch.setattr(global_solve, "load_solution", lambda *a, **k: object())
+    monkeypatch.setattr(global_solve, "merge", lambda *a, **k: _merged_placements(states=()))
+    result = engine.build(world_id, session_id)
+    assert result.diagnostics["placements_source"] is None
+
+
+def test_one_registered_placement_is_enough_to_claim_the_file(monkeypatch, tmp_path):
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    monkeypatch.setattr(global_solve, "load_solution", lambda *a, **k: object())
+    monkeypatch.setattr(global_solve, "merge", lambda *a, **k: _merged_placements(
+        states=("refused", "registered", "refused")
+    ))
+    result = engine.build(world_id, session_id)
+    assert result.diagnostics["placements_source"] == "global_solve"
 
 
 # ---------------------------------------------------------------------------
@@ -162,22 +226,117 @@ def _jpeg_bytes() -> bytes:
     return buf.tobytes()
 
 
-def _merged_placements():
+def _merged_placements(states=("registered",)):
+    """A stand-in for `merge()`'s result, with the placement states it chose.
+
+    Parameterised on state because "did merge run" and "did merge place
+    anything" are different questions and conflating them was a real defect.
+    """
     from tower.world_builder.records import SegmentPlacement
+
+    def placement(index: int, state: str) -> SegmentPlacement:
+        if state == "registered":
+            return SegmentPlacement(
+                segment_index=index, state="registered",
+                rotation_wxyz=(1.0, 0.0, 0.0, 0.0), translation=(0.0, 0.0, 0.0),
+                scale=1.0, reference_segment=index, refusal_reason=None,
+                input_digest="d", evidence={}, frame_revision=1,
+            )
+        return SegmentPlacement(
+            segment_index=index, state="refused",
+            rotation_wxyz=None, translation=None, scale=None,
+            reference_segment=None,
+            refusal_reason="the global solve posed none of this segment's keyframes",
+            input_digest="d", evidence={}, frame_revision=1,
+        )
 
     class _Merged:
         pose_rows: list = []
         point_rows: list = []
         support_rows: list = []
-        placements = [
-            SegmentPlacement(
-                segment_index=0, state="registered",
-                rotation_wxyz=(1.0, 0.0, 0.0, 0.0), translation=(0.0, 0.0, 0.0),
-                scale=1.0, reference_segment=0, refusal_reason=None,
-                input_digest="d", evidence={}, frame_revision=1,
-            )
-        ]
+        placements = [placement(i, state) for i, state in enumerate(states)]
         summary: dict = {}
         segments: dict = {}
 
     return _Merged()
+
+
+# ---------------------------------------------------------------------------
+# 4. The fallback must not be destructive.
+
+
+def test_the_registrar_will_not_replace_current_registered_placements(tmp_path):
+    """The second line of defence, for when the first is told the wrong thing.
+
+    `load_solution` absorbs any unreadable solution and returns None. That is
+    right for a torn archive and it is also what it returns if numpy changes
+    an exception type, a schema drifts, or the box runs out of memory. In all
+    of those `engine.build()` writes no placements, reports
+    `placements_source: None`, and the guard concludes there is no global
+    solve to defer to -- so it runs the registrar, which used to write
+    unconditionally and destroy exactly the placements the fix was written to
+    protect. From a cause whose only symptom is one `logger.warning`.
+
+    A placement set is trusted here only if it is REGISTERED and CURRENT: the
+    serving layer already drops placements whose digest disagrees with the
+    manifest, so a stale set is not worth preserving and re-registering it is
+    the correct outcome.
+    """
+    from scripts.world_build_session import register_session
+    from tower.world_builder.records import SegmentPlacement
+
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    store = engine._store
+    engine.build(world_id, session_id)
+    digest = (store.read_derived_manifest(world_id) or {}).get("input_digest")
+
+    good = [SegmentPlacement(
+        segment_index=0, state="registered",
+        rotation_wxyz=(1.0, 0.0, 0.0, 0.0), translation=(0.0, 0.0, 0.0),
+        scale=1.0, reference_segment=0, refusal_reason=None,
+        input_digest=digest, evidence={"points": 431}, frame_revision=1,
+    )]
+    store.write_placements(world_id, session_id, good)
+
+    outcome = register_session(store, world_id, session_id)
+
+    assert outcome["attempted"] is False
+    assert outcome["wrote_placements"] is False
+    after = store.read_placements(world_id, session_id)
+    assert [p.state for p in after] == ["registered"]
+    assert after[0].evidence == {"points": 431}, "the good placements were replaced"
+
+
+def test_the_registrar_still_runs_when_the_placements_are_stale(tmp_path):
+    """Stale placements are not something to protect.
+
+    The serving layer drops any placement whose `input_digest` disagrees with
+    the manifest, so preserving them would leave the world with nothing drawn
+    AND nothing to draw it from.
+    """
+    from scripts.world_build_session import register_session
+    from tower.world_builder.records import SegmentPlacement
+
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    store = engine._store
+    engine.build(world_id, session_id)
+
+    stale = [SegmentPlacement(
+        segment_index=0, state="registered",
+        rotation_wxyz=(1.0, 0.0, 0.0, 0.0), translation=(0.0, 0.0, 0.0),
+        scale=1.0, reference_segment=0, refusal_reason=None,
+        input_digest="a-digest-from-an-older-build", evidence={}, frame_revision=1,
+    )]
+    store.write_placements(world_id, session_id, stale)
+
+    outcome = register_session(store, world_id, session_id)
+    assert outcome["attempted"] is True
+
+
+def test_the_registrar_runs_on_a_world_with_no_placements(tmp_path):
+    from scripts.world_build_session import register_session
+
+    engine, world_id, session_id = _engine_with_a_session(tmp_path)
+    engine.build(world_id, session_id)
+    outcome = register_session(engine._store, world_id, session_id)
+    assert outcome["attempted"] is True

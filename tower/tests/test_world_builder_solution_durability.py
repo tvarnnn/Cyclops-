@@ -12,8 +12,8 @@ Two defects produced it, and these tests pin both.
     once its central directory lands last, and `open(..., "wb")` truncates
     the destination to zero at the start of a write measured in hundreds of
     milliseconds. The reader lives in a DIFFERENT PROCESS -- the builder
-    rebuilding its derived tree while the solver child it launched at
-    `world_build_session.py:1384` is still writing -- so no lock in either
+    rebuilding its derived tree while the solver child it launched from
+    `BackgroundSolver.maybe_launch` is still writing -- so no lock in either
     process could have closed the window.
 
 2.  `load_solution` promised in its own docstring that it "never raises: an
@@ -24,7 +24,7 @@ Two defects produced it, and these tests pin both.
     and `load_solution` returned None exactly ZERO times. `EOFError`
     descends from Exception and `BadZipFile` from Exception alone; neither
     is an `OSError`. One escaped, reached the builder's `BaseException`
-    handler at `world_build_session.py:1462`, and turned a rebuildable
+    `BaseException` handler, and turned a rebuildable
     derived file into `finalization.interrupted` on the whole session.
 """
 
@@ -327,3 +327,90 @@ def test_a_reader_loop_never_raises_against_a_writer_loop(tmp_path):
 
     assert not escaped, f"an exception escaped the race: {escaped[:3]}"
     assert loaded > 0, "the reader never once saw a published solution"
+
+
+# ---------------------------------------------------------------------------
+# 4. Two writers of one destination.
+#
+# The first version of the atomic write staged at `<name>.tmp` -- a name
+# derived only from the destination, so every writer of that destination
+# shared it. An adversarial review measured what that does: 656 BadZipFile
+# reads at the published path over 12 seconds, and a writer killed by
+# FileNotFoundError out of `replace` because its peer's `finally` had already
+# unlinked the temp underneath it. The fix it was written to deliver, undone
+# by the staging name.
+#
+# Nothing serialises writers of solution.npz: `acquire_writer_lock` is
+# per-world and taken only by the engine, and `scripts/world_solve.py` takes
+# no lock at all. A hand-run solve against a world with a live builder is two
+# writers, and it is an ordinary operator action -- it is how the field
+# artifact was recovered.
+
+
+def test_two_writers_never_publish_a_torn_archive(tmp_path):
+    workspace = _workspace(tmp_path)
+    solution = _solution(30_000)
+
+    torn: list[str] = []
+    writer_errors: list[str] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        while not stop.is_set():
+            try:
+                write_solution(workspace, solution)
+            except Exception as exc:  # noqa: BLE001
+                writer_errors.append(f"{type(exc).__name__}: {exc}")
+                return
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                data = workspace.arrays_path.read_bytes()
+            except (FileNotFoundError, PermissionError):
+                continue
+            if not data:
+                continue
+            try:
+                with np.load(io.BytesIO(data)) as arrays:
+                    arrays["xyz"]
+            except Exception as exc:  # noqa: BLE001
+                torn.append(f"{type(exc).__name__}: {exc}")
+                return
+
+    threads = [threading.Thread(target=writer, daemon=True) for _ in range(2)]
+    threads.append(threading.Thread(target=reader, daemon=True))
+    for thread in threads:
+        thread.start()
+    try:
+        for _ in range(60):
+            if torn or writer_errors:
+                break
+            stop.wait(0.05)
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=15)
+
+    assert not torn, f"two writers published a torn archive: {torn[:3]}"
+    assert not writer_errors, f"a writer was killed by its peer: {writer_errors[:3]}"
+
+
+def test_two_writers_do_not_share_a_staging_name(tmp_path):
+    """The mechanism, stated directly rather than raced for.
+
+    A shared staging name is what let one writer's `finally` delete the
+    other's in-flight temp, and what let one writer promote the half-written
+    bytes the other was still producing.
+    """
+    from tower.storage import _temp_path
+
+    target = tmp_path / "solution.npz"
+    names = {_temp_path(target).name for _ in range(50)}
+    assert len(names) == 50, "staging names collide"
+    assert all(n.endswith(".tmp") for n in names), (
+        "purge_world and the leftover-temp checks look for a .tmp suffix"
+    )
+    assert all(n.startswith("solution.npz.") for n in names), (
+        "a stray temp must still say which artifact it was staging"
+    )

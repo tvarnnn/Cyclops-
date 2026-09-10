@@ -21,7 +21,11 @@ second at the mobile point budget).
 from __future__ import annotations
 
 from tower.results.world_builder_geometry import contained_world_id
-from tower.world_builder.render import DEFAULT_MAX_POINTS, render_html
+from tower.world_builder.render import (
+    DEFAULT_MAX_POINTS,
+    VIEW_PRODUCT,
+    render_html,
+)
 from tower.world_builder.store import WorldStore, WorldStoreError
 
 # A phone draws every point on a 2-D canvas on every gesture, so the
@@ -94,7 +98,8 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
 
 
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
-                       max_points: int | None = None) -> str:
+                       max_points: int | None = None,
+                       view: str | None = None) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -111,7 +116,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     chosen = resolve_session(store, world_id, session_id)
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
-        return render_html(store, world_id, chosen, max_points=budget)
+        return render_html(store, world_id, chosen, max_points=budget,
+                           view=view or VIEW_PRODUCT)
     except FileNotFoundError:
         # Raced a `clear_derived` between the existence check and the read.
         # Worded here rather than from the exception: the phone shows the

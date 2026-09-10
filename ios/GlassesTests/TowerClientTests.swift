@@ -3119,6 +3119,151 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - tx_seq: telling a sender-side skip from a lost frame
+
+    /// Every frame carries a dense transmit counter beside the capture index.
+    ///
+    /// `seq` is the DAT capture index and this sender forwards only a fraction
+    /// of those, so a gap in `seq` at the Tower has three indistinguishable
+    /// causes: deliberate sampling, a sender-side drop, and genuine transit
+    /// loss. The Tower has carried the receiving half of the fix since
+    /// 2026-08-19 (`tower/metrics.py`, `tx_seq_gap_total`) and this app never
+    /// sent the field, so the counter stayed `None` and the question stayed
+    /// open.
+    ///
+    /// It was not academic. On the 2026-09-09 physical walk roughly half the
+    /// captured frames never reached the Tower — 474 of 953 source indices on
+    /// one capture, 2,391 of 4,801 on the next — and one resulting gap ran 410
+    /// source frames, 17 seconds, splitting the reconstruction in two. Nothing
+    /// in the artifacts can say whose fault that was.
+    func testEveryFrameCarriesADenseTransmitCounter() async {
+        let server = MockTowerServer()
+        let recorder = MessageRecorder()
+        server.onText = { [weak recorder] text in recorder?.record(text) }
+        respondToPing(server)
+        guard let port = server.start() else { return XCTFail("server did not start") }
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+
+        // Capture indices as the real sender produces them: sparse, because
+        // only about one frame in thirty is forwarded.
+        for sequence in [1, 30, 60, 90] {
+            client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: sequence)
+        }
+
+        let arrived = await waitUntil {
+            self.frames(recorder).count == 4
+        }
+        XCTAssertTrue(arrived, "not every frame reached the server")
+
+        let sent = frames(recorder)
+        XCTAssertEqual(
+            sent.compactMap { $0["seq"] as? Int }, [1, 30, 60, 90],
+            "the capture index must be unchanged by this"
+        )
+        // The point of the whole field: DENSE, whatever seq does.
+        XCTAssertEqual(
+            sent.compactMap { $0["tx_seq"] as? Int }, [0, 1, 2, 3],
+            "tx_seq must count frames sent, not frames captured"
+        )
+
+        client.disconnect()
+    }
+
+    /// A frame this client declines to send must not consume a `tx_seq`.
+    ///
+    /// If it did, the Tower would see a hole and read it as transit loss —
+    /// manufacturing the exact confusion the counter exists to remove. A full
+    /// send window is the drop that actually happens in the field.
+    func testADroppedFrameDoesNotConsumeATransmitNumber() async {
+        let server = MockTowerServer()
+        let recorder = MessageRecorder()
+        server.onText = { [weak recorder] text in recorder?.record(text) }
+        respondToPing(server)
+        guard let port = server.start() else { return XCTFail("server did not start") }
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+
+        // Enough frames in one main-actor turn to close the send window. The
+        // window rejects before encoding, so the surplus never reaches a send.
+        for sequence in 1...64 {
+            client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: sequence)
+        }
+        _ = await waitUntil { !self.frames(recorder).isEmpty }
+
+        let counters = frames(recorder).compactMap { $0["tx_seq"] as? Int }
+        XCTAssertFalse(counters.isEmpty, "no frame was sent at all")
+        XCTAssertEqual(
+            counters, Array(0..<counters.count),
+            "tx_seq skipped a number for a frame that was never sent; the Tower "
+            + "would score that as transit loss"
+        )
+
+        client.disconnect()
+    }
+
+    /// The counter restarts with the socket.
+    ///
+    /// The Tower builds `SessionMetrics` per connection, so a counter carried
+    /// across a reconnect would present every frame sent on the old socket as
+    /// one enormous gap on the new one. The 2026-09-09 walk reconnected once,
+    /// mid-session.
+    func testTheTransmitCounterRestartsWithTheConnection() async {
+        let server = MockTowerServer()
+        let recorder = MessageRecorder()
+        server.onText = { [weak recorder] text in recorder?.record(text) }
+        respondToPing(server)
+        guard let port = server.start() else { return XCTFail("server did not start") }
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        var online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 30)
+        _ = await waitUntil { self.frames(recorder).count == 2 }
+        client.disconnect()
+
+        // A SECOND recorder for the second socket. `MessageRecorder` has no
+        // reset, and adding one would let a test quietly forget evidence.
+        let afterReconnect = MessageRecorder()
+        server.onText = { [weak afterReconnect] text in afterReconnect?.record(text) }
+        client.connect(to: url(port: port))
+        online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 60)
+        let arrived = await waitUntil { !self.frames(afterReconnect).isEmpty }
+        XCTAssertTrue(arrived)
+
+        XCTAssertEqual(
+            frames(afterReconnect).first?["tx_seq"] as? Int, 0,
+            "the counter carried across a reconnect; the Tower would read the "
+            + "previous connection's frames as a gap in this one"
+        )
+
+        client.disconnect()
+    }
+
+    /// Every `frame` message the recorder saw, decoded, in order.
+    private func frames(_ recorder: MessageRecorder) -> [[String: Any]] {
+        recorder.all
+            .compactMap(decode)
+            .filter { $0["type"] as? String == "frame" }
+    }
 }
 
 /// Collects CV Lab control-plane events in arrival order.
@@ -3218,4 +3363,5 @@ final class TowerConfigurationOverrideTests: XCTestCase {
         XCTAssertEqual(TowerConfiguration.httpBaseURL.absoluteString, "http://\(authority)")
         XCTAssertNotNil(TowerConfiguration.acceptedAuthority(authority))
     }
+
 }

@@ -498,3 +498,82 @@ def test_a_stop_request_records_the_channel_it_came_from():
     request.request(StopRequest.SOFT, "stdin-closed")
     assert request.hard and request.source == "SIGBREAK"
     assert list(request.bounded(iter([1, 2, 3]))) == []
+
+
+def test_stopping_the_capture_and_the_workspace_together_is_an_ordinary_stop(
+    open_capture, tmp_path
+):
+    """The ordinary way a walk ends, and the way it used to be mislabelled.
+
+    iOS posts `session/stop` from `.onDisappear`, so the wearer tapping Stop
+    and then leaving the World Builder screen sends the capture's end and a
+    SOFT stop within milliseconds of each other. Every stop request used to
+    make the session `interrupted`, and `results/world_builder.py` maps that
+    to Interrupted before it ever looks at `finalization` -- so a walk that
+    solved, registered and finalized perfectly was shown as a failure.
+
+    Measured on a real 12 fps capture before the fix: a wearer who left
+    immediately got `interrupted`, one who lingered a second got `stop`, on
+    identical geometry. That is the 2026-09-09 symptom, and it survived the
+    first two fixes because they changed whether the final solve RAN, not
+    what `end_reason` recorded.
+
+    The question the builder asks now is whether the CAPTURE had finished,
+    not whether anyone had asked this process to go.
+    """
+    recorder, capture_dir, _capture_id = open_capture
+    root = tmp_path / "worlds"
+    process = _spawn(capture_dir, root, stop_on_stdin_close=True)
+    try:
+        _wait_for(lambda: _keyframes_written(root) >= 2, what="the first keyframes")
+        # Both at once, no wait between them: the capture ends and the
+        # workspace goes away in the same gesture.
+        recorder.stop()
+        process.stdin.close()
+        stdout, stderr = _finish(process)
+    finally:
+        pass
+    assert process.returncode == 0, stderr[-2000:]
+
+    store, world_id, session_id = _the_session(root)
+    session = store.read_session(world_id, session_id)
+    assert session.end_reason == "stop", (
+        "a normal Stop was recorded as an interruption; this is the 2026-09-09 label"
+    )
+    assert session.finalization["state"] == FINALIZATION_COMPLETE
+    # And the classifier the phone actually reads agrees. Asserting only
+    # `end_reason` would pass a fix that never reached the label: the
+    # mapping at `results/world_builder.py` tests `end_reason` BEFORE it
+    # looks at `finalization`, which is why a complete finalization could
+    # not rescue an interrupted-looking walk.
+    from tower.results.world_builder import _lifecycle
+
+    lifecycle = _lifecycle(
+        holder=None, stopped=True, session=session,
+        geometry_current=True, has_manifest=True,
+    )
+    assert lifecycle["state"] != "interrupted", lifecycle
+
+
+def test_a_stop_while_the_capture_is_still_open_is_still_an_interruption(
+    open_capture, tmp_path
+):
+    """The other half, which must not be lost to the fix above.
+
+    Frames were still being written and somebody asked this process to go.
+    That IS an interruption, and saying otherwise would make the label
+    useless in the case it exists for.
+    """
+    recorder, capture_dir, _capture_id = open_capture
+    root = tmp_path / "worlds"
+    process = _spawn(capture_dir, root, stop_on_stdin_close=True)
+    try:
+        _wait_for(lambda: _keyframes_written(root) >= 2, what="the first keyframes")
+        process.stdin.close()          # the capture is left OPEN
+        stdout, stderr = _finish(process)
+    finally:
+        recorder.stop()
+    assert process.returncode == 0, stderr[-2000:]
+
+    store, world_id, session_id = _the_session(root)
+    assert store.read_session(world_id, session_id).end_reason == "interrupted"

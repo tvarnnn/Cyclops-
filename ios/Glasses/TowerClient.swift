@@ -894,6 +894,33 @@ final class TowerClient: NSObject, ObservableObject {
     /// derived from a latency budget rather than picked.
     private var sendWindow: SendWindow
 
+    /// A dense counter over frames this client actually handed to the socket.
+    ///
+    /// Sent as `tx_seq` beside `seq`. `seq` is the DAT capture index, and this
+    /// sender forwards only a fraction of those, so a gap in `seq` at the
+    /// Tower has three indistinguishable causes: deliberate sampling, a
+    /// sender-side drop, or genuine transit loss. `tower/metrics.py` has
+    /// carried the receiving half of the fix since 2026-08-19 and says so in
+    /// its own docstring — *"Under the CURRENT wire protocol … a gap in seq
+    /// cannot be attributed to any single cause"* — while pointing at the
+    /// `source_seq`/`tx_seq` split as what would settle it. **This sender
+    /// never sent it.** `tx_seq` is absent from every Swift file in the app.
+    ///
+    /// The cost of that showed up on the 2026-09-09 physical walk. Of the
+    /// frames the glasses captured, roughly half never reached the Tower —
+    /// capture `6a1b544c` recorded 474 of 953 source indices, `dd885cca` 2,391
+    /// of 4,801 — and one of the resulting gaps was 410 source frames, 17
+    /// seconds, which split the reconstruction in two. Nothing in the
+    /// artifacts can say whether this app declined to send those frames or the
+    /// link lost them, because `tx_seq` was null on every recorded row. Those
+    /// are opposite diagnoses with opposite fixes.
+    ///
+    /// Dense over frames SENT, which is what makes it diagnostic: a gap here
+    /// is transit loss and nothing else. So it is incremented at the send
+    /// itself, not when a frame is picked up — every `return` above the send
+    /// leaves the number unclaimed for the next frame to use.
+    private var txSequence: Int = 0
+
     /// When `sendFrame` last ran, used only to tell a wedged socket from a
     /// wedged main actor. See `mainActorGapAllowance`. Cleared on teardown, so
     /// the first frame of a new connection never inherits the old one's pulse.
@@ -1403,9 +1430,17 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
 
+        // Read, not yet claimed. Every `return` between here and the send
+        // below leaves this number for the next frame, so `tx_seq` stays dense
+        // over frames the socket actually received. Claiming it here instead
+        // would make an encode failure or a closed send window look identical
+        // to transit loss at the Tower — the precise confusion `txSequence`
+        // exists to remove.
+        let txSeq = txSequence
         let payload: [String: Any] = [
             "type": "frame",
             "seq": sequence,
+            "tx_seq": txSeq,
             "width": width,
             "height": height,
             "format": "jpeg",
@@ -1434,8 +1469,14 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
         metrics.recordSendAttempt(wireBytes: jsonData.count)
+        // Claimed here, at the last statement before the frame goes out. The
+        // window is reserved, the JSON exists, and nothing between this line
+        // and `task.send` can decline to send. `sendFrame` is main-actor
+        // isolated with no suspension point, so no other frame can interleave
+        // and take the same number.
+        txSequence += 1
         if shouldLog {
-            log("frame #\(sequence) sending \(jsonData.count) bytes (\(width)x\(height), jpeg \(jpegData.count) bytes)")
+            log("frame #\(sequence) (tx \(txSeq)) sending \(jsonData.count) bytes (\(width)x\(height), jpeg \(jpegData.count) bytes)")
         }
 
         task.send(.string(jsonText)) { [weak self] error in
@@ -2334,6 +2375,13 @@ final class TowerClient: NSObject, ObservableObject {
         // Belongs to the socket that is going away: the next connection's
         // first frame must not be judged against the old one's pulse.
         lastSendFrameAt = nil
+        // Same reason, and it matters more than it looks. The Tower counts
+        // `tx_seq` gaps per CONNECTION (`SessionMetrics` is built per socket),
+        // so carrying the counter across a reconnect would present the frames
+        // this client never sent on the old socket as a gap on the new one —
+        // manufacturing exactly the transit loss `tx_seq` exists to measure.
+        // The 2026-09-09 walk reconnected once, mid-session.
+        txSequence = 0
 
         #if DEBUG
         // `isStreamingToTower` means "a stream_start has been sent and not yet

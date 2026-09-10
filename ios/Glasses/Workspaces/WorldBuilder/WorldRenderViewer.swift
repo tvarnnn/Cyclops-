@@ -10,17 +10,67 @@ import WebKit
 
 // MARK: - What is being looked at
 
+/// Which of the Tower's two renderings of the same world is wanted.
+///
+/// The Tower's render page is the **product** view of a world: the largest
+/// connected component composed as one world and coloured by real photometric
+/// RGB. A diagnostics variant of the same page — segment-index colouring, the
+/// solver's own view — is requested with `?view=diagnostics`.
+///
+/// **Two ways this can silently do nothing, both known and both accepted.**
+///
+/// 1. This app loads the page with `loadHTMLString(_:baseURL: nil)` — no
+///    origin, one navigation, everything else refused — so `location.search`
+///    is empty and an in-page link goes nowhere. That is deliberate and is
+///    not being loosened: an origin on that page would undo the reason
+///    `WorldRenderClient` fetches it in the first place.
+/// 2. So the Tower has to honour `view` **server-side**, when it composes
+///    the page. It does: `tower/routes/geometry.py::world_render` declares
+///    `view`, and `render.py` substitutes the opening mode into the script
+///    rather than reading it from a URL the phone cannot supply. The page
+///    was reading `location.search` until an iOS review pointed out that no
+///    client of it can ever set one.
+///
+/// A Tower too old to declare `view` answers with the ordinary world page
+/// and no error, because FastAPI ignores query parameters a route does not
+/// declare. That is the right failure: the wearer asked to see something and
+/// sees their world.
+///
+/// The sparse-geometry diagnostics that *this* app owns — the fragment gallery,
+/// the placement counts, the refusal prose, the segment origins — do not depend
+/// on any of that. They are behind the world screen's own Diagnostics
+/// disclosure and are reachable whatever the Tower does here.
+nonisolated enum WorldRenderView: String, Equatable, Hashable, Sendable {
+    /// The default. Sends no `view` parameter at all, so the URL is byte-for-byte
+    /// the one this app has always asked for.
+    case product
+    case diagnostics
+}
+
 /// A world, and optionally one of its sessions, whose viewer page can be
 /// asked for: `GET /worlds/{world_id}/render`, `WORLD-BUILDER-WORLDS.md` §4.
 ///
 /// `sessionID` is `nil` when the Tower is to choose — the newest session with
 /// geometry — which is what a picker tap on the world's own row means. It is
 /// never the empty string.
-nonisolated struct WorldRenderTarget: Equatable, Sendable, Identifiable {
+nonisolated struct WorldRenderTarget: Equatable, Hashable, Sendable, Identifiable {
     let worldID: String
     let sessionID: String?
+    /// A `var` with a default rather than a `let` with one: a `let` with an
+    /// initial value is left out of the memberwise initialiser entirely, which
+    /// would make `WorldRenderTarget(worldID:sessionID:view:)` unavailable to
+    /// the one call site that needs it.
+    var view: WorldRenderView = .product
 
-    var id: String { "\(worldID)/\(sessionID ?? "")" }
+    /// Includes the view, so `.sheet(item:)` re-presents when the reader asks
+    /// for the other rendering of the same world rather than treating it as
+    /// the same item.
+    var id: String { "\(worldID)/\(sessionID ?? "")/\(view.rawValue)" }
+
+    /// The same world and session, in the other rendering.
+    func showing(_ view: WorldRenderView) -> WorldRenderTarget {
+        WorldRenderTarget(worldID: worldID, sessionID: sessionID, view: view)
+    }
 }
 
 // MARK: - The fetch
@@ -112,9 +162,17 @@ nonisolated struct WorldRenderClient {
             ? String(components.percentEncodedPath.dropLast())
             : components.percentEncodedPath
         components.percentEncodedPath = "\(base)/worlds/\(world)/render"
+        var query: [URLQueryItem] = []
         if let sessionID = target.sessionID {
-            components.queryItems = [URLQueryItem(name: "session_id", value: sessionID)]
+            query.append(URLQueryItem(name: "session_id", value: sessionID))
         }
+        // Only for the diagnostics rendering. The product view sends no `view`
+        // parameter, so its URL is unchanged from every build before this one
+        // and a Tower that has never heard of the parameter is never sent it.
+        if target.view != .product {
+            query.append(URLQueryItem(name: "view", value: target.view.rawValue))
+        }
+        components.queryItems = query.isEmpty ? nil : query
         return components.url
     }
 
@@ -192,6 +250,15 @@ nonisolated extension WorldRenderFetchError {
 final class WorldRenderViewerModel: ObservableObject {
     @Published private(set) var state: WorldRenderViewerState = .loading
 
+    /// The world, the session and which rendering was asked for. A `let`: this
+    /// screen shows one page.
+    ///
+    /// It was briefly a `@Published var` with a `show(_:)` beside it, so a
+    /// segmented control in Details could switch renderings. That control is
+    /// gone — see `details` for why — and with it the only reason this could
+    /// change. A reader who wants the other rendering either uses the page's
+    /// own button, which costs nothing, or opens it from the world screen's
+    /// Diagnostics section, which is a new screen with its own model.
     let target: WorldRenderTarget
     private let client: WorldRenderClient
 
@@ -319,49 +386,123 @@ struct WorldRenderWebView: UIViewRepresentable {
     }
 }
 
-// MARK: - The sheet
+// MARK: - The 3D world on screen
 
-/// The interactive picture of a saved world, inside the app.
+/// The sheet form: a navigation stack of its own, and a Close that dismisses
+/// it. Presented from the World Builder workspace, which has no stack to push
+/// onto.
 ///
-/// Presented as a sheet from the World Builder header. It fetches the page as
-/// it appears, shows the Tower's own sentence when there is none, and hands
-/// the page to a web view that can go nowhere else. The caption at the top
-/// says what the picture is, in the same words the page itself uses, because
-/// a point cloud read as a scan of the room is the one claim this screen
-/// must not make.
+/// Split from `WorldRenderScene` because the saved-worlds picker **pushes** the
+/// same screen onto its own `NavigationStack`, and a `NavigationStack` nested
+/// inside another one breaks the back gesture, the title and the toolbar. The
+/// scene owns the model and the content; this owns the presentation.
 struct WorldRenderViewerView: View {
-    @StateObject private var model: WorldRenderViewerModel
     @Environment(\.dismiss) private var dismiss
 
-    init(target: WorldRenderTarget, client: WorldRenderClient = WorldRenderClient()) {
-        _model = StateObject(wrappedValue: WorldRenderViewerModel(target: target, client: client))
+    private let target: WorldRenderTarget
+    private let title: String?
+    private let note: String?
+    private let client: WorldRenderClient
+
+    init(
+        target: WorldRenderTarget,
+        title: String? = nil,
+        note: String? = nil,
+        client: WorldRenderClient = WorldRenderClient()
+    ) {
+        self.target = target
+        self.title = title
+        self.note = note
+        self.client = client
     }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                caption
-                content
-            }
-            .navigationTitle("Reconstruction")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+            WorldRenderScene(target: target, title: title, note: note, client: client)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Close") { dismiss() }
+                    }
                 }
-            }
-            .task { await model.load() }
         }
+    }
+}
+
+/// The 3D world itself, without a stack around it. **The primary way a saved
+/// world is seen.**
+///
+/// It fetches the Tower's composed page as it appears, shows the Tower's own
+/// sentence when there is none, and hands the page to a web view that can go
+/// nowhere else.
+///
+/// ## Why the ids left the caption
+///
+/// The caption used to read `World fcbca9e90b244785bdb671530b33c6a5 · session
+/// 8f2c…` in a monospaced font, over the sentence "Sparse structure-from-motion
+/// output: feature points and camera poses." Both are true and neither belongs
+/// on the first screen a person sees after opening a saved world: one is a
+/// database key and the other is the name of an algorithm. They moved into
+/// Details, at the bottom, along with the switch to the Tower's diagnostics
+/// rendering. Nothing was deleted.
+///
+/// The caption that replaced them still refuses the one claim this screen must
+/// not make — that a point cloud is a scan of the room — and does it in words
+/// that are true of both of the Tower's renderings.
+struct WorldRenderScene: View {
+    @StateObject private var model: WorldRenderViewerModel
+
+    /// What to call this world on screen: the Tower's display name, or a dated
+    /// title from the picker. `nil` falls back to "Saved world" — never to the
+    /// id, which is what the id being in Details is for.
+    private let title: String?
+    /// The ladder's note for a world that is not final, or `nil`. Composed by
+    /// `WorldReconstruction`, not here.
+    private let note: String?
+
+    /// Whether the Details disclosure is open. View state, and deliberately
+    /// not remembered across presentations: Details is where a person goes on
+    /// purpose, and a sheet that opens with it expanded is back to being a
+    /// debugger.
+    @State private var isShowingDetails = false
+
+    init(
+        target: WorldRenderTarget,
+        title: String? = nil,
+        note: String? = nil,
+        client: WorldRenderClient = WorldRenderClient()
+    ) {
+        _model = StateObject(wrappedValue: WorldRenderViewerModel(target: target, client: client))
+        self.title = title
+        self.note = note
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            caption
+            content
+            details
+        }
+        .navigationTitle(title ?? "Saved world")
+        .navigationBarTitleDisplayMode(.inline)
+        // One fetch, for the life of the screen. `model.target` is a `let`, so
+        // there is nothing for a `.task(id:)` to key on; a second rendering of
+        // the same world is a second screen, and the page's own button switches
+        // in place without fetching at all.
+        .task { await model.load() }
     }
 
     private var caption: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(model.target.sessionID.map { "World \(model.target.worldID) · session \($0)" }
-                 ?? "World \(model.target.worldID) · newest session with geometry")
-                .font(.caption.monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Text("Sparse structure-from-motion output: feature points and camera poses. Not a surface, not metric scale.")
+            if let note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // True of the product rendering and of the diagnostics one, and
+            // true whether the Tower colours by photometric RGB or by segment
+            // index. "Not a surface" is the load-bearing half.
+            Text("Points the Tower measured from the walk, with the camera path through them. Not a surface, and not to scale.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -377,14 +518,18 @@ struct WorldRenderViewerView: View {
         case .loading:
             VStack(spacing: 12) {
                 ProgressView()
-                Text("Asking the Tower for the picture…")
+                Text("Building the 3D world…")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .ready(let html):
+            // Explicitly flexible. `.ignoresSafeArea(edges: .bottom)` came off
+            // when Details arrived underneath — a view drawing into the
+            // home-indicator area would be drawn over the disclosure — and a
+            // `UIViewRepresentable` has no intrinsic size to fall back on.
             WorldRenderWebView(html: html)
-                .ignoresSafeArea(edges: .bottom)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message, let retryable):
             VStack(spacing: 12) {
                 Image(systemName: "cube.transparent")
@@ -404,5 +549,60 @@ struct WorldRenderViewerView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// The identifiers and the other rendering, both one tap away and neither
+    /// on the way to anything.
+    ///
+    /// `.ignoresSafeArea` came off the web view above when this arrived: a
+    /// disclosure underneath a view that draws into the home-indicator area
+    /// would be drawn over by it.
+    private var details: some View {
+        DisclosureGroup("Details", isExpanded: $isShowingDetails) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(model.target.sessionID.map { "World \(model.target.worldID)\nSession \($0)" }
+                     ?? "World \(model.target.worldID)\nNewest session with geometry")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // ## There is no rendering switch here, deliberately
+                //
+                // A segmented control stood here, bound to `model.show(_:)`.
+                // It worked and it was the wrong control, for two independent
+                // reasons that a review found before a wearer did.
+                //
+                // **It refetched the world to change one token.** Switching the
+                // view changes `WorldRenderTarget.id`, which restarts
+                // `.task(id:)`, which pulls the whole page again — several
+                // megabytes of point coordinates over Tailscale — to flip a
+                // single `let mode` in a script that is already on screen.
+                //
+                // **The page already has the control, and it is better.** The
+                // Tower's page carries `<button id="mode">` and a `d` key
+                // binding (`toggleMode()` in
+                // `tower/world_builder/render.py`), both of which switch in
+                // place with no request at all, reset the camera, and relabel
+                // themselves. It is on screen, above this disclosure, in front
+                // of the reader. Duplicating it worse, one level down, in a
+                // collapsed section, is not an affordance — it is a second
+                // way to do the same thing that costs a download.
+                //
+                // `WorldRenderView` and the `?view=diagnostics` parameter stay
+                // and are still used: they choose which rendering a page OPENS
+                // in, which is a fetch that was going to happen anyway. The
+                // world screen's Diagnostics section uses that, so a reader who
+                // wants the solver's view gets it without first loading the
+                // one they did not ask for.
+                Text("The page's own Diagnostics button, above, switches to the solver's view of this session without fetching anything. The solver's geometry is also drawn in full under Diagnostics on the world screen.")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        }
+        .font(.footnote)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 }

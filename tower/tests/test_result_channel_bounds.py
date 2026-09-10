@@ -173,6 +173,13 @@ def test_the_journal_cache_holds_a_summary_not_the_journal(tmp_path):
         "last_tracking": "tracking_lost",
         "stopped": False,
         "corrupt_lines": 0,
+        # Counted here rather than derived downstream, because the only other
+        # number a consumer had was the segment total and `segments - 1` is
+        # not a count of tracking losses -- a segment is also opened when the
+        # solver cannot extend its chain while tracking is fine. Both are
+        # scalars, so the memory bound below is unaffected.
+        "tracking_restarts": 1,
+        "chain_breaks": 0,
     }
     # Fixed arity whatever the journal length: this is the memory bound.
     assert len(_summarise_events(events * 1000)) == len(summary)

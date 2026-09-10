@@ -785,6 +785,8 @@ asserted without the figures to show for it.
 | `pose_count` | poses carrying a position that is **evidence**. Read from the manifest's `poses_positioned`, which the build counts per segment: every solved pose, plus the anchor of each segment that solved something. **Not** `poses_solved` (that drops the origin of every segment) and **not** `keyframes - poses_refused` (that promotes the bare anchor of a segment which resolved nothing). See the changelog for why this changed |
 | `poses_anchor` | how many poses were anchors. Reported beside the count, never folded into it, so an uncalibrated walk reads as "N segment origins, no trajectory" rather than as a trajectory |
 | `poses_solved`, `poses_refused`, `keyframes`, `segments` | the underlying figures |
+| `tracking_restarts` | how many times the tracker actually lost the world, **counted** from `tracking_lost` events. Never `segments - 1`: two independent causes open a segment, and only one of them is a tracking loss. On the 2026-09-09 walk 122 segments were 64 tracking losses, 57 solve-chain breaks and the one the session started with, while the phone rendered `segments - 1` under the words "Tracking restarted 121 times". `null` from a build with no journal to count |
+| `chain_breaks` | how many times the solver could not extend its chain and opened a segment while tracking was healthy. `events.py` is explicit that a consumer must not read one as the wearer having lost the world; it does not move `last_tracking`. Diagnostics, not a headline figure |
 | `path_length` | see below |
 | `provenance` | `"inferred"` |
 

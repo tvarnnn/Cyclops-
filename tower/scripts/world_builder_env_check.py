@@ -26,10 +26,16 @@ pins only the CLI contract.
 import argparse
 import importlib
 import json
+import pathlib
 import platform
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+# The sibling scripts all do this and this one did not, which is how it
+# imported a DIFFERENT checkout's `tower` -- see `collect_package_origin`.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # OpenCV symbols a monocular pipeline actually calls, grouped by role so a
 # partial build reports which capability its absence costs us, rather than
@@ -218,6 +224,100 @@ def collect_libraries():
     return {name: _module_version(name) for name in OPTIONAL_LIBRARIES}
 
 
+def collect_package_origin():
+    """WHERE THE INSTALL POINTS, not where this script happens to import from.
+
+    Asking `tower.__file__` in THIS process answers nothing: the line at the
+    top of this file puts the canonical checkout on `sys.path`, so the
+    answer is always "here". The hazard is the editable install underneath
+    it, which on this machine maps `tower` to
+    `Glasses-worktrees/all-cartridges-field-test-v1/tower/tower` -- a
+    different checkout, months of fixes behind.
+
+    Every entry point that sets `sys.path` (this script, and the three
+    world_* scripts) wins over that mapping. `tower/main.py` sets none, and
+    `import tower` from a neutral working directory therefore loads the
+    OTHER checkout -- verified by running it. `scripts/start_tower.ps1`
+    happens to `Set-Location` to the tower root first, so the supported
+    launcher is safe; a hand-run `python -m uvicorn tower.main:app` from
+    anywhere else is not.
+
+    A physical test conducted against a stale worktree would produce
+    results about code nobody edited, and nothing would say so.
+    """
+    here = pathlib.Path(__file__).resolve().parents[1]
+    record = {"expected": str(here), "resolved_here": None, "install_points_at": None}
+    try:
+        import tower
+        record["resolved_here"] = str(pathlib.Path(tower.__file__).resolve().parents[1])
+    except Exception as exc:  # noqa: BLE001
+        record["reason"] = f"{type(exc).__name__}: {exc}"
+        return record
+    # The editable install's own mapping, read without importing it.
+    try:
+        import glob
+        import re
+
+        # Ask the interpreter where its site-packages is, rather than
+        # deriving it from the package path -- the first version of this
+        # guessed `parents[2]/.venv` and landed one directory above the
+        # venv, so it found no mapping and reported OK for the exact
+        # condition it exists to catch.
+        finders = []
+        for entry in sys.path:
+            if entry.endswith("site-packages"):
+                finders.extend(glob.glob(str(pathlib.Path(entry) / "__editable__*finder.py")))
+        for finder in finders:
+            text = pathlib.Path(finder).read_text(encoding="utf-8")
+            match = re.search(r"'tower':\s*'([^']+)'", text)
+            if match:
+                mapped = pathlib.Path(match.group(1).replace("\\\\", "\\")).resolve()
+                record["install_points_at"] = str(mapped.parent)
+                break
+    except Exception:  # noqa: BLE001 -- absence is an answer, not an error
+        pass
+    record["matches"] = (
+        record["install_points_at"] is None
+        or pathlib.Path(record["install_points_at"]) == here
+    )
+    return record
+
+
+def collect_vocabulary_tree():
+    """Whether COLMAP's vocabulary tree is already on this machine.
+
+    IT IS ON THE LIVE PATH NOW. Loop detection used to run only in the
+    finalisation solve, and `global_solve` justified that partly as avoiding
+    "a network dependency". Since 2026-09-09 every background solve asks for
+    it, because that is what makes a live world converge instead of
+    fragmenting -- measured on the field capture, 16 components down to 5,
+    and the largest component's share of posed keyframes rising 0.75 -> 0.95
+    as the walk went on.
+
+    So the network dependency moved onto the walk. pycolmap downloads a
+    72 MB tree on first use and caches it in the USER's home, not the venv,
+    so a fresh checkout on a warm machine is fine and a fresh machine is
+    not. A cold cache during a walk means the first solve child spends the
+    download inside its own 120 s budget and is terminated if it overruns:
+    the session survives, no solution lands, and the world quietly stays in
+    pieces with nothing on screen saying why.
+
+    That is precisely the class of failure this pre-flight exists to catch
+    before someone puts the glasses on.
+    """
+    # The SAME function the solver gates on, so this check cannot disagree
+    # with the thing it is checking.
+    from tower.world_builder.global_solve import vocabulary_tree_cache_dir
+
+    home = vocabulary_tree_cache_dir()
+    trees = sorted(home.glob("*vocab_tree*")) if home.is_dir() else []
+    return {
+        "cache_dir": str(home),
+        "present": bool(trees),
+        "files": [{"name": t.name, "bytes": t.stat().st_size} for t in trees],
+    }
+
+
 def build_verdicts(report):
     """Turn raw facts into the few go/no-go statements an implementer needs.
 
@@ -254,6 +354,44 @@ def build_verdicts(report):
             f"(cuda_build={torch_info.get('cuda_build')})"
         )
     verdicts.append(("torch_cuda_usable", torch_cuda_ok, torch_detail))
+
+    # See collect_vocabulary_tree: loop detection is on every live solve now,
+    # and a cold cache turns the first solve of a walk into a 72 MB download.
+    vocab = report.get("vocabulary_tree") or {}
+    if vocab.get("present"):
+        total = sum(f["bytes"] for f in vocab["files"])
+        vocab_detail = (
+            f"{len(vocab['files'])} tree(s), {total / 1e6:.0f} MB, in {vocab['cache_dir']}"
+        )
+    else:
+        vocab_detail = (
+            f"absent from {vocab.get('cache_dir')}; loop detection will be OFF "
+            "for every solve, so the world will come out in more pieces than it "
+            "should. Warm it (needs a network, ~72 MB): .venv/Scripts/python.exe "
+            "-c \"import pycolmap; pycolmap.match_vocabtree\" then run any solve "
+            "with --loop-detection on a machine that can reach github.com."
+        )
+    verdicts.append(("vocabulary_tree_cached", bool(vocab.get("present")), vocab_detail))
+
+    # See collect_package_origin. A stale editable install is invisible
+    # until it produces results about code nobody edited.
+    origin = report.get("package_origin") or {}
+    points_at = origin.get("install_points_at")
+    if origin.get("reason"):
+        origin_detail = origin["reason"]
+    elif points_at is None:
+        origin_detail = f"no editable install mapping found; tower imports from {origin.get('resolved_here')}"
+    elif origin.get("matches"):
+        origin_detail = f"the editable install points at {points_at}"
+    else:
+        origin_detail = (
+            f"THE EDITABLE INSTALL POINTS AT {points_at}, not {origin['expected']}. "
+            "Scripts that set sys.path are unaffected, but `import tower` from any "
+            "other working directory loads that checkout -- tower/main.py sets no "
+            "sys.path. start_tower.ps1 Set-Locations to the tower root first, so use "
+            "it, or reinstall: .venv/Scripts/python.exe -m pip install -e ."
+        )
+    verdicts.append(("tower_package_is_this_checkout", bool(origin.get("matches")), origin_detail))
 
     # The interesting failure is specifically "GPU present, torch blind to
     # it": that is a fixable packaging problem rather than missing
@@ -410,6 +548,8 @@ def main(argv=None):
         "torch": collect_torch(),
         "opencv": collect_opencv(),
         "libraries": collect_libraries(),
+        "vocabulary_tree": collect_vocabulary_tree(),
+        "package_origin": collect_package_origin(),
     }
     verdicts = build_verdicts(report)
     report["verdicts"] = [

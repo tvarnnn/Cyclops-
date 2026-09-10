@@ -273,7 +273,8 @@ def resolve_intrinsics(store: IntrinsicsStore, observed_size, *, frame_source):
     return CameraIntrinsics.unknown()
 
 
-def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls, should_stop=None):
+def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls,
+                   should_stop=None, handle: dict | None = None):
     """Yield frames from a capture directory as the Tower writes them.
 
     THE SPLIT BELOW IS THE WHOLE POINT, AND IT IS NOT STYLE.
@@ -316,11 +317,20 @@ def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls, shou
         poll_seconds=poll_seconds,
         max_idle_polls=max_idle_polls,
         should_stop=should_stop,
+        handle=handle,
     )
 
 
-def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls, should_stop=None):
+def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls,
+                    should_stop=None, handle: dict | None = None):
     follower = CaptureFollower(directory, poll_seconds=poll_seconds)
+    # The caller needs to ask, AFTER the loop, whether the capture it was
+    # following had closed -- see `end_reason` in `main()`. The follower
+    # retargets `_directory` onto a successor across a reconnect, so its
+    # own `is_closed()` is the only answer that stays right; the directory
+    # this generator was called with may be two captures old by then.
+    if handle is not None:
+        handle["follower"] = follower
     # `should_stop` is asked inside the poll loop, which is where this
     # process spends a quiet walk. A stop that arrived while the follower
     # slept is noticed at the next poll, not at the next frame.
@@ -886,6 +896,33 @@ def solve_session(store: WorldStore, world_id: str, session_id: str, *, capture_
     return summary
 
 
+def should_register(result) -> bool:
+    """Whether the Sim3 registrar should run after this build.
+
+    A FUNCTION, not an expression at the call site, because the thing it
+    decides has already been got wrong once and the wrong version was
+    untestable. An adversarial review pointed out that the first fix left
+    the decision inline in `main()`, where the only test that could reach it
+    re-typed the condition into the test file and asserted the copy -- a
+    tautology that would have passed against any implementation at all.
+
+    The rule: the registrar answers "where do these fragments sit relative
+    to each other", pairwise and weakly. When a global solve has already
+    answered it from one reconstruction, a second weaker answer must not
+    overwrite the first. Otherwise the registrar is the only producer there
+    is, and it must run.
+
+    `placements_source` is set by `engine.build()`, which is the only code
+    that knows whether the build it just did wrote placements from a
+    solution. Asking anything else has been tried: the guard used to ask
+    whether the FINAL solve had succeeded, which is a different question,
+    and on the 2026-09-09 walk the answer to it was "no" while the answer to
+    this one was "yes, 72 segments across 14 components". The registrar ran
+    and replaced them with 120 refusals.
+    """
+    return (getattr(result, "diagnostics", None) or {}).get("placements_source") is None
+
+
 def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     """Place what can be placed, and say so. Never raises.
 
@@ -926,6 +963,52 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
 
     started = time.perf_counter()
     try:
+        # NEVER OVERWRITE A GLOBAL SOLVE'S PLACEMENTS. The caller's guard is
+        # the first line of defence and this is the second, because the first
+        # one can be told the wrong thing.
+        #
+        # `load_solution` absorbs any unreadable solution and returns None --
+        # the right answer for a torn archive, and also the answer it gives
+        # if numpy changes an exception type, a schema drifts, or the box
+        # runs out of memory. In every one of those `engine.build()` writes
+        # no placements, reports `placements_source: None`, and
+        # `should_register` concludes there is no global solve to defer to.
+        # It would then call this function, which used to write
+        # unconditionally -- destroying exactly the placements the fix was
+        # written to protect, from a cause whose only symptom is one
+        # `logger.warning`. An adversarial review found that path.
+        #
+        # A placement set is trusted here only if it is REGISTERED and
+        # CURRENT: the serving layer already drops any placement whose
+        # `input_digest` disagrees with the manifest, so a stale set is not
+        # worth preserving and re-registering it is the correct outcome.
+        #
+        # INSIDE the try, and that is not tidiness. This function promises
+        # in its own docstring never to raise, and the first version of this
+        # check read the store above the guard -- which `_Boom`, the test
+        # store whose every read fails, turned straight back into the
+        # session-ending exception the guard exists to prevent.
+        existing = store.read_placements(world_id, session_id) or []
+        manifest_now = store.read_derived_manifest(world_id) or {}
+        digest_now = manifest_now.get("input_digest")
+        current_registered = [
+            p for p in existing
+            if p.state == "registered" and p.input_digest == digest_now
+        ]
+        if current_registered:
+            logger.info(
+                "[Tower][WorldBuilder] registration stood down for session %s: %s "
+                "current registered placements already exist",
+                session_id, len(current_registered),
+            )
+            return {
+                "attempted": False,
+                "wrote_placements": False,
+                "reason": (
+                    f"{len(current_registered)} current registered placements "
+                    "already exist and were not replaced"
+                ),
+            }
         report = register(store, world_id, session_id)
         # Inside the guard, not after it. Persisting is not the safe part
         # of this: `placements_from_report` runs every placement through
@@ -1150,6 +1233,7 @@ def main(argv=None) -> int:
 
     capture_id = None
     synthetic_intrinsics = None
+    capture_handle: dict = {}
     if args.follow_capture:
         frames = follow_capture(
             args.follow_capture,
@@ -1158,6 +1242,7 @@ def main(argv=None) -> int:
             # Asked inside the poll loop, which is where this process
             # spends a quiet walk. See `StopRequest`.
             should_stop=stop_request.asked_for,
+            handle=capture_handle,
         )
         frame_source = "live-capture"
         capture_id = args.follow_capture.name
@@ -1418,13 +1503,39 @@ def main(argv=None) -> int:
                     solver.maybe_launch(store, accepted, sources)
         observe_seconds = time.perf_counter() - started
 
-        if stop_request.asked:
-            # The walk did not end by the wearer's Stop: somebody asked this
-            # process to go. The record says so, and says which channel.
+        # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?
+        #
+        # That is the question, and this used to ask a different one: any
+        # stop request at all made the session `interrupted`. But the
+        # wearer leaving the World Builder screen IS a soft stop -- iOS
+        # posts `session/stop` from `.onDisappear` -- and it arrives right
+        # after the Stop that closed the capture. So the ordinary way to
+        # finish a walk produced `end_reason: interrupted`, and
+        # `results/world_builder.py` maps that to Interrupted ahead of ever
+        # looking at `finalization`. Measured on a real 12 fps capture: a
+        # wearer who leaves immediately gets `interrupted`, one who lingers
+        # a second gets `stop`, on identical geometry.
+        #
+        # A capture that has written its end reason ended because somebody
+        # pressed Stop. Whether this process was also told to go afterwards
+        # says nothing about the walk. `is_closed()` is asked of the
+        # FOLLOWER, not of the directory we started with, because a
+        # reconnect retargets it onto a successor capture.
+        follower = capture_handle.get("follower")
+        capture_finished = follower.is_closed() if follower is not None else False
+        if stop_request.asked and not capture_finished:
+            # Now it means what it says: frames were still coming and
+            # somebody asked this process to go.
             end_reason = END_REASON_INTERRUPTED
             logger.warning(
-                "[Tower][WorldBuilder] stop requested (%s, %s) while observing; the "
-                "session ends as %r and the final solve is skipped",
+                "[Tower][WorldBuilder] stop requested (%s, %s) while the capture was "
+                "still open; the session ends as %r",
+                stop_request.level, stop_request.source, end_reason,
+            )
+        elif stop_request.asked:
+            logger.info(
+                "[Tower][WorldBuilder] stop requested (%s, %s) after the capture "
+                "closed; this is an ordinary end and the session ends as %r",
                 stop_request.level, stop_request.source, end_reason,
             )
         summary = engine.stop_session(end_reason, hold_lock=True)
@@ -1600,14 +1711,15 @@ def main(argv=None) -> int:
     #
     # `engine.build()` now says which producer owns the file, so the guard
     # asks the build that actually wrote it.
-    placements_source = (result.diagnostics or {}).get("placements_source")
-    if args.register and placements_source is None:
-        report["registration"] = register_session(store, world_id, session_id)
-    elif args.register:
-        report["registration"] = {
-            "attempted": False,
-            "reason": f"placements come from the {placements_source}",
-        }
+    if args.register:
+        report["registration"] = (
+            register_session(store, world_id, session_id)
+            if should_register(result)
+            else {
+                "attempted": False,
+                "reason": "the global solve placed these segments",
+            }
+        )
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

@@ -24,6 +24,30 @@ logger = logging.getLogger(__name__)
 TEMP_SUFFIX = ".tmp"
 
 
+def _temp_path(path: Path) -> Path:
+    """A staging name no other writer can be using.
+
+    `path.name + ".tmp"` was the convention here until an adversarial review
+    measured what it does with two writers of one destination: 656 torn reads
+    at the published path over 12 seconds, plus a writer killed by
+    `FileNotFoundError` out of `replace` because its peer's `finally` had
+    already unlinked the shared temp. One writer can also `replace` the
+    half-written temp the OTHER is still filling straight onto the
+    destination -- which is precisely the `BadZipFile` the atomic write was
+    introduced to prevent, reintroduced by the staging name.
+
+    Nothing in this Tower serialises writers of `solution.npz`:
+    `acquire_writer_lock` is per-world and taken only by the engine, and
+    `scripts/world_solve.py` takes no lock at all. A hand-run solve against a
+    world with a live builder is two writers, and that is an ordinary
+    operator action -- it is how the 2026-09-09 artifact was recovered.
+
+    pid plus uuid4: the pid makes a stray temp attributable when someone
+    finds one, and the uuid makes it unique even within one process.
+    """
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}{TEMP_SUFFIX}")
+
+
 def new_id() -> str:
     """Mint an opaque identifier.
 
@@ -56,7 +80,7 @@ REPLACE_BACKOFF_MAX_S = 0.05
 def write_json_atomic(path: Path, payload: dict) -> None:
     """Replace `path` atomically, leaving no temp file behind either way."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + TEMP_SUFFIX)
+    temp_path = _temp_path(path)
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             # `json.dumps(...)` then one write, NOT `json.dump(payload,
@@ -164,12 +188,19 @@ def write_bytes_atomic(path: Path, write: "Callable[[BinaryIO], None]") -> None:
     child that outstays a stop): the torn file then persists, and every
     later read of that world fails the same way.
 
-    Replacing a whole temp file closes both cases at once. A reader sees
-    the previous solution or the next one, never half of either, and a
-    killed writer leaves only a temp file that the `finally` removes.
+    Replacing a whole temp file closes both cases at once: a reader sees
+    the previous solution or the next one, never half of either.
+
+    IT DOES NOT CLEAN UP AFTER A KILL, and an earlier version of this
+    docstring claimed it did. The `finally` below runs on an exception; it
+    does not run on `TerminateProcess`, which is exactly how
+    `BackgroundSolver` ends a solve child that outstays a stop. Measured:
+    a real kill mid-write leaves the published archive VALID -- which is
+    the guarantee that matters -- and a stray `.tmp` beside it that
+    nothing prunes. `purge_world` is still the only sweeper.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + TEMP_SUFFIX)
+    temp_path = _temp_path(path)
     try:
         with temp_path.open("wb") as handle:
             write(handle)
@@ -196,7 +227,17 @@ def read_bytes_closed(path: Path) -> bytes:
     `np.load` on a path is exactly that lazy reader -- `NpzFile` keeps the
     zip open until it is closed -- so callers hand these bytes to
     `np.load(io.BytesIO(...))` instead. The arrays this Tower persists are
-    single-digit MB; the field session's `solution.npz` is 1.7 MB.
+    single-digit MB; the field session's `solution.npz` is 1.7 MB, and the
+    extra peak is one copy of the compressed file.
+
+    HOW MUCH THIS BUYS, HONESTLY: measured on that artifact, the lazy form
+    holds the handle 23.6-31.7 ms and the eager form 0.9-1.2 ms, against a
+    `REPLACE_BUDGET_S` of 2000 ms. So the retry already absorbed the lazy
+    reader comfortably and this is a margin, not a rescue. It is still the
+    right shape -- the budget is finite and a reader under solver load is
+    exactly what descheduled long enough to matter on 2026-09-06 -- but it
+    was oversold as closing a hazard, and it is not what fixed the field
+    failure. The atomic write is.
     """
     with path.open("rb") as handle:
         return handle.read()

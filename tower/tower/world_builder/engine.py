@@ -936,7 +936,21 @@ class WorldBuilderEngine:
                 # and 2 registrations, and that is the world the phone then
                 # drew. Nine good background solves were discarded by a
                 # question about a tenth that never happened.
-                "placements_source": "global_solve" if placements is not None else None,
+                #
+                # "PLACED SOMETHING", not "ran". An adversarial review found
+                # the first version of this asking `placements is not None`,
+                # which is true whenever `merge()` ran at all -- including
+                # when it returns [] because every segment is still pending,
+                # and when it returns nothing but refusals because the solve
+                # posed none of their keyframes. Both of those place zero
+                # segments, and both would have stood the registrar down and
+                # left the world with no placements at all. The registrar is
+                # the correct fallback there, and this must not suppress it.
+                "placements_source": (
+                    "global_solve"
+                    if placements and any(p.state == "registered" for p in placements)
+                    else None
+                ),
             },
         )
 

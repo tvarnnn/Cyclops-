@@ -74,7 +74,6 @@ import logging
 import os
 import shutil
 import time
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -562,6 +561,32 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
         return None
 
 
+def vocabulary_tree_cache_dir() -> Path:
+    """Where COLMAP caches the vocabulary tree it downloads.
+
+    `~/.cache/colmap`, and NOT the venv: a fresh checkout on a machine that
+    has solved before is fine, and a fresh machine is not. The code never
+    sets `vocab_tree_path`, so COLMAP resolves and caches it itself.
+    """
+    return Path.home() / ".cache" / "colmap"
+
+
+def vocabulary_tree_cached() -> bool:
+    """Whether loop detection can run without reaching the network.
+
+    Deliberately a filesystem check rather than a try/except around the
+    solve: COLMAP's failure to fetch the tree is a glog CHECK that aborts
+    the process, so by the time it is observable there is nothing left to
+    handle. Being wrong in this direction is survivable -- a tree we fail
+    to find means a solve without loop detection, not a dead one.
+    """
+    directory = vocabulary_tree_cache_dir()
+    try:
+        return any(directory.glob("*vocab_tree*"))
+    except OSError:
+        return False
+
+
 def _quiet_pycolmap():
     try:
         import pycolmap
@@ -635,10 +660,37 @@ def solve(
     pairing = pycolmap.SequentialPairingOptions()
     pairing.overlap = overlap
     pairing.quadratic_overlap = False
-    # Loop detection needs a vocabulary tree pycolmap downloads on first use.
-    # Off by default: it is a finalisation-time cost and a network
-    # dependency, and the caller decides (see scripts/world_solve.py).
-    pairing.loop_detection = bool(loop_detection) if loop_detection is not None else False
+    # Loop detection needs a vocabulary tree COLMAP downloads on first use
+    # and caches in the USER's home. It is what makes a live world converge
+    # instead of fragmenting -- 16 components to 5 on the 2026-09-09
+    # capture -- so every solve asks for it now, not just the final one.
+    #
+    # WHICH IS WHY THE ABSENCE OF THE TREE HAS TO BE CHECKED HERE. A missing
+    # tree is not a refusal: `match_sequential` is outside any try/except,
+    # and COLMAP's failure to fetch the file is a glog CHECK, so the process
+    # dies of `abort()` with exit code 3 and no Python exception to catch.
+    # Measured with an empty cache and no network:
+    #
+    #     file.cc:507] Check failed: blob.has_value() Failed to download file
+    #     *** Aborted ***                                        EXIT=3
+    #
+    # End to end that means EVERY solve dies, the manifest carries no
+    # `global_solve` at all, and the world ships with every segment refused
+    # -- the "87 disconnected fragments" outcome, from a new cause, on a
+    # machine that merely has no network. Turning loop detection off instead
+    # costs the convergence and keeps the walk.
+    wanted = bool(loop_detection) if loop_detection is not None else False
+    if wanted and not vocabulary_tree_cached():
+        logger.warning(
+            "global solve: no vocabulary tree in %s, so loop detection is off for "
+            "this solve. Fetching it needs a network and COLMAP aborts the process "
+            "rather than failing the call, so it is not attempted mid-walk. The "
+            "world will still solve, in more pieces than it would otherwise. "
+            "scripts/world_builder_env_check.py reports this before a walk.",
+            vocabulary_tree_cache_dir(),
+        )
+        wanted = False
+    pairing.loop_detection = wanted
     pycolmap.match_sequential(
         workspace.database_path, matching_options=matching, pairing_options=pairing
     )

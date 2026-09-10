@@ -211,3 +211,59 @@ def test_the_adapter_raises_its_own_error_for_a_missing_world(tmp_path):
 
     with pytest.raises(WorldRenderUnavailable):
         build_world_render(WorldStore(tmp_path), "w", None)
+
+
+# -- the diagnostics view, which only the route can deliver ----------------
+#
+# The viewer carries both views on one payload and can toggle between them
+# in a browser. The phone cannot use that: iOS loads this page with
+# `loadHTMLString(_:baseURL: nil)`, so there is no URL for the page to read
+# a mode from, and the web view's navigation policy cancels the page's own
+# links. So `?view=` has to be answered HERE, when the page is composed, or
+# the wearer has no route to the sparse solver output at all -- which the
+# product requirement keeps as reachable diagnostics, not as a deleted one.
+
+
+def test_the_route_serves_the_diagnostic_view_on_request(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/render",
+        params={"session_id": session_id, "view": "diagnostics"},
+    )
+    assert response.status_code == 200
+    assert "let mode = 'diag';" in response.text
+
+
+def test_the_route_serves_the_world_view_by_default(derived_world):
+    store, world_id, session_id = derived_world
+    response = _client(store).get(f"/worlds/{world_id}/render",
+                                  params={"session_id": session_id})
+    assert response.status_code == 200
+    assert "let mode = 'world';" in response.text
+
+
+@pytest.mark.parametrize("view", ["", "world", "PRODUCT", "nonsense", "../x", "<script>"])
+def test_an_unrecognised_view_still_serves_the_world(derived_world, view):
+    """A display mode on an unauthenticated route.
+
+    A 422 here would answer "show me my world" with a validation error, so
+    anything unrecognised opens the world view instead.
+    """
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/render",
+        params={"session_id": session_id, "view": view},
+    )
+    assert response.status_code == 200
+    assert "let mode = 'world';" in response.text
+
+
+def test_the_view_parameter_cannot_inject_into_the_page(derived_world):
+    """The mode is substituted into a <script> block."""
+    store, world_id, session_id = derived_world
+    response = _client(store).get(
+        f"/worlds/{world_id}/render",
+        params={"session_id": session_id, "view": "'; alert(1); //"},
+    )
+    assert response.status_code == 200
+    assert "alert(1)" not in response.text
