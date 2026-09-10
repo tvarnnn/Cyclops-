@@ -170,7 +170,17 @@ def test_the_env_file_is_read_the_way_the_launcher_reads_it(tmp_path, monkeypatc
     for line in awkward:
         env_file = tmp_path / ".env"
         env_file.write_text(line + "\n", encoding="utf-8")
-        assert dotenv_values(env_file).get("TOWER_WORLD_ROOT") == "data/world_builder", (
+        # `utf-8-sig`, the encoding the collector passes, and the reason
+        # it does. python-dotenv 1.2.1 does NOT strip a byte-order mark:
+        # read with the default `utf-8`, the last line here parses to the
+        # key `'\ufeffTOWER_WORLD_ROOT'` and the lookup finds nothing --
+        # a RED verdict against a correctly configured Tower, which is
+        # what this whole test exists to prevent. On Windows a BOM is the
+        # DEFAULT from Notepad and from PowerShell's `Out-File`, so this
+        # is the ordinary case and not a hostile one.
+        assert dotenv_values(
+            env_file, encoding="utf-8-sig"
+        ).get("TOWER_WORLD_ROOT") == "data/world_builder", (
             f"the test's own premise is wrong for {line!r}"
         )
 
@@ -303,4 +313,90 @@ def test_python_dotenv_is_a_declared_dependency():
     assert "python-dotenv" in dependencies, (
         "python-dotenv is not in the base dependencies; a venv built with "
         "plain uvicorn would make the calibration verdict a silent lie"
+    )
+
+
+def _env_check_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "env_check_backend", "scripts/world_builder_env_check.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_report():
+    """The keys `build_verdicts` reads, with nothing interesting in them.
+
+    The backend verdict is about the interpreter, not about the host, so
+    these tests must not depend on a GPU being present or on what
+    `nvidia-smi` says.
+    """
+    return {
+        "nvidia_smi": {"available": False, "reason": "stub"},
+        "torch": {"installed": False},
+        "opencv": {"installed": False},
+        "libraries": {},
+        "vocabulary_tree": {},
+        "package_origin": {},
+        "calibrations": {},
+    }
+
+
+def test_the_preflight_refuses_an_interpreter_that_cannot_solve(monkeypatch):
+    """Every other verdict can pass on a Python that reconstructs nothing.
+
+    `import tower` works from the tower directory whether or not the
+    package is installed, torch and OpenCV are commonly present
+    system-wide, and the vocabulary tree lives in `~/.cache` -- so a
+    green pre-flight is achievable on an interpreter with no pycolmap,
+    and a walk on it produces zero poses and zero points, announced
+    nowhere.
+
+    **The agent that wrote this check ran the whole Tower suite on such
+    an interpreter for a working session before noticing**, on this
+    machine, with `tower/.venv` sitting beside it. That is who this
+    verdict is for.
+    """
+    import builtins
+
+    module = _env_check_module()
+    real_import = builtins.__import__
+
+    def no_pycolmap(name, *args, **kwargs):
+        if name == "pycolmap":
+            raise ModuleNotFoundError("No module named 'pycolmap'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pycolmap)
+    verdicts = {
+        name: (ok, detail) for name, ok, detail in module.build_verdicts(_stub_report())
+    }
+
+    assert "sfm_backend_importable" in verdicts, sorted(verdicts)
+    ok, detail = verdicts["sfm_backend_importable"]
+    assert ok is False, detail
+    assert "zero poses and zero points" in detail
+    # It must name the interpreter, because "why is it failing" is almost
+    # always "you are not running the Python you think you are".
+    assert module.sys.executable in detail
+
+
+def test_the_preflight_passes_the_backend_check_where_it_can_solve():
+    """The other half: this suite runs on an interpreter that CAN solve.
+
+    If this ever fails, the suite itself is being run on the wrong Python
+    and every reconstruction result it reports is about a backend that is
+    not the one the Tower uses.
+    """
+    module = _env_check_module()
+    verdicts = {
+        name: (ok, detail) for name, ok, detail in module.build_verdicts(_stub_report())
+    }
+    ok, detail = verdicts["sfm_backend_importable"]
+    assert ok is True, (
+        "the test suite is running on an interpreter with no SfM backend: "
+        + detail
     )

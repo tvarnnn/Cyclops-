@@ -723,7 +723,33 @@ class WorldStore:
                 return None
             manifest = world_manifest
         if manifest is None:
-            return False
+            # NO MANIFEST ANYWHERE IS THE THIRD ANSWER, NOT `False`.
+            #
+            # This returned False, and the docstring above spends a
+            # paragraph explaining why that is wrong -- for the one case it
+            # DID handle, a world manifest naming another session. The case
+            # where there is no manifest at all fell through to here and got
+            # the answer the docstring rejects.
+            #
+            # `False` means "a manifest exists and disagrees", and
+            # `read_derived`'s gate refuses on exactly that. So a world
+            # built before per-session manifests existed, or one whose
+            # manifests were lost, was 404 for a reconstruction sitting on
+            # disk -- the campaign's named failure, on the serving path,
+            # in the function written to prevent it.
+            #
+            # It surfaced when the status channel learned to recount such a
+            # session's poses and points and report it `ready`: the channel
+            # promised a world and the wearer's next tap got nothing. A
+            # promise the next tap breaks is worse than the old
+            # consistently-wrong pair, which is why this is a defect the
+            # recount created rather than one it merely revealed.
+            #
+            # Nothing is lost by serving it. The wire contract carries
+            # `current`, the route sets it from this same three-valued
+            # answer, and the status channel says in words that currency
+            # cannot be judged.
+            return None
         return (
             manifest.get("schema_version") == SCHEMA_VERSION
             and manifest.get("input_digest") == input_digest
@@ -958,6 +984,155 @@ class WorldStore:
                 retained.append(str(world_dir))
 
             return PurgeReport(removed=tuple(removed), retained=tuple(retained))
+
+
+REQUIRED_MANIFEST_KEYS = (
+    "input_digest",
+    "session_id",
+    "keyframes",
+    "points",
+    "poses_solved",
+    "poses_refused",
+    "segments",
+)
+
+
+def session_has_drawable_geometry(store, world_id, session_id, manifest=None) -> bool:
+    """Would opening this session SHOW the wearer anything?
+
+    **Not "do the files exist", which is what two separate copies of this
+    used to ask.** `engine.build` calls `write_derived` unconditionally,
+    so a walk that solved nothing still leaves `poses.json` and a
+    `points.json` holding `{"points": []}` -- 14 bytes. Eleven sessions on
+    the real 163-world root are exactly that, and they were listed as
+    `complete, has_geometry: true` while the status channel for the same
+    session projected `needsRetry`.
+
+    Two surfaces need this answer and they must not compute it apart:
+
+      * `results/world_builder_library` puts it on the wire as
+        `has_geometry`, which `WorldPickerView` branches on;
+      * `results/world_builder_render.resolve_session` uses it to choose
+        WHICH session to draw, so an empty newer walk would otherwise be
+        picked over an older one that has geometry, and the page drawn
+        blank.
+
+    A third predicate, `results/world_builder._has_session_geometry`,
+    deliberately still answers EXISTENCE -- it decides which lifecycle
+    state a session is in ("was there a build"), which is a different
+    question, and its own test says so.
+
+    `manifest` is passed in when the caller already has it, which the
+    listing does; otherwise it is read here. The count of `points.json` is
+    the fallback for a session no manifest describes -- 0 of the 49 real
+    sessions with a tree, and every one of those manifests carries both
+    figures.
+    """
+    derived = store.derived_dir(world_id) / session_id
+    if not ((derived / "poses.json").exists() and (derived / "points.json").exists()):
+        return False
+    if manifest is None:
+        try:
+            manifest = store.read_session_manifest(world_id, session_id)
+            if not (
+                isinstance(manifest, dict)
+                and manifest.get("session_id") == session_id
+            ):
+                world = store.read_derived_manifest(world_id)
+                manifest = (
+                    world
+                    if isinstance(world, dict)
+                    and world.get("session_id") == session_id
+                    else None
+                )
+        except (WorldStoreError, OSError, ValueError, KeyError):
+            manifest = None
+    if isinstance(manifest, dict):
+        points = manifest.get("points")
+        positioned = manifest.get("poses_positioned")
+        if isinstance(points, int) or isinstance(positioned, int):
+            return (points or 0) > 0 or (positioned or 0) > 0
+    return _points_on_disk(store, world_id, session_id) > 0
+
+
+def _points_on_disk(store, world_id, session_id) -> int:
+    """`len(points.json)`, for a session no manifest summarises.
+
+    The rows are dropped as soon as they are counted; only the length is
+    kept. Unreadable is not empty -- but the only honest answer inside a
+    bool is the one that does not promise a wearer something to look at,
+    and the status channel says the difference in words.
+    """
+    path = store.derived_dir(world_id) / session_id / "points.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))["points"]
+    except (KeyError, TypeError, ValueError, OSError):
+        return 0
+    return len(rows) if isinstance(rows, list) else 0
+
+
+def validate_manifest(
+    manifest, world_id, source="derived manifest", *, require_figures=True
+):
+    """Schema-check a manifest, wherever it was read from, or None.
+
+    **HERE, RATHER THAN IN ONE READER, BECAUSE THERE ARE FOUR READERS.**
+    This lived in `results/world_builder.py` and the status producer was
+    the only caller. `results/world_builder_geometry._session_manifest`
+    -- which the geometry route, `usable_placements` and the saved-worlds
+    listing all reach -- checked only `isinstance(dict)` and
+    `session_id`, so the two disagreed about any manifest that was
+    readable and wrong.
+
+    A reviewer measured what that produced: for a session whose manifest
+    declares a schema this build does not know, and whose derived tree is
+    gone, the picker said `interrupted` -- "a build ran and its output is
+    gone" -- while the status channel behind that same row said
+    `stopped_unbuilt`, "this walk produced no geometry". The two surfaces
+    this campaign spent a round reconciling, contradicting each other,
+    through a comment that claimed "four readers, one rule".
+
+    A no-op on real data: all 49 sessions with a derived tree on the
+    163-world root pass both the loose and the strict rule.
+    """
+    if not isinstance(manifest, dict):
+        # `isinstance`, not `is None`. A world manifest holding a
+        # top-level list or string reached `.get()` and came out as an
+        # AttributeError -- a 500 on the status channel, where the
+        # identically corrupt per-session copy gave a clean refusal.
+        return None
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        # A manifest from another schema describes fields whose meaning
+        # this build does not know. It is refused as a SUMMARY; the poses
+        # and points beside it are a separate question, and
+        # `_figures_from_the_tree` answers it separately.
+        return None
+    if not require_figures:
+        # IDENTITY AND PROVENANCE ONLY, which is all some readers need.
+        #
+        # The figure check below exists because the STATUS CHANNEL reports
+        # those figures, and "geometry: available with every count null"
+        # is a claim with nothing behind it. A reader asking "which build
+        # produced this" needs only `session_id` and `input_digest`, and
+        # holding it to the figures refuses manifests that answer its
+        # question perfectly well.
+        #
+        # Unifying the two readers without this split was itself a defect:
+        # `usable_placements` started refusing every placement of a
+        # session whose manifest carries a digest and no counts, so a
+        # registered segment stopped serving its transform. Caught by
+        # `test_world_builder_placements.py`, five tests at once, in the
+        # full suite rather than in the targeted one I had been running.
+        return manifest
+    missing = [key for key in REQUIRED_MANIFEST_KEYS if manifest.get(key) is None]
+    if missing:
+        logger.warning(
+            "world builder: %s for %s is missing %s; treating it as absent "
+            "rather than reporting geometry with no figures",
+            source, world_id, missing,
+        )
+        return None
+    return manifest
 
 
 def compute_input_digest(keyframes: list[Keyframe]) -> str:

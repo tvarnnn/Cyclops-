@@ -4,11 +4,11 @@
 
 | | |
 |---|---|
-| Contract | `world_builder.worlds/2026-09-06` |
+| Contract | `world_builder.worlds/2026-09-10` |
 | Transport | HTTP `GET /worlds`, same origin and same rules as the geometry routes (`WORLD-BUILDER-GEOMETRY.md` §1) |
 | Tower producer | `tower/tower/results/world_builder_library.py` |
 | Tower route | `tower/tower/routes/geometry.py` |
-| iOS consumer | `ios/Glasses/Workspaces/WorldBuilder/WorldLibrary.swift` (compiled and tested on the Mac, 2026-09-06) |
+| iOS consumer | `ios/Glasses/Workspaces/WorldBuilder/WorldLibrary.swift` (compiled and tested on the Mac, 2026-09-06; the 2026-09-10 id bump has **not** been compiled — Windows lead) |
 
 ## 1. Why it exists
 
@@ -25,7 +25,7 @@ there are no worlds (`worlds: []`).
 
 | Field | Type | Meaning |
 |---|---|---|
-| `contract` | string | `world_builder.worlds/2026-09-06`. Compared for equality; a mismatch refuses the payload |
+| `contract` | string | `world_builder.worlds/2026-09-10`. Compared for equality; a mismatch refuses the payload |
 | `world_count` | int | Length of `worlds` |
 | `worlds` | array | Newest `updated_at` first |
 
@@ -51,9 +51,9 @@ Per session:
 | `frame_source` | string | `live-capture`, `recorded-capture`, `synthetic` |
 | `capture_id` | string \| null | The capture this session followed, when it followed one |
 | `keyframes_accepted` | int | As recorded on the session |
-| `has_geometry` | bool | A derived tree exists for this session (`poses.json` and `points.json`). The geometry manifest may still answer `current: false` |
+| `has_geometry` | bool | **Opening this session would show the wearer something.** The geometry manifest may still answer `current: false`. **Amended 2026-09-10 — this is why the contract id moved.** It used to mean only that `poses.json` and `points.json` exist, and `engine.build` writes both unconditionally: a walk that solved nothing leaves a `points.json` holding `{"points": []}`, 14 bytes. **Eleven sessions on the real 163-world root were reported `has_geometry: true` over exactly that**, while the status channel for the same session projected `needsRetry` — the picker promising a wearer something to look at and the panel behind it saying nothing came of the walk. It is now the same question the status channel asks, of the same figures: `points > 0` or `poses_positioned > 0`, from the session's manifest, or counted from `points.json` when no manifest describes it |
 | `abandoned` | bool | `ended_at` is `null` **and** the world is not `live`: the builder ended without finalising the record (killed inside the Tower's shutdown grace, or by hand). Its `keyframes_accepted` is then the start-of-session value, not the journal length, and its geometry is whatever the last interim build wrote. Additive (2026-09-06, Windows validation) |
-| `state` | string | One word, the status channel's lifecycle vocabulary: `receiving` (a live builder, session open), `finalizing` (a live builder, session stopped — the final solve and build are running), `complete` (finished; `finalization.state == "complete"`, or an older record that stopped and built), `interrupted` (killed mid-walk, killed mid-finalization, stopped by a request or an error — **`has_geometry` still says whether a reconstruction exists**), `unbuilt` (an older record that stopped and never built). Additive (2026-09-06, live-history lane) |
+| `state` | string | One word, the status channel's lifecycle vocabulary: `receiving` (a live builder, session open), `finalizing` (a live builder, session stopped — the final solve and build are running), `complete` (finished; `finalization.state == "complete"` **and** geometry on disk, or an older record that stopped and built), `interrupted` (killed mid-walk, killed mid-finalization, stopped by a request or an error, **or a session whose manifest records real figures and whose derived tree is gone** — something happened to this session, which is what the word claims), `unbuilt` (**there is nothing to open**: a record that stopped and never built, or one whose build ran and found nothing — a dark corridor, a blank wall, a calibration that never arrived. iOS renders it “No geometry”, which is the whole claim. It is deliberately NOT `interrupted`: nothing was interrupted, and saying so tells a wearer the walk failed when it merely found nothing). Additive (2026-09-06, live-history lane); **amended 2026-09-10**, which is why the contract id moved: `complete` gained the `has_geometry` requirement and `interrupted` gained the manifest-without-a-tree case, so a word a phone already implements now arrives in states it did not before. Nothing was added to the shape — an older phone decodes every field; it simply draws a different word. |
 | `keyframes_journaled` | int | Lines in the keyframe journal. On a record that never stopped `keyframes_accepted` is still the zero written at start; this is what actually landed (467 on the 09-06 walk against a recorded 0). Show this when the two disagree. Additive (2026-09-06) |
 | `finalization` | object \| null | The builder's own record of what happened after the session stopped: `{state: pending\|complete\|interrupted, final_solve: pending\|solved\|skipped\|failed\|unavailable\|null, started_at, updated_at, detail}`. `null` on records written before 2026-09-06 and on sessions that never stopped. Additive (2026-09-06) |
 

@@ -528,9 +528,27 @@ def test_the_three_surfaces_ask_the_same_question_of_the_same_files(tmp_path):
     one of them still said "if a third caller appears, move it into the
     store". The third is `world_builder_render._has_geometry`, on the
     surface the wearer actually looks at, and the first version of this
-    test left it free to drift. The modules must not import each other, so
-    the copies stay; this is what keeps them honest.
+    test left it free to drift.
+
+    AMENDED 2026-09-10. Two of the three moved into the store
+    (`session_has_drawable_geometry`) rather than staying copies, because
+    they were not merely at risk of drifting -- they were asking the wrong
+    question. Existence of `poses.json` and `points.json` is not
+    "opening this shows something": `engine.build` writes both
+    unconditionally, so a walk that solved nothing leaves a 14-byte
+    `points.json`, and eleven sessions on the real 163-world root are
+    exactly that.
+
+    The status copy stays separate ON PURPOSE and the loop below now says
+    so: `_has_session_geometry` answers "was there a build", which is what
+    decides a lifecycle state, and
+    `test_the_status_predicate_answers_existence_not_openability` pins it.
+    Where the three may differ is therefore exactly one place -- a tree
+    that exists and is empty -- and this asserts both that they agree
+    everywhere else and that they differ THERE in the right direction.
     """
+    import json as _json
+
     from tower.results.world_builder import _has_session_geometry
     from tower.results.world_builder_library import _has_geometry as library_has
     from tower.results.world_builder_render import _has_geometry as render_has
@@ -541,19 +559,88 @@ def test_the_three_surfaces_ask_the_same_question_of_the_same_files(tmp_path):
     derived = store.derived_dir(world_id) / session_id
     derived.mkdir(parents=True)
 
-    for present in ([], ["poses.json"], ["points.json"], ["poses.json", "points.json"]):
+    def answers():
+        return {
+            "status": _has_session_geometry(store, world_id, session_id),
+            "listing": library_has(store, world_id, session_id, None),
+            "render": render_has(store, world_id, session_id),
+        }
+
+    # Absent, half-present: all three say no.
+    for present in ([], ["poses.json"], ["points.json"]):
         for name in ("poses.json", "points.json"):
             path = derived / name
             if name in present:
-                path.write_text("{}", encoding="utf-8")
+                path.write_text(_json.dumps({"poses": [], "points": []}))
             else:
                 path.unlink(missing_ok=True)
-        answers = {
-            "status": _has_session_geometry(store, world_id, session_id),
-            "listing": library_has(store, world_id, session_id),
-            "render": render_has(store, world_id, session_id),
-        }
-        assert len(set(answers.values())) == 1, (present, answers)
+        assert set(answers().values()) == {False}, present
+
+    # BOTH PRESENT AND EMPTY: the one place they are meant to differ.
+    (derived / "poses.json").write_text(_json.dumps({"poses": []}))
+    (derived / "points.json").write_text(_json.dumps({"points": []}))
+    empty = answers()
+    assert empty["status"] is True, "a build DID run; the lifecycle needs to know"
+    assert empty["listing"] is False, (
+        "the picker promised the wearer something to look at, over an empty "
+        "reconstruction"
+    )
+    assert empty["render"] is False, (
+        "the render page would have chosen an empty session to draw"
+    )
+
+    # BOTH PRESENT AND REAL: all three say yes again.
+    (derived / "poses.json").write_text(
+        _json.dumps({"poses": [{"segment_index": 0, "status": "solved"}]})
+    )
+    (derived / "points.json").write_text(
+        _json.dumps({"points": [{"segment_index": 0, "xyz": [0.0, 0.0, 0.0]}]})
+    )
+    assert set(answers().values()) == {True}
+
+
+def test_the_render_page_does_not_pick_an_empty_walk_over_a_real_one(tmp_path):
+    """`resolve_session` chooses newest-with-geometry, and "with geometry"
+    used to mean "the files are there".
+
+    On a world walked twice where the SECOND walk solved nothing -- a dark
+    corridor, a lens cap, a calibration that never arrived -- the empty
+    session outranked the older one that has a reconstruction, and the
+    wearer got a blank page for a world with geometry in it.
+    """
+    import json as _json
+
+    from tower.results.world_builder_render import resolve_session
+    from tower.world_builder.records import Session, World
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path / "worlds")
+    world_id = "w" * 32
+    older, newer = "a" * 32, "b" * 32
+    store.write_world(World(
+        world_id=world_id, created_at=1.0, updated_at=9.0,
+        session_ids=(older, newer),
+    ))
+    store.write_session(Session(
+        session_id=older, world_id=world_id, started_at=1.0, ended_at=2.0))
+    store.write_session(Session(
+        session_id=newer, world_id=world_id, started_at=8.0, ended_at=9.0))
+
+    real = store.derived_dir(world_id) / older
+    real.mkdir(parents=True)
+    (real / "poses.json").write_text(
+        _json.dumps({"poses": [{"segment_index": 0, "status": "solved"}]}))
+    (real / "points.json").write_text(
+        _json.dumps({"points": [{"segment_index": 0, "xyz": [0.0, 0.0, 0.0]}]}))
+
+    empty = store.derived_dir(world_id) / newer
+    empty.mkdir(parents=True)
+    (empty / "poses.json").write_text(_json.dumps({"poses": []}))
+    (empty / "points.json").write_text(_json.dumps({"points": []}))
+
+    assert resolve_session(store, world_id, None) == older, (
+        "the render page chose the walk that reconstructed nothing"
+    )
 
 
 def test_the_status_predicate_answers_existence_not_openability(tmp_path):
@@ -783,13 +870,39 @@ def test_the_geometry_block_does_not_say_no_build_ran_over_a_built_session():
     absent = _geometry_block(None, False, 10, has_session_geometry=False)
     built = _geometry_block(None, False, 10, has_session_geometry=True)
 
-    assert absent["available"] is False and built["available"] is False
+    assert absent["available"] is False
     assert "no build has run" in absent["unavailable_reason"]
+    # `built` has a tree and no figures recovered from it, which since
+    # 2026-09-10 is the ONLY way a session with geometry on disk still
+    # reports unavailable. It must not be described as one that never
+    # built, and it must not be described as somebody else's session
+    # either -- the sentence that used to be here said exactly that, and
+    # said it about four different corrupt shapes that were nothing of
+    # the kind.
+    assert built["available"] is False
     assert "no build has run" not in built["unavailable_reason"], (
         "a session with its geometry on disk is told no build ran: "
         + built["unavailable_reason"]
     )
-    assert "another session" in built["unavailable_reason"]
+    assert "read" in built["unavailable_reason"]
+
+    # AND THE ORDINARY CASE, which is the point of the recount: figures
+    # recovered from the tree are reported, so the world opens.
+    counted = _geometry_block(
+        None, False, 10, has_session_geometry=True,
+        tree_figures={
+            "points": 1347, "keyframes": None, "input_digest": None,
+            "built_at": None, "backend_id": None, "scale_state": None,
+            "tree_fingerprint": "1:2|3:4", "poses_solved": 3,
+            "poses_refused": 0, "poses_anchor": 1, "poses_positioned": 4,
+            "segments": 1,
+        },
+    )
+    assert counted["available"] is True
+    assert counted["element_count"] == 1347
+    assert counted["built_from_keyframes"] is None, (
+        "a recount must not invent which keyframes produced it"
+    )
 
 
 def test_a_second_walk_does_not_take_the_first_walks_geometry_away(tmp_path):
@@ -1217,13 +1330,13 @@ def test_the_file_cache_evicts_rather_than_collapsing(tmp_path):
         path = tmp_path / f"{index}.json"
         path.write_text("{}", encoding="utf-8")
         paths.append(path)
-        cache.read(path, lambda index=index: index)
+        cache.read("test", path, lambda index=index: index)
 
     assert len(cache._entries) <= _FileCache.MAX_ENTRIES
 
     reads = []
     for path in paths[-10:]:
-        cache.read(path, lambda p=path: reads.append(p))
+        cache.read("test", path, lambda p=path: reads.append(p))
     assert reads == [], (
         f"{len(reads)} of the 10 most recent entries were evicted; the "
         "cache collapsed instead of evicting the oldest"
@@ -1237,12 +1350,12 @@ def test_the_file_cache_evicts_rather_than_collapsing(tmp_path):
     # demonstrated that on a three-key dict. The first version of this test
     # only checked that the newest survived, which FIFO satisfies too.
     hot = paths[-1]
-    cache.read(hot, lambda: pytest.fail("the hot entry was not cached"))
+    cache.read("test", hot, lambda: pytest.fail("the hot entry was not cached"))
     for index in range(_FileCache.MAX_ENTRIES):
         path = tmp_path / f"flood-{index}.json"
         path.write_text("{}", encoding="utf-8")
-        cache.read(path, lambda: index)
-        cache.read(hot, lambda: reads.append(hot))
+        cache.read("test", path, lambda: index)
+        cache.read("test", hot, lambda: reads.append(hot))
     assert reads == [], (
         "the entry read on every single poll was evicted while colder ones "
         "survived: the cache is first-in-first-out, not least-recently-used"

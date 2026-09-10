@@ -808,7 +808,7 @@ enum WorldReconstruction: Equatable {
             return .final(target)
         case .mapping, .building:
             return .partial(target, note: "This world is still being built, so it will change.")
-        case .improving, .finalizing:
+        case .improving:
             // NOT "it will change" — that reads as polish, and this is not
             // polish. The final solve is what MAKES the world: on the
             // 2026-09-09 capture it took the reconstruction from 16
@@ -829,6 +829,34 @@ enum WorldReconstruction: Equatable {
                 note: "This world is still being finished. It usually takes a "
                     + "few minutes, and the finished world is very different "
                     + "from this one — it is worth waiting for Saved."
+            )
+        case .finalizing:
+            // SPLIT FROM `.improving`, AND THE DIFFERENCE IS WHETHER
+            // ANYTHING IS ACTUALLY RUNNING.
+            //
+            // `.improving` is reached only with `buildInProgress == true`,
+            // which the Tower sets from a writer lock it can see
+            // (`lifecycle: finalizing`). The measured 179 seconds above are
+            // that state, and "it is worth waiting for" is a true promise
+            // there.
+            //
+            // `.finalizing` is everything else: `stopped_unbuilt` with
+            // geometry, where `build_in_progress` is null because nothing
+            // holds the lock, and `finalized` with `final_solve: pending`.
+            // A reviewer pointed out that the promise had been attached to
+            // both -- so a session whose finalization died, or an offline
+            // rebuild nobody ever runs, told the wearer to keep waiting for
+            // something that was never coming. That is the permanent
+            // "Finalizing" shape with a stronger sentence bolted on.
+            //
+            // Same facts, no promise: what is missing is named, and the
+            // wearer is told the phone cannot see anyone working on it.
+            return .partial(
+                target,
+                note: "The final pass has not landed for this world, and the "
+                    + "finished version is very different from this one. "
+                    + "Nothing here can see a build running, so it may need "
+                    + "to be built again."
             )
         case .partial:
             return .partial(

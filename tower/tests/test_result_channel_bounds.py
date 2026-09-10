@@ -205,13 +205,13 @@ def test_the_producer_caches_are_capped(tmp_path):
     for index in range(_FileCache.MAX_ENTRIES * 4):
         path = tmp_path / f"f{index}"
         path.write_text("x", encoding="utf-8")
-        cache.read(path, lambda: index)
+        cache.read("test", path, lambda: index)
 
     assert len(cache._entries) <= _FileCache.MAX_ENTRIES
 
     # A file that does not exist is never cached: it must be picked up the
     # moment it appears.
-    cache.read(absent, lambda: None)
+    cache.read("test", absent, lambda: None)
     assert str(absent) not in cache._entries
 
 

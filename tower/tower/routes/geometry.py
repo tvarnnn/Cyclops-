@@ -41,7 +41,7 @@ def _store(request: Request):
 def world_listing(request: Request) -> dict:
     """Every saved world and its sessions, so a viewer can open an old one.
 
-    Contract `world_builder.worlds/2026-09-06`. Read-only; a directory
+    Contract `world_builder.worlds/2026-09-10`. Read-only; a directory
     walk over `world.json` / `session.json`, no geometry. Sync `def` like
     the geometry handlers, and for the same reason.
     """

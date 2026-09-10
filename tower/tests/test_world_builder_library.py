@@ -6,6 +6,7 @@ import os
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.result_channel_fixtures import build_world
 from tower.results.world_builder_library import WORLDS_CONTRACT, build_world_listing
 from tower.routes import geometry as geometry_routes
 from tower.world_builder.store import WorldStore
@@ -164,3 +165,318 @@ def test_two_worlds_in_one_clock_tick_keep_a_stable_order(tmp_path):
     assert len(orders) == 1, f"the listing order was not stable: {orders}"
     # And it is a real order, not insertion luck: reversed ids, same answer.
     assert sorted(next(iter(orders)), reverse=True) == list(next(iter(orders)))
+
+
+# -- round 16: the picker's own two defects ----------------------------
+
+
+def test_a_session_whose_build_output_is_gone_is_not_called_unbuilt(derived_world):
+    """`unbuilt` claims nothing ever ran. A manifest proves otherwise.
+
+    `session_state`'s docstring says it "mirrors `_lifecycle`". It did
+    not: `_lifecycle` grew a whole `interrupted` branch precisely so a
+    session whose manifest describes a build would stop being reported as
+    one that never built -- and this surface, the one a person chooses a
+    walk FROM, kept the old sentence. Found by a reviewer building the
+    state and reading both answers side by side.
+    """
+    store, world_id, session_id = derived_world
+    derived = store.derived_dir(world_id) / session_id
+
+    # A build ran -- its manifest is the proof, and it is still there --
+    # and its output is gone.
+    (derived / "poses.json").unlink()
+    (derived / "points.json").unlink()
+    assert (derived / "manifest.json").exists()
+
+    session = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert session["has_geometry"] is False
+    assert session["state"] == "interrupted", (
+        "a session whose manifest proves a build ran was described to the "
+        "wearer as one that never built"
+    )
+
+
+def test_a_session_that_truly_never_built_is_still_called_unbuilt(derived_world):
+    """The other half. `interrupted` must not swallow `unbuilt` whole."""
+    store, world_id, session_id = derived_world
+    derived = store.derived_dir(world_id) / session_id
+    for name in ("poses.json", "points.json", "manifest.json"):
+        (derived / name).unlink()
+    (store.derived_dir(world_id) / "manifest.json").unlink()
+
+    session = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert session["has_geometry"] is False
+    assert session["state"] == "unbuilt"
+
+
+def test_one_malformed_world_does_not_take_the_whole_listing_down(derived_world):
+    """The tiebreak made a latent bad row fatal, and only on a tie.
+
+    `created_at` is required and un-defaulted, so a world MISSING it never
+    reaches the sort -- `world_from_json_dict` raises `KeyError` and
+    `build_world_listing` skips it. A world carrying `null` there does
+    reach it, and comparing `None` to a float raises `TypeError` only
+    when a tie on `updated_at` sends Python to the second key. The sort is
+    outside the try/except and `routes/geometry.py` has no handler, so
+    that is a 500 on `GET /worlds`: one bad row and the picker loses every
+    world.
+
+    The single-key sort this replaced could not reach it, which is what
+    makes it a regression rather than an old wart.
+    """
+    store, world_id, _ = derived_world
+    original = json.loads((store.world_dir(world_id) / "world.json").read_text())
+
+    # A second world, TIED on updated_at -- which on Windows' ~15.6 ms
+    # clock two worlds created back to back genuinely are.
+    other = dict(original)
+    other["world_id"] = "w1"
+    other["created_at"] = None
+    other["session_ids"] = []
+    path = store.world_dir("w1") / "world.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(other))
+
+    listing = build_world_listing(store)
+    assert listing["world_count"] == 2, (
+        "a malformed row took the whole listing with it"
+    )
+
+
+def test_the_recount_agrees_with_a_manifest_written_by_hand(derived_world):
+    """`_summarise_pose_rows` against figures nothing in it produced.
+
+    The fixture's manifest is written by a person, from a pose layout
+    designed around the one rule that is easy to get wrong: an ANCHOR is
+    a position only in a segment that solved. Segment 0 has an anchor and
+    a solved pose (2 positions); segment 1 has an anchor and a refusal
+    (0). `poses_positioned: 2`, not 4, not 3.
+
+    Recomputing that from poses.json is what lets a world with no
+    manifest report real figures, so the recount has to agree with the
+    build. This compares it against a number the recount had no hand in.
+    """
+    from tower.results.world_builder import _summarise_pose_rows
+
+    store, world_id, session_id = derived_world
+    manifest = store.read_session_manifest(world_id, session_id)
+    recount = _summarise_pose_rows(
+        store.derived_dir(world_id) / session_id / "poses.json"
+    )
+    for field in (
+        "poses_solved", "poses_refused", "poses_anchor",
+        "poses_positioned", "segments",
+    ):
+        assert recount[field] == manifest[field], field
+
+def test_a_build_that_found_nothing_says_no_geometry_not_interrupted(derived_world):
+    """`engine.build` writes a derived tree even when it solved nothing.
+
+    `points.json` is then `{"points": []}` -- 14 bytes -- and **eleven
+    sessions on the real 163-world root are exactly that shape**. They
+    listed as `complete` with `has_geometry: true`, because that field
+    used to mean "the files exist", so the picker told the wearer opening
+    the walk would show something while the panel behind it projected
+    `needsRetry`. `WorldPickerView` branches on that field.
+
+    And the first fix for it called them `interrupted`, which iOS renders
+    "Interrupted": a claim that the walk FAILED, over one that finalized
+    cleanly and merely found nothing to reconstruct. `unbuilt` renders
+    "No geometry", which is the true sentence.
+    """
+    store, world_id, session_id = derived_world
+    derived = store.derived_dir(world_id) / session_id
+
+    # A build that ran and found nothing: the tree is there and empty,
+    # and the manifest says so rather than being absent.
+    (derived / "points.json").write_text(json.dumps({"points": []}))
+    (derived / "poses.json").write_text(json.dumps({"poses": []}))
+    for path in (derived / "manifest.json", store.derived_dir(world_id) / "manifest.json"):
+        manifest = json.loads(path.read_text())
+        manifest["points"] = 0
+        manifest["poses_solved"] = 0
+        manifest["poses_positioned"] = 0
+        path.write_text(json.dumps(manifest))
+
+    session = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert session["has_geometry"] is False, (
+        "the picker promised the wearer something to look at, over an "
+        "empty reconstruction"
+    )
+    assert session["state"] == "unbuilt", (
+        "a walk that finalized cleanly and found nothing was reported as "
+        "an interruption"
+    )
+
+
+def test_the_picker_and_the_panel_agree_about_every_session(derived_world):
+    """A row that says one thing must not open onto a canvas saying another.
+
+    `session_state`'s own comment: "A row in the picker and the panel it
+    opens must not disagree about what a session is." The two surfaces
+    compute their answers separately, from the same disk, and the only
+    thing keeping them together is that they ask the same question of the
+    same numbers. This asserts they do, over the three shapes that exist.
+    """
+    from tower.results.world_builder import _has_drawable_geometry
+
+    store, world_id, session_id = derived_world
+    derived = store.derived_dir(world_id) / session_id
+
+    def row():
+        return build_world_listing(store)["worlds"][0]["sessions"][0]
+
+    # 1. A real build.
+    assert row()["has_geometry"] is True
+    assert _has_drawable_geometry({
+        "geometry": {"element_count": 2}, "trajectory": {"pose_count": 2},
+    }) is True
+
+    # 2. A build that found nothing.
+    (derived / "points.json").write_text(json.dumps({"points": []}))
+    (derived / "poses.json").write_text(json.dumps({"poses": []}))
+    for path in (derived / "manifest.json", store.derived_dir(world_id) / "manifest.json"):
+        manifest = json.loads(path.read_text())
+        manifest.update(points=0, poses_solved=0, poses_positioned=0)
+        path.write_text(json.dumps(manifest))
+    assert row()["has_geometry"] is False
+    assert _has_drawable_geometry({
+        "geometry": {"element_count": 0}, "trajectory": {"pose_count": 0},
+    }) is False
+
+    # 3. Poses but no points, and points but no poses. EITHER is geometry
+    #    -- a build can place cameras and recover few points, or recover
+    #    points across segments whose cameras were never placed -- and
+    #    both surfaces have to agree about that too.
+    for points, positioned in ((5, 0), (0, 5)):
+        for path in (
+            derived / "manifest.json",
+            store.derived_dir(world_id) / "manifest.json",
+        ):
+            manifest = json.loads(path.read_text())
+            manifest.update(points=points, poses_positioned=positioned)
+            path.write_text(json.dumps(manifest))
+        assert row()["has_geometry"] is True, (points, positioned)
+        assert _has_drawable_geometry({
+            "geometry": {"element_count": points},
+            "trajectory": {"pose_count": positioned},
+        }) is True, (points, positioned)
+
+
+def test_a_legacy_world_the_channel_says_to_open_is_actually_served(tmp_path):
+    """The wearer's NEXT TAP, which is where four rounds of fixes stopped short.
+
+    The status channel saying `ready` with real figures is a promise, and
+    the phone redeems it by fetching from `routes/geometry.py`. Two
+    campaign defects lived in exactly that gap: `ready` beside a 404 when
+    `read_derived`'s verify gate judged an older session against another
+    session's digest, and a route serving geometry the phone had been told
+    was still finalizing.
+
+    This walks the whole promise for the shape round 16 added: a derived
+    tree with no manifest at all.
+    """
+    import json
+
+    from tower.results.world_builder import WorldBuilderStatusProducer
+
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=8)
+    store = WorldStore(root)
+    derived = store.derived_dir(world_id)
+    (derived / session_id / "manifest.json").unlink()
+    (derived / "manifest.json").unlink()
+
+    # 1. The channel says there is something here, and how much.
+    producer = WorldBuilderStatusProducer(root, lambda: 1000.0)
+    snapshot = producer.snapshot(world_id=world_id, session_id=session_id)
+    payload = getattr(snapshot, "payload", snapshot)
+    assert payload["lifecycle"]["state"] == "ready"
+    promised = payload["geometry"]["element_count"]
+    assert promised > 0
+
+    # 2. The route hands it over. Same disk, separate reader, no manifest
+    #    for either of them to agree through.
+    client = _client(store)
+    manifest = client.get(
+        f"/worlds/{world_id}/geometry/manifest", params={"session_id": session_id}
+    )
+    assert manifest.status_code == 200, manifest.text
+    body = manifest.json()
+    assert body["segment_count"] >= 1
+
+    served = 0
+    for index in range(body["segment_count"]):
+        segment = client.get(
+            f"/worlds/{world_id}/geometry/segment/{index}",
+            params={"session_id": session_id},
+        )
+        assert segment.status_code == 200, segment.text
+        served += len(segment.json()["points"])
+
+    assert served == promised, (
+        f"the channel promised {promised} points and the route served {served}"
+    )
+    # And the promise came from the files, not from either of them
+    # trusting the other.
+    on_disk = len(
+        json.loads((derived / session_id / "points.json").read_text())["points"]
+    )
+    assert on_disk == promised
+
+
+def test_a_malformed_updated_at_does_not_take_the_top_of_the_picker(derived_world):
+    """"Newest first" must not be won by a value that is not a time.
+
+    The first tiebreak keyed on the TYPE NAME -- `("str", ...)` above
+    `("num", ...)` under `reverse=True` -- so a world carrying
+    `updated_at: "2020-01-01T00:00:00Z"` was placed ahead of every real
+    world. A reviewer built it against a copy of the real 163-world root
+    and watched it take the top row. A malformed value is not evidence of
+    recency.
+    """
+    store, world_id, _ = derived_world
+    original = json.loads((store.world_dir(world_id) / "world.json").read_text())
+
+    for bad in ("2020-01-01T00:00:00Z", None, {"a": 1}, True):
+        other = dict(original, world_id="w1", session_ids=[], updated_at=bad)
+        path = store.world_dir("w1") / "world.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(other))
+
+        listing = build_world_listing(store)
+        assert listing["world_count"] == 2, bad
+        assert listing["worlds"][0]["world_id"] == world_id, (
+            f"a world whose updated_at is {bad!r} took the top row"
+        )
+
+
+def test_no_value_of_updated_at_can_take_the_listing_down(derived_world):
+    """`_sortable`'s docstring says it never raises. It has to be true.
+
+    `float(10**400)` raises `OverflowError` -- out of the sort, out of
+    `build_world_listing`, which has no handler above it, and into a 500
+    on `GET /worlds` that loses every world. Same trigger as the case the
+    tiebreak was written to fix. NaN is here too: it does not raise, it
+    silently makes `sort` produce an arbitrary permutation.
+    """
+    store, world_id, _ = derived_world
+    original = json.loads((store.world_dir(world_id) / "world.json").read_text())
+
+    for bad in (10**400, float("nan"), float("inf"), [], "", 0):
+        other = dict(
+            original, world_id="w1", session_ids=[],
+            updated_at=bad if not isinstance(bad, float) or bad == bad else 0,
+            created_at=bad,
+        )
+        # `created_at` carries the hostile value so the tie on
+        # `updated_at` is what forces the comparison, which is the only
+        # way the second key is ever reached.
+        other["updated_at"] = original["updated_at"]
+        path = store.world_dir("w1") / "world.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(other))
+
+        listing = build_world_listing(store)
+        assert listing["world_count"] == 2, bad

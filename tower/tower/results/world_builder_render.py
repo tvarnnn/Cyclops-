@@ -26,7 +26,11 @@ from tower.world_builder.render import (
     VIEW_PRODUCT,
     render_html,
 )
-from tower.world_builder.store import WorldStore, WorldStoreError
+from tower.world_builder.store import (
+    WorldStore,
+    WorldStoreError,
+    session_has_drawable_geometry,
+)
 
 # A phone draws every point on a 2-D canvas on every gesture, so the
 # budget is lower than the operator's 200k default. Fractional-stride
@@ -72,8 +76,18 @@ class WorldRenderUnavailable(Exception):
 
 
 def _has_geometry(store: WorldStore, world_id: str, session_id: str) -> bool:
-    derived = store.derived_dir(world_id) / session_id
-    return (derived / "poses.json").exists() and (derived / "points.json").exists()
+    """Whether drawing this session would put anything on the page.
+
+    **Existence of the files was the wrong question here specifically.**
+    `resolve_session` uses this to CHOOSE which session to draw, newest
+    first -- so on a world walked twice where the second walk solved
+    nothing, an empty `points.json` (14 bytes, and `engine.build` writes
+    one unconditionally) outranked the older walk that has geometry, and
+    the wearer got a blank page for a world with a reconstruction in it.
+    Found by `test_the_three_surfaces_ask_the_same_question_of_the_same_files`
+    the moment the listing's copy was corrected.
+    """
+    return session_has_drawable_geometry(store, world_id, session_id)
 
 
 def _clip(value: str, limit: int = 80) -> str:

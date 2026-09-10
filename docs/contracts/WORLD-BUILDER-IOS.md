@@ -178,10 +178,10 @@ guessed.
 **Since 2026-09-10, `stopped_unbuilt` does not always project to
 `finalizing`.** It carries two states and only one of them means wait:
 
-| `lifecycle.state` | `geometry.available` | `model_state` | means |
+| `lifecycle.state` | the figures | `model_state` | means |
 |---|---|---|---|
-| `stopped_unbuilt` | `true` | `finalizing` | built, and BEHIND its keyframes. A rebuild is outstanding; the world is intact. |
-| `stopped_unbuilt` | `false` | `interrupted` | nothing was built. There is nothing to wait for. |
+| `stopped_unbuilt` | `element_count > 0` or `pose_count > 0` | `finalizing` | built, and BEHIND its keyframes. A rebuild is outstanding; the world is intact. |
+| `stopped_unbuilt` | neither above zero | `interrupted` | nothing drawable came of this walk. There is nothing to wait for. |
 
 The second used to project to `finalizing` too, and the phone therefore
 showed a **permanent "Finalizing"** over a walk that had produced no
@@ -190,9 +190,29 @@ that by four separate routes. The distinction is made in the projection
 rather than in `lifecycle.state`, deliberately: the state name is on the
 wire and iOS decodes it, so it did not move.
 
+The predicate is the FIGURES, not `geometry.available`. `available` is true
+as soon as a build ran and left a tree behind, and `engine.build` writes one
+unconditionally — a walk down a dark corridor produces `poses.json`,
+`points.json` and a manifest reading `points: 0, poses_solved: 0`. The first
+version of this rule gated on `available` and therefore kept saying
+`finalizing` over a world with nothing in it. It is deliberately the same
+question `WorldEvidence.hasGeometry` asks on iOS — `(elements ?? 0) > 0 ||
+(poses ?? 0) > 0` — because if the two disagree the Tower tells the wearer to
+wait for a screen the phone will never have anything to put on.
+
+**Also since 2026-09-10: `lifecycle.state: "ready"` covers a derived tree that
+no manifest describes** — a world built before the Tower wrote one per session,
+or one whose manifest cannot be read. `geometry.current` is `false`,
+`lifecycle.reason` is non-null and says currency cannot be judged, and
+`element_count`/`pose_count` are **recounted from `poses.json` and
+`points.json`** rather than left null. That last part is what makes the world
+open: the phone decides what to draw from those two numbers, so reporting them
+as null over a real reconstruction rendered *"Needs retry — nothing usable came
+of this session"* on top of 1,347 points and 4 camera poses.
+
 A client that switches on `model_state` needs no change. A client that
 switches on `lifecycle.state` and assumes the old projection should read
-`geometry.available` beside it.
+`geometry.element_count` and `trajectory.pose_count` beside it.
 
 ## 3.1 `selection`: whose world is on the wire
 

@@ -2366,18 +2366,30 @@ def main(argv=None) -> int:
         # `world_build_session.session_manifest`. Stamping a placement
         # with another session's digest makes the reader refuse it.
         #
-        # `session_id`, THE RESOLVED ONE. This read `args.session`, which
-        # is None on every invocation that lets the CLI pick the world's
-        # only session -- which is what its own `--session` help text
-        # says it is for. `session_manifest_path` then did
-        # `derived_dir / None` and the whole run died with a TypeError
-        # AFTER `register()` had done the expensive Sim3 pass, throwing
-        # the walk away. That is the loss `register_session`'s try/except
-        # exists to prevent, reintroduced in a different file.
+        # `session_id`, THE RESOLVED ONE -- not `args.session`, which is
+        # None on every invocation that lets the CLI pick the world's only
+        # session, which is what its own `--session` help text says it is
+        # for. `session_manifest_path(world, None)` does `derived_dir /
+        # None` and raises `TypeError` -- and it would raise it AFTER
+        # `register()` has done the expensive Sim3 pass, throwing the walk
+        # away. That is the loss `register_session`'s try/except exists to
+        # prevent.
         #
-        # I made this exact mistake in `world_finalize.py` an hour
-        # earlier, wrote a comment there explaining it, and then made it
-        # again here. A reviewer ran the CLI; nothing in the suite does.
+        # HISTORICAL NOTE, CORRECTED. An earlier version of this comment
+        # told that as something the committed code had done. It had not:
+        # the line this replaced was
+        # `store.read_derived_manifest(args.world) or {}`, which never
+        # touched `args.session`. The `args.session` version existed only
+        # in an unversioned working copy between edits, and a reviewer
+        # caught the comment claiming otherwise by reading the diff. A
+        # comment about this repository's history has to match its
+        # history.
+        #
+        # The `world_finalize.py` half is real and is why this reads
+        # carefully: the same mistake shipped there, was caught by the
+        # suite in under a minute, and got a comment of its own. Nothing
+        # in the suite calls THIS CLI's `main()`; a reviewer ran it by
+        # hand.
         manifest = store.read_session_manifest(args.world, session_id)
         if not (isinstance(manifest, dict)
                 and manifest.get("session_id") == session_id):
@@ -2387,6 +2399,32 @@ def main(argv=None) -> int:
         placements = placements_from_report(
             report, input_digest=manifest.get("input_digest")
         )
+        if manifest.get("input_digest") is None:
+            # REFUSE, DO NOT WRITE. `usable_placements` discards every
+            # placement whose digest is None ("solved against a different
+            # build"), so this write can only produce a file the serving
+            # path throws away -- and `write_placements` REPLACES
+            # `derived/<sid>/placements.json` wholesale, so on a world
+            # that already carries a good one (the 2026-09-09 walk carries
+            # a 35 KB placements.json from its global solve) a single
+            # `--write` would destroy it and leave a warning in the
+            # scrollback.
+            #
+            # A first version did print that warning and then write
+            # anyway. A reviewer pointed out that the warning's own
+            # reasoning says not to: nothing here can produce a servable
+            # file, and the existing one is the only thing of value in
+            # the directory.
+            print(
+                "refusing to write: no manifest describes this session, so "
+                "these placements would carry no input_digest and the "
+                "geometry route would refuse all of them -- and writing "
+                "would replace any placements.json already there. Rebuild "
+                "the session first (world_build_session.py) so a manifest "
+                "exists, then run this again.",
+                file=sys.stderr,
+            )
+            return 1
         store.write_placements(args.world, session_id, placements)
         registered = sum(1 for p in placements if p.state == "registered")
         print(

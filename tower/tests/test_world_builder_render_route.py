@@ -91,10 +91,32 @@ def test_the_session_defaults_to_the_newest_with_geometry(derived_world):
     store.write_world(World(world_id=world_id, created_at=world.created_at,
                             updated_at=12.0, session_ids=(session_id, "s1")))
     assert resolve_session(store, world_id, None) == session_id
+
+    # AN EMPTY TREE IS NOT GEOMETRY, and this used to write one and assert
+    # it won. `engine.build` calls `write_derived` unconditionally, so a
+    # walk that solved nothing leaves both files with empty arrays -- 14
+    # bytes of points.json, and eleven sessions on the real 163-world root
+    # look exactly like this. Choosing that over the older walk that has a
+    # reconstruction opens the world to a blank page.
     derived = store.derived_dir(world_id) / "s1"
     derived.mkdir(parents=True)
     (derived / "poses.json").write_text(json.dumps({"poses": []}))
     (derived / "points.json").write_text(json.dumps({"points": []}))
+    assert resolve_session(store, world_id, None) == session_id, (
+        "a newer walk that reconstructed nothing outranked one that did"
+    )
+
+    # ...and a newer one that DID build must win, which is what the
+    # comment above this test always claimed to check.
+    (derived / "poses.json").write_text(json.dumps(
+        {"poses": [{"keyframe_id": "k", "segment_index": 0,
+                    "status": "solved", "degeneracy": "",
+                    "rotation": [1.0, 0.0, 0.0, 0.0],
+                    "translation": [0.0, 0.0, 0.0]}]}
+    ))
+    (derived / "points.json").write_text(json.dumps(
+        {"points": [{"segment_index": 0, "xyz": [0.0, 0.0, 1.0]}]}
+    ))
     assert resolve_session(store, world_id, None) == "s1"
     assert resolve_session(store, world_id, session_id) == session_id
 

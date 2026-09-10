@@ -378,7 +378,26 @@ def collect_calibrations():
         try:
             from dotenv import dotenv_values
 
-            env = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+            # `utf-8-sig`, NOT the default `utf-8`.
+            #
+            # python-dotenv 1.2.1 does not strip a byte-order mark: a
+            # `.env` beginning EF BB BF parses to the key
+            # `'﻿TOWER_WORLD_ROOT'`, and the lookup below then finds
+            # nothing and reports a correctly configured Tower as unset --
+            # a RED verdict of exactly the kind the paragraph above says
+            # this must never produce. On WINDOWS that is the default
+            # outcome, not an exotic one: Notepad and PowerShell's
+            # `Out-File` both write UTF-8 with a BOM, and this repository's
+            # own CLAUDE.md warns about it. Measured here on 1.2.1; the
+            # suite's own premise check caught it.
+            #
+            # `utf-8-sig` consumes a BOM if there is one and is identical
+            # to `utf-8` if there is not.
+            env = {
+                k: v
+                for k, v in dotenv_values(env_path, encoding="utf-8-sig").items()
+                if v is not None
+            }
         except Exception as exc:  # noqa: BLE001 - a diagnostic never fails on its input
             # NAME IT, AND THEN GET OUT OF THE WAY.
             #
@@ -570,6 +589,49 @@ def build_verdicts(report):
             "every point of the walk will be missing"
         )
     verdicts.append(("calibration_for_the_camera", bool(calib.get("covered")), calib_detail))
+
+    # THE INTERPRETER RUNNING THIS MUST BE ABLE TO SOLVE, and nothing
+    # above establishes that.
+    #
+    # Every other verdict here can pass on a Python that cannot
+    # reconstruct anything. `import tower` works from the tower directory
+    # whether or not the package is installed, torch and OpenCV are
+    # commonly present system-wide, and the vocabulary tree lives in
+    # ~/.cache -- so a green pre-flight is achievable on an interpreter
+    # with no pycolmap at all, and a walk on it produces a world with
+    # zero poses and zero points, announced nowhere.
+    #
+    # This is not hypothetical and it is not the operator's mistake to
+    # imagine: the agent that wrote this check ran the entire Tower test
+    # suite on the wrong interpreter for a whole working session before
+    # noticing, on this machine, with `tower/.venv` sitting beside it.
+    # `sys.executable` is in the detail for exactly that reason -- the
+    # answer to "why is it failing" is usually "you are not running the
+    # Python you think you are".
+    try:
+        import pycolmap  # noqa: PLC0415
+
+        backend_ok = hasattr(pycolmap, "incremental_mapping")
+        backend_detail = (
+            f"pycolmap {getattr(pycolmap, '__version__', '?')} in "
+            f"{sys.executable}"
+            if backend_ok
+            else (
+                f"pycolmap {getattr(pycolmap, '__version__', '?')} is "
+                "importable but has no incremental_mapping; this is not a "
+                f"build that can reconstruct. Interpreter: {sys.executable}"
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - a diagnostic never fails on its input
+        backend_ok = False
+        backend_detail = (
+            f"pycolmap is not importable here ({type(exc).__name__}), so "
+            "EVERY walk on this interpreter will produce zero poses and "
+            f"zero points. Interpreter: {sys.executable}. The Tower's own "
+            "environment is tower/.venv -- run start_tower.ps1, or "
+            ".venv/Scripts/python.exe, rather than a system Python"
+        )
+    verdicts.append(("sfm_backend_importable", backend_ok, backend_detail))
 
     # The interesting failure is specifically "GPU present, torch blind to
     # it": that is a fixable packaging problem rather than missing

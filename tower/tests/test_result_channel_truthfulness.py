@@ -1083,3 +1083,259 @@ def test_a_walk_that_built_nothing_does_not_say_finalizing(monkeypatch, tmp_path
     assert payload["model_state"] == "interrupted", (
         "a walk with no geometry told the wearer to keep waiting"
     )
+
+
+# -- round 16: the figures, not the flag -------------------------------
+
+
+def _featureless(root, *, frames=8):
+    """A walk with nothing in it to detect, match or solve.
+
+    Uniform grey. A blank wall, a dark corridor, a lens cap, a
+    calibration that never arrived. `engine.build` runs, solves nothing,
+    and writes `poses.json`, `points.json` and a manifest saying
+    `points: 0, poses_solved: 0` -- because `write_derived` is
+    unconditional. That combination is the whole point of these tests.
+    """
+    import numpy as np
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+
+    width, height = 480, 360
+    camera_matrix = ss.camera_matrix(width, height)
+    engine = WorldBuilderEngine(WorldStore(root))
+    world_id = engine.create_world("Dark Hallway")
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated", model="pinhole",
+            fx=float(camera_matrix[0, 0]), fy=float(camera_matrix[1, 1]),
+            cx=float(camera_matrix[0, 2]), cy=float(camera_matrix[1, 2]),
+            calibrated_width=width, calibrated_height=height,
+        ),
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    blank = np.full((height, width, 3), 128, dtype=np.uint8)
+    for index in range(frames):
+        engine.observe(ss.encode_jpeg(blank), source_seq=index, wire_seq=index)
+    engine.build(world_id, session_id)
+    engine.stop_session()
+    return world_id, session_id
+
+
+def _behind(root, world_id, session_id):
+    """One keyframe the build never saw, so the build is stale."""
+    from tower.world_builder.records import Keyframe
+
+    WorldStore(root).append_keyframe(world_id, Keyframe(
+        keyframe_id=f"{session_id}:behind", session_id=session_id,
+        source_seq=9999, received_at=9999.0, image_relpath="images/x.jpg",
+        width=8, height=8, byte_count=9,
+    ))
+
+
+def test_a_build_that_solved_nothing_is_not_something_to_wait_for(
+    monkeypatch, tmp_path
+):
+    """`geometry.available` is the WRONG predicate, and this is why.
+
+    The previous round split `stopped_unbuilt` on `geometry.available`,
+    which is true as soon as a manifest and a derived tree exist. But
+    `engine.build` calls `write_derived` unconditionally, so a walk that
+    solved nothing writes a tree too -- and the split kept saying
+    "finalizing" over a world with zero points and zero poses. iOS
+    decides what to draw from the FIGURES
+    (`WorldEvidence.hasGeometry`), so the wearer got a "Finalizing" that
+    nothing would ever change: the permanent Finalizing, back through a
+    different door one round after it was closed.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = _featureless(root)
+    _behind(root, world_id, session_id)
+
+    payload = _payload(monkeypatch, root)
+    assert payload["lifecycle"]["state"] == "stopped_unbuilt"
+    # The flag that used to decide this is TRUE here. That is the trap.
+    assert payload["geometry"]["available"] is True
+    assert payload["geometry"]["element_count"] == 0
+    assert payload["trajectory"]["pose_count"] == 0
+    assert payload["model_state"] == "interrupted", (
+        "a walk that solved nothing told the wearer to keep waiting for it"
+    )
+
+
+def test_a_real_world_that_is_behind_is_still_something_to_wait_for(
+    monkeypatch, tmp_path
+):
+    """The other half, pinned against the same predicate change."""
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=10)
+    _behind(root, world_id, session_id)
+
+    payload = _payload(monkeypatch, root)
+    assert payload["lifecycle"]["state"] == "stopped_unbuilt"
+    assert payload["geometry"]["element_count"] > 0
+    assert payload["model_state"] == "finalizing", (
+        "a complete world that merely needs a rebuild was called an "
+        "interruption"
+    )
+
+
+def test_a_world_with_no_manifest_still_reports_its_figures(
+    monkeypatch, tmp_path
+):
+    """The defect this campaign is named for, reintroduced by this campaign.
+
+    A derived tree with no manifest describing it was given
+    `lifecycle: ready` and `geometry.available: false,
+    element_count: null` -- and the branch's own comment promised "the
+    world itself opens normally". It did not. iOS reads those two
+    numbers, so a complete reconstruction rendered as "Needs retry:
+    nothing usable came of this session. Walking the space again is what
+    produces another one", over 1,347 points and 4 camera poses that the
+    geometry route was serving 200 at the same moment.
+
+    A manifest is a SUMMARY of these files. The files are still there.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=10)
+    store = WorldStore(root)
+    derived = store.derived_dir(world_id)
+
+    # Independent truth: the files themselves, read separately from the
+    # code under test.
+    on_disk_points = len(
+        json.loads((derived / session_id / "points.json").read_text())["points"]
+    )
+    with_manifest = _payload(monkeypatch, root)
+    assert on_disk_points > 0
+    assert with_manifest["geometry"]["element_count"] == on_disk_points
+
+    # LEGACY: no manifest names this session, from either copy.
+    (derived / session_id / "manifest.json").unlink()
+    (derived / "manifest.json").unlink()
+
+    payload = _payload(monkeypatch, root)
+    assert payload["lifecycle"]["state"] == "ready"
+    assert payload["geometry"]["available"] is True
+    assert payload["geometry"]["element_count"] == on_disk_points, (
+        "the figures were not recovered from the files that hold them"
+    )
+    # And the RECOUNT AGREES WITH THE BUILD for this tree.
+    #
+    # NOT a check of the anchor rule, and an earlier version of this
+    # comment claimed it was. This fixture is one segment with three
+    # solved poses and one anchor, so "an anchor counts only in a segment
+    # that solved" is never exercised: a reviewer mutated that rule away
+    # and watched this test stay green.
+    # `test_the_recount_agrees_with_a_manifest_written_by_hand`
+    # (`test_world_builder_library.py`) owns that rule and catches the
+    # mutation, because its fixture has a segment that resolved nothing.
+    #
+    # What this DOES check is that the two paths through the same payload
+    # -- manifest present, manifest absent -- report the same figures for
+    # the same disk, which is the property the recount exists to give.
+    assert (
+        payload["trajectory"]["pose_count"]
+        == with_manifest["trajectory"]["pose_count"]
+    )
+    assert payload["trajectory"]["segments"] == with_manifest["trajectory"]["segments"]
+    assert (
+        payload["trajectory"]["poses_solved"]
+        == with_manifest["trajectory"]["poses_solved"]
+    )
+
+
+def test_an_unjudgeable_build_does_not_claim_keyframes_arrived_after_it(
+    monkeypatch, tmp_path
+):
+    """`current: false` has two meanings and one message was serving both.
+
+    "Behind" is a build genuinely older than the keyframes. "No manifest"
+    is a build whose age nothing here knows. Telling a wearer keyframes
+    have been accepted since a build ran, when nothing knows when it ran,
+    is a fabrication of exactly the family this campaign is about.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=10)
+    derived = WorldStore(root).derived_dir(world_id)
+    (derived / session_id / "manifest.json").unlink()
+    (derived / "manifest.json").unlink()
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["current"] is False
+    for block in ("geometry", "trajectory"):
+        stale = payload[block]["stale_reason"]
+        assert stale is not None
+        assert "have been accepted since this build ran" not in stale, (
+            f"{block} claimed to know when a build with no manifest ran"
+        )
+        assert "counted from" in stale
+
+
+def test_a_corrupt_manifest_is_not_reported_as_an_absent_one(
+    monkeypatch, tmp_path
+):
+    """`_validate_manifest` refuses cleanly; the refusal was then laundered.
+
+    Four corrupt shapes -- unreadable bytes, a top-level list, a schema
+    version from the future, a required key set to null -- all reached a
+    branch whose evidence said the world's manifest "names another
+    session and this session has no copy of its own". Both files existed
+    and both named this session. A reviewer built all four and got that
+    sentence for every one.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=10)
+    derived = WorldStore(root).derived_dir(world_id)
+    (derived / session_id / "manifest.json").write_bytes(b"\xff\xfe not json")
+    (derived / "manifest.json").write_bytes(b"\xff\xfe not json")
+
+    payload = _payload(monkeypatch, root)
+    evidence = payload["lifecycle"]["evidence"]
+    assert "no copy of its own" not in evidence, (
+        "a manifest that is present and corrupt was described as absent"
+    )
+    assert "cannot be read" in evidence
+    # And the world still opens: the files are fine, only the summary is not.
+    assert payload["geometry"]["element_count"] > 0
+
+
+def test_an_unreadable_tree_is_not_reported_as_an_empty_one(
+    monkeypatch, tmp_path
+):
+    """Counting a tree that cannot be read must not produce zero.
+
+    Zero is a claim about a build. "Could not read" is a claim about a
+    file, and the two must not be spelled the same way -- a wearer told
+    "this walk produced nothing" over an unreadable file will walk the
+    space again for no reason.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=10)
+    derived = WorldStore(root).derived_dir(world_id)
+    (derived / session_id / "manifest.json").unlink()
+    (derived / "manifest.json").unlink()
+    (derived / session_id / "points.json").write_bytes(b"\xff\xfe not json")
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["available"] is False
+    assert payload["geometry"]["element_count"] is None
+    reason = payload["geometry"]["unavailable_reason"]
+    # THE EXACT SENTENCE, not a substring that several sentences share.
+    # A reviewer showed the earlier `"read" in reason` could not tell this
+    # case from a readable tree the producer had refused for another
+    # reason -- both said "read" -- which is precisely the distinction
+    # the test is named for.
+    assert reason == (
+        "this session has a derived tree and neither its poses nor its "
+        "points could be read, so nothing here can summarise it; the "
+        "geometry route reads the same files"
+    ), reason
+    # The two sentences this must NOT be: both claim something about the
+    # BUILD, and nothing here knows anything about the build.
+    assert "no geometry exists" not in reason
+    assert "no build has run" not in reason

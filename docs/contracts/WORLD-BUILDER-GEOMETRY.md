@@ -12,7 +12,7 @@
 | Design record | `tower/docs/superpowers/specs/2026-08-25-world-builder-geometry-transport-design.md` |
 
 **Why this is a separate file from `WORLD-BUILDER-IOS.md`.** That document
-reconciles **one** contract (`world_builder.status/2026-09-06`) over **one**
+reconciles **one** contract (`world_builder.status/2026-09-10`) over **one**
 transport, and its whole thesis is *"no second socket, no second connection, no
 view-owned transport"*. Geometry is a different contract with a different
 identifier, on a different transport, versioned independently — a client may

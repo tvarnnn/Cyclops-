@@ -11,7 +11,7 @@ import Foundation
 /// transport, versioned on its own. Opaque and compared for equality only, as
 /// the other two are.
 nonisolated enum WorldListingContract {
-    static let identifier = "world_builder.worlds/2026-09-06"
+    static let identifier = "world_builder.worlds/2026-09-10"
 }
 
 /// One session of a stored world, as the Tower lists it.

@@ -1,6 +1,6 @@
 """The list of saved worlds, for a viewer that wants to open an old one.
 
-Contract: `world_builder.worlds/2026-09-06` (docs/contracts/WORLD-BUILDER-WORLDS.md).
+Contract: `world_builder.worlds/2026-09-10` (docs/contracts/WORLD-BUILDER-WORLDS.md).
 
 Read-only, and deliberately thin: it is the index a phone needs to choose
 a `(world_id, session_id)` pair, which the status subscription
@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import os
 
+from tower.results.world_builder_geometry import manifest_for
 from tower.world_builder.records import FINALIZATION_COMPLETE
-from tower.world_builder.store import WorldStore, WorldStoreError
+from tower.world_builder.store import (
+    WorldStore,
+    WorldStoreError,
+    session_has_drawable_geometry,
+)
 
-WORLDS_CONTRACT = "world_builder.worlds/2026-09-06"
+WORLDS_CONTRACT = "world_builder.worlds/2026-09-10"
 
 # Per-session `state`, the same vocabulary the status channel's lifecycle
 # uses (`tower/results/world_builder.py`), minus the two words that only
@@ -44,9 +49,16 @@ def _world_is_live(store: WorldStore, world_id: str) -> bool:
     )
 
 
-def _has_geometry(store: WorldStore, world_id: str, session_id: str) -> bool:
-    derived = store.derived_dir(world_id) / session_id
-    return (derived / "poses.json").exists() and (derived / "points.json").exists()
+def _has_geometry(store: WorldStore, world_id: str, session_id: str, manifest) -> bool:
+    """`WorldStore.session_has_drawable_geometry`, under this module's name.
+
+    The rule itself lives in the store because the render page needs the
+    same answer and the two modules must not import each other -- see
+    `test_the_three_surfaces_ask_the_same_question_of_the_same_files`,
+    which was written after a reviewer counted three copies of an earlier
+    version of this and found them free to drift.
+    """
+    return session_has_drawable_geometry(store, world_id, session_id, manifest)
 
 
 def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> int:
@@ -65,12 +77,26 @@ def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> i
         return 0
 
 
-def session_state(session, *, live: bool, has_geometry: bool) -> str:
+def session_state(session, *, live: bool, has_geometry: bool, manifest=None) -> str:
     """One word for what a session IS, from the record, the lock and the tree.
 
     Mirrors `_lifecycle` in the status producer for the facts a listing
     has (it does not compute geometry currency, so `complete` on a record
     that predates finalization means "stopped and built", not "current").
+
+    `manifest` is the fact that made the sentence above true. Without it
+    the last line read `complete if has_geometry else unbuilt`, and
+    `unbuilt` is defined as "an older record that stopped and never
+    built" -- so a session whose manifest PROVES a build ran, and whose
+    derived tree was then deleted, was described to the wearer as one that
+    never built. `_lifecycle` grew a whole `interrupted` branch to stop
+    saying exactly that; this surface, which the docstring claims to
+    mirror and which is the one a person chooses a walk from, kept saying
+    it. Found by a reviewer building the state and reading both.
+
+    It carries the FIGURES, not just presence, because presence alone
+    cannot tell "a build lost its output" from "a build found nothing" --
+    see `_nothing_to_open`.
     """
     finalization = session.finalization
     stopped = session.ended_at is not None
@@ -95,8 +121,91 @@ def session_state(session, *, live: bool, has_geometry: bool) -> str:
         # behind it does.
         if finalization.get("state") == FINALIZATION_COMPLETE and has_geometry:
             return SESSION_COMPLETE
-        return SESSION_INTERRUPTED
-    return SESSION_COMPLETE if has_geometry else SESSION_UNBUILT
+        if finalization.get("state") != FINALIZATION_COMPLETE:
+            # The finalization itself did not finish. That IS an
+            # interruption, whatever is or is not on disk.
+            return SESSION_INTERRUPTED
+        return _nothing_to_open(manifest)
+    if has_geometry:
+        return SESSION_COMPLETE
+    return _nothing_to_open(manifest)
+
+
+def _nothing_to_open(manifest) -> str:
+    """One word for a session with no geometry, and WHICH kind of none.
+
+    Two situations reach here and they are not the same thing, which is
+    the whole reason this is a function.
+
+    **A build recorded real figures and they are not on disk now.** Poses
+    and points were deleted, or a write was lost. Something happened to
+    this session, and `interrupted` says so. Reporting it as `unbuilt` --
+    documented as "stopped and never built" -- describes a session whose
+    own manifest proves the opposite, which is what a reviewer caught
+    `session_state` doing while its docstring claimed to mirror
+    `_lifecycle`.
+
+    **A build ran and found nothing.** `engine.build` writes a derived
+    tree unconditionally, so this is a real and ordinary shape: a dark
+    corridor, a blank wall, a lens cap, a calibration that never arrived.
+    `points.json` holds `{"points": []}`, 14 bytes, and eleven sessions on
+    the real 163-world root are exactly this. NOTHING WAS INTERRUPTED
+    here, and saying so tells a wearer the walk failed when it merely
+    found nothing to reconstruct. `unbuilt` is the word, and iOS renders
+    it **"No geometry"** -- which is the true sentence, and the one the
+    panel behind the row agrees with.
+
+    A manifest that cannot be read, or carries no figures, says nothing
+    either way; the tree is empty or absent regardless, so `unbuilt`.
+    """
+    if isinstance(manifest, dict):
+        points = manifest.get("points")
+        positioned = manifest.get("poses_positioned")
+        if (isinstance(points, int) and not isinstance(points, bool) and points > 0) or (
+            isinstance(positioned, int)
+            and not isinstance(positioned, bool)
+            and positioned > 0
+        ):
+            return SESSION_INTERRUPTED
+    return SESSION_UNBUILT
+
+
+def _sortable(value):
+    """A key that cannot raise, and that keeps garbage out of the way.
+
+    Returns `(rank, comparable)`. Comparison reaches the second element
+    only when the ranks are equal, and within a rank the second elements
+    are always the same type, so no comparison can raise.
+
+    **RANK 1 FOR A REAL TIMESTAMP, RANK 0 FOR EVERYTHING ELSE, and that
+    ordering is the point.** The sort is `reverse=True` over
+    `updated_at`, whose contract is "newest first". A first version of
+    this ranked by TYPE NAME -- `("str", ...)` sorts above `("num", ...)`
+    -- so a world carrying `updated_at: "2020-01-01T00:00:00Z"` was
+    placed **ahead of every real world in the picker**. A reviewer built
+    it against a copy of the real 163-world root and watched it take the
+    top row. A malformed value is not evidence of recency and must sort
+    last; under `reverse=True` that means lowest.
+
+    `float()` IS NOT CALLED, and calling it was the other half of the
+    same bug: `float(10**400)` raises `OverflowError`, out of a function
+    whose docstring said it never raises and into `GET /worlds`, which
+    has no handler -- a 500 losing all 163 worlds, on the same trigger
+    (a tie sending Python to the second key) as the case this was written
+    to fix. Python compares `int` and `float` without converting either.
+    """
+    if isinstance(value, bool):
+        # Before the int check: `bool` IS an int, and `True` sorting among
+        # timestamps as 1.0 is a silent wrong answer.
+        return (0, ("bool", value))
+    if isinstance(value, (int, float)) and value == value:  # noqa: PLR0124
+        # `value == value` excludes NaN, which is not orderable: a single
+        # NaN in a list makes `sort` produce an arbitrary permutation
+        # rather than raise, which is the worst of both.
+        return (1, value)
+    if value is None:
+        return (0, ("", ""))
+    return (0, ("str", str(value)))
 
 
 def build_world_listing(store: WorldStore) -> dict:
@@ -117,7 +226,13 @@ def build_world_listing(store: WorldStore) -> dict:
                 session = store.read_session(world_id, session_id)
             except (WorldStoreError, OSError, ValueError, KeyError):
                 continue
-            has_geometry = _has_geometry(store, world_id, session_id)
+            # The SAME manifest rule the status producer and the geometry
+            # route use -- the session's own copy, then the world's but
+            # only if it names this session. Four readers, one rule; a
+            # fifth reader with its own idea is how this campaign's
+            # defects kept coming back.
+            manifest = manifest_for(store, world_id, session_id)
+            has_geometry = _has_geometry(store, world_id, session_id, manifest)
             sessions.append({
                 "session_id": session.session_id,
                 "started_at": session.started_at,
@@ -141,7 +256,12 @@ def build_world_listing(store: WorldStore) -> dict:
                 # One word, the status channel's vocabulary (additive,
                 # 2026-09-06): receiving | finalizing | complete |
                 # interrupted | unbuilt.
-                "state": session_state(session, live=live, has_geometry=has_geometry),
+                "state": session_state(
+                    session,
+                    live=live,
+                    has_geometry=has_geometry,
+                    manifest=manifest,
+                ),
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.
                 "finalization": session.finalization,
@@ -167,8 +287,33 @@ def build_world_listing(store: WorldStore) -> dict:
     # back-to-back) under a loaded machine, which is the same tie.
     # `created_at` breaks most of them and the id breaks the rest; the id
     # is arbitrary but it is STABLE, which is the property that matters.
+    #
+    # `_sortable` IS NOT DEFENSIVE CLUTTER. `created_at` is a required,
+    # un-defaulted field and `world_from_json_dict` subscripts it, so a
+    # world missing it never reaches here -- but a world carrying `null`,
+    # or a string, does. Comparing that to a float raises `TypeError`
+    # only when a tie on `updated_at` makes Python look at the second key.
+    # This sort is outside `build_world_listing`'s try/except and
+    # `routes/geometry.py` has no handler, so the raise is a 500 on
+    # `GET /worlds`: one malformed row and the picker loses every world.
+    #
+    # CORRECTION. An earlier version of this comment called that a
+    # regression introduced by the tiebreak, "which is why the single-key
+    # sort this replaced could not reach it". The sort this replaced was
+    # not single-key -- `git show e60d753` has the same three -- and a
+    # reviewer ran the old key against the same input and got the same
+    # `TypeError`. It is an old wart, and the fix is the same fix; only
+    # the story about where it came from was wrong.
+    # A reviewer produced both shapes. `_sortable` keeps every
+    # comparison within one type, and puts anything that is not a real
+    # timestamp LAST rather than merely somewhere -- see there for why
+    # "arbitrary but total" was not enough for the primary key.
     worlds.sort(
-        key=lambda w: (w["updated_at"], w["created_at"], w["world_id"]),
+        key=lambda w: (
+            _sortable(w["updated_at"]),
+            _sortable(w["created_at"]),
+            _sortable(w["world_id"]),
+        ),
         reverse=True,
     )
     return {"contract": WORLDS_CONTRACT, "world_count": len(worlds), "worlds": worlds}

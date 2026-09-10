@@ -22,6 +22,7 @@ cache on the pair.
 import pytest
 
 from tower.world_builder.records import SegmentPlacement
+from tower.world_builder.schema import SCHEMA_VERSION
 from tower.world_builder.store import WorldStore
 
 
@@ -185,7 +186,19 @@ def _tiny_world(store, world_id="w" * 32, session_id="s" * 32):
     ]
     store.write_derived(
         world_id, session_id, poses=poses, points=points,
-        manifest={"session_id": session_id, "input_digest": "x"},
+        manifest={
+            # `schema_version`, because every manifest `write_derived`
+            # actually writes carries one and `derived_currency` has
+            # always required it. Without it this stub was refused by
+            # `manifest_for` once that reader was held to the same
+            # schema rule as the status channel -- and the refusal was
+            # right: a manifest whose field meanings this build cannot
+            # vouch for is not evidence for anybody. The stub was
+            # under-specified, not the rule too strict.
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "input_digest": "x",
+        },
     )
     return world_id, session_id
 
@@ -289,7 +302,19 @@ def test_the_rollup_still_moves_when_only_geometry_changes(tmp_path):
         poses=[{"keyframe_id": "k0", "segment_index": 0, "status": "anchor",
                 "degeneracy": "", "rotation": None, "translation": None}],
         points=[{"segment_index": 0, "xyz": [9.0, 9.0, 9.0]}],
-        manifest={"session_id": session_id, "input_digest": "x"},
+        manifest={
+            # `schema_version`, because every manifest `write_derived`
+            # actually writes carries one and `derived_currency` has
+            # always required it. Without it this stub was refused by
+            # `manifest_for` once that reader was held to the same
+            # schema rule as the status channel -- and the refusal was
+            # right: a manifest whose field meanings this build cannot
+            # vouch for is not evidence for anybody. The stub was
+            # under-specified, not the rule too strict.
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "input_digest": "x",
+        },
     )
     after = adapter.build_manifest(store, world_id, session_id)
     assert before["geometry_revision"] != after["geometry_revision"]

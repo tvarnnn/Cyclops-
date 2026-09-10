@@ -386,3 +386,124 @@ class TestEveryCandidatePairIsAccountedFor:
                 pair["clauses"]["cameras_considered"]
                 >= pair["clauses"]["cameras"]
             ), "the filter reported keeping more cameras than it was given"
+
+
+# -- round 16: the CLI entry point nothing called -----------------------
+
+
+def _registration_module():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "world_registration.py"
+    spec = importlib.util.spec_from_file_location("world_registration_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _one_session_world(root):
+    from tests.result_channel_fixtures import build_world
+
+    return build_world(root, frames=8)
+
+
+def test_the_write_path_resolves_the_session_the_help_text_promises(tmp_path, capsys):
+    """**`main()` had no caller in this suite, and it crashed.**
+
+    `--session` says it "defaults to the world's only session", and the
+    `--write` branch read `args.session` -- `None` on every invocation
+    that takes that default. `session_manifest_path(world, None)` does
+    `derived_dir / None` and raises `TypeError`, **after** `register()`
+    has done the expensive Sim3 pass, throwing the walk away. That is the
+    loss `register_session`'s try/except exists to prevent, and a
+    reviewer found it by running the CLI because nothing here did.
+
+    This is that caller. It exercises the default-session path end to end
+    and checks the placements are stamped with the digest of the session
+    that was actually resolved -- the thing that makes them servable.
+    """
+    from tower.world_builder.store import WorldStore
+
+    root = tmp_path / "worlds"
+    world_id, session_id = _one_session_world(root)
+    module = _registration_module()
+
+    code = module.main([
+        "--root", str(root), "--world", world_id, "--write", "--format", "json",
+    ])
+    assert code == 0, capsys.readouterr()
+
+    store = WorldStore(root)
+    written = store.derived_dir(world_id) / session_id / "placements.json"
+    assert written.exists(), "the --write path produced no placements"
+
+    placements = json.loads(written.read_text(encoding="utf-8"))["placements"]
+    manifest = store.read_session_manifest(world_id, session_id)
+    digests = {p.get("input_digest") for p in placements}
+    assert digests == {manifest["input_digest"]}, (
+        "placements were stamped with a digest that is not this session's, "
+        "so the geometry route will refuse every one of them"
+    )
+
+
+def test_naming_the_session_explicitly_gives_the_same_answer(tmp_path, capsys):
+    """The two ways in must not disagree; only one of them was ever run."""
+    from tower.world_builder.store import WorldStore
+
+    root = tmp_path / "worlds"
+    world_id, session_id = _one_session_world(root)
+    module = _registration_module()
+
+    assert module.main([
+        "--root", str(root), "--world", world_id, "--write",
+    ]) == 0
+    store = WorldStore(root)
+    written = store.derived_dir(world_id) / session_id / "placements.json"
+    by_default = written.read_text(encoding="utf-8")
+
+    written.unlink()
+    assert module.main([
+        "--root", str(root), "--world", world_id,
+        "--session", session_id, "--write",
+    ]) == 0
+    assert json.loads(written.read_text(encoding="utf-8")) == json.loads(by_default)
+
+
+def test_a_write_that_cannot_be_served_says_so(tmp_path, capsys):
+    """Exit 0 and a success line over placements the route refuses in full.
+
+    With no manifest describing the session, every placement is written
+    with `input_digest: null`, and `usable_placements` refuses each one --
+    "solved against a different build". Not a regression (before the
+    session fix they carried the WRONG digest and were refused just as
+    completely), but a silent zero is worse than a loud one, and the CLI
+    printed nothing but success.
+    """
+    root = tmp_path / "worlds"
+    world_id, session_id = _one_session_world(root)
+    module = _registration_module()
+
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(root)
+    (store.derived_dir(world_id) / session_id / "manifest.json").unlink()
+    (store.derived_dir(world_id) / "manifest.json").unlink()
+
+    existing = store.derived_dir(world_id) / session_id / "placements.json"
+    existing.write_text('{"placements": ["a good one from a global solve"]}')
+
+    code = module.main(["--root", str(root), "--world", world_id, "--write"])
+    captured = capsys.readouterr()
+    assert "input_digest" in captured.err, (
+        "a write the geometry route will discard in full was reported as "
+        "an ordinary success: " + captured.err
+    )
+    assert code != 0, "the CLI reported success for a write it did not make"
+    # AND IT DID NOT WRITE. `write_placements` replaces the file whole, so
+    # writing unusable placements over a good one destroys the only thing
+    # of value in the directory -- the 2026-09-09 walk carries a 35 KB
+    # placements.json from its global solve. A reviewer pointed out that
+    # the warning's own reasoning says not to write.
+    assert "a good one from a global solve" in existing.read_text(), (
+        "an unusable write replaced placements that were fine"
+    )

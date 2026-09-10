@@ -1508,7 +1508,7 @@ final class WorldListingDecoderTests: XCTestCase {
     /// test below covers that path.
     private func listingJSON() -> [String: Any] {
         [
-            "contract": "world_builder.worlds/2026-09-06",
+            "contract": "world_builder.worlds/2026-09-10",
             "worlds": [
                 [
                     "world_id": "w-new", "display_name": "Kitchen walk",
@@ -1602,13 +1602,13 @@ final class WorldListingDecoderTests: XCTestCase {
         XCTAssertNil(WorldListingPresentation.keyframeCaption(for: open))
     }
 
-    /// The additive fields of `world_builder.worlds/2026-09-06`, as the Tower
+    /// The additive fields of `world_builder.worlds/2026-09-10`, as the Tower
     /// sends them: `state`, `keyframes_accepted`, `keyframes_journaled`,
     /// `abandoned`, `finalization`. Through `JSONSerialization`, so the
     /// integers arrive as the `NSNumber`s they will be on the phone.
     func testANewListingDecodesItsAdditiveFields() throws {
         let text = """
-            {"contract":"world_builder.worlds/2026-09-06",
+            {"contract":"world_builder.worlds/2026-09-10",
              "worlds":[{"world_id":"fcbca9e90b244785bdb671530b33c6a5","display_name":null,
                         "created_at":1788894856,"updated_at":1788895032,
                         "live":false,
@@ -1734,7 +1734,7 @@ final class WorldListingDecoderTests: XCTestCase {
     /// still read as a `Double`.
     func testAListingDecodesFromJSONTextWithIntegerTimestamps() throws {
         let text = """
-            {"contract":"world_builder.worlds/2026-09-06",
+            {"contract":"world_builder.worlds/2026-09-10",
              "worlds":[{"world_id":"w1","display_name":null,
                         "created_at":1787463000,"updated_at":1787463900,
                         "live":false,
@@ -1753,7 +1753,7 @@ final class WorldListingDecoderTests: XCTestCase {
     }
 
     func testTheListingContractIsItsOwn() {
-        XCTAssertEqual(WorldListingContract.identifier, "world_builder.worlds/2026-09-06")
+        XCTAssertEqual(WorldListingContract.identifier, "world_builder.worlds/2026-09-10")
         XCTAssertNotEqual(WorldListingContract.identifier, WorldGeometryContract.identifier)
         XCTAssertNotEqual(WorldListingContract.identifier, WorldBuilderResultContract.identifier)
     }
@@ -1848,7 +1848,7 @@ final class WorldListingPresentationTests: XCTestCase {
         // Through the bytes, so integers and nulls arrive as they would from
         // the Tower.
         let data = try JSONSerialization.data(withJSONObject: [
-            "contract": "world_builder.worlds/2026-09-06", "worlds": worlds,
+            "contract": "world_builder.worlds/2026-09-10", "worlds": worlds,
         ])
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         return try XCTUnwrap(WorldListingDecoder.listing(from: json))
