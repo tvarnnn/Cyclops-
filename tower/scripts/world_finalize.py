@@ -213,8 +213,29 @@ def main(argv=None) -> int:
         # improve on. The authoritative journals are untouched either way,
         # so a failure is still retryable once its cause is fixed.
         detail = f"{type(exc).__name__}: {exc}"
+        # PRESERVE THE RECORD ONLY IF WHAT IT DESCRIBES IS STILL THERE.
+        #
+        # Not downgrading a healthy record was the right fix for pointing
+        # this tool at an already-complete world. But `solve()` and
+        # `build()` have already run by the time we get here -- they are
+        # WRITERS -- so a failure between them can leave the derived tree
+        # deleted while the preserved record still says `complete` with a
+        # solved final solve. An adversarial review demonstrated exactly
+        # that: the CLI exited 1 and said so on stdout, and the world went
+        # on reading `ready` to the phone with no geometry behind it.
+        #
+        # The record may only stand if the manifest it implies still does.
         was_complete = (before.finalization or {}).get("state") == FINALIZATION_COMPLETE
-        state = FINALIZATION_COMPLETE if was_complete else FINALIZATION_INTERRUPTED
+        try:
+            still_has_geometry = store.read_derived_manifest(args.world) is not None
+        except Exception:  # noqa: BLE001 -- unreadable is not "still there"
+            still_has_geometry = False
+        state = (
+            FINALIZATION_COMPLETE
+            if was_complete and still_has_geometry
+            else FINALIZATION_INTERRUPTED
+        )
+        was_complete = was_complete and still_has_geometry
         if was_complete:
             # Keep the record exactly as it was, including its final_solve
             # and its detail: this run has nothing truer to say about it.

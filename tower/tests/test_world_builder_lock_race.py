@@ -17,6 +17,7 @@ filesystem.
 """
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -155,3 +156,120 @@ def test_a_process_can_still_retake_its_own_lock(tmp_path):
     store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
     store.acquire_writer_lock(world_id)
     store.acquire_writer_lock(world_id)          # must not raise
+
+
+# ---------------------------------------------------------------------------
+# What the create-exclusive rewrite itself made possible.
+
+
+def test_a_zero_byte_lock_does_not_brick_a_world_forever(tmp_path):
+    """A lock that names nobody must not refuse everybody, permanently.
+
+    The old code wrote the lock through `write_json_atomic`, which is never
+    partial. The rewrite creates the file with `O_CREAT|O_EXCL` and writes
+    the record afterwards -- so a kill, a power loss or ENOSPC in that
+    window leaves a ZERO-BYTE lock. `lock_holder` returns None for it, the
+    loop treated None as "try again", and after eight attempts the world was
+    refused. Forever: every retry hit the same file, and
+    `scripts/world_finalize.py` -- the recovery tool -- was refused too.
+
+    An adversarial review measured it raising in 1.3 ms and staying that way.
+    """
+    root = tmp_path / "worlds"
+    store = WorldStore(root)
+    world_id = "w" * 32
+    store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
+    store.lock_path(world_id).write_bytes(b"")
+
+    assert store.lock_holder(world_id) is None
+    store.acquire_writer_lock(world_id)          # must not raise
+    holder = store.lock_holder(world_id)
+    assert holder is not None and holder["pid"] == os.getpid()
+
+
+def test_an_unparseable_lock_does_not_brick_a_world_either(tmp_path):
+    root = tmp_path / "worlds"
+    store = WorldStore(root)
+    world_id = "w" * 32
+    store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
+    store.lock_path(world_id).write_text("{ this is not json", encoding="utf-8")
+
+    store.acquire_writer_lock(world_id)          # must not raise
+    assert store.lock_holder(world_id)["pid"] == os.getpid()
+
+
+def test_a_lock_being_written_right_now_is_not_stolen(tmp_path):
+    """The other half: an empty lock is only an orphan once it STAYS empty.
+
+    A peer between its create and its write leaves exactly the same
+    zero-byte file for microseconds. Reclaiming that would delete a live
+    writer's lock -- which is the failure the grace period exists to avoid,
+    and the reason the fix is a wait rather than an unconditional reclaim.
+    """
+    import threading
+
+    root = tmp_path / "worlds"
+    store = WorldStore(root)
+    world_id = "w" * 32
+    store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
+    path = store.lock_path(world_id)
+    path.write_bytes(b"")
+
+    # A "peer" that finishes its write well inside the grace period.
+    def finish():
+        import json
+        import time as _time
+
+        _time.sleep(0.01)
+        path.write_text(
+            json.dumps({"pid": 999999, "created_at": 0.0}), encoding="utf-8"
+        )
+
+    writer = threading.Thread(target=finish, daemon=True)
+    writer.start()
+    try:
+        store.acquire_writer_lock(world_id)
+    finally:
+        writer.join(timeout=5)
+    # 999999 is not a live pid, so reclaiming it is correct -- what matters
+    # is that the record was READ rather than the file deleted while empty.
+    assert store.lock_holder(world_id)["pid"] == os.getpid()
+
+
+def test_the_loser_of_a_race_is_told_who_holds_it(tmp_path):
+    """"Contending" loses the pid, and is indistinguishable from a brick.
+
+    Without a pause between attempts an adversarial review measured every
+    loser of a natural race exhausting all eight in 1.2 ms and reporting
+    "could not take the writer lock in 8 attempts" -- 104 of 104 times,
+    never once naming the live holder. `world_finalize.py` prints that
+    string to an operator.
+    """
+    import subprocess
+    import sys as _sys
+
+    from tower.world_builder import store as store_module
+
+    root = tmp_path / "worlds"
+    store = WorldStore(root)
+    world_id = "w" * 32
+    store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
+
+    holder = subprocess.Popen(
+        [_sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL
+    )
+    original = store_module.os.getpid
+    store_module.os.getpid = lambda: holder.pid
+    try:
+        store.acquire_writer_lock(world_id)
+    finally:
+        store_module.os.getpid = original
+    try:
+        with pytest.raises(WorldLockedError) as raised:
+            store.acquire_writer_lock(world_id)
+        assert str(holder.pid) in str(raised.value), (
+            f"the error does not name the holder: {raised.value}"
+        )
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)

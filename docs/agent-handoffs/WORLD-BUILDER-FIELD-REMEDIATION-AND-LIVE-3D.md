@@ -245,13 +245,18 @@ now   complete / final_solve: solved
       67 s, nothing in the artifact edited by hand
 ```
 
-**These figures vary run to run.** GLOMAP is not bit-deterministic. A second
-recovery of the same pristine copy, after every later fix in this campaign,
-gave **86** of 122 registered, 664 of 795 posed, and a largest component of
-81 segments / 650 keyframes / 19,417 points. Read every number in this
-document as one sample of a distribution a couple of percent wide, not as a
-constant — including the 88 above, which is also quoted in the commit
-messages.
+**These figures vary run to run.** GLOMAP is not bit-deterministic. Three
+recoveries of the same pristine copy, at three points in this campaign:
+
+| run | registered | largest component |
+|---|---:|---|
+| first | 88 / 122 | 81 segments, 652 keyframes, 19,382 points |
+| after the final-review fixes | 86 / 122 | 81 segments, 650 keyframes, 19,417 points |
+| after everything | 85 / 122 | 80 segments, 646 keyframes, 19,531 points |
+
+A spread of about 3%. Read every number in this document as one sample, not
+a constant — including the 88 quoted above and in the commit messages. All
+three runs left **zero** stray staging files.
 
 Idempotent (every step rewrites), refuses a world a live builder holds
 (tested against a genuinely live other process — the same-process case
@@ -511,6 +516,29 @@ Five review passes ran against work their authors did not write.
 | `tx_seq_gap_total` scored every Tower-side refusal as transit loss (10 sent, 0 lost, reported 3) — the instrument this campaign enabled | SERIOUS | a refused frame advances the counter |
 | iOS: no `didFinish`/`didFail`/render timeout, so a failed render was a black rectangle; unbounded reload on content-process death; session rows pushing into a guaranteed 404; the final-solve sentence stale forever | BLOCKING / SERIOUS | all fixed |
 | two assertions in `test_storage_replace_retry.py` had become **vacuous** — asserting the absence of a name that is no longer created | COSMETIC | assert on any staging file |
+
+
+**The fixes-to-fixes round.** A reviewer was pointed at the least-reviewed
+work in the campaign — the two most recent commits — on the theory that
+every round so far had found something in the newest code. It found six,
+all the lead's, and one is this campaign's own pattern in miniature.
+
+| finding | severity | resolution |
+|---|---|---|
+| **The last commit silently un-fixed the one before it.** `prepare_images` spelled the pid bare; tightening the sweeper to require `p<pid>` stopped it sweeping the writer that leaks MOST — the per-frame undistort write, where terminated solve children die | BLOCKING | `staging_path` is the one producer; the binding test runs `prepare_images`, spies on what it writes, and hands that to the real sweeper |
+| **The sweeper's test wrote a name by hand**, so it pinned the fix and not the code — its docstring spelled the name one way and its assertion another | BLOCKING (it is why the above survived) | the test asks the producer; verified to fail against the bare-pid name |
+| **The `O_EXCL` lock rewrite created a way to brick a world permanently.** The old code wrote through `write_json_atomic`, never partial; the rewrite creates then writes, so a kill in that window leaves a zero-byte lock naming nobody — refused after eight attempts in 1.3 ms, forever, including for the recovery tool | BLOCKING | an unreadable lock is waited out, then reclaimed: a lock that names nobody protects nobody |
+| **Two processes could still both take it** — the reclaim unlinked whatever was at the path, not the file it read. Driven to both-acquiring 5 of 5 with a stall injected (0 of 120 naturally) | BLOCKING | the winner reads its own record back before returning; the loop sleeps between attempts, so a loser is told *who* holds it rather than "contending" (which it reported 104 of 104 times) |
+| **A bound was still labelled `stop`** — the warning claimed the truncation "is not reported as a clean finish" beside the clean-finish label. The path had no test at all | SERIOUS | a self-imposed bound records `interrupted`; nobody asks for a capture to end at forty minutes |
+| **`camera.json` was committed before the images matched it**, so an interrupted recalibration made stale frames permanent — measured: the second call re-undistorted zero frames with three of four from the old calibration | SERIOUS | the camera is committed last, so the file means "the images beside me were made with these parameters" and an interrupted pass self-heals |
+| **A preserved record described artifacts the tool had just destroyed** — `complete / solved` on a world whose derived tree was gone, reading `ready` to the phone | SERIOUS | the record stands only if its manifest does; the classifier's READY branch requires one |
+
+It also corrected the flake characterisation used in an earlier commit
+message: `test_object_memory_lifecycle`'s teardown race fails ~29% in
+isolation on an idle machine, so "load-sensitive" was the wrong word, and
+the test and its implementation were both added on this branch — not, as
+claimed, code the campaign never touched. It is still not a regression from
+any of these commits. The claim was wrong; the conclusion was not.
 
 **Exonerated by measurement**, against the lead's own stated doubts: the render page is fast (5.3 ms median for 19,329 points — the Chrome timeouts were screenshot artifacts); loop-detection-always is a net win at every *live* horizon (the 22%-fewer-points result did not reproduce); `load_solution`'s eager read projects to ~49 MB peak at 6,000 keyframes; a kill mid-`write_derived` or mid-`append_jsonl` loses no authoritative data; the field artifact is **byte-identical** to its preserved copy (1,542 files, 116,452,684 bytes, 0 mismatches), verified twice.
 

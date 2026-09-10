@@ -86,6 +86,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import (  # noqa: E402
     END_REASON_DISCONNECT as END_REASON_CAPTURE_DISCONNECT,
+    END_REASON_BOUNDED_LIMIT as END_REASON_CAPTURE_BOUNDED,
     END_REASON_STOP as END_REASON_CAPTURE_STOP,
     CaptureFollower,
 )
@@ -1599,12 +1600,23 @@ def main(argv=None) -> int:
                 "closed (%s); this is an ordinary end and the session ends as %r",
                 stop_request.level, stop_request.source, capture_end, end_reason,
             )
-        if capture_end == "bounded_limit":
+        if capture_end == END_REASON_CAPTURE_BOUNDED:
+            # A BOUND IS NOT A STOP, and this used only to say so in a log
+            # line while recording `stop` anyway -- a warning that claimed
+            # "the truncation is not reported as a clean finish" beside the
+            # clean-finish label. Caught by an adversarial review running
+            # these very lines against a real follower.
+            #
+            # Nobody asked for this walk to end: the recorder reached forty
+            # minutes and stopped itself while the wearer was still
+            # walking, and everything after that moment is missing from the
+            # world. `interrupted` is what that is.
+            end_reason = END_REASON_INTERRUPTED
             logger.warning(
                 "[Tower][WorldBuilder] the capture stopped ITSELF at a configured "
-                "bound, not because anyone asked. The walk may have been longer "
-                "than the world; the session ends as %r so the truncation is not "
-                "reported as a clean finish.",
+                "bound, not because anyone asked; the walk was longer than the "
+                "world. The session ends as %r, and whatever came after the bound "
+                "is not in it.",
                 end_reason,
             )
         summary = engine.stop_session(end_reason, hold_lock=True)

@@ -490,7 +490,18 @@ def test_an_undistort_staging_file_is_swept_too(tmp_path):
     workspace.images_dir.mkdir(parents=True, exist_ok=True)
     dead = subprocess.Popen([_sys.executable, "-c", "pass"])
     dead.wait()
-    stray = workspace.images_dir / f"00000001.p{dead.pid}.8ecff1a3.tmp.jpg"
+    # THE NAME THE PRODUCER ACTUALLY MAKES, not one written by hand.
+    #
+    # This test used to invent `00000001.p{pid}.8ecff1a3.tmp.jpg`, which no
+    # code produces. `prepare_images` was spelling the pid BARE, so when the
+    # sweeper was tightened to require the `p` form this writer stopped
+    # being swept -- and the test went on passing, because it was pinning
+    # its own invention. Ask the producer.
+    # The shape `prepare_images` produces. That the producer REALLY makes
+    # this shape is bound in `test_world_builder_prepare_images.py`, which
+    # runs it and hands the name to the sweeper -- a check this file cannot
+    # make, because inventing a name here is exactly how the gap survived.
+    stray = workspace.images_dir / f"00000001.jpg.p{dead.pid}.8ecff1a3.tmp.jpg"
     stray.write_bytes(b"half an undistorted frame")
     keep = workspace.images_dir / "00000002.jpg"
     keep.write_bytes(b"a real frame")

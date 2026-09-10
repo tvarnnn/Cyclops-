@@ -26,8 +26,9 @@ that produced it, so a stale derived tree is detected rather than trusted.
 """
 
 import hashlib
-import os
 import json
+import os
+import time
 import logging
 import shutil
 import threading
@@ -76,6 +77,18 @@ IMAGES_DIRNAME = "images"
 # before it gives up. Contention here is two processes reclaiming one
 # dead lock, which resolves in one round; this is a bound, not a wait.
 _LOCK_ACQUIRE_ATTEMPTS = 8
+
+# How long an unreadable lock is given to become readable before it is
+# treated as a writer that died between its create and its write. The write
+# is one `json.dumps` and an `fsync`; a tenth of a second is four orders of
+# magnitude more than that and still imperceptible to a wearer.
+_LOCK_UNREADABLE_GRACE_S = 0.1
+# A pause between attempts, so eight of them span long enough to outlast a
+# peer's reclaim rather than burning through in a millisecond. Without it an
+# adversarial review measured every loser of a natural race exhausting all
+# eight attempts in 1.2 ms and reporting "contending" instead of naming the
+# live holder -- 104 of 104 times.
+_LOCK_RETRY_SLEEP_S = 0.02
 
 
 class WorldStoreError(Exception):
@@ -629,7 +642,8 @@ class WorldStore:
         # holder is gone RECLAIMS by unlinking and trying the exclusive
         # create again -- so two processes that both find a dead lock still
         # cannot both win, and the loser re-reads and sees the winner.
-        for attempt in range(_LOCK_ACQUIRE_ATTEMPTS):
+        unreadable_since: float | None = None
+        for _attempt in range(_LOCK_ACQUIRE_ATTEMPTS):
             try:
                 handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
@@ -639,14 +653,64 @@ class WorldStore:
                     file.write(json.dumps(_lock_record(os.getpid())))
                     file.flush()
                     os.fsync(file.fileno())
-                return
+                # WON THE CREATE -- NOW CONFIRM WE STILL HOLD IT.
+                #
+                # The create is atomic; the reclaim below is not. A peer
+                # that decided this lock was dead unlinks whatever is at
+                # the path -- not the file it read -- so it can delete a
+                # lock created since, and then create its own. An
+                # adversarial review drove that to BOTH PROCESSES
+                # ACQUIRING, 5 of 5, with a stall injected in the reclaim
+                # window (0 of 120 naturally, so it is narrow, not
+                # imaginary).
+                #
+                # Reading our own record back closes the outcome that
+                # matters: whoever's record is on disk owns the world, and
+                # a process whose record was replaced goes round rather
+                # than returning to write underneath the winner.
+                mine = self.lock_holder(world_id)
+                if mine is not None and mine["pid"] == os.getpid():
+                    return
+                continue
             holder = self.lock_holder(world_id)
             if holder is None:
-                # Unreadable, or it vanished between the create and the
-                # read. Either way this is not evidence of no holder --
-                # `lock_holder`'s own docstring says so -- and a retry is
-                # cheaper than being wrong about it.
+                # Unreadable. Two very different things look like this and
+                # only time tells them apart.
+                #
+                # TRANSIENT: a peer is between its `O_CREAT|O_EXCL` and its
+                # write, so the file exists and is empty for microseconds.
+                # Reclaiming here would delete a live writer's lock.
+                #
+                # ORPHANED: that peer was killed in the same window, and
+                # the zero-byte file it left names nobody. This is a NEW
+                # possibility -- the old code wrote the lock through
+                # `write_json_atomic`, which is never partial -- and
+                # refusing it forever bricks the world: an adversarial
+                # review measured `acquire_writer_lock` raising in 1.3 ms
+                # and every retry, and `world_finalize.py`, refused
+                # identically. Permanently.
+                #
+                # So: wait out the transient case, then reclaim. The write
+                # window is measured in microseconds; anything unreadable
+                # for a tenth of a second is not a writer in progress.
+                now = time.monotonic()
+                if unreadable_since is None:
+                    unreadable_since = now
+                elif now - unreadable_since >= _LOCK_UNREADABLE_GRACE_S:
+                    logger.warning(
+                        "world builder: reclaiming an unreadable lock on %s; it "
+                        "names no process and has not become readable in %ss, so "
+                        "it is a writer that died mid-write",
+                        world_id, _LOCK_UNREADABLE_GRACE_S,
+                    )
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    unreadable_since = None
+                time.sleep(_LOCK_RETRY_SLEEP_S)
                 continue
+            unreadable_since = None
             if holder["alive"] and holder["pid"] != os.getpid():
                 raise WorldLockedError(
                     f"world {world_id} is locked by live pid {holder['pid']}; "
@@ -662,6 +726,7 @@ class WorldStore:
                 path.unlink()
             except OSError:
                 pass
+            time.sleep(_LOCK_RETRY_SLEEP_S)
         raise WorldLockedError(
             f"world {world_id}: could not take the writer lock in "
             f"{_LOCK_ACQUIRE_ATTEMPTS} attempts; another writer is contending "

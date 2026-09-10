@@ -992,6 +992,18 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
         session.end_reason in ("error", "interrupted")
         and (finalization or {}).get("state") == "complete"
         and (finalization or {}).get("final_solve") == FINAL_SOLVE_SOLVED
+        # AND THE GEOMETRY IT IMPLIES EXISTS. A repair whose build failed
+        # can leave `complete / solved` on a world whose derived tree is
+        # gone, and the first version of this returned READY without ever
+        # consulting `has_manifest` -- an adversarial review reached it
+        # end-to-end. `ready` on a world with nothing to open is the same
+        # class of lie as "Nothing mapped yet" over 26,634 points, pointing
+        # the other way.
+        #
+        # The `end_reason == "stop"` branch below has the same hole and it
+        # predates this campaign; it is left alone rather than widened by
+        # guesswork, and noted in the handoff.
+        and has_manifest
     ):
         return {
             "state": LIFECYCLE_READY,

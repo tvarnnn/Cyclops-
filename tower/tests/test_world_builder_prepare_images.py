@@ -20,6 +20,7 @@ defects in it that a test would have caught, both silent.
 """
 
 import json
+import pathlib
 
 import cv2
 import numpy as np
@@ -186,3 +187,119 @@ def test_the_camera_written_is_the_camera_asked_for(session):
         json.loads(workspace.camera_path.read_text(encoding="utf-8"))
     )
     assert stored == camera
+
+
+def test_the_staging_name_it_writes_is_one_the_sweeper_recognises(session, monkeypatch):
+    """The producer and the sweeper must agree, and only this can check it.
+
+    `prepare_images` spelled the pid BARE while `storage.staging_path`
+    spells it `p<pid>`. When the sweeper was tightened to require the `p`
+    form -- so a hex uuid or a frame number could not be mistaken for a
+    process -- this writer silently stopped being swept, and it is the one
+    that leaks most: the builder terminates a solve child on every stop
+    that outstays its budget, and this is the per-frame write it dies
+    inside.
+
+    The suite missed it because the sweeper's own test wrote a name BY
+    HAND. A test that invents its subject's output cannot notice when the
+    subject stops producing it. So this asks the real function what it
+    writes, and hands that to the real sweeper.
+    """
+    import cv2 as _cv2
+
+    from tower.storage import sweep_abandoned_staging
+
+    store, world_id, session_id, keyframes, workspace = session
+
+    seen: list[str] = []
+    real_imwrite = _cv2.imwrite
+
+    def spy(path, *args, **kwargs):
+        seen.append(str(path))
+        return real_imwrite(path, *args, **kwargs)
+
+    #  is imported INSIDE prepare_images, so patch the module.
+    monkeypatch.setattr(_cv2, "imwrite", spy)
+    _prepare(store, world_id, session_id, keyframes)
+    assert seen, "prepare_images wrote nothing to spy on"
+
+    # Re-create one of those staging files, attributed to a DEAD process,
+    # and check the sweeper takes it.
+    import re
+    import subprocess
+    import sys as _sys
+
+    dead = subprocess.Popen([_sys.executable, "-c", "pass"])
+    dead.wait()
+    produced = pathlib.Path(seen[0])
+    stray = produced.with_name(
+        re.sub(r"\.p\d+\.", f".p{dead.pid}.", produced.name, count=1)
+    )
+    assert stray.name != produced.name, (
+        f"prepare_images wrote {produced.name!r}, which carries no p<pid> "
+        "component -- the sweeper cannot attribute it and will never take it"
+    )
+    stray.write_bytes(b"half an undistorted frame")
+
+    assert sweep_abandoned_staging(workspace.images_dir) == 1, (
+        f"the sweeper did not recognise {stray.name!r}, which is the shape "
+        "prepare_images actually writes"
+    )
+    assert not stray.exists()
+
+
+def test_an_interrupted_recalibration_heals_on_the_next_call(session, monkeypatch):
+    """A pass that does not finish must not leave the workspace lying.
+
+    `camera.json` used to be written BEFORE the re-undistort loop, and the
+    loop was gated on a per-CALL flag. So an abandoned pass -- and the loop
+    has three ways to abandon a frame without failing: an unreadable
+    source, a wrong-sized source, and any exception -- left a `camera.json`
+    that already matched, and the next call computed `recalibrated = False`
+    and skipped every stale frame FOREVER.
+
+    An adversarial review measured the second call re-undistorting zero
+    frames with three of four images still from the old calibration. The
+    camera is committed last now, so the file means "the images beside me
+    were made with these parameters" and an interrupted pass self-heals.
+    """
+    store, world_id, session_id, keyframes, workspace = session
+    _prepare(store, world_id, session_id, keyframes)
+    originals = {p.name: p.read_bytes() for p in workspace.images_dir.glob("*.jpg")}
+
+    _recalibrate(store, world_id, session_id, 80.0, -0.25)
+
+    # Abandon the pass partway, the way an unreadable frame does.
+    real_imread = global_solve.cv2.imread if hasattr(global_solve, "cv2") else None
+    import cv2 as _cv2
+
+    calls = {"n": 0}
+    real = _cv2.imread
+
+    def flaky(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise RuntimeError("the pass was abandoned")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(_cv2, "imread", flaky)
+    monkeypatch.setattr(global_solve.shutil, "rmtree", lambda *a, **k: None)
+    with pytest.raises(RuntimeError):
+        _prepare(store, world_id, session_id, keyframes)
+    monkeypatch.undo()
+
+    # The camera must NOT have been committed, or the next call will trust
+    # images that do not match it.
+    stored = PinholeCamera.from_json_dict(
+        json.loads(workspace.camera_path.read_text(encoding="utf-8"))
+    )
+    monkeypatch.setattr(global_solve.shutil, "rmtree", lambda *a, **k: None)
+    _camera, written = _prepare(store, world_id, session_id, keyframes)
+    assert written == 4, (
+        "the interrupted recalibration was treated as done; stale frames are "
+        "now permanent"
+    )
+    after = {p.name: p.read_bytes() for p in workspace.images_dir.glob("*.jpg")}
+    assert all(after[n] != originals[n] for n in originals), (
+        "frames from the old calibration survived a completed second pass"
+    )

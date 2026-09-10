@@ -577,3 +577,41 @@ def test_a_stop_while_the_capture_is_still_open_is_still_an_interruption(
 
     store, world_id, session_id = _the_session(root)
     assert store.read_session(world_id, session_id).end_reason == "interrupted"
+
+
+def test_a_capture_that_hits_its_own_bound_is_an_interruption(open_capture, tmp_path):
+    """A bound is not a Stop, and the label has to say so.
+
+    `CaptureRecorder` stops ITSELF at `CaptureLimits.max_seconds` -- forty
+    minutes -- and its own log says a follower sees that "exactly as if it
+    were" a disconnect. So the wearer is still walking, nobody asked for
+    anything, and everything after that moment is missing from the world.
+
+    This recorded `stop` while logging a warning that claimed the
+    truncation "is not reported as a clean finish". `stop` IS the
+    clean-finish label. Caught by an adversarial review executing the
+    shipped lines against a real follower; the path had no test at all
+    (`grep -rl bounded_limit tests/` returned nothing).
+    """
+    from tower.capture import END_REASON_BOUNDED_LIMIT
+
+    recorder, capture_dir, _capture_id = open_capture
+    root = tmp_path / "worlds"
+    process = _spawn(capture_dir, root)
+    try:
+        _wait_for(lambda: _keyframes_written(root) >= 2, what="the first keyframes")
+        recorder.stop(END_REASON_BOUNDED_LIMIT)
+        stdout, stderr = _finish(process)
+    finally:
+        pass
+    assert process.returncode == 0, stderr[-2000:]
+
+    store, world_id, session_id = _the_session(root)
+    session = store.read_session(world_id, session_id)
+    assert session.end_reason == "interrupted", (
+        "a capture truncated at its own bound was recorded as a clean stop"
+    )
+    # And the geometry it did get is still there -- a truncated walk is not
+    # a lost one.
+    assert session.finalization["state"] == FINALIZATION_COMPLETE
+    assert store.read_derived_manifest(world_id) is not None

@@ -394,3 +394,69 @@ def test_a_failed_repair_on_an_already_broken_world_still_says_so(interrupted_wo
     after = store.read_session(world_id, session_id).finalization
     assert after["state"] == FINALIZATION_INTERRUPTED
     assert "ImagesPurgedError" in after["detail"]
+
+
+@pytest.mark.parametrize(
+    "has_manifest, expected",
+    [(True, "ready"), (False, "interrupted")],
+)
+def test_ready_is_not_claimed_over_geometry_that_is_not_there(has_manifest, expected):
+    """`ready` on a world with nothing to open is the same class of lie as
+    "Nothing mapped yet" over 26,634 points, pointing the other way.
+
+    The first version of this branch returned READY without consulting
+    `has_manifest`, and an adversarial review reached it end to end: a
+    repair whose build failed left `complete / solved` on a world whose
+    derived tree it had just deleted, and the phone read `ready`.
+    """
+    from tower.results.world_builder import _lifecycle
+    from tower.world_builder.records import Session
+
+    session = Session(
+        session_id="s" * 32, world_id="w" * 32, started_at=0.0,
+        frame_source="synthetic", ended_at=1.0, end_reason="error",
+        finalization={
+            "state": FINALIZATION_COMPLETE, "final_solve": "solved",
+            "started_at": 0.0, "updated_at": 1.0, "detail": None,
+        },
+    )
+    lifecycle = _lifecycle(
+        holder=None, stopped=True, session=session,
+        geometry_current=True, has_manifest=has_manifest,
+    )
+    assert lifecycle["state"] == expected
+
+
+def test_a_failed_repair_that_lost_the_derived_tree_does_not_stay_complete(
+    interrupted_world, monkeypatch
+):
+    """The other half of the same hole, at the source.
+
+    `solve()` and `build()` are WRITERS and have already run by the time
+    the failure is handled, so a failure between them can leave the tree
+    deleted while the preserved record still says `complete`.
+    """
+    root, world_id, session_id = interrupted_world
+    store = WorldStore(root)
+
+    assert _run(root, world_id, "--skip-solve")["finalized"] is True
+    engine = WorldBuilderEngine(store)
+    engine.mark_finalization(
+        world_id, session_id,
+        state=FINALIZATION_COMPLETE, final_solve="solved", detail=None,
+    )
+    assert store.read_derived_manifest(world_id) is not None
+
+    # A build that destroys the tree and then fails.
+    def wreck(self, world, session):
+        store.clear_derived(world)
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(WorldBuilderEngine, "build", wreck)
+    report = _run(root, world_id, "--skip-solve")
+
+    assert report["finalized"] is False
+    assert store.read_derived_manifest(world_id) is None
+    assert store.read_session(world_id, session_id).finalization["state"] == (
+        FINALIZATION_INTERRUPTED
+    ), "the record still claims a complete world whose geometry is gone"

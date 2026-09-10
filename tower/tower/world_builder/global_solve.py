@@ -82,6 +82,7 @@ import numpy as np
 
 from tower.storage import (
     read_bytes_closed,
+    staging_path,
     replace_with_retry,
     sweep_abandoned_staging,
     read_json_closed,
@@ -417,7 +418,23 @@ def prepare_images(
                 # every solve to the face-redacted session copies: the
                 # ledger's measured 337 images down to 307.
                 write_sources_records(workspace, sources_before)
-    write_json_atomic(workspace.camera_path, camera.to_json_dict())
+    # THE CAMERA IS COMMITTED AFTER THE IMAGES MATCH IT, not before.
+    #
+    # This wrote `camera.json` here, before the loop, and gated the
+    # re-undistort on a per-CALL `recalibrated` flag. So if the pass did
+    # not finish -- and the loop has three ways to abandon a frame without
+    # failing: an unreadable source, a wrong-sized source, and any
+    # exception -- then the NEXT call read a `camera.json` that already
+    # matched, computed `recalibrated = False`, and skipped every stale
+    # frame forever. An adversarial review demonstrated the second call
+    # re-undistorting zero frames and leaving three of four images from the
+    # old calibration under a `camera.json` naming the new one: the same
+    # defect this flag was added to close, reached by a different route.
+    #
+    # Committing the camera last makes the file mean what it says -- "the
+    # images beside me were made with these parameters" -- and makes an
+    # interrupted pass self-healing, because the next call still sees a
+    # mismatch and tries again.
     sources = read_sources(workspace)
     written = 0
     for keyframe in keyframes:
@@ -443,7 +460,18 @@ def prepare_images(
         # `os.replace` could publish the other's partial JPEG, and the
         # `if target.exists(): continue` above means a corrupt frame is
         # never regenerated: it feeds COLMAP for the life of the workspace.
-        tmp = target.with_name(f"{target.stem}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.jpg")
+        # `staging_path`, NOT a hand-rolled name. This spelled the pid bare
+        # while `staging_path` spells it `p<pid>`, and when the sweeper was
+        # tightened to require the `p` form -- so that a hex uuid or a frame
+        # number could not be mistaken for a process -- this writer silently
+        # stopped being swept. It is the writer that leaks MOST: the builder
+        # terminates a solve child on every stop that outstays its budget,
+        # and this is the per-frame write it dies inside.
+        #
+        # The suite did not notice because the test wrote a name by hand
+        # instead of asking the producer for one, so it pinned the fix and
+        # not the code. One producer, one convention.
+        tmp = staging_path(target).with_suffix(".tmp.jpg")
         try:
             cv2.imwrite(str(tmp), undistorted, [cv2.IMWRITE_JPEG_QUALITY, 95])
             # `replace_with_retry`, not `os.replace`. Windows refuses a
@@ -456,6 +484,7 @@ def prepare_images(
         finally:
             tmp.unlink(missing_ok=True)
         written += 1
+    write_json_atomic(workspace.camera_path, camera.to_json_dict())
     return camera, written
 
 
