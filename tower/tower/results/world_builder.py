@@ -39,6 +39,7 @@ from pathlib import Path
 
 from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
+from tower.results.world_builder_library import _sortable
 from tower.storage import read_json_closed, read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
 from tower.world_builder.records import FINAL_SOLVE_SOLVED, format_distance
@@ -487,7 +488,20 @@ class WorldBuilderStatusProducer:
                 world = store.read_world(wid)
             except (WorldStoreError, KeyError, OSError):
                 continue
-            if world.updated_at > best_at:
+            # `_sortable`, FOR THE REASON THE LISTING GIVES -- and this
+            # is the surface that is up during the walk.
+            #
+            # `world_from_json_dict` does not coerce `updated_at`, and
+            # `best_at` starts at `-math.inf`, so a `world.json` carrying
+            # a string raises `TypeError` HERE, in
+            # `resolve_with_selection`, which runs BEFORE `snapshot()`'s
+            # try. Two rounds hardened the three HTTP surfaces against
+            # exactly this and did not grep for the other readers of the
+            # same fields. A reviewer built all 24 corruption shapes and
+            # found `GET /worlds`, `/render` and `/geometry/manifest`
+            # surviving every one while the status channel died on all of
+            # them.
+            if _sortable(world.updated_at) > _sortable(best_at):
                 best, best_at = wid, world.updated_at
         if best is None:
             return None, SELECTION_NONE, "no world could be read"
@@ -524,7 +538,8 @@ class WorldBuilderStatusProducer:
                 session = store.read_session(world_id, sid)
             except (WorldStoreError, KeyError, OSError):
                 continue
-            if session.started_at > best_at:
+            # See the world loop above: `started_at` is uncoerced too.
+            if _sortable(session.started_at) > _sortable(best_at):
                 best, best_at = sid, session.started_at
         return best
 
@@ -539,7 +554,28 @@ class WorldBuilderStatusProducer:
             return self._unavailable(problem)
         try:
             return self._snapshot(resolved_world, resolved_session, selection)
-        except (WorldStoreError, KeyError, ValueError, OSError) as exc:
+        except (
+            WorldStoreError,
+            KeyError,
+            ValueError,
+            OSError,
+            # `TypeError` AND `OverflowError`, because a record field that
+            # is the wrong TYPE is a corrupt-input problem exactly like a
+            # missing key, and neither was in this tuple.
+            #
+            # `_elapsed_seconds` subtracts `session.started_at` from the
+            # clock; a string raises TypeError and a `10**400` raises
+            # OverflowError, both from inside the snapshot rather than
+            # from the resolver above. Uncaught, they reach
+            # `publisher.poll_once`'s bare `except Exception`, and after
+            # `MAX_CONSECUTIVE_TARGET_FAILURES` the subscriber is sent
+            # `fail_target` and the panel stops updating **for the rest of
+            # the walk**. A reviewer traced that path; the alternative is
+            # one poll reporting `unavailable`, which is what every other
+            # corrupt input here already does.
+            TypeError,
+            OverflowError,
+        ) as exc:
             # A world this build cannot read is a real answer, not a
             # crash. Refusing to interpret an unknown schema is the store's
             # documented behaviour and it must survive to the wire rather

@@ -469,12 +469,55 @@ def manifest_for(store, world_id: str, session_id: str | None = None) -> dict | 
         return None
 
 
+def _solve_segments(store, world_id: str, session_id: str) -> dict:
+    """The global solve's per-segment verdicts, or `{}`.
+
+    **A `.get` CHAIN IS NOT A GUARD.** This was
+    `(manifest or {}).get("global_solve") or {}).get("segments") or {}`,
+    which raises `AttributeError` the moment `global_solve` is a string or
+    a list rather than a dict, and again if `segments` is -- straight out
+    of `build_manifest` and into an HTTP **500** on a route whose own
+    comment promises "404 now means ABSENT only", where the phone has no
+    branch for a 500.
+
+    It was reachable at HEAD for a schema-1 manifest with a malformed
+    `global_solve`. Round 18 WIDENED it: `manifest_for` became identity-only
+    and stopped checking `schema_version`, so manifests from an unknown
+    schema -- whose fields `validate_manifest`'s own comment says "this
+    build does not know" -- now reach this chain too. A reviewer measured
+    four shapes going 200 -> 500 across that change, and pointed out it
+    becomes broad rather than narrow the moment `SCHEMA_VERSION` is
+    bumped.
+
+    The purpose split stays as it is -- `usable_placements` genuinely
+    needs only the digest, and refusing 408 real placements over a record
+    schema bump was the defect that split was for. What was wrong is
+    reading a FIGURES-shaped field off the identity path without checking
+    its shape. Both halves are fixed here: the read is type-checked, and
+    the coverage verdicts come from a manifest validated for figures.
+    """
+    manifest = manifest_describing(store, world_id, session_id, purpose="figures")
+    if not isinstance(manifest, dict):
+        return {}
+    solve = manifest.get("global_solve")
+    if not isinstance(solve, dict):
+        return {}
+    segments = solve.get("segments")
+    return segments if isinstance(segments, dict) else {}
+
+
 def coverage_for_segment(index: int, poses: list, points: list, solve_segments: dict) -> str | None:
     """The global solve's coverage class for a segment, or a truthful
     fallback: `unresolved` for a segment with keyframes and no points, and
     null when nothing has judged a segment that does have points."""
     judged = solve_segments.get(str(index)) or solve_segments.get(index)
-    if judged and judged.get("coverage") in ("confident", "partial", "unresolved"):
+    # `isinstance`, not truthiness: a `segments` map whose VALUES are
+    # strings passed the `if judged` and raised `AttributeError` on the
+    # `.get` below. Same class as the chain above, one level deeper, and
+    # a reviewer produced it.
+    if isinstance(judged, dict) and judged.get("coverage") in (
+        "confident", "partial", "unresolved"
+    ):
         return judged["coverage"]
     if poses and not points:
         return "unresolved"
@@ -496,9 +539,7 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     placements = usable_placements(store, world_id, session_id)
 
     segments = []
-    solve_segments = (
-        (manifest_for(store, world_id, session_id) or {}).get("global_solve") or {}
-    ).get("segments") or {}
+    solve_segments = _solve_segments(store, world_id, session_id)
     for index in sorted(grouped):
         poses = grouped[index]["poses"]
         points = grouped[index]["points"]

@@ -1,6 +1,7 @@
 """`GET /worlds`: the index a viewer opens old worlds from."""
 
 import json
+import pathlib
 import os
 
 from fastapi import FastAPI
@@ -620,3 +621,112 @@ def test_the_drawable_predicate_does_not_re_admit_a_refused_manifest(derived_wor
     # And the surface that calls it with no manifest agrees.
     row = build_world_listing(store)["worlds"][0]["sessions"][0]
     assert row["has_geometry"] is False
+
+
+# -- the ghost lock ----------------------------------------------------
+
+
+def _legacy_lock(store, world_id, pid, *, written_at):
+    """A lock in the shape the 29 real ones have: a pid and nothing else."""
+    import json as _json
+    import os as _os
+
+    path = store.lock_path(world_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps({"pid": pid}), encoding="utf-8")
+    _os.utime(path, (written_at, written_at))
+    return path
+
+
+def test_a_recycled_pid_on_a_legacy_lock_is_not_a_live_builder(derived_world):
+    """**The likeliest thing to go wrong at the retest, before this.**
+
+    `_holder_is_running` reads `if created_at is None: return True`, and on
+    the machine this campaign is preparing **29 of 163 worlds hold a lock
+    file and not one carries `created_at`** -- every one predates the
+    field. So all 29 are decided by the pid alone, and Windows recycles
+    pids freely: two independent reviewers hit the same live alias within
+    an hour, one on their first sample.
+
+    What it does: `_most_relevant` prefers a world with a live lock over
+    every saved world, so a fortnight-old empty world hijacks the default
+    subscription and the phone is told `receiving`, 0 keyframes,
+    `mapping_seconds: 1,407,085`. Reproduced end to end through a real
+    Tower by a reviewer: the wearer's real walk built correctly, and then
+    **at the moment finalization released its own lock** the live screen
+    reverted to the ghost and said "Mapping" for the rest of the session.
+
+    A process that started AFTER the lock file was written cannot be the
+    process that wrote it. The filesystem keeps that timestamp for free,
+    and it settles all 29 without deleting anything.
+    """
+    import os as _os
+
+    import psutil
+
+    store, world_id, _ = derived_world
+    me = _os.getpid()
+    started = psutil.Process(me).create_time()
+
+    # THE GHOST: this pid, on a lock written a day before this process
+    # existed. Whatever wrote that lock, it was not this process.
+    _legacy_lock(store, world_id, me, written_at=started - 86_400)
+    holder = store.lock_holder(world_id)
+    assert holder is not None and holder["pid"] == me
+    assert holder["alive"] is False, (
+        "a pid recycled onto a fortnight-old lock was reported as a live "
+        "builder, which is what tells the wearer a walk is in progress "
+        "before they have taken a step"
+    )
+    assert build_world_listing(store)["worlds"][0]["live"] is False
+
+    # A REAL BUILDER: same legacy shape, but the lock was written after
+    # the process started, which is what actually happens -- the lock is
+    # acquired milliseconds into the run. This must still read alive, or
+    # the fix would be worse than the defect.
+    _legacy_lock(store, world_id, me, written_at=started + 1.0)
+    holder = store.lock_holder(world_id)
+    assert holder["alive"] is True, (
+        "a live builder holding a legacy lock was reported dead"
+    )
+    # NOT asserted through the listing: `_world_is_live` deliberately
+    # excludes `holder["pid"] == os.getpid()`, so a lock this test process
+    # holds reads not-live there however alive it is. `lock_holder` is the
+    # answer under test; the listing's own rule is a separate one.
+
+    store.lock_path(world_id).unlink()
+
+
+def test_a_lock_that_cannot_be_read_is_not_an_idle_world(derived_world, monkeypatch):
+    """`lock_holder` swallowed a transient read into "no lock at all".
+
+    Every caller reads `None` as "this world is idle", so one collision on
+    the LOCK file -- which `write_json_atomic` replaces like everything
+    else -- reports a live walk as dead: `live: false` in the picker and
+    the status channel dropping out of `receiving` for a poll. The suite
+    showed it before a reviewer named it: the one test asserting a live
+    session reads `receiving` failed once under full-suite load and passes
+    otherwise.
+    """
+    import os as _os
+
+    from tower.world_builder import store as store_module
+
+    store, world_id, _ = derived_world
+    _legacy_lock(store, world_id, _os.getpid(), written_at=None or 1.0)
+    path = store.lock_path(world_id)
+    real = store_module.read_json_closed
+
+    def busy(target):
+        if pathlib.Path(target) == path:
+            raise PermissionError(13, "The process cannot access the file")
+        return real(target)
+
+    monkeypatch.setattr(store_module, "read_json_closed", busy)
+    holder = store.lock_holder(world_id)
+    assert holder is not None, (
+        "a lock file that is right there was reported as no lock at all"
+    )
+    assert holder["unreadable"] is True
+    assert holder["alive"] is False
+    store.lock_path(world_id).unlink()

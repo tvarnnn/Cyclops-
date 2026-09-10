@@ -167,8 +167,10 @@ _REPLACE_READ_BACKOFF = 0.001
 def _read_json_past_a_replace(path, *, absent_on_failure=True):
     """`read_json_closed`, surviving a writer replacing the file underneath.
 
-    **`write_derived` REPLACES FIVE FILES MICROSECONDS APART** -- poses,
-    points, support and both manifests -- and on Windows `os.replace` onto
+    **ONE BUILD REPLACES SIX FILES MICROSECONDS APART** -- `world.json`
+    from `write_world`, then poses, points, support and both manifests
+    from `write_derived`, which `engine.build` calls on the very next
+    statement -- and on Windows `os.replace` onto
     a path a reader holds open fails with WinError 5, symmetrically with
     the reader's own `open()` during the writer's window.
 
@@ -304,7 +306,37 @@ class WorldStore:
         path = self.world_path(world_id)
         if not path.exists():
             raise WorldStoreError(f"no world at {path}")
-        data = read_json_closed(path)
+        # THE SIXTH FILE. `engine.build` calls `write_world` and then, on
+        # the very next statement, `write_derived` -- so `world.json` is
+        # replaced microseconds before the five that
+        # `_read_json_past_a_replace` was written for, and it was the one
+        # left on a bare read. A reviewer measured the difference with a
+        # writer doing both: escapes out of `build_manifest` fell from
+        # 9.35% to 0.00% when only `write_derived` ran, and stopped at
+        # **1.10%** when `write_world` ran too -- every residual one a
+        # `PermissionError` from this line.
+        #
+        # `absent_on_failure=False`, because this method's contract is to
+        # RAISE for a world it cannot produce (`WorldStoreError` above),
+        # and callers distinguish that from an absent world. A persistent
+        # fault must keep reaching them.
+        try:
+            data = _read_json_past_a_replace(path, absent_on_failure=False)
+        except ValueError as exc:
+            # A CORRUPT WORLD IS NOT A SERVER FAULT. `read_json_closed`
+            # raises `JSONDecodeError` (a `ValueError`) on a truncated or
+            # non-UTF-8 `world.json`, and this method let it out --
+            # through `world_builder_geometry._read`, which catches only
+            # `WorldStoreError`, and out of `routes/geometry.py`, which
+            # has no handler at all. A reviewer measured the result: an
+            # HTTP **500 on an unauthenticated route** for a world whose
+            # file is merely damaged.
+            #
+            # `WorldStoreError` is the word every caller here already
+            # understands, and it is the honest one: this world cannot be
+            # produced. A genuine `OSError` still escapes, which keeps
+            # "the disk is broken" a 500 rather than a silent 404.
+            raise WorldStoreError(f"world {world_id} is unreadable: {exc}") from exc
         require_schema(data, f"world {world_id}")
         require_pose_convention(data["pose_convention"])
         return world_from_json_dict(data)
@@ -1021,7 +1053,22 @@ class WorldStore:
         try:
             if not path.exists():
                 return None
-            holder = read_json_closed(path)
+            # THROUGH THE RETRY. Swallowing a transient `OSError` here
+            # returns "no lock", which every caller reads as "this world
+            # is idle" -- so a collision on the LOCK file reports a live
+            # walk as dead: `live: false` in the picker, and the status
+            # channel dropping out of `receiving` for a poll. A reviewer
+            # named this reader as one of the two still on a bare read,
+            # and the suite showed it: the one test that asserts a live
+            # session reads `receiving` failed once under full-suite load
+            # and passes 3/3 otherwise.
+            holder = _read_json_past_a_replace(path)
+            # `None` after the retries falls through to the `isinstance`
+            # check below, which already answers `unreadable: True` -- NOT
+            # "no lock", which is the downgrade this docstring warns
+            # about. No branch is needed here and an earlier version of
+            # this fix added one; a mutation showed it was dead code.
+            lock_written_at = path.stat().st_mtime
         except (OSError, json.JSONDecodeError, ValueError):
             return None
         if not isinstance(holder, dict):
@@ -1031,7 +1078,9 @@ class WorldStore:
             return {"pid": None, "alive": False, "unreadable": True}
         return {
             "pid": pid,
-            "alive": _holder_is_running(pid, holder.get("created_at")),
+            "alive": _holder_is_running(
+                pid, holder.get("created_at"), lock_written_at
+            ),
             "unreadable": False,
         }
 
@@ -1359,25 +1408,66 @@ def _pid_is_running(pid: int) -> bool:
     return _holder_is_running(pid, None)
 
 
-def _holder_is_running(pid: int, created_at) -> bool:
-    """Whether the process a lock names is the process that is running.
+# How much later than the lock file a process may have started and still
+# be believed to be its writer. A builder writes its lock within
+# milliseconds of starting; this only has to absorb clock skew and
+# filesystem timestamp granularity, and erring generous here is safe --
+# the failure it prevents (calling a LIVE builder dead) is far worse than
+# the one it allows (believing a pid recycled within five seconds).
+_RECYCLED_PID_GRACE_S = 5.0
+
+
+def _holder_is_running(pid: int, created_at, lock_written_at=None) -> bool:
+    """Whether the process a lock names is the process that WROTE it.
 
     With a start time on the lock, a running pid whose start time differs
     is a DIFFERENT process -- the builder that wrote the lock is dead and
-    its number was recycled. Without one (a lock written before start
-    times were recorded) the pid alone decides, as it always did.
+    its number was recycled.
+
+    **AND WITHOUT ONE, THE LOCK FILE'S OWN MTIME ANSWERS THE SAME
+    QUESTION.** A process that started AFTER the lock was written cannot
+    be the process that wrote it. That is not a heuristic; it is the same
+    argument the `created_at` check makes, from a timestamp the filesystem
+    keeps for free.
+
+    This matters because it is not hypothetical and it is not rare. The
+    check above reads `if created_at is None: return True`, and on the
+    machine this campaign is preparing for a retest **29 of 163 worlds
+    hold a lock file and not one of them carries `created_at`** -- they
+    were all written before the field existed. Two independent reviewers
+    found the same consequence within an hour of each other, and one
+    reproduced it end to end through a real Tower: a pid from a
+    fortnight-old lock was recycled onto a live `bash.exe`, the status
+    producer prefers a world with a live lock over every saved world, and
+    the phone was told a 16-day-old empty world was `receiving` with 0
+    keyframes and `mapping_seconds: 1,407,085`. In the end-to-end run the
+    wearer's real walk built correctly and then, **at the moment
+    finalization completed and released its own lock**, the live screen
+    reverted to the ghost and said "Mapping" forever.
+
+    The tolerance runs one way on purpose. A real builder writes its lock
+    within milliseconds of starting, so its `create_time` is at or before
+    the lock's mtime; a recycled pid on an old lock starts hours or days
+    after. Only a process that started **clearly** later is called dead,
+    so a live builder can never be judged dead by a slow clock or a coarse
+    filesystem timestamp.
+
+    Nothing is deleted to make this work: the 29 legacy locks stay exactly
+    where they are and simply read dead, which is what they are.
     """
     try:
         import psutil
 
         if not psutil.pid_exists(pid):
             return False
-        if created_at is None:
-            return True
         try:
             actual = psutil.Process(pid).create_time()
         except psutil.Error:
             return False
-        return abs(float(actual) - float(created_at)) <= _CREATE_TIME_TOLERANCE_S
+        if created_at is not None:
+            return abs(float(actual) - float(created_at)) <= _CREATE_TIME_TOLERANCE_S
+        if lock_written_at is not None:
+            return float(actual) <= float(lock_written_at) + _RECYCLED_PID_GRACE_S
+        return True
     except Exception:  # pragma: no cover - psutil is a hard dependency
         return False

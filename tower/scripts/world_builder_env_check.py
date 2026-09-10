@@ -481,6 +481,10 @@ def collect_calibrations():
                 break
 
     return {
+        # Published so `build_verdicts` can ask about locks without
+        # resolving the root a second way -- two resolvers for one path is
+        # how this campaign's defects kept coming back.
+        "world_root": str(world_root),
         "intrinsics_dir": str(directory),
         "available": available,
         "last_capture": last,
@@ -632,6 +636,62 @@ def build_verdicts(report):
             ".venv/Scripts/python.exe, rather than a system Python"
         )
     verdicts.append(("sfm_backend_importable", backend_ok, backend_detail))
+
+    # WHICH WORLDS CLAIM TO BE BEING BUILT RIGHT NOW.
+    #
+    # A lock file whose pid is alive makes the status producer prefer that
+    # world over every saved one, so the phone opens onto it. On this
+    # machine 29 of 163 worlds hold a lock and none carries `created_at`
+    # -- they predate the field -- so before `_holder_is_running` learned
+    # to compare the process start time against the lock file's own mtime,
+    # a recycled pid was indistinguishable from a live builder. Two
+    # reviewers hit the same alias within an hour and one reproduced the
+    # consequence end to end: a real walk built correctly and then, the
+    # moment finalization released its own lock, the live screen reverted
+    # to a fortnight-old empty world and said "Mapping" forever.
+    #
+    # The judgement is fixed. This verdict exists so the operator can SEE
+    # the condition rather than discover it mid-walk: any world reported
+    # live before a walk starts is one to look at.
+    try:
+        from tower.world_builder.store import WorldStore  # noqa: PLC0415
+
+        world_root = (report.get("calibrations") or {}).get("world_root")
+        if not world_root:
+            locks_ok, locks_detail = True, (
+                "no TOWER_WORLD_ROOT to check; nothing claims to be building"
+            )
+        else:
+            store = WorldStore(pathlib.Path(world_root))
+            held = live = 0
+            live_ids = []
+            for world_id in store.list_world_ids():
+                if not store.lock_path(world_id).exists():
+                    continue
+                held += 1
+                holder = store.lock_holder(world_id)
+                if holder and holder.get("alive"):
+                    live += 1
+                    live_ids.append(f"{world_id[:8]} (pid {holder.get('pid')})")
+            locks_ok = live == 0
+            if live:
+                locks_detail = (
+                    f"{live} of {held} lock files name a LIVE process: "
+                    + ", ".join(live_ids[:4])
+                    + ". If no walk is running, one of these is a recycled "
+                    "pid and the phone will open onto that world instead of "
+                    "the wearer's"
+                )
+            else:
+                locks_detail = (
+                    f"{held} lock file(s), none naming a live process"
+                    if held
+                    else "no world holds a writer lock"
+                )
+    except Exception as exc:  # noqa: BLE001 - a diagnostic never fails on its input
+        locks_ok = True
+        locks_detail = f"could not be checked ({type(exc).__name__})"
+    verdicts.append(("no_world_claims_to_be_building", locks_ok, locks_detail))
 
     # The interesting failure is specifically "GPU present, torch blind to
     # it": that is a fixable packaging problem rather than missing

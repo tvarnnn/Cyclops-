@@ -89,6 +89,14 @@ TOTAL_SEND_TIMEOUT_S = LOCK_TIMEOUT_S + SEND_TIMEOUT_S
 # never coming back. An earlier version logged each failure and continued
 # indefinitely, which is the silence this module's header calls the worst
 # outcome. Three, so a burst of contention cannot trip it.
+# How long one cartridge's snapshot may take before the pass moves on
+# without it. Generous by design: the slowest measured real snapshot is
+# World Builder's at ~40 ms on a 163-world root, and `GET /worlds` under a
+# disk fault that touches every manifest is ~2.1 s. This is not a
+# performance budget -- it is the line between "slow" and "wedged", and
+# only the second is worth telling a subscriber about.
+SNAPSHOT_TIMEOUT_SECONDS = 10.0
+
 MAX_CONSECUTIVE_TARGET_FAILURES = 3
 
 # Per connection. A client with more than this many open subscriptions is
@@ -594,10 +602,62 @@ class ResultHub:
 
         for target, sample in targets.items():
             try:
-                snapshot = await asyncio.to_thread(
-                    self._snapshot_for, sample.cartridge, sample.result_type,
-                    sample.world_id, sample.session_id,
+                # A DEADLINE, BECAUSE ONE CARTRIDGE MUST NOT BE ABLE TO
+                # SILENCE THE OTHERS BY BEING SLOW.
+                #
+                # These targets are polled SEQUENTIALLY, so a producer
+                # that blocks blocks everything behind it in the same
+                # pass. A reviewer measured both ends of that: a wedged
+                # World Builder read delivered **nothing at all, for any
+                # cartridge, across 12 poll windows** with no error and no
+                # `fail_target` -- the loop simply never came back -- and
+                # a merely SLOW producer (2 s) made Document Memory and
+                # Scene Understanding exactly **5x slower**.
+                #
+                # `asyncio.wait_for` cancels the await, not the thread:
+                # the worker keeps running to completion and is not
+                # reused for this pass, which is the correct trade. What
+                # it buys is that the loop returns, the other targets are
+                # served, and a target that keeps timing out reaches the
+                # consecutive-failure path below and TELLS its
+                # subscribers -- instead of every subscriber on the Tower
+                # going quiet with nothing said.
+                snapshot = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._snapshot_for, sample.cartridge,
+                        sample.result_type, sample.world_id,
+                        sample.session_id,
+                    ),
+                    timeout=SNAPSHOT_TIMEOUT_SECONDS,
                 )
+            except TimeoutError:
+                logger.warning(
+                    "[Tower][Results] snapshot for %s exceeded %.1fs; the "
+                    "other cartridges are being served without it",
+                    target, SNAPSHOT_TIMEOUT_SECONDS,
+                )
+                failures = self._failures.get(target, 0) + 1
+                self._failures[target] = failures
+                if failures >= MAX_CONSECUTIVE_TARGET_FAILURES:
+                    # The same notification the branch below makes, for
+                    # the same reason: persistent, not transient, so tell
+                    # this target's subscribers rather than logging into
+                    # the void forever.
+                    reason = (
+                        f"the Tower could not build this cartridge's state "
+                        f"within {SNAPSHOT_TIMEOUT_SECONDS:.0f}s, "
+                        f"{failures} times in a row"
+                    )
+                    for channel in list(self._channels):
+                        try:
+                            channel.fail_target(target, reason)
+                        except Exception:
+                            logger.exception(
+                                "[Tower][Results] could not notify a channel "
+                                "of a persistent target timeout"
+                            )
+                    self._failures.pop(target, None)
+                continue
             except Exception as exc:
                 # One unreadable target must not stop the others, and must
                 # not stop the loop. The producer already turns expected

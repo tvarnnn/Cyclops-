@@ -114,7 +114,24 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
     # The directory scan the listing uses, not `world.json`'s list: the
     # engine writes `session.json` before it appends to `world.json`, and a
     # session the listing offers must be one the render can find.
-    sessions = set(store.list_session_ids(world_id)) | set(world.session_ids)
+    # `world.session_ids` COMES OFF DISK UNCOERCED, and this line both
+    # hashes it and (below) sorts it. A `world.json` carrying
+    # `session_ids: [{"a": 1}]` raises `TypeError: unhashable` right here;
+    # one carrying `[123, "s0"]` hashes fine and then raises in the sort
+    # three lines down. Either is an HTTP **500 on the route the phone
+    # opens a saved world with**.
+    #
+    # A reviewer found both immediately after the round that hardened
+    # `candidates.sort` on line 141 and walked past line 127 -- in a round
+    # whose own title was about fixing things one line above the line it
+    # fixed.
+    #
+    # Ids are strings by contract; anything else is a corrupt record and
+    # is dropped rather than allowed to take the whole render with it. The
+    # directory scan is authoritative anyway, so a dropped `world.json`
+    # entry costs nothing that is actually on disk.
+    listed = {sid for sid in world.session_ids if isinstance(sid, str)}
+    sessions = set(store.list_session_ids(world_id)) | listed
     if session_id is not None:
         if session_id not in sessions:
             raise WorldRenderUnavailable(
@@ -138,6 +155,9 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
     # `started_at` comes off disk uncoerced, and a string beside a float
     # raises `TypeError` out of a route with no handler. Here that is a
     # 500 on the render page instead of the world.
+    # `pair[1]` is a session id and is now guaranteed to be a string --
+    # the union above drops anything else -- so the tiebreak cannot raise
+    # on a rank tie either.
     candidates.sort(key=lambda pair: (_sortable(pair[0]), pair[1]))
     return candidates[-1][1]
 

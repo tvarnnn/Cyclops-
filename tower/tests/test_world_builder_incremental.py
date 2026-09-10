@@ -898,3 +898,79 @@ class TestTheEngineFlushesRatherThanResolves:
         # rather than being handed the second session's solve.
         rebuilt = WorldBuilderEngine(store).build(world_id, first_session)
         assert rebuilt.points == first.points
+
+
+def test_a_frame_of_a_different_size_does_not_kill_the_walk(tmp_path):
+    """An unguarded C assertion on the live frame path.
+
+    `MotionTracker.measure` feeds this frame and a stored reference frame
+    straight into `cv2.calcOpticalFlowPyrLK`, which asserts they are the
+    same size -- in C, as a `cv2.error`, which is not a `ValueError` and
+    walks past `observe`'s decode guard. `world_build_session.py` catches
+    only `OSError` around the frame loop, so it reaches the outermost
+    `except BaseException`: session `end_reason: error`, finalization
+    `interrupted`, every remaining frame discarded.
+
+    A reviewer drove it through a real Tower -- 220 frames with a
+    resolution change at frame 120 -- and watched a wearer who walked the
+    whole room get "Interrupted".
+
+    Rejecting is the correct answer, not merely the safe one: the
+    calibration is per-resolution and exact, so a frame at a size this
+    session is not calibrated for could not have produced a usable pose.
+    """
+    import numpy as np
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera_matrix = ss.camera_matrix(width, height)
+    scene = ss.furnished_room()
+    poses = ss.strafe(8, step=0.09)
+    images = ss.render_sequence(scene, poses, camera_matrix, width, height)
+
+    engine = WorldBuilderEngine(WorldStore(tmp_path / "worlds"))
+    world_id = engine.create_world("Rung Change")
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated", model="pinhole",
+            fx=float(camera_matrix[0, 0]), fy=float(camera_matrix[1, 1]),
+            cx=float(camera_matrix[0, 2]), cy=float(camera_matrix[1, 2]),
+            calibrated_width=width, calibrated_height=height,
+        ),
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    try:
+        for index, image in enumerate(images[:4]):
+            engine.observe(ss.encode_jpeg(image), source_seq=index, wire_seq=index)
+
+        # THE RUNG CHANGE. A perfectly decodable JPEG of another size.
+        smaller = np.ascontiguousarray(images[4][:288, :384])
+        result = engine.observe(ss.encode_jpeg(smaller), source_seq=4, wire_seq=4)
+        assert result is not None
+        assert getattr(result, "reason", None) == "frame_size_changed", result
+
+        # ...and the walk carries on. This is the half that matters: the
+        # remaining frames were being discarded with the session.
+        for index, image in enumerate(images[5:], start=5):
+            engine.observe(ss.encode_jpeg(image), source_seq=index, wire_seq=index)
+
+        summary = engine.stop_session()
+        assert summary is not None
+    finally:
+        try:
+            engine.stop_session()
+        except Exception:
+            pass
+
+    store = WorldStore(tmp_path / "worlds")
+    session = store.read_session(world_id, session_id)
+    assert session.end_reason != "error", (
+        "one frame of the wrong size ended the whole walk"
+    )
+    assert session.keyframes_accepted > 0

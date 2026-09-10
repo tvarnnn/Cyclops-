@@ -471,3 +471,123 @@ def test_hub_shutdown_survives_a_reader_that_already_died():
 
 async def _noop_send(_payload):
     return None
+
+
+def test_a_wedged_cartridge_does_not_silence_the_others(monkeypatch):
+    """One producer that never returns must not take the Tower with it.
+
+    The targets are polled SEQUENTIALLY in one pass, so before this a
+    producer that blocked blocked everything behind it. A reviewer
+    measured both ends: a wedged World Builder read delivered **nothing
+    at all, for any cartridge, across 12 poll windows** -- no error, no
+    `fail_target`, the loop simply never came back -- and a merely slow
+    (2 s) producer made Document Memory and Scene Understanding exactly
+    5x slower.
+
+    That is the brief's own non-negotiable: a World Builder failure must
+    not degrade CV Lab, Object Memory, Document Memory, Scene
+    Understanding or the Tower's networking.
+    """
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "SNAPSHOT_TIMEOUT_SECONDS", 0.2)
+    release = threading.Event()
+    calls = []
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        calls.append(world_id)
+        if world_id == "wedged":
+            # Never returns within the deadline. Released at the end so
+            # the worker thread does not outlive the test.
+            release.wait(timeout=30)
+            return _snapshot("late")
+        return _snapshot("fine")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    async def _run():
+        channel = ConnectionChannel(hub, _capture, lambda: 0.0)
+        for index, world in enumerate(("wedged", "healthy")):
+            subscription = Subscription(
+                subscription_id=f"sub-{index}",
+                cartridge="world_builder",
+                result_type="status",
+                contract="c",
+                world_id=world,
+                session_id=None,
+                cursor_status=None,
+            )
+            await channel.add(subscription)
+        await hub.poll_once()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if delivered:
+                break
+        await channel.close()
+        return delivered
+
+    try:
+        messages = asyncio.run(_run())
+    finally:
+        release.set()
+
+    assert "wedged" in calls and "healthy" in calls, calls
+    assert [m["payload"]["revision_marker"] for m in messages] == ["fine"], (
+        "the healthy cartridge was silenced by the wedged one"
+    )
+
+
+def test_a_cartridge_that_keeps_timing_out_tells_its_own_subscribers(monkeypatch):
+    """And it must say so, rather than going quiet forever.
+
+    The consecutive-failure path exists so a persistent problem reaches
+    the people watching it instead of the log. A timeout is exactly such
+    a problem and was not routed into it.
+    """
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "SNAPSHOT_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        release.wait(timeout=30)
+        return _snapshot("late")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    async def _run():
+        channel = ConnectionChannel(hub, _capture, lambda: 0.0)
+        await channel.add(Subscription(
+            subscription_id="sub-0", cartridge="world_builder",
+            result_type="status", contract="c", world_id="wedged",
+            session_id=None, cursor_status=None,
+        ))
+        for _ in range(publisher_module.MAX_CONSECUTIVE_TARGET_FAILURES):
+            await hub.poll_once()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if delivered:
+                break
+        await channel.close()
+        return delivered
+
+    try:
+        messages = asyncio.run(_run())
+    finally:
+        release.set()
+
+    assert messages, "a target that timed out repeatedly said nothing at all"
+    reasons = " ".join(str(m) for m in messages)
+    assert "within" in reasons and "times in a row" in reasons, reasons

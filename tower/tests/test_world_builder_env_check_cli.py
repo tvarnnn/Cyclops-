@@ -400,3 +400,59 @@ def test_the_preflight_passes_the_backend_check_where_it_can_solve():
         "the test suite is running on an interpreter with no SfM backend: "
         + detail
     )
+
+
+def test_the_preflight_names_a_world_that_claims_to_be_building(tmp_path):
+    """A lock whose pid is alive makes the phone open onto THAT world.
+
+    `_most_relevant` prefers a world with a live lock over every saved
+    one. The judgement is now sound -- a process that started after the
+    lock was written cannot be its writer -- but the operator should be
+    able to SEE the condition before walking rather than discover it
+    afterwards, which is what this verdict is for.
+    """
+    import json as _json
+    import os as _os
+
+    import psutil
+
+    from tower.world_builder.records import World
+    from tower.world_builder.store import WorldStore
+
+    module = _env_check_module()
+    store = WorldStore(tmp_path / "worlds")
+    world_id = "w" * 32
+    # A real record: `list_world_ids` answers about worlds, not about
+    # stray lock files.
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=2.0,
+                            session_ids=()))
+    lock = store.lock_path(world_id)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
+    report = _stub_report()
+    report["calibrations"] = {"world_root": str(store.root)}
+
+    def verdict():
+        rows = {n: (ok, d) for n, ok, d in module.build_verdicts(report)}
+        return rows["no_world_claims_to_be_building"]
+
+    # A live lock: this process, written after it started -- the shape a
+    # real builder leaves.
+    started = psutil.Process(_os.getpid()).create_time()
+    lock.write_text(_json.dumps({"pid": _os.getpid()}), encoding="utf-8")
+    _os.utime(lock, (started + 1.0, started + 1.0))
+    ok, detail = verdict()
+    assert ok is False, detail
+    assert "LIVE process" in detail and world_id[:8] in detail
+
+    # The same lock, written a fortnight before this process existed: a
+    # recycled pid, and not something to warn about.
+    _os.utime(lock, (started - 14 * 86_400,) * 2)
+    ok, detail = verdict()
+    assert ok is True, detail
+    assert "none naming a live process" in detail
+
+    # And no lock at all.
+    lock.unlink()
+    ok, detail = verdict()
+    assert ok is True and "no world holds a writer lock" in detail

@@ -197,6 +197,11 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        # The size every frame of this session must be. Set by the
+        # first frame rather than from the declared size, because
+        # the declared size is what the phone SAYS and this is what
+        # it actually sent. See `observe`.
+        self._frame_shape = None
         self._segment_solved = 0
         self._barren_segments = 0
         self._segments_used: set[int] = set()
@@ -263,6 +268,11 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        # The size every frame of this session must be. Set by the
+        # first frame rather than from the declared size, because
+        # the declared size is what the phone SAYS and this is what
+        # it actually sent. See `observe`.
+        self._frame_shape = None
         # Reset with its sibling. start_session resets every other piece
         # of per-session state; leaving this one behind let a new
         # session inherit a restart budget the previous one earned.
@@ -300,6 +310,41 @@ class WorldBuilderEngine:
             self._note_rejected("malformed_frame")
             self._events.append("frame_rejected", {"reason": "malformed_frame"})
             return self._result("reject", "malformed_frame")
+
+        # A FRAME OF A DIFFERENT SIZE IS REJECTED, NOT TRACKED.
+        #
+        # `MotionTracker.measure` feeds this frame and a stored reference
+        # frame straight into `cv2.calcOpticalFlowPyrLK`, which asserts
+        # they are the same size -- in C, as a `cv2.error`, which is not a
+        # `ValueError` and so walks straight past the guard above.
+        # `world_build_session.py` catches only `OSError` around the frame
+        # loop, so it reaches the outermost `except BaseException`: the
+        # session is closed `end_reason: error`, finalization
+        # `interrupted`, and every remaining frame of the walk is
+        # discarded. A reviewer drove exactly that through a real Tower --
+        # 220 frames with a rung change at frame 120 -- and the wearer,
+        # who walked the whole room, gets "Interrupted".
+        #
+        # Rejecting is not merely safer than crashing, it is the correct
+        # answer: the calibration is per-resolution and exact, so a frame
+        # at a size this session is not calibrated for could not have
+        # produced a usable pose anyway. `_require_matching_resolution`
+        # would refuse the build at the next rebuild for the same reason
+        # -- and that exception is raised in one place and caught
+        # NOWHERE, so this guard is what stops it ever being reached.
+        #
+        # Counted and named, so a walk that quietly changed rung is
+        # visible afterwards instead of merely short.
+        if self._frame_shape is None:
+            self._frame_shape = gray.shape[:2]
+        elif gray.shape[:2] != self._frame_shape:
+            self._note_rejected("frame_size_changed")
+            self._events.append("frame_rejected", {
+                "reason": "frame_size_changed",
+                "expected": list(self._frame_shape),
+                "received": list(gray.shape[:2]),
+            })
+            return self._result("reject", "frame_size_changed")
 
         quality = analyse_frame(gray)
         self._selector.note_frame(quality)

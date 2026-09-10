@@ -699,7 +699,28 @@ def _offer_capture_opened(supervisor, capture_id, capture_dir, continues) -> Non
         )
 
 
-def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
+async def _stop_capture(
+    websocket, reason: str = END_REASON_STOP, owner=None
+) -> None:
+    """Stop recording and tell the worker supervisor, WITHOUT stalling the loop.
+
+    **`supervisor.capture_closed()` can block for the whole detach
+    grace.** It calls `reap()` and then holds the supervisor's lock across
+    a `detach`, and World Builder's `stop_grace_seconds` is **30.0**
+    (`main.py`). Run on the event loop -- which is where both callers are
+    -- that stops every cartridge, every frame reply, every result and
+    `/health` for the duration. A reviewer measured **33.72 seconds** of
+    dead loop against the real supervisor, reached by the ordinary
+    sequence "press Stop, lose WiFi".
+
+    The sibling call was already moved for exactly this reason: see
+    `_offer_capture_opened` below, whose comment explains why interleaving
+    is safe -- the supervisor's RLock and its lineage bookkeeping exist to
+    handle it. `capture_closed` was left behind on the loop.
+
+    The recorder stop itself stays inline: it is a file close, it is fast,
+    and serialising recorder teardown per connection is deliberate.
+    """
     supervisor = _capture_workers(websocket)
     for observer in _frame_observers(websocket):
         closed_id = None
@@ -726,7 +747,7 @@ def _stop_capture(websocket, reason: str = END_REASON_STOP, owner=None) -> None:
         _tell_cartridges_about_capture(websocket, closed_id, opened=False)
         try:
             if supervisor is not None:
-                supervisor.capture_closed(closed_id)
+                await asyncio.to_thread(supervisor.capture_closed, closed_id)
         except Exception:
             logger.exception(
                 "[Tower][Capture] could not notify the worker supervisor that "
@@ -831,7 +852,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "[Tower][Session] stream_stop received with no active "
                         "measurement window"
                     )
-                _stop_capture(websocket, END_REASON_STOP, owner=connection_token)
+                await _stop_capture(
+                    websocket, END_REASON_STOP, owner=connection_token
+                )
                 await _close_cartridge_streams(websocket, connection_token)
             elif message_type in cv_lab_ws.CV_LAB_MESSAGE_TYPES:
                 await cv_lab_ws.handle(
@@ -907,7 +930,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         try:
             await channels.close()
         finally:
-            _stop_capture(
+            await _stop_capture(
                 websocket, END_REASON_DISCONNECT, owner=connection_token
             )
             # On ANY exit, not only a polite stream_stop, and for the same
