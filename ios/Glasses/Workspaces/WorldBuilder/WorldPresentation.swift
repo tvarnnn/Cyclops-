@@ -809,7 +809,27 @@ enum WorldReconstruction: Equatable {
         case .mapping, .building:
             return .partial(target, note: "This world is still being built, so it will change.")
         case .improving, .finalizing:
-            return .partial(target, note: "This world is being finished, so it will change.")
+            // NOT "it will change" — that reads as polish, and this is not
+            // polish. The final solve is what MAKES the world: on the
+            // 2026-09-09 capture it took the reconstruction from 16
+            // disconnected components to 6, and put 652 of 795 keyframes
+            // into one. Opening a world before it lands shows the
+            // shattered version, and a wearer who does that concludes the
+            // walk failed about 170 seconds before it succeeds — measured
+            // at 179 s post-Stop on a four-minute walk, with nothing on
+            // screen moving for any of it.
+            //
+            // A note is the only place this can be said: the Tower
+            // publishes no progress during finalization (the payload is
+            // byte-identical from second 3 to second 179), so the phone
+            // cannot show a bar, and the button is deliberately not
+            // disabled — a wearer who wants to look is entitled to.
+            return .partial(
+                target,
+                note: "This world is still being finished. It usually takes a "
+                    + "few minutes, and the finished world is very different "
+                    + "from this one — it is worth waiting for Saved."
+            )
         case .partial:
             return .partial(
                 target,

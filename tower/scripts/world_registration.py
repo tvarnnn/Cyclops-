@@ -2362,7 +2362,28 @@ def main(argv=None) -> int:
         # display, and a transform that will be applied must not be
         # rounded. Five decimal places puts a quaternion 1.9e-6 off
         # unit, which is invisible until a validator refuses it.
-        manifest = store.read_derived_manifest(args.world) or {}
+        # The SESSION's manifest -- see
+        # `world_build_session.session_manifest`. Stamping a placement
+        # with another session's digest makes the reader refuse it.
+        #
+        # `session_id`, THE RESOLVED ONE. This read `args.session`, which
+        # is None on every invocation that lets the CLI pick the world's
+        # only session -- which is what its own `--session` help text
+        # says it is for. `session_manifest_path` then did
+        # `derived_dir / None` and the whole run died with a TypeError
+        # AFTER `register()` had done the expensive Sim3 pass, throwing
+        # the walk away. That is the loss `register_session`'s try/except
+        # exists to prevent, reintroduced in a different file.
+        #
+        # I made this exact mistake in `world_finalize.py` an hour
+        # earlier, wrote a comment there explaining it, and then made it
+        # again here. A reviewer ran the CLI; nothing in the suite does.
+        manifest = store.read_session_manifest(args.world, session_id)
+        if not (isinstance(manifest, dict)
+                and manifest.get("session_id") == session_id):
+            manifest = store.read_derived_manifest(args.world) or {}
+            if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
+                manifest = {}
         placements = placements_from_report(
             report, input_digest=manifest.get("input_digest")
         )

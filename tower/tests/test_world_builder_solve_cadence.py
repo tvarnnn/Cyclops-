@@ -242,51 +242,83 @@ class TestLoopDetectionIsALiveSettingNotAFinalisationOne:
 class TestTheRebuildIntervalGrowsWithTheWorld:
     """`--rebuild-every 4` is a fixed count; the rebuild is not a fixed cost.
 
-    `write_derived` rewrites poses, points, support and the manifest IN FULL
-    every time, so it grows with the world while a fixed interval does not.
-    Measured against derived trees at the field walk's own ratios (33.5
-    points and 26.2 support rows per keyframe): 0.34 s at 795 keyframes,
-    0.86 s at 2,000, 1.85 s at 4,000, 3.48 s at 6,000.
+    THE FIRST VERSION OF THIS MODELLED THE WRONG OPERATION. It costed
+    `write_derived` -- 0.34 s at 795 keyframes -- and concluded the crossover
+    was about 2,700 keyframes, roughly fourteen minutes. The loop does not
+    call `write_derived`; it calls `engine.build()`, which is that write plus
+    the merge, the placement pass and the manifest.
 
-    At the measured 3.2 keyframes/sec, four keyframes is 1.21 s of wall
-    clock. The write alone crosses that at about 2,700 keyframes -- roughly
-    fourteen minutes -- and the stated target is twenty to thirty. Past that
-    point the builder falls behind for the rest of the walk with the capture
-    directory as its only queue.
+    Measured over the 204 rebuilds of a replay of the real 2026-09-09
+    capture, against that walk's own arrival rate of 3.23 keyframes/second:
+
+        keyframes     mean build     share at interval 4
+          1- 200        0.141 s            11.4%
+        201- 400        0.386 s            31.1%
+        401- 600        0.585 s            47.2%
+        601- 800        1.006 s            81.2%
+        801-1000        0.895 s            72.2%
+
+    81% where the model said 27%, and it is reached at about four minutes of
+    walking rather than fourteen. The old knee also arrived a doubling late:
+    `(accepted // 750).bit_length() - 1` is zero below 1500, so nothing
+    widened until long after the builder had stopped keeping up.
     """
 
     def test_a_short_walk_is_unchanged(self):
         from scripts.world_build_session import rebuild_interval
 
-        # The 2026-09-09 walk was 795 keyframes. Nothing about it moves.
-        for accepted in (2, 100, 400, 749):
+        for accepted in (2, 100, 400, 599):
             assert rebuild_interval(4, accepted) == 4, accepted
-        assert rebuild_interval(4, 795) == 4
+
+    def test_the_walk_that_started_this_campaign_now_widens(self):
+        """795 keyframes used to be explicitly exempted -- "nothing about the
+        2026-09-09 walk moves" -- on a model that undercounted the rebuild by
+        three times. At 795 the builder is measured at 81% of wall clock. It
+        is the case that most needs the widening, not the one to protect from
+        it."""
+        from scripts.world_build_session import rebuild_interval
+
+        assert rebuild_interval(4, 795) == 8
 
     def test_the_interval_doubles_as_the_world_doubles(self):
         from scripts.world_build_session import rebuild_interval
 
-        assert rebuild_interval(4, 1500) == 8
-        assert rebuild_interval(4, 3000) == 16
-        assert rebuild_interval(4, 6000) == 32
+        assert rebuild_interval(4, 600) == 4
+        assert rebuild_interval(4, 601) == 8
+        assert rebuild_interval(4, 1200) == 16
+        assert rebuild_interval(4, 2400) == 32
+        assert rebuild_interval(4, 4800) == 64
 
     def test_the_rebuild_stays_a_bounded_share_of_the_walk(self):
         """The property, not the numbers: rebuilding must not outgrow walking.
 
-        With a fixed four the share runs 27% -> 69% -> 148% -> 288%, and
-        anything over 100% is a builder that can never catch up.
+        Costed on `engine.build()`, which is what the loop pays. The measured
+        rows are the replay's own; the larger two extrapolate its slope
+        (~0.0013 s per keyframe of world), and are the sizes a 20-30 minute
+        walk reaches. With a fixed four the share runs 81% at 795 and past
+        100% before 1,200 -- a builder that can never catch up.
         """
         from scripts.world_build_session import rebuild_interval
 
-        measured_write_seconds = {795: 0.342, 1500: 0.65, 3000: 1.40, 6000: 3.481}
-        keyframes_per_second = 3.2
-        for accepted, write in measured_write_seconds.items():
+        measured_build_seconds = {700: 1.006, 900: 0.895, 1500: 1.95,
+                                  3000: 3.90, 6000: 7.80}
+        keyframes_per_second = 3.23
+        for accepted, build in measured_build_seconds.items():
             interval = rebuild_interval(4, accepted)
-            share = write / (interval / keyframes_per_second)
-            assert share < 0.5, (
+            share = build / (interval / keyframes_per_second)
+            assert share < 0.6, (
                 f"at {accepted} keyframes the rebuild is {share:.0%} of the "
                 "wall clock; the builder cannot keep up"
             )
+
+    def test_a_fixed_interval_would_fail_that_property(self):
+        """So the property above is not vacuously true of any schedule."""
+        keyframes_per_second = 3.23
+        share = 1.006 / (4 / keyframes_per_second)
+        assert share > 0.6, (
+            "the fixed interval this replaced would have passed; the "
+            "property is measuring nothing"
+        )
 
     def test_it_stops_doubling_rather_than_running_away(self):
         """A cap, so a pathological session cannot stop rebuilding entirely."""

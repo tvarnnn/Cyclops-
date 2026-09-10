@@ -21,6 +21,7 @@ hiccup.
 
 import base64
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -328,3 +329,216 @@ def test_an_absent_journal_yields_nothing(tmp_path):
     from tower.capture import _JournalTail
 
     assert _JournalTail(tmp_path / "missing.jsonl").read_new() == []
+
+
+# -- a stop that arrives while a reconnect is in flight ------------------
+
+
+def test_a_stop_during_the_reconnect_wait_is_noticed_immediately(tmp_path):
+    """Ninety seconds is a long time to be deaf.
+
+    `_await_successor` polled the whole grace window without ever asking
+    `should_stop`, and `routes/ws.py` stops every cartridge session when
+    the last connection goes -- which a slow reconnect is exactly what
+    gets you. A reviewer measured this Tower's own 52 reconnect chains and
+    found three at 31-35 s, against a socket the server notices as dead in
+    20-40 s.
+    """
+    recorder = CaptureRecorder(tmp_path)
+    first = recorder.start(owner=object())
+    recorder.write_frame(_jpeg(10), source_seq=1)
+    recorder.stop(END_REASON_DISCONNECT)
+    # No successor exists yet, so the follower would wait out the window.
+
+    slept = []
+    follower = CaptureFollower(
+        recorder.capture_dir(first),
+        poll_seconds=0.001,
+        sleep=lambda s: slept.append(s),
+        resume_grace_seconds=90.0,
+    )
+    seqs = list(follower.follow(should_stop=lambda: True))
+
+    assert seqs == [], "a stop before the first poll must not pull in a frame"
+    assert slept == [], (
+        f"the follower slept {len(slept)} times after being told to stop"
+    )
+    assert follower.stopped_awaiting_successor() is False, (
+        "nothing was awaited: the stop arrived before the journal was read"
+    )
+
+
+def test_a_stop_mid_reconnect_does_not_bind_to_a_capture_it_never_reads(tmp_path):
+    """The truncation, not the delay -- and it is the worse half.
+
+    The loop ran to the end of the grace window, found the successor,
+    rebound onto it, and `continue`d straight into the `should_stop` check
+    at the top of `follow`. It returned having read ZERO frames of the
+    capture it had just bound to, and the rebind moved `end_reason()` onto
+    a capture that was still open -- so the walk was silently truncated at
+    the reconnect and nothing downstream could say so.
+    """
+    recorder = CaptureRecorder(tmp_path)
+    first = recorder.start(owner=object())
+    recorder.write_frame(_jpeg(10), source_seq=1)
+    recorder.stop(END_REASON_DISCONNECT)
+    second = recorder.start(owner=object(), continues=first)
+    recorder.write_frame(_jpeg(200), source_seq=2)
+
+    # Stop on the SECOND ask: the first is the one at the top of `follow`,
+    # before the journal is read, so the walk's own frame still lands.
+    asks = {"n": 0}
+
+    def should_stop():
+        asks["n"] += 1
+        return asks["n"] > 1
+
+    follower = CaptureFollower(
+        recorder.capture_dir(first), poll_seconds=0.001, sleep=lambda _s: None,
+    )
+    seqs = [frame.source_seq for frame in follower.follow(should_stop=should_stop)]
+
+    assert seqs == [1], "the predecessor's frames were not read"
+    assert follower.directory.name == first, (
+        "the follower bound to a successor it never read a frame of; "
+        f"end_reason() now describes {follower.directory.name}"
+    )
+    assert follower.stopped_awaiting_successor() is True, (
+        "nothing recorded that a reconnect was in flight when the stop "
+        "landed, so a caller cannot tell this walk from a finished one"
+    )
+    assert follower.end_reason() == END_REASON_DISCONNECT
+
+
+def test_a_permanent_disconnect_is_still_an_ordinary_end(tmp_path):
+    """The flag means "a reconnect was in flight", not "a stop arrived".
+
+    The first version set it on ANY stop landing inside the 90 s grace
+    window -- which is also the ordinary shape of a phone that disconnects
+    for good: the socket dies, `routes/ws.py` stops the session 20-40 s
+    later, comfortably inside the grace. So it quietly reversed the policy
+    in `world_build_session.py` that a `disconnect` capture counts as
+    finished, and a permanent disconnect started reporting `interrupted`
+    -- this campaign's headline symptom, back through the door it was
+    pushed out of. Measured by a reviewer running the CLI, not inferred.
+    """
+    recorder = CaptureRecorder(tmp_path)
+    first = recorder.start(owner=object())
+    recorder.write_frame(_jpeg(10), source_seq=1)
+    recorder.stop(END_REASON_DISCONNECT)
+    # No successor, and none is coming.
+
+    asks = {"n": 0}
+
+    def should_stop():
+        asks["n"] += 1
+        return asks["n"] > 1
+
+    follower = CaptureFollower(
+        recorder.capture_dir(first), poll_seconds=0.001, sleep=lambda _s: None,
+    )
+    seqs = [frame.source_seq for frame in follower.follow(should_stop=should_stop)]
+
+    assert seqs == [1]
+    assert follower.stopped_awaiting_successor() is False, (
+        "a phone that never came back was reported as an interrupted walk"
+    )
+
+
+def test_finding_a_successor_does_not_read_every_capture_on_the_disk(tmp_path):
+    """The grace window has to be bounded by the grace window.
+
+    `_find_successor` opened and parsed every `capture.json` under the
+    captures root, in `iterdir` order, with no early exit -- and it runs
+    once per poll for up to 360 polls. A reviewer measured **11 ms per scan
+    against 104 real captures**, so a "ninety second" wait actually ran
+    94 s, an overrun that grows with a directory that only ever grows.
+
+    Newest first, and nothing older than the capture being followed: a
+    successor is created after its predecessor ends, so an older directory
+    cannot be one. The scan now stops at the first match instead of
+    reading past it.
+    """
+    import tower.capture as capture_module
+
+    recorder = CaptureRecorder(tmp_path)
+    # Twenty finished, unrelated captures, all older than the walk.
+    for _ in range(20):
+        stale = recorder.start(owner=object())
+        recorder.write_frame(_jpeg(1), source_seq=1)
+        recorder.stop(END_REASON_STOP)
+
+    first = recorder.start(owner=object())
+    recorder.write_frame(_jpeg(10), source_seq=1)
+    recorder.stop(END_REASON_DISCONNECT)
+    second = recorder.start(owner=object(), continues=first)
+    recorder.write_frame(_jpeg(200), source_seq=2)
+    recorder.stop(END_REASON_STOP)
+
+    opened = []
+    real_read = capture_module.read_json_closed
+
+    def counting_read(path):
+        opened.append(pathlib.Path(path).parent.name)
+        return real_read(path)
+
+    capture_module.read_json_closed = counting_read
+    try:
+        follower = CaptureFollower(
+            recorder.capture_dir(first), poll_seconds=0.001, sleep=lambda _s: None,
+        )
+        found = follower._find_successor()
+    finally:
+        capture_module.read_json_closed = real_read
+
+    assert found is not None and found.name == second
+    assert opened == [second], (
+        f"the scan opened {len(opened)} manifests to find a successor that is "
+        f"the newest directory there is: {opened}"
+    )
+
+
+def test_a_successor_created_before_its_predecessor_closed_is_still_found(tmp_path):
+    """The prune must not be able to lose a successor permanently.
+
+    `_find_successor` skips directories older than the capture it follows.
+    A reviewer measured what that cuts: `write_json_atomic` on
+    `capture.json` bumps the parent directory's mtime, so the predecessor's
+    `stop()` moves it FORWARD -- and `CaptureRecorder.stop`'s own docstring
+    records the ordering where the new connection arms a recording before
+    the old connection's `finally` stops the previous one. The successor is
+    then older than its predecessor, pruned by fractions of a second, and
+    missed on **0 of 360 polls** -- both mtimes are frozen for the whole
+    window, so a prune that misses once misses every time.
+
+    The compound cost is the part that matters: the follower reports no
+    reconnect, the walk finalises as an ordinary end, and the successor's
+    frames are silently dropped from a world reported Saved.
+    """
+    import os
+
+    recorder = CaptureRecorder(tmp_path)
+    first = recorder.start(owner=object())
+    recorder.write_frame(_jpeg(10), source_seq=1)
+    recorder.stop(END_REASON_DISCONNECT)
+    second = recorder.start(owner=object(), continues=first)
+    recorder.write_frame(_jpeg(200), source_seq=2)
+    recorder.stop(END_REASON_STOP)
+
+    # The inverted ordering, forced: the successor's directory predates the
+    # predecessor's final manifest write.
+    predecessor = recorder.capture_dir(first)
+    successor = recorder.capture_dir(second)
+    stamp = predecessor.stat().st_mtime
+    os.utime(successor, (stamp - 0.5, stamp - 0.5))
+    assert successor.stat().st_mtime < predecessor.stat().st_mtime
+
+    follower = CaptureFollower(
+        predecessor, poll_seconds=0.001, sleep=lambda _s: None,
+    )
+    assert follower._find_successor() is not None, (
+        "a successor 0.5 s older than its own predecessor was pruned away"
+    )
+
+    seqs = [frame.source_seq for frame in follower.follow(max_idle_polls=3)]
+    assert seqs == [1, 2], f"the walk was cut at the reconnect: {seqs}"

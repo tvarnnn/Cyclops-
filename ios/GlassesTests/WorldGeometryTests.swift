@@ -1958,7 +1958,7 @@ final class WorldBuilderContractAdoptionTests: XCTestCase {
     func testTheStatusContractIsTheOneThisTowerServes() {
         XCTAssertEqual(
             WorldBuilderResultContract.identifier,
-            "world_builder.status/2026-09-06"
+            "world_builder.status/2026-09-10"
         )
     }
 

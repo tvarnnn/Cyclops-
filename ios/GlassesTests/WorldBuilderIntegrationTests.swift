@@ -470,7 +470,7 @@ final class TowerWorldBuilderClientTests: XCTestCase {
     /// `nonisolated` because it is read as a default argument below, and a
     /// default argument is evaluated in the caller's context rather than in
     /// this class's. A constant string has no isolation to give up.
-    private nonisolated static let contract = "world_builder.status/2026-09-06"
+    private nonisolated static let contract = "world_builder.status/2026-09-10"
 
     private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
 
@@ -1451,7 +1451,7 @@ final class WorldBuilderContract20260825Tests: XCTestCase {
     /// Pinning either old one now would ask the Tower for a contract it no
     /// longer serves.
     func testThisBuildImplementsTheContractTheTowerNowOffers() {
-        XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-09-06")
+        XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-09-10")
         XCTAssertFalse(
             TowerCapabilities.supported.contains("world_builder.status/2026-08-25"),
             "the 2026-08-25 contract is still claimed; it has no word for an interrupted world"
@@ -1464,7 +1464,7 @@ final class WorldBuilderContract20260825Tests: XCTestCase {
         // `ProductShellTests.testTheImplementedContractsAreExactlyTheFiveThisBuildDecodes`.
         // Re-asserting it here made a World Builder test fail for a Scene
         // Understanding change, which points a reader at the wrong lane.
-        XCTAssertTrue(TowerCapabilities.supported.contains("world_builder.status/2026-09-06"))
+        XCTAssertTrue(TowerCapabilities.supported.contains("world_builder.status/2026-09-10"))
         XCTAssertFalse(
             TowerCapabilities.supported.contains("world_builder.status/2026-08-23"),
             """
@@ -1765,13 +1765,13 @@ final class TowerWorldBuilderSessionBindingTests: XCTestCase {
     /// Written out rather than read from `WorldBuilderResultContract`, so this
     /// suite pins the string the Tower actually offers instead of agreeing with
     /// whatever the app happens to hold.
-    private static let contract = "world_builder.status/2026-09-06"
+    private static let contract = "world_builder.status/2026-09-10"
     private static let ourCapture = "6bf1c84c92f94fb68db62d5ba24c3ad2"
     private static let earlierCapture = "2e6cff0d1a3b4c5d6e7f8091a2b3c4d5"
 
     private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
 
-    private func serve(_ server: MockTowerServer, contract: String = "world_builder.status/2026-09-06") {
+    private func serve(_ server: MockTowerServer, contract: String = "world_builder.status/2026-09-10") {
         server.onText = { text in
             guard
                 let data = text.data(using: .utf8),
@@ -2451,7 +2451,7 @@ final class WorldRenderViewerTests: XCTestCase {
 
 // MARK: - The 2026-09-06 contract: interrupted, selection, finalization
 
-/// The decode half of `world_builder.status/2026-09-06`, with no socket in
+/// The decode half of `world_builder.status/2026-09-10`, with no socket in
 /// it. The new word, the new block that says why a world is on the wire, and
 /// the builder's finalization record.
 @MainActor
@@ -2731,8 +2731,8 @@ final class WorldBuilderContract20260906PayloadTests: XCTestCase {
     // MARK: the identifier
 
     func testTheContractIdentifierIsTheNewOneAndTheOldOneIsNoLongerClaimed() {
-        XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-09-06")
-        XCTAssertTrue(TowerCapabilities.supported.contains("world_builder.status/2026-09-06"))
+        XCTAssertEqual(WorldBuilderResultContract.identifier, "world_builder.status/2026-09-10")
+        XCTAssertTrue(TowerCapabilities.supported.contains("world_builder.status/2026-09-10"))
         XCTAssertFalse(TowerCapabilities.supported.contains("world_builder.status/2026-08-25"))
         XCTAssertFalse(TowerCapabilities.supported.contains("world_builder.status/2026-08-23"))
     }
@@ -2756,11 +2756,11 @@ final class WorldBuilderContract20260906PayloadTests: XCTestCase {
 // MARK: - Live versus History over a real socket
 
 /// The ownership rule and the C3 subscription race, against the mock Tower
-/// speaking `world_builder.status/2026-09-06` with its `selection` block.
+/// speaking `world_builder.status/2026-09-10` with its `selection` block.
 @MainActor
 final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
 
-    private nonisolated static let contract = "world_builder.status/2026-09-06"
+    private nonisolated static let contract = "world_builder.status/2026-09-10"
     private static let host = URL(string: "http://stub.invalid")!
 
     private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }

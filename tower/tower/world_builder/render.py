@@ -403,7 +403,12 @@ def derived_current(store: WorldStore, world_id: str, session_id: str):
         digest = compute_input_digest(store.read_keyframes(world_id, session_id))
     except Exception:  # noqa: BLE001 - an unreadable journal is "unknown", not "stale"
         return None
-    return bool(store.derived_is_current(world_id, digest))
+    # WITH the session id -- see `WorldStore.derived_currency`. The render
+    # page for an earlier walk showed "stale" against a digest belonging to
+    # a different session entirely. `None` ("nothing can judge it") reports
+    # as not-current here, which is what this function's own docstring
+    # already promises for the unknowable case.
+    return bool(store.derived_currency(world_id, digest, session_id) is True)
 
 
 def compose_frames(segments: dict):

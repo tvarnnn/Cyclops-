@@ -348,7 +348,29 @@ def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls,
             received_at=frame.received_at,
             width=frame.width,
             height=frame.height,
-            source_path=directory / frame.relpath,
+            # `follower.directory`, NOT the `directory` this generator was
+            # called with. `relpath` is relative to the capture the frame
+            # CAME FROM, and a reconnect retargets the follower onto a
+            # successor -- the comment fifteen lines above says so about
+            # `is_closed()` and this line was left reading the closure.
+            #
+            # Measured on the 2026-09-09 field walk, which reconnected once:
+            # `sources.json` named capture 6a1b544c for all 643 keyframes,
+            # and 523 of them were actually in dd885cca. Every one of those
+            # 523 resolved to a path that does not exist, so `_source_frame`
+            # fell back to the session's face-redacted copies and COLMAP
+            # was fed those instead of the raw frames -- for 81% of the
+            # walk. This is the mechanism behind what the handoff had
+            # recorded as "sources.json is already 523/643 stale"; nothing
+            # was stale, the ledger was wrong when it was written.
+            #
+            # It could have been worse than missing. The phone's source
+            # index happened to run 1..953 in the first capture and
+            # 1309..6109 in the second, so no path collided; had the
+            # counter restarted at 1, the same bug would have handed
+            # COLMAP a DIFFERENT REAL PHOTOGRAPH under the right name, and
+            # nothing anywhere would have noticed.
+            source_path=follower.directory / frame.relpath,
         )
 
 
@@ -923,31 +945,85 @@ def solve_session(store: WorldStore, world_id: str, session_id: str, *, capture_
 #
 # So the interval grows with the world, doubling each time the keyframe
 # count doubles past the knee. That keeps the rebuild a bounded FRACTION of
-# the wall clock instead of a growing one. The knee is 750 because that is
-# what puts the fraction where it should be at both ends:
+# the wall clock instead of a growing one, rather than 27% -> 69% -> 148%
+# -> 288%, which is what a fixed four gives and is why the builder fell
+# behind for the back half of a long walk.
 #
-#   keyframes   interval   rebuild every   write    share of wall clock
-#         795        4        1.2 s        0.34 s        27%   (unchanged)
-#        1500        8        2.5 s        0.65 s        26%
-#        3000       16        5.0 s        1.4 s         28%
-#        6000       32       10.0 s        3.5 s         35%
-#
-# rather than 27% -> 69% -> 148% -> 288%, which is what a fixed four gives
-# and is why the builder fell behind for the back half of a long walk.
+# EVERYTHING ABOVE IS THE ORIGINAL REASONING AND IT IS SOUND. THE NUMBERS
+# IN IT ARE NOT: they cost `write_derived`, and the loop calls
+# `engine.build()`. The knee was 750 and the schedule was 795->4,
+# 1500->8, 3000->16, 6000->32. The block immediately below supersedes all
+# of that -- read it, not this.
 #
 # The wearer loses nothing that matters. A rebuild is a redraw of a world
 # that is already mostly settled by then, and the two triggers that carry
 # real news are untouched: a completed background solve still forces a
 # rebuild immediately, and the final build still runs at Stop.
-REBUILD_KNEE_KEYFRAMES = 750
+# RE-ANCHORED ON WHAT THE LOOP ACTUALLY PAYS.
+#
+# The first version of this modelled `write_derived` -- 0.342 s at 795
+# keyframes -- and set the knee at 750 so that "nothing about the
+# 2026-09-09 walk moves". The loop below does not call `write_derived`; it
+# calls `engine.build()`, which is that write plus the merge, the placement
+# pass and the manifest. Measured over the 204 rebuilds of a replay of the
+# real field capture, against that walk's own arrival rate of 3.23
+# keyframes/second:
+#
+#     keyframes     mean build     share of wall clock at interval 4
+#       1- 200        0.141 s              11.4%
+#     201- 400        0.386 s              31.1%
+#     401- 600        0.585 s              47.2%
+#     601- 800        1.006 s              81.2%
+#     801-1000        0.895 s              72.2%
+#
+# 81%, where the model said 27%. So the knee was in the wrong place AND
+# arrived one doubling late: `(accepted // 750).bit_length() - 1` is zero
+# for everything below 1500, which is about eight minutes -- the interval
+# did not widen until long after the builder had stopped keeping up.
+#
+# 600 and no `- 1`, so the first doubling lands where the measured share
+# crosses a half: 8 from 601, 16 from 1200, 32 from 2400, 64 from 4800,
+# and capped there. `min(doublings, 4)` still caps at `4 << 4` = 64; it
+# now engages at 9,600 rather than 12,000, which is past where 64 is
+# first reached either way. At 3.23 keyframes/second that is a live refresh every
+# 2.5 s at the start of the widening and every 20 s at the cap, against a
+# builder that otherwise falls permanently behind the camera with the
+# capture directory as its only queue.
+REBUILD_KNEE_KEYFRAMES = 600
 
 
 def rebuild_interval(base: int, accepted: int) -> int:
     """The rebuild interval for a world of `accepted` keyframes."""
     if accepted <= REBUILD_KNEE_KEYFRAMES:
         return base
-    doublings = (accepted // REBUILD_KNEE_KEYFRAMES).bit_length() - 1
+    doublings = (accepted // REBUILD_KNEE_KEYFRAMES).bit_length()
     return base << min(doublings, 4)
+
+
+def session_manifest(store, world_id: str, session_id: str) -> dict:
+    """The manifest that describes THIS session, from either copy.
+
+    THE READER WAS FIXED AND THE WRITERS WERE NOT. `usable_placements`
+    judges a placement by the session's own manifest; the two places that
+    STAMP a placement's `input_digest` still read the world's, which names
+    whichever session built last. In the live flow they are the same file's
+    contents, so nothing showed -- but `world_registration.py --write
+    --session <older>` on a world walked twice stamps the newer session's
+    digest, and then every one of those placements is refused by the reader
+    for disagreeing. A reviewer found it by asking what else read the
+    world-level copy.
+
+    The session's own first, then the world's but only if it names this
+    session; a manifest about another session is not evidence about this
+    one.
+    """
+    manifest = store.read_session_manifest(world_id, session_id)
+    if isinstance(manifest, dict) and manifest.get("session_id") == session_id:
+        return manifest
+    world = store.read_derived_manifest(world_id)
+    if isinstance(world, dict) and world.get("session_id") == session_id:
+        return world
+    return {}
 
 
 def should_register(result) -> bool:
@@ -1043,7 +1119,7 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
         # store whose every read fails, turned straight back into the
         # session-ending exception the guard exists to prevent.
         existing = store.read_placements(world_id, session_id) or []
-        manifest_now = store.read_derived_manifest(world_id) or {}
+        manifest_now = session_manifest(store, world_id, session_id)
         digest_now = manifest_now.get("input_digest")
         current_registered = [
             p for p in existing
@@ -1072,7 +1148,7 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
         # exists for. Measured with these three lines outside the try: a
         # raising `write_placements` gave exit code 1 and zero bytes of
         # report, losing a walk that had reconstructed perfectly well.
-        manifest = store.read_derived_manifest(world_id) or {}
+        manifest = session_manifest(store, world_id, session_id)
         placements = placements_from_report(
             report, input_digest=manifest.get("input_digest")
         )
@@ -1199,7 +1275,15 @@ def main(argv=None) -> int:
         "--solve-every",
         type=int,
         default=DEFAULT_SOLVE_EVERY,
-        help="accepted keyframes between background solves (0 = final solve only)",
+        help=(
+            "MINIMUM accepted keyframes between background solves "
+            "(0 = final solve only). The launch is checked inside the "
+            "rebuild block, so the effective spacing is this value "
+            "rounded up to the rebuild interval -- which widens with the "
+            "world (see rebuild_interval): 16x --rebuild-every past 4,800 "
+            "keyframes, so 64 at the default. A value below the current "
+            "interval cannot be honoured."
+        ),
     )
     parser.add_argument(
         "--solve-wait-seconds",
@@ -1584,7 +1668,19 @@ def main(argv=None) -> int:
         # `stop`, while the wearer is still walking. The bound is forty
         # minutes now, but a walk that reaches it should say so.
         capture_end = follower.end_reason() if follower is not None else None
-        capture_finished = capture_end in (END_REASON_CAPTURE_STOP, END_REASON_CAPTURE_DISCONNECT)
+        # A reconnect still in flight when the stop arrived is NOT a
+        # finished walk, even though the capture it was following ended
+        # `disconnect` and `disconnect` counts as finished. The wearer was
+        # still walking; the link died and nobody waited for it. Only the
+        # follower knows, so it is asked -- see
+        # `CaptureFollower.stopped_awaiting_successor`.
+        abandoned_reconnect = (
+            follower is not None and follower.stopped_awaiting_successor()
+        )
+        capture_finished = (
+            capture_end in (END_REASON_CAPTURE_STOP, END_REASON_CAPTURE_DISCONNECT)
+            and not abandoned_reconnect
+        )
         if stop_request.asked and not capture_finished:
             # Now it means what it says: frames were still coming and
             # somebody asked this process to go.
@@ -1619,7 +1715,9 @@ def main(argv=None) -> int:
                 "is not in it.",
                 end_reason,
             )
-        summary = engine.stop_session(end_reason, hold_lock=True)
+        summary = engine.stop_session(
+            end_reason, hold_lock=True, capture_end_reason=capture_end
+        )
 
         # -- finalization: the lock is still held, the record says pending --
         if solver is None:

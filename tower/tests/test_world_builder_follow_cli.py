@@ -322,6 +322,67 @@ class TestInspectFollow:
         assert "session_stopped" in result.stdout
         assert "keyframe_accepted" in result.stdout
 
+    def test_the_stop_event_records_what_happened_to_the_CAPTURE(
+        self, tmp_path, finished_capture
+    ):
+        """`end_reason` is the world's; `capture_end_reason` is the link's.
+
+        They differ in a case a real walk produces. A capture that ended
+        `disconnect` counts as finished, so a walk whose phone never came
+        back is recorded as an ordinary `stop` -- deliberately, because
+        the alternative puts the campaign's headline symptom back. That
+        choice is defensible only while the artifact still says which it
+        was, and the session record names only the FIRST capture it
+        followed, so after a reconnect the link was a timestamp search.
+        """
+        from tower.world_builder.store import WorldStore
+
+        directory, capture_id = finished_capture
+        root = tmp_path / "worlds"
+        report = json.loads(
+            _run(
+                "world_build_session.py",
+                "--follow-capture", str(directory),
+                "--root", str(root),
+                "--format", "json",
+            ).stdout
+        )
+
+        store = WorldStore(root)
+        events = store.read_events(report["world_id"], report["session_id"])
+        stopped = [e for e in events if e["kind"] == "session_stopped"]
+        assert stopped, "the walk never recorded a stop"
+        payload = stopped[-1]["payload"]
+        recorded = json.loads(
+            (directory / "capture.json").read_text(encoding="utf-8")
+        )["end_reason"]
+        assert payload["capture_end_reason"] == recorded, (
+            "the journal does not say what happened to the link: "
+            f"{payload} against a capture that ended {recorded!r}"
+        )
+
+    def test_an_offline_caller_writes_the_journal_it_always_wrote(self, tmp_path):
+        """The key is ABSENT when nobody knows, not None and not guessed.
+
+        Every offline caller -- a replay, a test, `world_finalize.py` --
+        has no follower to ask. Their journals must be byte-identical to
+        what they were before this field existed.
+        """
+        from tower.world_builder.engine import WorldBuilderEngine
+        from tower.world_builder.store import WorldStore
+
+        store = WorldStore(tmp_path / "worlds")
+        engine = WorldBuilderEngine(store)
+        world_id = engine.create_world("offline")
+        session_id = engine.start_session(world_id, frame_source="synthetic")
+        engine.stop_session("stop")
+
+        stopped = [
+            e for e in store.read_events(world_id, session_id)
+            if e["kind"] == "session_stopped"
+        ]
+        assert stopped[-1]["payload"] == {"end_reason": "stop"}
+
     def test_follow_emits_json_lines_when_asked(self, tmp_path, finished_capture):
         """A viewer consumes this, not a human. One event per line."""
         directory, _ = finished_capture

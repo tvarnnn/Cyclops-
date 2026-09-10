@@ -46,7 +46,28 @@ nonisolated enum WorldBuilderResultContract {
     /// rather than shown that. The same payload also gained `selection` —
     /// why this world is on the wire — and `lifecycle.finalization`, both
     /// additive; the new word is what earned the bump.
-    static let identifier = "world_builder.status/2026-09-06"
+    ///
+    /// `world_builder.status/2026-09-10` supersedes `.../2026-09-06` for a
+    /// subtler reason: no word was added, and a state this app already
+    /// decodes started arriving where a different one used to. A
+    /// `lifecycle.state: "stopped_unbuilt"` with `geometry.available: false`
+    /// now projects to `interrupted` instead of `finalizing`, because there
+    /// is nothing to wait for — the old projection put a **permanent
+    /// "Finalizing"** on this screen over a walk that had produced no
+    /// geometry, and four separate reviews found it by four separate routes.
+    ///
+    /// A build that adopts the string without reading `geometry.available`
+    /// beside `lifecycle.state` gets the right answer anyway, because the
+    /// stage ladder switches on `model_state`. The bump is here because the
+    /// MEANING moved, and this file's own comment above says what serving
+    /// an old identifier over new meaning is: the silent widening the
+    /// refusal exists to prevent.
+    ///
+    /// **A Tower on this branch will refuse a phone built before this
+    /// line.** That is deliberate and it is loud, which is the whole point
+    /// of a dated identifier — but it makes rebuilding the app a
+    /// precondition for the retest rather than a caution.
+    static let identifier = "world_builder.status/2026-09-10"
 }
 
 // MARK: - Where the geometry lives

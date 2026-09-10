@@ -550,7 +550,7 @@ def test_stopping_the_capture_and_the_workspace_together_is_an_ordinary_stop(
 
     lifecycle = _lifecycle(
         holder=None, stopped=True, session=session,
-        geometry_current=True, has_manifest=True,
+        geometry_current=True, has_manifest=True, has_session_geometry=True,
     )
     assert lifecycle["state"] != "interrupted", lifecycle
 

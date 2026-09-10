@@ -602,16 +602,43 @@ def test_geometry_from_another_session_is_not_attributed_to_this_one(
     engine.stop_session()
     engine.build(world_id, second_session)
 
-    manifest = WorldStore(root).read_derived_manifest(world_id)
+    store = WorldStore(root)
+    manifest = store.read_derived_manifest(world_id)
     assert manifest["session_id"] == second_session, "precondition"
 
     first = _payload(monkeypatch, root, world_id=world_id, session_id=first_session)
     second = _payload(monkeypatch, root, world_id=world_id, session_id=second_session)
 
-    assert first["geometry"]["available"] is False
-    assert first["geometry"]["element_count"] is None
+    # EACH SESSION'S OWN FIGURES, which is a stronger statement than the
+    # one this test used to make. It asserted that the first session
+    # reported NO geometry -- true at the time, and only because the
+    # producer had nothing to read for it. That absence was itself the
+    # defect: an older walk reported no geometry, no poses and no currency
+    # over a reconstruction on disk, and the phone drew a red "Needs retry"
+    # on it. `write_derived` writes a manifest beside each session's own
+    # poses and points now, so the question this test asks -- is one
+    # session's geometry reported as another's -- can be asked properly.
+    own = {
+        session: store.read_session_manifest(world_id, session)
+        for session in (first_session, second_session)
+    }
+    assert own[first_session]["session_id"] == first_session
+    assert own[second_session]["session_id"] == second_session
+
+    assert first["geometry"]["available"] is True
+    assert first["geometry"]["element_count"] == own[first_session]["points"]
     assert second["geometry"]["available"] is True
+    assert second["geometry"]["element_count"] == own[second_session]["points"]
     assert second["geometry"]["element_count"] == manifest["points"]
+
+    # And the trajectory beside it, which used to say "no build has run for
+    # this session" over the first session's poses.
+    assert first["trajectory"]["available"] is True
+    # A count, not a formula: `pose_count` includes segment anchors, so it
+    # is not `poses_solved`. What matters here is that it is a real number
+    # for a session the producer used to have nothing to say about.
+    assert isinstance(first["trajectory"]["pose_count"], int)
+    assert first["trajectory"]["pose_count"] > 0
 
 
 # -- the producer itself ------------------------------------------------
@@ -792,20 +819,73 @@ def test_a_live_session_projects_to_receiving(monkeypatch, tmp_path):
         engine.stop_session()
 
 
-def test_a_stopped_unbuilt_session_projects_to_finalizing(monkeypatch, tmp_path):
-    """`.finalizing` is "capture ended, figures may still change".
+def test_a_stopped_unbuilt_session_does_not_ask_the_wearer_to_wait(
+    monkeypatch, tmp_path
+):
+    """`.finalizing` means "wait". Nothing here is coming.
 
-    That is exactly what `stopped_unbuilt` means, and it is why the two
-    map onto each other -- not because Tower can see a build running,
-    which lifecycle.build_in_progress still reports it cannot.
+    This asserted `finalizing`, on the reasoning that Tower cannot see
+    whether a build is running so "figures may still change" is the honest
+    reading. That reasoning was true when it was written and this campaign
+    made it false: `stop_session(hold_lock=True)` holds the writer lock
+    through finalization, so a build in progress IS visible -- as a live
+    lock, which `_lifecycle` answers three branches earlier as
+    `finalizing`. Every state that reaches `stopped_unbuilt` has already
+    been shown to have no live holder.
+
+    Four review rounds found the consequence by four different routes --
+    a permanent "Finalizing" over a world nothing would ever touch again,
+    which this campaign's own iOS note now renders as "it usually takes a
+    few minutes... worth waiting for Saved". Three of them were answered
+    with another branch in `_lifecycle`; the fourth found a route the
+    branches still missed. The mapping was the wrong level to keep
+    patching around.
     """
     root = tmp_path / "worlds"
     _, _, engine = start_live_world(root, frames=8)
     engine.stop_session()
 
     payload = _payload(monkeypatch, root)
-    assert payload["model_state"] == "finalizing"
+    assert payload["model_state"] == "interrupted", (
+        "a stopped session with nothing to open and nobody working on it "
+        "told the wearer to keep waiting"
+    )
+    assert payload["lifecycle"]["state"] == "stopped_unbuilt"
     assert payload["lifecycle"]["build_in_progress"] is None
+
+
+def test_a_build_that_really_is_running_still_says_finalizing(
+    monkeypatch, tmp_path
+):
+    """The other half, and the reason the mapping above could change.
+
+    "Wait" is right when something is actually working, and that state is
+    distinguishable on disk: the builder holds the writer lock through
+    finalization. If that ever stops being true, this test fails and the
+    mapping above has to be reconsidered rather than trusted.
+    """
+    import os
+
+    from tower.world_builder.store import WorldStore
+
+    root = tmp_path / "worlds"
+    world_id, _, engine = start_live_world(root, frames=8)
+    engine.stop_session()
+
+    # A live holder: this process, which is by definition running.
+    store = WorldStore(root)
+    store.acquire_writer_lock(world_id)
+    try:
+        holder = store.lock_holder(world_id)
+        assert holder is not None and holder["pid"] == os.getpid()
+        payload = _payload(monkeypatch, root)
+    finally:
+        store.release_writer_lock(world_id)
+
+    assert payload["model_state"] == "finalizing", (
+        "a build holding the writer lock was not reported as working"
+    )
+    assert payload["lifecycle"]["state"] == "finalizing"
 
 
 def test_no_world_root_projects_to_unsupported_not_idle(monkeypatch):
@@ -950,3 +1030,56 @@ def test_a_reopened_world_carries_the_replay_data_it_has(monkeypatch, built):
     encoded = _json.dumps(payload)
     assert "image_relpath" not in encoded
     assert "translation" not in encoded
+
+
+def test_a_world_that_is_merely_behind_still_says_finalizing(monkeypatch, tmp_path):
+    """`stopped_unbuilt` carries two states and only one of them means wait.
+
+    "Built, and behind" is a world that is intact and needs a rebuild:
+    "Finalizing" is right. "Nothing was built" is a walk that produced no
+    geometry, and telling a wearer to wait for that is the permanent
+    "Finalizing" four separate reviews found by four separate routes.
+
+    A previous round fixed the second by pointing the whole state at
+    `interrupted`, and a reviewer built the first and watched a complete
+    world start rendering a red "Interrupted ... what was built before it
+    stopped is here". Both halves are asserted here so neither can be
+    fixed at the other's expense again.
+    """
+    from tower.world_builder.records import Keyframe
+
+    root = tmp_path / "worlds"
+    world_id, session_id, engine = start_live_world(root, frames=8)
+    engine.build(world_id, session_id)
+    engine.stop_session()
+
+    # BEHIND: a keyframe the build never saw.
+    store = WorldStore(root)
+    store.append_keyframe(world_id, Keyframe(
+        keyframe_id=f"{session_id}:behind", session_id=session_id,
+        source_seq=9999, received_at=9999.0, image_relpath="images/x.jpg",
+        width=8, height=8, byte_count=9,
+    ))
+
+    behind = _payload(monkeypatch, root)
+    assert behind["lifecycle"]["state"] == "stopped_unbuilt"
+    assert behind["geometry"]["available"] is True
+    assert behind["geometry"]["current"] is False
+    assert behind["model_state"] == "finalizing", (
+        "a complete world that merely needs a rebuild was reported as an "
+        "interruption"
+    )
+
+
+def test_a_walk_that_built_nothing_does_not_say_finalizing(monkeypatch, tmp_path):
+    """The other half: nothing to wait for, so do not say wait."""
+    root = tmp_path / "worlds"
+    _, _, engine = start_live_world(root, frames=8)
+    engine.stop_session()
+
+    payload = _payload(monkeypatch, root)
+    assert payload["lifecycle"]["state"] == "stopped_unbuilt"
+    assert payload["geometry"]["available"] is False
+    assert payload["model_state"] == "interrupted", (
+        "a walk with no geometry told the wearer to keep waiting"
+    )

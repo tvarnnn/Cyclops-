@@ -377,10 +377,40 @@ class WorldStore:
             return None
         try:
             data = read_json_closed(path)
-        except json.JSONDecodeError:
+        except ValueError:
+            # `ValueError`, NOT `json.JSONDecodeError`. The latter is a
+            # subclass, and `UnicodeDecodeError` -- which is what invalid
+            # UTF-8 raises -- is a sibling. A reviewer wrote the same three
+            # bad bytes into each copy of one manifest and got opposite
+            # answers: the session copy (which already caught `ValueError`)
+            # refused cleanly, the world copy raised out of every reader
+            # that touches it, including out of `read_derived`'s verify
+            # gate, which sits ABOVE its own `try`. Two files meant to be
+            # identical have to fail identically.
             logger.warning("world builder: derived manifest unreadable at %s", path)
             return None
-        return data
+        return data if isinstance(data, dict) else None
+
+    def session_manifest_path(self, world_id: str, session_id: str) -> Path:
+        """The manifest beside a session's own poses and points.
+
+        Absent for anything built before `write_derived` started writing it.
+        `read_derived_manifest` above is the WORLD's, which names whichever
+        session built last; this one always describes the session it sits
+        in.
+        """
+        return self.derived_dir(world_id) / session_id / DERIVED_MANIFEST
+
+    def read_session_manifest(self, world_id: str, session_id: str) -> dict | None:
+        path = self.session_manifest_path(world_id, session_id)
+        if not path.exists():
+            return None
+        try:
+            data = read_json_closed(path)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("world builder: session manifest unreadable at %s", path)
+            return None
+        return data if isinstance(data, dict) else None
 
     def write_derived(
         self,
@@ -421,6 +451,26 @@ class WorldStore:
             write_json_atomic(derived / "points.json", {"points": points})
             if support is not None:
                 write_json_atomic(derived / "support.json", {"support": support})
+            # THE SAME MANIFEST, BESIDE THE FILES IT DESCRIBES.
+            #
+            # A world has ONE `derived/manifest.json` and it names whichever
+            # session built last. That is the root of a whole family of
+            # defects this campaign kept fixing one symptom at a time: the
+            # status producer discards the manifest for any other session
+            # (correctly -- attributing one session's figures to another is
+            # worse), and then has no figures at all, so an older session of
+            # a world walked twice reported no geometry, no poses, no
+            # currency, and the phone rendered a red "Needs retry" over a
+            # reconstruction sitting on disk. Four separate branches were
+            # written to paper over that, three of them wrong, before the
+            # question "why is there only one copy" got asked.
+            #
+            # A session that describes itself needs none of them. Cheap
+            # (one small JSON per build, beside megabytes of points),
+            # atomic like everything else here, and additive: a world built
+            # before this has no per-session copy and reads exactly as it
+            # did.
+            write_json_atomic(derived / DERIVED_MANIFEST, manifest)
             write_json_atomic(self.derived_manifest_path(world_id), manifest)
 
     def read_derived(
@@ -446,11 +496,19 @@ class WorldStore:
             digest = compute_input_digest(
                 self.read_keyframes(world_id, session_id)
             )
-            if not self.derived_is_current(world_id, digest):
+            # `is False`, NOT `not ...`. `None` is "no manifest here can
+            # judge this" -- a legacy world walked twice, where the only
+            # manifest describes another session. Refusing that is a
+            # guaranteed 404 for a reconstruction that is sitting on disk
+            # and perfectly good; serving it with the wire contract's
+            # `current` flag OFF is the honest compromise, and the status
+            # channel says in words why it cannot be judged. Only a
+            # manifest that actually disagrees is stale.
+            if self.derived_currency(world_id, digest, session_id) is False:
                 logger.warning(
-                    "world builder: derived output for %s is stale; "
+                    "world builder: derived output for %s/%s is stale; "
                     "treating as absent",
-                    world_id,
+                    world_id, session_id,
                 )
                 return None
         derived = self.derived_dir(world_id) / session_id
@@ -464,8 +522,31 @@ class WorldStore:
                 "points": read_json_closed(points_path)["points"],
                 "support": self._read_support(derived),
             }
-        except (json.JSONDecodeError, KeyError):
-            logger.warning("world builder: derived output unreadable for %s", world_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            # `TypeError` BELONGS HERE, and its absence was the one gap in
+            # this file. `_read_support` and `read_placements` below both
+            # carry explicit comments about a top-level list raising
+            # TypeError "straight out of a method whose docstring promises
+            # it never raises"; this method, which has the same promise and
+            # the same subscript, was never given the same guard. A reviewer
+            # fed it `[]` and watched the TypeError come out through
+            # `build_manifest` as an HTTP 500 where every other corrupt
+            # derived tree gives a 404. A corrupt world and an absent one
+            # are both "nothing to serve"; neither is a server fault.
+            # (`json.JSONDecodeError` is a `ValueError`, so it is in here
+            # by inheritance rather than by being listed twice.)
+            #
+            # `OSError` IS NOT IN THIS TUPLE, and it was, briefly. A
+            # reviewer injected EIO and watched a disk fault become
+            # "no geometry for this session" -- a 404 on a route whose own
+            # comment says "404 now means ABSENT only", and an empty
+            # reconstruction in `world_inspect`. A server that cannot read
+            # its own storage should say so, loudly, and 500 is how. The
+            # widening was a guess dressed as symmetry.
+            logger.warning(
+                "world builder: derived output unreadable for %s/%s: %s: %s",
+                world_id, session_id, type(exc).__name__, exc,
+            )
             return None
 
     def write_placements(self, world_id: str, session_id: str, placements) -> None:
@@ -570,8 +651,77 @@ class WorldStore:
             )
             return None
 
-    def derived_is_current(self, world_id: str, input_digest: str) -> bool:
-        manifest = self.read_derived_manifest(world_id)
+    def derived_is_current(
+        self, world_id: str, input_digest: str, session_id: str | None = None
+    ) -> bool:
+        """Whether the stored geometry answers the question these keyframes ask.
+
+        THIS HAS NO PRODUCTION CALLERS LEFT. `read_derived`, the geometry
+        route and the render page all call `derived_currency` directly,
+        because two of the three answers it gives are not booleans. Two
+        tests still call this, and a boolean is what they want. A previous
+        version of this docstring named those three as its callers; they
+        had already moved.
+
+        What the world-level version cost: on a world walked twice, every
+        reader that gated on it refused the OLDER session outright, logging
+        "stale; treating as absent". So "open an earlier walk from Saved
+        Worlds" returned a 404 for a reconstruction sitting on disk.
+        The status channel's version of the same bug was found and fixed
+        four times in four review rounds; this half of it, on the path that
+        actually serves the geometry, was found by asking what the phone
+        does after the status channel says `ready`.
+
+        With a session id, a session that has its own manifest is judged by
+        it. Anything built before those existed falls back to the world's,
+        which is exactly as right and as wrong as it was.
+        """
+        return self.derived_currency(world_id, input_digest, session_id) is True
+
+    def derived_currency(
+        self, world_id: str, input_digest: str, session_id: str | None = None
+    ):
+        """True, False, or **None for "nothing here can judge it"**.
+
+        THE THIRD ANSWER IS THE POINT, and folding it into `False` is what
+        the first version of this fix did wrong. Two different questions
+        were being asked of one boolean:
+
+          * *is this geometry current?* -- what the wire contract's
+            `current` flag means, "reflects every keyframe accepted so
+            far", and what the status channel reports.
+          * *may this geometry be served at all?* -- what
+            `read_derived`'s verify gate decides.
+
+        For a world built before per-session manifests existed, walked
+        twice, the honest answer to the first is "unknown" and to the
+        second is "yes, with the flag off". Returning `True` from one
+        boolean made the ROUTE assert `current: true` over geometry a
+        reviewer then made genuinely stale by appending a keyframe -- while
+        the status channel beside it said `current: false`. Returning
+        `False` refuses to serve a good reconstruction. Neither is the
+        answer; there are three.
+        """
+        manifest = None
+        if session_id is not None:
+            manifest = self.read_session_manifest(world_id, session_id)
+            if manifest is not None and manifest.get("session_id") != session_id:
+                # A session's own copy naming somebody else is corruption,
+                # not a world walked twice.
+                manifest = None
+        if manifest is None:
+            world_manifest = self.read_derived_manifest(world_id)
+            if not isinstance(world_manifest, dict):
+                world_manifest = None
+            if (
+                session_id is not None
+                and world_manifest is not None
+                and world_manifest.get("session_id") != session_id
+            ):
+                # The world's manifest is about another session and this
+                # one has no copy of its own: a legacy world walked twice.
+                return None
+            manifest = world_manifest
         if manifest is None:
             return False
         return (

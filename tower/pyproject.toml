@@ -10,6 +10,15 @@ dependencies = [
     "opencv-python-headless>=4.9",
     "numpy>=1.26",
     "psutil>=5.9",
+    # DECLARED, not borrowed. `start_tower.ps1` hands uvicorn
+    # `--env-file .env`, which uvicorn reads through python-dotenv, and
+    # `scripts/world_builder_env_check.py` reads the same file through the
+    # same library so its verdict is about the Tower that is going to run.
+    # It arrived only as `uvicorn[standard]`'s own extra, so a venv built
+    # with plain `uvicorn` -- or a future uvicorn that drops it -- would
+    # have made the pre-flight report a RED calibration verdict on a
+    # correctly configured machine, silently. Measured by a reviewer.
+    "python-dotenv>=0.13",
 ]
 
 [project.optional-dependencies]

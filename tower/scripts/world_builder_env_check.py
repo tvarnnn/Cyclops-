@@ -318,6 +318,158 @@ def collect_vocabulary_tree():
     }
 
 
+def collect_calibrations():
+    r"""Whether a calibration exists for the resolution the glasses deliver.
+
+    THE PRE-FLIGHT WAS ALL-GREEN AND MISSED THIS. A reviewer pointed a
+    replay at a fresh `--root`, which had no `intrinsics/` beside it, and
+    watched a whole walk produce nothing:
+
+        world builder: no calibration for 360x640 (looked for
+          ...\intrinsics\360x640.json); intrinsics stay unknown and no
+          poses will be solved
+        world builder: backend selected unposed -- will produce no poses
+          and no points
+        rebuild 131: 499 keyframes -> 0 positioned poses, 0 points
+
+    131 rebuilds, zero geometry, and a WARNING in a log nobody is reading.
+    The seven verdicts this script already emits check that OpenCV *can*
+    calibrate; none of them check that anything *has*.
+
+    The resolution cannot be known before the phone connects, so this asks
+    the last capture what it sent. That is the best available evidence and
+    it is real evidence: every frame of the five most recent captures on
+    this host is 360x640.
+    """
+    from tower.config import get_settings
+
+    settings = get_settings()
+
+    # THE SAME `.env` THE LAUNCHER HANDS UVICORN.
+    #
+    # `world_root` and `capture_root` are None unless the environment sets
+    # them, and this script runs BEFORE `start_tower.ps1` -- that is the
+    # point of a pre-flight. The launcher passes `--env-file .env`, so the
+    # file beside it is what the Tower will actually use. Reading it here
+    # is how this check can be about the Tower that is going to run rather
+    # than about this shell. An env var already set still wins, exactly as
+    # it does for uvicorn.
+    tower_root = pathlib.Path(__file__).resolve().parents[1]
+    env_path = tower_root / ".env"
+    env = {}
+    env_error = None
+    if env_path.is_file():
+        # PYTHON-DOTENV, NOT A HAND-ROLLED PARSER.
+        #
+        # The first version split on the first `=` and stripped
+        # whitespace, and a reviewer diffed it against dotenv on twelve
+        # inputs: it disagreed on SIX. `export KEY=v` filed the key as
+        # "export KEY"; quotes were kept as part of the value; a UTF-8 BOM
+        # left the key unreachable (`str.strip()` does not remove ﻿,
+        # which is Cf, not whitespace); and an inline `# comment` became
+        # part of the path. Every disagreement pointed the same way -- a
+        # RED verdict saying "every pose and every point of the walk will
+        # be missing" against a Tower that is correctly configured, which
+        # is a lie told in exactly the situation this check exists for.
+        #
+        # `start_tower.ps1` hands uvicorn `--env-file`, and uvicorn's
+        # reader is dotenv. Using the same library is the only way this
+        # check can be about the Tower that is going to run.
+        try:
+            from dotenv import dotenv_values
+
+            env = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never fails on its input
+            # NAME IT, AND THEN GET OUT OF THE WAY.
+            #
+            # The first version swallowed this into an empty dict and the
+            # verdict then read "there is no .env to read it from" -- about
+            # a file `is_file()` had confirmed two lines earlier. The
+            # second version returned early with the exception named, which
+            # was honest and ALSO WRONG: an operator who exports
+            # TOWER_WORLD_ROOT needs no `.env` at all, and the early return
+            # skipped the env-var lookup below, so a machine that was
+            # correctly configured went RED anyway. A reviewer measured
+            # both, and the old fallthrough was right about that case.
+            #
+            # So: remember the failure, keep going, and let it into the
+            # verdict only if the environment could not answer either.
+            env_error = f"{type(exc).__name__}: {exc}"
+            env = {}
+
+    def _root(configured, key):
+        raw = configured if configured is not None else env.get(key)
+        if raw is None:
+            return None
+        path = pathlib.Path(raw)
+        return path if path.is_absolute() else (tower_root / path)
+
+    world_root = _root(settings.world_root, "TOWER_WORLD_ROOT")
+    capture_root = _root(settings.capture_root, "TOWER_CAPTURE_ROOT")
+    if capture_root is not None:
+        # `tower/capture.py` appends `captures/<id>`, which `.env` says in
+        # its own comment; the root in the file is one level above.
+        capture_root = capture_root / "captures"
+    if world_root is None:
+        # The `.env` sitting there unread is a DIFFERENT failure from no
+        # `.env` at all, and the first version of this sentence said the
+        # second about the first.
+        if env_error is not None:
+            detail = (
+                f"no world root: TOWER_WORLD_ROOT is unset and {env_path} "
+                f"could not be read ({env_error})"
+            )
+        elif env_path.is_file():
+            detail = (
+                f"no world root: TOWER_WORLD_ROOT is unset and {env_path} "
+                "does not set it"
+            )
+        else:
+            detail = (
+                "no world root: TOWER_WORLD_ROOT is unset and there is no "
+                f"{env_path} to read it from"
+            )
+        return {"intrinsics_dir": None, "available": [], "last_capture": None,
+                "last_capture_resolution": None, "covered": False,
+                "reason": detail}
+
+    directory = world_root / "intrinsics"
+    available = sorted(path.stem for path in directory.glob("*.json")) \
+        if directory.is_dir() else []
+
+    last, observed = None, None
+    if capture_root is not None and capture_root.is_dir():
+        captures = sorted(
+            (path for path in capture_root.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for capture in captures:
+            journal = capture / "frames.jsonl"
+            if not journal.is_file():
+                continue
+            try:
+                with journal.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        record = json.loads(line)
+                        width, height = record.get("width"), record.get("height")
+                        if width and height:
+                            last, observed = capture.name, f"{width}x{height}"
+                            break
+            except (OSError, ValueError):
+                continue
+            if observed:
+                break
+
+    return {
+        "intrinsics_dir": str(directory),
+        "available": available,
+        "last_capture": last,
+        "last_capture_resolution": observed,
+        "covered": bool(observed) and observed in available,
+    }
+
+
 def build_verdicts(report):
     """Turn raw facts into the few go/no-go statements an implementer needs.
 
@@ -392,6 +544,32 @@ def build_verdicts(report):
             "it, or reinstall: .venv/Scripts/python.exe -m pip install -e ."
         )
     verdicts.append(("tower_package_is_this_checkout", bool(origin.get("matches")), origin_detail))
+
+    # See collect_calibrations. A missing calibration is not a degraded
+    # walk, it is a walk with no geometry at all, announced only in a log.
+    calib = report.get("calibrations") or {}
+    observed = calib.get("last_capture_resolution")
+    available = calib.get("available") or []
+    if calib.get("reason"):
+        calib_detail = calib["reason"]
+    elif not available:
+        calib_detail = f"no calibrations at all under {calib.get('intrinsics_dir')}"
+    elif observed is None:
+        calib_detail = (
+            f"have {', '.join(available)}; no capture on this host says what "
+            "resolution the glasses send, so this cannot be checked"
+        )
+    elif calib.get("covered"):
+        calib_detail = (
+            f"{observed} is calibrated (last capture {calib.get('last_capture')})"
+        )
+    else:
+        calib_detail = (
+            f"the last capture sent {observed} and there is no "
+            f"{observed}.json; have {', '.join(available)}. Every pose and "
+            "every point of the walk will be missing"
+        )
+    verdicts.append(("calibration_for_the_camera", bool(calib.get("covered")), calib_detail))
 
     # The interesting failure is specifically "GPU present, torch blind to
     # it": that is a fixable packaging problem rather than missing
@@ -550,6 +728,7 @@ def main(argv=None):
         "libraries": collect_libraries(),
         "vocabulary_tree": collect_vocabulary_tree(),
         "package_origin": collect_package_origin(),
+        "calibrations": collect_calibrations(),
     }
     verdicts = build_verdicts(report)
     report["verdicts"] = [

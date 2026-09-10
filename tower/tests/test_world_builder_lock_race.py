@@ -273,3 +273,81 @@ def test_the_loser_of_a_race_is_told_who_holds_it(tmp_path):
     finally:
         holder.terminate()
         holder.wait(timeout=10)
+
+
+def test_a_record_replaced_under_the_winner_is_not_returned_as_a_win(tmp_path):
+    """The create is atomic; the reclaim is not.
+
+    A peer that decides this lock is dead unlinks whatever is AT THE PATH --
+    not the file it read -- so it can delete a lock created microseconds ago
+    and create its own. An adversarial review drove that to both processes
+    acquiring, 5 of 5, with a stall injected into the reclaim window (0 of
+    120 naturally: narrow, not imaginary). The fix reads the record back
+    before returning.
+
+    The stall is injected here deterministically, at the read-back itself:
+    the first `read_json_closed` on this path IS the winner's confirmation
+    of its own record, so the moment before it runs is the window. What
+    happens in that window is exactly what the review drove -- the lock is
+    unlinked and replaced with a live stranger's record. (The `os.fsync`
+    that ends the write looks like a tidier seam and is not one: it runs
+    while the handle is still open, and Windows will not unlink an open
+    file.)
+
+    The right outcome is not "acquired" and not a crash: this process lost,
+    and being told so by `WorldLockedError` is how a loser learns it. What
+    must never happen is returning to write underneath the winner.
+    """
+    import psutil
+
+    from tower.world_builder import store as store_module
+
+    root = tmp_path / "worlds"
+    store = WorldStore(root)
+    world_id = "w" * 32
+    store.world_dir(world_id).mkdir(parents=True, exist_ok=True)
+
+    peer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert psutil.pid_exists(peer.pid), "the stand-in peer died immediately"
+        lock = store.lock_path(world_id)
+        real_read = store_module.read_json_closed
+        fired = []
+
+        def steal(path):
+            if fired:
+                return real_read(path)
+            fired.append(True)
+            # A peer reclaiming what it believed was a dead lock.
+            lock.unlink(missing_ok=True)
+            # The store's own producer, not a hand-written record: a
+            # test that invents its subject's output cannot notice when
+            # the subject stops producing it. This campaign learned that
+            # from the staging sweeper.
+            lock.write_text(
+                json.dumps(store_module._lock_record(peer.pid)), encoding="utf-8"
+            )
+
+            return real_read(path)
+
+        store_module.read_json_closed = steal
+        try:
+            with pytest.raises(WorldLockedError) as raised:
+                store.acquire_writer_lock(world_id)
+        finally:
+            store_module.read_json_closed = real_read
+
+        assert fired, "the injection never ran; this test proved nothing"
+        assert str(peer.pid) in str(raised.value), (
+            f"the loser was not told who holds it: {raised.value}"
+        )
+        holder = store.lock_holder(world_id)
+        assert holder is not None and holder["pid"] == peer.pid, (
+            f"the loser wrote underneath the winner: the lock names {holder}"
+        )
+    finally:
+        peer.kill()
+        peer.wait(timeout=30)

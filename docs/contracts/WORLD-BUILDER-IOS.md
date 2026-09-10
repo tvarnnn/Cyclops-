@@ -10,7 +10,7 @@
 
 **Status:** implemented on both sides and exercised end to end over a real
 socket. The Tower half has met the Ray-Ban camera; the iOS half of
-`world_builder.status/2026-09-06` has not yet been walked. See
+`world_builder.status/2026-09-10` has not yet been walked. See
 `docs/agent-handoffs/WORLD-BUILDER-INTEGRATION.md` for exactly what has and
 has not met hardware.
 
@@ -24,7 +24,7 @@ Contracts in play:
 | | |
 |---|---|
 | Envelope | `cartridge_results.envelope/2026-08-23` |
-| World Builder payload | `world_builder.status/2026-09-06` (supersedes `/2026-08-25`: `model_state` gained `interrupted`; the payload gained `selection` and `lifecycle.finalization`) |
+| World Builder payload | `world_builder.status/2026-09-10` (supersedes `/2026-08-25`: `model_state` gained `interrupted`; the payload gained `selection` and `lifecycle.finalization`) |
 | World Builder geometry | `world_builder.geometry/2026-08-25` — **its own document: [`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md)**. Different transport (HTTP), versioned independently |
 | Tower cartridge name | `world_builder` |
 | iOS catalog id | `world-build` |
@@ -174,6 +174,25 @@ stored figures are not the final figures"**, `build_in_progress` is `null`, and
 the phone keeps the guarded sentence. `WorldModelState.finalizing` carries
 `buildInProgress: Bool?` so the two copies are chosen from the payload, not
 guessed.
+
+**Since 2026-09-10, `stopped_unbuilt` does not always project to
+`finalizing`.** It carries two states and only one of them means wait:
+
+| `lifecycle.state` | `geometry.available` | `model_state` | means |
+|---|---|---|---|
+| `stopped_unbuilt` | `true` | `finalizing` | built, and BEHIND its keyframes. A rebuild is outstanding; the world is intact. |
+| `stopped_unbuilt` | `false` | `interrupted` | nothing was built. There is nothing to wait for. |
+
+The second used to project to `finalizing` too, and the phone therefore
+showed a **permanent "Finalizing"** over a walk that had produced no
+geometry — a state nothing would ever change. Four separate reviews found
+that by four separate routes. The distinction is made in the projection
+rather than in `lifecycle.state`, deliberately: the state name is on the
+wire and iOS decodes it, so it did not move.
+
+A client that switches on `model_state` needs no change. A client that
+switches on `lifecycle.state` and assumes the old projection should read
+`geometry.available` beside it.
 
 ## 3.1 `selection`: whose world is on the wire
 

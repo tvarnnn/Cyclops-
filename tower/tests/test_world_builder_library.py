@@ -103,14 +103,64 @@ def test_an_unreadable_world_is_omitted_not_invented(derived_world, tmp_path):
 
 
 def test_worlds_are_newest_first_and_sessions_oldest_first(tmp_path):
+    """RECENCY, established rather than assumed.
+
+    This created two worlds back-to-back and asserted the second sorted
+    first. Windows' clock granularity is about 15.6 ms, so under load the
+    two shared an `updated_at` -- and "newest first" is not a property the
+    system can have when two things are the same age. It failed in the
+    suite as `assert 1 < 0` and it was the TEST that was wrong: the
+    listing was answering an unanswerable question.
+
+    `test_two_worlds_in_one_clock_tick_keep_a_stable_order` covers what is
+    actually guaranteed for a tie -- an order that does not change between
+    polls, so rows do not swap under the wearer's finger.
+    """
+    from dataclasses import replace
+
     from tower.world_builder.engine import WorldBuilderEngine
 
     store = WorldStore(tmp_path)
     engine = WorldBuilderEngine(store)
     first = engine.create_world("first")
     second = engine.create_world("second")
+    for world_id, stamp in ((first, 1000.0), (second, 2000.0)):
+        world = store.read_world(world_id)
+        store.write_world(replace(world, created_at=stamp, updated_at=stamp))
     listing = build_world_listing(store)
     ids = [w["world_id"] for w in listing["worlds"]]
     assert ids.index(second) < ids.index(first)
     assert listing["worlds"][0]["display_name"] == "second"
     assert all(w["sessions"] == [] for w in listing["worlds"])
+
+
+def test_two_worlds_in_one_clock_tick_keep_a_stable_order(tmp_path):
+    """A tie must not leave the order to whatever the filesystem yields.
+
+    Windows' clock granularity is about 15.6 ms, so two worlds created
+    back-to-back can share an `updated_at`. Sorting on that alone left
+    their order to `list_world_ids`, which can differ between polls -- and
+    the phone redraws this list every time it arrives, so rows swap places
+    under the wearer's finger. It surfaced first as a suite flake under
+    load (`assert 1 < 0` on exactly this pair).
+    """
+    from dataclasses import replace
+
+    from tower.world_builder.engine import WorldBuilderEngine
+
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    ids = [engine.create_world(f"world-{index}") for index in range(4)]
+
+    # Force the tie the clock only sometimes produces.
+    for world_id in ids:
+        world = store.read_world(world_id)
+        store.write_world(replace(world, updated_at=1000.0, created_at=1000.0))
+
+    orders = {
+        tuple(w["world_id"] for w in build_world_listing(store)["worlds"])
+        for _ in range(5)
+    }
+    assert len(orders) == 1, f"the listing order was not stable: {orders}"
+    # And it is a real order, not insertion luck: reversed ids, same answer.
+    assert sorted(next(iter(orders)), reverse=True) == list(next(iter(orders)))

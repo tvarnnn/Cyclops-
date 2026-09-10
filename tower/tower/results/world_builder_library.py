@@ -84,7 +84,16 @@ def session_state(session, *, live: bool, has_geometry: bool) -> str:
     if session.end_reason in ("error", "interrupted"):
         return SESSION_INTERRUPTED
     if finalization is not None:
-        if finalization.get("state") == FINALIZATION_COMPLETE:
+        # `has_geometry` HERE TOO, not only on the line below.
+        #
+        # This is the surface a person chooses a walk FROM, and it said
+        # "Complete" over a session whose derived tree was gone -- the
+        # same hole the status producer's READY branch had, found by a
+        # reviewer in the same pass, on the more damaging of the two
+        # surfaces. The docstring above says this "mirrors `_lifecycle`";
+        # it did not, and a claim like that is only worth what the code
+        # behind it does.
+        if finalization.get("state") == FINALIZATION_COMPLETE and has_geometry:
             return SESSION_COMPLETE
         return SESSION_INTERRUPTED
     return SESSION_COMPLETE if has_geometry else SESSION_UNBUILT
@@ -147,5 +156,19 @@ def build_world_listing(store: WorldStore) -> dict:
             "session_count": len(sessions),
             "sessions": sessions,
         })
-    worlds.sort(key=lambda w: w["updated_at"], reverse=True)
+    # A TOTAL ORDER, not just a key. Windows' clock granularity is about
+    # 15.6 ms, so two worlds created in one tick share an `updated_at` --
+    # and a sort on that alone leaves their order to whatever
+    # `list_world_ids` happened to yield, which can differ between polls.
+    # The phone redraws this list every time it arrives, so a tie makes
+    # rows swap places under the wearer's finger.
+    #
+    # Found as a suite flake (`assert 1 < 0` on two worlds created
+    # back-to-back) under a loaded machine, which is the same tie.
+    # `created_at` breaks most of them and the id breaks the rest; the id
+    # is arbitrary but it is STABLE, which is the property that matters.
+    worlds.sort(
+        key=lambda w: (w["updated_at"], w["created_at"], w["world_id"]),
+        reverse=True,
+    )
     return {"contract": WORLDS_CONTRACT, "world_count": len(worlds), "worlds": worlds}

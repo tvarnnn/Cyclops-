@@ -121,7 +121,18 @@ def _is_current(store, world_id: str, session_id: str) -> bool:
         digest = compute_input_digest(store.read_keyframes(world_id, session_id))
     except (WorldStoreError, KeyError, ValueError, OSError):
         return False
-    return store.derived_is_current(world_id, digest)
+    # WITH the session id. Without it this asks the world's manifest, which
+    # names whichever session built last, so an older session of a world
+    # walked twice was reported not-current against another session's
+    # digest -- and `read_derived` refused to serve it at all.
+    #
+    # `derived_currency` can also answer None, "nothing here can judge it".
+    # The wire contract defines `current` as "reflects every keyframe
+    # accepted so far", which is a claim, so an unjudgeable tree reports
+    # FALSE -- the same answer the status channel gives, and the
+    # conservative one. `read_derived` treats None differently, because it
+    # is deciding whether to serve rather than what to claim.
+    return store.derived_currency(world_id, digest, session_id) is True
 
 
 def contained_world_id(store, world_id: str) -> str | None:
@@ -304,7 +315,13 @@ def usable_placements(store, world_id: str, session_id: str) -> dict:
     if not stored:
         return {}
 
-    manifest = store.read_derived_manifest(world_id) or {}
+    # THE SESSION'S OWN MANIFEST. This read the world's, which names
+    # whichever session built last, so every placement of an OLDER session
+    # was compared against another session's digest, failed, and was
+    # served as unplaced -- an earlier walk could not be composited at all.
+    # Found by a reviewer who checked what else still read the world-level
+    # copy after `derived_is_current` had been given a session id.
+    manifest = _session_manifest(store, world_id, session_id) or {}
     digest = manifest.get("input_digest")
     fresh = {}
     for placement in stored:
@@ -417,7 +434,38 @@ def _placement_fields(placement) -> dict:
     }
 
 
-def manifest_for(store, world_id: str) -> dict | None:
+def _session_manifest(store, world_id: str, session_id: str) -> dict | None:
+    """The manifest that describes THIS session, from either copy.
+
+    The session's own first -- `write_derived` writes one beside the poses
+    and points it describes -- then the world's, but only if it names this
+    session. A world manifest naming another session is not evidence about
+    this one, and treating it as such is how an older walk was served
+    another session's coverage classes and had every placement refused.
+    """
+    try:
+        manifest = store.read_session_manifest(world_id, session_id)
+        if isinstance(manifest, dict) and manifest.get("session_id") == session_id:
+            return manifest
+        world = store.read_derived_manifest(world_id)
+        if isinstance(world, dict) and world.get("session_id") == session_id:
+            return world
+    except Exception:  # noqa: BLE001 -- an unreadable manifest is "no judgement"
+        return None
+    return None
+
+
+def manifest_for(store, world_id: str, session_id: str | None = None) -> dict | None:
+    """The manifest to judge a session by, or the world's when none is named.
+
+    `session_id` is defaulted only so callers written before per-session
+    manifests existed keep working; every caller inside this module passes
+    it. Without one this answers about whichever session built last, which
+    for `global_solve.segments` means serving one walk's coverage classes
+    as another's.
+    """
+    if session_id is not None:
+        return _session_manifest(store, world_id, session_id)
     try:
         return store.read_derived_manifest(world_id)
     except Exception:  # noqa: BLE001 -- an unreadable manifest is "no judgement"
@@ -451,7 +499,9 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     placements = usable_placements(store, world_id, session_id)
 
     segments = []
-    solve_segments = ((manifest_for(store, world_id) or {}).get("global_solve") or {}).get("segments") or {}
+    solve_segments = (
+        (manifest_for(store, world_id, session_id) or {}).get("global_solve") or {}
+    ).get("segments") or {}
     for index in sorted(grouped):
         poses = grouped[index]["poses"]
         points = grouped[index]["points"]

@@ -227,7 +227,21 @@ def main(argv=None) -> int:
         # The record may only stand if the manifest it implies still does.
         was_complete = (before.finalization or {}).get("state") == FINALIZATION_COMPLETE
         try:
-            still_has_geometry = store.read_derived_manifest(args.world) is not None
+            # THIS SESSION's geometry, not the world's manifest. The
+            # world-level one names whichever session built last, so a
+            # wrecked build on the older session of a world walked
+            # twice preserved a `complete` record on the strength of
+            # another session's manifest. Found by a reviewer chasing
+            # every remaining world-level read after the reader side
+            # was given a session id.
+            # `session_id`, the RESOLVED one -- `args.session` is None
+            # whenever the caller let the CLI pick the latest, which is
+            # every ordinary invocation.
+            derived = store.derived_dir(args.world) / session_id
+            still_has_geometry = (
+                (derived / "poses.json").exists()
+                and (derived / "points.json").exists()
+            )
         except Exception:  # noqa: BLE001 -- unreadable is not "still there"
             still_has_geometry = False
         state = (

@@ -90,7 +90,20 @@ RESULT_TYPE_LIVE = "live"
 # a contract disagreement, not an empty world), so it must be told to
 # update rather than shown a decode failure -- which is exactly what the
 # dated identifier is for.
-WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-09-06"
+# `/2026-09-10` supersedes `/2026-09-06` because a `model_state` a phone
+# already implements now arrives in a state it did not before: a
+# `lifecycle.state: "stopped_unbuilt"` with no geometry projects to
+# `interrupted` rather than `finalizing`. No word was added and nothing
+# is refused by an older phone -- it decodes both -- but a client that
+# switched on `lifecycle.state` and assumed the old projection would draw
+# the wrong screen, silently, which is worse than a decode failure.
+#
+# The rule this file states three paragraphs up is "equality only; a
+# mismatch means we are not talking about the same agreement". Leaving
+# the id alone would have served the old agreement's name over new
+# behaviour. A reviewer caught it still saying `/2026-09-06` after the
+# meaning moved.
+WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-09-10"
 
 # Scene Understanding's live scene.
 #

@@ -6,7 +6,7 @@ something does not exist, it says so and says why.
 
 **Envelope contract:** `cartridge_results.envelope/2026-08-23`
 **Producers offered:** World Builder `status`, contract
-`world_builder.status/2026-09-06`. Nothing else. See §9.
+`world_builder.status/2026-09-10`. Nothing else. See §9.
 
 **Audience.** Whoever implements the iOS consumer. You should be able to
 write it from this document without reading Tower's Python. If you find
@@ -71,7 +71,7 @@ asserts they cannot drift. **The phone does not need it.**
     {
       "cartridge": "world_builder",
       "result_type": "status",
-      "contract": "world_builder.status/2026-09-06",
+      "contract": "world_builder.status/2026-09-10",
       "available": true,
       "unavailable_reason": null,
       "snapshot_only": true
@@ -132,7 +132,7 @@ subscription open.
   "type": "result_subscribe",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-09-06",
+  "contract": "world_builder.status/2026-09-10",
   "world_id": null,
   "session_id": null,
   "since_revision": null
@@ -162,7 +162,7 @@ counter that moved would be a bug.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-09-06",
+  "contract": "world_builder.status/2026-09-10",
   "snapshot_only": true,
   "world_id": null,
   "session_id": null,
@@ -203,7 +203,7 @@ cartridge-specific part.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-09-06",
+  "contract": "world_builder.status/2026-09-10",
   "seq": 4,
   "revision": "e252f739c1cdedab",
   "revision_changed": true,
@@ -442,7 +442,7 @@ move.
 
 | Cartridge | Result type | Contract | Section |
 |---|---|---|---|
-| World Builder | `status` | `world_builder.status/2026-09-06` | §10 |
+| World Builder | `status` | `world_builder.status/2026-09-10` | §10 |
 | Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 | Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
 | Document Memory | `status` | `document_memory.status/2026-09-07` | §15 |
@@ -529,7 +529,7 @@ and that is worth knowing before adding a third:
 
 ## 10. World Builder `status` payload
 
-Contract: `world_builder.status/2026-09-06`.
+Contract: `world_builder.status/2026-09-10`.
 
 ### 10.0 If you implement nothing else, implement this
 
@@ -579,7 +579,7 @@ prose for a person, or null.
 | `unsupported` | this Tower cannot serve World Builder at all | e.g. no world root configured. Do not invite the user to wait |
 | `idle` | Tower is fine, there is nothing to show yet | no worlds, or a world with no sessions |
 | `receiving` | a mapping session is live | a process holds the world's writer lock |
-| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat |
+| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat, and since 2026-09-10 only when `geometry.available` is true — see below |
 | `finalized` | capture ended and the stored geometry matches the keyframes | |
 | `interrupted` | the session did not end the way a walk ends: the builder died, was asked to stop mid-walk, recorded an error, or finalization was left unfinished | **`world_snapshot` and `geometry` still describe whatever was built.** `model_state_reason` says what happened; `lifecycle.finalization` says how far finalization got. Added at `/2026-09-06` (the reason the identifier moved) |
 | `failed` | reserved; nothing on disk maps to it since `/2026-09-06` | a client must still decode it |
@@ -657,7 +657,7 @@ evidence behind these values.
 | `finalizing` | the session stopped and the builder is finishing it (final solve, final build) | a live pid holds the writer lock **and** `session_stopped` was written. Since 2026-09-06 the live builder keeps its lock through finalization |
 | `ready` | the session finished; stored geometry is what it produced | `finalization.state == "complete"` and the lock released; or, on an older record, manifest current |
 | `interrupted` | the session did not end the way a walk ends | a lock held by a dead pid (mid-walk or mid-finalization); `end_reason` `error` or `interrupted`; or a `finalization` left `pending`/`interrupted` with no live holder. **`geometry.available` says whether a reconstruction exists regardless** |
-| `stopped_unbuilt` | (records older than 2026-09-06) capture ended; stored geometry is not current with the keyframes | no manifest, or a stale one, and no `finalization` record |
+| `stopped_unbuilt` | (records older than 2026-09-06) capture ended; stored geometry is not current with the keyframes, **or** nothing was built at all | no manifest, or a stale one, and no `finalization` record. `geometry.available` tells the two apart, and since 2026-09-10 the `model_state` projection does too: `finalizing` when there is geometry to improve, `interrupted` when there is none |
 | `failed` | reserved; no longer emitted | — |
 | `idle` | a world with no live session and no stop event | — |
 | `unavailable` | nothing could be read | see `reason` |
@@ -1937,7 +1937,17 @@ because they govern different surfaces with different failure modes: the
 `library` payload is bulk text on HTTP and is pulled. A change to one is
 not a change to the other.
 
-### `world_builder.status/2026-09-06`
+### `world_builder.status/2026-09-10`
+
+Supersedes `/2026-09-06`. No word was added and nothing an older phone
+decodes was removed; what changed is that a `model_state` it already
+implements now arrives in a state it did not before. A
+`lifecycle.state: "stopped_unbuilt"` with `geometry.available: false`
+projects to `interrupted` rather than `finalizing`, because there is
+nothing to wait for -- a phone told to wait there waits forever. A client
+that switches on `model_state` needs no change; one that switched on
+`lifecycle.state` and assumed the old projection should read
+`geometry.available` beside it.
 
 Supersedes `world_builder.status/2026-08-23`. **One field changed
 meaning**, which is why the identifier moved rather than staying put for

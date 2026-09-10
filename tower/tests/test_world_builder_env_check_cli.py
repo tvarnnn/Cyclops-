@@ -69,3 +69,238 @@ def test_strict_exit_code_follows_the_verdicts():
     strict = _run("--strict")
 
     assert (strict.returncode != 0) == any_failed
+
+
+def _calibration_verdict(report):
+    return next(v for v in report["verdicts"] if v["check"] == "calibration_for_the_camera")
+
+
+def test_an_uncalibrated_world_root_is_a_red_verdict(tmp_path):
+    """The check that would have caught a whole walk producing nothing.
+
+    A reviewer pointed a replay at a `--root` with no `intrinsics/` beside
+    it and watched 131 rebuilds produce zero poses and zero points, with a
+    WARNING in a log nobody was reading. The pre-flight was all-green
+    throughout: its verdicts checked that OpenCV CAN calibrate, never that
+    anything HAS.
+    """
+    import os
+
+    environment = dict(os.environ, TOWER_WORLD_ROOT=str(tmp_path))
+    result = subprocess.run(
+        [sys.executable, "scripts/world_builder_env_check.py", "--format", "json"],
+        capture_output=True, text=True, env=environment,
+    )
+    assert result.returncode == 0
+    verdict = _calibration_verdict(json.loads(result.stdout))
+    assert verdict["ok"] is False
+    assert str(tmp_path) in verdict["detail"], (
+        "the verdict does not say WHICH directory it looked in"
+    )
+
+
+def test_a_calibrated_world_root_is_a_green_verdict(tmp_path):
+    """And it goes green for the resolution the last capture actually sent,
+    not merely because some calibration exists."""
+    import os
+
+    captures = tmp_path / "captures"
+    (captures / "cap").mkdir(parents=True)
+    (captures / "cap" / "frames.jsonl").write_text(
+        json.dumps({"source_seq": 1, "width": 360, "height": 640,
+                    "relpath": "frames/00000001.jpg"}) + "\n",
+        encoding="utf-8",
+    )
+    worlds = tmp_path / "worlds"
+    (worlds / "intrinsics").mkdir(parents=True)
+    (worlds / "intrinsics" / "360x640.json").write_text("{}", encoding="utf-8")
+
+    environment = dict(
+        os.environ,
+        TOWER_WORLD_ROOT=str(worlds),
+        TOWER_CAPTURE_ROOT=str(tmp_path),
+    )
+    result = subprocess.run(
+        [sys.executable, "scripts/world_builder_env_check.py", "--format", "json"],
+        capture_output=True, text=True, env=environment,
+    )
+    verdict = _calibration_verdict(json.loads(result.stdout))
+    assert verdict["ok"] is True, verdict["detail"]
+    assert "360x640" in verdict["detail"]
+
+    # And red again when the calibration is for a DIFFERENT resolution --
+    # the case a "does any calibration exist" check would wave through.
+    (worlds / "intrinsics" / "360x640.json").rename(
+        worlds / "intrinsics" / "1280x720.json"
+    )
+    result = subprocess.run(
+        [sys.executable, "scripts/world_builder_env_check.py", "--format", "json"],
+        capture_output=True, text=True, env=environment,
+    )
+    verdict = _calibration_verdict(json.loads(result.stdout))
+    assert verdict["ok"] is False, verdict["detail"]
+    assert "360x640" in verdict["detail"] and "1280x720" in verdict["detail"]
+
+
+def test_the_env_file_is_read_the_way_the_launcher_reads_it(tmp_path, monkeypatch):
+    """A parser that disagrees with the launcher makes the verdict a lie in
+    exactly the situation it exists for.
+
+    `start_tower.ps1` hands uvicorn `--env-file`, and uvicorn's reader is
+    python-dotenv. The first version of this check split on the first `=`
+    and stripped whitespace; a reviewer diffed it against dotenv on twelve
+    inputs and it disagreed on six -- `export KEY=v`, single and double
+    quotes, a UTF-8 BOM, an inline `# comment`, and a quoted value with a
+    space. Every disagreement produced a RED verdict against a correctly
+    configured Tower.
+    """
+    from dotenv import dotenv_values
+
+    worlds = tmp_path / "data" / "world_builder"
+    (worlds / "intrinsics").mkdir(parents=True)
+
+    awkward = [
+        'TOWER_WORLD_ROOT=data/world_builder',
+        'export TOWER_WORLD_ROOT=data/world_builder',
+        'TOWER_WORLD_ROOT="data/world_builder"',
+        "TOWER_WORLD_ROOT='data/world_builder'",
+        'TOWER_WORLD_ROOT=data/world_builder # the world root',
+        '﻿TOWER_WORLD_ROOT=data/world_builder',
+    ]
+    for line in awkward:
+        env_file = tmp_path / ".env"
+        env_file.write_text(line + "\n", encoding="utf-8")
+        assert dotenv_values(env_file).get("TOWER_WORLD_ROOT") == "data/world_builder", (
+            f"the test's own premise is wrong for {line!r}"
+        )
+
+    # And the collector resolves the same directory for every one of them.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "env_check_under_test", "scripts/world_builder_env_check.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    resolved = set()
+    for line in awkward:
+        (tmp_path / ".env").write_text(line + "\n", encoding="utf-8")
+        monkeypatch.setattr(module, "__file__", str(tmp_path / "scripts" / "x.py"))
+        monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
+        # `str`, because a parser that loses the key entirely returns
+        # None here and a bare set would raise on sorting rather than
+        # reporting. The BOM case does exactly that.
+        resolved.add(str(module.collect_calibrations()["intrinsics_dir"]))
+    assert len(resolved) == 1, (
+        f"the same world root spelled six legal ways resolved {len(resolved)} "
+        f"different directories: {sorted(resolved)}"
+    )
+
+
+def test_a_missing_dotenv_reader_says_so_instead_of_blaming_the_file(tmp_path, monkeypatch):
+    """The verdict must not describe a file it can see as absent.
+
+    The first version swallowed any reader failure into an empty dict, and
+    the detail then read "there is no .env to read it from" -- about a file
+    `is_file()` had confirmed two lines earlier, on a machine whose
+    calibration was fine. Reachable because python-dotenv was only
+    `uvicorn[standard]`'s transitive dependency; it is declared now, and
+    this pins what happens if it goes missing anyway.
+    """
+    import builtins
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "env_check_dotenvless", "scripts/world_builder_env_check.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    (tmp_path / ".env").write_text(
+        "TOWER_WORLD_ROOT=data/world_builder\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "scripts" / "x.py"))
+    monkeypatch.delenv("TOWER_WORLD_ROOT", raising=False)
+
+    real_import = builtins.__import__
+
+    def no_dotenv(name, *args, **kwargs):
+        if name == "dotenv":
+            raise ModuleNotFoundError("No module named 'dotenv'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_dotenv)
+    result = module.collect_calibrations()
+
+    assert result["covered"] is False
+    assert "ModuleNotFoundError" in result["reason"], result["reason"]
+    assert "there is no" not in result["reason"], (
+        "the verdict blames the file for the reader's absence: " + result["reason"]
+    )
+
+
+def test_a_missing_dotenv_reader_does_not_override_the_environment(tmp_path, monkeypatch):
+    """And it gets out of the way when the environment can answer.
+
+    The first fix for the swallowed failure returned early with the
+    exception named -- honest, and also wrong: an operator who exports
+    `TOWER_WORLD_ROOT` needs no `.env` at all, and the early return skipped
+    the env-var lookup, so a correctly configured machine went RED anyway.
+    A reviewer measured both versions against the same environment and the
+    behaviour being replaced was right about this case.
+    """
+    import builtins
+    import importlib.util
+
+    worlds = tmp_path / "worlds"
+    (worlds / "intrinsics").mkdir(parents=True)
+    (worlds / "intrinsics" / "360x640.json").write_text("{}", encoding="utf-8")
+    captures = tmp_path / "captures"
+    (captures / "cap").mkdir(parents=True)
+    (captures / "cap" / "frames.jsonl").write_text(
+        json.dumps({"source_seq": 1, "width": 360, "height": 640,
+                    "relpath": "frames/00000001.jpg"}) + chr(10),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("# nothing useful here" + chr(10),
+                                   encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location(
+        "env_check_env_wins", "scripts/world_builder_env_check.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "__file__", str(tmp_path / "scripts" / "x.py"))
+    monkeypatch.setenv("TOWER_WORLD_ROOT", str(worlds))
+    monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(tmp_path))
+
+    real_import = builtins.__import__
+
+    def no_dotenv(name, *args, **kwargs):
+        if name == "dotenv":
+            raise ModuleNotFoundError("No module named 'dotenv'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_dotenv)
+    result = module.collect_calibrations()
+
+    assert result["covered"] is True, (
+        "a machine configured entirely through the environment went red "
+        "because a file it does not need could not be parsed: "
+        + str(result.get("reason"))
+    )
+
+
+def test_python_dotenv_is_a_declared_dependency():
+    """Not borrowed from `uvicorn[standard]`'s extras. The pre-flight's
+    verdict is only about the Tower that will run if it reads the same
+    `.env` uvicorn will."""
+    import pathlib
+
+    text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+    dependencies = text.split("[project.optional-dependencies]")[0]
+    assert "python-dotenv" in dependencies, (
+        "python-dotenv is not in the base dependencies; a venv built with "
+        "plain uvicorn would make the calibration verdict a silent lie"
+    )

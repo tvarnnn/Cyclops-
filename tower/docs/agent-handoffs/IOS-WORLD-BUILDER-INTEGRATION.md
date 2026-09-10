@@ -117,7 +117,8 @@ enum WorldSessionBinding: Equatable, Sendable {
 | open | nothing received yet | `.awaiting` | `.awaitingFirstUpdate` |
 | open | matches ours, `receiving` | `.bound` | `.receiving(snapshot)` |
 | open | **foreign**, any state | `.foreign` | **`.awaitingFirstUpdate`** |
-| closed | matches, `stopped_unbuilt` | `.bound` | `.finalizing(snapshot)` |
+| closed | matches, `stopped_unbuilt`, geometry available | `.bound` | `.finalizing(snapshot)` |
+| closed | matches, `stopped_unbuilt`, no geometry | `.bound` | `.interrupted(snapshot)` (since 2026-09-10) |
 | closed | matches, `ready` | `.bound` | `.finalized(snapshot)` |
 | closed | foreign, `ready` | `.foreign` | `.finalized` **only** under `.inspecting(worldID:)` |
 

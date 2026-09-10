@@ -695,6 +695,15 @@ def _observe_all(store, payloads, intrinsics, *, rebuild_every=0, redactor=None)
             continue
         accepted += 1
         since += 1
+        # A HAND-ROLLED GATE, deliberately, and it is not the production
+        # one: `main()` widens the interval with the world
+        # (`rebuild_interval`). These walks are well under the 600-keyframe
+        # knee, where the two agree exactly, and the property under test --
+        # that a mid-walk rebuild does not change the final result -- is
+        # about rebuilding AT ALL, not about the cadence. Flagged by a
+        # reviewer as pinning a schedule production no longer uses; the
+        # answer is that it pins no schedule, and saying so is cheaper than
+        # importing the CLI into a unit test.
         if rebuild_every and since >= rebuild_every and accepted >= 2:
             engine.build(world_id, session_id)
             since = 0

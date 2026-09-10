@@ -433,7 +433,11 @@ class WorldBuilderEngine:
         )
 
     def stop_session(
-        self, reason: str = END_REASON_STOP, *, hold_lock: bool = False
+        self,
+        reason: str = END_REASON_STOP,
+        *,
+        hold_lock: bool = False,
+        capture_end_reason: str | None = None,
     ) -> SessionSummary:
         """Close the session record. Optionally keep the writer lock.
 
@@ -472,7 +476,29 @@ class WorldBuilderEngine:
             finalization=finalization,
         )
         self._store.write_session(session)
-        self._events.append("session_stopped", {"end_reason": reason})
+        # `capture_end_reason` IS NOT `reason`, AND THAT IS THE POINT.
+        #
+        # `reason` is what happened to the WORLD; the capture's own end is
+        # what happened to the LINK. They differ in a case the field walk
+        # actually produced: a capture that ended `disconnect` counts as
+        # finished, so a walk whose phone never came back is recorded --
+        # deliberately, see `world_build_session.py` -- as an ordinary
+        # `stop`. That choice errs toward calling a real, openable world
+        # Saved rather than putting the campaign's headline symptom back,
+        # and it is defensible only while the artifact still says which it
+        # was. `data/captures/<id>/capture.json` says, but the session
+        # names only the FIRST capture it followed, and a reconnect starts
+        # a new one; after that the link is a timestamp search.
+        #
+        # One key on an event that is already written exactly once. Not a
+        # new periodic write on the live path -- that is the family §14.6
+        # of the handoff declines to open in the last hour of a campaign,
+        # and this is not it. Absent when the caller does not know, so
+        # every offline caller's journal is byte-identical to before.
+        stopped_payload = {"end_reason": reason}
+        if capture_end_reason is not None:
+            stopped_payload["capture_end_reason"] = capture_end_reason
+        self._events.append("session_stopped", stopped_payload)
         if not hold_lock:
             self._store.release_writer_lock(session.world_id)
 

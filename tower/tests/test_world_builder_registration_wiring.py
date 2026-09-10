@@ -223,31 +223,96 @@ class TestTheTransformIsBoundToTheBuildItWasSolvedAgainst:
     def test_a_placement_solved_against_another_build_is_not_served(
         self, registered_world, tmp_path
     ):
+        """A REBUILD WRITES BOTH MANIFESTS, so simulating one has to.
+
+        This edited only the world's `derived/manifest.json`. That was a
+        complete simulation while there was one copy; `write_derived` now
+        writes a second beside the poses and points it describes, and
+        `usable_placements` reads THAT one -- because after a crash between
+        the two writes it is the copy that matches the geometry actually on
+        disk. Editing one file no longer means "a rebuild happened", it
+        means "the two copies disagree", which is a different question and
+        the next test asks it.
+
+        Caught by the suite, as a regression, from the change that gave
+        `usable_placements` the session id.
+        """
         from tower.results.world_builder_geometry import usable_placements
 
         store, world_id, session_id, _ = registered_world
         before = usable_placements(store, world_id, session_id)
         assert before, "the fixture served no placements at all"
 
-        # `world_path` names world.json itself, not the directory.
-        manifest_path = (
-            store.world_path(world_id).parent / "derived" / "manifest.json"
-        )
-        assert manifest_path.exists()
-        original = manifest_path.read_text()
-        manifest = json.loads(original)
-        manifest["input_digest"] = "0" * 64
-        manifest_path.write_text(json.dumps(manifest))
+        paths = [
+            # `world_path` names world.json itself, not the directory.
+            store.world_path(world_id).parent / "derived" / "manifest.json",
+            store.session_manifest_path(world_id, session_id),
+        ]
+        originals = {}
+        for path in paths:
+            assert path.exists(), path
+            originals[path] = path.read_text()
+            manifest = json.loads(originals[path])
+            manifest["input_digest"] = "0" * 64
+            path.write_text(json.dumps(manifest))
         try:
             after = usable_placements(store, world_id, session_id)
         finally:
-            manifest_path.write_text(original)
+            for path, text in originals.items():
+                path.write_text(text)
 
         assert after == {}, (
             "a placement solved against a different build was still "
             "served; a rebuild replaces poses and points wholesale, so "
             "the transform now describes geometry that does not exist"
         )
+
+    def test_the_copy_beside_the_geometry_decides_when_the_two_disagree(
+        self, registered_world
+    ):
+        """A crash between the two manifest writes, both directions.
+
+        `write_derived` writes poses, points, support, then the SESSION
+        manifest, then the world's. A crash in that last gap leaves new
+        geometry, a new session manifest and a stale world manifest -- so
+        the session's copy is the one that matches what is on disk, and
+        judging placements by it is what keeps them bound to the geometry
+        they were solved against.
+
+        The reverse is the conservative case: a session copy that says the
+        geometry moved refuses the placements even if the world's copy
+        still agrees with them.
+        """
+        from tower.results.world_builder_geometry import usable_placements
+
+        store, world_id, session_id, _ = registered_world
+        world_manifest = store.world_path(world_id).parent / "derived" / "manifest.json"
+        session_manifest = store.session_manifest_path(world_id, session_id)
+        originals = {p: p.read_text() for p in (world_manifest, session_manifest)}
+
+        def with_digest(path, digest):
+            manifest = json.loads(originals[path])
+            manifest["input_digest"] = digest
+            path.write_text(json.dumps(manifest))
+
+        try:
+            # The world's copy lagged; the session's matches the geometry.
+            with_digest(world_manifest, "0" * 64)
+            assert usable_placements(store, world_id, session_id), (
+                "placements bound to the geometry on disk were refused "
+                "because a second, staler copy of the manifest disagreed"
+            )
+
+            # And the other way: the session's copy says the geometry moved.
+            world_manifest.write_text(originals[world_manifest])
+            with_digest(session_manifest, "0" * 64)
+            assert usable_placements(store, world_id, session_id) == {}, (
+                "the copy beside the geometry said the build moved and the "
+                "placements were served anyway"
+            )
+        finally:
+            for path, text in originals.items():
+                path.write_text(text)
 
 
 class TestEveryCandidatePairIsAccountedFor:

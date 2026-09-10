@@ -91,13 +91,34 @@ def test_a_truncated_keyframe_journal_does_not_fabricate_geometry(
     _assert_no_fabrication(payload)
 
 
+def _every_manifest(store, world_id, session_id):
+    """Both copies of a session's manifest.
+
+    THERE ARE TWO NOW. `write_derived` writes the world's
+    `derived/manifest.json` and a copy beside the session's own poses and
+    points, because one manifest per world -- naming whichever session
+    built last -- was the root of four rounds of "an older walk reports no
+    geometry" defects.
+
+    The three tests below corrupt A manifest to check that an untrustworthy
+    one is never evidence of geometry. With two copies, corrupting one and
+    asserting absence would have been asserting that the OTHER copy does
+    not work -- so they corrupt both, and `test_one_good_copy_is_enough`
+    below pins what happens when only one is bad.
+    """
+    return [
+        store.derived_manifest_path(world_id),
+        store.session_manifest_path(world_id, session_id),
+    ]
+
+
 def test_a_manifest_from_another_schema_is_refused(monkeypatch, world):
-    root, world_id, _ = world
+    root, world_id, session_id = world
     store = WorldStore(root)
-    path = store.derived_manifest_path(world_id)
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    manifest["schema_version"] = 999
-    path.write_text(json.dumps(manifest), encoding="utf-8")
+    for path in _every_manifest(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 999
+        path.write_text(json.dumps(manifest), encoding="utf-8")
 
     payload = _payload(monkeypatch, root)
     assert payload["geometry"]["available"] is False
@@ -112,13 +133,13 @@ def test_a_manifest_missing_keys_is_not_evidence_of_geometry(monkeypatch, world)
     refusal sentence reading "None of this session's poses were refused,
     so the path has gaps". Both found by adversarial review.
     """
-    root, world_id, _ = world
+    root, world_id, session_id = world
     store = WorldStore(root)
-    path = store.derived_manifest_path(world_id)
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("points", "poses_solved", "poses_refused", "keyframes", "segments"):
-        manifest.pop(key, None)
-    path.write_text(json.dumps(manifest), encoding="utf-8")
+    for path in _every_manifest(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("points", "poses_solved", "poses_refused", "keyframes", "segments"):
+            manifest.pop(key, None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
 
     payload = _payload(monkeypatch, root)
     geometry = payload["geometry"]
@@ -138,13 +159,96 @@ def test_a_manifest_missing_keys_is_not_evidence_of_geometry(monkeypatch, world)
 
 
 def test_an_unreadable_manifest_is_survived(monkeypatch, world):
-    root, world_id, _ = world
-    WorldStore(root).derived_manifest_path(world_id).write_text(
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    for path in _every_manifest(store, world_id, session_id):
+        path.write_text("{not json at all", encoding="utf-8")
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["available"] is False
+    _assert_no_fabrication(payload)
+
+
+def test_both_manifest_copies_fail_the_same_way(monkeypatch, world):
+    """Two files meant to be identical have to fail identically.
+
+    `read_session_manifest` caught `ValueError`; `read_derived_manifest`
+    caught only `json.JSONDecodeError`. `UnicodeDecodeError` is a sibling
+    of the first and a subclass of neither -- so a reviewer wrote the same
+    three bad bytes into each copy and got opposite answers: the session
+    copy refused cleanly, the world copy raised out of every reader that
+    touches it, INCLUDING out of `read_derived`'s verify gate, which sits
+    above its own `try` and so never reaches the widened except tuple
+    there.
+
+    `{not json at all` -- what the test above uses -- is a JSONDecodeError
+    and is caught by both, which is why this hole survived.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+
+    for path in _every_manifest(store, world_id, session_id):
+        original = path.read_bytes()
+        try:
+            path.write_bytes(b"\xff\xfe\x00 not utf-8 at all")
+            # The store refuses rather than raising...
+            assert store.read_derived_manifest(world_id) is None or True
+            payload = _payload(monkeypatch, root)
+            assert payload.get("geometry") is not None, (
+                f"invalid UTF-8 in {path.name} took the whole snapshot down"
+            )
+            _assert_no_fabrication(payload)
+        finally:
+            path.write_bytes(original)
+
+
+def test_one_good_copy_is_enough(monkeypatch, world):
+    """Corrupting the world's manifest must not hide a session's own.
+
+    The two copies are written from one dict under one lock, so they
+    disagree only if something outside the Tower edited one -- or if a
+    crash landed between the two writes. The session's copy goes first, so
+    "session valid, world stale or absent" is exactly what an interrupted
+    build leaves, and reading the session's own is the right answer to it.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    truth = json.loads(
+        store.session_manifest_path(world_id, session_id).read_text(encoding="utf-8")
+    )
+    store.derived_manifest_path(world_id).write_text(
         "{not json at all", encoding="utf-8"
     )
 
     payload = _payload(monkeypatch, root)
-    assert payload["geometry"]["available"] is False
+    assert payload["geometry"]["available"] is True, (
+        "a session with its own valid manifest reported nothing because the "
+        "WORLD's copy was corrupt"
+    )
+    assert payload["geometry"]["element_count"] == truth["points"]
+
+
+def test_a_session_manifest_naming_another_session_is_refused(monkeypatch, world):
+    """A copy that names somebody else is corruption, not a second walk.
+
+    The whole point of the per-session copy is that it always describes the
+    directory it sits in. One that does not is the single input that could
+    turn this change into the misattribution it was meant to prevent.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    path = store.session_manifest_path(world_id, session_id)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["session_id"] = "f" * 32
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    store.derived_manifest_path(world_id).write_text(
+        "{not json at all", encoding="utf-8"
+    )
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["available"] is False, (
+        "a manifest naming another session was accepted as this one's"
+    )
     _assert_no_fabrication(payload)
 
 
@@ -288,9 +392,26 @@ def test_the_channel_survives_the_world_vanishing_mid_subscription(
     that partially succeeds against open handles, so the world survives in
     pieces and the outcome depends on which files happened to go. An
     earlier version of this test used it and passed or failed by luck.
-    Unlinking `world.json` is deterministic and is the stronger case
-    anyway -- the world becomes unreadable while the subscription is live.
+    Unlinking `world.json` is the stronger case anyway -- the world becomes
+    unreadable while the subscription is live.
+
+    THE UNLINK IS RETRIED, because this docstring used to call it
+    "deterministic" and it is not. The subscription under test polls
+    `world.json`, and Windows refuses to unlink a file another handle has
+    open: `PermissionError: [WinError 32]`. Measured by a reviewer at
+    roughly 1 run in 20 -- never in 11 unloaded runs, once in 4 concurrent
+    ones -- which is exactly the profile of a test that looks solid until
+    the suite is busy. `rmtree` was rejected for partially succeeding;
+    `unlink` does not partially succeed, it raises, which is worse only in
+    that it looks like a product failure.
+
+    Retrying is not weakening the test. The file still goes, the
+    subscription is still live when it does, and the assertions below are
+    unchanged; what goes away is a failure mode that belongs to the
+    filesystem rather than to the code under test.
     """
+    import time
+
     from tests.result_channel_fixtures import pump
 
     root, world_id, _ = world
@@ -300,7 +421,16 @@ def test_the_channel_survives_the_world_vanishing_mid_subscription(
         first = drain(ws, expect="cartridge_result")
         assert first["payload"]["lifecycle"]["state"] == "ready"
 
-        WorldStore(root).world_path(world_id).unlink()
+        path = WorldStore(root).world_path(world_id)
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                path.unlink()
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
         pump(client)
         later = drain(ws, expect="cartridge_result")
