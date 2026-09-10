@@ -49,7 +49,16 @@ def staging_path(path: Path) -> Path:
     pid plus uuid4: the pid makes a stray temp attributable when someone
     finds one, and the uuid makes it unique even within one process.
     """
-    return path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}{TEMP_SUFFIX}")
+    # `p` before the pid, and it is not decoration. The sweeper has to find
+    # the pid again, and "the all-digit component" is not a safe rule:
+    # `uuid4().hex[:8]` is all decimal digits 2.33% of the time (measured
+    # over 200k samples), and the capture recorder names its own staging
+    # files `<source_seq>.jpg.tmp` -- so a frame NUMBER would be read as a
+    # pid. Both were demonstrated deleting files they should not have.
+    # A `p`-prefixed component cannot be produced by either.
+    return path.with_name(
+        f"{path.name}.p{os.getpid()}.{uuid.uuid4().hex[:8]}{TEMP_SUFFIX}"
+    )
 
 
 def new_id() -> str:
@@ -113,13 +122,20 @@ def sweep_abandoned_staging(directory: Path) -> int:
         # against.
         if TEMP_SUFFIX.lstrip(".") not in parts:
             continue
+        # EXACTLY the `p<digits>` component `staging_path` writes, and
+        # nothing else. Reading "the last all-digit component" as a pid was
+        # demonstrated deleting a LIVE writer's file whenever its uuid
+        # happened to be all digits, and deleting a user's `2024.tmp`, and
+        # deleting the capture recorder's `<source_seq>.jpg.tmp` by reading
+        # the frame number as a process. A deletion primitive does not get
+        # to guess.
         pid = None
         for part in parts:
-            if part.isdigit():
-                pid = int(part)
+            if len(part) > 1 and part[0] == "p" and part[1:].isdigit():
+                pid = int(part[1:])
+                break
         if pid is None:
-            # A staging name from before they carried a pid, or something
-            # that merely looks like one. Not ours to judge, and deleting
+            # Not a name this module wrote. Not ours to judge, and deleting
             # an unattributable file is not a sweep.
             continue
         try:

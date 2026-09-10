@@ -315,6 +315,12 @@ Every point carries a measured colour.
 34 segments could not be placed at all.
 ```
 
+Colour coverage improves with the recovery, for a reason worth naming: the
+shipped world's points were a mix of the global solve's (which carry `rgb`)
+and the local chain's (which do not), at **18,954 of 26,634 = 71%**. The
+recovered world's points come from one solve, at **19,710 of 19,963 = 99%**.
+Both figures measured directly on the two `points.json` files.
+
 **Visually inspected** in Chrome (screenshots in the session transcript). It
 is one coherent frame with corridor-into-room topology — a dense structured
 cluster and a linear trail — not noise. It is also unmistakably a sparse
@@ -369,6 +375,83 @@ Measured on this host (Windows 11 26200, NTFS, Python 3.12):
 Cross-cartridge soak (`scripts/cartridge_switch_soak.py --cycles 10`, World
 Builder ↔ CV Lab): threads 41→41, RSS 651.0→652.3 MB, handles 612→612,
 verdict **flat**, 0 dead locks, 10 of 10 worlds `complete`.
+
+---
+
+## 11b. Cross-cartridge: what this campaign did to everything else
+
+The campaign modified SHARED infrastructure — `capture.py`, `metrics.py`,
+`routes/ws.py`, `storage.py`, and the iOS sender every cartridge uses — so a
+reviewer was asked the one question nobody else had: did any of it break CV
+Lab, Object Memory, Document Memory, Scene Understanding or Tower
+networking?
+
+**Two regressions, both mine, both fixed.**
+
+*The metrics fix went the wrong way.* Making a refused frame advance
+`last_tx_seq` stopped a refusal being counted as transit loss — and
+swallowed any real gap that sat immediately before one. Measured across five
+scenarios: three frames genuinely lost then a refusal reported as **zero**,
+and a session where every frame was refused reported `0` where the file's
+own Rule 3 requires `None` ("we cannot tell" must not be reported as "no
+loss occurred"). It lands on CV Lab, which refuses every frame while its
+module is stopped, arming or paused. A refused frame now does the same
+arithmetic an accepted one does — it is a frame this Tower SAW, so it closes
+the interval without being missing itself. All five scenarios report the
+truth:
+
+| scenario | truth | first fix | now |
+|---|---:|---:|---:|
+| module active, 3 lost in transit | 3 | 3 | **3** |
+| module paused, refuses 3 frames, nothing lost | 0 | 3 | **0** |
+| 3 lost immediately before a refusal | 3 | **0** | **3** |
+| every frame refused, 6 lost | 6 | **0** | **6** |
+| alternating refuse/accept, 10 lost | 10 | 13 | **10** |
+
+*The sweeper could delete a live writer's file.* It read "the last all-digit
+component" as the pid, and `uuid4().hex[:8]` is all decimal digits **2.33%**
+of the time — so a live writer's staging file was deleted at that rate. It
+also deleted a user's `2024.tmp` and the capture recorder's own
+`<source_seq>.jpg.tmp`, reading a frame number as a process. Staging names
+now carry the pid as a `p`-prefixed component, which neither a hex uuid nor
+a frame number can produce, and all seven cases are pinned.
+
+Also: the `_replace_with_retry` → `replace_with_retry` rename left one caller
+broken in `scripts/research/native_eval/` — outside the suite, so nothing
+caught it.
+
+**Proved clean:** `tx_seq` is additive on the wire (`REQUIRED_FIELDS` is a
+missing-field check; no cartridge sees the raw dict); `is_closed()` is
+provably identical for its two callers; object and document memory define
+their own `TEMP_SUFFIX` and never touch `staging_path`; the lifecycle change
+is sealed inside a private function with one call site.
+`--ignore-glob="tests/*world*"` → 2,227 passed; the four other cartridges →
+1,130 passed.
+
+**And one blocker that was not this campaign's, which is now fixed.**
+Document Memory could not start on this Windows Tower at all:
+`ModuleNotFoundError: no module named 'bidi'`, from a **corrupted**
+`python-bidi 0.6.11` install — recorded as installed, module absent. Not a
+version conflict; a force-reinstall of the same version repaired it.
+Pre-existing (the dependency file was last touched before this campaign's
+baseline), and it had never shown up because the all-cartridge soak had only
+ever been run on macOS. So the "five cartridges, one Tower" property was
+**unproven on Windows** for the whole campaign and is now proven:
+
+```
+all_cartridge_switch_soak.py --cycles 8
+  threads 82 -> 81   rss_mb 949.1 -> 943.0   handles 803 -> 801
+  workers left: 0    strays: 0    locks: complete 8
+  VERDICT: STABLE -- every cycle held, nothing leaked
+```
+
+**One intermittent, honestly:** of three all-cartridge soak runs (3, 8, 8
+cycles), one 8-cycle run ended `the Tower did not stop when asked` against
+the harness's 120 s budget — on a Tower whose own log showed a clean
+`Application shutdown complete`. Measured in isolation, shutdown takes
+**0.4 s** with or without Document Memory loaded, and the re-run of the same
+8 cycles was STABLE with RSS *falling* 6.1 MB. Cause not established. It is
+recorded rather than explained.
 
 ---
 
@@ -493,8 +576,24 @@ Five review passes ran against work their authors did not write.
 
 ## 15. The physical retest
 
-Run the pre-flight first. If `vocabulary_tree_cached` or
-`tower_package_is_this_checkout` is `[NO ]`, fix that before walking.
+**On the Mac, first — and this is a real step, not a formality.** The branch
+did not compile for several commits and nothing said so (see the verdict),
+and the iOS changes since are large.
+
+```
+xcodebuild build          # expect this to be where a problem shows up
+xcodebuild test           # GlassesTests
+```
+
+**Install the DEBUG build.** `TowerClient.sendFrame` is inside `#if DEBUG`,
+deliberately — this is an app that streams camera frames — so a Release
+build transmits nothing at all and the walk produces an empty world. That
+guard was left alone; it is a build instruction, not a bug.
+
+**On the Tower, run the pre-flight.** If `vocabulary_tree_cached` or
+`tower_package_is_this_checkout` is `[NO ]`, fix that before walking: the
+first means every solve runs without loop detection and the world comes out
+in pieces, the second means you are testing a different checkout.
 
 ```
 cd tower
@@ -532,6 +631,36 @@ reasons.
 If the world comes out in pieces, the first thing to check is
 `tx_seq_gap_total` in the session metrics: it now says whether the frames
 were lost in the air or never sent.
+
+---
+
+## 15b. Temporary resources this campaign created
+
+Filesystem policy rule 9. All under `C:\Users\tvllo\Projects\Glasses-scratch\`;
+nothing at the drive root, nothing in the home directory, no new worktree.
+**None of these were deleted** — rule 14 requires explicit human approval and
+rule 15 says move rather than delete. They are already in the approved
+location, so they are recorded here instead.
+
+| directory | MB | what it is | keep? |
+|---|---:|---|---|
+| `wb-field-forensics\` | 115 | **The preserved field artifact.** Byte-identical to the live one, verified twice (1,542 files, 116,452,684 bytes, 0 mismatches). | **KEEP — evidence** |
+| `wb-recover2\` | 138 | The most recent recovery of a pristine copy, after every fix. The best available reconstruction of the 2026-09-09 walk. | KEEP until the retest |
+| `wb-replay\` | 244 | The first recovery, plus the rendered pages (`recovered-render.html`, `product-render.html`, `dpr-render.html`) that were visually inspected. | disposable |
+| `wb-recover\` | 138 | Superseded by `wb-recover2`. | disposable |
+| `wb-horizon\` | 134 | The loop-detection horizon sweep's workspaces. | disposable |
+| `wb-production-walk\` | 7 | The production-argv walk's world and capture. | disposable |
+
+The live world root under `tower/data/world_builder/` was never modified:
+every recovery ran against a copy.
+
+Scripts live in the session scratchpad under `%TEMP%\claude\...` and go with
+the session: `production_walk.py` (the production-argv walk),
+`horizon_sweep.py` (the loop-detection sweep), `swiftcheck.py` (a brace
+balancer for a host that cannot compile Swift), and `swiftinit.py` — an
+argument-label checker that produced 43 false positives and was **abandoned
+rather than polished**, because a checker that cannot gate is worse than
+none.
 
 ---
 

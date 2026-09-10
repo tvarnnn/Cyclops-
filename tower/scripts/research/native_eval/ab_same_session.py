@@ -65,7 +65,7 @@ def _install_old():
                 json.dump(payload, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
-            storage._replace_with_retry(temp_path, path)
+            storage.replace_with_retry(temp_path, path)
         finally:
             temp_path.unlink(missing_ok=True)
 

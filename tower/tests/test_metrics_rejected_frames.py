@@ -14,6 +14,8 @@ the same snapshot. Before it, the `invalid_frame` and `module_unavailable`
 paths incremented no counter at all and left nothing to contradict the
 inflated stride.
 """
+import pytest
+
 from tower.metrics import SessionMetrics
 
 
@@ -148,3 +150,73 @@ def test_a_frame_refused_before_it_decoded_cannot_be_attributed():
     snapshot = m.snapshot()
     assert snapshot["tx_seq_gap_total"] == 1      # honestly unattributable
     assert snapshot["frames_rejected"] == 1       # and the doubt is visible
+
+
+# ---------------------------------------------------------------------------
+# The five scenarios an adversarial review used to show the first fix went
+# the WRONG WAY. It stopped a refusal being counted as a loss by having the
+# refusal advance the counter -- and swallowed any real gap that happened to
+# sit immediately before one. Row 3 went from a visible over-count of 4
+# against a truth of 3, to a confident ZERO. Row 4 turned "we cannot tell"
+# into "no loss occurred", which `metrics.py` names as a rule it must not
+# break.
+#
+# A refused frame is one this Tower SAW. It closes the interval like any
+# other arrival: whatever was missing before it is still missing, and it is
+# not itself missing.
+
+
+def _run(script):
+    """script: [(tx_seq, "accept"|"refuse")]. Absent tx values were lost."""
+    import itertools
+
+    from tower.metrics import SessionMetrics
+
+    metrics = SessionMetrics(clock=itertools.count(0.0, 0.1).__next__)
+    for tx, what in script:
+        if what == "accept":
+            metrics.record_frame(seq=tx, byte_count=100, receive_to_result_ms=1.0,
+                                 cv_processing_ms=1.0, tx_seq=tx, source_seq=tx)
+        else:
+            metrics.record_frame_rejected(tx_seq=tx)
+    return metrics.snapshot()["tx_seq_gap_total"]
+
+
+@pytest.mark.parametrize(
+    "script, truth, scenario",
+    [
+        ([(0, "accept"), (1, "accept"), (5, "accept")], 3,
+         "the module is active and three frames were lost in transit"),
+        ([(i, "refuse" if i in (3, 4, 7) else "accept") for i in range(10)], 0,
+         "the module is paused and refuses three frames; nothing was lost"),
+        ([(0, "accept"), (1, "accept"), (5, "refuse"), (6, "accept")], 3,
+         "three lost in transit IMMEDIATELY BEFORE a refusal -- the case the "
+         "first fix reported as zero"),
+        ([(0, "refuse"), (7, "refuse")], 6,
+         "every frame refused all session, six lost in transit -- the case "
+         "the first fix reported as zero against a truth of six"),
+        ([(0, "accept"), (1, "refuse"), (2, "accept"), (13, "refuse"),
+          (14, "accept")], 10,
+         "alternating refuse and accept with ten lost mid-session"),
+    ],
+)
+def test_transit_loss_is_counted_whatever_the_module_was_doing(script, truth, scenario):
+    assert _run(script) == truth, scenario
+
+
+def test_a_sender_that_never_sends_tx_seq_still_reports_we_cannot_tell():
+    """`metrics.py`'s own Rule 3: None, not 0.
+
+    "We cannot tell" must not be reported as "no loss occurred", and a
+    refusal path that initialised the counter would have broken that for
+    any sender without `tx_seq` -- every sender before 2026-09-09.
+    """
+    import itertools
+
+    from tower.metrics import SessionMetrics
+
+    metrics = SessionMetrics(clock=itertools.count(0.0, 0.1).__next__)
+    metrics.record_frame(seq=1, byte_count=100, receive_to_result_ms=1.0,
+                         cv_processing_ms=1.0, source_seq=1)
+    metrics.record_frame_rejected()
+    assert metrics.snapshot()["tx_seq_gap_total"] is None

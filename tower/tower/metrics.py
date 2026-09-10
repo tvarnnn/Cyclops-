@@ -224,8 +224,24 @@ class SessionMetrics:
         # is reported beside the gap so the reader can see how much room
         # for doubt there is.
         if tx_seq is not None:
+            # THE SAME ARITHMETIC `record_frame` DOES, not just an advance.
+            #
+            # The first version only moved `last_tx_seq`, which fixed the
+            # over-count (a refusal read as a loss) by creating an
+            # UNDER-count: a gap that happened to sit immediately before a
+            # refusal was swallowed whole. Measured by an adversarial
+            # review -- three frames genuinely lost in transit, then a
+            # refused frame, reported as ZERO. That is the worse error, and
+            # it lands on CV Lab, which refuses every frame while its
+            # module is stopped, arming or paused.
+            #
+            # A refused frame is one this Tower SAW. It closes the interval
+            # like any other arrival: whatever was missing before it is
+            # still missing, and it is not itself missing.
             if self.tx_seq_gap_total is None:
                 self.tx_seq_gap_total = 0
+            elif self.last_tx_seq is not None and tx_seq > self.last_tx_seq + 1:
+                self.tx_seq_gap_total += tx_seq - self.last_tx_seq - 1
             self.last_tx_seq = tx_seq
 
     def should_log_summary(self) -> bool:

@@ -443,7 +443,7 @@ def test_a_dead_writers_staging_file_is_swept(tmp_path):
 
     dead = subprocess.Popen([_sys.executable, "-c", "pass"])
     dead.wait()
-    stray = workspace.root / f"solution.npz.{dead.pid}.deadbeef.tmp"
+    stray = workspace.root / f"solution.npz.p{dead.pid}.deadbeef.tmp"
     stray.write_bytes(b"x" * 4096)
 
     assert sweep_abandoned_staging(workspace.root) == 1
@@ -463,7 +463,7 @@ def test_a_live_writers_staging_file_is_left_alone(tmp_path):
 
     workspace = _workspace(tmp_path)
     workspace.root.mkdir(parents=True, exist_ok=True)
-    mine = workspace.root / f"solution.npz.{os.getpid()}.cafebabe.tmp"
+    mine = workspace.root / f"solution.npz.p{os.getpid()}.cafebabe.tmp"
     mine.write_bytes(b"in flight")
 
     assert sweep_abandoned_staging(workspace.root) == 0
@@ -490,7 +490,7 @@ def test_an_undistort_staging_file_is_swept_too(tmp_path):
     workspace.images_dir.mkdir(parents=True, exist_ok=True)
     dead = subprocess.Popen([_sys.executable, "-c", "pass"])
     dead.wait()
-    stray = workspace.images_dir / f"00000001.{dead.pid}.8ecff1a3.tmp.jpg"
+    stray = workspace.images_dir / f"00000001.p{dead.pid}.8ecff1a3.tmp.jpg"
     stray.write_bytes(b"half an undistorted frame")
     keep = workspace.images_dir / "00000002.jpg"
     keep.write_bytes(b"a real frame")
@@ -527,3 +527,59 @@ def test_a_staging_file_with_no_pid_in_it_is_left_alone(tmp_path):
 
     assert sweep_abandoned_staging(workspace.root) == 0
     assert legacy.exists()
+
+
+@pytest.mark.parametrize(
+    "name, should_sweep, why",
+    [
+        ("solution.npz.p{dead}.abcd1234.tmp", True, "a dead writer's archive"),
+        ("00000001.p{dead}.8ecff1a3.tmp.jpg", True, "a dead writer's undistort"),
+        ("x.json.p{dead}.12345678.tmp", True, "a dead writer whose uuid is ALL DIGITS"),
+        ("points.json.p{live}.deadbeef.tmp", False, "a LIVE writer's file in flight"),
+        ("00000123.jpg.tmp", False, "the capture recorder's own frame staging"),
+        ("2024.tmp", False, "a user's file that happens to be numeric"),
+        ("solution.npz.tmp", False, "a staging name from before pids were in them"),
+    ],
+)
+def test_the_sweeper_deletes_only_what_it_wrote(tmp_path, name, should_sweep, why):
+    """A deletion primitive does not get to guess.
+
+    The first version read "the last all-digit component" as the pid. An
+    adversarial review proved that deletes a LIVE writer's file whenever its
+    `uuid4().hex[:8]` happens to be all decimal digits -- **2.33% of the
+    time**, measured over 200k samples -- and deletes a user's `2024.tmp`,
+    and deletes the capture recorder's `<source_seq>.jpg.tmp` by reading the
+    frame number as a process id.
+
+    `staging_path` writes the pid as a `p`-prefixed component, which neither
+    a hex uuid nor a frame number can produce, and the sweeper matches
+    exactly that.
+    """
+    import os
+    import subprocess
+    import sys as _sys
+
+    from tower.storage import sweep_abandoned_staging
+
+    dead = subprocess.Popen([_sys.executable, "-c", "pass"])
+    dead.wait()
+    target = tmp_path / name.format(dead=dead.pid, live=os.getpid())
+    target.write_bytes(b"contents")
+
+    swept = sweep_abandoned_staging(tmp_path)
+    assert (swept == 1) is should_sweep, why
+    assert target.exists() is not should_sweep, why
+
+
+def test_the_staging_name_carries_a_pid_the_sweeper_can_find(tmp_path):
+    """The writer and the sweeper must agree, or one of them is wrong."""
+    import os
+
+    from tower.storage import staging_path, sweep_abandoned_staging
+
+    mine = staging_path(tmp_path / "points.json")
+    mine.write_bytes(b"in flight")
+    assert f".p{os.getpid()}." in mine.name
+    # Alive, so it stays.
+    assert sweep_abandoned_staging(tmp_path) == 0
+    assert mine.exists()
