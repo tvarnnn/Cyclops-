@@ -16,13 +16,14 @@ is asked of the OS rather than of a timestamp for the same reason.
 
 from __future__ import annotations
 
+import math
 import os
 
-from tower.results.world_builder_geometry import manifest_for
 from tower.world_builder.records import FINALIZATION_COMPLETE
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
+    manifest_describing,
     session_has_drawable_geometry,
 )
 
@@ -198,10 +199,25 @@ def _sortable(value):
         # Before the int check: `bool` IS an int, and `True` sorting among
         # timestamps as 1.0 is a silent wrong answer.
         return (0, ("bool", value))
-    if isinstance(value, (int, float)) and value == value:  # noqa: PLR0124
-        # `value == value` excludes NaN, which is not orderable: a single
-        # NaN in a list makes `sort` produce an arbitrary permutation
-        # rather than raise, which is the worst of both.
+    if isinstance(value, int) or (
+        isinstance(value, float) and math.isfinite(value)
+    ):
+        # `int` FIRST AND WITHOUT `isfinite`. An int is finite by
+        # construction, and `math.isfinite` converts to float first --
+        # `math.isfinite(10**400)` raises `OverflowError`, which is the
+        # very escape this function exists to prevent, reintroduced by
+        # the fix for the infinities. Caught by the test written for the
+        # first version of it. Python compares a big int against a float
+        # exactly, without converting either.
+        #
+        # `math.isfinite` for the float, not `value == value`. The latter excludes NaN
+        # -- which is not orderable, and which silently makes `sort`
+        # return an arbitrary permutation rather than raise -- and ADMITS
+        # the infinities, so `float("inf")` sorted ahead of every real
+        # world under `reverse=True`: the exact outcome this function was
+        # written to stop a string producing. Reachable from the Tower's
+        # own writer: `json.dumps` emits the bare `Infinity` token by
+        # default and `json.loads` accepts it back.
         return (1, value)
     if value is None:
         return (0, ("", ""))
@@ -231,7 +247,15 @@ def build_world_listing(store: WorldStore) -> dict:
             # only if it names this session. Four readers, one rule; a
             # fifth reader with its own idea is how this campaign's
             # defects kept coming back.
-            manifest = manifest_for(store, world_id, session_id)
+            # `purpose="figures"`, NOT the identity rule the geometry
+            # module uses. Everything this listing does with a manifest
+            # reads COUNTS out of it -- `has_geometry` and
+            # `_nothing_to_open` -- and a manifest whose fields this build
+            # cannot vouch for must not supply them. `manifest_for` is the
+            # identity question and answers a different one.
+            manifest = manifest_describing(
+                store, world_id, session_id, purpose="figures"
+            )
             has_geometry = _has_geometry(store, world_id, session_id, manifest)
             sessions.append({
                 "session_id": session.session_id,
@@ -266,7 +290,22 @@ def build_world_listing(store: WorldStore) -> dict:
                 # null on a record written before it existed.
                 "finalization": session.finalization,
             })
-        sessions.sort(key=lambda s: s["started_at"])
+        # `_sortable` HERE TOO, and its absence here was the whole
+        # argument for it thirty lines below.
+        #
+        # `session_from_json_dict` does not coerce -- `started_at =
+        # data["started_at"]`, raw -- so a `session.json` carrying a
+        # string or a null reaches this comparison. This sort is at the
+        # top of the per-world loop, OUTSIDE the inner try that skips an
+        # unreadable session, outside `build_world_listing`'s only
+        # handler, on a route with none: the raise escapes before any
+        # world is returned, so **one bad session record empties Saved
+        # Worlds entirely** -- all 163 worlds, not a shortened list.
+        #
+        # A reviewer reproduced it by writing an ISO timestamp string into
+        # one `started_at`, immediately after the round that hardened the
+        # world sort against the identical shape and did not look up.
+        sessions.sort(key=lambda s: _sortable(s["started_at"]))
         worlds.append({
             "world_id": world.world_id,
             "display_name": world.display_name,

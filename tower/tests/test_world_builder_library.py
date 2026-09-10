@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from tests.result_channel_fixtures import build_world
 from tower.results.world_builder_library import WORLDS_CONTRACT, build_world_listing
 from tower.routes import geometry as geometry_routes
+from tower.world_builder.records import Session, World
 from tower.world_builder.store import WorldStore
 
 
@@ -480,3 +481,142 @@ def test_no_value_of_updated_at_can_take_the_listing_down(derived_world):
 
         listing = build_world_listing(store)
         assert listing["world_count"] == 2, bad
+
+
+# -- round 18 ----------------------------------------------------------
+
+
+def test_one_bad_session_record_does_not_empty_saved_worlds(derived_world):
+    """The session sort, thirty lines above the world sort that was fixed.
+
+    `session_from_json_dict` does not coerce -- `started_at =
+    data["started_at"]`, raw -- so a `session.json` carrying a string
+    reaches the comparison. The sort sits at the top of the per-world
+    loop, OUTSIDE the inner try that skips an unreadable session, outside
+    `build_world_listing`'s only handler, on a route with none. So the
+    raise escapes before ANY world is returned: one bad record and the
+    picker loses all 163 worlds, not one row.
+
+    A reviewer found it by applying the world sort's own justification --
+    *"a world carrying null, or a string, does [reach here]"* -- to the
+    line above it.
+    """
+    store, world_id, session_id = derived_world
+
+    # A second session, so the sort actually compares something.
+    store.write_session(Session(session_id="s1", world_id=world_id,
+                                started_at=5.0, ended_at=6.0))
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=7.0,
+                            session_ids=(session_id, "s1")))
+    assert build_world_listing(store)["world_count"] == 1
+
+    path = store.session_dir(world_id, "s1") / "session.json"
+    for bad in ("2026-09-11T09:00:00Z", None, [], {"a": 1}, float("nan")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["started_at"] = bad
+        path.write_text(json.dumps(record), encoding="utf-8")
+        listing = build_world_listing(store)
+        assert listing["world_count"] == 1, (
+            f"a session whose started_at is {bad!r} emptied the whole listing"
+        )
+
+
+def test_an_infinity_is_not_the_newest_world(derived_world):
+    """`float('inf')` sorted ahead of every real world.
+
+    The first version of `_sortable` excluded NaN with `value == value`,
+    which admits the infinities -- so an `updated_at` of `Infinity` took
+    the top row under `reverse=True`, which is the exact outcome the
+    function was written to stop a STRING producing. Reachable from the
+    Tower's own writer: `json.dumps` emits the bare `Infinity` token by
+    default and `json.loads` reads it back.
+    """
+    store, world_id, _ = derived_world
+    original = json.loads((store.world_dir(world_id) / "world.json").read_text())
+
+    for bad in (float("inf"), float("-inf")):
+        other = dict(original, world_id="w1", session_ids=[], updated_at=bad)
+        path = store.world_dir("w1") / "world.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(other))
+        listing = build_world_listing(store)
+        assert listing["world_count"] == 2, bad
+        assert listing["worlds"][0]["world_id"] == world_id, (
+            f"a world whose updated_at is {bad!r} took the top row"
+        )
+
+
+def test_a_manifest_is_judged_by_what_the_reader_needs_of_it(derived_world):
+    """Identity and figures are different questions with different rules.
+
+    `SCHEMA_VERSION` versions the WHOLE record family -- `World`,
+    `Session`, `Keyframe`, `KeyframeEdge` -- and the manifest inherits
+    `world.schema_version` rather than the module constant. The rows in
+    `poses.json` and `points.json` carry no version at all; their shape is
+    pinned by `world_builder.geometry/2026-08-25`, which has never moved
+    under it.
+
+    So refusing a PLACEMENT because the record schema moved is refusing a
+    Sim3 for a reason that has nothing to do with it. A reviewer bumped
+    the constant against the real 163-world root and watched **408
+    placements across 10 sessions drop to 0** -- every segment a
+    disconnected island, the picture the final solve exists to prevent.
+
+    The figures are the other question, and there the schema matters:
+    a manifest whose fields this build cannot vouch for must not say how
+    many points there are.
+    """
+    from tower.world_builder.store import manifest_describing
+
+    store, world_id, session_id = derived_world
+    path = store.session_manifest_path(world_id, session_id)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 999
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    world_path = store.derived_manifest_path(world_id)
+    world_manifest = json.loads(world_path.read_text(encoding="utf-8"))
+    world_manifest["schema_version"] = 999
+    world_path.write_text(json.dumps(world_manifest), encoding="utf-8")
+
+    identity = manifest_describing(store, world_id, session_id, purpose="identity")
+    figures = manifest_describing(store, world_id, session_id, purpose="figures")
+
+    assert identity is not None, (
+        "a record-schema bump refused a manifest whose digest is all the "
+        "placement reader wanted"
+    )
+    assert identity["input_digest"] == manifest["input_digest"]
+    assert figures is None, (
+        "a manifest from an unknown schema was allowed to report figures"
+    )
+
+
+def test_the_drawable_predicate_does_not_re_admit_a_refused_manifest(derived_world):
+    """The fifth reader, in the function written to stop there being one.
+
+    `session_has_drawable_geometry` re-read the manifest with a LOOSE rule
+    when its caller passed `None` -- re-admitting exactly what
+    `validate_manifest` had just refused. The caller passes the strict
+    answer and this substituted a looser one, so one session produced
+    three answers: picker "complete", panel "Needs retry", render page
+    blank.
+    """
+    from tower.world_builder.store import session_has_drawable_geometry
+
+    store, world_id, session_id = derived_world
+    derived = store.derived_dir(world_id) / session_id
+    # The disk says nothing is there...
+    (derived / "poses.json").write_text(json.dumps({"poses": []}))
+    (derived / "points.json").write_text(json.dumps({"points": []}))
+    # ...and a manifest this build cannot read says 500 points are.
+    for path in (derived / "manifest.json", store.derived_manifest_path(world_id)):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.update(schema_version=999, points=500, poses_positioned=5)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert session_has_drawable_geometry(store, world_id, session_id) is False, (
+        "a manifest from an unknown schema was believed over the files"
+    )
+    # And the surface that calls it with no manifest agrees.
+    row = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert row["has_geometry"] is False

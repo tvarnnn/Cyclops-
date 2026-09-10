@@ -26,6 +26,7 @@ from tower.world_builder.render import (
     VIEW_PRODUCT,
     render_html,
 )
+from tower.results.world_builder_library import _sortable
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
@@ -133,7 +134,11 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
         candidates.append((started, candidate))
     if not candidates:
         raise WorldRenderUnavailable(f"world {world_id!r} has no session with geometry yet")
-    candidates.sort()
+    # `_sortable`, for the reason `build_world_listing` gives at length:
+    # `started_at` comes off disk uncoerced, and a string beside a float
+    # raises `TypeError` out of a route with no handler. Here that is a
+    # 500 on the render page instead of the world.
+    candidates.sort(key=lambda pair: (_sortable(pair[0]), pair[1]))
     return candidates[-1][1]
 
 

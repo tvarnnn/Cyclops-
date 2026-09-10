@@ -157,6 +157,85 @@ def require_pose_convention(convention: dict) -> None:
 
 
 
+# Five attempts over ~14 ms of backoff. `write_json_atomic`'s own
+# `replace_with_retry` carries a 2,000 ms budget on the writer side, so
+# the two ladders overlap rather than race each other to a failure.
+_REPLACE_READ_ATTEMPTS = 5
+_REPLACE_READ_BACKOFF = 0.001
+
+
+def _read_json_past_a_replace(path, *, absent_on_failure=True):
+    """`read_json_closed`, surviving a writer replacing the file underneath.
+
+    **`write_derived` REPLACES FIVE FILES MICROSECONDS APART** -- poses,
+    points, support and both manifests -- and on Windows `os.replace` onto
+    a path a reader holds open fails with WinError 5, symmetrically with
+    the reader's own `open()` during the writer's window.
+
+    The two manifests were the ones nobody guarded. `read_derived_manifest`
+    caught only `ValueError` and `read_session_manifest` only
+    `(JSONDecodeError, ValueError)`; `derived_currency` calls both with no
+    `try` at all, and `world_builder_geometry._is_current` calls
+    `derived_currency` OUTSIDE its own. So a `PermissionError` walked out
+    through `build_manifest` and became an HTTP **500** on the geometry
+    route -- measured by a reviewer at **2.4% of requests** beside a live
+    writer, on a route whose own comment promises "404 now means ABSENT
+    only" and for which the phone has no branch. On the status channel the
+    same exception is caught by `snapshot()` and blinks the whole world
+    out of existence for a poll.
+
+    A round of this campaign measured that exact hazard and fixed it on
+    `poses.json` and `points.json`, the two files it was reading at the
+    time, and walked past the three that were already unguarded.
+
+    Two immediate retries, no sleep: a replace is over in microseconds and
+    this runs in a poll path. A reviewer measured the retry taking a
+    reader from 2.77% failures to **0%** on a 1.3 MB file, and 2.60% to
+    0.39% at 2,360 writes in six seconds, with **zero** additional writer
+    failures -- `replace_with_retry` already carries a 2,000 ms budget and
+    the worst observed write used 6% of it.
+
+    A `ValueError` is NOT retried and is re-raised for the caller's own
+    handler: a file that parsed and was wrong will parse and be wrong
+    again. An `OSError` that survives the retries is a real fault, and it
+    is reported as "no manifest" rather than raised, because every caller
+    of this treats an absent manifest as "nothing here can judge it" --
+    honest and degraded, where the raise is a 500 the phone cannot read.
+    """
+    last = None
+    for attempt in range(_REPLACE_READ_ATTEMPTS):
+        try:
+            return read_json_closed(path)
+        except OSError as exc:
+            last = exc
+            if attempt + 1 < _REPLACE_READ_ATTEMPTS:
+                # A SMALL BACKOFF, AND ONLY ON FAILURE.
+                #
+                # Three back-to-back attempts are not enough against a
+                # writer that starts its next replace immediately: a probe
+                # with an unthrottled writer (~80 write_derived/s, far
+                # hotter than any real build) put all three inside one
+                # collision window and the PermissionError still escaped.
+                # The successful path never sleeps, and the whole ladder
+                # is 14 ms against a 500 ms poll.
+                time.sleep(_REPLACE_READ_BACKOFF * (2 ** attempt))
+    if not absent_on_failure:
+        # RETRY IS NOT SWALLOW, and this half keeps that true.
+        #
+        # `read_derived` deliberately leaves `OSError` out of its except
+        # tuple so that a genuine disk fault is a 500 rather than a
+        # silent 404 -- a reviewer injected EIO to establish that, and it
+        # is the right call. A transient Windows replace collision is not
+        # a disk fault, though, and telling them apart is exactly what
+        # three attempts do: what survives them is reported as itself.
+        raise last
+    logger.warning(
+        "world builder: %s stayed unreadable (%r); treating it as absent",
+        path, last,
+    )
+    return None
+
+
 class WorldStore:
     """Filesystem storage for one root directory of worlds."""
 
@@ -376,7 +455,7 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            data = read_json_closed(path)
+            data = _read_json_past_a_replace(path)
         except ValueError:
             # `ValueError`, NOT `json.JSONDecodeError`. The latter is a
             # subclass, and `UnicodeDecodeError` -- which is what invalid
@@ -406,7 +485,7 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            data = read_json_closed(path)
+            data = _read_json_past_a_replace(path)
         except (json.JSONDecodeError, ValueError):
             logger.warning("world builder: session manifest unreadable at %s", path)
             return None
@@ -517,9 +596,22 @@ class WorldStore:
         if not poses_path.exists() or not points_path.exists():
             return None
         try:
+            # THROUGH THE RETRY, for the reason `_read_json_past_a_replace`
+            # gives at length -- and with `absent_on_failure=False`, so a
+            # real fault still raises out of here exactly as it did.
+            #
+            # These two are the LARGEST files `write_derived` replaces, so
+            # they hold the collision window open longest. A probe with a
+            # live writer beside the geometry route measured the escape as
+            # an HTTP 500 here, one layer above the manifest readers that
+            # a reviewer had already found unguarded.
             return {
-                "poses": read_json_closed(poses_path)["poses"],
-                "points": read_json_closed(points_path)["points"],
+                "poses": _read_json_past_a_replace(
+                    poses_path, absent_on_failure=False
+                )["poses"],
+                "points": _read_json_past_a_replace(
+                    points_path, absent_on_failure=False
+                )["points"],
                 "support": self._read_support(derived),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -633,7 +725,11 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            support = read_json_closed(path)["support"]
+            # Through the retry as well: a replace collision here would
+            # otherwise be absorbed by the `except Exception` below and
+            # silently drop an index that is perfectly good, one poll
+            # after the build that wrote it.
+            support = _read_json_past_a_replace(path)["support"]
             # Shape-checked, not just parsed. A top-level list raised
             # TypeError straight out of a method whose docstring promises
             # it never raises, and a string was returned AS the support
@@ -1032,21 +1128,24 @@ def session_has_drawable_geometry(store, world_id, session_id, manifest=None) ->
     if not ((derived / "poses.json").exists() and (derived / "points.json").exists()):
         return False
     if manifest is None:
-        try:
-            manifest = store.read_session_manifest(world_id, session_id)
-            if not (
-                isinstance(manifest, dict)
-                and manifest.get("session_id") == session_id
-            ):
-                world = store.read_derived_manifest(world_id)
-                manifest = (
-                    world
-                    if isinstance(world, dict)
-                    and world.get("session_id") == session_id
-                    else None
-                )
-        except (WorldStoreError, OSError, ValueError, KeyError):
-            manifest = None
+        # `manifest_describing`, NOT A HAND-ROLLED READ.
+        #
+        # This used to re-read the manifest with a loose rule --
+        # `isinstance(dict)` and `session_id` -- which re-admitted exactly
+        # the manifests `validate_manifest` had just refused. The caller
+        # passes the strict answer, `None`, and this quietly substituted a
+        # looser one: a reviewer built a session whose manifest claims
+        # `points: 500` under a schema this build does not know, over
+        # `poses.json` and `points.json` that are both empty, and got
+        # **three answers from one payload** -- picker "complete", panel
+        # "Needs retry", render page blank.
+        #
+        # In a function whose own docstring says "two surfaces need this
+        # answer and they must not compute it apart", and one round after
+        # a reviewer counted the readers and found five.
+        manifest = manifest_describing(
+            store, world_id, session_id, purpose="figures"
+        )
     if isinstance(manifest, dict):
         points = manifest.get("points")
         positioned = manifest.get("poses_positioned")
@@ -1071,8 +1170,77 @@ def _points_on_disk(store, world_id, session_id) -> int:
     return len(rows) if isinstance(rows, list) else 0
 
 
+def manifest_describing(store, world_id, session_id, *, purpose):
+    """The manifest that describes THIS session, judged for one PURPOSE.
+
+    **ONE READER, ONE RULE -- and the rule depends on the question, which
+    is what three rounds of this campaign kept getting wrong in both
+    directions.** Two questions are asked of a manifest and they need
+    different standards:
+
+    ``"figures"`` -- how many points, how many poses. The status channel
+    reports these and the picker draws from them, so a manifest that
+    cannot be trusted field-by-field must not supply them: schema checked,
+    required keys checked.
+
+    ``"identity"`` -- WHICH BUILD produced this tree, i.e. `input_digest`.
+    `usable_placements` and `_is_current` compare that digest and nothing
+    else. Holding them to the figures refuses manifests that answer their
+    question perfectly, and holding them to the SCHEMA is worse:
+    `SCHEMA_VERSION` versions the whole record family (`World`, `Session`,
+    `Keyframe`, `KeyframeEdge`), the manifest inherits
+    `world.schema_version` rather than the module constant, and
+    `poses.json`/`points.json` rows carry no version at all -- their shape
+    is pinned by `world_builder.geometry/2026-08-25`, which has never
+    moved under it. A reviewer bumped the constant against the real root
+    and watched **408 placements across 10 sessions drop to 0**, every
+    segment becoming a disconnected island, on a change that has nothing
+    to do with a Sim3.
+
+    The session's own copy first, then the world's but only if it names
+    this session -- a manifest naming somebody else is not evidence about
+    this one.
+    """
+    figures = purpose == "figures"
+    try:
+        manifest = validate_manifest(
+            store.read_session_manifest(world_id, session_id),
+            world_id,
+            source="session manifest",
+            require_figures=figures,
+            require_schema=figures,
+        )
+        if manifest is not None and manifest.get("session_id") == session_id:
+            return manifest
+        world = validate_manifest(
+            store.read_derived_manifest(world_id),
+            world_id,
+            require_figures=figures,
+            require_schema=figures,
+        )
+        if world is not None and world.get("session_id") == session_id:
+            return world
+    except (WorldStoreError, OSError, ValueError, KeyError, TypeError):
+        # OSError BELONGS HERE. `write_derived` replaces five files
+        # microseconds apart, and on Windows a replace onto a path a
+        # reader has open -- and a reader's open during the writer's
+        # window -- fails with WinError 5. Neither
+        # `read_derived_manifest` nor `read_session_manifest` catches it,
+        # and a reviewer measured the escape reaching `GET /worlds/...`
+        # as an HTTP **500** on 2.4% of requests beside a live writer, on
+        # a route whose own comment says "404 now means ABSENT only" and
+        # for which the phone has no branch.
+        return None
+    return None
+
+
 def validate_manifest(
-    manifest, world_id, source="derived manifest", *, require_figures=True
+    manifest,
+    world_id,
+    source="derived manifest",
+    *,
+    require_figures=True,
+    require_schema=True,
 ):
     """Schema-check a manifest, wherever it was read from, or None.
 
@@ -1101,7 +1269,7 @@ def validate_manifest(
         # AttributeError -- a 500 on the status channel, where the
         # identically corrupt per-session copy gave a clean refusal.
         return None
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    if require_schema and manifest.get("schema_version") != SCHEMA_VERSION:
         # A manifest from another schema describes fields whose meaning
         # this build does not know. It is refused as a SUMMARY; the poses
         # and points beside it are a separate question, and

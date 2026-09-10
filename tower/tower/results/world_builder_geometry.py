@@ -28,7 +28,7 @@ from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
     compute_input_digest,
-    validate_manifest,
+    manifest_describing,
 )
 
 GEOMETRY_CONTRACT = "world_builder.geometry/2026-08-25"
@@ -444,29 +444,12 @@ def _session_manifest(store, world_id: str, session_id: str) -> dict | None:
     this one, and treating it as such is how an older walk was served
     another session's coverage classes and had every placement refused.
     """
-    try:
-        # `require_figures=False`: this module's callers ask WHICH BUILD
-        # produced a tree -- `usable_placements` compares digests,
-        # `_is_current` compares digests -- and a manifest carrying a
-        # session id and a digest answers that completely. The figure
-        # check belongs to the reader that reports figures. What IS shared
-        # is the schema check: a manifest from a schema this build does
-        # not know is not evidence for anybody.
-        manifest = validate_manifest(
-            store.read_session_manifest(world_id, session_id),
-            world_id, source="session manifest", require_figures=False,
-        )
-        if manifest is not None and manifest.get("session_id") == session_id:
-            return manifest
-        world = validate_manifest(
-            store.read_derived_manifest(world_id), world_id,
-            require_figures=False,
-        )
-        if world is not None and world.get("session_id") == session_id:
-            return world
-    except Exception:  # noqa: BLE001 -- an unreadable manifest is "no judgement"
-        return None
-    return None
+    # `purpose="identity"`: this module's callers ask WHICH BUILD produced
+    # a tree -- `usable_placements` compares `input_digest`, `_is_current`
+    # compares `input_digest` -- and a manifest carrying a session id and a
+    # digest answers that completely. See `manifest_describing` for why
+    # neither the figures nor the SCHEMA belongs on this path.
+    return manifest_describing(store, world_id, session_id, purpose="identity")
 
 
 def manifest_for(store, world_id: str, session_id: str | None = None) -> dict | None:
