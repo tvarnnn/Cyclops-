@@ -38,9 +38,19 @@ struct WorldFragmentsModel: Equatable {
 
     /// Whether the Tower's geometry reflects every keyframe it has accepted.
     ///
+    /// **Optional, and defaulted to `nil` rather than to `true`.** It was
+    /// `true`, and that meant a model built for the empty and cleared cases —
+    /// which have no manifest to ask, because no manifest was ever fetched —
+    /// asserted that its geometry was up to date. A gallery that had never
+    /// fetched anything said, in effect, "this is current", and the one line
+    /// that would have told the reader otherwise (`buildingNote`) was
+    /// suppressed by the same default. `nil` is the honest third answer: no
+    /// manifest has said.
+    ///
     /// A `var` with a default so the memberwise initialiser keeps working for
-    /// the empty and cleared cases, which have no manifest to ask.
-    var isCurrent: Bool = true
+    /// those cases, and so `WorldGeometryManifest.current` — a plain `Bool` —
+    /// still passes straight into it.
+    var isCurrent: Bool? = nil
 
     /// The Tower's coverage words this model treats specially. Anything else
     /// it does not know is still shown verbatim on the tile, and never acted
@@ -170,21 +180,40 @@ struct WorldFragmentsModel: Equatable {
     /// Said out loud when the fragments on screen are real but behind. Not a
     /// warning and not an error state: the world is still being built, and
     /// this is what "still building" looks like from here.
+    /// Spoken only where a manifest actually said `current: false`. `nil` —
+    /// no manifest — says nothing, because there is nothing it could say
+    /// truthfully.
     var buildingNote: String? {
-        if isCurrent { return nil }
+        guard isCurrent == false else { return nil }
         return "The Tower is still building this world, so these fragments "
             + "may be behind the newest frames."
     }
 
-    /// What is connected and what is not, in one line.
+    /// What is connected and what is not, in one line, or `nil` when this
+    /// model has nothing drawable to describe.
     ///
     /// A "connected world" is a cluster — segments the Tower placed into one
     /// frame — and the count after it is how many segments that frame holds.
     /// The loose fragments are named separately and never added to it.
-    var headline: String {
+    ///
+    /// ## Why the empty case returns `nil` instead of a sentence
+    ///
+    /// It used to return `"Nothing mapped yet"`. That string was drawn over the
+    /// 2026-09-06 walk's world — 463 keyframes, 467 poses, 17,674 points —
+    /// because this model is empty in five situations and only one of them is
+    /// "the Tower built nothing" (see `WorldPresentation.swift`). This type
+    /// cannot tell them apart: it holds a manifest's segments and knows nothing
+    /// about whether a manifest was ever fetched.
+    ///
+    /// So it no longer answers a question it cannot answer.
+    /// `WorldGeometryAccount` does, from the fetch's state *and* the Tower's
+    /// own claims, and the words "Nothing mapped yet" now exist in exactly one
+    /// place — `WorldGeometryAccount.nothingMapped` — reachable only where the
+    /// Tower has actually said so.
+    var headline: String? {
         let clusters = self.clusters
         let loose = unclusteredFragments.count
-        if clusters.isEmpty && loose == 0 { return "Nothing mapped yet" }
+        if clusters.isEmpty && loose == 0 { return nil }
 
         var parts: [String] = []
         if !clusters.isEmpty {
@@ -427,9 +456,30 @@ struct ClusterCanvas: View {
 
 /// The gallery: the connected world(s), the known-but-unconnected fragments,
 /// plus honest accounts of the states that have no geometry to draw.
+///
+/// **This is a diagnostic surface now, not the normal one.** It draws the
+/// sparse solver output — per-segment point clouds in unregistered frames, the
+/// Tower's registration words, its refusal prose — and every one of those is a
+/// statement about the reconstruction rather than about the room. The normal
+/// way to see a saved world is the Tower's composed 3D page
+/// (`WorldRenderViewerView`); this lives behind the Diagnostics disclosure in
+/// `WorldCanvasView`, and is reachable from there in every state it was ever
+/// reachable from. Nothing here was deleted.
 struct WorldFragmentsView: View {
     let model: WorldFragmentsModel
     let chunks: [String: WorldSegmentChunk]
+
+    /// What to say when there is nothing drawable, decided from the fetch's
+    /// state and the Tower's own claims rather than from this model being
+    /// empty. See `WorldGeometryAccount` — and the five situations in
+    /// `WorldPresentation.swift` that all used to produce one sentence.
+    ///
+    /// Defaulted so previews and any caller that only wants the tiles
+    /// construct this view as they did before — and defaulted to the account
+    /// that **asserts nothing**, not to `nothingMapped`. A caller that supplied
+    /// no account has said nothing about the world, and the app’s strongest
+    /// negative claim must never be what silence produces.
+    var account: WorldGeometryAccount = .undescribed
 
     private var columns: [GridItem] { [GridItem(.adaptive(minimum: 140), spacing: 12)] }
 
@@ -443,7 +493,10 @@ struct WorldFragmentsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(model.headline)
+            // The gallery's own count when it has something to count, and the
+            // account's headline otherwise. `model.headline` is `nil` in
+            // exactly the case the account was written for.
+            Text(model.headline ?? account.headline)
                 .font(.headline)
 
             if let note = model.buildingNote {
@@ -463,11 +516,24 @@ struct WorldFragmentsView: View {
             }
 
             if clusters.isEmpty && loose.isEmpty {
-                // UNKNOWN: nothing has been mapped. Not an empty canvas,
-                // which would read as an empty room.
-                Text("The glasses have not mapped anything here yet.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                // Nothing to draw. Which of the six reasons that is, this view
+                // does not know and no longer guesses.
+                //
+                // The sentence that stood here was "The glasses have not mapped
+                // anything here yet." It was drawn under a world holding 463
+                // keyframes and 17,674 points, because it keyed off this
+                // model being empty and this model is empty whenever the
+                // *fetch* produced nothing — which includes every way the fetch
+                // can fail. That string no longer exists anywhere in the app;
+                // the only account that says nothing was mapped is
+                // `WorldGeometryAccount.nothingMapped`, and it is reachable
+                // only from the Tower having actually said so.
+                if let detail = account.detail {
+                    Text(detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else if !loose.isEmpty {
                 LazyVGrid(columns: columns, spacing: 12) {
                     ForEach(loose, id: \.segmentIndex) { segment in

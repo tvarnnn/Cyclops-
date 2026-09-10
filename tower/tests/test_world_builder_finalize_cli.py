@@ -238,3 +238,159 @@ def test_the_root_flag_routes_through_the_artifact_guard():
 
     source = inspect.getsource(world_finalize.main)
     assert '"--root", type=artifact_root_arg' in source
+
+
+# ---------------------------------------------------------------------------
+# The repair has to reach the SURFACE, not just the record.
+
+
+def test_a_repaired_session_stops_reading_as_interrupted(interrupted_world):
+    """Otherwise this tool cannot deliver what it exists for.
+
+    `end_reason` describes the CAPTURE; `finalization` describes the WORLD.
+    The lifecycle classifier answered both with the first, so a session whose
+    capture ended badly could never be reported as finished however it was
+    repaired. Measured on the recovered 2026-09-09 artifact before the fix:
+    finalization complete, final solve solved, 88 of 122 segments registered
+    -- and the phone still said Interrupted.
+
+    `end_reason` is deliberately NOT rewritten. That walk really did end in
+    an error.
+    """
+    from tower.results.world_builder import _lifecycle
+
+    root, world_id, session_id = interrupted_world
+    store = WorldStore(root)
+
+    before = _lifecycle(
+        holder=None, stopped=True, session=store.read_session(world_id, session_id),
+        geometry_current=True, has_manifest=True,
+    )
+    assert before["state"] == "interrupted"
+
+    # A repair that solved nothing must NOT flip the label -- only a
+    # finalization that actually finished, with a final solve that landed.
+    _run(root, world_id, "--skip-solve")
+    skipped = _lifecycle(
+        holder=None, stopped=True, session=store.read_session(world_id, session_id),
+        geometry_current=True, has_manifest=True,
+    )
+    assert skipped["state"] == "interrupted", (
+        "a repair that skipped the solve claimed the world was finished"
+    )
+
+    # Now the real thing: record a solved final solve the way a successful
+    # repair does, and the surface follows.
+    engine = WorldBuilderEngine(store)
+    engine.mark_finalization(
+        world_id, session_id,
+        state=FINALIZATION_COMPLETE, final_solve="solved", detail=None,
+    )
+    after = _lifecycle(
+        holder=None, stopped=True, session=store.read_session(world_id, session_id),
+        geometry_current=True, has_manifest=True,
+    )
+    assert after["state"] == "ready"
+    assert store.read_session(world_id, session_id).end_reason == "error", (
+        "the capture's end_reason was rewritten; that erases what happened"
+    )
+    assert "'error'" in after["reason"], "the reason hides the interrupted capture"
+
+
+def test_it_registers_when_the_solve_placed_nothing(interrupted_world):
+    """The fallback the builder has and this tool did not.
+
+    When no global solve placed anything, the Sim3 registrar is the only
+    producer of placements there is, and `world_build_session.py` runs it
+    for exactly that case. Without it a repair rebuilt the derived tree and
+    left the world with no placements at all -- every fragment its own
+    island, which is the outcome this whole campaign is about. Found by an
+    adversarial review of the repair tool.
+    """
+    root, world_id, _session_id = interrupted_world
+    report = _run(root, world_id, "--skip-solve")
+    assert report["finalized"] is True
+    assert report["build"]["placements_source"] is None
+    # It was ASKED. What the registrar could place from a six-keyframe
+    # synthetic world is its own business; that it ran is this test's.
+    assert report["registration"]["attempted"] is True
+
+
+def test_it_does_not_re_register_over_a_global_solve(interrupted_world, monkeypatch):
+    """And the guard the builder uses is the guard this uses."""
+    from tower.world_builder import global_solve as gs
+
+    root, world_id, _session_id = interrupted_world
+
+    class _Merged:
+        pose_rows: list = []
+        point_rows: list = []
+        support_rows: list = []
+        summary: dict = {}
+        segments: dict = {}
+
+    from tower.world_builder.records import SegmentPlacement
+
+    _Merged.placements = [SegmentPlacement(
+        segment_index=0, state="registered",
+        rotation_wxyz=(1.0, 0.0, 0.0, 0.0), translation=(0.0, 0.0, 0.0),
+        scale=1.0, reference_segment=0, refusal_reason=None,
+        input_digest="d", evidence={}, frame_revision=1,
+    )]
+    monkeypatch.setattr(gs, "load_solution", lambda *a, **k: object())
+    monkeypatch.setattr(gs, "merge", lambda *a, **k: _Merged())
+
+    report = _run(root, world_id, "--skip-solve")
+    assert report["build"]["placements_source"] == "global_solve"
+    assert report["registration"]["attempted"] is False
+
+
+def test_a_failed_repair_does_not_downgrade_a_healthy_record(interrupted_world):
+    """A repair that fails must leave the world as it found it.
+
+    This wrote `interrupted` unconditionally, so pointing the tool at an
+    already-complete world and hitting any error -- a purged world, a full
+    disk, a raising solve -- downgraded a healthy record permanently, with
+    no way back: every re-run hits the same error. An adversarial review
+    demonstrated it on a purged world.
+    """
+    root, world_id, session_id = interrupted_world
+    store = WorldStore(root)
+
+    # Get it healthy first.
+    assert _run(root, world_id, "--skip-solve")["finalized"] is True
+    engine = WorldBuilderEngine(store)
+    engine.mark_finalization(
+        world_id, session_id,
+        state=FINALIZATION_COMPLETE, final_solve="solved", detail=None,
+    )
+    healthy = dict(store.read_session(world_id, session_id).finalization)
+
+    # Now make the rebuild fail the way a purged world does.
+    world = store.read_world(world_id)
+    store.write_world(replace(world, images_purged=True))
+
+    report = _run(root, world_id, "--skip-solve")
+    assert report["finalized"] is False
+    assert "ImagesPurgedError" in report["reason"]
+
+    after = store.read_session(world_id, session_id).finalization
+    assert after["state"] == FINALIZATION_COMPLETE, (
+        "a failed repair downgraded a healthy record, and there is no way back"
+    )
+    assert after["final_solve"] == healthy["final_solve"]
+    assert after["detail"] == healthy["detail"]
+
+
+def test_a_failed_repair_on_an_already_broken_world_still_says_so(interrupted_world):
+    """The other half: nothing to preserve, so record the failure."""
+    root, world_id, session_id = interrupted_world
+    store = WorldStore(root)
+    world = store.read_world(world_id)
+    store.write_world(replace(world, images_purged=True))
+
+    report = _run(root, world_id, "--skip-solve")
+    assert report["finalized"] is False
+    after = store.read_session(world_id, session_id).finalization
+    assert after["state"] == FINALIZATION_INTERRUPTED
+    assert "ImagesPurgedError" in after["detail"]

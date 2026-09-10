@@ -13,20 +13,31 @@ import SwiftUI
 /// the Tower did not send. Every state is now reachable:
 /// `TowerWorldBuilderClient` maps the Tower's `model_state` onto them.
 ///
+/// ## The 3D world is the primary content, and it is not drawn here
+///
+/// A saved world's main content is the Tower's own composed 3D page, opened by
+/// `reconstructionCard` into `WorldRenderViewerView`'s `WKWebView`. That is the
+/// only surface in this target that draws 3D, and it is deliberately the only
+/// one: the Tower composes the world, colours it and decimates it to a mobile
+/// budget, and a second renderer on the phone would be a second answer able to
+/// disagree with the first.
+///
+/// The sparse per-segment gallery below is a **diagnostic**, behind the
+/// Diagnostics disclosure. It used to be the primary content of a saved world,
+/// which made opening one an act of debugging.
+///
 /// Deliberately absent, and each for a reason:
 ///
-/// - **No 3D framework.** SceneKit, RealityKit and Metal are still absent, and
-///   now for a sharper reason than "nothing to render". There *is* something to
-///   render — points and poses arrive over HTTP, per segment — but the
-///   manifest's `up_axis` is `"unknown"`, so a 3D view would have to guess
-///   which way is up, and segments are unregistered, so a single scene would
-///   superimpose reconstructions that share no coordinate frame. A top-down
-///   `(x, z)` `Canvas` per fragment is both cheaper and the only honest
-///   projection available. See `WorldFragmentsView`.
-/// - **No single world map.** Each fragment gets its own frame, its own scale
-///   and its own box until the Tower registers them. Per-segment scale
-///   disagrees by up to ~87x on a real walk; one shared scale would draw
-///   something that looks like a room and means nothing.
+/// - **No 3D framework in this target.** SceneKit, RealityKit and Metal are
+///   still absent. The reason is no longer "nothing to render" and no longer
+///   "`up_axis` is unknown" — the Tower renders the world itself, in a page
+///   this app already shows. Adding one here would duplicate that.
+/// - **No single world map drawn by this app.** Each fragment in the
+///   diagnostics gallery gets its own frame, its own scale and its own box
+///   until the Tower registers them. Per-segment scale disagrees by up to ~87x
+///   on a real walk; one shared scale would draw something that looks like a
+///   room and means nothing. Compositing the largest component into one world
+///   is the Tower's job, and the render page is where it is done.
 /// - **No animated placeholder.** A drifting point cloud would look like
 ///   progress and be a fabrication.
 /// - **No spinner in the unsupported state.** A spinner claims work is
@@ -73,11 +84,34 @@ struct WorldCanvasView: View {
     ///
     /// Defaulted to empty so that the states with nothing to draw — and the
     /// previews, and any caller that only wants the summary rows — construct
-    /// this view exactly as they did before. An empty model draws the
-    /// "nothing mapped yet" sentence, which is what the panel said in that
-    /// situation anyway.
+    /// this view exactly as they did before. An empty model no longer implies
+    /// anything about the world: what an empty gallery *means* is decided by
+    /// `presentation.account`, from the fetch's own state.
     var fragments = WorldFragmentsModel(segments: [])
     var geometryChunks: [String: WorldSegmentChunk] = [:]
+
+    /// The derived half of the screen: the stage word, the 3D ladder, the
+    /// account for a gallery with nothing in it, the final-solve sentence and
+    /// what survived. Built by `WorldBuilderViewModel.presentation` and by
+    /// nothing else, so this view composes no judgment of its own.
+    ///
+    /// Defaulted to `.empty` so previews and the states with no world in them
+    /// construct this view exactly as they did before.
+    var presentation: WorldPresentation = .empty
+
+    /// Opens the 3D world. `nil` in a context that cannot present a sheet —
+    /// previews, and any future embedding — in which case the primary control
+    /// is not drawn at all rather than drawn and inert.
+    var openReconstruction: ((WorldRenderTarget) -> Void)? = nil
+
+    /// Whether the Diagnostics disclosure is open.
+    ///
+    /// View state, and deliberately not remembered: every time this screen
+    /// opens it opens as the product surface. The sparse solver output behind
+    /// it is one tap away and nothing in it was removed — see
+    /// `WorldFragmentsView`'s own doc comment — but a screen that reopens
+    /// expanded is a screen that has quietly gone back to being a debugger.
+    @State private var isShowingDiagnostics = false
 
     /// The stored world the Tower offered in place of a live one, when
     /// following live and nothing is live. Drawn in `.idle` as one line with
@@ -156,9 +190,11 @@ struct WorldCanvasView: View {
             }
 
         case .receiving(let snapshot):
-            headline(snapshot.name ?? "Building", systemImage: "cube")
+            stageHeadline(fallback: "Building", systemImage: "cube")
+            worldName(snapshot)
+            reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: true)
-            fragmentGallery
+            diagnostics
 
         case .finalizing(let snapshot, let buildInProgress):
             // ## A spinner only on evidence
@@ -177,7 +213,8 @@ struct WorldCanvasView: View {
             // where an indicator is a report rather than an assertion, and it
             // is drawn for that case alone. `null` — an older record — keeps
             // the staleness sentence, which is what that state means.
-            headline(snapshot.name ?? "World", systemImage: "cube")
+            stageHeadline(fallback: "Finalizing", systemImage: "cube")
+            worldName(snapshot)
             if buildInProgress == true {
                 HStack(spacing: 10) {
                     ProgressView()
@@ -186,18 +223,22 @@ struct WorldCanvasView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: false)
             if buildInProgress == true {
                 detailText("A live process holds this world's writer lock and its session has stopped: the final solve and the final build are running, and these figures are not final.")
             } else {
                 detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
             }
-            fragmentGallery
+            diagnostics
 
         case .finalized(let snapshot):
-            headline(snapshot.name ?? "World", systemImage: "cube.fill")
+            stageHeadline(fallback: "Saved", systemImage: "cube.fill")
+            worldName(snapshot)
+            reconstructionCard
+            finalSolveNote
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            fragmentGallery
+            diagnostics
 
         case .interrupted(let snapshot, let reason):
             // Its own state, never "failed" and never a finished world. The
@@ -205,10 +246,24 @@ struct WorldCanvasView: View {
             // and — through `renderTarget`, which the coordinates for this
             // snapshot still earn — the picture button all stay, because the
             // geometry exists whatever happened to the process.
-            headline("Interrupted", systemImage: "exclamationmark.triangle")
+            stageHeadline(fallback: "Interrupted", systemImage: "exclamationmark.triangle")
+            worldName(snapshot)
+            // What survived and what can be done about it, before the Tower's
+            // own reason. There is no rebuild route on the Tower — see
+            // `WorldRecoverability` — so this is a sentence and never a button.
+            if let recoverability = presentation.recoverability,
+               let sentence = recoverability.sentence {
+                detailText(sentence)
+            }
+            reconstructionCard
+            finalSolveNote
+            // The Tower's own words for what happened, kept verbatim. Under the
+            // recovery sentence rather than over it: "your world is still here"
+            // is what a reader needs first, and the process's error text is
+            // what they need second.
             detailText(reason)
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            fragmentGallery
+            diagnostics
 
         case .failed(let failure):
             headline("World building failed", systemImage: "exclamationmark.triangle.fill")
@@ -283,19 +338,178 @@ struct WorldCanvasView: View {
         }
     }
 
-    /// What the Tower actually built, drawn one fragment at a time.
+    // MARK: The primary thing on screen
+
+    /// The best available 3D reconstruction, and a control that opens it.
     ///
-    /// Below the summary rows and never instead of them. The rows are the
-    /// Tower's own figures; this is the geometry those figures are about, and a
-    /// reader who scrolls past a picture should still find the counts that
-    /// picture came from.
+    /// ## Why this is above the rows and the gallery
+    ///
+    /// The one surface in this app that can show 3D is the `WKWebView` in
+    /// `WorldRenderViewer`, which renders the Tower's own composed page. It was
+    /// reachable only through a small bordered "Picture" button in the
+    /// workspace header, while the *primary* content of a saved world was the
+    /// sparse fragment gallery — per-segment point clouds in unregistered
+    /// frames, drawn top-down, captioned with the solver's registration
+    /// vocabulary. That is a reconstruction debugger, and it was the default
+    /// experience of opening a saved world.
+    ///
+    /// So the ladder — final 3D world, then partial 3D world, then a truthful
+    /// degraded state — is drawn here, first, in every state that has a world.
+    /// The gallery moved behind Diagnostics and lost nothing.
+    ///
+    /// The three cases are genuinely different and are drawn differently.
+    /// `.unavailable` is *the Tower named no address*, which is not the same as
+    /// the render route answering 404 — that happens later, inside the viewer,
+    /// and arrives with the Tower's own detail attached.
+    @ViewBuilder
+    private var reconstructionCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let target = presentation.reconstruction.target, let open = openReconstruction {
+                Button {
+                    open(target)
+                } label: {
+                    Label(presentation.reconstruction.actionTitle, systemImage: "cube.transparent")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityLabel("Open the 3D world")
+                if let note = reconstructionNote {
+                    Text(note)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else if let reason = reconstructionUnavailableReason {
+                // No control at all, and a sentence saying why. A disabled
+                // button here would be a control with no explanation beside it,
+                // which is what the header's "Picture" button was.
+                Text(reason)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// `World <id>` and, when one is known, `Session <id>`, or `nil` when the
+    /// Tower has named neither. Built here rather than in the builder above for
+    /// the reason `reconstructionNote` gives.
+    private var identifiers: String? {
+        var lines: [String] = []
+        if let worldID = state.snapshot?.worldID { lines.append("World \(worldID)") }
+        if let sessionID = presentation.reconstruction.target?.sessionID {
+            lines.append("Session \(sessionID)")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
+    /// The `.partial` note, or `nil`. Read through a property rather than bound
+    /// inside the builder above — the pattern this codebase settled on after a
+    /// result-builder block with a binding in it caused trouble in Product
+    /// Shell V2.
+    private var reconstructionNote: String? {
+        if case .partial(_, let note) = presentation.reconstruction { return note }
+        return nil
+    }
+
+    private var reconstructionUnavailableReason: String? {
+        if case .unavailable(let reason) = presentation.reconstruction { return reason }
+        return nil
+    }
+
+    /// The final solve's sentence, when there is one worth making. `.solved`
+    /// returns none: a world that finished properly does not need a line saying
+    /// it finished properly.
+    ///
+    /// This field — `lifecycle.finalization.final_solve` — has been decoded
+    /// since 2026-09-06 and read by no view until now. It is `null` on the
+    /// field world, meaning the final solve never ran, and the phone presented
+    /// that world as a finished one.
+    @ViewBuilder
+    private var finalSolveNote: some View {
+        if let sentence = presentation.finalSolve.sentence {
+            Text(sentence)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: Diagnostics
+
+    /// The sparse solver output, one tap away and never in the way.
+    ///
+    /// Everything that used to be on the normal surface is in here and nothing
+    /// was deleted: the fragment gallery, the per-segment point counts, the
+    /// Tower's registration words and refusal prose, the coverage tokens, the
+    /// segment origins and the segment count. Debugging observability is the
+    /// point of the exercise — it just stopped being the first thing a person
+    /// sees when they open a saved world.
     ///
     /// Shown in the four states that carry a snapshot and in no others.
-    /// `.idle` and `.failed` have no world to have geometry for, and drawing an
-    /// empty gallery under them would offer a container where there is not even
-    /// a world.
-    private var fragmentGallery: some View {
-        WorldFragmentsView(model: fragments, chunks: geometryChunks)
+    /// `.idle` and `.failed` have no world to have geometry for, and offering a
+    /// diagnostics container under them would offer a container where there is
+    /// not even a world.
+    private var diagnostics: some View {
+        DisclosureGroup("Diagnostics", isExpanded: $isShowingDiagnostics) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("The solver's own view: geometry per tracking segment, in the frames the solver placed them in. Not the world above.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // The Tower's own page, opened straight into its diagnostics
+                // rendering (`?view=diagnostics`, served since 2026-09-09 by
+                // `routes/geometry.py::world_render`).
+                //
+                // The entry point lives **here** rather than as a switch inside
+                // the viewer. A switch there would refetch several megabytes to
+                // change one token in a script already on screen, and the
+                // Tower's page carries its own instant toggle anyway. Choosing
+                // the rendering at the moment a page is opened costs a fetch
+                // that was going to happen regardless, and it puts the solver's
+                // view where the rest of the solver's output already is.
+                if let target = presentation.reconstruction.target, let open = openReconstruction {
+                    Button {
+                        open(target.showing(.diagnostics))
+                    } label: {
+                        Label("Open the solver's 3D view", systemImage: "scope")
+                            .font(.footnote)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Open the solver's 3D view")
+                }
+
+                if let snapshot = state.snapshot {
+                    WorldSummaryView(snapshot: snapshot, isLive: false, scope: .solver)
+                }
+
+                // The raw identifiers, kept reachable. They used to be on the
+                // ordinary surface — the workspace header's "Looking at saved
+                // world <32 hex characters>" and the picker's session rows,
+                // where a session id was the row's *primary* label. They are
+                // what the Tower's own logs are keyed by, so a person
+                // diagnosing a walk needs them; they are also the least
+                // meaningful thing on a screen about a room.
+                if let identifiers {
+                    Text(identifiers)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                WorldFragmentsView(
+                    model: fragments, chunks: geometryChunks, account: presentation.account
+                )
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        }
+        .font(.subheadline)
+        .accessibilityIdentifier("world-diagnostics")
     }
 
     /// The state that is actually reachable today.
@@ -314,6 +528,39 @@ struct WorldCanvasView: View {
     private func headline(_ text: String, systemImage: String) -> some View {
         Label(text, systemImage: systemImage)
             .font(.headline)
+    }
+
+    /// The stage word, or the caller's fallback when there is no stage.
+    ///
+    /// The four world states used to headline themselves with the world's
+    /// *name* — `snapshot.name ?? "World"` — which meant the largest words on
+    /// the screen said nothing about what the world was doing, and on a Tower
+    /// that names nothing (156 of the real root's 162 worlds) said "World".
+    /// The stage says what is happening in one word from a vocabulary a person
+    /// already has: Mapping, Building, Improving, Finalizing, Saved, Partial,
+    /// Interrupted, Needs retry. The name moved to the line under it, where a
+    /// name belongs.
+    ///
+    /// The fallback is per-state and is what this build drew before there was a
+    /// stage, so a `WorldPresentation` that was never built — a preview, a
+    /// caller that passes only a state — is unchanged.
+    private func stageHeadline(fallback: String, systemImage: String) -> some View {
+        headline(
+            presentation.stage?.label ?? fallback,
+            systemImage: presentation.stage?.systemImage ?? systemImage
+        )
+    }
+
+    /// The Tower's own name for this world, under the stage word, when it has
+    /// one. Never the id — that is in Diagnostics.
+    @ViewBuilder
+    private func worldName(_ snapshot: WorldSnapshot) -> some View {
+        if let name = snapshot.name, !name.isEmpty {
+            Text(name)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
     }
 
     /// Named `detailText` rather than `body` on purpose: a method sharing the
@@ -337,10 +584,63 @@ struct WorldCanvasView: View {
 /// Reached from `.receiving`, `.finalizing`, `.finalized` and `.interrupted`,
 /// all of which `TowerWorldBuilderClient` produces from real Tower snapshots.
 struct WorldSummaryView: View {
+    /// Which half of the Tower's figures this instance draws.
+    ///
+    /// Two rows moved out of the ordinary panel and into Diagnostics, and only
+    /// two: **Segment origins** and **Segments**. Both are statements about how
+    /// the solver cut the walk up, not about the room — "36 segment origins" is
+    /// the count of coordinate frames it opened — and a person looking at a
+    /// saved world has no use for either. Everything else stayed where it was,
+    /// including the anchors-only sentence and the tracking-restart sentence,
+    /// because those explain something a reader can otherwise see and not
+    /// understand: why there is no path length.
+    enum Scope: Equatable {
+        /// Everything but the two solver rows.
+        case product
+        /// Only the two solver rows, plus the chain-break count that has never
+        /// been drawn anywhere.
+        case solver
+    }
+
     let snapshot: WorldSnapshot
     let isLive: Bool
+    var scope: Scope = .product
 
+    @ViewBuilder
     var body: some View {
+        if scope == .solver {
+            solverRows
+        } else {
+            productRows
+        }
+    }
+
+    /// The solver's own cut of the walk. Diagnostics only.
+    private var solverRows: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Beside the pose count, never folded into it.
+            // `world_builder.status/2026-08-25` exists because the two were
+            // being added: an anchor is a segment's origin — identity rotation,
+            // zero translation — and 36 of them are not 36 camera positions.
+            if let anchors = snapshot.trajectory.posesAnchor {
+                row("Segment origins", "\(anchors)")
+            }
+            if let segments = snapshot.trajectory.segments {
+                row("Segments", "\(segments)")
+            }
+            // Never drawn anywhere before. The Tower counts these separately
+            // from tracking losses precisely so the two are not confused; see
+            // `WorldTrajectoryReport.segments`.
+            if let breaks = snapshot.trajectory.chainBreaks {
+                row("Solve-chain breaks", "\(breaks)")
+            }
+            if let restarts = snapshot.trajectory.trackingRestarts {
+                row("Tracking restarts", "\(restarts)")
+            }
+        }
+    }
+
+    private var productRows: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let keyframes = snapshot.keyframeCount {
                 row("Keyframes", "\(keyframes)")
@@ -405,17 +705,12 @@ struct WorldSummaryView: View {
         if let poses = snapshot.trajectory.poseCount {
             row("Camera poses", "\(poses)")
         }
-        // Beside the count, never folded into it. `world_builder.status/2026-08-25`
-        // exists because the two were being added: an anchor is a segment's
-        // origin — identity rotation, zero translation — and 36 of them are not
-        // 36 camera positions. Shown whenever the Tower reported any, so a walk
-        // that positioned 41 cameras across 3 segments reads as both figures.
-        if let anchors = snapshot.trajectory.posesAnchor {
-            row("Segment origins", "\(anchors)")
-        }
-        if let segments = snapshot.trajectory.segments {
-            row("Segments", "\(segments)")
-        }
+        // "Segment origins" and "Segments" used to sit here, beside the pose
+        // count. They are the solver's own cut of the walk rather than
+        // anything about the room, and they moved to `solverRows` — behind
+        // Diagnostics — where they are still shown, still beside the pose count
+        // in the reader's memory, and no longer in the way of a person who
+        // opened a saved world to look at it.
         if snapshot.trajectory.isAnchorsOnly {
             // The uncalibrated outcome, said plainly. No intrinsics exist for
             // this camera yet, so the backend that solves poses withholds every

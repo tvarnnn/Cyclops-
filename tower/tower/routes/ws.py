@@ -146,7 +146,7 @@ async def _handle_frame_message(
             # numbers below", and a refused frame is missing from them.
             if reason is None:
                 metrics.record_frame_processing_error()
-            metrics.record_frame_rejected()
+            metrics.record_frame_rejected(tx_seq=frame.tx_seq)
         # The module's own code when it named one, `frame_skipped`
         # otherwise. This transport does not know what the codes mean and
         # must not: a module that is deliberately not processing and a
@@ -165,7 +165,7 @@ async def _handle_frame_message(
             exc,
         )
         if metrics is not None:
-            metrics.record_frame_rejected()
+            metrics.record_frame_rejected(tx_seq=frame.tx_seq)
         await _send_frame_error(sender, frame.seq, "module_unavailable", str(exc))
         _fan_out_frame(websocket, frame)
         return

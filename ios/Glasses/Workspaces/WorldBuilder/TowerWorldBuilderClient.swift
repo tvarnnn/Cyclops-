@@ -579,7 +579,25 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     var selection: WorldSelection? { lastReport?.selection }
 
     /// The builder's account of finalization from the last report, or `nil`.
-    var finalization: WorldFinalizationReport? { lastReport?.finalization }
+    ///
+    /// Stored and published rather than computed off `lastReport`, and the
+    /// difference is not cosmetic. `state` above drops repeats at the source,
+    /// so a report that moves `final_solve` from `pending` to `solved` while
+    /// the snapshot stands still used to announce nothing at all — leaving
+    /// "The final pass has not run yet." on screen for the whole length of a
+    /// final solve, which is the exact window that sentence is about. Kept
+    /// current by `lastReport`'s `didSet`, so every assignment to the report,
+    /// including the one that clears it, is covered by one line.
+    private(set) var finalization: WorldFinalizationReport? {
+        didSet {
+            guard finalization != oldValue else { return }
+            finalizationSubject.send(finalization)
+        }
+    }
+
+    var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> {
+        finalizationSubject.eraseToAnyPublisher()
+    }
 
     /// The pin the next `result_subscribe` carries, or `nil` to follow the
     /// live world. Kept across reconnects on purpose: a reader looking at a
@@ -591,6 +609,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
     private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
     private let recentWorldSubject = PassthroughSubject<WorldRecentReference?, Never>()
+    private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -647,6 +666,10 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         didSet {
             // Nothing offered stands once the report that offered it is gone.
             if lastReport == nil { recentWorld = nil }
+            // Every assignment, including the clearing one above. Its own
+            // `didSet` drops repeats, so a two-second heartbeat carrying an
+            // unchanged finalization publishes nothing.
+            finalization = lastReport?.finalization
         }
     }
 

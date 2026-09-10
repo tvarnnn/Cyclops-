@@ -41,7 +41,7 @@ from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
 from tower.storage import read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
-from tower.world_builder.records import format_distance
+from tower.world_builder.records import FINAL_SOLVE_SOLVED, format_distance
 from tower.world_builder.schema import (
     INTRINSICS_SOURCE_UNKNOWN,
     POSE_STATUS_ANCHOR,
@@ -967,6 +967,41 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             "reason": (
                 "the process finalizing this world exited before it finished; "
                 "the geometry stored is the last build it completed"
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    # A COMPLETED FINALIZATION OUTRANKS HOW THE CAPTURE ENDED.
+    #
+    # `end_reason` describes the CAPTURE; `finalization` describes the
+    # WORLD, and they are different questions. This block used to answer
+    # both with the first, so a session whose capture ended badly could
+    # never be reported as finished however it was repaired -- which made
+    # `scripts/world_finalize.py` unable to deliver what it exists for.
+    # Measured on the recovered 2026-09-09 artifact: finalization
+    # `{state: complete, final_solve: solved}`, 88 of 122 segments
+    # registered, and this function still said `interrupted`.
+    #
+    # `end_reason` is NOT rewritten to achieve this -- that walk really did
+    # end in an error and the record should keep saying so. It is carried
+    # into the reason string instead, so the phone can say a world was
+    # finished after an interrupted capture rather than having to choose
+    # which half of the truth to show.
+    if (
+        session.end_reason in ("error", "interrupted")
+        and (finalization or {}).get("state") == "complete"
+        and (finalization or {}).get("final_solve") == FINAL_SOLVE_SOLVED
+    ):
+        return {
+            "state": LIFECYCLE_READY,
+            "evidence": (
+                f"the capture ended with end_reason={session.end_reason!r}, and "
+                "the finalization record is complete with a solved final solve"
+            ),
+            "reason": (
+                f"this walk's capture ended with {session.end_reason!r}; the "
+                "world was finished afterwards and is complete"
             ),
             "build_in_progress": False,
             "build_in_progress_unavailable_reason": None,

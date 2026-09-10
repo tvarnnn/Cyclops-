@@ -32,7 +32,33 @@ from tower.world_builder.store import WorldStore, WorldStoreError
 # budget is lower than the operator's 200k default. Fractional-stride
 # sampling spans the whole cloud (contract §3), so the picture is the same
 # room, thinner. A client may ask for more, up to the operator's default.
-MOBILE_MAX_POINTS = 80_000
+#
+# 80,000 WAS THE NUMBER UNTIL IT WAS MEASURED. The reasoning above was
+# right and the value was a guess. Timing the page's own `draw()` -- the
+# function an orbit drag calls once per frame -- on the recovered field
+# world in desktop Chrome, 1920x819, by cloning its segments to reach each
+# count:
+#
+#      19,329 pts    6.2 ms   161 fps
+#      38,658 pts   13.6 ms    74 fps
+#      77,316 pts   35.3 ms    28 fps      <- roughly the old budget
+#     115,974 pts   65.0 ms    15 fps
+#
+# Superlinear, and 28 fps is what a FAST DESKTOP manages at the budget the
+# phone was being handed. A phone is slower than that at canvas fill by
+# some factor this host cannot measure -- so the old value was not a
+# margin, it was the cliff.
+#
+# 40,000 sits at 13.6 ms / 74 fps here, which is a 2.6x margin on the
+# measured cliff and still twice the 19,866 points the 2026-09-09 walk
+# produced in total. A 20-30 minute walk is the case this protects: at
+# ~3.2 keyframes/sec it reaches several times this and would otherwise be
+# handed the whole cloud up to the old ceiling.
+#
+# UNVERIFIED: the desktop-to-phone factor. The next physical test is the
+# first chance to measure it, and this number should be revisited with
+# that measurement rather than argued about.
+MOBILE_MAX_POINTS = 40_000
 MAX_POINTS_CEILING = DEFAULT_MAX_POINTS
 
 

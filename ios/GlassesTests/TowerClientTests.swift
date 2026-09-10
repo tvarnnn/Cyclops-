@@ -3189,21 +3189,46 @@ final class TowerClientTests: XCTestCase {
         guard let port = server.start() else { return XCTFail("server did not start") }
         defer { server.stop() }
 
-        let client = TowerClient()
+        // A window of two, so the drop is arranged rather than hoped for.
+        //
+        // This test used to build a default client and push 64 frames at it,
+        // then assert only that the `tx_seq` values it saw were contiguous.
+        // Contiguous is what an *empty* list is, and what a list is when
+        // nothing was dropped at all — so the test passed whether or not the
+        // property it names ever happened. Neither `counters.count < 64` nor
+        // `sendWindowDrops > 0` was ever asserted.
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 2)
         client.connect(to: url(port: port))
         let online = await waitUntil { client.status == .online }
         XCTAssertTrue(online)
+        metrics.begin()
         client.sendStreamStart()
 
         // Enough frames in one main-actor turn to close the send window. The
         // window rejects before encoding, so the surplus never reaches a send.
-        for sequence in 1...64 {
+        let frameCount = 64
+        for sequence in 1...frameCount {
             client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: sequence)
         }
+
+        // **The drop actually happened.** Asserted first, because every
+        // assertion below is vacuous without it.
+        let drops = metrics.currentSnapshot.sendWindowDrops
+        XCTAssertGreaterThan(drops, 0, "the send window never rejected anything, so this test "
+                             + "proves nothing about what a rejection does to tx_seq")
+        XCTAssertEqual(metrics.currentSnapshot.sendAttempts, 2,
+                       "only the window's worth of frames may be handed to the socket")
+        XCTAssertEqual(drops, frameCount - 2, "every frame past the window must be dropped")
+
         _ = await waitUntil { !self.frames(recorder).isEmpty }
 
         let counters = frames(recorder).compactMap { $0["tx_seq"] as? Int }
         XCTAssertFalse(counters.isEmpty, "no frame was sent at all")
+        // And the sent frames are strictly fewer than the offered ones, which
+        // is the same fact from the wire's side rather than the metrics'.
+        XCTAssertLessThan(counters.count, frameCount,
+                          "every frame reached the wire, so nothing was dropped")
         XCTAssertEqual(
             counters, Array(0..<counters.count),
             "tx_seq skipped a number for a frame that was never sent; the Tower "

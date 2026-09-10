@@ -639,6 +639,12 @@ const sel = document.getElementById('frame'), canvas = document.getElementById('
 // because both views ride on one payload.
 let mode = __OPENING_MODE__;
 let cur = -1, yaw = 0.7, pitch = 0.5, zoom = 1, panX = 0, panY = 0, drag = null, pinch = null;
+// The backing store's scale over CSS pixels, set by resize(). Pointer
+// deltas arrive in CSS pixels and the projection works in backing
+// pixels, so pan is KEPT in CSS pixels and converted at the one place
+// it is used -- otherwise a 2x store makes a drag move the world half
+// as far as the finger.
+let DPR = 1;
 // In the world view a frame is only offered when the store placed its
 // segments into a shared space. An unregistered fragment has its own
 // scale -- up to ~87x off on a real walk -- so it is not a world and is
@@ -661,7 +667,29 @@ function applyMode(){
   fillSelect(); resize();
 }
 function chrome(){ return document.getElementById('bar').offsetHeight + document.getElementById('caption').offsetHeight + facts.offsetHeight + (message.hidden ? 0 : message.offsetHeight); }
-function resize(){ canvas.width = innerWidth; canvas.height = Math.max(50, innerHeight - chrome()); draw(); }
+// A BACKING STORE THE SCREEN'S SIZE, not the layout's.
+//
+// This set `canvas.width = innerWidth` with no CSS size, so on a phone the
+// bitmap was CSS pixels and the browser upscaled it by the device pixel
+// ratio with smoothing on. At dpr 3 a 1.8 px point became a ~5.4 px
+// smoothed blob, and a cloud of blobs is a haze. The desktop this was
+// inspected on runs at dpr 1, where the defect does not appear at all --
+// so "the world reads as a diffuse point cloud" was partly a phone-only
+// rendering artifact and not the reconstruction.
+//
+// Capped at 2 rather than taking dpr 3 whole. A 3x backing store measured
+// 1.8x the draw cost, which is affordable at this world's 19k points and
+// not at the 40k budget the phone may be handed; 2x buys most of the
+// sharpness for less than half the extra cost. `imageSmoothingEnabled`
+// off so nothing re-blurs what the extra pixels bought.
+function resize(){
+  const scale = DPR = Math.min(devicePixelRatio || 1, 2);
+  const cssW = innerWidth, cssH = Math.max(50, innerHeight - chrome());
+  canvas.style.width = cssW + 'px'; canvas.style.height = cssH + 'px';
+  canvas.width = Math.round(cssW * scale); canvas.height = Math.round(cssH * scale);
+  ctx.imageSmoothingEnabled = false;
+  draw();
+}
 function rot(){ const cy=Math.cos(yaw), sy=Math.sin(yaw), cp=Math.cos(pitch), sp=Math.sin(pitch);
   return [[cy,0,sy],[sy*sp,cp,-cy*sp],[-sy*cp,sp,cy*cp]]; }
 function draw(){
@@ -680,7 +708,7 @@ function draw(){
   const R = rot(), c = f.centre, s = zoom * 0.9 * Math.min(W,H) / f.extent;
   function P(p){ const x=p[0]-c[0], y=p[1]-c[1], z=p[2]-c[2];
     const u = R[0][0]*x+R[0][1]*y+R[0][2]*z, v = R[1][0]*x+R[1][1]*y+R[1][2]*z;
-    return [W/2 + panX + u*s, H/2 + panY - v*s]; }
+    return [W/2 + panX*DPR + u*s, H/2 + panY*DPR - v*s]; }
   const dot = mode === 'diag' ? 1.5 : 1.8;
   for (const seg of f.segments){
     const xs = seg.xyz;

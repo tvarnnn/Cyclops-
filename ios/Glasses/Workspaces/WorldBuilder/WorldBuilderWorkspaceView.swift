@@ -135,6 +135,8 @@ struct WorldBuilderWorkspaceView: View {
                 sessionBinding: world.sessionBinding,
                 fragments: world.fragmentsModel,
                 geometryChunks: world.geometryChunks,
+                presentation: world.presentation,
+                openReconstruction: { target in viewerTarget = target },
                 recentWorld: world.recentWorld,
                 openRecent: { recent in
                     world.open(worldID: recent.worldID, sessionID: recent.sessionID)
@@ -158,7 +160,14 @@ struct WorldBuilderWorkspaceView: View {
             WorldPickerView(world: world)
         }
         .sheet(item: $viewerTarget) { target in
-            WorldRenderViewerView(target: target)
+            // The title and the note come from the same `WorldPresentation`
+            // the canvas draws, so the sheet and the screen behind it cannot
+            // describe the same world differently.
+            WorldRenderViewerView(
+                target: target,
+                title: world.state.snapshot?.name,
+                note: viewerNote
+            )
         }
         // The World Builder cartridge session: `start` on appearance and
         // whenever the socket comes back while on screen, `stop` on
@@ -207,9 +216,15 @@ struct WorldBuilderWorkspaceView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if case .inspecting(let worldID) = world.inspection {
+            if world.inspection.isInspecting {
                 HStack(spacing: 8) {
-                    Text("Looking at saved world \(worldID ?? "(unnamed)").")
+                    // The world's NAME, or nothing. This line used to end in a
+                    // raw 32-character hex world id — `Looking at saved world
+                    // fcbca9e90b244785bdb671530b33c6a5.` — which is a database
+                    // key on the ordinary surface of the app. The id is still
+                    // reachable: it is in the canvas's Diagnostics disclosure
+                    // and in the 3D viewer's Details.
+                    Text(savedWorldLine)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -224,6 +239,27 @@ struct WorldBuilderWorkspaceView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// What the inspecting line says. The Tower's display name when it gave
+    /// one — 156 of the real root's 162 worlds have none — and the stage word
+    /// otherwise, which is at least a fact about the world rather than a key
+    /// into the Tower's filesystem.
+    private var savedWorldLine: String {
+        if let name = world.state.snapshot?.name, !name.isEmpty {
+            return "Looking at saved world \(name)."
+        }
+        if let stage = world.presentation.stage {
+            return "Looking at saved world · \(stage.label)."
+        }
+        return "Looking at saved world."
+    }
+
+    /// The ladder's note for the world the viewer is about to show, so the
+    /// sheet says the same thing the card behind it says.
+    private var viewerNote: String? {
+        if case .partial(_, let note) = world.presentation.reconstruction { return note }
+        return nil
     }
 }
 

@@ -102,8 +102,29 @@ FRAMES_DIRNAME = "frames"
 class CaptureLimits:
     """Hard bounds. Rule 15 -- no unbounded operation on the live path."""
 
-    max_seconds: float = 900.0
-    max_bytes: int = 1_073_741_824
+    # Sized for the session length the product actually asks for.
+    #
+    # 900 s -- fifteen minutes -- was the bound until an adversarial review
+    # pointed out what it does to the stated target of "potentially 20-30
+    # minute sessions". At the bound the recorder stops ITSELF, cleanly,
+    # and the warning it logs says a follower "will see the capture close
+    # exactly as if it were" a disconnect. So a thirty-minute walk recorded
+    # fifteen minutes, the builder finalised a world at the halfway point,
+    # and -- since a closed capture now reads as an ordinary wearer stop --
+    # it did so under the label `stop`. Silent truncation that looks like
+    # success is the worst shape this bug could have taken.
+    #
+    # 2400 s is forty minutes: the target plus a third, so a wearer who
+    # goes long is not truncated by a round number. It is still a BOUND,
+    # which is the point of Rule 15 -- an unbounded recorder on the live
+    # path is how a disk fills during a walk.
+    max_seconds: float = 2400.0
+    # The byte bound has to move with it or it becomes the binding one.
+    # Measured on the 2026-09-09 captures: 2,865 frames over 7 captures,
+    # mean 24.6 KB per recorded JPEG at 360x640. Forty minutes at the
+    # measured 12 fps is ~28,800 frames, ~708 MB. 2 GiB leaves room for a
+    # larger frame without the bound arriving unannounced mid-walk.
+    max_bytes: int = 2_147_483_648
 
 
 @dataclass
@@ -557,16 +578,31 @@ class CaptureFollower:
 
     def is_closed(self) -> bool:
         """True once the recorder has written an end reason."""
+        return self.end_reason() is not None
+
+    def end_reason(self) -> str | None:
+        """WHY the capture ended, or None while it is still open.
+
+        Carried rather than collapsed into `is_closed`, because the three
+        reasons are not the same event to a consumer. `stop` is the wearer.
+        `disconnect` is the link. `bounded_limit` is the recorder stopping
+        ITSELF at a configured bound while the wearer is very likely still
+        walking -- and a builder that treats that as an ordinary end
+        finalises a world at the bound and says nothing.
+        """
         path = self._directory / CAPTURE_FILENAME
         if not path.exists():
-            return False
+            return None
         try:
-            return read_json_closed(path).get("ended_at") is not None
+            manifest = read_json_closed(path)
         except (OSError, ValueError):
             # A manifest caught mid-replace is not an ended capture. Say
             # "still open" and re-read next poll rather than truncating
             # the session on a transient read.
-            return False
+            return None
+        if manifest.get("ended_at") is None:
+            return None
+        return manifest.get("end_reason") or END_REASON_STOP
 
     def follow(self, *, max_idle_polls: int | None = None, should_stop=None):
         """Frames, until the capture ends, the idle bound expires, or a

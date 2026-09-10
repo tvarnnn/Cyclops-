@@ -237,3 +237,67 @@ class TestLoopDetectionIsALiveSettingNotAFinalisationOne:
         """The final solve used to add both flags together; adding
         `--loop-detection` unconditionally must not double it."""
         assert self._argv(tmp_path, final=True).count("--loop-detection") == 1
+
+
+class TestTheRebuildIntervalGrowsWithTheWorld:
+    """`--rebuild-every 4` is a fixed count; the rebuild is not a fixed cost.
+
+    `write_derived` rewrites poses, points, support and the manifest IN FULL
+    every time, so it grows with the world while a fixed interval does not.
+    Measured against derived trees at the field walk's own ratios (33.5
+    points and 26.2 support rows per keyframe): 0.34 s at 795 keyframes,
+    0.86 s at 2,000, 1.85 s at 4,000, 3.48 s at 6,000.
+
+    At the measured 3.2 keyframes/sec, four keyframes is 1.21 s of wall
+    clock. The write alone crosses that at about 2,700 keyframes -- roughly
+    fourteen minutes -- and the stated target is twenty to thirty. Past that
+    point the builder falls behind for the rest of the walk with the capture
+    directory as its only queue.
+    """
+
+    def test_a_short_walk_is_unchanged(self):
+        from scripts.world_build_session import rebuild_interval
+
+        # The 2026-09-09 walk was 795 keyframes. Nothing about it moves.
+        for accepted in (2, 100, 400, 749):
+            assert rebuild_interval(4, accepted) == 4, accepted
+        assert rebuild_interval(4, 795) == 4
+
+    def test_the_interval_doubles_as_the_world_doubles(self):
+        from scripts.world_build_session import rebuild_interval
+
+        assert rebuild_interval(4, 1500) == 8
+        assert rebuild_interval(4, 3000) == 16
+        assert rebuild_interval(4, 6000) == 32
+
+    def test_the_rebuild_stays_a_bounded_share_of_the_walk(self):
+        """The property, not the numbers: rebuilding must not outgrow walking.
+
+        With a fixed four the share runs 27% -> 69% -> 148% -> 288%, and
+        anything over 100% is a builder that can never catch up.
+        """
+        from scripts.world_build_session import rebuild_interval
+
+        measured_write_seconds = {795: 0.342, 1500: 0.65, 3000: 1.40, 6000: 3.481}
+        keyframes_per_second = 3.2
+        for accepted, write in measured_write_seconds.items():
+            interval = rebuild_interval(4, accepted)
+            share = write / (interval / keyframes_per_second)
+            assert share < 0.5, (
+                f"at {accepted} keyframes the rebuild is {share:.0%} of the "
+                "wall clock; the builder cannot keep up"
+            )
+
+    def test_it_stops_doubling_rather_than_running_away(self):
+        """A cap, so a pathological session cannot stop rebuilding entirely."""
+        from scripts.world_build_session import rebuild_interval
+
+        assert rebuild_interval(4, 10**6) == 4 << 4
+
+    def test_a_zero_base_still_means_never(self):
+        """`--rebuild-every 0` is "build once at the end" and must stay so.
+        The caller guards on `args.rebuild_every` being truthy, but this
+        must not turn a 0 into a positive interval if that ever changes."""
+        from scripts.world_build_session import rebuild_interval
+
+        assert rebuild_interval(0, 6000) == 0

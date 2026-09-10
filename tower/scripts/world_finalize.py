@@ -174,14 +174,60 @@ def main(argv=None) -> int:
             "scale_state": result.scale_state,
             "placements_source": (result.diagnostics or {}).get("placements_source"),
         }
+        # THE FALLBACK THE BUILDER HAS AND THIS DID NOT. When no global
+        # solve placed anything, the Sim3 registrar is the only producer of
+        # placements there is, and `world_build_session.py` runs it for
+        # exactly that case. Without this, a repair of a session whose solve
+        # found nothing rebuilt the derived tree and left the world with no
+        # placements at all -- every fragment its own island, which is the
+        # outcome this whole campaign is about. Found by an adversarial
+        # review of the repair tool.
+        #
+        # `register_session` never raises and refuses to replace placements
+        # that are registered and current, so calling it is safe whichever
+        # way the solve went; `should_register` decides.
+        from scripts.world_build_session import (  # noqa: PLC0415
+            register_session,
+            should_register,
+        )
+
+        if should_register(result):
+            report["registration"] = register_session(store, args.world, session_id)
+        else:
+            report["registration"] = {
+                "attempted": False,
+                "reason": "the global solve placed these segments",
+            }
         state = FINALIZATION_COMPLETE
         report["finalized"] = True
     except Exception as exc:  # noqa: BLE001
-        # Say what happened and leave the record honest. The authoritative
-        # journals are untouched either way, so this is retryable.
-        state = FINALIZATION_INTERRUPTED
+        # A REPAIR THAT FAILS MUST NOT LEAVE THE WORLD WORSE THAN IT FOUND
+        # IT. This wrote `interrupted` unconditionally, so pointing the tool
+        # at an already-complete world and hitting any error -- a purged
+        # world, a full disk, a raising solve -- DOWNGRADED a healthy record
+        # to interrupted, with no way back: every re-run hits the same
+        # error. An adversarial review demonstrated it on a purged world,
+        # `complete` -> `interrupted`, permanently.
+        #
+        # The record only moves if this run actually had something to
+        # improve on. The authoritative journals are untouched either way,
+        # so a failure is still retryable once its cause is fixed.
         detail = f"{type(exc).__name__}: {exc}"
-        report.update({"finalized": False, "reason": detail})
+        was_complete = (before.finalization or {}).get("state") == FINALIZATION_COMPLETE
+        state = FINALIZATION_COMPLETE if was_complete else FINALIZATION_INTERRUPTED
+        if was_complete:
+            # Keep the record exactly as it was, including its final_solve
+            # and its detail: this run has nothing truer to say about it.
+            final_solve_state = (before.finalization or {}).get("final_solve")
+            detail_to_record = (before.finalization or {}).get("detail")
+        else:
+            detail_to_record = detail
+        detail = detail_to_record
+        report.update({
+            "finalized": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "record_left_as": state,
+        })
     finally:
         try:
             engine.mark_finalization(

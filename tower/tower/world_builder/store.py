@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tower.storage import (
+    staging_path,
     TEMP_SUFFIX,
     append_jsonl,
     read_json_closed,
@@ -69,6 +70,12 @@ LOCK_FILENAME = "LOCK"
 DERIVED_DIRNAME = "derived"
 DERIVED_MANIFEST = "manifest.json"
 IMAGES_DIRNAME = "images"
+
+
+# How many times `acquire_writer_lock` will lose the exclusive create
+# before it gives up. Contention here is two processes reclaiming one
+# dead lock, which resolves in one round; this is a bound, not a wait.
+_LOCK_ACQUIRE_ATTEMPTS = 8
 
 
 class WorldStoreError(Exception):
@@ -315,7 +322,13 @@ class WorldStore:
         images = self.images_dir(world_id, session_id)
         images.mkdir(parents=True, exist_ok=True)
         path = images / filename
-        temp_path = path.with_name(path.name + TEMP_SUFFIX)
+        # `staging_path`, not `name + TEMP_SUFFIX`: a staging name derived only
+        # from the destination is shared by every writer of it. Keyframe
+        # filenames are unique per session so a collision is unlikely here,
+        # but "unlikely" is what the same pattern was called in
+        # `write_bytes_atomic` before it was measured producing 656 torn
+        # reads. One convention, one place.
+        temp_path = staging_path(path)
         try:
             with temp_path.open("wb") as handle:
                 handle.write(jpeg_bytes)
@@ -598,8 +611,42 @@ class WorldStore:
         """
         path = self.lock_path(world_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        holder = self.lock_holder(world_id)
-        if holder is not None:
+        # CREATE-EXCLUSIVE, NOT CHECK-THEN-WRITE.
+        #
+        # This read the holder and then wrote the lock, with nothing atomic
+        # in between, so two processes arriving in that window both saw "no
+        # lock" and both proceeded. The second write overwrote the first's
+        # record, so the file named only one of them -- and when the first
+        # finished, `release_writer_lock` unlinked a lock the OTHER writer
+        # still believed it held. An adversarial review measured TWO
+        # SIMULTANEOUS WRITERS ADMITTED IN 8 OF 8 TRIALS, and drove two
+        # concurrent `world_finalize.py` runs to `finalized: True` on one
+        # world. `world_finalize.py` calls this "the whole safety story".
+        #
+        # `O_CREAT | O_EXCL` is one atomic operation on Windows and POSIX
+        # alike: exactly one caller creates the file. Everyone else falls
+        # through to the liveness check, and a caller that decides the
+        # holder is gone RECLAIMS by unlinking and trying the exclusive
+        # create again -- so two processes that both find a dead lock still
+        # cannot both win, and the loser re-reads and sees the winner.
+        for attempt in range(_LOCK_ACQUIRE_ATTEMPTS):
+            try:
+                handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(handle, "w", encoding="utf-8") as file:
+                    file.write(json.dumps(_lock_record(os.getpid())))
+                    file.flush()
+                    os.fsync(file.fileno())
+                return
+            holder = self.lock_holder(world_id)
+            if holder is None:
+                # Unreadable, or it vanished between the create and the
+                # read. Either way this is not evidence of no holder --
+                # `lock_holder`'s own docstring says so -- and a retry is
+                # cheaper than being wrong about it.
+                continue
             if holder["alive"] and holder["pid"] != os.getpid():
                 raise WorldLockedError(
                     f"world {world_id} is locked by live pid {holder['pid']}; "
@@ -610,7 +657,16 @@ class WorldStore:
                 world_id,
                 holder["pid"],
             )
-        write_json_atomic(path, _lock_record(os.getpid()))
+            # Unlink and go round: the create is what decides, not this.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise WorldLockedError(
+            f"world {world_id}: could not take the writer lock in "
+            f"{_LOCK_ACQUIRE_ATTEMPTS} attempts; another writer is contending "
+            "for it"
+        )
 
     def lock_holder(self, world_id: str) -> dict | None:
         """Who holds the writer lock, and whether that process is alive.

@@ -74,6 +74,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -81,6 +82,8 @@ import numpy as np
 
 from tower.storage import (
     read_bytes_closed,
+    replace_with_retry,
+    sweep_abandoned_staging,
     read_json_closed,
     write_bytes_atomic,
     write_json_atomic,
@@ -319,7 +322,15 @@ def write_sources(store, world_id: str, session_id: str, sources: dict) -> None:
     solve; read by `prepare_images`. Absent means "find by name, else use
     the session's copy".
     """
-    workspace = workspace_for(store, world_id, session_id)
+    write_sources_records(workspace_for(store, world_id, session_id), sources)
+
+
+def write_sources_records(workspace: SolveWorkspace, sources: dict) -> None:
+    """The same, addressed by workspace rather than by store.
+
+    Split out so `prepare_images` can put back what a recalibration's
+    `rmtree` just deleted -- it holds a workspace, not a store.
+    """
     workspace.root.mkdir(parents=True, exist_ok=True)
     write_json_atomic(
         workspace.root / SOURCES_FILENAME,
@@ -373,19 +384,45 @@ def prepare_images(
     width, height = keyframes[0].width, keyframes[0].height
     m1, m2, (x, y, rw, rh), camera = _undistort_maps(session.intrinsics, width, height)
     workspace.images_dir.mkdir(parents=True, exist_ok=True)
+    recalibrated = False
     if workspace.camera_path.exists():
         stored = PinholeCamera.from_json_dict(read_json_closed(workspace.camera_path))
         if stored != camera:
             # Calibration changed under a live workspace. Everything in it
             # was undistorted with the old maps; start over.
+            #
+            # AND `rmtree(ignore_errors=True)` DOES NOT GUARANTEE THAT. On
+            # Windows a file any reader holds open cannot be unlinked, and
+            # `ignore_errors` turns that into silence -- the tree survives,
+            # the loop below sees `target.exists()` and SKIPS it, and COLMAP
+            # is handed a mix of two calibrations under one `camera.json`.
+            # An adversarial review demonstrated exactly that: one image
+            # from calibration A and three from B, no exception, no warning.
+            #
+            # `recalibrated` makes the skip conditional instead, so a frame
+            # that survived the delete is re-undistorted rather than
+            # trusted. The rmtree stays as the cheap path; correctness no
+            # longer depends on it succeeding.
+            sources_before = read_sources(workspace)
             shutil.rmtree(workspace.root, ignore_errors=True)
             workspace.images_dir.mkdir(parents=True, exist_ok=True)
+            recalibrated = True
+            if sources_before:
+                # `sources.json` maps each keyframe to the RAW capture frame
+                # it came from, and the builder that observed those frames is
+                # the only thing that knows it -- a replay stages them under
+                # enumeration indices, so the name alone does not find them.
+                # The rmtree above deletes it three lines before
+                # `read_sources` runs, so a recalibration silently demoted
+                # every solve to the face-redacted session copies: the
+                # ledger's measured 337 images down to 307.
+                write_sources_records(workspace, sources_before)
     write_json_atomic(workspace.camera_path, camera.to_json_dict())
     sources = read_sources(workspace)
     written = 0
     for keyframe in keyframes:
         target = workspace.images_dir / keyframe_image_name(keyframe)
-        if target.exists():
+        if target.exists() and not recalibrated:
             continue
         source = _source_frame(keyframe, session_dir, capture_dirs, sources)
         image = cv2.imread(str(source), cv2.IMREAD_COLOR)
@@ -397,9 +434,27 @@ def prepare_images(
                            source, image.shape[1], image.shape[0], width, height)
             continue
         undistorted = cv2.remap(image, m1, m2, cv2.INTER_LINEAR)[y:y + rh, x:x + rw]
-        tmp = target.with_suffix(".tmp.jpg")
-        cv2.imwrite(str(tmp), undistorted, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        os.replace(tmp, target)
+        # A staging name no other solve can be using, and a `finally` that
+        # does not leave one behind. Both were missing: the name was
+        # `<target>.tmp.jpg`, derived only from the destination, so two
+        # solves of one world -- the builder's child and an operator's
+        # hand-run `world_solve.py`, which `storage.staging_path` calls an
+        # ordinary operator action -- collided on it. One writer's
+        # `os.replace` could publish the other's partial JPEG, and the
+        # `if target.exists(): continue` above means a corrupt frame is
+        # never regenerated: it feeds COLMAP for the life of the workspace.
+        tmp = target.with_name(f"{target.stem}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.jpg")
+        try:
+            cv2.imwrite(str(tmp), undistorted, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # `replace_with_retry`, not `os.replace`. Windows refuses a
+            # replace onto a destination any handle has open, and after a
+            # recalibration this path OVERWRITES frames a reader may be
+            # holding -- which is exactly the WinError 5 the retry exists
+            # for, in a function that had no tests until one held a frame
+            # open and it raised.
+            replace_with_retry(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
         written += 1
     return camera, written
 
@@ -441,6 +496,24 @@ def _pose_matrices(entry: dict):
     r_wc = r_cw.T
     centre = -r_wc @ t_cw
     return r_wc, centre
+
+
+def sweep_workspace(workspace: SolveWorkspace) -> int:
+    """Clear staging files left by solve children that were killed.
+
+    `BackgroundSolver` terminates a child that outstays its budget and the
+    final solve on a hard stop, and `TerminateProcess` runs no `finally`.
+    With per-writer staging names that leaves one file per kill, forever --
+    up to 13 MB each for a `solution.npz` at 6,000 keyframes. Swept here
+    because this is the directory those writers write into, and a solve is
+    the moment nobody else is using it.
+    """
+    if not workspace.root.is_dir():
+        return 0
+    swept = sweep_abandoned_staging(workspace.root)
+    if workspace.images_dir.is_dir():
+        swept += sweep_abandoned_staging(workspace.images_dir)
+    return swept
 
 
 def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
@@ -620,6 +693,7 @@ def solve(
     available, reason = solver_available()
     if not available:
         return {"solved": False, "reason": reason}
+    sweep_workspace(workspace_for(store, world_id, session_id))
     import pycolmap
 
     _quiet_pycolmap()

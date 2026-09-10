@@ -2099,6 +2099,27 @@ final class WorldRenderViewerTests: XCTestCase {
         WorldRenderClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession())
     }
 
+    /// Poll until `condition`, or give up. The render watchdog is a real
+    /// unstructured `Task` with a real sleep in it, so the tests that prove the
+    /// bound exists have to wait for it — in milliseconds, because the timeout
+    /// is injected.
+    ///
+    /// Local to this class rather than shared: the identically named helper a
+    /// few hundred lines up is `private` to a different one, and reaching for a
+    /// shared one would mean making a test utility visible across a 3,800-line
+    /// file for two call sites.
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+
     // MARK: Address
 
     func testTheAddressIsTheContractRouteWithTheSessionAsAQuery() {
@@ -2219,22 +2240,148 @@ final class WorldRenderViewerTests: XCTestCase {
 
     // MARK: The sheet's model
 
-    func testTheModelReportsLoadingThenReadyOrFailed() async {
+    /// A successful fetch lands in `.rendering`, **not** in `.ready`.
+    ///
+    /// The whole point of the third state: the page has arrived and nothing has
+    /// drawn it. `.ready` was where a successful fetch used to land, and that
+    /// was the app claiming a render it had never observed — a page that failed
+    /// to execute left a black rectangle indistinguishable from a crash, with
+    /// no message and no end, because the 30 s bound is on the fetch only.
+    func testAFetchedPageIsRenderingUntilTheWebViewSaysOtherwise() async {
         StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
         let model = WorldRenderViewerModel(
             target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
         )
-        XCTAssertEqual(model.state, .loading)
+        XCTAssertEqual(model.state, .fetching)
         await model.load()
-        XCTAssertEqual(model.state, .ready(html: "<!doctype html>"))
+        XCTAssertEqual(model.state, .rendering(html: "<!doctype html>"))
+        XCTAssertTrue(model.state.isRendering)
+        XCTAssertEqual(model.state.html, "<!doctype html>", "the web view is handed the page in both states")
 
-        StubbedGeometryProtocol.set(route: "/worlds/w1/render", to: (404, #"{"detail": "no world 'w1'"}"#))
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: "<!doctype html>"))
+        XCTAssertFalse(model.state.isRendering)
+        XCTAssertEqual(model.state.html, "<!doctype html>", "and it is the SAME page, so the same web view")
+    }
+
+    func testAFailedFetchStillFailsWithTheTowersOwnWords() async {
+        StubbedGeometryProtocol.reset(routes: [
+            "/worlds/w1/render": (404, #"{"detail": "no world 'w1'"}"#),
+        ])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
         await model.load()
         guard case .failed(let message, let retryable) = model.state else {
             return XCTFail("expected failed, got \(model.state)")
         }
         XCTAssertTrue(message.contains("no world 'w1'"))
         XCTAssertTrue(retryable)
+    }
+
+    /// A page that never reports finishing fails, in bounded time, saying which
+    /// half gave up.
+    ///
+    /// The timeout is injected in milliseconds; the point is that the bound
+    /// exists, not how long it is.
+    func testAPageThatNeverFinishesDrawingFailsRatherThanHangingForever() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        model.renderTimeout = .milliseconds(50)
+        await model.load()
+        XCTAssertTrue(model.state.isRendering)
+
+        let failed = await waitUntil { model.state.failureMessage != nil }
+        XCTAssertTrue(failed, "the render was never bounded; the wearer would wait forever")
+        XCTAssertTrue(model.state.failureMessage?.contains("did not finish drawing") == true,
+                      "the sentence must blame the render, not the Tower that delivered the page")
+        XCTAssertTrue(model.state.failureIsRetryable)
+    }
+
+    /// A `didFinish` that arrives after the timeout already reported failure
+    /// must not silently un-fail the screen under a reader who has started
+    /// reading the message.
+    func testALateRenderDoesNotOverwriteAFailureAlreadyShown() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        model.renderTimeout = .milliseconds(50)
+        await model.load()
+        _ = await waitUntil { model.state.failureMessage != nil }
+
+        model.pageEvent(.rendered)
+        XCTAssertNotNil(model.state.failureMessage, "a late didFinish must not un-fail the screen")
+    }
+
+    /// The page's own failures reach the reader, and are told apart from the
+    /// fetch's.
+    func testAPageThatFailsToDrawSaysSoAndDoesNotBlameTheTower() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        await model.load()
+        model.pageEvent(.failed("the web content process crashed"))
+        XCTAssertTrue(model.state.failureMessage?.contains("arrived but could not be drawn") == true)
+        XCTAssertTrue(model.state.failureMessage?.contains("crashed") == true, "WebKit's own words")
+        XCTAssertTrue(model.state.failureIsRetryable)
+    }
+
+    /// A page that keeps killing the content process is not reloaded forever.
+    func testRepeatedContentProcessDeathsStopAndSayHowMany() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        await model.load()
+        model.pageEvent(.gaveUpAfterTerminations(3))
+        XCTAssertTrue(model.state.failureMessage?.contains("too large to draw") == true)
+        XCTAssertTrue(model.state.failureMessage?.contains("3 times") == true)
+        XCTAssertTrue(model.state.failureIsRetryable,
+                      "memory pressure is transient, so asking again is not a control that cannot work")
+    }
+
+    /// A reload after a content-process death is bounded too.
+    ///
+    /// The budget stops the loop; this stops the hole *inside* the budget. A
+    /// page put back after a kill is drawn again, and if that draw never
+    /// finishes the screen would be a black rectangle with no bound — the same
+    /// defect one layer down. So the reload returns the state to `.rendering`
+    /// and re-arms the watchdog.
+    func testAReloadAfterAContentProcessDeathIsBoundedAsWell() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        model.renderTimeout = .milliseconds(50)
+        await model.load()
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: "<!doctype html>"))
+
+        model.pageEvent(.reloadingAfterTermination)
+        XCTAssertTrue(model.state.isRendering, "the page is being drawn again, and says so")
+
+        let failed = await waitUntil { model.state.failureMessage != nil }
+        XCTAssertTrue(failed, "a reload that never finishes must be bounded like the first draw")
+    }
+
+    /// A retry of the same page carries a new attempt number, which is the only
+    /// thing that makes the web view reload a byte-identical string.
+    func testARetryOfTheSamePageIsANewAttempt() async {
+        StubbedGeometryProtocol.reset(routes: ["/worlds/w1/render": (200, "<!doctype html>")])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil), client: client()
+        )
+        await model.load()
+        let first = model.renderAttempt
+        model.pageEvent(.failed("boom"))
+        await model.load()
+        XCTAssertGreaterThan(model.renderAttempt, first,
+                             "without a new attempt number the coordinator skips the reload and "
+                             + "Try again does nothing at all")
     }
 
     // MARK: Navigation policy
@@ -3285,18 +3432,22 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     private(set) var sessionBinding: WorldSessionBinding = .none
     private(set) var inspection: WorldInspectionMode = .live
     private(set) var recentWorld: WorldRecentReference?
+    /// The builder's finalization record. `nil` until a test sends one.
+    private(set) var finalization: WorldFinalizationReport?
 
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
     private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
     private let recentSubject = PassthroughSubject<WorldRecentReference?, Never>()
     private let geometrySubject = PassthroughSubject<WorldGeometryCoordinates, Never>()
+    private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
 
     var stateUpdates: AnyPublisher<WorldModelState, Never> { stateSubject.eraseToAnyPublisher() }
     var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> { bindingSubject.eraseToAnyPublisher() }
     var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> { inspectionSubject.eraseToAnyPublisher() }
     var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { recentSubject.eraseToAnyPublisher() }
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> { geometrySubject.eraseToAnyPublisher() }
+    var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> { finalizationSubject.eraseToAnyPublisher() }
 
     /// Recorded so a test can assert the view model asked for the pin it was
     /// told to.
@@ -3314,6 +3465,14 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     func send(recent: WorldRecentReference?) {
         recentWorld = recent
         recentSubject.send(recent)
+    }
+
+    /// A finalization report **without** a state change beside it. That is the
+    /// shape the real Tower sends while a long final solve runs, and the shape
+    /// that used to reach the screen as nothing at all.
+    func send(finalization report: WorldFinalizationReport?) {
+        finalization = report
+        finalizationSubject.send(report)
     }
 
     func send(_ coordinates: WorldGeometryCoordinates) {

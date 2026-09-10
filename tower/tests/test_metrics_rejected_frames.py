@@ -86,3 +86,65 @@ def test_a_clean_run_reports_no_rejections_so_the_stride_is_trustworthy():
 
     assert snapshot["sampling_stride_avg"] == 30.0
     assert snapshot["frames_rejected"] == 0
+
+
+def test_a_refused_frame_is_not_scored_as_transit_loss():
+    """`tx_seq_gap_total` is the one number that says "lost in the air".
+
+    A frame this Tower SAW and refused is not a lost message, but it never
+    reaches `record_frame`, so it used to leave a hole that the next
+    accepted frame turned into a gap. Measured by an adversarial review
+    before the fix: 10 transmitted, 0 lost, and the number reported 3 --
+    exactly `frames_rejected`.
+    """
+    import itertools
+
+    from tower.metrics import SessionMetrics
+
+    m = SessionMetrics(clock=itertools.count(0.0, 0.1).__next__)
+    for tx in range(10):
+        if tx in (3, 4, 7):
+            m.record_frame_rejected(tx_seq=tx)
+            continue
+        m.record_frame(seq=tx, byte_count=100, receive_to_result_ms=1.0,
+                       cv_processing_ms=1.0, tx_seq=tx, source_seq=tx)
+    snapshot = m.snapshot()
+    assert snapshot["frames_rejected"] == 3
+    assert snapshot["tx_seq_gap_total"] == 0, (
+        "a frame this Tower refused was counted as one it never received"
+    )
+
+
+def test_a_genuinely_lost_frame_is_still_scored():
+    """The fix must not have made the instrument blind."""
+    import itertools
+
+    from tower.metrics import SessionMetrics
+
+    m = SessionMetrics(clock=itertools.count(0.0, 0.1).__next__)
+    for tx in (0, 1, 2, 5):          # 3 and 4 never arrived at all
+        m.record_frame(seq=tx, byte_count=100, receive_to_result_ms=1.0,
+                       cv_processing_ms=1.0, tx_seq=tx, source_seq=tx)
+    assert m.snapshot()["tx_seq_gap_total"] == 2
+
+
+def test_a_frame_refused_before_it_decoded_cannot_be_attributed():
+    """And the residue is documented rather than guessed at.
+
+    A message refused before it parsed has no `tx_seq` to read, so it
+    leaves a hole nothing can fill. `frames_rejected` is reported beside
+    the gap so a reader can see how much room for doubt there is.
+    """
+    import itertools
+
+    from tower.metrics import SessionMetrics
+
+    m = SessionMetrics(clock=itertools.count(0.0, 0.1).__next__)
+    m.record_frame(seq=0, byte_count=100, receive_to_result_ms=1.0,
+                   cv_processing_ms=1.0, tx_seq=0, source_seq=0)
+    m.record_frame_rejected()                     # unparseable: no tx_seq
+    m.record_frame(seq=2, byte_count=100, receive_to_result_ms=1.0,
+                   cv_processing_ms=1.0, tx_seq=2, source_seq=2)
+    snapshot = m.snapshot()
+    assert snapshot["tx_seq_gap_total"] == 1      # honestly unattributable
+    assert snapshot["frames_rejected"] == 1       # and the doubt is visible

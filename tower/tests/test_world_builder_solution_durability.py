@@ -403,10 +403,10 @@ def test_two_writers_do_not_share_a_staging_name(tmp_path):
     other's in-flight temp, and what let one writer promote the half-written
     bytes the other was still producing.
     """
-    from tower.storage import _temp_path
+    from tower.storage import staging_path
 
     target = tmp_path / "solution.npz"
-    names = {_temp_path(target).name for _ in range(50)}
+    names = {staging_path(target).name for _ in range(50)}
     assert len(names) == 50, "staging names collide"
     assert all(n.endswith(".tmp") for n in names), (
         "purge_world and the leftover-temp checks look for a .tmp suffix"
@@ -414,3 +414,116 @@ def test_two_writers_do_not_share_a_staging_name(tmp_path):
     assert all(n.startswith("solution.npz.") for n in names), (
         "a stray temp must still say which artifact it was staging"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. What unique staging names cost, and who pays it back.
+
+
+def test_a_dead_writers_staging_file_is_swept(tmp_path):
+    """Unique names fixed one problem and created another.
+
+    A shared `<name>.tmp` meant a killed writer left one file that the next
+    successful write's `finally` removed. Unique names mean a killed writer
+    leaves one EVERY TIME: the `finally` does not run under
+    `TerminateProcess`, and `purge_world` -- which the docstrings call the
+    sweeper -- has no production caller. An adversarial review measured 21
+    strays and 11.4 MB after six hard kills, and the builder kills a solve
+    child on every stop that outstays its budget.
+    """
+    from tower.storage import staging_path, sweep_abandoned_staging
+
+    workspace = _workspace(tmp_path)
+    write_solution(workspace, _solution())
+    good = workspace.arrays_path.read_bytes()
+
+    # A dead process's leavings: pick a pid that is certainly gone.
+    import subprocess
+    import sys as _sys
+
+    dead = subprocess.Popen([_sys.executable, "-c", "pass"])
+    dead.wait()
+    stray = workspace.root / f"solution.npz.{dead.pid}.deadbeef.tmp"
+    stray.write_bytes(b"x" * 4096)
+
+    assert sweep_abandoned_staging(workspace.root) == 1
+    assert not stray.exists()
+    assert workspace.arrays_path.read_bytes() == good, "the sweep touched the world"
+
+
+def test_a_live_writers_staging_file_is_left_alone(tmp_path):
+    """The pid in the name is what makes sweeping safe at any time.
+
+    A staging file belonging to a live process is someone's write in
+    flight. Deleting it is the shared-name bug again, with extra steps.
+    """
+    import os
+
+    from tower.storage import sweep_abandoned_staging
+
+    workspace = _workspace(tmp_path)
+    workspace.root.mkdir(parents=True, exist_ok=True)
+    mine = workspace.root / f"solution.npz.{os.getpid()}.cafebabe.tmp"
+    mine.write_bytes(b"in flight")
+
+    assert sweep_abandoned_staging(workspace.root) == 0
+    assert mine.exists()
+
+
+def test_an_undistort_staging_file_is_swept_too(tmp_path):
+    """`.tmp` is a COMPONENT of a staging name, not always its suffix.
+
+    `staging_path` puts it last for a JSON or npz write, but
+    `prepare_images` stages an undistorted frame as
+    `<stem>.<pid>.<uuid>.tmp.jpg`. The first version of the sweeper matched
+    `*.tmp` and therefore swept the writers that rarely die while missing
+    the one the builder TERMINATES on every over-long stop -- in the very
+    directory it claims to sweep. Found by testing it against every staging
+    shape rather than the one it was written against.
+    """
+    import subprocess
+    import sys as _sys
+
+    from tower.storage import sweep_abandoned_staging
+
+    workspace = _workspace(tmp_path)
+    workspace.images_dir.mkdir(parents=True, exist_ok=True)
+    dead = subprocess.Popen([_sys.executable, "-c", "pass"])
+    dead.wait()
+    stray = workspace.images_dir / f"00000001.{dead.pid}.8ecff1a3.tmp.jpg"
+    stray.write_bytes(b"half an undistorted frame")
+    keep = workspace.images_dir / "00000002.jpg"
+    keep.write_bytes(b"a real frame")
+
+    assert sweep_abandoned_staging(workspace.images_dir) == 1
+    assert not stray.exists()
+    assert keep.exists(), "the sweep took a real frame"
+
+
+def test_the_sweep_never_touches_a_finished_artifact(tmp_path):
+    """It runs before every solve, so it must be safe against the workspace
+    exactly as a solve leaves it."""
+    from tower.storage import sweep_abandoned_staging
+
+    workspace = _workspace(tmp_path)
+    write_solution(workspace, _solution())
+    workspace.camera_path.write_text("{}", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in workspace.root.iterdir() if p.is_file()}
+
+    assert sweep_abandoned_staging(workspace.root) == 0
+    assert {p.name: p.read_bytes()
+            for p in workspace.root.iterdir() if p.is_file()} == before
+
+
+def test_a_staging_file_with_no_pid_in_it_is_left_alone(tmp_path):
+    """An older shared-name temp, or something else entirely. Not ours to
+    judge, and deleting an unknown file is not a sweep."""
+    from tower.storage import sweep_abandoned_staging
+
+    workspace = _workspace(tmp_path)
+    workspace.root.mkdir(parents=True, exist_ok=True)
+    legacy = workspace.root / "solution.npz.tmp"
+    legacy.write_bytes(b"from before staging names carried a pid")
+
+    assert sweep_abandoned_staging(workspace.root) == 0
+    assert legacy.exists()

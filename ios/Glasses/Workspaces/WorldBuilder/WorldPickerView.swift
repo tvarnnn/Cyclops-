@@ -13,20 +13,44 @@ import SwiftUI
 /// a dated title with the id as a caption; the session count; a "live" badge
 /// when a builder holds the world's writer lock; and per session the Tower's
 /// `frame_source` word, its state word as a badge, and its keyframe count.
-/// Tapping a session opens it; tapping the world's own row opens the world
-/// and lets the Tower pick the session.
+/// Tapping a session pushes its 3D world; tapping the world's own row pushes
+/// the world and lets the Tower pick the session.
 ///
-/// Worlds with no sessions are not offered as rows. There is nothing to open
-/// in one — the Tower answers "the world exists and has no sessions" and the
-/// picture 404s — and on the real root they were 96 of 162. They are counted
-/// behind one disclosure at the bottom, so the number is still visible and a
-/// person who wants one can still reach it.
+/// **A row is a control only when there is something behind it.** The render
+/// route answers 404 for a world with no sessions, for a world none of whose
+/// sessions has geometry, and for a session that has none — and `absent` is
+/// classified retryable, so every one of those taps would land on the Tower's
+/// absence prose beside a Try again that nothing on this screen can satisfy.
+/// Those three are drawn as text that says which case it is. See
+/// `emptyWorldRow`, `worldRow` and `sessionRow`.
+///
+/// Worlds with no sessions are not offered as **controls**. There is nothing to
+/// open in one — the Tower answers "the world exists and has no sessions" and
+/// the render route 404s — and on the real root they were 96 of 162. They are
+/// listed behind one disclosure at the bottom, as text with their ids, so the
+/// number and the identifiers stay visible and no tap leads into a 404 with a
+/// Try again that cannot succeed. See `emptyWorldRow`.
 ///
 /// Not `#if DEBUG`: opening a stored world reads, and a Release build with no
 /// camera is entitled to read.
 struct WorldPickerView: View {
     @ObservedObject var world: WorldBuilderViewModel
     @Environment(\.dismiss) private var dismiss
+
+    /// The world whose 3D reconstruction is pushed, or `nil`.
+    ///
+    /// ## Why a tap here goes straight to the 3D world
+    ///
+    /// It used to pin the world and dismiss, leaving the reader on the
+    /// workspace looking at a gallery of top-down sparse point clouds captioned
+    /// with the solver's registration vocabulary. The 3D reconstruction — the
+    /// thing they opened a saved world to see — was behind a small bordered
+    /// "Picture" button in the header, two taps and a scroll away.
+    ///
+    /// So the tap pushes it. The pin still happens, so the workspace behind is
+    /// showing the same world when Close is used, and the picker stays up
+    /// underneath so a person comparing two walks does not have to reopen it.
+    @State private var opened: WorldRenderTarget?
 
     private var grouped: WorldListingPresentation.Grouped {
         WorldListingPresentation.grouped(world.worlds)
@@ -50,7 +74,7 @@ struct WorldPickerView: View {
                     Section {
                         DisclosureGroup(heading) {
                             ForEach(grouped.empty, id: \.worldID) { entry in
-                                worldRow(entry)
+                                emptyWorldRow(entry)
                             }
                         }
                         .font(.footnote)
@@ -65,8 +89,49 @@ struct WorldPickerView: View {
                     Button("Close") { dismiss() }
                 }
             }
+            // Pushed, not presented: a sheet over a sheet stacks two dimming
+            // layers and two Close buttons, and the back gesture is what a
+            // person reaches for after looking at one of several walks.
+            .navigationDestination(item: $opened) { target in
+                WorldRenderScene(target: target, title: openedTitle, note: openedNote)
+            }
             .task { await world.loadWorlds() }
         }
+    }
+
+    /// What to call the world that is pushed. Resolved from the listing rather
+    /// than from the live snapshot, because the pin's first status report has
+    /// usually not arrived by the time this is drawn.
+    private var openedTitle: String? {
+        guard let opened else { return nil }
+        return openedEntry.map { WorldListingPresentation.title(for: $0) }
+    }
+
+    /// What the pushed screen says about the world under its caption, or `nil`.
+    ///
+    /// From the **listing's** finalization record, not from a status report:
+    /// the pin's first report has usually not arrived when this screen appears,
+    /// and `WorldListingSession.finalization` is already in hand. It is only
+    /// ever a sentence about a final pass the Tower said did not happen —
+    /// silence stays silent, per `WorldFinalSolve.notReported`.
+    private var openedNote: String? {
+        guard let session = openedSession else { return nil }
+        let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
+        return solve.deniesAFinishedWorld ? solve.sentence : nil
+    }
+
+    private var openedEntry: WorldListingEntry? {
+        guard let opened else { return nil }
+        return world.worlds.first { $0.worldID == opened.worldID }
+    }
+
+    /// The listing row for the session that was pushed, when one was named. A
+    /// tap on a world's own row names none — the Tower chooses — so this is
+    /// `nil` there and the screen says nothing rather than guessing which
+    /// session the Tower will pick.
+    private var openedSession: WorldListingSession? {
+        guard let sessionID = opened?.sessionID else { return nil }
+        return openedEntry?.sessions.first { $0.sessionID == sessionID }
     }
 
     // MARK: Status
@@ -108,68 +173,201 @@ struct WorldPickerView: View {
 
     // MARK: Rows
 
+    /// A world with at least one session that has geometry: tapping it lets the
+    /// Tower choose the session and pushes the 3D world.
+    ///
+    /// A world whose sessions **all** report `has_geometry: false` is drawn the
+    /// way a session-less world is, and for the same reason: the render route
+    /// picks the newest session with geometry, finds none, and 404s. Tapping it
+    /// could only ever land on the Tower's absence prose under a Try again that
+    /// this screen cannot make succeed.
+    @ViewBuilder
     private func worldRow(_ entry: WorldListingEntry) -> some View {
-        Button {
-            open(worldID: entry.worldID, sessionID: nil)
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(entry.title)
-                        .font(.headline)
-                    // The id stays reachable — it is what the Tower's logs
-                    // and the canvas header name — but as a caption under a
-                    // title, never as the title.
-                    Text(entry.worldID)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(WorldListingPresentation.sessionCount(entry.sessions.count))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if entry.live {
-                    Text("live")
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+        if entry.sessions.contains(where: \.hasGeometry) {
+            Button {
+                open(worldID: entry.worldID, sessionID: nil)
+            } label: {
+                HStack {
+                    worldLabel(entry)
+                    Spacer()
+                    liveBadge(entry)
                 }
             }
+            .buttonStyle(.plain)
+        } else {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    worldLabel(entry)
+                    Text("None of these sessions has geometry, so there is nothing to open.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                liveBadge(entry)
+            }
         }
-        .buttonStyle(.plain)
     }
 
+    @ViewBuilder
+    private func liveBadge(_ entry: WorldListingEntry) -> some View {
+        if entry.live {
+            Text("live")
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.15), in: Capsule())
+        }
+    }
+
+    /// A world the Tower lists with **no sessions**, drawn as text and not as a
+    /// control.
+    ///
+    /// ## Why this is not a button
+    ///
+    /// It was one, briefly, and that was a regression a review caught before a
+    /// person did. A world with no sessions has nothing to render: the Tower
+    /// answers 404 on the render route, and `WorldRenderFetchError.absent` is
+    /// classified retryable — correctly, for a world still being built — so the
+    /// reader would be pushed into the Tower's 404 prose under a "Try again"
+    /// button that can never succeed, because nothing reachable from this
+    /// screen can give a world a session. On the real root that is 96 of 162
+    /// rows.
+    ///
+    /// A control for an operation that cannot work is exactly what this pass
+    /// set out to remove. So the row says what the world is and offers nothing.
+    /// It keeps its id, because the id is the only reason a person would be
+    /// looking inside this disclosure at all.
+    private func emptyWorldRow(_ entry: WorldListingEntry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            worldLabel(entry)
+            Text("No sessions, so there is nothing to open.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    /// The title, the id and the session count. Shared so an openable world and
+    /// a shell are described in the same words.
+    private func worldLabel(_ entry: WorldListingEntry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(entry.title)
+                .font(.headline)
+            // The id, restored as a caption.
+            //
+            // It was removed here on the grounds that 162 rows of hex is a wall
+            // — which is true — and the removal made a world id from a Tower log
+            // unfindable, because every row then read "Walk · <date>" and
+            // nothing else told them apart. That is the worse failure: the id
+            // is the one string a person arrives at this screen already
+            // holding. It goes back where it was, as a caption under a human
+            // title, which is the arrangement that was never the complaint.
+            Text(entry.worldID)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(WorldListingPresentation.sessionCount(entry.sessions.count))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// One session. A **control** only when the Tower says it has geometry.
+    ///
+    /// ## The same defect, one level down
+    ///
+    /// `emptyWorldRow` exists because a world with no sessions pushes into a
+    /// guaranteed 404 under a Try again that cannot succeed. A session the
+    /// Tower reports as `has_geometry: false` is the identical situation:
+    /// `GET /worlds/{id}/render?session_id=` answers 404, `absent` is
+    /// classified retryable, and nothing this screen can do will build geometry
+    /// for a session that has none. `hasGeometry` was consulted here for
+    /// exactly one thing — which shade of grey to paint the badge.
+    ///
+    /// So the row stops being a button and says what it is instead. The Tower's
+    /// own state word stays on it, and for a session that is still open the
+    /// sentence says the Tower may yet build one, because that is the one case
+    /// where the answer can change — and it changes by the Tower building,
+    /// which a refresh of this list will show, not by a Try again on a 404.
+    @ViewBuilder
     private func sessionRow(entry: WorldListingEntry, session: WorldListingSession) -> some View {
-        Button {
-            open(worldID: entry.worldID, sessionID: session.sessionID)
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(session.sessionID)
-                        .font(.caption.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    HStack(spacing: 6) {
-                        Text(session.frameSource)
-                        if let keyframes = WorldListingPresentation.keyframeCaption(for: session) {
-                            Text("·")
-                            Text(keyframes)
-                        }
-                    }
+        if session.hasGeometry {
+            Button {
+                open(worldID: entry.worldID, sessionID: session.sessionID)
+            } label: {
+                sessionLabel(session)
+            }
+            .buttonStyle(.plain)
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                sessionLabel(session)
+                Text(session.isStillOpen
+                     ? "No geometry yet. The Tower may still build it for this walk."
+                     : "No geometry was built for this walk, so there is nothing to open.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if let badge = WorldListingPresentation.stateBadge(for: session) {
-                    Text(badge)
-                        .font(.caption2)
-                        .foregroundStyle(badgeStyle(for: session))
-                }
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .buttonStyle(.plain)
+    }
+
+    private func sessionLabel(_ session: WorldListingSession) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                // When the walk happened, as the row's primary label.
+                //
+                // It used to be `session.sessionID` — a raw 32-character
+                // hex string, in a monospaced font, as the **primary**
+                // label of every session row. Nothing about a session is
+                // less useful to a person choosing which walk to look at,
+                // and nothing on the screen was louder. The id is shown for
+                // the session actually opened, in the 3D viewer's Details
+                // and in the canvas's Diagnostics.
+                Text(WorldListingPresentation.sessionTitle(for: session))
+                    .font(.subheadline)
+                HStack(spacing: 6) {
+                    Text(session.frameSource)
+                    if let keyframes = WorldListingPresentation.keyframeCaption(for: session) {
+                        Text("·")
+                        Text(keyframes)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                // The final pass, when the Tower's own record says it did
+                // not happen. `WorldListingSession.finalization` has been
+                // decoded off this route since 2026-09-06 and read by
+                // nothing; it is the one source of that word that does not
+                // require pinning the session first, and it is what makes
+                // "this walk is not everything it could be" visible while
+                // the reader is still choosing which walk to open.
+                if let solve = WorldListingPresentation.finalSolveCaption(for: session) {
+                    Text(solve)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                // The session id, restored as a caption rather than as the
+                // row's primary label.
+                //
+                // Removing it outright made two sessions of one world
+                // started in the same minute indistinguishable, and left a
+                // session id from a Tower log with nothing to match
+                // against. The complaint it answered was that this string
+                // was the LOUDEST thing on the row; as a tertiary caption
+                // under a dated title, it is not.
+                Text(session.sessionID)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            if let badge = WorldListingPresentation.stateBadge(for: session) {
+                Text(badge)
+                    .font(.caption2)
+                    .foregroundStyle(badgeStyle(for: session))
+            }
+        }
     }
 
     /// Muted for a session with nothing to show, ordinary otherwise. The
@@ -179,8 +377,17 @@ struct WorldPickerView: View {
         session.hasGeometry ? .secondary : .tertiary
     }
 
+    /// Pin the world for the workspace behind, and push its 3D reconstruction.
+    ///
+    /// Both, in that order. The pin is what makes the workspace describe this
+    /// world when the reader comes back to it, and what starts the geometry
+    /// fetch that fills Diagnostics; the push is what they came for.
+    ///
+    /// The picker is **not** dismissed. It was, and the effect was that opening
+    /// a world dropped the reader onto a workspace showing a sparse fragment
+    /// gallery, with the 3D world still two taps away.
     private func open(worldID: String, sessionID: String?) {
         world.open(worldID: worldID, sessionID: sessionID)
-        dismiss()
+        opened = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
     }
 }

@@ -84,7 +84,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
-from tower.capture import CaptureFollower  # noqa: E402
+from tower.capture import (  # noqa: E402
+    END_REASON_DISCONNECT as END_REASON_CAPTURE_DISCONNECT,
+    END_REASON_STOP as END_REASON_CAPTURE_STOP,
+    CaptureFollower,
+)
 from tower.world_builder.backends import (  # noqa: E402
     BACKEND_AUTO,
     BACKEND_NAMES,
@@ -896,6 +900,55 @@ def solve_session(store: WorldStore, world_id: str, session_id: str, *, capture_
     return summary
 
 
+# How many keyframes a rebuild is worth, at a given size of world.
+#
+# `--rebuild-every 4` is a fixed count and the rebuild is not a fixed cost:
+# `write_derived` rewrites poses, points, support and the manifest IN FULL
+# every time, so it grows with the world while the interval does not.
+# Measured against derived trees at the field walk's own ratios (33.5
+# points and 26.2 support rows per keyframe):
+#
+#     keyframes   tree size   write_derived
+#           795      3.7 MB       0.34 s
+#          2000      9.4 MB       0.86 s
+#          4000     18.8 MB       1.85 s
+#          6000     28.2 MB       3.48 s
+#
+# At the measured 3.2 keyframes/sec, four keyframes is 1.21 s of wall time.
+# The write alone crosses that at about 2,700 keyframes -- roughly FOURTEEN
+# MINUTES into a walk -- and from there the builder falls behind for the
+# rest of the session, with the capture directory as the only queue. The
+# stated target is twenty to thirty minutes.
+#
+# So the interval grows with the world, doubling each time the keyframe
+# count doubles past the knee. That keeps the rebuild a bounded FRACTION of
+# the wall clock instead of a growing one. The knee is 750 because that is
+# what puts the fraction where it should be at both ends:
+#
+#   keyframes   interval   rebuild every   write    share of wall clock
+#         795        4        1.2 s        0.34 s        27%   (unchanged)
+#        1500        8        2.5 s        0.65 s        26%
+#        3000       16        5.0 s        1.4 s         28%
+#        6000       32       10.0 s        3.5 s         35%
+#
+# rather than 27% -> 69% -> 148% -> 288%, which is what a fixed four gives
+# and is why the builder fell behind for the back half of a long walk.
+#
+# The wearer loses nothing that matters. A rebuild is a redraw of a world
+# that is already mostly settled by then, and the two triggers that carry
+# real news are untouched: a completed background solve still forces a
+# rebuild immediately, and the final build still runs at Stop.
+REBUILD_KNEE_KEYFRAMES = 750
+
+
+def rebuild_interval(base: int, accepted: int) -> int:
+    """The rebuild interval for a world of `accepted` keyframes."""
+    if accepted <= REBUILD_KNEE_KEYFRAMES:
+        return base
+    doublings = (accepted // REBUILD_KNEE_KEYFRAMES).bit_length() - 1
+    return base << min(doublings, 4)
+
+
 def should_register(result) -> bool:
     """Whether the Sim3 registrar should run after this build.
 
@@ -1461,7 +1514,8 @@ def main(argv=None) -> int:
             # Two keyframes is the minimum a two-view backend can say anything
             # about. Rebuilding on one would burn a build to produce an anchor
             # pose and nothing else.
-            if (args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2) or (
+            if (args.rebuild_every and since_rebuild >= rebuild_interval(
+                    args.rebuild_every, accepted) and accepted >= 2) or (
                 solve_landed and accepted >= 2
             ):
                 rebuild_started = time.perf_counter()
@@ -1522,7 +1576,14 @@ def main(argv=None) -> int:
         # FOLLOWER, not of the directory we started with, because a
         # reconnect retargets it onto a successor capture.
         follower = capture_handle.get("follower")
-        capture_finished = follower.is_closed() if follower is not None else False
+        # `bounded_limit` is NOT the wearer. The recorder stops itself at a
+        # configured bound and its own log says a follower sees that "exactly
+        # as if it were" a disconnect -- so treating a closed capture as an
+        # ordinary end would finalise a world at the bound, under the label
+        # `stop`, while the wearer is still walking. The bound is forty
+        # minutes now, but a walk that reaches it should say so.
+        capture_end = follower.end_reason() if follower is not None else None
+        capture_finished = capture_end in (END_REASON_CAPTURE_STOP, END_REASON_CAPTURE_DISCONNECT)
         if stop_request.asked and not capture_finished:
             # Now it means what it says: frames were still coming and
             # somebody asked this process to go.
@@ -1535,8 +1596,16 @@ def main(argv=None) -> int:
         elif stop_request.asked:
             logger.info(
                 "[Tower][WorldBuilder] stop requested (%s, %s) after the capture "
-                "closed; this is an ordinary end and the session ends as %r",
-                stop_request.level, stop_request.source, end_reason,
+                "closed (%s); this is an ordinary end and the session ends as %r",
+                stop_request.level, stop_request.source, capture_end, end_reason,
+            )
+        if capture_end == "bounded_limit":
+            logger.warning(
+                "[Tower][WorldBuilder] the capture stopped ITSELF at a configured "
+                "bound, not because anyone asked. The walk may have been longer "
+                "than the world; the session ends as %r so the truncation is not "
+                "reported as a clean finish.",
+                end_reason,
             )
         summary = engine.stop_session(end_reason, hold_lock=True)
 

@@ -48,7 +48,11 @@ def test_a_reader_descheduled_for_150ms_does_not_fail_the_writer(tmp_path):
         stop.set()
         reader.join(2)
     assert json.loads(path.read_text(encoding="utf-8"))["i"] == 19
-    assert not path.with_name(path.name + storage.TEMP_SUFFIX).exists()
+    # Any staging file, not the one name it used to use. Since staging
+    # names carry a pid and a uuid, asserting the OLD name is absent
+    # is vacuous -- it is never created, so the assertion passed
+    # against every implementation including a leaking one.
+    assert list(path.parent.glob(f"*{storage.TEMP_SUFFIX}")) == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="POSIX replaces over open readers")
@@ -74,4 +78,8 @@ def test_a_parked_reader_still_fails_the_writer_within_the_budget(tmp_path, monk
         release.set()
         parked.join(2)
     assert json.loads(path.read_text(encoding="utf-8")) == {"a": 1}
-    assert not path.with_name(path.name + storage.TEMP_SUFFIX).exists()
+    # Any staging file, not the one name it used to use. Since staging
+    # names carry a pid and a uuid, asserting the OLD name is absent
+    # is vacuous -- it is never created, so the assertion passed
+    # against every implementation including a leaking one.
+    assert list(path.parent.glob(f"*{storage.TEMP_SUFFIX}")) == []

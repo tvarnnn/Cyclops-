@@ -109,6 +109,42 @@ nonisolated enum WorldListingPresentation {
         return nil
     }
 
+    /// What to call one session on a row: when the walk started, in the
+    /// phone's zone.
+    ///
+    /// The session's own id used to be the row's primary label — 32 hex
+    /// characters, monospaced, on every session of every world. It identifies
+    /// the record and tells a person nothing about which walk it was. The start
+    /// time does, and it is the one thing a reader choosing between two walks
+    /// of the same world actually has to go on.
+    ///
+    /// `"Walk · "` matches `datedTitle`, so a world's own row and its sessions'
+    /// rows read in the same vocabulary.
+    static func sessionTitle(for session: WorldListingSession) -> String {
+        datedTitle(updatedAt: session.startedAt)
+    }
+
+    /// `"no final pass"`, or `nil`.
+    ///
+    /// ## The field this reads had never been read
+    ///
+    /// `WorldListingSession.finalization` is decoded off `GET /worlds` and was
+    /// consulted by nothing. Its `final_solve` word is the difference between a
+    /// walk that finished and a walk whose last, best pass was skipped or
+    /// failed — and the picker is where a person chooses between two walks, so
+    /// it is the place that difference is worth the two words it costs.
+    ///
+    /// **Only the words that say the pass did not happen.** `solved` gets no
+    /// caption (a finished walk does not need a badge saying it finished),
+    /// `pending` gets none (it may yet run), and a `nil` record gets none at
+    /// all — silence is not a finding, which is the rule
+    /// `WorldFinalSolve.notReported` states in one place for the whole app.
+    static func finalSolveCaption(for session: WorldListingSession) -> String? {
+        let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
+        guard solve.deniesAFinishedWorld else { return nil }
+        return "no final pass"
+    }
+
     /// `"467 keyframes"`, or `nil` when neither count was sent. The journal's
     /// count stands in when the record's is the start-of-session zero — see
     /// `WorldListingSession.keyframeCount`.

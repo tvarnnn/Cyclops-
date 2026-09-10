@@ -19,7 +19,7 @@ from tower.document_memory.records import (
     DocumentObservation,
     document_observation_from_json_dict,
 )
-from tower.storage import _replace_with_retry, append_jsonl, read_raw_jsonl
+from tower.storage import append_jsonl, read_raw_jsonl, replace_with_retry
 
 # A reader that meets a rewrite mid-flight on Windows gets PermissionError
 # on open. Retried briefly: the rewrite is atomic and finishes in
@@ -140,7 +140,7 @@ class DocumentStore:
                 # Retried, never bare: a status producer, a search or the
                 # phone's re-fetch may hold the journal open at this
                 # instant, and Windows refuses a rename onto an open file.
-                _replace_with_retry(temp_path, self._path)
+                replace_with_retry(temp_path, self._path)
             finally:
                 temp_path.unlink(missing_ok=True)
             return True
@@ -167,7 +167,7 @@ class DocumentStore:
                 handle.write(jpeg_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
-            _replace_with_retry(temp_path, path)
+            replace_with_retry(temp_path, path)
         finally:
             temp_path.unlink(missing_ok=True)
         return path
@@ -456,7 +456,7 @@ class DocumentStore:
                         handle.write(json.dumps(record) + "\n")
                     handle.flush()
                     os.fsync(handle.fileno())
-                _replace_with_retry(temp_path, self._path)
+                replace_with_retry(temp_path, self._path)
             finally:
                 temp_path.unlink(missing_ok=True)
             return dropped

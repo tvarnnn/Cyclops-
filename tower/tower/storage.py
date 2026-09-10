@@ -24,8 +24,12 @@ logger = logging.getLogger(__name__)
 TEMP_SUFFIX = ".tmp"
 
 
-def _temp_path(path: Path) -> Path:
+def staging_path(path: Path) -> Path:
     """A staging name no other writer can be using.
+
+    Public, because two modules need the one convention: this file's two
+    atomic writers and `world_builder/store.py`'s keyframe images. A second
+    spelling of it is a second chance to get it wrong.
 
     `path.name + ".tmp"` was the convention here until an adversarial review
     measured what it does with two writers of one destination: 656 torn reads
@@ -77,10 +81,70 @@ REPLACE_BACKOFF_S = 0.005
 REPLACE_BACKOFF_MAX_S = 0.05
 
 
+def sweep_abandoned_staging(directory: Path) -> int:
+    """Remove staging files whose writer is gone. Returns how many.
+
+    UNIQUE NAMES FIXED ONE PROBLEM AND CREATED ANOTHER. A shared
+    `<name>.tmp` meant a killed writer left one file that the next
+    successful write's `finally` cleaned up. Unique names mean a killed
+    writer leaves one file EVERY TIME, and nothing removes it: the
+    `finally` does not run under `TerminateProcess`, and `purge_world` --
+    which the docstrings call the sweeper -- has no production caller at
+    all. An adversarial review measured 21 strays and 11.4 MB after six
+    hard kills, and the builder kills a solve child on every stop that
+    outstays its budget.
+
+    The pid in the name is what makes this safe: a staging file belonging
+    to a LIVE process is someone's write in flight and is left alone. Only
+    a dead writer's leavings are swept, so this can run at any time.
+    """
+    swept = 0
+    for candidate in directory.iterdir():
+        if not candidate.is_file():
+            continue
+        parts = candidate.name.split(".")
+        # `.tmp` as a COMPONENT, not as a suffix. `staging_path` puts it
+        # last for a JSON or npz write, but `prepare_images` stages an
+        # undistorted frame as `<stem>.<pid>.<uuid>.tmp.jpg` -- so a
+        # suffix match swept the writers that rarely die and missed the
+        # one the builder terminates on every over-long stop, in the very
+        # directory this claims to sweep. Caught by testing the sweeper
+        # against every staging shape rather than the one it was written
+        # against.
+        if TEMP_SUFFIX.lstrip(".") not in parts:
+            continue
+        pid = None
+        for part in parts:
+            if part.isdigit():
+                pid = int(part)
+        if pid is None:
+            # A staging name from before they carried a pid, or something
+            # that merely looks like one. Not ours to judge, and deleting
+            # an unattributable file is not a sweep.
+            continue
+        try:
+            import psutil
+
+            if psutil.pid_exists(pid):
+                continue
+        except Exception:  # noqa: BLE001 -- absence of psutil is not a reason to delete
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
+        swept += 1
+    if swept:
+        logger.info(
+            "storage: swept %s abandoned staging file(s) from %s", swept, directory
+        )
+    return swept
+
+
 def write_json_atomic(path: Path, payload: dict) -> None:
     """Replace `path` atomically, leaving no temp file behind either way."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = _temp_path(path)
+    temp_path = staging_path(path)
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             # `json.dumps(...)` then one write, NOT `json.dump(payload,
@@ -118,13 +182,19 @@ def write_json_atomic(path: Path, payload: dict) -> None:
             handle.write(json.dumps(payload))
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_with_retry(temp_path, path)
+        replace_with_retry(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
 
 
-def _replace_with_retry(temp_path: Path, path: Path) -> None:
+def replace_with_retry(temp_path: Path, path: Path) -> None:
     """os.replace, retried while a concurrent READER holds the destination.
+
+    Public, because every writer of a file a reader can hold needs it, not
+    only the JSON ones. `prepare_images` undistorts keyframes with a bare
+    `os.replace` and raised `PermissionError` the first time a test held one
+    of its outputs open -- which is the same WinError 5 this function was
+    written for, in a path that had never been tested.
 
     Windows refuses `replace()` onto a destination any handle has open,
     and -- measured, not assumed -- `FILE_SHARE_DELETE` does NOT lift
@@ -200,7 +270,7 @@ def write_bytes_atomic(path: Path, write: "Callable[[BinaryIO], None]") -> None:
     nothing prunes. `purge_world` is still the only sweeper.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = _temp_path(path)
+    temp_path = staging_path(path)
     try:
         with temp_path.open("wb") as handle:
             write(handle)
@@ -211,7 +281,7 @@ def write_bytes_atomic(path: Path, write: "Callable[[BinaryIO], None]") -> None:
             # visible, which is the one ordering that produces a file
             # that IS published and IS torn.
             os.fsync(handle.fileno())
-        _replace_with_retry(temp_path, path)
+        replace_with_retry(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
 

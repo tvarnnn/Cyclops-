@@ -193,12 +193,87 @@ nonisolated struct WorldRenderClient {
 
 // MARK: - The viewer's state
 
-/// What the viewer sheet knows. One of three, and the failure carries its
-/// sentence so the view composes nothing.
+/// What the viewer sheet knows. The failure carries its sentence so the view
+/// composes nothing.
+///
+/// ## Why fetching and rendering are two states
+///
+/// They were one, called `.loading`, and it ended at the moment the HTTP
+/// response arrived. Everything after that was unobserved: the page was handed
+/// to a `WKWebView` and the app never learned whether it drew. There was no
+/// `didFinish`, no `didFail`, and no timeout covering the render — the client's
+/// 30 s bound is on the **fetch** — so a page that failed to execute left the
+/// wearer looking at a black rectangle that is indistinguishable from a crash,
+/// with no spinner, no message and no end. On a multi-megabyte point cloud on a
+/// phone under memory pressure that is not a hypothetical.
+///
+/// So the page's own life is a state now. `.rendering` means the string is in
+/// the web view and `didFinish` has not arrived; it is bounded by
+/// `WorldRenderViewerModel.renderTimeout` and resolves to `.ready` or to a
+/// `.failed` that says which of the two halves gave up.
 enum WorldRenderViewerState: Equatable {
-    case loading
+    /// Asking the Tower for the page. Bounded by `WorldRenderClient.timeout`.
+    case fetching
+    /// The page is in the web view and has not finished loading. Bounded by
+    /// `WorldRenderViewerModel.renderTimeout`.
+    case rendering(html: String)
+    /// `didFinish` arrived: the page is on screen.
     case ready(html: String)
     case failed(message: String, retryable: Bool)
+
+    /// The page to hand the web view, in the two states that have one.
+    ///
+    /// Read by the view so that **one** `WorldRenderWebView` spans both:
+    /// branching on the state inside a `ViewBuilder` would put the two in
+    /// different `_ConditionalContent` arms, and SwiftUI would tear down the
+    /// `WKWebView` and build a new one at the exact moment the first finished
+    /// rendering — throwing away the render this state exists to observe.
+    var html: String? {
+        switch self {
+        case .rendering(let html), .ready(let html): return html
+        case .fetching, .failed: return nil
+        }
+    }
+
+    /// Whether the page is in the web view and has not reported finishing.
+    var isRendering: Bool {
+        if case .rendering = self { return true }
+        return false
+    }
+
+    /// The failure's sentence, or `nil`. A property rather than an `if case`
+    /// binding in the view for the reason this codebase gives everywhere else:
+    /// a result-builder block with a binding in it caused trouble in Product
+    /// Shell V2.
+    var failureMessage: String? {
+        if case .failed(let message, _) = self { return message }
+        return nil
+    }
+
+    var failureIsRetryable: Bool {
+        if case .failed(_, let retryable) = self { return retryable }
+        return false
+    }
+}
+
+/// Something the page itself did, reported by the web view's delegate.
+///
+/// A value rather than three closures, so the model has one entry point and a
+/// test can drive the whole render lifecycle without a `WKWebView`.
+nonisolated enum WorldRenderPageEvent: Equatable {
+    /// `didFinish`: the page loaded and its script ran.
+    case rendered
+    /// `didFail` / `didFailProvisionalNavigation` with an error that is not a
+    /// navigation this app deliberately cancelled.
+    case failed(String)
+    /// The content process died and the page is being put back. The page on
+    /// screen is gone until it finishes, so this returns the screen to
+    /// `.rendering` and re-arms its bound — without it, a reload that never
+    /// completes is the same unobserved black rectangle one layer down.
+    case reloadingAfterTermination
+    /// WebKit's content process was killed this many times and the web view
+    /// has stopped putting the page back. See `Coordinator.reloadBudget`.
+    case gaveUpAfterTerminations(Int)
 }
 
 nonisolated extension WorldRenderFetchError {
@@ -248,7 +323,7 @@ nonisolated extension WorldRenderFetchError {
 /// it holds a string, not a connection, so losing it loses nothing.
 @MainActor
 final class WorldRenderViewerModel: ObservableObject {
-    @Published private(set) var state: WorldRenderViewerState = .loading
+    @Published private(set) var state: WorldRenderViewerState = .fetching
 
     /// The world, the session and which rendering was asked for. A `let`: this
     /// screen shows one page.
@@ -262,15 +337,55 @@ final class WorldRenderViewerModel: ObservableObject {
     let target: WorldRenderTarget
     private let client: WorldRenderClient
 
+    /// How long the page gets to draw itself after the fetch succeeds.
+    ///
+    /// Generous: the Tower decimates to a mobile budget, but the script still
+    /// builds typed arrays over tens of thousands of points on a phone. Bounded
+    /// all the same (Rule 15) — an unbounded wait here is exactly the black
+    /// rectangle this state was added to end. Injectable so a test can prove
+    /// the bound exists in milliseconds rather than spending twenty seconds.
+    var renderTimeout: Duration = .seconds(20)
+
+    /// Bumped on every `load()`.
+    ///
+    /// Handed to `WorldRenderWebView` so a **retry of the same page** actually
+    /// reloads. The coordinator skips a `loadHTMLString` when the string has
+    /// not changed — which is right for the re-renders SwiftUI does constantly,
+    /// and wrong for a deliberate "Try again" after a render failure, where the
+    /// string is identical and reloading it is the entire point.
+    @Published private(set) var renderAttempt = 0
+
+    /// Bounds `.rendering`. Cancelled when the page reports either way.
+    ///
+    /// Unstructured (`Task { }`), so it does not die with the SwiftUI `.task`
+    /// that started the fetch; `[weak self]` so a dismissed sheet is not kept
+    /// alive for the length of the timeout.
+    private var renderWatchdog: Task<Void, Never>?
+
     init(target: WorldRenderTarget, client: WorldRenderClient = WorldRenderClient()) {
         self.target = target
         self.client = client
     }
 
+    // No `deinit` cancelling the watchdog, deliberately. It captures `[weak
+    // self]`, so a dismissed sheet is released immediately and the task that
+    // outlives it holds nothing but a sleeping timer — and a `deinit` on a
+    // global-actor-isolated class reaching for an isolated stored property is
+    // the kind of thing that is legal today and an error the next time the
+    // language mode moves. The `[weak self]` is the guarantee; the `deinit`
+    // would only have been an optimisation of a timer.
+
     func load() async {
-        state = .loading
+        renderWatchdog?.cancel()
+        renderWatchdog = nil
+        renderAttempt += 1
+        state = .fetching
         do {
-            state = .ready(html: try await client.page(for: target))
+            let html = try await client.page(for: target)
+            guard !Task.isCancelled else { return }
+            // Not `.ready`. The page has arrived; nothing has drawn it yet.
+            state = .rendering(html: html)
+            startRenderWatchdog()
         } catch let error as WorldRenderFetchError {
             // A dismissed sheet cancels the task mid-fetch; that is not a
             // failure to report, and nobody is looking.
@@ -279,6 +394,59 @@ final class WorldRenderViewerModel: ObservableObject {
         } catch {
             guard !Task.isCancelled else { return }
             state = .failed(message: error.localizedDescription, retryable: true)
+        }
+    }
+
+    /// What the page did. The only route from the web view into this model.
+    func pageEvent(_ event: WorldRenderPageEvent) {
+        renderWatchdog?.cancel()
+        renderWatchdog = nil
+        switch event {
+        case .rendered:
+            // Only from `.rendering`. A `didFinish` that arrives after a
+            // timeout already reported failure must not quietly un-fail the
+            // screen underneath a reader who has started reading the message.
+            guard case .rendering(let html) = state else { return }
+            state = .ready(html: html)
+        case .reloadingAfterTermination:
+            // Back to a bounded wait, with the overlay over it. Truthful: the
+            // page really is being drawn again.
+            guard let html = state.html else { return }
+            state = .rendering(html: html)
+            startRenderWatchdog()
+        case .failed(let detail):
+            state = .failed(
+                message: "The Tower's page arrived but could not be drawn: \(detail)",
+                retryable: true
+            )
+        case .gaveUpAfterTerminations(let count):
+            // Retryable, and the sentence says why it stopped on its own.
+            // Memory pressure is transient — closing another app can genuinely
+            // change the answer — so this is not a control that cannot work.
+            // What it must not do is keep reloading a page that keeps killing
+            // the process, which is what it did before there was a budget.
+            state = .failed(
+                message: "This world was too large to draw on this phone: the page ran out of "
+                    + "memory \(count) times and was not reloaded again.",
+                retryable: true
+            )
+        }
+    }
+
+    /// Fail truthfully if the page never reports finishing.
+    ///
+    /// The message says the fetch succeeded, because it did — blaming the Tower
+    /// for a page it delivered would send the reader to the wrong machine.
+    private func startRenderWatchdog() {
+        let timeout = renderTimeout
+        renderWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled, let self, self.state.isRendering else { return }
+            self.state = .failed(
+                message: "The Tower's page arrived but did not finish drawing. This world may be "
+                    + "too large to render on this phone.",
+                retryable: true
+            )
         }
     }
 }
@@ -309,6 +477,17 @@ nonisolated enum WorldRenderNavigationPolicy {
 /// A `WKWebView` that shows one string and goes nowhere.
 struct WorldRenderWebView: UIViewRepresentable {
     let html: String
+    /// Which `load()` this page belongs to. A retry of the **same** page after
+    /// a render failure carries a new number, which is what makes the reload
+    /// happen at all; see `WorldRenderViewerModel.renderAttempt`.
+    var attempt: Int = 0
+    /// What the page did. No cycle: the coordinator holds this closure, the
+    /// closure holds the model, and the model holds neither.
+    ///
+    /// `@MainActor` on the closure type, matching `decidePolicyFor`'s own
+    /// handler in this file: every `WKNavigationDelegate` callback arrives on
+    /// the main thread, and the model it calls is `@MainActor`.
+    var onEvent: (@MainActor (WorldRenderPageEvent) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -330,25 +509,65 @@ struct WorldRenderWebView: UIViewRepresentable {
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
         webView.scrollView.contentInsetAdjustmentBehavior = .never
-        context.coordinator.load(html, into: webView)
+        // Assigned before the load, so an event from a page that fails
+        // immediately still has somewhere to go.
+        context.coordinator.onEvent = onEvent
+        context.coordinator.load(html, attempt: attempt, into: webView)
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        context.coordinator.load(html, into: webView)
+        // Re-assigned on every update: this struct is rebuilt on every parent
+        // render and the closure it carries captures the current model, while
+        // the coordinator persists across all of them.
+        context.coordinator.onEvent = onEvent
+        context.coordinator.load(html, attempt: attempt, into: webView)
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         /// The string on screen, so `updateUIView` — called on every parent
         /// re-render — reloads only when the page actually changed.
         private var loaded: String?
+        /// Which attempt that string belongs to. Without it, "Try again" after
+        /// a render failure is a no-op: the html is identical, `loaded != html`
+        /// is false, and nothing reloads.
+        private var loadedAttempt: Int?
         /// Whether the one allowed navigation has been decided. Each
         /// `loadHTMLString` is one; the flag is reset when one is issued.
         private var hasDecidedInitialLoad = false
+        /// What the page did, back to the model.
+        var onEvent: (@MainActor (WorldRenderPageEvent) -> Void)?
 
-        func load(_ html: String, into webView: WKWebView) {
-            guard loaded != html else { return }
+        /// How many content-process kills this coordinator will put the page
+        /// back after, before it stops and says so.
+        ///
+        /// `webViewWebContentProcessDidTerminate` used to reload
+        /// unconditionally and forever. A page that runs the content process
+        /// out of memory on load runs it out of memory on the reload too, so
+        /// the honest reading of that loop is: an app that reloads a
+        /// multi-megabyte point cloud into a dying process indefinitely, with
+        /// nothing on screen and no way for the reader to learn why. Two
+        /// retries is enough for a transient kill — another app spiking, a
+        /// backgrounded return — and short of a loop.
+        ///
+        /// Counted for the life of this coordinator, **not** reset by a
+        /// successful `didFinish`: a page that renders and then OOMs on the
+        /// first gesture is the same failure arriving later, and resetting
+        /// would make the budget unbounded again for exactly that case. A
+        /// deliberate retry does reset it, because that is the reader asking
+        /// for a fresh budget with full knowledge; see `load(_:attempt:into:)`.
+        private static let reloadBudget = 2
+        private var terminations = 0
+
+        func load(_ html: String, attempt: Int, into webView: WKWebView) {
+            guard loaded != html || loadedAttempt != attempt else { return }
             loaded = html
+            if loadedAttempt != attempt {
+                // A new attempt is the reader asking again, knowingly. Fresh
+                // budget.
+                terminations = 0
+            }
+            loadedAttempt = attempt
             reload(into: webView)
         }
 
@@ -375,12 +594,67 @@ struct WorldRenderWebView: UIViewRepresentable {
             decisionHandler(allowed ? .allow : .cancel)
         }
 
+        /// The page loaded and its script ran. The one signal that says the
+        /// black rectangle became a world.
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            onEvent?(.rendered)
+        }
+
+        /// The load failed after it had started.
+        func webView(
+            _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
+        ) {
+            report(error)
+        }
+
+        /// The load failed before it had started. Both are reported the same
+        /// way: from the reader's side there is no difference between a page
+        /// that never began and one that stopped.
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            report(error)
+        }
+
+        /// A failure worth telling the reader about, or nothing.
+        ///
+        /// **Cancellations are not failures here.** `decidePolicyFor` refuses
+        /// every navigation but the first, by design, and a refusal surfaces as
+        /// a provisional-navigation failure with `NSURLErrorCancelled` or
+        /// WebKit's `frameLoadInterrupted`. Reporting those would turn the
+        /// navigation policy doing its job into "the page could not be drawn"
+        /// — on a page that is on screen and working.
+        private func report(_ error: Error) {
+            let ns = error as NSError
+            let isCancellation =
+                (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled)
+                || (ns.domain == WKError.errorDomain
+                    && ns.code == WKError.Code.frameLoadInterrupted.rawValue)
+            guard !isCancellation else { return }
+            onEvent?(.failed(ns.localizedDescription))
+        }
+
         /// WebKit's content process was killed — under memory pressure, a
         /// multi-megabyte page redrawing 80k points on every gesture is a
         /// candidate — and the view is now blank. The string is still here,
         /// so put it back rather than leaving the reader a black rectangle
         /// with nothing to do but Close and reopen.
+        ///
+        /// **Up to `reloadBudget` times.** Past that the page is not put back
+        /// and the reader is told, because a page that kills the process on
+        /// load kills it again on the reload, and an unbounded loop of that is
+        /// a blank screen plus a warm phone.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            terminations += 1
+            guard terminations <= Self.reloadBudget else {
+                onEvent?(.gaveUpAfterTerminations(terminations))
+                return
+            }
+            // Announced before the reload, so the screen is back in a bounded
+            // `.rendering` before the page has a chance to die again silently.
+            onEvent?(.reloadingAfterTermination)
             reload(into: webView)
         }
     }
@@ -441,9 +715,13 @@ struct WorldRenderViewerView: View {
 /// 8f2c…` in a monospaced font, over the sentence "Sparse structure-from-motion
 /// output: feature points and camera poses." Both are true and neither belongs
 /// on the first screen a person sees after opening a saved world: one is a
-/// database key and the other is the name of an algorithm. They moved into
-/// Details, at the bottom, along with the switch to the Tower's diagnostics
-/// rendering. Nothing was deleted.
+/// database key and the other is the name of an algorithm. The ids moved into
+/// Details, at the bottom, and nothing was deleted.
+///
+/// Details holds **only** the ids. A segmented control for the two renderings
+/// briefly lived there too and was removed: it refetched a multi-megabyte page
+/// to change one token, and the Tower's page already carries an instant toggle
+/// of its own. See `details`.
 ///
 /// The caption that replaced them still refuses the one claim this screen must
 /// not make — that a point cloud is a scan of the room — and does it in words
@@ -512,43 +790,78 @@ struct WorldRenderScene: View {
         .padding(.vertical, 8)
     }
 
+    /// The page, the two waits, and the failure.
+    ///
+    /// ## Why this is not a `switch`
+    ///
+    /// `.rendering` and `.ready` hold the same page, and the web view must be
+    /// the **same view** across both: separate arms of a `switch` inside a
+    /// `ViewBuilder` are separate `_ConditionalContent` branches, so SwiftUI
+    /// would destroy the `WKWebView` and build a new one at the instant the
+    /// first one finished loading — discarding the render, and starting a
+    /// second one that would finish and be discarded in turn. One `if let` over
+    /// `state.html` keeps one web view for the life of the page.
     @ViewBuilder
     private var content: some View {
-        switch model.state {
-        case .loading:
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Building the 3D world…")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .ready(let html):
-            // Explicitly flexible. `.ignoresSafeArea(edges: .bottom)` came off
-            // when Details arrived underneath — a view drawing into the
-            // home-indicator area would be drawn over the disclosure — and a
-            // `UIViewRepresentable` has no intrinsic size to fall back on.
-            WorldRenderWebView(html: html)
+        if let html = model.state.html {
+            WorldRenderWebView(html: html, attempt: model.renderAttempt, onEvent: model.pageEvent)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .failed(let message, let retryable):
-            VStack(spacing: 12) {
-                Image(systemName: "cube.transparent")
-                    .font(.largeTitle)
-                    .foregroundStyle(.secondary)
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
-                if retryable {
-                    Button("Try again") {
-                        Task { await model.load() }
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay { renderingOverlay }
+        } else if model.state.failureMessage != nil {
+            failureView
+        } else {
+            waiting("Fetching this world from the Tower…")
         }
+    }
+
+    /// Over the web view while the page has not reported finishing.
+    ///
+    /// Opaque on purpose: underneath it is a black rectangle, and a
+    /// half-transparent spinner over black reads as a stuck page rather than as
+    /// a page arriving. It disappears on `didFinish`, and if that never comes
+    /// the watchdog replaces the whole thing with a sentence.
+    @ViewBuilder
+    private var renderingOverlay: some View {
+        if model.state.isRendering {
+            waiting("Drawing the world…")
+                .background(Color(.systemBackground))
+        }
+    }
+
+    /// The two waits, worded for what is actually happening.
+    ///
+    /// The fetching sentence read "Building the 3D world…", which described
+    /// neither half: the Tower composed the page before this screen existed,
+    /// and what this app is doing is downloading it. Then drawing it. Those are
+    /// different waits, they fail differently, and they now say so.
+    private func waiting(_ sentence: String) -> some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text(sentence)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var failureView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "cube.transparent")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text(model.state.failureMessage ?? "")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            if model.state.failureIsRetryable {
+                Button("Try again") {
+                    Task { await model.load() }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// The identifiers and the other rendering, both one tap away and neither

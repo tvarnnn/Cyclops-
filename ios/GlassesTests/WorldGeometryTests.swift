@@ -793,10 +793,34 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertEqual(model.headline, "1 fragment, not yet connected")
     }
 
-    func testAnEmptyWorldSaysNothingIsMappedRatherThanShowingAnEmptyCanvas() {
+    /// An empty model no longer answers the question "was anything mapped?",
+    /// because it never could.
+    ///
+    /// This test asserted `model.headline == "Nothing mapped yet"`. That string
+    /// was drawn over the 2026-09-06 walk's world — 463 keyframes, 17,674
+    /// points — because this model is empty whenever the *fetch* produced
+    /// nothing, which includes every way the fetch can fail. The model now
+    /// returns `nil` and `WorldGeometryAccount` answers instead, from the
+    /// fetch's state and the Tower's own claims. See `WorldPresentationTests`.
+    func testAnEmptyModelMakesNoClaimAboutWhetherAnythingWasMapped() {
         let model = WorldFragmentsModel(segments: [])
         XCTAssertTrue(model.fragments.isEmpty)
-        XCTAssertEqual(model.headline, "Nothing mapped yet")
+        XCTAssertNil(
+            model.headline,
+            "an empty gallery must not assert that nothing was mapped; it does not know"
+        )
+    }
+
+    /// A model built with no manifest behind it does not claim its geometry is
+    /// up to date.
+    ///
+    /// `isCurrent` defaulted to `true`, so every empty and cleared model — a
+    /// gallery that had never fetched anything — asserted currency, and the one
+    /// line that would have said otherwise was suppressed by the same default.
+    func testAModelWithNoManifestBehindItAssertsNoCurrency() {
+        let never = WorldFragmentsModel(segments: [])
+        XCTAssertNil(never.isCurrent, "no manifest has said anything about currency")
+        XCTAssertNil(never.buildingNote)
     }
 
     func testAWorldStillBeingBuiltSaysSoRatherThanPassingAsFinished() {

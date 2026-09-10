@@ -84,7 +84,8 @@ final class TowerSmokeUITests: XCTestCase {
     /// whole timeout scrolling away from the thing it is looking for.
     ///
     /// That is not hypothetical: it is what made
-    /// `testASavedWorldsPictureOpensInsideTheApp` fail at `reveal(picture)`
+    /// `testOpeningASavedWorldShowsThe3DWorld` (then named
+    /// `testASavedWorldsPictureOpensInsideTheApp`) fail at `reveal(picture)`
     /// straight after the picker closed. Instrumenting the same step showed
     /// the button `exists`, `isEnabled` and `isHittable` once the dismissal
     /// animation had finished — the product was right and the helper was
@@ -142,19 +143,35 @@ final class TowerSmokeUITests: XCTestCase {
 
     // MARK: World Builder
 
-    /// Saved worlds -> choose a world -> the picture opens and draws inside
-    /// the app -> Close -> Back to live.
-    func testASavedWorldsPictureOpensInsideTheApp() throws {
+    /// Saved worlds -> choose a session -> **the 3D world is what opens** ->
+    /// back -> Close -> the workspace offers the same world, with the sparse
+    /// solver output behind Diagnostics.
+    ///
+    /// ## What changed here, and why the old assertions were pinning a defect
+    ///
+    /// This test used to tap a session, assert the picker DISMISSED, then hunt
+    /// the workspace for a small bordered "Picture" button and tap that. It was
+    /// an accurate description of the product and the product was wrong:
+    /// opening a saved world dropped the reader onto a gallery of top-down
+    /// sparse point clouds captioned with the solver's registration vocabulary,
+    /// with the 3D reconstruction two taps and a scroll away.
+    ///
+    /// A tap now pushes the 3D world onto the picker's own navigation stack.
+    /// The picker stays up underneath, so a person comparing two walks does not
+    /// reopen it each time, and Close still lands on a workspace pinned to the
+    /// world they chose.
+    func testOpeningASavedWorldShowsThe3DWorld() throws {
         open(cartridge: "World Builder")
         attach("world-builder-live")
 
-        // Nothing named yet: the picture button is offered and disabled.
+        // Nothing named yet: the header's picture control is offered and
+        // disabled. Unchanged, and still the honest answer for a live screen
+        // with no world on it.
         let picture = app.buttons["Interactive picture of the world"]
         XCTAssertTrue(reveal(picture))
         XCTAssertFalse(picture.isEnabled, "no world has been named, so there is nothing to open")
 
         XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
-        // A world is listed at all.
         let sessionTag = app.staticTexts.containing(NSPredicate(format: "label ENDSWITH %@", "session")).firstMatch
         let sessionsTag = app.staticTexts.containing(NSPredicate(format: "label ENDSWITH %@", "sessions")).firstMatch
         XCTAssertTrue(sessionTag.waitForExistence(timeout: 15) || sessionsTag.waitForExistence(timeout: 1),
@@ -162,103 +179,158 @@ final class TowerSmokeUITests: XCTestCase {
         attach("saved-worlds")
 
         // A SESSION row, chosen by its badge, rather than the world's own row.
-        //
-        // This test used to tap the world row and expect a picture. Since
-        // 2026-09-06 that is the wrong expectation, and deliberately so.
         // Opening a world without naming a session asks the Tower for its
-        // `latest` selection, which is the most recently updated session --
-        // and if that session has no geometry, there is no picture to offer
-        // and the control is correctly disabled. Drawing an older session's
-        // geometry under a newer session's name is exactly the "geometry that
-        // is not this world's, presented as if it were" defect the World
-        // Builder lane set out to close, so a test that demanded it was
-        // pinning the bug.
-        //
-        // The picture path therefore goes through a session that HAS
-        // geometry, which is what a person does: the picker shows a badge per
-        // session, and "Complete" is the one with something to draw.
+        // `latest` selection, and if that session has no geometry there is no
+        // picture to show. "Complete" is the badge with something to draw.
         let complete = app.staticTexts["Complete"].firstMatch
         try XCTSkipUnless(complete.waitForExistence(timeout: 15),
                           "the Tower's list has no completed session to picture")
         XCTAssertTrue(reveal(complete))
 
-        // The header now names the world, and the picture is offered.
+        // The 3D world opens from the tap itself. No second control.
+        let caption = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+        ).firstMatch
+        XCTAssertTrue(tap(complete, until: caption.exists),
+                      "tapping a session opens its 3D world, with no further tap")
+
+        // The page arrived and the web view drew it. Asserted on the presence
+        // of the Tower's page rather than on its wording: the render page's own
+        // caption is the Tower's to write, and asserting a phrase from it here
+        // would pin a page that is being rewritten on the other side.
+        let webView = app.webViews.firstMatch
+        XCTAssertTrue(webView.waitForExistence(timeout: 30), "the Tower's page rendered inside the WKWebView")
+        attach("3d-world")
+
+        // The canvas takes a gesture without the screen moving under it.
+        webView.swipeLeft()
+        webView.pinch(withScale: 1.5, velocity: 1)
+        attach("3d-world-after-gestures")
+        XCTAssertTrue(caption.exists)
+
+        // Details holds what used to be in the caption: the identifiers, and
+        // the switch to the Tower's diagnostics rendering. Both still
+        // reachable, neither in the way.
+        let details = app.buttons["Details"].firstMatch
+        if reveal(details, timeout: 4, settle: 1) {
+            details.tap()
+            XCTAssertTrue(app.staticTexts.containing(
+                NSPredicate(format: "label BEGINSWITH %@", "World ")
+            ).firstMatch.waitForExistence(timeout: 5),
+                          "the world id is reachable in Details")
+            attach("3d-world-details")
+        }
+
+        // Back to the picker, then out of it: the workspace is pinned to the
+        // world that was opened.
+        // The back button by its LABEL, which UIKit sets to the previous
+        // screen's title. `app.navigationBars.buttons.element(boundBy: 0)` is
+        // unscoped across every navigation bar on screen and can pick the
+        // wrong one while a push is still animating; a labelled query cannot.
+        // The index form stays only as a last resort, for the case where a
+        // long title makes UIKit collapse the label to "Back".
+        let named = app.navigationBars.buttons["Saved worlds"]
+        let generic = app.navigationBars.buttons["Back"]
+        let backToWorlds = named.exists ? named
+            : (generic.exists ? generic : app.navigationBars.firstMatch.buttons.element(boundBy: 0))
+        XCTAssertTrue(tap(backToWorlds, until: app.navigationBars["Saved worlds"].exists),
+                      "the 3D world pops back to the list it was opened from")
+        XCTAssertTrue(tap(app.buttons["Close"], until: !app.navigationBars["Saved worlds"].exists))
+
         let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
-        XCTAssertTrue(tap(complete, until: looking.exists), "the session opened and the picker closed")
-        XCTAssertTrue(reveal(picture))
-        XCTAssertTrue(picture.isEnabled)
+        XCTAssertTrue(looking.waitForExistence(timeout: 10), "the workspace names the world that was opened")
         attach("inspecting-saved-world")
 
-        XCTAssertTrue(tap(picture, until: app.navigationBars["Reconstruction"].exists))
-        // The page arrived and the web view drew it: the page's own title
-        // bar names the world, and its caption says what the picture is.
-        let pageTitle = app.webViews.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "world ")).firstMatch
-        XCTAssertTrue(pageTitle.waitForExistence(timeout: 30), "the Tower's page rendered inside the WKWebView")
-        let pageCaption = app.webViews.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "structure-from-motion")).firstMatch
-        XCTAssertTrue(pageCaption.exists, "the page's own caption is on screen")
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Not a surface")).firstMatch.exists,
-                      "the sheet's caption is on screen")
-        attach("picture")
+        // The 3D world is the workspace's primary control for this world too.
+        let open3D = app.buttons["Open the 3D world"].firstMatch
+        XCTAssertTrue(reveal(open3D), "the workspace leads with the 3D world, not with the gallery")
 
-        // The canvas takes a gesture without the sheet or page moving.
-        let canvas = app.webViews.firstMatch
-        canvas.swipeLeft()
-        canvas.pinch(withScale: 1.5, velocity: 1)
-        attach("picture-after-gestures")
-        XCTAssertTrue(app.navigationBars["Reconstruction"].exists)
+        // The sentence that was wrong in the field must not be anywhere on a
+        // screen describing a world the Tower built.
+        XCTAssertFalse(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", "have not mapped anything")
+            ).firstMatch.exists,
+            "a world with geometry must never be described as unmapped"
+        )
 
-        XCTAssertTrue(tap(app.buttons["Close"], until: !app.navigationBars["Reconstruction"].exists))
-        XCTAssertTrue(looking.waitForExistence(timeout: 5))
+        // And the sparse solver output is still reachable, behind Diagnostics.
+        //
+        // Queried by the identifier the view actually sets
+        // (`WorldCanvasView.diagnostics`), with the label as a fallback: a
+        // `DisclosureGroup` is published as a button on some OS versions and as
+        // a container on others, and a hard assertion on one of those spellings
+        // burns the full `reveal` timeout when the other is what shipped.
+        //
+        // Tolerated rather than asserted, for the same reason the Details
+        // disclosure above is: this test's subject is that the 3D world is what
+        // opens, and the gallery's own presence is pinned by
+        // `WorldPresentationTests` without a simulator. A miss is reported so
+        // it is visible in the log rather than silently passing.
+        let byIdentifier = app.descendants(matching: .any)
+            .matching(identifier: "world-diagnostics").firstMatch
+        let byLabel = app.buttons["Diagnostics"].firstMatch
+        let diagnostics = byIdentifier.exists ? byIdentifier : byLabel
+        if reveal(diagnostics, timeout: 4, settle: 1) {
+            attach("diagnostics-available")
+        } else {
+            XCTContext.runActivity(named: "Diagnostics disclosure not found by identifier or label") { _ in }
+        }
+
         XCTAssertTrue(reveal(app.buttons["Back to live"]))
         XCTAssertTrue(tap(app.buttons["Back to live"], until: !looking.exists))
         attach("back-to-live")
     }
 
-    /// A session with no geometry is told to the reader in the Tower's own
-    /// words, with a way to try again -- not a blank page.
-    func testASessionWithoutGeometrySaysSo() throws {
+    /// A session the Tower says has no geometry is described on the row, and
+    /// is not a control.
+    ///
+    /// ## Why this test stopped tapping
+    ///
+    /// It used to tap the row and read the Tower's 404 prose with a "Try again"
+    /// beneath it. That is a control for an operation that cannot work:
+    /// `GET /worlds/{id}/render?session_id=` answers 404 for a session with no
+    /// geometry, `WorldRenderFetchError.absent` is classified retryable, and
+    /// nothing reachable from this screen builds geometry for a session that
+    /// has none. The same defect was removed one level up for worlds with no
+    /// sessions; this is it applied to session rows.
+    ///
+    /// So the assertion is now about the row: the Tower's word is on it, the
+    /// reason is spelled out, and the tap does nothing because there is nothing
+    /// to tap.
+    func testASessionWithoutGeometrySaysSoOnTheRow() throws {
         open(cartridge: "World Builder")
         XCTAssertTrue(reveal(app.buttons["Saved worlds"]))
         XCTAssertTrue(tap(app.buttons["Saved worlds"], until: app.navigationBars["Saved worlds"].exists))
-        // "No geometry" since 2026-09-06: the picker now words the badge from
-        // the Tower's own `state`, and `unbuilt` reads "No geometry". The old
+        // "No geometry" since 2026-09-06: the picker words the badge from the
+        // Tower's own `state`, and `unbuilt` reads "No geometry". The old
         // lower-case "no geometry" was the fallback for a Tower that sent no
-        // state at all, and it is still reachable, so both are accepted --
-        // matching on the words rather than on one spelling of them.
+        // state at all, and it is still reachable, so both are accepted.
         let noGeometry = app.staticTexts.containing(
             NSPredicate(format: "label ==[c] %@", "no geometry")
         ).firstMatch
         try XCTSkipUnless(noGeometry.waitForExistence(timeout: 15), "the Tower's list has no session without geometry")
         XCTAssertTrue(reveal(noGeometry))
-        let looking = app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH %@", "Looking at saved world")).firstMatch
-        XCTAssertTrue(tap(noGeometry, until: looking.exists), "the session opened and the picker closed")
-        let picture = app.buttons["Interactive picture of the world"]
-        XCTAssertTrue(reveal(picture))
 
-        // The picture is REFUSED, not offered and then apologised for.
-        //
-        // This test used to open the viewer here and read the Tower's 404
-        // prose ("session ... has no geometry yet") with a Try again button.
-        // Since 2026-09-06 that sheet is unreachable for this session, and
-        // deliberately: the Tower says `geometry.available: false`, the app
-        // therefore names no render target, and the control is disabled --
-        // "a control that appears from nowhere is one nobody looks for, and
-        // a disabled one says 'not yet' truthfully"
-        // (WorldBuilderWorkspaceView). Offering a button whose only outcome
-        // is a 404 was the weaker behaviour, so this asserts the better one.
-        //
-        // The session is still openable and still named, which is the half
-        // that matters: a session with nothing to draw is a session a person
-        // can look at and be told about, not one that disappears.
-        XCTAssertFalse(picture.isEnabled,
-                       "a session the Tower says has no geometry must not offer a picture")
+        // The row says why, in one of the two sentences the picker can use.
+        let reason = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "nothing to open")
+        ).firstMatch
+        let stillComing = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "may still build it")
+        ).firstMatch
+        XCTAssertTrue(reason.waitForExistence(timeout: 5) || stillComing.exists,
+                      "a session with no geometry must say why it cannot be opened")
         attach("no-geometry")
 
-        // The Tower's own 404 prose is still the viewer's answer when a
-        // render fails for a session that DID claim geometry. That path is
-        // covered by the Tower's route tests; it is not reachable from this
-        // screen for this session any more, and pretending otherwise here
-        // would be pinning a control that no longer exists.
+        // And tapping it leads nowhere: no 3D screen, so no caption from one.
+        noGeometry.tap()
+        let caption = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+        ).firstMatch
+        XCTAssertFalse(caption.waitForExistence(timeout: 3),
+                       "a session with nothing to draw must not push a 3D screen")
+        XCTAssertTrue(app.navigationBars["Saved worlds"].exists, "still on the list")
     }
 
     // MARK: CV Lab
