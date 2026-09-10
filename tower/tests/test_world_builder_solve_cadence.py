@@ -185,3 +185,55 @@ def test_solve_children_are_spawned_as_one_owned_process(tmp_path):
     assert argv[0] == interpreter_executable()
     assert kwargs.get("env") == interpreter_environment()
     solver.close()
+
+
+class TestLoopDetectionIsALiveSettingNotAFinalisationOne:
+    """Every solve looks for revisits, not just the last one.
+
+    Sequential matching reaches `SEQUENTIAL_OVERLAP = 20` keyframes either
+    side and no further, so a solve without loop detection can only chain
+    forwards. It cannot discover that the wearer walked back into a room it
+    already mapped, and the world therefore comes APART as the walk goes on
+    rather than together.
+
+    Measured on the 2026-09-09 capture at the field run's own solve
+    horizons -- sequential only, then the same keyframes re-solved in one
+    workspace with loop detection:
+
+        horizon   components (seq -> loop)   largest component's share
+           156          6 -> 3                        0.75
+           311         11 -> 6                        0.77
+           526         14 -> 5                        0.90
+           646         16 -> 6                        0.91
+           795          -    5                        0.95
+
+    The cost is 1.2-1.9x, paid in matching, which is incremental: pairs
+    already tested stay in the database.
+    """
+
+    def _argv(self, tmp_path, *, final: bool) -> list[str]:
+        solver = BackgroundSolver(
+            root=tmp_path, world_id="w", session_id="s", every=10, capture_dirs=[],
+        )
+        return solver._argv(final=final)
+
+    def test_a_background_solve_asks_for_loop_detection(self, tmp_path):
+        assert "--loop-detection" in self._argv(tmp_path, final=False)
+
+    def test_a_background_solve_is_still_not_a_final_one(self, tmp_path):
+        """`--final` remains the finalisation solve's own distinction.
+
+        It is the one solve that sees every keyframe, including the tail no
+        live solve reached -- on the field walk, 149 of 795.
+        """
+        assert "--final" not in self._argv(tmp_path, final=False)
+
+    def test_the_final_solve_asks_for_both(self, tmp_path):
+        argv = self._argv(tmp_path, final=True)
+        assert "--loop-detection" in argv
+        assert "--final" in argv
+
+    def test_the_flag_is_passed_once(self, tmp_path):
+        """The final solve used to add both flags together; adding
+        `--loop-detection` unconditionally must not double it."""
+        assert self._argv(tmp_path, final=True).count("--loop-detection") == 1

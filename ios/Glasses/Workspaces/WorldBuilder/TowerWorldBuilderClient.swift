@@ -359,6 +359,13 @@ enum WorldBuilderResultDecoder {
                 posesSolved: evidence["poses_solved"] as? Int,
                 posesRefused: evidence["poses_refused"] as? Int,
                 segments: evidence["segments"] as? Int,
+                // Counted by the Tower, never derived here. `segments - 1`
+                // was the old sentence's number and it was wrong by 57 on
+                // the 2026-09-09 walk; see `WorldTrajectoryReport.segments`.
+                // Absent on a Tower that predates the field, and the view
+                // stays silent rather than falling back to arithmetic.
+                trackingRestarts: evidence["tracking_restarts"] as? Int,
+                chainBreaks: evidence["chain_breaks"] as? Int,
                 pathLength: trajectory["path_length"] as? Double,
                 pathLengthUnit: trajectory["path_length_unit"] as? String,
                 // Carried separately from the snapshot's own scale: a spatial

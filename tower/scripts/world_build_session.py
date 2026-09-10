@@ -598,8 +598,42 @@ class BackgroundSolver:
         ]
         for capture_dir in self.capture_dirs:
             argv += ["--capture-dir", str(capture_dir)]
+        # LOOP DETECTION ON EVERY SOLVE, not only the final one.
+        #
+        # Sequential matching reaches 20 keyframes either side and no
+        # further, so a live solve can only ever chain forwards: it cannot
+        # discover that the wearer has walked back into a room it already
+        # mapped. The consequence is not a slightly worse world, it is a
+        # world that comes APART as the walk goes on. Measured on the
+        # 2026-09-09 capture, sequential only, at the field run's own solve
+        # horizons: 6 components at 156 keyframes, 11 at 311, 14 at 526,
+        # 16 at 646, with the largest holding 24% of posed keyframes.
+        #
+        # The same capture re-solved with loop detection at the same
+        # horizons, in one workspace, the way a live session accumulates:
+        #
+        #     horizon   components   largest component's share
+        #        156        3              0.75
+        #        311        6              0.77
+        #        526        5              0.90
+        #        646        6              0.91
+        #        795        5              0.95
+        #
+        # It CONVERGES instead of fragmenting, which is the whole product
+        # requirement: geometry that becomes more recognisable while the
+        # wearer walks, not less.
+        #
+        # The cost is 1.2-1.9x the sequential solve -- 50.8 s against
+        # 42.6 s at 646 keyframes, 17.1 s against 9.1 s at 156 -- and it is
+        # paid in matching, which is incremental: pairs already tested stay
+        # in the database, so each solve only matches what is new. That is
+        # far cheaper than it looks next to a from-scratch mapping stage.
+        #
+        # `--final` still differs, and still matters: it is the one solve
+        # that sees every keyframe including the tail no live solve reached.
+        argv += ["--loop-detection"]
         if final:
-            argv += ["--final", "--loop-detection"]
+            argv += ["--final"]
         if self.threads is not None:
             argv += ["--threads", str(self.threads)]
         return argv
@@ -1398,10 +1432,25 @@ def main(argv=None) -> int:
         # -- finalization: the lock is still held, the record says pending --
         if solver is None:
             final_solve_state = None
-        elif stop_request.asked:
+        elif stop_request.hard:
+            # ONLY a hard stop skips it. This used to be `stop_request.asked`,
+            # so a SOFT stop -- the wearer leaving the World Builder screen,
+            # or the cartridge session being stopped -- skipped the final
+            # solve too, on the reasoning that "nobody is waiting for it".
+            #
+            # The 2026-09-09 walk falsifies that premise. Nobody watches a
+            # final solve; they open the world afterwards. And the final
+            # solve is what MAKES the world: re-running the one that walk
+            # never got, on its own images, took 16 components to 6 and put
+            # 652 of 795 keyframes into one at 0.82 px, against a largest
+            # component of 156 before. Skipping it does not save the wearer
+            # a wait, it costs them the reconstruction.
+            #
+            # A hard stop is different and still skips: the Tower is going
+            # down, and `run_final` below would be killed mid-solve anyway.
             final_solve_state = FINAL_SOLVE_SKIPPED
             finalization_detail = (
-                f"final solve skipped: stop requested ({stop_request.source}) "
+                f"final solve skipped: hard stop ({stop_request.source}) "
                 "while observing"
             )
             solver.wait(0.0)

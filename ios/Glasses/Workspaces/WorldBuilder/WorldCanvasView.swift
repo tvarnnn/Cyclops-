@@ -425,14 +425,30 @@ struct WorldSummaryView: View {
                 No camera position was reconstructed. Each origin marks where \
                 tracking restarted, not where the camera was.
                 """)
-        } else if let segments = snapshot.trajectory.segments, segments > 1 {
+        } else if let restarts = snapshot.trajectory.trackingRestarts, restarts > 0 {
             // Why there is no path length beside these figures. The Tower
             // refuses one across a segment break, because poses either side of
             // it share no coordinate frame.
+            //
+            // The number is the Tower's COUNT of tracking losses. This line
+            // rendered `segments - 1` until 2026-09-09, which on that walk read
+            // "Tracking restarted 121 times" against 64 actual losses — the
+            // other 57 segments were opened by the solver failing to place a
+            // keyframe while tracking was fine. See
+            // `WorldTrajectoryReport.segments`.
             caption("""
-                Tracking restarted \(segments - 1) time\(segments == 2 ? "" : "s"). \
+                Tracking restarted \(restarts) time\(restarts == 1 ? "" : "s"). \
                 Distances either side of a restart are not comparable, so the \
                 Tower reports no path length.
+                """)
+        } else if let segments = snapshot.trajectory.segments, segments > 1 {
+            // A Tower that does not count restarts. Say only what the segment
+            // count actually supports — that the pieces do not share one frame
+            // — and not how many times tracking was lost, which this number
+            // cannot tell us.
+            caption("""
+                This walk is in \(segments) pieces that do not share one \
+                coordinate frame, so the Tower reports no path length.
                 """)
         }
         if snapshot.trajectory.labelledFigureDisplayable, let length = snapshot.trajectory.pathLength {

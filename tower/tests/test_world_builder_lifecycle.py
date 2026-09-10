@@ -247,13 +247,33 @@ def test_a_soft_stop_mid_walk_closes_the_session_as_interrupted_and_keeps_the_bu
     assert _report(stdout)["end_reason"] == "interrupted"
 
 
-def test_a_soft_stop_mid_walk_skips_the_final_solve_and_says_so(open_capture, tmp_path):
+def test_a_soft_stop_mid_walk_still_runs_the_final_solve(open_capture, tmp_path):
+    """The wearer leaving World Builder must not cost them the world.
+
+    This test asserted the OPPOSITE until 2026-09-09, on the reasoning
+    recorded in `StopRequest`: a soft stop means "you are no longer wanted
+    for new frames", so the final solve was skipped because "nobody is
+    waiting for it".
+
+    The field walk falsifies the premise. Nobody watches a final solve;
+    they open the world afterwards, and the final solve is what makes the
+    world worth opening. Re-running the one that walk never got, on its own
+    images, took 16 components to 6 and put 652 of 795 keyframes into one
+    component at 0.82 px -- against a largest component of 156 without it.
+
+    A HARD stop still skips: the Tower is going down, and the solve would
+    be killed mid-run anyway. That is the test below this one.
+    """
     recorder, capture_dir, capture_id = open_capture
     root = tmp_path / "worlds"
-    # A stub that would take a minute: if the builder ran it, this test
-    # would show it by taking a minute.
-    stub = tmp_path / "slow_solve.py"
-    stub.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    # A stub that reports itself rather than solving, so what is measured
+    # is whether the builder RAN it, not how fast pycolmap is.
+    stub = tmp_path / "marker_solve.py"
+    stub.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'solved': False, 'reason': 'stub'}))\n",
+        encoding="utf-8",
+    )
     process = _spawn(
         capture_dir, root, "--solve", "--solve-every", "0", "--solve-script", str(stub),
         stop_on_stdin_close=True,
@@ -261,21 +281,20 @@ def test_a_soft_stop_mid_walk_skips_the_final_solve_and_says_so(open_capture, tm
     try:
         _wait_for(lambda: _keyframes_written(root) >= 2, what="the first keyframes")
         process.stdin.close()
-        started = time.monotonic()
         stdout, stderr = _finish(process)
     finally:
         recorder.stop()
     assert process.returncode == 0, stderr[-2000:]
-    assert time.monotonic() - started < 45.0, "the final solve was not skipped"
 
     store, world_id, session_id = _the_session(root)
     record = store.read_session(world_id, session_id).finalization
     assert record["state"] == FINALIZATION_COMPLETE
-    assert record["final_solve"] == FINAL_SOLVE_SKIPPED
-    assert "stop requested" in record["detail"]
     report = _report(stdout)
-    assert report["global_solve"]["final_solve"] == FINAL_SOLVE_SKIPPED
-    assert report["global_solve"]["attempted"] is False
+    # The solve was ATTEMPTED. What it returned is the stub's business.
+    assert report["global_solve"]["attempted"] is True, (
+        "a soft stop skipped the final solve; that is the 2026-09-09 defect"
+    )
+    assert record["final_solve"] != FINAL_SOLVE_SKIPPED
 
 
 # -- told to stop during finalization --------------------------------------

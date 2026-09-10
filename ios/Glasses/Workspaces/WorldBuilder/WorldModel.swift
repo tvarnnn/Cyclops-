@@ -192,10 +192,30 @@ struct WorldTrajectoryReport: Equatable, Sendable {
     /// build that refused everything, and only these tell them apart.
     var posesSolved: Int?
     var posesRefused: Int?
-    /// Tracking segments. A break means tracking was lost, and poses either
-    /// side of one share no coordinate frame — which is why the Tower refuses
-    /// a path length across more than one.
+    /// Tracking segments. Poses either side of a break share no coordinate
+    /// frame, which is why the Tower refuses a path length across more than
+    /// one.
+    ///
+    /// **A break does NOT mean tracking was lost**, and this doc comment said
+    /// it did until 2026-09-09. Two independent causes open a segment: the
+    /// tracker losing the world, and the solver failing to place a keyframe
+    /// while tracking is perfectly healthy. The Tower is explicit that the
+    /// second must not be read as the first. On the 2026-09-09 walk the
+    /// 122 segments were 64 tracking losses and 57 solve-chain breaks, and
+    /// this view rendered `segments - 1` under the words "Tracking restarted
+    /// 121 times" — 57 of which had nothing to do with tracking.
+    ///
+    /// Use `trackingRestarts` for that sentence. Never subtract from this.
     var segments: Int?
+    /// Times the tracker actually lost the world, **counted** by the Tower
+    /// from `tracking_lost` events rather than inferred from `segments`.
+    ///
+    /// `nil` from a Tower that predates `tracking_restarts`; the view says
+    /// nothing about restarts rather than guessing when it is absent.
+    var trackingRestarts: Int?
+    /// Times the solver could not extend its chain and started a new segment
+    /// while tracking was healthy. Diagnostics, not a headline figure.
+    var chainBreaks: Int?
     /// Path length, in the unit the Tower names below.
     var pathLength: Double?
     /// The Tower's unit string for `pathLength`, if it gave one.

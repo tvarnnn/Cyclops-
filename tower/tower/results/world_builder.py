@@ -630,7 +630,8 @@ class WorldBuilderStatusProducer:
             "scale": _scale_block(world, attributable=manifest is not None),
             "geometry": _geometry_block(manifest, geometry_current, keyframes_now),
             "trajectory": self._trajectory_block(
-                store, world, session_id, manifest, geometry_current, keyframes_now
+                store, world, session_id, manifest, geometry_current,
+                keyframes_now, events,
             ),
             "persistence": _persistence_block(world),
             "artifacts": _artifacts_block(
@@ -640,7 +641,8 @@ class WorldBuilderStatusProducer:
         }
 
     def _trajectory_block(
-        self, store, world, session_id, manifest, current, keyframes_now
+        self, store, world, session_id, manifest, current, keyframes_now,
+        events,
     ) -> dict:
         # Same reasoning as _geometry_block: a trajectory over the first N
         # keyframes is a correct answer to an older question, not a wrong
@@ -686,6 +688,12 @@ class WorldBuilderStatusProducer:
             "poses_anchor": manifest.get("poses_anchor"),
             "keyframes": manifest.get("keyframes"),
             "segments": manifest.get("segments"),
+            # Beside `segments`, and never derivable from it. See
+            # `_events_summary`: 122 segments on the 2026-09-09 walk were
+            # 64 tracking losses plus 57 solve-chain breaks plus the one
+            # the session started with.
+            "tracking_restarts": events.get("tracking_restarts"),
+            "chain_breaks": events.get("chain_breaks"),
             "path_length": self._path_length(
                 store, world, session_id, manifest, revision
             ),
@@ -761,10 +769,16 @@ class WorldBuilderStatusProducer:
                     "so a common coordinate frame cannot be assumed"
                     if segments is None
                     else (
-                        f"this session has {segments} segments; tracking was "
-                        "lost between them, so their poses share no "
-                        "coordinate frame and a total length would sum "
-                        "incomparable distances"
+                        # NOT "tracking was lost between them", which this
+                        # string said until 2026-09-09. A segment boundary is
+                        # opened by a tracking loss OR by the solver failing
+                        # to extend its chain while tracking is healthy, and
+                        # on that walk 57 of 121 boundaries were the second.
+                        # The refusal does not depend on which: either way
+                        # the poses share no frame.
+                        f"this session is in {segments} segments whose poses "
+                        "share no coordinate frame, so a total length would "
+                        "sum incomparable distances"
                     )
                 ),
             }
@@ -1064,6 +1078,8 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
     accepted = 0
     last_tracking = None
     stopped = False
+    tracking_restarts = 0
+    chain_breaks = 0
     for event in events:
         kind = event.get("kind")
         if kind == "keyframe_accepted":
@@ -1071,6 +1087,9 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
             last_tracking = kind
         elif kind == "tracking_lost":
             last_tracking = kind
+            tracking_restarts += 1
+        elif kind == "solve_chain_broken":
+            chain_breaks += 1
         elif kind == "session_stopped":
             stopped = True
     return {
@@ -1078,6 +1097,24 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
         "last_tracking": last_tracking,
         "stopped": stopped,
         "corrupt_lines": corrupt_lines,
+        # COUNTED, not inferred from the segment total.
+        #
+        # A segment boundary is not a tracking loss. Two independent
+        # causes open a segment (engine.py:314 on a tracking loss,
+        # engine.py:400 on a solve-chain break), and the engine is
+        # explicit that the second must not be read as the wearer having
+        # lost the world -- `solve_chain_broken` deliberately does not
+        # move `last_tracking`.
+        #
+        # iOS had no counted number to show, so it rendered
+        # `segments - 1` under the words "Tracking restarted N times".
+        # On the 2026-09-09 walk that read "121" against 64 actual
+        # losses: 57 of the 121 were the solver failing to place a
+        # keyframe while tracking was healthy. Both counts ride here now
+        # so the phone can stop doing arithmetic on a number that does
+        # not mean what its label says.
+        "tracking_restarts": tracking_restarts,
+        "chain_breaks": chain_breaks,
     }
 
 
@@ -1361,6 +1398,8 @@ def _trajectory_unavailable(reason: str) -> dict:
         "poses_anchor": None,
         "keyframes": None,
         "segments": None,
+        "tracking_restarts": None,
+        "chain_breaks": None,
         "path_length": None,
         "revision": None,
         "provenance": None,
