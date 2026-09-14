@@ -1544,6 +1544,7 @@ def main(argv=None) -> int:
     rebuilds = 0
     since_rebuild = 0
     accepted = 0
+    warned_frame_size = False
     # keyframe_id -> raw frame path, for the global solver (see ObservedFrame).
     sources: dict = {}
     capture_dirs = [d for d in (args.follow_capture, args.frames) if d is not None]
@@ -1587,6 +1588,25 @@ def main(argv=None) -> int:
                 tx_seq=frame.tx_seq,
             )
             if outcome.keyframe_id is None:
+                if (
+                    getattr(outcome, "reason", None) == "frame_size_changed"
+                    and not warned_frame_size
+                ):
+                    # ONCE PER SESSION, at WARNING, because the engine's
+                    # rejection is silent here otherwise: this loop
+                    # `continue`d past it with no log, and a whole walk at
+                    # the wrong rung left nothing but journal lines. The
+                    # count reaches the phone through the status channel;
+                    # this is for the operator reading the Tower log.
+                    warned_frame_size = True
+                    logger.warning(
+                        "[Tower][WorldBuilder] session %s is receiving frames "
+                        "of a different size from its first frame; they are "
+                        "being rejected, because the calibration is exact "
+                        "per resolution. Every further frame at that size "
+                        "will be rejected too",
+                        session_id,
+                    )
                 continue
             accepted += 1
             since_rebuild += 1

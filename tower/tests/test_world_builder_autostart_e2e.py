@@ -313,3 +313,110 @@ def test_a_reconnect_keeps_one_world_and_one_worker(tower):
     assert len(worlds) == 1, (
         f"one walk produced {len(worlds)} worlds; a reconnect forked it"
     )
+
+
+def test_a_superseding_stream_start_continues_the_walk(tower):
+    """The FIRST of two ways one reconnect became two worlds.
+
+    iOS reconnects in about half a second while uvicorn takes 20-40 s to
+    notice the old socket died, so the new connection's `stream_start`
+    arrives while the old capture is still recording. `_start_capture`
+    stops that capture to open the new one -- and it stopped it as
+    `END_REASON_STOP`, which `resumable_capture()` does not offer as a
+    predecessor. `continues_capture` was never set; the old builder saw a
+    politely closed capture and finalised world 1; the new capture began
+    world 2. A dress-rehearsal reviewer drove it through a real Tower at
+    four timings and got two half-walks, "Complete", every time.
+
+    `test_a_reconnect_keeps_one_world_and_one_worker` above exercises the
+    disconnect path -- the first socket is gone before the second opens.
+    This one holds BOTH open, which is the supersession path, and the one
+    the field link actually takes.
+    """
+    client, app, tmp_path = tower
+    frames = _frames(24)
+    recorder = app.state.frame_observers[0]
+    with client.websocket_connect("/ws") as first:
+        first.send_json({"type": "stream_start"})
+        for index, data in enumerate(frames[:12], start=1):
+            first.send_json(_frame_message(index, data))
+            first.receive_json()
+        first_capture = recorder.status.capture_id
+        assert first_capture is not None
+
+        # The old socket is still open -- the Tower has not noticed
+        # anything -- when the phone's new socket re-opens the bracket.
+        with client.websocket_connect("/ws") as second:
+            second.send_json({"type": "stream_start"})
+            for index, data in enumerate(frames[12:24], start=13):
+                second.send_json(_frame_message(index, data))
+                second.receive_json()
+            second_capture = recorder.status.capture_id
+            assert second_capture != first_capture
+
+            first_manifest = json.loads(
+                (recorder.capture_dir(first_capture) / "capture.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            second_manifest = json.loads(
+                (recorder.capture_dir(second_capture) / "capture.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert first_manifest["end_reason"] == "disconnect", (
+                "a superseded capture was closed as a polite stop, which is "
+                "what told the old builder the walk was over"
+            )
+            assert second_manifest["continues_capture"] == first_capture, (
+                "the superseding capture did not declare its predecessor, so "
+                "this is two walks on disk"
+            )
+            second.send_json({"type": "stream_stop"})
+
+
+def test_the_last_client_leaving_does_not_end_a_walk_inside_the_resume_grace(tower):
+    """The SECOND way: the Tower notices the drop before the phone returns.
+
+    A capture that ended by disconnect is inside its 90 s resume grace,
+    and the builder is sitting in `_await_successor` for it. The last
+    connection going away used to stop every cartridge session -- which
+    closed that builder's stdin, which `should_stop` honours at once:
+    world 1 finalised, and the phone that came back 60 s later started
+    world 2. Only World Builder is deferred; it is the cartridge whose
+    session follows a capture lineage, and its builder finishes on its
+    own at the end of the grace if nobody returns.
+    """
+    client, app, tmp_path = tower
+    frames = _frames(24)
+    recorder = app.state.frame_observers[0]
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(frames[:12], start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        _wait_for(app.state.capture_workers.status, 10.0, "the first worker")
+    # The socket dropped without a stream_stop and nobody else is
+    # connected: this is the moment every session used to be stopped.
+    assert recorder.resumable_capture() is not None, (
+        "the fixture's drop did not leave a resumable capture; the test "
+        "cannot say anything"
+    )
+    # CALLED DIRECTLY, not observed through the client's teardown.
+    # Starlette's TestClient cancels the handler at the first `await` of
+    # the disconnect `finally`, so `_stop_cartridge_sessions` never runs
+    # under it -- a reviewer measured `stop calls: []` for every
+    # TestClient run -- and a test that waited for it would pass whatever
+    # the function did. The real-uvicorn reconnect harness is the
+    # end-to-end proof; this pins the decision itself.
+    from types import SimpleNamespace
+
+    from tower.routes.ws import _stop_cartridge_sessions
+
+    _stop_cartridge_sessions(SimpleNamespace(app=app))
+    sessions = app.state.cartridge_sessions
+    assert sessions["world_builder"].state != "stopped", (
+        "the World Builder session was stopped while its capture was "
+        "inside the resume grace -- the builder's stdin was closed and the "
+        "walk ended at the first WiFi blip"
+    )

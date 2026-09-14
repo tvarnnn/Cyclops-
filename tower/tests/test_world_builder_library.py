@@ -1,6 +1,8 @@
 """`GET /worlds`: the index a viewer opens old worlds from."""
 
 import json
+
+import pytest
 import pathlib
 import os
 
@@ -730,3 +732,103 @@ def test_a_lock_that_cannot_be_read_is_not_an_idle_world(derived_world, monkeypa
     assert holder["unreadable"] is True
     assert holder["alive"] is False
     store.lock_path(world_id).unlink()
+
+
+# -- round 20 ----------------------------------------------------------
+
+
+def test_a_process_whose_start_time_is_hidden_is_not_called_dead(
+    derived_world, monkeypatch
+):
+    """`AccessDenied` on `create_time()` must not admit a second writer.
+
+    The process exists; only its start time is hidden -- an elevation
+    mismatch between the Tower and a `world_finalize.py` run is enough on
+    Windows. `except psutil.Error: return False` called that process dead,
+    and a dead holder is exactly what lets `acquire_writer_lock` hand the
+    world to someone else while a builder is still writing it. That is
+    the one failure the lock exists to prevent; assuming the process alive
+    costs at worst a refused acquisition.
+    """
+    import json as _json
+    import os as _os
+
+    import psutil
+
+    store, world_id, _ = derived_world
+    lock = store.lock_path(world_id)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(_json.dumps({"pid": _os.getpid()}), encoding="utf-8")
+
+    real_process = psutil.Process
+
+    class _Hidden(real_process):
+        def create_time(self):
+            raise psutil.AccessDenied(pid=self.pid)
+
+    monkeypatch.setattr(psutil, "Process", _Hidden)
+    holder = store.lock_holder(world_id)
+    assert holder is not None and holder["alive"] is True, (
+        "a live process whose start time could not be read was reported "
+        "dead, which would let a second writer onto this world"
+    )
+    lock.unlink()
+
+
+def test_a_completed_finalization_outranks_an_interrupted_capture_in_the_picker(
+    derived_world,
+):
+    """The picker said "Interrupted" over a session the panel called "Saved".
+
+    Leaving the World Builder screen sends `session/stop` while the
+    capture is still open, so the record reads `end_reason: interrupted`
+    -- and then finalises `complete`, solved, with geometry on disk. The
+    status producer's rule is "a completed finalization outranks how the
+    capture ended", and this function's docstring says it mirrors that
+    producer. It tested `end_reason` first. Built by a dress-rehearsal
+    reviewer: picker "Interrupted", pinned panel "Saved", render page a
+    normal coloured world, one session.
+    """
+    from dataclasses import replace
+
+    store, world_id, session_id = derived_world
+    session = store.read_session(world_id, session_id)
+    store.write_session(replace(
+        session,
+        end_reason="interrupted",
+        finalization={
+            "state": "complete", "final_solve": "solved",
+            "started_at": 2.0, "updated_at": 3.0, "detail": None,
+        },
+    ))
+    row = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert row["has_geometry"] is True
+    assert row["state"] == "complete", (
+        "a finalised, solved session with geometry was listed as interrupted "
+        "because of how its capture ended"
+    )
+
+
+def test_a_world_json_that_is_a_list_does_not_take_the_listing_down(derived_world):
+    """A top-level list parsed fine and then raised out of `require_schema`.
+
+    `AttributeError: 'list' object has no attribute 'get'` -- an HTTP 500
+    on `GET /worlds` and the status producer raising on every poll, so
+    picker and panel were both blind while the file existed. Reproduced
+    by a dress-rehearsal reviewer. Not shown reachable from the Tower's
+    own writers, which is why it is a `WorldStoreError` rather than a
+    wider net; every caller already turns that into "skip this world".
+    """
+    from tower.world_builder.store import WorldStoreError
+
+    store, world_id, _ = derived_world
+    path = store.world_dir(world_id) / "world.json"
+    original = path.read_text(encoding="utf-8")
+    path.write_text("[1, 2, 3]", encoding="utf-8")
+    try:
+        with pytest.raises(WorldStoreError):
+            store.read_world(world_id)
+        listing = build_world_listing(store)
+        assert listing["world_count"] == 0, "a corrupt world was listed"
+    finally:
+        path.write_text(original, encoding="utf-8")

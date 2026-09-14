@@ -337,6 +337,18 @@ class WorldStore:
             # produced. A genuine `OSError` still escapes, which keeps
             # "the disk is broken" a 500 rather than a silent 404.
             raise WorldStoreError(f"world {world_id} is unreadable: {exc}") from exc
+        if not isinstance(data, dict):
+            # A top-level list or string parsed fine and then raised
+            # `AttributeError` out of `require_schema`'s `.get` -- an HTTP
+            # 500 on `GET /worlds` and the status producer raising on
+            # every poll, picker and panel blind while the file exists.
+            # Reproduced by a dress-rehearsal reviewer; not shown reachable
+            # from the Tower's own writers, which is why it is a
+            # `WorldStoreError` rather than a wider net.
+            raise WorldStoreError(
+                f"world {world_id} is unreadable: top level is "
+                f"{type(data).__name__}, not an object"
+            )
         require_schema(data, f"world {world_id}")
         require_pose_convention(data["pose_convention"])
         return world_from_json_dict(data)
@@ -1462,6 +1474,15 @@ def _holder_is_running(pid: int, created_at, lock_written_at=None) -> bool:
             return False
         try:
             actual = psutil.Process(pid).create_time()
+        except psutil.AccessDenied:
+            # CANNOT JUDGE IS NOT DEAD. The process exists and its start
+            # time is hidden -- an elevation mismatch between the Tower
+            # and a `world_finalize.py` run is enough on Windows. Calling
+            # it dead would let a second writer onto one store, which is
+            # the one failure this whole lock exists to prevent; assuming
+            # it alive costs at worst a refused acquisition. A reviewer
+            # named this path; it is the safe direction.
+            return True
         except psutil.Error:
             return False
         if created_at is not None:

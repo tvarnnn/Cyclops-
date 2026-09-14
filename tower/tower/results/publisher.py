@@ -481,6 +481,8 @@ class ResultHub:
         self._task: asyncio.Task | None = None
         # Bounded by the number of live targets, and pruned every pass.
         self._failures: dict = {}
+        # One running snapshot per target, at most. See `poll_once`.
+        self._in_flight: dict = {}
         # Set after every completed poll pass. Tests wait on this instead
         # of sleeping, which is what makes them deterministic.
         self.polled = asyncio.Event()
@@ -569,6 +571,33 @@ class ResultHub:
                         "reader failure"
                     )
 
+    def _note_failure(self, target, reason: str, *, log=None) -> None:
+        """Count one failure for a target, and tell its subscribers after three.
+
+        One place for both failure kinds -- a snapshot that raised and one
+        that is still running at the deadline -- so they escalate the same
+        way and say the same thing. Persistent, not transient: after
+        `MAX_CONSECUTIVE_TARGET_FAILURES` in a row the subscribers watching
+        this target are told rather than left holding a subscription that
+        has gone quiet.
+        """
+        if log is not None:
+            logger.warning(*log)
+        failures = self._failures.get(target, 0) + 1
+        self._failures[target] = failures
+        if failures < MAX_CONSECUTIVE_TARGET_FAILURES:
+            return
+        message = f"{reason}, {failures} times in a row"
+        for channel in list(self._channels):
+            try:
+                channel.fail_target(target, message)
+            except Exception:
+                logger.exception(
+                    "[Tower][Results] could not notify a channel of a "
+                    "persistent target failure"
+                )
+        self._failures.pop(target, None)
+
     async def poll_once(self) -> None:
         """One pass: compute each distinct target once, offer it to all.
 
@@ -600,64 +629,96 @@ class ResultHub:
                 if target in targets
             }
 
+        # ONE SNAPSHOT IN FLIGHT PER TARGET, ALL TARGETS AT ONCE, ONE
+        # DEADLINE FOR THE PASS.
+        #
+        # Three defects lived in the loop this replaces, and the second
+        # was introduced by the fix for the first.
+        #
+        # First, targets were polled SEQUENTIALLY with no deadline, so a
+        # wedged World Builder read delivered nothing, for any cartridge,
+        # across 12 poll windows with no error and no `fail_target`; and a
+        # merely slow (2 s) producer made Document Memory and Scene
+        # Understanding 5x slower, because the pass length was the SUM of
+        # the targets.
+        #
+        # Second, the fix wrapped each call in `asyncio.wait_for`, which
+        # cancels the await and NOT the thread -- and then re-dispatched
+        # the same target on the very next pass while the previous thread
+        # was still running. A reviewer measured one leaked thread per
+        # poll per wedged target into the default executor, which the
+        # capture path shares: at the default 0.5 s poll and 10 s deadline
+        # a single wedged target exhausted a 24-worker pool in ~252 s,
+        # after which EVERY `asyncio.to_thread` in the process queued
+        # forever -- `stream_start`'s `capture_opened`, the disconnect
+        # cleanup, the subscribe-time snapshot, `supervisor.shutdown`.
+        # Before that fix the wedge silenced the result channel and
+        # nothing else. That is a fix worse than its defect, and it is
+        # this campaign's own.
+        #
+        # Third, the sequential shape meant the 10 s deadline only turned
+        # ">10 s" into a failure; a 2 s producer still cost everyone 2 s.
+        #
+        # So: a target that already has a snapshot running is NOT
+        # dispatched again -- its future is kept in `_in_flight` and
+        # simply checked -- which bounds the threads at one per target by
+        # construction, however long a read wedges. Every target that is
+        # free is dispatched, and the pass waits on all of them together
+        # with one bounded `asyncio.wait`, which does not cancel: a slow
+        # snapshot survives into the next pass and is delivered when it
+        # lands, as the freshest state there is. The pass length is the
+        # SLOWEST target capped at the deadline, not the sum. A target
+        # still pending at the deadline counts one failure, and the
+        # existing escalation tells its subscribers after three.
+        for target in list(self._in_flight):
+            if target not in targets and self._in_flight[target].done():
+                # Nobody is watching this any more and its thread has
+                # finished: forget it. A still-running thread for a
+                # departed target stays until it finishes, so it can
+                # never be dispatched twice.
+                del self._in_flight[target]
+
+        waiting: dict = {}
         for target, sample in targets.items():
-            try:
-                # A DEADLINE, BECAUSE ONE CARTRIDGE MUST NOT BE ABLE TO
-                # SILENCE THE OTHERS BY BEING SLOW.
-                #
-                # These targets are polled SEQUENTIALLY, so a producer
-                # that blocks blocks everything behind it in the same
-                # pass. A reviewer measured both ends of that: a wedged
-                # World Builder read delivered **nothing at all, for any
-                # cartridge, across 12 poll windows** with no error and no
-                # `fail_target` -- the loop simply never came back -- and
-                # a merely SLOW producer (2 s) made Document Memory and
-                # Scene Understanding exactly **5x slower**.
-                #
-                # `asyncio.wait_for` cancels the await, not the thread:
-                # the worker keeps running to completion and is not
-                # reused for this pass, which is the correct trade. What
-                # it buys is that the loop returns, the other targets are
-                # served, and a target that keeps timing out reaches the
-                # consecutive-failure path below and TELLS its
-                # subscribers -- instead of every subscriber on the Tower
-                # going quiet with nothing said.
-                snapshot = await asyncio.wait_for(
+            future = self._in_flight.get(target)
+            if future is None or future.done() and target not in self._in_flight:
+                future = None
+            if future is None:
+                future = asyncio.ensure_future(
                     asyncio.to_thread(
                         self._snapshot_for, sample.cartridge,
                         sample.result_type, sample.world_id,
                         sample.session_id,
-                    ),
-                    timeout=SNAPSHOT_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "[Tower][Results] snapshot for %s exceeded %.1fs; the "
-                    "other cartridges are being served without it",
-                    target, SNAPSHOT_TIMEOUT_SECONDS,
-                )
-                failures = self._failures.get(target, 0) + 1
-                self._failures[target] = failures
-                if failures >= MAX_CONSECUTIVE_TARGET_FAILURES:
-                    # The same notification the branch below makes, for
-                    # the same reason: persistent, not transient, so tell
-                    # this target's subscribers rather than logging into
-                    # the void forever.
-                    reason = (
-                        f"the Tower could not build this cartridge's state "
-                        f"within {SNAPSHOT_TIMEOUT_SECONDS:.0f}s, "
-                        f"{failures} times in a row"
                     )
-                    for channel in list(self._channels):
-                        try:
-                            channel.fail_target(target, reason)
-                        except Exception:
-                            logger.exception(
-                                "[Tower][Results] could not notify a channel "
-                                "of a persistent target timeout"
-                            )
-                    self._failures.pop(target, None)
+                )
+                self._in_flight[target] = future
+            waiting[future] = target
+
+        if waiting:
+            await asyncio.wait(
+                list(waiting), timeout=SNAPSHOT_TIMEOUT_SECONDS
+            )
+
+        now = self._clock()
+        for future, target in waiting.items():
+            if not future.done():
+                self._note_failure(
+                    target,
+                    f"the Tower could not build this cartridge's state within "
+                    f"{SNAPSHOT_TIMEOUT_SECONDS:.0f}s",
+                    log=(
+                        "[Tower][Results] snapshot for %s has exceeded %.1fs "
+                        "and is still running; the other cartridges are "
+                        "being served without it",
+                        target, SNAPSHOT_TIMEOUT_SECONDS,
+                    ),
+                )
                 continue
+            # Done, one way or the other: this target is free for the
+            # next pass whether it succeeded or raised.
+            self._in_flight.pop(target, None)
+            try:
+                snapshot = future.result()
             except Exception as exc:
                 # One unreadable target must not stop the others, and must
                 # not stop the loop. The producer already turns expected
@@ -666,29 +727,13 @@ class ResultHub:
                 logger.exception(
                     "[Tower][Results] could not build a snapshot for %s", target
                 )
-                failures = self._failures.get(target, 0) + 1
-                self._failures[target] = failures
-                if failures >= MAX_CONSECUTIVE_TARGET_FAILURES:
-                    # Persistent, not transient. Tell this target's
-                    # subscribers rather than logging into the void
-                    # forever.
-                    reason = (
-                        f"the Tower could not read this cartridge's state "
-                        f"{failures} times in a row; the last failure was "
-                        f"{type(exc).__name__}"
-                    )
-                    for channel in list(self._channels):
-                        try:
-                            channel.fail_target(target, reason)
-                        except Exception:
-                            logger.exception(
-                                "[Tower][Results] could not notify a channel "
-                                "of a persistent target failure"
-                            )
-                    self._failures.pop(target, None)
+                self._note_failure(
+                    target,
+                    f"the Tower could not read this cartridge's state; the "
+                    f"last failure was {type(exc).__name__}",
+                )
                 continue
             self._failures.pop(target, None)
-            now = self._clock()
             for channel in list(self._channels):
                 channel.offer(
                     target, snapshot, now=now, heartbeat=self._heartbeat_seconds

@@ -25,6 +25,7 @@ from fastapi import WebSocketDisconnect
 from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
 from tower.results.publisher import (
+    SNAPSHOT_TIMEOUT_SECONDS,
     LOCK_TIMEOUT_S,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
     SEND_TIMEOUT_S,
@@ -302,8 +303,22 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # begins with a complete snapshot".
 
     try:
-        snapshot = await asyncio.to_thread(
-            hub._snapshot_for, cartridge, result_type, world_id, session_id
+        # THE SAME DEADLINE THE POLL LOOP HAS, because this runs inline in
+        # the connection's message loop: while it waits, nothing else on
+        # this socket is answered. A reviewer injected a 3 s stall and
+        # watched a frame sent behind a subscribe wait the full 3 s for
+        # its `frame_result`, and iOS sends `result_subscribe` on every
+        # reconnect of the World Builder screen. A wedged read here hung
+        # that phone's socket outright. `TimeoutError` is an `Exception`,
+        # so it takes the reply below rather than leaving the client
+        # waiting on an answer that never comes. The thread outlives the
+        # cancel -- bounded at one per subscribe attempt, which is
+        # client-driven and not a 2 Hz loop.
+        snapshot = await asyncio.wait_for(
+            asyncio.to_thread(
+                hub._snapshot_for, cartridge, result_type, world_id, session_id
+            ),
+            timeout=SNAPSHOT_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         # A subscribe that cannot produce its first snapshot must SAY so.

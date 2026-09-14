@@ -1339,3 +1339,44 @@ def test_an_unreadable_tree_is_not_reported_as_an_empty_one(
     # BUILD, and nothing here knows anything about the build.
     assert "no geometry exists" not in reason
     assert "no build has run" not in reason
+
+
+def test_a_wrong_sized_walk_is_visible_on_the_wire_while_it_happens(
+    monkeypatch, tmp_path
+):
+    """Rejecting the frame was right; rejecting it silently was not.
+
+    A reviewer drove seven of eight frames into `frame_size_changed` and
+    found no trace of it anywhere a person looks: the live payload had
+    no rejection count, the session record's tally is final-only, and
+    the follower `continue`d past each one without a log line. A whole
+    walk at the wrong rung read "Mapping" with a frozen keyframe count
+    and then "Saved" with a truncated world -- where before the guard it
+    at least read "Interrupted".
+
+    The engine journals this rejection (an ordinary one writes no event),
+    so the live channel can count it. It must, and it must do so while
+    the session is still open.
+    """
+    import numpy as np
+
+    from tests import synthetic_scene as ss
+
+    root = tmp_path / "worlds"
+    world_id, session_id, engine = start_live_world(root, frames=4)
+    try:
+        # Four more frames at another size: all rejected, all journaled.
+        smaller = np.full((288, 384, 3), 128, dtype=np.uint8)
+        for index in range(4, 8):
+            outcome = engine.observe(
+                ss.encode_jpeg(smaller), source_seq=index, wire_seq=index
+            )
+            assert outcome.keyframe_id is None
+
+        payload = _payload(monkeypatch, root)
+        assert payload["lifecycle"]["state"] == "receiving"
+        assert payload["progress"]["frames_rejected_wrong_size"] == 4, payload["progress"]
+        # The final-only tally is still honestly absent mid-session.
+        assert payload["progress"]["rejected_by_reason"] is None
+    finally:
+        engine.stop_session()

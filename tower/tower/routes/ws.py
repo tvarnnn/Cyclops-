@@ -5,6 +5,7 @@ import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
+from tower.results.contracts import CARTRIDGE_WORLD_BUILDER
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
 from tower.modules.base import FrameSkippedError, ModuleUnavailableError
@@ -556,9 +557,37 @@ def _stop_cartridge_sessions(websocket) -> None:
     open.
     """
     sessions = getattr(websocket.app.state, "cartridge_sessions", None) or {}
+    # A capture that ended by disconnect inside its resume grace is a walk
+    # WAITING FOR ITS PHONE, not a walk that is over. World Builder's
+    # builder is already sitting in `_await_successor` for it and will
+    # finalise on its own at the end of the grace if nobody returns.
+    # Stopping the session here closed that builder's stdin, which
+    # `should_stop` honours at once: world 1 finalised, and the phone that
+    # came back 60 s later started world 2. Measured by a dress-rehearsal
+    # reviewer through a real Tower; it is the second of the two ways one
+    # reconnect became two worlds, and the one that fires whenever the
+    # Tower notices the drop before the phone returns.
+    #
+    # Only World Builder is deferred: it is the one cartridge whose
+    # session follows a capture lineage. Object Memory and the rest keep
+    # the documented rule -- no phone, no session.
+    waiting_for_a_phone = any(
+        observer.resumable_capture() is not None
+        for observer in _frame_observers(websocket)
+    )
     for name, session in sessions.items():
         try:
             if session.state == "stopped":
+                continue
+            if name == CARTRIDGE_WORLD_BUILDER and waiting_for_a_phone:
+                logger.info(
+                    "[Tower][Cartridge] %s left running: the last client "
+                    "connection closed, but its capture ended by disconnect "
+                    "inside the resume grace, so the builder is waiting for "
+                    "the phone to come back and will finish on its own if "
+                    "it does not",
+                    name,
+                )
                 continue
             session.stop()
             logger.info(
@@ -610,7 +639,26 @@ async def _start_capture(websocket, owner) -> None:
                 # Unconditional (no owner): this connection is deliberately
                 # taking over, which is different from a dead connection
                 # tearing down a live one.
-                observer.stop(END_REASON_STOP)
+                #
+                # `END_REASON_DISCONNECT`, NOT `END_REASON_STOP`, AND THE
+                # DIFFERENCE IS WHETHER A RECONNECT IS ONE WALK OR TWO.
+                # `resumable_capture()` below offers the previous capture as
+                # this one's predecessor only if it ended by disconnect
+                # (`capture.py`: `_interrupted` is set for that reason
+                # alone). Ending it as `stop` here meant `continues` was
+                # never set on a supersession -- so the old builder saw a
+                # politely closed capture and finalised world 1, and the new
+                # capture started world 2. A dress-rehearsal reviewer drove
+                # a mid-walk reconnect through a real Tower at four timings
+                # and got two worlds, each "Complete", each half the walk,
+                # every time; the campaign's own reconnect proof (§16) had
+                # driven the builder directly and never crossed this route.
+                #
+                # And `disconnect` is the truth: the socket that opened the
+                # old capture is gone. The phone re-opened the bracket on a
+                # new one, which `handoff.md` 9.3 calls the EXPECTED case on
+                # this link.
+                observer.stop(END_REASON_DISCONNECT)
             # Read before `start`, which clears it. The supervisor needs
             # the same lineage the manifest records, or it cannot tell a
             # reconnect from a new walk and starts a second builder on
@@ -705,9 +753,11 @@ async def _stop_capture(
     """Stop recording and tell the worker supervisor, WITHOUT stalling the loop.
 
     **`supervisor.capture_closed()` can block for the whole detach
-    grace.** It calls `reap()` and then holds the supervisor's lock across
-    a `detach`, and World Builder's `stop_grace_seconds` is **30.0**
-    (`main.py`). Run on the event loop -- which is where both callers are
+    grace.** Not through work of its own -- it logs and calls `reap()`,
+    and stops nothing -- but `reap()` takes the supervisor's lock, and a
+    concurrent `detach` holds that lock across its grace; World Builder's
+    is **30.0 s** (`main.py`). A reviewer corrected the first version of
+    this sentence, which said the call held the lock itself. Run on the event loop -- which is where both callers are
     -- that stops every cartridge, every frame reply, every result and
     `/health` for the duration. A reviewer measured **33.72 seconds** of
     dead loop against the real supervisor, reached by the ordinary

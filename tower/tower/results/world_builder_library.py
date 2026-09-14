@@ -108,6 +108,21 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None) -> 
     if not stopped:
         # Open record, nobody writing: killed mid-walk.
         return SESSION_INTERRUPTED
+    if (
+        finalization is not None
+        and finalization.get("state") == FINALIZATION_COMPLETE
+        and has_geometry
+    ):
+        # BEFORE the end-reason check, because a completed finalization
+        # outranks how the capture ended -- the status producer's own rule
+        # (`world_builder.py`, "a completed finalization outranks how the
+        # capture ended"), which this function claims to mirror. Leaving
+        # the World Builder screen sends `session/stop` while the capture
+        # is open, so the record reads `end_reason: interrupted` and then
+        # finalises `complete`, solved, with geometry: the picker said
+        # "Interrupted" over a session the panel called "Saved". Built by
+        # a dress-rehearsal reviewer.
+        return SESSION_COMPLETE
     if session.end_reason in ("error", "interrupted"):
         return SESSION_INTERRUPTED
     if finalization is not None:

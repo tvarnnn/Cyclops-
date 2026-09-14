@@ -697,6 +697,8 @@ record written before 2026-09-06 or a session that never stopped.
 | `frames_observed` | int or **null** | **null while live.** An ordinary rejected frame writes no journal event, so this is genuinely not knowable until the session stops. `null ≠ 0` |
 | `frames_observed_unavailable_reason` | string or null | why, when null |
 | `rejected_by_reason` | object or null | histogram, available only after stop |
+| `frames_rejected_wrong_size` | int | frames rejected for being a different size from the session's first frame, counted LIVE from the journal (the engine journals this rejection, unlike an ordinary one). The calibration is exact per resolution, so such a frame could never have produced a pose; before this was counted, a whole walk at the wrong rung read "Mapping" with a frozen keyframe count and then "Saved" with a truncated world. Additive (2026-09-14) |
+| `frames_rejected_malformed` | int | frames rejected because they could not be decoded, counted live from the journal. Additive (2026-09-14) |
 | `journal_corrupt_lines` | int | Unparseable lines in the event journal. **1 at the tail is routine** — a journal is appended without fsync, so a reader can arrive mid-write. More than that, or a count that does not clear, means corruption, and the keyframe count beside it is correspondingly low |
 | `mapping_seconds` | float or **null** | **on the Tower's clock.** Do not derive this from a phone timer. **Null** if the Tower's wall clock moved backwards during the session — reported as unknown rather than clamped to `0.0`, because a plausible zero is worse than an absent value |
 | `mapping_seconds_unavailable_reason` | string or null | why, when null |
@@ -991,6 +993,7 @@ coordinate frame rather than a camera position.
 | lifecycle, tracking, calibration | ✅ | ✅ | ✅ |
 | `keyframes_accepted`, `mapping_seconds` | ✅ | ✅ | ✅ |
 | `frames_observed`, `rejected_by_reason` | ❌ null | ✅ | ✅ |
+| `frames_rejected_wrong_size`, `frames_rejected_malformed` | ✅ (from the journal, live) | ✅ | ✅ |
 | `scale.state` beyond `unknown` | ❌ | ❌ | ✅ |
 | geometry: representation, element count | ⚠️ | ❌ | ✅ |
 | trajectory: pose count | ⚠️ | ❌ | ✅ |

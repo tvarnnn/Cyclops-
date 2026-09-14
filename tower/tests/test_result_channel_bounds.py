@@ -180,6 +180,10 @@ def test_the_journal_cache_holds_a_summary_not_the_journal(tmp_path):
         # scalars, so the memory bound below is unaffected.
         "tracking_restarts": 1,
         "chain_breaks": 0,
+        # The fixture's rejections carry no reason, so neither counter
+        # moves; the truthfulness suite drives the real event.
+        "frames_rejected_wrong_size": 0,
+        "frames_rejected_malformed": 0,
     }
     # Fixed arity whatever the journal length: this is the memory bound.
     assert len(_summarise_events(events * 1000)) == len(summary)
@@ -591,3 +595,120 @@ def test_a_cartridge_that_keeps_timing_out_tells_its_own_subscribers(monkeypatch
     assert messages, "a target that timed out repeatedly said nothing at all"
     reasons = " ".join(str(m) for m in messages)
     assert "within" in reasons and "times in a row" in reasons, reasons
+
+
+def test_a_wedged_target_is_never_dispatched_twice(monkeypatch):
+    """The fix for the wedge must not leak a thread per poll.
+
+    The first deadline used `asyncio.wait_for`, which cancels the await
+    and NOT the thread -- and then dispatched the same target again on
+    the very next pass while the previous thread was still running. A
+    reviewer measured one leaked thread per poll per wedged target into
+    the default executor, which the capture path shares: at the default
+    0.5 s poll and 10 s deadline, one wedged target exhausted a 24-worker
+    pool in ~252 s, after which every `asyncio.to_thread` in the process
+    queued forever -- `stream_start`, the disconnect cleanup, the
+    subscribe-time snapshot, shutdown. Before that fix the wedge silenced
+    the result channel and nothing else. A fix worse than its defect.
+
+    A target with a snapshot in flight is not dispatched again. Over 25
+    polls the wedged producer must be entered exactly ONCE, and the
+    healthy target beside it must be served on every one of them.
+    """
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "SNAPSHOT_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    entered = {"wedged": 0, "healthy": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered[world_id] += 1
+        if world_id == "wedged":
+            release.wait(timeout=30)
+            return _snapshot("late")
+        return _snapshot(f"fine-{entered['healthy']}")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    async def _run():
+        channel = ConnectionChannel(hub, _capture, lambda: 0.0)
+        for index, world in enumerate(("wedged", "healthy")):
+            await channel.add(Subscription(
+                subscription_id=f"sub-{index}", cartridge="world_builder",
+                result_type="status", contract="c", world_id=world,
+                session_id=None, cursor_status=None,
+            ))
+        for _ in range(25):
+            await hub.poll_once()
+            await asyncio.sleep(0)
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(delivered) >= 1:
+                break
+        await channel.close()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        release.set()
+
+    assert entered["wedged"] == 1, (
+        f"the wedged target was dispatched {entered['wedged']} times across 25 "
+        "polls -- one leaked thread per poll, which is how the executor the "
+        "capture path shares was exhausted"
+    )
+    assert entered["healthy"] == 25, entered
+    assert delivered and delivered[0]["payload"]["revision_marker"].startswith("fine")
+
+
+def test_targets_are_polled_together_not_one_after_another():
+    """A slow producer must not cost every other cartridge its own delay.
+
+    Sequential polling made a 2 s World Builder snapshot cost Document
+    Memory and Scene Understanding 2 s each -- measured at exactly 5x
+    slower -- and the first deadline did not change that: it only turned
+    "more than 10 s" into a failure. Two targets that each take 0.3 s
+    must finish in one pass of ~0.3 s, not ~0.6 s.
+    """
+    import time as _time
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        _time.sleep(0.3)
+        return _snapshot(world_id)
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    async def _run():
+        channel = ConnectionChannel(hub, _capture, lambda: 0.0)
+        for index, world in enumerate(("slow-a", "slow-b")):
+            await channel.add(Subscription(
+                subscription_id=f"sub-{index}", cartridge="world_builder",
+                result_type="status", contract="c", world_id=world,
+                session_id=None, cursor_status=None,
+            ))
+        started = _time.perf_counter()
+        await hub.poll_once()
+        elapsed = _time.perf_counter() - started
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(delivered) >= 2:
+                break
+        await channel.close()
+        return elapsed
+
+    elapsed = asyncio.run(_run())
+    markers = sorted(m["payload"]["revision_marker"] for m in delivered)
+    assert markers == ["slow-a", "slow-b"], markers
+    # Sequential is >= 0.6 s; concurrent is ~0.3 s. The margin is 50 ms
+    # on the wrong side, which is coarse enough to survive suite load.
+    assert elapsed < 0.55, f"one pass over two 0.3 s targets took {elapsed:.2f}s"

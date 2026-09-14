@@ -870,3 +870,4 @@ def test_the_picker_and_the_panel_agree_about_every_broken_manifest(
         assert row["state"] == "complete", (label, row["state"])
     else:
         assert row["state"] in ("unbuilt", "interrupted"), (label, row["state"])
+

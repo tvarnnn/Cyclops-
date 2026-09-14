@@ -1600,8 +1600,37 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
     stopped = False
     tracking_restarts = 0
     chain_breaks = 0
+    rejected_wrong_size = 0
+    rejected_malformed = 0
     for event in events:
         kind = event.get("kind")
+        if kind == "frame_rejected":
+            # ONLY the rejections the engine journals -- an ordinary
+            # rejected frame writes no event (engine.py `observe`), and
+            # this does not pretend otherwise. What IS journaled is the
+            # kind worth a sentence on the phone: a frame of a size this
+            # session is not calibrated for. A reviewer drove seven of
+            # eight frames into that rejection and found no trace of it
+            # in the live payload, the session record or the follower's
+            # log; a whole walk at the wrong rung read "Mapping" with a
+            # frozen keyframe count and then "Saved" with a truncated
+            # world.
+            # The reason rides in the event's PAYLOAD -- `WorldEvent` is
+            # `{event_id, kind, at, payload}` -- which the first version
+            # of this read at the top level and counted nothing.
+            # Two SCALARS, not a dict keyed by reason. The summary is
+            # cached for as long as anyone is subscribed and this
+            # function's contract -- pinned by
+            # `test_the_journal_cache_holds_a_summary_not_the_journal` --
+            # is fixed size and scalars only. The engine journals exactly
+            # two rejection kinds, so two counters lose nothing.
+            payload = event.get("payload")
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            if reason == "frame_size_changed":
+                rejected_wrong_size += 1
+            elif reason == "malformed_frame":
+                rejected_malformed += 1
+            continue
         if kind == "keyframe_accepted":
             accepted += 1
             last_tracking = kind
@@ -1635,6 +1664,8 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
         # not mean what its label says.
         "tracking_restarts": tracking_restarts,
         "chain_breaks": chain_breaks,
+        "frames_rejected_wrong_size": rejected_wrong_size,
+        "frames_rejected_malformed": rejected_malformed,
     }
 
 
@@ -1685,6 +1716,12 @@ def _progress_block(session, events, counts_are_final: bool, now: float) -> dict
                 "not knowable yet"
             )
         ),
+        # LIVE, from the journal, and only for the rejections the engine
+        # journals. `rejected_by_reason` below is the session record's
+        # full tally and is final-only by design; this is the subset a
+        # wearer needs to hear about while still walking. Additive.
+        "frames_rejected_wrong_size": events.get("frames_rejected_wrong_size", 0),
+        "frames_rejected_malformed": events.get("frames_rejected_malformed", 0),
         "rejected_by_reason": (
             dict(session.rejected_by_reason) if counts_are_final else None
         ),
