@@ -514,12 +514,18 @@ final class TowerWorldBuilderClientTests: XCTestCase {
                     """)
             case "result_subscribe":
                 subscribeCount += 1
+                // Echoed from the request, as the Tower's ack does
+                // (`routes/results_ws.py`): the pin on the ack is what says
+                // which subscribe it answers, and a mock that always said
+                // `null` hid that from every pinned test here.
+                let world = (json["world_id"] as? String).map { "\"\($0)\"" } ?? "null"
+                let session = (json["session_id"] as? String).map { "\"\($0)\"" } ?? "null"
                 server.send(text: """
                     {"type":"result_subscribed",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
                      "subscription_id":"sub-\(subscribeCount)","cartridge":"world_builder",
                      "result_type":"status","contract":"\(contract)",
-                     "snapshot_only":true,"world_id":null,"session_id":null,
+                     "snapshot_only":true,"world_id":\(world),"session_id":\(session),
                      "cursor_status":"absent"}
                     """)
             default:
@@ -1218,6 +1224,111 @@ final class TowerWorldBuilderClientTests: XCTestCase {
 
     private func settleBriefly() async {
         try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+
+    /// Answers pings and the declaration and NOTHING else: every
+    /// `result_subscribe` is recorded and left for the test to answer by hand,
+    /// so the order and pin of each ack is the test's to choose.
+    private func serveAnsweringNothing(_ server: MockTowerServer) -> MessageRecorder {
+        let recorder = MessageRecorder()
+        server.onText = { text in
+            recorder.record(text)
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let type = json["type"] as? String
+            else { return }
+            switch type {
+            case "ping":
+                server.send(text: #"{"type":"pong"}"#)
+            case "cartridges":
+                server.send(text: """
+                    {"type":"cartridges",
+                     "envelope_contract":"cartridge_results.envelope/2026-08-23",
+                     "cartridges":[{"cartridge":"world_builder","result_type":"status",
+                        "contract":"\(Self.contract)","available":true,
+                        "unavailable_reason":null,"snapshot_only":true}],
+                     "not_offered":[]}
+                    """)
+            default:
+                break
+            }
+        }
+        return recorder
+    }
+
+    private func ack(_ server: MockTowerServer, _ id: String, worldID: String?) {
+        let world = worldID.map { "\"\($0)\"" } ?? "null"
+        server.send(text: """
+            {"type":"result_subscribed",
+             "envelope_contract":"cartridge_results.envelope/2026-08-23",
+             "subscription_id":"\(id)","cartridge":"world_builder",
+             "result_type":"status","contract":"\(Self.contract)",
+             "snapshot_only":true,"world_id":\(world),"session_id":null,
+             "cursor_status":"absent"}
+            """)
+    }
+
+    /// **A pin change while a timed-out subscribe is still answerable keeps
+    /// the pinned subscription, not the live one.** A slow Tower answers
+    /// every subscribe it received, in order. The phone times out the first
+    /// (unpinned), retries, and the wearer then taps a saved world; three
+    /// acks arrive in order. A count of outstanding acks adopted the second
+    /// — the live retry — under the pin and unsubscribed the pinned third.
+    /// The ack carries its pin, and that is what decides. Found by a fresh
+    /// reviewer of the first version of the retry.
+    func testAPinChangeDuringATimedOutRetryKeepsThePinnedSubscription() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = serveAnsweringNothing(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower, subscribeAckTimeout: .milliseconds(300))
+        tower.connect(to: url(port: port))
+
+        func subscribes() -> [[String: Any]] {
+            recorder.all.compactMap(self.decode).filter { $0["type"] as? String == "result_subscribe" }
+        }
+        // sub-1 sent and left unanswered; the bound expires; sub-2 is the retry.
+        await expect("the timed-out subscribe was never retried") { subscribes().count == 2 }
+        // The wearer opens a saved world: sub-3, pinned.
+        client.inspect(worldID: "w-pinned", sessionID: nil)
+        await expect("the pin did not open a subscription") { subscribes().count == 3 }
+        XCTAssertEqual(subscribes()[2]["world_id"] as? String, "w-pinned")
+
+        // The Tower answers all three, in the order it received them.
+        ack(server, "sub-1", worldID: nil)
+        ack(server, "sub-2", worldID: nil)
+        ack(server, "sub-3", worldID: "w-pinned")
+        // A snapshot on the pinned subscription must reach the screen ...
+        server.send(text: snapshotMessage(
+            seq: 1, modelState: "finalized", keyframes: 40, revision: "r1", subscription: "sub-3"
+        ))
+        await expect("the pinned subscription's snapshot never reached the screen") {
+            client.state.hasWorld
+        }
+        // ... and the two unpinned ones are closed, the pinned one kept.
+        await expect("the unpinned subscriptions were not closed") {
+            let closed = Set(recorder.all.compactMap(self.decode)
+                .filter { $0["type"] as? String == "result_unsubscribe" }
+                .compactMap { $0["subscription_id"] as? String })
+            return closed.isSuperset(of: ["sub-1", "sub-2"])
+        }
+        let closed = recorder.all.compactMap(decode)
+            .filter { $0["type"] as? String == "result_unsubscribe" }
+            .compactMap { $0["subscription_id"] as? String }
+        XCTAssertFalse(closed.contains("sub-3"), "the pinned subscription was unsubscribed: \(closed)")
+        XCTAssertEqual(client.inspection, .inspecting(worldID: "w-pinned"))
+
+        // And a late heartbeat on a closed one is not applied.
+        server.send(text: snapshotMessage(
+            seq: 2, modelState: "receiving", keyframes: 99, revision: "r2", subscription: "sub-2"
+        ))
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertFalse(client.state.isReceivingUpdates, "a heartbeat on the closed live subscription was applied under the pin")
+
+        tower.disconnect()
     }
 
     /// **`snapshot_failed` is asked again, not rendered as a failed walk.**
@@ -2010,12 +2121,15 @@ final class TowerWorldBuilderSessionBindingTests: XCTestCase {
                      "not_offered":[]}
                     """)
             case "result_subscribe":
+                // The pin is echoed from the request, as the Tower does.
+                let world = (json["world_id"] as? String).map { "\"\($0)\"" } ?? "null"
+                let session = (json["session_id"] as? String).map { "\"\($0)\"" } ?? "null"
                 server.send(text: """
                     {"type":"result_subscribed",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
                      "subscription_id":"sub-1","cartridge":"world_builder",
                      "result_type":"status","contract":"\(contract)",
-                     "snapshot_only":true,"world_id":null,"session_id":null,
+                     "snapshot_only":true,"world_id":\(world),"session_id":\(session),
                      "cursor_status":"absent"}
                     """)
             default:
@@ -3015,12 +3129,14 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
                 subscribeCount += 1
                 let worldID = json["world_id"] as? String
                 let world = worldID.map { "\"\($0)\"" } ?? "null"
+                // The session too: the Tower echoes both halves of the pin.
+                let session = (json["session_id"] as? String).map { "\"\($0)\"" } ?? "null"
                 server.send(text: """
                     {"type":"result_subscribed",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
                      "subscription_id":"sub-\(subscribeCount)","cartridge":"world_builder",
                      "result_type":"status","contract":"\(Self.contract)",
-                     "snapshot_only":true,"world_id":\(world),"session_id":null,
+                     "snapshot_only":true,"world_id":\(world),"session_id":\(session),
                      "cursor_status":"absent"}
                     """)
             default:

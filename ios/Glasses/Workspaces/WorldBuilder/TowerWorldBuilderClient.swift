@@ -1062,7 +1062,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                 message: """
                     The Tower did not acknowledge the World Builder subscription \
                     within \(subscribeAckTimeout.components.seconds) seconds, \
-                    \(Self.resubscribeBudget + 1) times on one connection. \
+                    repeatedly, on one connection. \
                     The connection is still open, so this is the Tower not \
                     answering rather than the network being gone. The walk \
                     itself is unaffected: the builder runs on the Tower whether \
@@ -1108,9 +1108,9 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                 CartridgeFailure(
                     kind: .transport,
                     message: """
-                        The Tower could not produce a first World Builder report \
-                        \(Self.resubscribeBudget + 1) times on this connection \
-                        (\(message)). The walk itself is unaffected: the builder \
+                        The Tower could not produce a first World Builder report, \
+                        repeatedly, on this connection (\(message)). \
+                        The walk itself is unaffected: the builder \
                         runs on the Tower whether or not this screen can read it. \
                         Reconnecting is what resolves it.
                         """
@@ -1153,6 +1153,22 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
         case .subscribed(let ack):
             guard ack.cartridge == WorldBuilderResultContract.towerCartridge else { return }
+            if ack.worldID != pinned?.worldID || ack.sessionID != pinned?.sessionID {
+                // Answers a subscribe carrying a DIFFERENT pin from the one
+                // this client holds now — the unpinned subscribe that a tap
+                // on a saved world replaced, or the reverse. Not this
+                // client's to adopt, whatever the count below says: the
+                // count only ranks acks that are interchangeable, and a
+                // subscription to another world is not. Found by a reviewer
+                // walking the slow-Tower case: the timeout write-off leaves a
+                // reply in flight, a pin change follows, and a count-based
+                // rule then adopted the live subscription under the pin and
+                // unsubscribed the pinned one.
+                if pendingSubscribeAcks > 0 { pendingSubscribeAcks -= 1 }
+                tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
+                retiredSubscriptionIDs.insert(ack.subscriptionID)
+                return
+            }
             if subscriptionID != nil, pendingSubscribeAcks == 0 {
                 // An ack for a subscribe this client stopped waiting for — a
                 // bound expired, the attempt was written off and retried, and
@@ -1391,7 +1407,17 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             return
         }
         recentWorld = nil
-        if pinned == nil, !report.selection.isHistoryOfferedAsLive, let worldID = report.worldID {
+
+        let binding = WorldSessionGate.binding(
+            isCaptureBracketOpen: isCaptureBracketOpen,
+            session: report.session,
+            modelState: report.state
+        )
+        // Remembered only for a walk this screen actually SHOWED: a report
+        // the gate refused as foreign (another phone's walk, seen here as
+        // "waiting") must not come back later as "Saved" under Live.
+        if pinned == nil, !report.selection.isHistoryOfferedAsLive, let worldID = report.worldID,
+           binding.allowsThroughTheGate {
             switch report.state {
             case .receiving, .finalizing:
                 followedWalk = (worldID, report.sessionID, Date())
@@ -1399,12 +1425,6 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                 break
             }
         }
-
-        let binding = WorldSessionGate.binding(
-            isCaptureBracketOpen: isCaptureBracketOpen,
-            session: report.session,
-            modelState: report.state
-        )
         // Before the state, so a subscriber woken by `stateUpdates` that reads
         // `sessionBinding` sees the binding that produced it.
         sessionBinding = binding
@@ -1509,7 +1529,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                         kind: .transport,
                         message: """
                             The Tower closed this world's result subscription \
-                            \(Self.resubscribeBudget + 1) times on one connection. \
+                            repeatedly on one connection. \
                             Reconnecting is what resolves it.
                             """
                     )
@@ -1529,6 +1549,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         if error.cartridge != nil, error.subscriptionID == nil, pendingSubscribeAcks > 0 {
             pendingSubscribeAcks -= 1
         }
+        // A reply to a subscribe this client already stopped waiting for,
+        // arriving while a later one is held: it changes nothing on screen.
+        // Without this, `retryFirstSnapshot` cleared the held subscription
+        // without unsubscribing it, and that orphan kept heartbeating for the
+        // life of the socket — under the next pin, for a different world.
+        if error.cartridge != nil, error.subscriptionID == nil, subscriptionID != nil { return }
 
         switch error.reason {
         case "cartridge_unavailable":

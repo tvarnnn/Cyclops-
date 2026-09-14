@@ -81,6 +81,16 @@ struct WorldSessionReport: Equatable, Sendable {
 /// "we have established that it is not ours" call for different words on
 /// screen, and neither is "no capture is open".
 enum WorldSessionBinding: Equatable, Sendable {
+    /// Whether `WorldSessionGate.presented` passes a world state through
+    /// under this binding (`.none`, `.bound`) rather than turning it into
+    /// "waiting" (`.awaiting`, `.foreign`).
+    var allowsThroughTheGate: Bool {
+        switch self {
+        case .none, .bound: return true
+        case .awaiting, .foreign: return false
+        }
+    }
+
     /// No capture bracket is open on this phone, so there is nothing to bind
     /// to and the Tower's own state is the whole answer. This is also the
     /// permanent value in a Release build, which has no capture control.
