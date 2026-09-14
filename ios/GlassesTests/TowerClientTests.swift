@@ -3137,12 +3137,14 @@ final class TowerClientTests: XCTestCase {
     /// one capture, 2,391 of 4,801 on the next — and one resulting gap ran 410
     /// source frames, 17 seconds, splitting the reconstruction in two. Nothing
     /// in the artifacts can say whose fault that was.
-    func testEveryFrameCarriesADenseTransmitCounter() async {
-        let server = MockTowerServer()
-        let recorder = MessageRecorder()
-        server.onText = { [weak recorder] text in recorder?.record(text) }
-        respondToPing(server)
-        guard let port = server.start() else { return XCTFail("server did not start") }
+    func testEveryFrameCarriesADenseTransmitCounter() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
         defer { server.stop() }
 
         let client = TowerClient()
@@ -3181,12 +3183,14 @@ final class TowerClientTests: XCTestCase {
     /// If it did, the Tower would see a hole and read it as transit loss —
     /// manufacturing the exact confusion the counter exists to remove. A full
     /// send window is the drop that actually happens in the field.
-    func testADroppedFrameDoesNotConsumeATransmitNumber() async {
-        let server = MockTowerServer()
-        let recorder = MessageRecorder()
-        server.onText = { [weak recorder] text in recorder?.record(text) }
-        respondToPing(server)
-        guard let port = server.start() else { return XCTFail("server did not start") }
+    func testADroppedFrameDoesNotConsumeATransmitNumber() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
         defer { server.stop() }
 
         // A window of two, so the drop is arranged rather than hoped for.
@@ -3244,12 +3248,14 @@ final class TowerClientTests: XCTestCase {
     /// across a reconnect would present every frame sent on the old socket as
     /// one enormous gap on the new one. The 2026-09-09 walk reconnected once,
     /// mid-session.
-    func testTheTransmitCounterRestartsWithTheConnection() async {
-        let server = MockTowerServer()
-        let recorder = MessageRecorder()
-        server.onText = { [weak recorder] text in recorder?.record(text) }
-        respondToPing(server)
-        guard let port = server.start() else { return XCTFail("server did not start") }
+    func testTheTransmitCounterRestartsWithTheConnection() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
         defer { server.stop() }
 
         let client = TowerClient()
@@ -3264,8 +3270,9 @@ final class TowerClientTests: XCTestCase {
 
         // A SECOND recorder for the second socket. `MessageRecorder` has no
         // reset, and adding one would let a test quietly forget evidence.
-        let afterReconnect = MessageRecorder()
-        server.onText = { [weak afterReconnect] text in afterReconnect?.record(text) }
+        // It has to keep answering pings, or the second socket never comes
+        // online; `attachRecorder` installs a fresh recorder that does both.
+        let afterReconnect = attachRecorder(server)
         client.connect(to: url(port: port))
         online = await waitUntil { client.status == .online }
         XCTAssertTrue(online)
@@ -3389,4 +3396,286 @@ final class TowerConfigurationOverrideTests: XCTestCase {
         XCTAssertNotNil(TowerConfiguration.acceptedAuthority(authority))
     }
 
+}
+
+// MARK: - World Builder session requests reach the Tower in order
+
+/// Answers the session surface without a network, **holding** the first
+/// request so a second can be issued while it is out, and recording when each
+/// request started and finished — which is the only way to tell "sent after
+/// the previous one was answered" from "sent at the same time".
+///
+/// Its own stub rather than `WorldBuilderSessionStubProtocol`: that one
+/// answers instantly and keeps its routes private, and this test is about
+/// what happens *during* a round trip.
+final class OrderedSessionStubProtocol: URLProtocol {
+    struct Record: Sendable {
+        let path: String
+        let startedAt: TimeInterval
+        var completedAt: TimeInterval?
+    }
+
+    private static let lock = NSLock()
+    private static var body: [String: Any] = [:]
+    private static var records: [Record] = []
+    /// Seconds to hold the answer to the first request only. Later requests
+    /// answer at once, so the test is about ordering and not about a slow
+    /// stub.
+    private static var firstRequestDelay: TimeInterval = 0
+
+    static func reset(body: [String: Any], firstRequestDelay: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.body = body
+        self.firstRequestDelay = firstRequestDelay
+        records = []
+    }
+
+    static func recorded() -> [Record] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records
+    }
+
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OrderedSessionStubProtocol.self]
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        OrderedSessionStubProtocol.lock.lock()
+        let index = OrderedSessionStubProtocol.records.count
+        OrderedSessionStubProtocol.records.append(
+            Record(path: path, startedAt: Date().timeIntervalSinceReferenceDate)
+        )
+        let delay = index == 0 ? OrderedSessionStubProtocol.firstRequestDelay : 0
+        let body = OrderedSessionStubProtocol.body
+        OrderedSessionStubProtocol.lock.unlock()
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
+            guard let url = request.url else { return }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+            OrderedSessionStubProtocol.lock.lock()
+            OrderedSessionStubProtocol.records[index].completedAt = Date().timeIntervalSinceReferenceDate
+            OrderedSessionStubProtocol.lock.unlock()
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+/// `WorldBuilderSessionController` fires `start` on appear and `stop` on
+/// disappear, and a cartridge switch does appear, disappear, appear within
+/// one round trip. The generation counter decides which reply may touch
+/// `status`; nothing decided the order the Tower *received* the requests in.
+/// Two concurrent POSTs land in whichever order the network gives them, and
+/// the Tower applies them as they land — so it could finish on `stop` with
+/// the workspace on screen, or on `start` with nobody there.
+@MainActor
+final class WorldBuilderSessionOrderingTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let startPath = "/cartridges/world_builder/session/start"
+    private static let stopPath = "/cartridges/world_builder/session/stop"
+
+    /// A `cartridge_session.control/2026-08-27` snapshot the decoder accepts.
+    /// The state it reports does not matter here — the test is about the
+    /// wire order, not the footnote.
+    private static let activeSession: [String: Any] = [
+        "contract": "cartridge_session.control/2026-08-27",
+        "cartridge": "world_builder",
+        "worker": "world-build-session",
+        "supported": true,
+        "state": "active",
+        "state_means": "intent-not-liveness",
+        "states": ["stopped", "active", "paused"],
+        "actions": ["start", "pause", "resume", "stop"],
+        "session_id": "sess-1",
+        "started_at": 1788895000.0,
+        "changed_at": 1788895000.0,
+        "following": [String](),
+        "following_this_session": [String](),
+        "captures": [String](),
+        "accepted": true,
+        "changed": true,
+        "attached_capture_id": NSNull(),
+        "stop_policy": "request",
+    ]
+
+    private func makeController() -> WorldBuilderSessionController {
+        WorldBuilderSessionController(
+            control: CartridgeSessionHTTPClient(
+                baseURL: Self.host,
+                session: OrderedSessionStubProtocol.makeSession(),
+                cartridge: "world_builder"
+            )
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    /// Appear, disappear, appear while the first `start` is still out. All
+    /// three must reach the wire, in that order, and each only after the one
+    /// before it was answered.
+    func testRequestsAreSentInTheOrderTheyWereDecidedAndOneAtATime() async {
+        OrderedSessionStubProtocol.reset(body: Self.activeSession, firstRequestDelay: 0.3)
+        let controller = makeController()
+
+        controller.workspaceDidAppear(isTowerReachable: true)
+        let firstOut = await waitUntil { OrderedSessionStubProtocol.recorded().count == 1 }
+        XCTAssertTrue(firstOut, "the first start never reached the stub")
+
+        controller.workspaceDidDisappear()
+        controller.workspaceDidAppear(isTowerReachable: true)
+
+        let allAnswered = await waitUntil(timeout: 4) {
+            OrderedSessionStubProtocol.recorded().count == 3
+                && OrderedSessionStubProtocol.recorded().allSatisfy { $0.completedAt != nil }
+        }
+        let records = OrderedSessionStubProtocol.recorded()
+        XCTAssertTrue(allAnswered, "expected three answered requests, saw \(records.map(\.path))")
+        guard records.count == 3 else { return }
+
+        XCTAssertEqual(records.map(\.path), [Self.startPath, Self.stopPath, Self.startPath])
+        XCTAssertGreaterThanOrEqual(
+            records[1].startedAt, records[0].completedAt ?? .infinity,
+            "the stop was sent while the first start was still out; the Tower may apply them in either order"
+        )
+        XCTAssertGreaterThanOrEqual(
+            records[2].startedAt, records[1].completedAt ?? .infinity,
+            "the second start was sent while the stop was still out"
+        )
+
+        // The generation rule still stands: the last request decided the
+        // status, and the screen is on, so it is `.active`.
+        let active = await waitUntil { controller.status == .active }
+        XCTAssertTrue(active, "status is \(controller.status)")
+    }
+}
+
+// MARK: - The reconnect schedule says when it has given up
+
+/// When the reconnect budget is spent, `status` stays `.failed(message)` —
+/// the same value it held while the phone was still retrying — and the only
+/// signal at the give-up point was a log line. The World Builder capture
+/// control said "The Tower is not connected" in both cases, so a wearer
+/// waited for a retry that was never coming.
+@MainActor
+final class TowerReconnectGiveUpTests: XCTestCase {
+
+    private func url(port: UInt16) -> URL {
+        URL(string: "ws://127.0.0.1:\(port)/")!
+    }
+
+    private func respondToPing(_ server: MockTowerServer) {
+        server.onText = { text in
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                json["type"] == "ping"
+            else { return }
+            server.send(text: #"{"type":"pong"}"#)
+        }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return condition()
+    }
+
+    /// A short schedule through the internal seam, so the budget is spent in
+    /// well under a second; the shipped one takes ~16 s against a refused
+    /// port, which is the case a stopped listener produces here.
+    private func makeClient() -> TowerClient {
+        TowerClient(
+            metrics: SenderMetrics(),
+            autoReconnect: true,
+            handshakeLegTimeout: 1,
+            reconnectBackoff: [0.05, 0.05, 0.05]
+        )
+    }
+
+    func testAnExhaustedScheduleSaysSoAndAFreshConnectClearsIt() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = makeClient()
+        XCTAssertFalse(client.reconnectGaveUp)
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        XCTAssertFalse(client.reconnectGaveUp)
+
+        // The Tower goes away for good: socket dropped, listener closed, so
+        // every retry is refused at the port.
+        server.stop()
+        let gaveUp = await waitUntil(timeout: 6) { client.reconnectGaveUp }
+        XCTAssertTrue(gaveUp, "the schedule was spent and nothing said so; status is \(client.status)")
+        XCTAssertNotEqual(client.status, .online)
+
+        // A deliberate tap on Connect against a Tower that is back. The flag
+        // clears as the socket opens — before the handshake, because "stopped
+        // trying" is false from that moment — and stays clear once online.
+        let revived = try MockTowerServer()
+        let revivedPort = try await revived.start()
+        respondToPing(revived)
+        defer { revived.stop() }
+
+        client.connect(to: url(port: revivedPort))
+        XCTAssertFalse(client.reconnectGaveUp, "a fresh connect left the give-up signal standing")
+        let backOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(backOnline)
+        XCTAssertFalse(client.reconnectGaveUp)
+
+        client.disconnect()
+    }
+
+    /// A deliberate disconnect after the schedule is spent is the user acting,
+    /// not the phone giving up; the flag must not outlive it, or the capture
+    /// control would tell a person who just disconnected to tap Connect
+    /// because the phone had stopped trying.
+    func testADeliberateDisconnectClearsTheSignal() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = makeClient()
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+
+        server.stop()
+        let gaveUp = await waitUntil(timeout: 6) { client.reconnectGaveUp }
+        XCTAssertTrue(gaveUp, "status is \(client.status)")
+
+        client.disconnect()
+        XCTAssertFalse(client.reconnectGaveUp)
+        XCTAssertEqual(client.status, .offline)
+    }
 }

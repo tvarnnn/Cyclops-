@@ -182,9 +182,27 @@ final class WorldBuilderSessionController: ObservableObject {
         }
     }
 
-    /// One request at a time. A newer one supersedes an older one's *effect*
-    /// on `status`, not its delivery — a `stop` that follows a `start` still
-    /// goes out, because the Tower needs both.
+    /// One request at a time, **on the wire as well as in `status`**. A newer
+    /// one supersedes an older one's *effect* on `status`, not its delivery —
+    /// a `stop` that follows a `start` still goes out, because the Tower
+    /// needs both — and it goes out *after* the older one has been answered.
+    ///
+    /// ## Why the requests are chained
+    ///
+    /// They were not. The generation counter decided which reply may touch
+    /// `status`, and nothing decided the order the Tower *received* them in:
+    /// appear, disappear, appear within one round trip fired `start`, `stop`,
+    /// `start` concurrently, and three POSTs on three connections arrive in
+    /// whatever order the network gives them. The Tower applies them as they
+    /// land, so it could finish on `stop` with the workspace on screen — a
+    /// walk with no builder attached, under a footnote saying "active" from
+    /// the reply that happened to come last — or on `start` with nobody on
+    /// screen, a session `active` for a cartridge that has been left.
+    ///
+    /// Awaiting the previous task before sending is what makes the Tower
+    /// receive the actions in the order the phone decided them. The previous
+    /// task's own `await` on *its* predecessor makes the chain transitive, so
+    /// three requests in one round trip still land as three, in order.
     private func begin(
         _ action: CartridgeSessionAction,
         pending: Status,
@@ -194,7 +212,12 @@ final class WorldBuilderSessionController: ObservableObject {
         let mine = generation
         status = pending
         let control = self.control
+        let previous = inFlight
         inFlight = Task { [weak self] in
+            // Whatever the previous request's outcome, this one waits for it.
+            // Its result is not read here — its generation already decided
+            // whether it may touch `status` — only its completion.
+            await previous?.value
             let result: Result<CartridgeSessionOutcome, Error>
             do {
                 result = .success(try await control.apply(action))

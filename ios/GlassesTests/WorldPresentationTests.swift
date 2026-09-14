@@ -316,10 +316,23 @@ final class WorldStageTests: XCTestCase {
 
     private func stage(
         _ state: WorldModelState,
-        evidence: WorldEvidence? = FieldWalk.evidence,
+        evidence: WorldEvidence?,
         finalization: WorldFinalizationReport? = nil
     ) -> WorldStage? {
         WorldStage.stage(for: state, evidence: evidence, finalization: finalization)
+    }
+
+    /// The field walk's evidence unless a test says otherwise. This is an
+    /// overload rather than a default argument on purpose: `FieldWalk` is
+    /// main-actor isolated (the app target's default isolation), and in Swift
+    /// 5 language mode a default-argument expression is evaluated outside the
+    /// actor, so `= FieldWalk.evidence` did not compile. The Windows lane that
+    /// wrote it could not build the test target to find out.
+    private func stage(
+        _ state: WorldModelState,
+        finalization: WorldFinalizationReport? = nil
+    ) -> WorldStage? {
+        stage(state, evidence: FieldWalk.evidence, finalization: finalization)
     }
 
     /// The states with no world in them stay out of the vocabulary. "Mapping"
@@ -943,6 +956,200 @@ final class WorldBuilderViewModelGeometryStatusTests: XCTestCase {
                 account.headline, "Nothing mapped yet",
                 "\(status) over 463 keyframes and 17,674 points"
             )
+        }
+    }
+}
+
+// MARK: - Render page: a policy refusal is not a failure
+
+/// `WorldRenderWebView`'s navigation policy refuses every navigation but the
+/// first, and WebKit reports that refusal to the delegate as an error. The
+/// coordinator must swallow exactly those and report everything else.
+///
+/// The WebKit half of the predicate is a hand-spelled domain and code: the
+/// public `WKError` enum has no case for a policy-interrupted frame load, and
+/// the campaign that wrote this line named a `WKError.Code.frameLoadInterrupted`
+/// that does not exist, which is why the branch did not compile until the Mac
+/// gate. This pins the spelling so a future "tidy-up" cannot re-break it.
+final class WorldRenderNavigationErrorTests: XCTestCase {
+    private typealias Coordinator = WorldRenderWebView.Coordinator
+
+    func testAPolicyRefusalIsSwallowed() {
+        let cancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        XCTAssertTrue(Coordinator.isNavigationCancellation(cancelled))
+
+        let interrupted = NSError(
+            domain: Coordinator.webKitLegacyErrorDomain,
+            code: Coordinator.webKitFrameLoadInterruptedByPolicyChange
+        )
+        XCTAssertTrue(Coordinator.isNavigationCancellation(interrupted))
+
+        // The literal values WebKit actually uses, so the constants cannot
+        // drift to something that merely agrees with itself.
+        XCTAssertEqual(Coordinator.webKitLegacyErrorDomain, "WebKitErrorDomain")
+        XCTAssertEqual(Coordinator.webKitFrameLoadInterruptedByPolicyChange, 102)
+    }
+
+    func testAGenuineLoadFailureIsReported() {
+        let offline = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+        XCTAssertFalse(Coordinator.isNavigationCancellation(offline))
+
+        let timedOut = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+        XCTAssertFalse(Coordinator.isNavigationCancellation(timedOut))
+
+        // Same code in the wrong domain, and the wrong code in the right
+        // domain, are both failures: the predicate is a pair, not either half.
+        XCTAssertFalse(
+            Coordinator.isNavigationCancellation(
+                NSError(domain: NSURLErrorDomain, code: Coordinator.webKitFrameLoadInterruptedByPolicyChange)))
+        XCTAssertFalse(
+            Coordinator.isNavigationCancellation(
+                NSError(domain: Coordinator.webKitLegacyErrorDomain, code: NSURLErrorCancelled)))
+    }
+}
+
+
+// MARK: - Mac gate 2026-09-14: the words the row and the canvas share
+
+/// `WorldListingPresentation` states an invariant in its own docstring — a
+/// row that says "Interrupted" opens onto a canvas headlined "Interrupted" —
+/// and two rows broke it: "Complete · no final pass" over a canvas reading
+/// "Partial", and "Interrupted" over a canvas reading "Needs retry". These
+/// pin the row to the canvas's own rules (`WorldStage.stage`).
+@MainActor
+final class WorldListingBadgeAgreementTests: XCTestCase {
+
+    private func session(
+        state: String, hasGeometry: Bool, finalSolve: String? = nil, ended: Bool = true
+    ) -> WorldListingSession {
+        var json: [String: Any] = [
+            "session_id": "s1", "started_at": 1788894857.0,
+            "frame_source": "live-capture", "has_geometry": hasGeometry, "state": state,
+        ]
+        if ended { json["ended_at"] = 1788895000.0 }
+        if let finalSolve {
+            json["finalization"] = ["state": "complete", "final_solve": finalSolve]
+        }
+        return WorldListingSession(json: json)!
+    }
+
+    func testACompleteRowWhoseFinalPassDidNotRunSaysPartialLikeTheCanvas() {
+        for word in ["skipped", "failed", "unavailable"] {
+            let row = session(state: "complete", hasGeometry: true, finalSolve: word)
+            XCTAssertEqual(WorldListingPresentation.stateBadge(for: row), "Partial", word)
+            // The same record through the canvas's rule.
+            let stage = WorldStage.stage(
+                for: .finalized(FieldWalk.snapshot), evidence: FieldWalk.evidence,
+                finalization: WorldFinalizationReport(state: .complete, finalSolve: word)
+            )
+            XCTAssertEqual(stage, .partial, word)
+        }
+    }
+
+    func testACompleteRowWithASolvedOrSilentRecordStaysComplete() {
+        XCTAssertEqual(
+            WorldListingPresentation.stateBadge(for: session(state: "complete", hasGeometry: true, finalSolve: "solved")),
+            "Complete")
+        XCTAssertEqual(
+            WorldListingPresentation.stateBadge(for: session(state: "complete", hasGeometry: true)),
+            "Complete")
+        XCTAssertEqual(
+            WorldListingPresentation.stateBadge(for: session(state: "complete", hasGeometry: true, finalSolve: "pending")),
+            "Complete")
+    }
+
+    func testAnInterruptedRowWithoutGeometrySaysNeedsRetryLikeTheCanvas() {
+        XCTAssertEqual(
+            WorldListingPresentation.stateBadge(for: session(state: "interrupted", hasGeometry: false)),
+            "Needs retry")
+        XCTAssertEqual(
+            WorldListingPresentation.stateBadge(for: session(state: "interrupted", hasGeometry: true)),
+            "Interrupted")
+        XCTAssertEqual(
+            WorldStage.stage(for: .interrupted(FieldWalk.barrenSnapshot, reason: "killed"),
+                             evidence: FieldWalk.barrenEvidence, finalization: nil),
+            .needsRetry)
+        XCTAssertEqual(
+            WorldStage.stage(for: .interrupted(FieldWalk.snapshot, reason: "killed"),
+                             evidence: FieldWalk.evidence, finalization: nil),
+            .interrupted)
+    }
+
+    /// The caption under a row that cannot be opened names WHICH of the
+    /// three "nothing to open" cases it is, because the Tower tells them
+    /// apart on purpose.
+    func testTheNoGeometryCaptionSaysWhichKindOfNothing() {
+        XCTAssertNil(WorldListingPresentation.noGeometryCaption(for: session(state: "complete", hasGeometry: true)))
+        XCTAssertEqual(
+            WorldListingPresentation.noGeometryCaption(for: session(state: "receiving", hasGeometry: false, ended: false)),
+            "No geometry yet. The Tower may still build it for this walk.")
+        XCTAssertEqual(
+            WorldListingPresentation.noGeometryCaption(for: session(state: "interrupted", hasGeometry: false)),
+            "This walk's geometry is no longer on the Tower, so there is nothing to open.")
+        XCTAssertEqual(
+            WorldListingPresentation.noGeometryCaption(for: session(state: "unbuilt", hasGeometry: false)),
+            "No geometry was built for this walk, so there is nothing to open.")
+    }
+}
+
+/// Two stage rules the Mac gate tightened.
+@MainActor
+final class WorldStageMacGateTests: XCTestCase {
+
+    /// A `solved` report stands in for the figures only when there are no
+    /// figures. Over counted zeros it does not make a world "Saved".
+    func testASolvedReportOverZeroFiguresIsNotSaved() {
+        let zeros = WorldSnapshot(
+            worldID: "w-zero", keyframeCount: 3,
+            geometry: WorldGeometryReport(representation: "sparse point cloud", elementCount: 0, isIncremental: false),
+            trajectory: WorldTrajectoryReport(poseCount: 0)
+        )
+        let solved = WorldFinalizationReport(state: .complete, finalSolve: "solved")
+        XCTAssertEqual(
+            WorldStage.stage(for: .finalized(zeros), evidence: WorldEvidence(snapshot: zeros), finalization: solved),
+            .needsRetry)
+        // No figures at all — an older record — and the solve's word stands.
+        XCTAssertEqual(
+            WorldStage.stage(for: .finalized(WorldSnapshot()), evidence: nil, finalization: solved),
+            .saved)
+        // And real figures are Saved with or without the word.
+        XCTAssertEqual(
+            WorldStage.stage(for: .finalized(FieldWalk.snapshot), evidence: FieldWalk.evidence, finalization: nil),
+            .saved)
+    }
+
+    /// The `.finalizing` note is reached with a live builder holding the
+    /// lock over a walk with no drawable geometry yet, under a spinner that
+    /// says the Tower is finishing it. It must not say nothing is running.
+    func testTheFinalizingNoteDoesNotContradictTheSpinner() {
+        let target = WorldRenderTarget(worldID: "w1", sessionID: "s1")
+        let ladder = WorldReconstruction.ladder(
+            target: target, stage: .finalizing, finalSolve: .notReported, evidence: FieldWalk.barrenEvidence
+        )
+        guard case .partial(_, let note) = ladder else { return XCTFail("\(ladder)") }
+        XCTAssertFalse(note.lowercased().contains("see a build running"), note)
+        XCTAssertFalse(note.lowercased().contains("built again"), note)
+        XCTAssertTrue(note.contains("final pass has not landed"), note)
+        // A live builder without drawable geometry is `.finalizing`, not
+        // `.improving` — the state that reaches this note.
+        XCTAssertEqual(
+            WorldStage.stage(for: .finalizing(FieldWalk.barrenSnapshot, buildInProgress: true),
+                             evidence: FieldWalk.barrenEvidence, finalization: nil),
+            .finalizing)
+    }
+
+    /// The record's own sentence ("The final pass was skipped, …") is drawn
+    /// by the canvas on its own line under the card. The card's note must
+    /// not repeat it — the Mac gate's screenshot showed it twice in a row.
+    func testThePartialNoteDoesNotRepeatTheRecordsOwnSentence() {
+        let target = WorldRenderTarget(worldID: "w1", sessionID: "s1")
+        for solve in [WorldFinalSolve.skipped, .failed, .unavailable] {
+            let ladder = WorldReconstruction.ladder(
+                target: target, stage: .partial, finalSolve: solve, evidence: FieldWalk.evidence
+            )
+            guard case .partial(_, let note) = ladder else { XCTFail("\(ladder)"); continue }
+            XCTAssertNotEqual(note, solve.sentence, "\(solve)")
+            XCTAssertFalse(note.isEmpty)
         }
     }
 }

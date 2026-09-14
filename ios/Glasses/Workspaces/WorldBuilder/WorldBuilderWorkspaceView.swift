@@ -347,6 +347,14 @@ private extension WorldBuilderWorkspaceView {
                 // Advice, not a `.disabled` condition — see the equivalent
                 // branch in `HomeWorkspaceView.sessionControl`.
                 HelperText("Camera access is not granted. Allow it under Connections, then start capture.")
+            } else if tower.status != .online && tower.reconnectGaveUp {
+                // Distinct from the sentence below because the remedy is
+                // different. While the phone is still retrying, waiting is
+                // enough; once the reconnect budget is spent nothing will
+                // change until someone taps Connect, and a line that said only
+                // "not connected" — the same words in both cases — left the
+                // wearer waiting for a retry that was never coming.
+                HelperText("The phone has stopped trying to reconnect. Use Connect under Connections to retry.")
             } else if tower.status != .online {
                 // The Tower must be online *before* capture starts: a
                 // `stream_start` sent while it is offline is dropped, and every

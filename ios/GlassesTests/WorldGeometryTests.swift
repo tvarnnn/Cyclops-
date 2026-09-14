@@ -2120,6 +2120,21 @@ final class StubbedGeometryProtocol: URLProtocol {
     /// transport error, which is a third failure shape worth having.
     private static var routes: [String: (Int, String)] = [:]
     private static var paths: [String] = []
+    /// Request path → seconds to hold the answer. A held request is what
+    /// lets a test supersede, repeat or forget a fetch *while it is out*,
+    /// which is where the lifecycle bugs live; an instant stub answers
+    /// before the test can act.
+    private static var delays: [String: TimeInterval] = [:]
+    /// The `timeoutInterval` of the last request on each path — the bound
+    /// the URL loading system was actually handed, not the one a client
+    /// says it sets.
+    private static var timeouts: [String: TimeInterval] = [:]
+    /// Paths whose loading was stopped by the session **before the stub
+    /// answered** — which is what a cancelled `URLSessionTask` does to its
+    /// protocol, and the only observable proof that a `Task.cancel()`
+    /// reached the wire. A stop after the answer is routine teardown and is
+    /// not recorded.
+    private static var stopped: [String] = []
     private static let lock = NSLock()
 
     static func reset(routes: [String: (Int, String)]) {
@@ -2127,12 +2142,21 @@ final class StubbedGeometryProtocol: URLProtocol {
         defer { lock.unlock() }
         self.routes = routes
         paths = []
+        delays = [:]
+        timeouts = [:]
+        stopped = []
     }
 
     static func set(route: String, to response: (Int, String)) {
         lock.lock()
         defer { lock.unlock() }
         routes[route] = response
+    }
+
+    static func set(delay: TimeInterval, for path: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        delays[path] = delay
     }
 
     /// How many times a path was requested. The assertion that matters is a
@@ -2142,6 +2166,18 @@ final class StubbedGeometryProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         return paths.filter { $0 == path }.count
+    }
+
+    static func timeout(for path: String) -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return timeouts[path]
+    }
+
+    static func wasStopped(_ path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped.contains(path)
     }
 
     /// A session wired to this stub. `.ephemeral` so nothing is cached between
@@ -2158,13 +2194,41 @@ final class StubbedGeometryProtocol: URLProtocol {
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
+    /// Set by `stopLoading`, read under the lock before a held answer is
+    /// delivered: a protocol the session has stopped must not call back.
+    private var isStopped = false
+
     override func startLoading() {
         let path = request.url?.path ?? ""
         StubbedGeometryProtocol.lock.lock()
         StubbedGeometryProtocol.paths.append(path)
+        StubbedGeometryProtocol.timeouts[path] = request.timeoutInterval
         let route = StubbedGeometryProtocol.routes[path]
+        let delay = StubbedGeometryProtocol.delays[path]
         StubbedGeometryProtocol.lock.unlock()
 
+        guard let delay else {
+            answer(route)
+            return
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
+            answer(route)
+        }
+    }
+
+    /// Whether this protocol has delivered its answer. `URLSession` calls
+    /// `stopLoading` on every protocol when it is done with it, finished ones
+    /// included — so a stop is evidence of a *cancellation* only when it
+    /// arrives before the answer did, and an answer must not go out after a
+    /// stop.
+    private var hasAnswered = false
+
+    private func answer(_ route: (Int, String)?) {
+        StubbedGeometryProtocol.lock.lock()
+        let stopped = isStopped
+        if !stopped { hasAnswered = true }
+        StubbedGeometryProtocol.lock.unlock()
+        guard !stopped else { return }
         guard let route, let url = request.url else {
             client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
             return
@@ -2177,7 +2241,13 @@ final class StubbedGeometryProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        StubbedGeometryProtocol.lock.lock()
+        defer { StubbedGeometryProtocol.lock.unlock() }
+        isStopped = true
+        guard !hasAnswered else { return }
+        StubbedGeometryProtocol.stopped.append(request.url?.path ?? "")
+    }
 }
 
 @MainActor
@@ -2672,4 +2742,369 @@ final class WorldGeometryRealTowerTests: XCTestCase {
     private static let segmentFromTower = """
         {"contract":"world_builder.geometry/2026-08-25","current":true,"segment_index":1,"content_hash":"5dec8e3d298549d3","frame_id":"segment:1","registered":false,"transform_to_world":null,"poses":[{"keyframe_id":"dd5d13a2381e430db9b27c7da2cf2928:00000227","status":"anchor","degeneracy":"","rotation":[1.0,0.0,0.0,0.0],"translation":[0.0,0.0,0.0]},{"keyframe_id":"dd5d13a2381e430db9b27c7da2cf2928:00000231","status":"solved","degeneracy":"","rotation":[0.9998091786737427,0.0003777739565228689,0.018821894384747233,0.005215344508603099],"translation":[0.6468719904899493,-0.48572241488399487,0.5879033624660022]}],"points":[[-2.8251864910125732,5.851417541503906,15.733039855957031],[-2.186521053314209,5.635050296783447,16.11659812927246],[-1.8723406791687012,4.938211441040039,14.373701095581055],[-1.1238046884536743,4.631518840789795,14.525111198425293],[-2.8285560607910156,4.136114597320557,13.772270202636719],[-2.0341405868530273,4.704507827758789,15.736750602722168],[-0.30785658955574036,5.988716125488281,14.859391212463379],[-0.8918599486351013,7.088468074798584,15.09296989440918],[-1.1977990865707397,7.724607467651367,15.978129386901855],[-2.2038235664367676,2.6321513652801514,14.866150856018066],[-2.417578935623169,3.8686137199401855,14.086015701293945],[-1.0965282917022705,7.609363079071045,15.096478462219238],[-0.6792806386947632,7.607414245605469,15.949424743652344],[-1.612669587135315,5.767972946166992,14.382736206054688],[-0.19934609532356262,5.844282150268555,14.771583557128906],[-1.575760841369629,6.185068607330322,15.624072074890137],[-1.9238148927688599,4.948044776916504,14.391816139221191],[-1.650587558746338,4.203355312347412,14.41063117980957],[-2.4525389671325684,3.9035892486572266,14.213698387145996],[-1.8688095808029175,6.067925453186035,14.986702919006348],[1.077223300933838,7.307618618011475,15.748136520385742],[-0.681450605392456,7.692735195159912,16.147676467895508],[-0.11376218497753143,7.142821311950684,15.280884742736816],[-0.5584840178489685,7.026514530181885,14.85836410522461],[-3.217444658279419,7.9374284744262695,14.789570808410645],[-1.895555019378662,4.887986660003662,14.239521026611328],[-1.5252230167388916,4.860350608825684,14.724884033203125],[-1.8334002494812012,5.045142650604248,15.393455505371094],[-1.5201964378356934,4.753427028656006,14.689470291137695],[-1.8639649152755737,4.360745906829834,14.802159309387207],[-1.8759959936141968,2.1857194900512695,14.06497859954834],[-2.7521438598632812,5.463398456573486,14.620830535888672],[-1.776002287864685,5.552976608276367,14.027909278869629],[-0.22061984241008759,5.946706295013428,15.015033721923828],[-1.4285938739776611,5.690371990203857,14.253219604492188],[-2.8464677333831787,6.021506309509277,13.909974098205566],[-0.08249344676733017,7.755697727203369,15.897381782531738],[-0.11279231309890747,7.099442481994629,15.242985725402832],[-0.5737655162811279,7.15782356262207,15.177337646484375],[-1.5470340251922607,-5.597318649291992,13.622379302978516],[0.07912556827068329,7.038555145263672,15.571170806884766],[-0.23409663140773773,5.770210266113281,14.620176315307617],[-2.5984976291656494,5.637725353240967,14.002154350280762],[-2.938666820526123,5.790436267852783,15.463438987731934],[-2.5228145122528076,5.095469951629639,13.786197662353516],[-1.8832415342330933,4.371485233306885,14.806140899658203],[0.8296099305152893,7.777370929718018,17.423053741455078],[0.8274226188659668,6.7445573806762695,15.283087730407715],[-1.9186128377914429,5.287703037261963,15.600086212158203],[-2.3309764862060547,-6.030884265899658,14.042960166931152],[-1.584289789199829,-5.597256660461426,13.699226379394531],[-1.9601857662200928,7.7627458572387695,15.391879081726074],[-1.4358505010604858,7.430853843688965,14.97073745727539],[-2.1320760250091553,4.935245513916016,16.512163162231445],[-2.307460069656372,5.512132167816162,15.523356437683105],[-1.9194636344909668,5.908429145812988,14.840858459472656],[-0.23655809462070465,6.21229362487793,15.582989692687988],[-0.932158350944519,6.59898567199707,16.164398193359375],[-1.2383867502212524,8.200161933898926,16.154293060302734],[-1.7708415985107422,8.232685089111328,15.95460033416748],[1.0707435607910156,7.812127113342285,16.662673950195312],[-2.3162841796875,2.7824103832244873,14.676214218139648],[-1.4269706010818481,7.442532539367676,14.938467979431152],[-1.7120250463485718,5.125080108642578,15.626901626586914],[-0.11175594478845596,7.88596248626709,16.01896858215332],[-0.5071048140525818,8.488019943237305,16.455476760864258],[-1.1431732177734375,7.7255635261535645,15.955605506896973],[-0.0829896628856659,7.001388072967529,15.05306339263916],[-0.6029805541038513,7.452394008636475,14.997210502624512],[-0.2849757671356201,6.4143147468566895,16.07878875732422],[-1.7868516445159912,5.963043689727783,14.772315979003906],[-1.9040725231170654,4.456711769104004,15.061767578125],[1.191226840019226,7.255112171173096,15.383050918579102],[0.7692299485206604,6.889119625091553,15.530254364013672],[-0.851668119430542,5.994761943817139,14.815544128417969],[-1.620657205581665,-5.754885673522949,14.050065994262695],[-1.7382028102874756,6.8811492919921875,14.401448249816895],[-0.2518391013145447,5.793506145477295,14.708212852478027],[-0.763960599899292,5.903599739074707,14.752820014953613]],"points_sent":79,"points_total":79,"point_sampling":"none"}
         """
+}
+
+// MARK: - The fetch's lifecycle: superseded, repeated, forgotten
+
+/// What `WorldBuilderViewModel` does with a geometry fetch that is *still
+/// out* when the world moves under it.
+///
+/// Driven through `ScriptedWorldBuilderClient`'s geometry subject rather than
+/// by calling `geometryDidChange` directly, because the behaviour under test
+/// is the task management in `fetchGeometry(at:)` — which a direct call
+/// bypasses. The segment route is held open by the stub so the test can act
+/// while the fetch is between requests.
+@MainActor
+final class WorldGeometryFetchLifecycleTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let manifestPath = "/worlds/w1/geometry/manifest"
+    private static func segmentPath(_ index: Int) -> String { "/worlds/w1/geometry/segment/\(index)" }
+
+    /// A manifest naming the given segment indices, each resolved with
+    /// bounds so its chunk is worth fetching.
+    private static func manifest(revision: String, segments: [Int]) -> String {
+        let rows = segments.map { index in
+            """
+            {"segment_index": \(index), "content_hash": "h\(index)", "frame_id": "segment:\(index)",
+             "registered": false, "transform_to_world": null,
+             "resolution_state": "resolved", "dominant_degeneracy": null,
+             "keyframe_count": 2, "solved_count": 1, "point_count": 1,
+             "bounds": {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}}
+            """
+        }
+        return """
+            {"contract": "world_builder.geometry/2026-08-25",
+             "world_id": "w1", "session_id": "s1", "geometry_revision": "\(revision)",
+             "pose_convention": {
+               "pose_type": "T_world_camera", "quaternion_order": "wxyz",
+               "handedness": "right",
+               "camera_axes": "opencv_x_right_y_down_z_forward",
+               "translation_units": "world",
+               "world_axes_origin": "first_keyframe_camera",
+               "up_axis": "unknown", "pose_dtype": "float64",
+               "point_dtype": "float32"},
+             "segment_count": \(segments.count),
+             "segments": [\(rows.joined(separator: ","))]}
+            """
+    }
+
+    private static func segment(_ index: Int) -> String {
+        """
+        {"contract": "world_builder.geometry/2026-08-25",
+         "segment_index": \(index), "content_hash": "h\(index)", "frame_id": "segment:\(index)",
+         "registered": false, "transform_to_world": null,
+         "poses": [{"keyframe_id": "s1:\(index)", "status": "anchor", "degeneracy": "",
+                    "rotation": [1.0, 0.0, 0.0, 0.0],
+                    "translation": [0.0, 0.0, 0.0]}],
+         "points": [[0.5, 0.5, 0.5]],
+         "points_sent": 1, "points_total": 1, "point_sampling": "none"}
+        """
+    }
+
+    private func makeViewModel(over client: any WorldBuilderClient) -> WorldBuilderViewModel {
+        WorldBuilderViewModel(
+            client: client,
+            geometry: WorldGeometryClient(
+                baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()
+            )
+        )
+    }
+
+    /// Three segments under revision `g1`, every segment held for
+    /// `segmentDelay` so the fetch is reliably between requests when the
+    /// test acts.
+    private func stubThreeSegments(segmentDelay: TimeInterval = 0.3) {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.manifest(revision: "g1", segments: [0, 1, 2])),
+            Self.segmentPath(0): (200, Self.segment(0)),
+            Self.segmentPath(1): (200, Self.segment(1)),
+            Self.segmentPath(2): (200, Self.segment(2)),
+            Self.segmentPath(3): (200, Self.segment(3)),
+        ])
+        for index in 0...3 {
+            StubbedGeometryProtocol.set(delay: segmentDelay, for: Self.segmentPath(index))
+        }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    /// Rule 15. This was the only HTTP client in the app with no bound of its
+    /// own, so a wedged Tower cost `URLRequest`'s 60 s default per segment.
+    /// Asserted on the request the URL loading system was handed, not on the
+    /// client's property.
+    func testGeometryRequestsCarryTheRenderClientsBound() async {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, Self.manifest(revision: "g1", segments: [0])),
+            Self.segmentPath(0): (200, Self.segment(0)),
+        ])
+        let viewModel = makeViewModel(over: UnavailableWorldBuilderClient())
+        await viewModel.geometryDidChange(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        XCTAssertEqual(StubbedGeometryProtocol.timeout(for: Self.manifestPath), 30)
+        XCTAssertEqual(StubbedGeometryProtocol.timeout(for: Self.segmentPath(0)), 30)
+    }
+
+    /// A newer revision while a fetch is between segments: the superseded
+    /// fetch must stop asking, not merely stop publishing.
+    ///
+    /// Before this, the two `isStillOurs` guards refused the *publish*, but
+    /// the loop between them went on requesting every segment the dead
+    /// manifest named. On a live walk that is a standing queue of requests
+    /// for pictures nobody will see, in front of the fetch that matters.
+    func testASupersededFetchStopsRequestingSegmentsAndPublishesNothing() async {
+        stubThreeSegments()
+        let client = ScriptedWorldBuilderClient()
+        let viewModel = makeViewModel(over: client)
+
+        client.send(WorldGeometryCoordinates(worldID: "w1", sessionID: "s1", revision: "g1"))
+        let firstSegmentOut = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath(0)) == 1
+        }
+        XCTAssertTrue(firstSegmentOut, "the g1 fetch never reached its first segment")
+
+        // The world moved: g2 names a different segment entirely, so any
+        // request for 1 or 2 can only be the superseded fetch's.
+        StubbedGeometryProtocol.set(
+            route: Self.manifestPath, to: (200, Self.manifest(revision: "g2", segments: [3]))
+        )
+        client.send(WorldGeometryCoordinates(worldID: "w1", sessionID: "s1", revision: "g2"))
+
+        let loaded = await waitUntil {
+            viewModel.fragmentsModel.segments.map(\.segmentIndex) == [3]
+                && viewModel.geometryChunks.count == 1
+        }
+        XCTAssertTrue(loaded, "the g2 fetch never landed; status is \(viewModel.geometryStatus)")
+        // Long enough for the superseded loop to have issued its next request
+        // if it were going to.
+        try? await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath(1))
+                + StubbedGeometryProtocol.requestCount(for: Self.segmentPath(2)),
+            0,
+            "the superseded fetch went on requesting segments of a manifest it may not draw"
+        )
+        XCTAssertTrue(
+            StubbedGeometryProtocol.wasStopped(Self.segmentPath(0)),
+            "the request in flight was left to complete rather than cancelled"
+        )
+        XCTAssertNil(
+            viewModel.geometryChunks[WorldGeometryCacheKey.make(contentHash: "h0", placementHash: nil)],
+            "a chunk of the superseded manifest was published"
+        )
+    }
+
+    /// The heartbeat. The status channel re-sends an unchanged address every
+    /// ~2 s, and a fetch for those same coordinates must survive it: cancel
+    /// it and `geometryDidChange` refuses the re-fetch under
+    /// `lastGeometryRevision`, so the world is never drawn.
+    func testAHeartbeatDoesNotCancelTheFetchItRepeats() async {
+        stubThreeSegments()
+        let client = ScriptedWorldBuilderClient()
+        let viewModel = makeViewModel(over: client)
+        let coordinates = WorldGeometryCoordinates(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        client.send(coordinates)
+        let firstSegmentOut = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath(0)) == 1
+        }
+        XCTAssertTrue(firstSegmentOut)
+
+        client.send(coordinates)
+        client.send(coordinates)
+
+        let loaded = await waitUntil(timeout: 4) { viewModel.geometryChunks.count == 3 }
+        XCTAssertTrue(loaded, "the fetch never completed; status is \(viewModel.geometryStatus)")
+        XCTAssertFalse(StubbedGeometryProtocol.wasStopped(Self.segmentPath(0)),
+                       "the heartbeat cancelled the fetch it was repeating")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 1)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.segmentPath(0)), 1)
+    }
+
+    /// A fetch that *finished* — here, failed — is not mistaken for one still
+    /// out, or the same-coordinates rule above would refuse the retry the
+    /// revision marker exists to allow.
+    func testAFinishedFetchDoesNotBlockTheNextHeartbeatsRetry() async {
+        StubbedGeometryProtocol.reset(routes: [Self.manifestPath: (404, "")])
+        let client = ScriptedWorldBuilderClient()
+        let viewModel = makeViewModel(over: client)
+        let coordinates = WorldGeometryCoordinates(worldID: "w1", sessionID: "s1", revision: "g1")
+
+        client.send(coordinates)
+        let answered = await waitUntil {
+            if case .towerReportsNone = viewModel.geometryStatus { return true }
+            return false
+        }
+        XCTAssertTrue(answered)
+
+        StubbedGeometryProtocol.set(
+            route: Self.manifestPath, to: (200, Self.manifest(revision: "g1", segments: [0]))
+        )
+        StubbedGeometryProtocol.set(route: Self.segmentPath(0), to: (200, Self.segment(0)))
+        client.send(coordinates)
+        let retried = await waitUntil { viewModel.geometryChunks.count == 1 }
+        XCTAssertTrue(retried, "the heartbeat after a failure was refused as a duplicate")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 2)
+    }
+
+    /// The world goes away while its fetch is out. Nothing on screen
+    /// describes it any more, so nothing should still be fetching for it.
+    func testForgettingTheWorldCancelsItsFetch() async {
+        stubThreeSegments()
+        let client = ScriptedWorldBuilderClient()
+        let viewModel = makeViewModel(over: client)
+        client.send(.receiving(WorldSnapshot(worldID: "w1")))
+        client.send(WorldGeometryCoordinates(worldID: "w1", sessionID: "s1", revision: "g1"))
+        let firstSegmentOut = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.segmentPath(0)) == 1
+        }
+        XCTAssertTrue(firstSegmentOut)
+
+        client.send(.idle)
+        let cancelled = await waitUntil { StubbedGeometryProtocol.wasStopped(Self.segmentPath(0)) }
+        XCTAssertTrue(cancelled, "the fetch for a forgotten world was left running")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.segmentPath(1)), 0)
+        XCTAssertEqual(viewModel.geometryStatus, .noWorld)
+        XCTAssertTrue(viewModel.geometryChunks.isEmpty)
+    }
+}
+
+// MARK: - The seeded state gets the same reading a published one does
+
+/// `WorldBuilderViewModel.init` seeds `state` from the client, and the
+/// `.noWorld → .notAddressed` step used to live only in `stateDidChange`.
+/// The client outlives the view model, so a cartridge switch and back builds
+/// a fresh view model over a client already holding a world — and the
+/// gallery said "There is no world on screen for geometry to belong to"
+/// beside a world with figures until the next heartbeat moved the state.
+@MainActor
+final class WorldBuilderViewModelSeedingTests: XCTestCase {
+
+    private static let walked = WorldSnapshot(
+        worldID: "w1",
+        keyframeCount: 463,
+        geometry: WorldGeometryReport(representation: "sparse-points", elementCount: 17_674)
+    )
+
+    func testAWorldAlreadyHeldByTheClientIsNotReportedAsNoWorld() {
+        let client = ScriptedWorldBuilderClient()
+        client.send(.finalized(Self.walked))
+
+        // Built *after* the state was sent, so the view model only ever sees
+        // it through the seed, never through `stateUpdates`.
+        let viewModel = WorldBuilderViewModel(client: client)
+
+        XCTAssertEqual(viewModel.geometryStatus, .notAddressed)
+        XCTAssertNotEqual(
+            viewModel.presentation.account.headline, "No world",
+            "a world with 463 keyframes was introduced as no world at all"
+        )
+    }
+
+    /// The negative control: a client holding no world seeds `.noWorld`, as
+    /// before, so the rule is the same one `stateDidChange` applies and not
+    /// a blanket promotion.
+    func testAClientWithNoWorldStillSeedsNoWorld() {
+        let client = ScriptedWorldBuilderClient()
+        let viewModel = WorldBuilderViewModel(client: client)
+        XCTAssertEqual(viewModel.geometryStatus, .noWorld)
+        XCTAssertEqual(viewModel.presentation.account.headline, "No world")
+    }
+}
+
+// MARK: - The saved-worlds load survives its caller
+
+/// `loadWorlds()` is called from the picker's `.task`, which SwiftUI cancels
+/// the moment the list is pushed aside for a world — the thing a person
+/// opens the picker to do. The load used to run on that task, so the
+/// cancellation reached `URLSession` and the picker came back to an empty
+/// list under "The world list could not be fetched: cancelled".
+@MainActor
+final class WorldListLoadLifecycleTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let worldsPath = "/worlds"
+    private static let listing = """
+        {"contract": "world_builder.worlds/2026-09-10",
+         "worlds": [{"world_id": "w-new", "display_name": "Kitchen walk",
+                     "created_at": 1787463000.0, "updated_at": 1787463900.5,
+                     "live": false, "sessions": []}]}
+        """
+
+    private func makeViewModel() -> WorldBuilderViewModel {
+        WorldBuilderViewModel(
+            client: UnavailableWorldBuilderClient(),
+            library: WorldListClient(
+                baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()
+            )
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    func testACancelledCallerDoesNotBlankTheList() async {
+        StubbedGeometryProtocol.reset(routes: [Self.worldsPath: (200, Self.listing)])
+        StubbedGeometryProtocol.set(delay: 0.3, for: Self.worldsPath)
+        let viewModel = makeViewModel()
+
+        let caller = Task { await viewModel.loadWorlds() }
+        let requested = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.worldsPath) == 1
+        }
+        XCTAssertTrue(requested)
+        caller.cancel()
+
+        let settled = await waitUntil { !viewModel.isLoadingWorlds && !viewModel.worlds.isEmpty }
+        XCTAssertTrue(
+            settled,
+            "the list never landed: failure=\(viewModel.worldListFailure ?? "nil") loading=\(viewModel.isLoadingWorlds)"
+        )
+        XCTAssertNil(viewModel.worldListFailure, "a cancelled caller was reported as a failed fetch")
+        XCTAssertEqual(viewModel.worlds.map(\.worldID), ["w-new"])
+        XCTAssertFalse(StubbedGeometryProtocol.wasStopped(Self.worldsPath),
+                       "the caller's cancellation reached the request")
+    }
+
+    /// The `.task` and a pull-to-refresh overlap. One request, one answer,
+    /// and `isLoadingWorlds` cleared once by the load that ran — not by
+    /// whichever of two finished last.
+    func testOverlappingLoadsShareOneRequest() async {
+        StubbedGeometryProtocol.reset(routes: [Self.worldsPath: (200, Self.listing)])
+        StubbedGeometryProtocol.set(delay: 0.2, for: Self.worldsPath)
+        let viewModel = makeViewModel()
+
+        let first = Task { await viewModel.loadWorlds() }
+        let second = Task { await viewModel.loadWorlds() }
+        await first.value
+        await second.value
+
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.worldsPath), 1)
+        XCTAssertFalse(viewModel.isLoadingWorlds)
+        XCTAssertEqual(viewModel.worlds.count, 1)
+
+        // And a load after both have finished is a fresh request, so the
+        // single-flight rule is about *overlap*, not a one-shot cache.
+        await viewModel.loadWorlds()
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.worldsPath), 2)
+    }
 }

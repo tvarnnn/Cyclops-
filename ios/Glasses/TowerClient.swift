@@ -690,6 +690,25 @@ nonisolated enum TowerHealthState: Equatable, Sendable {
 final class TowerClient: NSObject, ObservableObject {
     @Published private(set) var status: TowerStatus = .offline
 
+    /// Whether the automatic reconnect schedule has been spent and this
+    /// client is no longer trying.
+    ///
+    /// `status` cannot say this. It is `.failed(message)` from the first
+    /// dropped socket to the last refused retry and after, so a screen
+    /// reading it could only say "not connected" — the same words while the
+    /// phone was still retrying and after it had stopped. The only signal at
+    /// the give-up point was a log line, and the wearer does not read the
+    /// log. The World Builder capture control reads this to say, instead,
+    /// that a tap on Connect is now the only thing that will bring the Tower
+    /// back.
+    ///
+    /// Set in exactly one place, the give-up branch of `scheduleReconnect`.
+    /// Cleared wherever a socket is actually opened — `openConnection`, which
+    /// every connect path ends in — and by `cancelReconnect`, because a
+    /// deliberate disconnect is not the phone giving up. It cannot survive a
+    /// successful reconnect: no reconnect happens without a socket opening.
+    @Published private(set) var reconnectGaveUp = false
+
     #if DEBUG
     /// How many `frame_result` messages the receive loop has processed — the
     /// only end-to-end proof that the Tower received a frame and replied.
@@ -1049,10 +1068,21 @@ final class TowerClient: NSObject, ObservableObject {
     /// forever behind a pill that never settles, and the app has a manual
     /// Connect control for the deliberate retry.
     ///
-    /// The delays total 15.5 s, but each attempt also carries up to the 6 s
-    /// pong timeout in `validateConnection`, so giving up against a dead
-    /// endpoint takes up to ~45 s.
+    /// Five attempts, delayed 0.5, 1, 2, 4 and 8 s — 15.5 s of waiting —
+    /// and each attempt is bounded by the handshake watchdog
+    /// (`handshakeLegTimeout × 2`, 12 s as shipped), not by the per-leg
+    /// timeouts it backs up. So the give-up point depends on how the host
+    /// fails: ~16 s against one that refuses the TCP connection outright,
+    /// and up to ~75 s against one that accepts TCP and never completes the
+    /// WebSocket upgrade. (An earlier version of this comment quoted a 6 s
+    /// pong timeout and ~45 s; the watchdog replaced that bound.)
     private static let reconnectBackoff: [TimeInterval] = [0.5, 1, 2, 4, 8]
+
+    /// The schedule this instance runs. The shipped one unless a test
+    /// substitutes a shorter one — the give-up point is observable behaviour,
+    /// and a test that reached it by sleeping through the real schedule
+    /// would cost the suite the better part of a minute per case.
+    private let reconnectBackoff: [TimeInterval]
 
     /// The shipped send-window capacity, as the arithmetic that justifies it
     /// rather than as a literal.
@@ -1071,6 +1101,7 @@ final class TowerClient: NSObject, ObservableObject {
         )
         self.autoReconnect = false
         self.handshakeLegTimeout = Self.defaultHandshakeLegTimeout
+        self.reconnectBackoff = Self.reconnectBackoff
         super.init()
     }
 
@@ -1082,8 +1113,10 @@ final class TowerClient: NSObject, ObservableObject {
     ///   - stallTimeout: Overridable so tests can trip stall detection without
     ///     waiting `sendStallTimeout` seconds. `nil` uses the shipped value.
     ///   - autoReconnect: See the property of the same name.
+    ///   - reconnectBackoff: Overridable so a test can spend the reconnect
+    ///     budget in well under a second. `nil` uses the shipped schedule.
     ///
-    /// Both overrides are `nil`-defaulted and resolved in the body rather than
+    /// The overrides are `nil`-defaulted and resolved in the body rather than
     /// being computed default arguments: default arguments are evaluated
     /// outside this type's actor, and `defaultMaxFramesInFlight` reads
     /// main-actor-isolated configuration. `GlassesConnection.init` avoids the
@@ -1093,10 +1126,12 @@ final class TowerClient: NSObject, ObservableObject {
         maxFramesInFlight: Int? = nil,
         stallTimeout: TimeInterval? = nil,
         autoReconnect: Bool = false,
-        handshakeLegTimeout: Int? = nil
+        handshakeLegTimeout: Int? = nil,
+        reconnectBackoff: [TimeInterval]? = nil
     ) {
         self.metrics = metrics
         self.handshakeLegTimeout = handshakeLegTimeout ?? Self.defaultHandshakeLegTimeout
+        self.reconnectBackoff = reconnectBackoff ?? Self.reconnectBackoff
         self.sendWindow = SendWindow(
             capacity: maxFramesInFlight ?? Self.defaultMaxFramesInFlight,
             stallTimeout: stallTimeout ?? Self.sendStallTimeout
@@ -1191,6 +1226,11 @@ final class TowerClient: NSObject, ObservableObject {
 
         log("connection attempt: \(url)")
         status = .connecting
+        // A socket is being opened, so "stopped trying" is no longer true —
+        // whoever asked for it. Here and not in `connect(to:)`, so a reconnect
+        // and `connectIfIdle` clear it too; after the `.connecting` guard, so
+        // a redundant tap that opens nothing changes nothing.
+        reconnectGaveUp = false
 
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.session = session
@@ -1264,6 +1304,9 @@ final class TowerClient: NSObject, ObservableObject {
         reconnectURL = nil
         reconnectAttempt = 0
         becameOnlineAt = nil
+        // The user asked for this connection to end. That is not the phone
+        // giving up, and a screen must not say it was.
+        reconnectGaveUp = false
     }
 
     /// Queues one delayed reconnect attempt, if automatic reconnect is enabled
@@ -1285,12 +1328,14 @@ final class TowerClient: NSObject, ObservableObject {
         }
         becameOnlineAt = nil
 
-        guard reconnectAttempt < Self.reconnectBackoff.count else {
+        guard reconnectAttempt < reconnectBackoff.count else {
             log("reconnect given up after \(reconnectAttempt) attempts — use Connect to retry")
+            // `status` stays `.failed` and cannot carry this; see the property.
+            reconnectGaveUp = true
             return
         }
 
-        let delay = Self.reconnectBackoff[reconnectAttempt]
+        let delay = reconnectBackoff[reconnectAttempt]
         reconnectAttempt += 1
         let attempt = reconnectAttempt
         log("reconnect attempt \(attempt) scheduled in \(delay)s")

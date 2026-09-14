@@ -285,7 +285,7 @@ nonisolated extension WorldRenderFetchError {
             // FastAPI's default for a path it does not serve, which is never
             // one of the contract's five sentences. That is a Tower older
             // than the route, not a world with nothing built.
-            return "This Tower does not serve the picture route; it predates WORLD-BUILDER-WORLDS.md §4."
+            return "This Tower is too old to serve a picture of a saved world. Its worlds are still listed and their diagnostics still open."
         case .absent(let detail?):
             // No "yet": the detail says which — a world still being built
             // answers "no geometry yet", and a world that does not exist
@@ -623,17 +623,33 @@ struct WorldRenderWebView: UIViewRepresentable {
         /// **Cancellations are not failures here.** `decidePolicyFor` refuses
         /// every navigation but the first, by design, and a refusal surfaces as
         /// a provisional-navigation failure with `NSURLErrorCancelled` or
-        /// WebKit's `frameLoadInterrupted`. Reporting those would turn the
-        /// navigation policy doing its job into "the page could not be drawn"
-        /// — on a page that is on screen and working.
-        private func report(_ error: Error) {
+        /// WebKit's "frame load interrupted by policy change". Reporting those
+        /// would turn the navigation policy doing its job into "the page could
+        /// not be drawn" — on a page that is on screen and working.
+        ///
+        /// The WebKit one is spelled out by hand because the public `WKError`
+        /// enum has no case for it: WebKit reports a policy refusal under its
+        /// legacy `WebKitErrorDomain` with code 102
+        /// (`WebKitErrorFrameLoadInterruptedByPolicyChange`), and neither the
+        /// domain string nor the code is exported to Swift on iOS. The first
+        /// version of this line named a `WKError.Code.frameLoadInterrupted`
+        /// that does not exist, and the branch did not compile until the Mac
+        /// gate caught it.
+        nonisolated static let webKitLegacyErrorDomain = "WebKitErrorDomain"
+        nonisolated static let webKitFrameLoadInterruptedByPolicyChange = 102
+
+        /// Whether a navigation error is the policy refusing a navigation
+        /// (not a failure) rather than the page failing to load (a failure).
+        nonisolated static func isNavigationCancellation(_ error: Error) -> Bool {
             let ns = error as NSError
-            let isCancellation =
-                (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled)
-                || (ns.domain == WKError.errorDomain
-                    && ns.code == WKError.Code.frameLoadInterrupted.rawValue)
-            guard !isCancellation else { return }
-            onEvent?(.failed(ns.localizedDescription))
+            return (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled)
+                || (ns.domain == webKitLegacyErrorDomain
+                    && ns.code == webKitFrameLoadInterruptedByPolicyChange)
+        }
+
+        private func report(_ error: Error) {
+            guard !Self.isNavigationCancellation(error) else { return }
+            onEvent?(.failed((error as NSError).localizedDescription))
         }
 
         /// WebKit's content process was killed — under memory pressure, a
