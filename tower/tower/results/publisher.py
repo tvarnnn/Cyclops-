@@ -36,6 +36,8 @@ correctness, because it has no reference to any of them.
 
 import asyncio
 import logging
+import threading
+import time
 
 from tower.results.contracts import RESULT_TYPE_STATUS
 from tower.results.envelope import ResultEnvelope
@@ -98,6 +100,11 @@ TOTAL_SEND_TIMEOUT_S = LOCK_TIMEOUT_S + SEND_TIMEOUT_S
 SNAPSHOT_TIMEOUT_SECONDS = 10.0
 
 MAX_CONSECUTIVE_TARGET_FAILURES = 3
+# A snapshot still running this many deadlines after it was dispatched is
+# ABANDONED: forgotten by the hub, so the next pass dispatches the target
+# afresh, on the chance the fault has cleared. The abandoned thread is a
+# daemon and finishes, or does not, on its own. See `_dispatch`.
+SNAPSHOT_ABANDON_MULTIPLIER = 3
 
 # Per connection. A client with more than this many open subscriptions is
 # either confused or hostile; either way the answer is a refusal, not
@@ -483,6 +490,17 @@ class ResultHub:
         self._failures: dict = {}
         # One running snapshot per target, at most. See `poll_once`.
         self._in_flight: dict = {}
+        # When each in-flight snapshot was dispatched, by target, so a
+        # pass can tell "still running past the deadline" from "started
+        # a moment ago by someone else".
+        self._dispatched_at: dict = {}
+        # Passes do not interleave. See `poll_once`.
+        self._pass_lock = asyncio.Lock()
+        # The subscription ids watching each target when its in-flight
+        # snapshot was dispatched. A result whose watchers have ALL gone
+        # was computed for nobody who is still here. See the discard rule
+        # in `_poll_once_locked`.
+        self._watchers_at_dispatch: dict = {}
         # Set after every completed poll pass. Tests wait on this instead
         # of sleeping, which is what makes them deterministic.
         self.polled = asyncio.Event()
@@ -512,6 +530,20 @@ class ResultHub:
             # join belongs.
             task, self._task = self._task, None
             task.cancel()
+            # And forget what the cancelled pass would have collected. A
+            # snapshot that finishes now finishes for nobody: a done
+            # future left here was handed to the NEXT subscription as its
+            # first snapshot, computed before that phone connected -- a
+            # reviewer measured 4.0 s old, against a newer revision on
+            # disk, on a real socket. A still-running one stays, so the
+            # target is never computed twice at once; its watchers are
+            # cleared, so the pass that finds it done discards it unless
+            # a subscribe has joined it since.
+            for target in list(self._in_flight):
+                if self._in_flight[target].done():
+                    self._forget(target)
+                else:
+                    self._watchers_at_dispatch[target] = set()
 
     async def shutdown(self) -> None:
         """Stop the reader on app teardown. Never raises.
@@ -571,6 +603,127 @@ class ResultHub:
                         "reader failure"
                     )
 
+    async def first_snapshot(self, subscription, *, timeout: float):
+        """The snapshot a new subscription is answered with, WITHOUT a new thread
+        if one is already computing it.
+
+        `results_ws` used to run its own `asyncio.to_thread` here under a
+        `wait_for`. The deadline stopped the socket hanging, and left the
+        thread running -- "bounded at one per subscribe attempt, which is
+        client-driven". It is client-driven at the fastest rate the client
+        has: iOS's `sendStallTimeout` is 2 s, so while the first snapshot
+        stalls the phone replaces the socket and re-subscribes every ~2.5 s,
+        and each attempt minted a thread. A reviewer drove that against a
+        wedged read: **24 executor threads in 60 s, then `stream_start`
+        never answered for any phone** -- the exact exhaustion the poll
+        loop had just been cured of, one route over.
+
+        Sharing `_in_flight` bounds it at one thread per target across
+        BOTH paths. A subscribe that finds a snapshot already running waits
+        on that one, for whatever is LEFT of its deadline; if it is still
+        running the caller gets `TimeoutError` and the future stays where
+        it is for the next pass to collect. Nothing is cancelled and
+        nothing is duplicated.
+
+        Two things it must NOT do, both measured by the next reviewer:
+
+        * Wait on a future that is already past its deadline. This runs
+          inline in the connection's message loop, and every subscribe to
+          a wedged target was sitting here for the full 10 s -- six
+          consecutive subscribes, all timing out, three of them after the
+          fault had cleared -- while the frames behind it went
+          unanswered. A future older than the deadline is a known wedge;
+          the answer is immediate.
+        * Hand over a future that is already DONE. Nobody collected it,
+          so it was computed for a subscription that has gone -- a phone
+          that dropped mid-pass -- and it is stale by construction: a
+          reconnected phone was given a revision 4.0 s old while disk
+          held a newer one, and told its own current cursor was "stale".
+          It is discarded and the target dispatched afresh.
+        """
+        target = subscription.target
+        future = self._in_flight.get(target)
+        if future is not None and future.done():
+            self._forget(target)
+            future = None
+        if future is None:
+            future = self._dispatch(target, subscription, {subscription})
+        else:
+            self._watchers_at_dispatch.setdefault(target, set()).add(subscription)
+        age = self._clock() - self._dispatched_at.get(target, self._clock())
+        remaining = min(timeout, SNAPSHOT_TIMEOUT_SECONDS - age)
+        if remaining > 0:
+            await asyncio.wait({future}, timeout=remaining)
+        if not future.done():
+            raise TimeoutError(
+                f"the first snapshot for {target} is still running after "
+                f"{max(age, 0.0) + max(remaining, 0.0):.0f}s"
+            )
+        if self._in_flight.get(target) is future:
+            self._forget(target)
+        return future.result()
+
+    def _dispatch(self, target, sample, watchers):
+        """Start ONE snapshot for `target` on a thread of its own, and record it.
+
+        A plain daemon thread, not `asyncio.to_thread`, for two reasons a
+        reviewer measured. The default executor is shared with the capture
+        path -- `stream_start`, the disconnect teardown, `supervisor.shutdown`
+        -- and a snapshot thread that never returns must not be able to
+        take a worker from it (this is what turned one wedged read into a
+        Tower that answered nobody, twice). And `asyncio.run` joins the
+        default executor's threads on the way out: a Tower shut down with
+        one wedged snapshot thread sat at "Application shutdown complete"
+        for **300 s** before the interpreter gave up on the join. A daemon
+        thread is joined by nobody. The result crosses back to the loop
+        with `call_soon_threadsafe`, and is dropped on the floor if the
+        loop has closed or the hub has since abandoned the future.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def deliver(result, error):
+            if future.cancelled():
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+        def run():
+            try:
+                result = self._snapshot_for(
+                    sample.cartridge, sample.result_type,
+                    sample.world_id, sample.session_id,
+                )
+            except BaseException as exc:  # noqa: BLE001 -- crosses a thread
+                result, error = None, exc
+            else:
+                error = None
+            try:
+                loop.call_soon_threadsafe(deliver, result, error)
+            except RuntimeError:
+                # The loop is closed: the Tower is gone, and so is
+                # anyone who wanted this.
+                pass
+
+        threading.Thread(
+            target=run, name=f"tower-result-snapshot", daemon=True
+        ).start()
+        self._in_flight[target] = future
+        self._dispatched_at[target] = self._clock()
+        self._watchers_at_dispatch[target] = set(watchers)
+        return future
+
+    def _forget(self, target) -> None:
+        """Drop a target's in-flight record, retrieving a raised exception
+        so asyncio does not log "Future exception was never retrieved"."""
+        future = self._in_flight.pop(target, None)
+        self._dispatched_at.pop(target, None)
+        self._watchers_at_dispatch.pop(target, None)
+        if future is not None and future.done() and not future.cancelled():
+            future.exception()
+
     def _note_failure(self, target, reason: str, *, log=None) -> None:
         """Count one failure for a target, and tell its subscribers after three.
 
@@ -599,12 +752,35 @@ class ResultHub:
         self._failures.pop(target, None)
 
     async def poll_once(self) -> None:
+        """One pass over every watched target. Passes never interleave.
+
+        **A RACE THAT WITHHELD DELIVERIES, found by the suite.** The
+        background loop and a forced pass (`pump()` in the tests, with
+        the heartbeat set to zero so it MUST deliver) ran concurrently on
+        one loop. The background pass dispatched a target's snapshot; the
+        forced pass, arriving a moment later, found that future "already
+        in flight", counted it a failure and returned without offering
+        anything; the background pass then completed it and offered under
+        the ordinary heartbeat rule, which sends nothing for an unchanged
+        world. Net: a pass that had to deliver delivered nothing, and the
+        waiting test hung the whole run for 33 minutes at
+        `test_a_partially_deleted_world_reports_honestly_and_does_not_crash`.
+        Before the in-flight table every pass owned its own thread, so the
+        race could not exist; it is the table's cost, paid here with a
+        lock. A pass waiting for the previous one to finish is cheap --
+        passes are ~40 ms on the real root -- and correct: the second pass
+        then finds the target free, or done, and does its own work.
+        """
+        async with self._pass_lock:
+            await self._poll_once_locked()
+
+    async def _poll_once_locked(self) -> None:
         """One pass: compute each distinct target once, offer it to all.
 
-        Snapshot computation is pushed off the event loop with
-        `asyncio.to_thread`, because it reads and JSON-parses files and
-        the loop is also answering frames. A disk stall must cost this
-        channel latency, never the frame path.
+        Snapshot computation is pushed off the event loop onto a thread
+        per dispatch (`_dispatch`), because it reads and JSON-parses files
+        and the loop is also answering frames. A disk stall must cost
+        this channel latency, never the frame path.
         """
         targets = {}
         for channel in self._channels:
@@ -614,23 +790,26 @@ class ResultHub:
         # Forget the failure counts of targets nobody is watching any
         # more. `_failures` was pruned on success and on escalation, but
         # not when a subscription simply went away, so a target that
-        # failed once and was then unsubscribed left an entry forever.
+        # failed once and was then unsubscribed left an entry forever --
+        # and, when the target came back, escalated it after ONE failure
+        # instead of three (the first version pruned only when the dict
+        # had outgrown the target set, which let a count survive a
+        # reconnect). Every pass, unconditionally: it is a dict the size
+        # of the live targets.
         #
         # It is small and it is genuinely unbounded: `Subscription.target`
         # includes the client-chosen `world_id` and `session_id`, so a
         # connection can mint distinct targets at will. Bounded now by the
-        # live subscriptions rather than by the client's imagination. The
-        # comment at the field says "pruned every pass"; this is what
-        # makes that true.
-        if len(self._failures) > len(targets):
+        # live subscriptions rather than by the client's imagination.
+        if self._failures:
             self._failures = {
                 target: count
                 for target, count in self._failures.items()
                 if target in targets
             }
 
-        # ONE SNAPSHOT IN FLIGHT PER TARGET, ALL TARGETS AT ONCE, ONE
-        # DEADLINE FOR THE PASS.
+        # ONE SNAPSHOT IN FLIGHT PER TARGET, ALL TARGETS AT ONCE, EACH
+        # OFFERED THE MOMENT IT LANDS, ONE DEADLINE FOR THE PASS.
         #
         # Three defects lived in the loop this replaces, and the second
         # was introduced by the fix for the first.
@@ -658,86 +837,195 @@ class ResultHub:
         #
         # Third, the sequential shape meant the 10 s deadline only turned
         # ">10 s" into a failure; a 2 s producer still cost everyone 2 s.
+        # The version after it waited for ALL of the pass's futures before
+        # offering any, which turned sum into max and was not a fix: a
+        # reviewer measured CV Lab, Object Memory and Document Memory at
+        # 7 deliveries in 20 s beside a 2.1 s World Builder read -- 17.5%
+        # of their cadence -- and a full 10 s blackout for every cartridge
+        # on the pass that first meets a wedge. Each future is now offered
+        # as it completes; the slow one costs only its own subscribers.
         #
         # So: a target that already has a snapshot running is NOT
         # dispatched again -- its future is kept in `_in_flight` and
         # simply checked -- which bounds the threads at one per target by
         # construction, however long a read wedges. Every target that is
-        # free is dispatched, and the pass waits on all of them together
-        # with one bounded `asyncio.wait`, which does not cancel: a slow
+        # free is dispatched, and the pass waits on this pass's own
+        # futures with a bounded wait that does not cancel: a slow
         # snapshot survives into the next pass and is delivered when it
-        # lands, as the freshest state there is. The pass length is the
-        # SLOWEST target capped at the deadline, not the sum. A target
-        # still pending at the deadline counts one failure, and the
-        # existing escalation tells its subscribers after three.
+        # lands, as the freshest state there is. A target still pending
+        # at the deadline counts one failure, and the existing escalation
+        # tells its subscribers after three. A target still pending
+        # `SNAPSHOT_ABANDON_MULTIPLIER` deadlines later is forgotten and
+        # dispatched afresh next pass -- the version before this never
+        # re-dispatched, so a thread that never returned poisoned its
+        # target for the life of the process, and a fault that cleared
+        # was never noticed.
+        watchers_now: dict = {}
+        for channel in self._channels:
+            for subscription in channel._subscriptions.values():
+                watchers_now.setdefault(subscription.target, set()).add(
+                    subscription
+                )
         for target in list(self._in_flight):
             if target not in targets and self._in_flight[target].done():
                 # Nobody is watching this any more and its thread has
                 # finished: forget it. A still-running thread for a
                 # departed target stays until it finishes, so it can
                 # never be dispatched twice.
-                del self._in_flight[target]
+                self._forget(target)
 
+        now = self._clock()
         waiting: dict = {}
+        fresh: set = set()
         for target, sample in targets.items():
             future = self._in_flight.get(target)
-            if future is None or future.done() and target not in self._in_flight:
-                future = None
-            if future is None:
-                future = asyncio.ensure_future(
-                    asyncio.to_thread(
-                        self._snapshot_for, sample.cartridge,
-                        sample.result_type, sample.world_id,
-                        sample.session_id,
-                    )
+            if (
+                future is not None
+                and future.done()
+                and not (
+                    self._watchers_at_dispatch.get(target, set())
+                    & watchers_now.get(target, set())
                 )
-                self._in_flight[target] = future
+            ):
+                # DONE, AND EVERYONE IT WAS COMPUTED FOR HAS GONE: discarded.
+                #
+                # The test is the WATCHERS, not "did a pass run while nobody
+                # watched" -- no pass may run in that gap at all (the phone
+                # drops and returns between two polls), and the first
+                # version of this rule missed exactly that and handed a
+                # reconnected phone the stale result. And not merely
+                # `done()` either: a target watched by the same subscriber
+                # throughout, whose snapshot simply finished after its
+                # pass's deadline, is the freshest state there is; the
+                # version before that discarded it and re-dispatched -- one
+                # extra producer entry, caught by the leak test's count.
+                #
+                # The watchers are the `Subscription` OBJECTS, not their
+                # ids: ids are minted per connection, so every phone's
+                # first subscription is "sub-1", and a reconnected phone's
+                # "sub-1" matched the dead socket's "sub-1" -- a false
+                # "still watching" for exactly the case this rule exists
+                # for. A reviewer parametrised the shipped test with the
+                # reused id and it failed.
+                #
+                # This is a snapshot computed for a subscription that has
+                # since gone -- the target left `targets` for a pass while
+                # its thread was still running, and came back. Delivering
+                # it sent a stale revision to a NEW subscription: a
+                # reviewer measured `rev 1` then **`rev 0`**, 7.5 s old,
+                # on a reconnected phone's default target, which is the
+                # one every phone subscribes to. Age was unbounded, not
+                # "at most one poll" as the previous comment claimed.
+                self._forget(target)
+                future = None
+            elif future is not None and not future.done():
+                age = now - self._dispatched_at.get(target, now)
+                if age >= SNAPSHOT_ABANDON_MULTIPLIER * SNAPSHOT_TIMEOUT_SECONDS:
+                    # ABANDONED. Its thread may still return, into a
+                    # future nothing references any more.
+                    logger.warning(
+                        "[Tower][Results] snapshot for %s has been running "
+                        "for %.0fs; giving up on that thread and trying "
+                        "the target afresh",
+                        target, age,
+                    )
+                    self._forget(target)
+                    future = None
+            if future is None:
+                future = self._dispatch(
+                    target, sample, watchers_now.get(target, set())
+                )
+                fresh.add(future)
             waiting[future] = target
 
-        if waiting:
-            await asyncio.wait(
-                list(waiting), timeout=SNAPSHOT_TIMEOUT_SECONDS
+        offered: set = set()
+
+        def collect(done_futures) -> None:
+            # Done, one way or the other: this target is free for the
+            # next pass whether it succeeded or raised.
+            moment = self._clock()
+            for future in done_futures:
+                target = waiting[future]
+                offered.add(future)
+                self._forget(target)
+                try:
+                    snapshot = future.result()
+                except Exception as exc:
+                    # One unreadable target must not stop the others, and
+                    # must not stop the loop. The producer already turns
+                    # expected storage failures into an `unavailable`
+                    # payload; reaching here means something genuinely
+                    # unexpected.
+                    logger.exception(
+                        "[Tower][Results] could not build a snapshot for %s",
+                        target,
+                    )
+                    self._note_failure(
+                        target,
+                        f"the Tower could not read this cartridge's state; "
+                        f"the last failure was {type(exc).__name__}",
+                    )
+                    continue
+                self._failures.pop(target, None)
+                for channel in list(self._channels):
+                    channel.offer(
+                        target, snapshot, now=moment,
+                        heartbeat=self._heartbeat_seconds,
+                    )
+
+        # Carried over and already done -- finished after its own pass's
+        # deadline, still watched: the freshest state there is.
+        collect([f for f in waiting if f.done() and f not in fresh])
+
+        # ONLY THE FUTURES DISPATCHED THIS PASS are waited on. A
+        # carried-over future that is already past the deadline is not
+        # waited on again: the previous version put it back into the wait
+        # every pass, so one wedged target held EVERY pass at the full
+        # deadline until its subscribers were told -- a reviewer measured
+        # the healthy cartridges dropping from ~160 deliveries to 38 in
+        # 16 s. A wedge now costs the others nothing after its first
+        # pass; it is checked with `done()` and counted below.
+        #
+        # And each is offered AS IT LANDS: `FIRST_COMPLETED`, in a loop,
+        # against a wall-clock budget (the hub's own clock may be a test's
+        # frozen one, and a frozen clock must not make this loop wait the
+        # full deadline again and again).
+        pending = set(fresh)
+        budget_ends = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        while pending:
+            remaining = budget_ends - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
             )
+            collect(done)
 
         now = self._clock()
         for future, target in waiting.items():
-            if not future.done():
-                self._note_failure(
-                    target,
-                    f"the Tower could not build this cartridge's state within "
-                    f"{SNAPSHOT_TIMEOUT_SECONDS:.0f}s",
-                    log=(
-                        "[Tower][Results] snapshot for %s has exceeded %.1fs "
-                        "and is still running; the other cartridges are "
-                        "being served without it",
-                        target, SNAPSHOT_TIMEOUT_SECONDS,
-                    ),
-                )
+            if future in offered or future.done():
                 continue
-            # Done, one way or the other: this target is free for the
-            # next pass whether it succeeded or raised.
-            self._in_flight.pop(target, None)
-            try:
-                snapshot = future.result()
-            except Exception as exc:
-                # One unreadable target must not stop the others, and must
-                # not stop the loop. The producer already turns expected
-                # storage failures into an `unavailable` payload; reaching
-                # here means something genuinely unexpected.
-                logger.exception(
-                    "[Tower][Results] could not build a snapshot for %s", target
-                )
-                self._note_failure(
-                    target,
-                    f"the Tower could not read this cartridge's state; the "
-                    f"last failure was {type(exc).__name__}",
-                )
+            # ONLY ONCE IT HAS ACTUALLY AGED PAST THE DEADLINE. A future
+            # dispatched moments ago by a subscribe (`first_snapshot`)
+            # or by the previous pass is not a wedge, and the first
+            # version counted it as one -- logging "has exceeded
+            # 10.0s" six milliseconds after the connection opened.
+            # Three subscribes during three passes would have told a
+            # healthy target's subscribers it had failed.
+            age = now - self._dispatched_at.get(target, now)
+            if age < SNAPSHOT_TIMEOUT_SECONDS:
                 continue
-            self._failures.pop(target, None)
-            for channel in list(self._channels):
-                channel.offer(
-                    target, snapshot, now=now, heartbeat=self._heartbeat_seconds
-                )
+            self._note_failure(
+                target,
+                f"the Tower could not build this cartridge's state within "
+                f"{SNAPSHOT_TIMEOUT_SECONDS:.0f}s",
+                log=(
+                    "[Tower][Results] snapshot for %s has exceeded %.1fs "
+                    "and is still running; the other cartridges are "
+                    "being served without it",
+                    target, SNAPSHOT_TIMEOUT_SECONDS,
+                ),
+            )
 
         self.polled.set()
         self.polled.clear()

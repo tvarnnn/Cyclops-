@@ -189,7 +189,7 @@ POST /cartridges/{cartridge}/session/{start|pause|resume|stop}
 ```
 
 Response carries `contract`, `state`, `state_means`, `states`, `actions`,
-`supported`, `session_id`, `started_at`, `changed_at`, `following`,
+`supported`, `session_id`, `started_at`, `changed_at`, `requested_at` (additive, 2026-09-14: the last `start` asked for, whether or not it changed anything), `following`,
 `captures`, and on POST also `accepted`, `changed`, `attached_capture_id`.
 
 **`state_means: "intent-not-liveness"`, and this is the field a client

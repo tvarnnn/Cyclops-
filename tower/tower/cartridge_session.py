@@ -184,6 +184,13 @@ class CartridgeSession:
         self._session_id: str | None = None
         self._started_at: float | None = None
         self._changed_at: float | None = None
+        # When Start was last ASKED FOR, whether or not it changed
+        # anything. `changed_at` moves only on a transition, so a Start
+        # on an already-active session leaves it alone -- and the one
+        # question that needs "has anybody asked for this since?"
+        # (`ws._stop_world_builder_after_grace`) is exactly the case
+        # where the session is still active.
+        self._requested_at: float | None = None
         # Every capture this session's worker has been seen following, in
         # the order they were first seen. Accumulated rather than
         # declared: a session started before the walk attaches nothing
@@ -300,6 +307,7 @@ class CartridgeSession:
         """
         with self._lock:
             self._require_supported()
+            self._requested_at = self._clock()
             if self._state == ACTIVE:
                 return self._result(changed=False)
             if self._state == STOPPED:
@@ -424,6 +432,8 @@ class CartridgeSession:
             "session_id": self._session_id,
             "started_at": self._started_at,
             "changed_at": self._changed_at,
+            # Every Start, including one that changed nothing. Additive.
+            "requested_at": self._requested_at,
             # What the wearer asked for is `state`. What is actually
             # happening is this. An ACTIVE session with an empty
             # `following` while a capture is recording is a producer that

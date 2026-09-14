@@ -4,7 +4,7 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP
+from tower.capture import END_REASON_DISCONNECT, END_REASON_STOP, RESUME_GRACE_SECONDS
 from tower.results.contracts import CARTRIDGE_WORLD_BUILDER
 from tower.frames import FrameError, parse_and_decode_frame
 from tower.metrics import SessionMetrics
@@ -535,18 +535,190 @@ async def _close_cartridge_streams(websocket, owner) -> None:
     its work, leaving a stream open in a live cartridge's book for ever.
     The thread guarantees the close happens; the await is best effort.
     """
+    await _tear_down_after_disconnect(
+        websocket, owner, closed_captures=(), stop_sessions=False
+    )
+
+
+async def _tear_down_after_disconnect(
+    websocket, owner, *, closed_captures, stop_sessions: bool
+) -> None:
+    """Everything a dropped connection owes the cartridges, on ONE thread
+    that is started before the handler can be cancelled again.
+
+    In order, as the polite path does them: the worker supervisor hears
+    the closed captures, the live cartridges hear the stream close, and
+    -- when this was the last client -- the cartridge sessions are
+    stopped. Each of the three can block (a detach grace, an OCR flush,
+    a supervisor lock held across a grace), which is why none of them
+    may run on the loop.
+
+    **And why they may not each get their own `await`.** The stream
+    close above learned it the hard way for itself; the session stop
+    then went the same way. Under Starlette's test client the disconnect
+    is queued and the handler task is cancelled in the same breath, and
+    anyio re-cancels the task at EVERY await until it exits. The stop sat
+    behind three awaits -- `channels.close()`, the supervisor
+    notification, the stream close -- so whichever of them suspended
+    first took the cancellation and the `finally` never reached it:
+    `test_the_session_stops_when_the_last_connection_closes` failed six
+    times in eight, and had been failing in every full run since the
+    stop was moved off the loop, filed as load. Under uvicorn a real
+    disconnect is a `WebSocketDisconnect` and the chain runs to the end;
+    the cancellation path is shutdown and the test client. One thread
+    carries the whole chain either way; the await is best effort.
+    """
     import threading
 
     done = threading.Event()
 
     def run():
         try:
+            _notify_captures_closed(websocket, closed_captures)
             _tell_cartridges_the_stream_closed(websocket, owner)
+            if stop_sessions:
+                _stop_cartridge_sessions(websocket)
         finally:
             done.set()
 
     threading.Thread(target=run, name="tower-stream-teardown", daemon=True).start()
     await asyncio.to_thread(done.wait, 30.0)
+
+
+# How long after the resume grace expires the deferred World Builder stop
+# is revisited. The grace is the builder's own wait for a successor; the
+# margin is for the builder to finalise and exit before the session is
+# told nobody is coming.
+_DEFERRED_STOP_MARGIN_SECONDS = 15.0
+
+
+def _a_capture_is_waiting_for_its_phone(websocket) -> bool:
+    """A capture that ended by disconnect inside its resume grace.
+
+    A walk WAITING FOR ITS PHONE, not a walk that is over: World
+    Builder's builder is already sitting in `_await_successor` for it.
+    """
+    return any(
+        observer.resumable_capture() is not None
+        for observer in _frame_observers(websocket)
+    )
+
+
+def _world_builder_deferral(websocket):
+    """`(session_id, requested_at)` of the World Builder walk the
+    last-client stop is about to leave running, or None if it is not
+    about to leave one running.
+
+    Asked on the event loop, before the teardown thread starts, so the
+    follow-up is armed synchronously and cannot be lost to a
+    cancellation -- and asked with the same two facts
+    `_stop_cartridge_sessions` will use a few milliseconds later.
+    """
+    sessions = getattr(websocket.app.state, "cartridge_sessions", None) or {}
+    world_builder = sessions.get(CARTRIDGE_WORLD_BUILDER)
+    if world_builder is None or world_builder.state == "stopped":
+        return None
+    if not _a_capture_is_waiting_for_its_phone(websocket):
+        return None
+    snapshot = world_builder.snapshot() or {}
+    return snapshot.get("session_id"), snapshot.get("requested_at")
+
+
+def _arm_world_builder_follow_up(websocket) -> None:
+    """Schedule the deferred stop -- only when a deferral is happening,
+    and once per deferred walk.
+
+    **The first version armed this on EVERY last-client disconnect and
+    the follow-up stopped EVERY cartridge session.** A reviewer drove it
+    on a real Tower: phone A connected and left without ever touching
+    World Builder; phone B arrived five seconds later, started Object
+    Memory and walked; at drop+106 s the Tower SIGBREAK'd B's producer
+    mid-walk and logged "the last client connection closed, so nobody is
+    asking for it any more" about a phone that was streaming. That is
+    the one failure this whole design exists to rule out -- a World
+    Builder mechanism reaching into another cartridge -- and it shipped
+    in the fix for a World Builder hole. Two gates now: nothing is armed
+    unless the stop below is actually leaving a World Builder walk
+    running, and what is armed stops that walk and nothing else.
+
+    **Once per walk, not once per disconnect.** The same reviewer
+    traced that a phone in bad WiFi -- reconnecting and dropping every
+    60 s -- restarted the 105 s clock on every drop, so the follow-up
+    never fired and the hole it closes stayed open indefinitely. A
+    pending follow-up for the same deferred walk is left to its
+    original deadline; it decides then, on the facts then.
+    """
+    deferral = _world_builder_deferral(websocket)
+    if deferral is None:
+        return
+    session_id, requested_at = deferral
+    state = websocket.app.state
+    previous = getattr(state, "world_builder_grace_stop", None)
+    if previous is not None and not previous.done():
+        if getattr(state, "world_builder_grace_stop_for", None) == session_id:
+            return
+        previous.cancel()
+    state.world_builder_grace_stop_for = session_id
+    state.world_builder_grace_stop = asyncio.create_task(
+        _stop_world_builder_after_grace(websocket, session_id, requested_at)
+    )
+
+
+async def _stop_world_builder_after_grace(
+    websocket, deferred_session_id, requested_before
+) -> None:
+    """Stop the deferred World Builder walk once it can no longer resume.
+
+    The deferral in `_stop_cartridge_sessions` is correct for the phone
+    that comes back and was a hole for the phone that does not: nothing
+    ever revisited it, so a walk whose wearer's battery died on the World
+    Builder screen left that session `active` forever -- and the NEXT
+    phone to open ANY screen and stream got a builder attached that
+    nobody asked for. A reviewer reproduced it end to end: a different
+    client, no `session/start` anywhere, and a second world built from
+    its frames. `ws.py`'s own justification for the last-client stop
+    describes exactly that failure. This task is what makes the deferral
+    a delay rather than an exemption.
+    """
+    await asyncio.sleep(RESUME_GRACE_SECONDS + _DEFERRED_STOP_MARGIN_SECONDS)
+    # NOT "is anybody connected", which is what the first version asked
+    # and which a reviewer defeated four seconds after the grace: CV Lab
+    # connected, the revisit saw a live connection and returned, and CV
+    # Lab's frames got a World Builder nobody asked for. The question is
+    # whether anybody has asked for WORLD BUILDER since the deferral --
+    # every `session/start` moves the session's `requested_at`, even one
+    # that changed nothing because the session was still active (which
+    # is exactly the deferred case; `changed_at` would NOT move for it,
+    # and the first version keyed on that). If it has not moved, the
+    # walk is over and nobody has come back for it, whoever else is on
+    # the socket.
+    #
+    # And ONLY World Builder, and only THAT walk. The walk is named by
+    # its `session_id`: if the session has been stopped since, or a
+    # different walk has begun, there is nothing here for this task to
+    # do -- whoever is on the socket now, and whatever else they are
+    # running.
+    sessions = getattr(websocket.app.state, "cartridge_sessions", None) or {}
+    world_builder = sessions.get(CARTRIDGE_WORLD_BUILDER)
+    if world_builder is None or world_builder.state == "stopped":
+        return
+    snapshot = world_builder.snapshot() or {}
+    if snapshot.get("session_id") != deferred_session_id:
+        return
+    if snapshot.get("requested_at") != requested_before:
+        return
+    try:
+        await asyncio.to_thread(world_builder.stop)
+        logger.info(
+            "[Tower][Cartridge] %s stopped: its walk ended by disconnect, "
+            "the resume grace has passed, and nobody has asked for it since",
+            CARTRIDGE_WORLD_BUILDER,
+        )
+    except Exception:
+        logger.exception(
+            "[Tower][Cartridge] %s did not stop after its resume grace",
+            CARTRIDGE_WORLD_BUILDER,
+        )
 
 
 def _stop_cartridge_sessions(websocket) -> None:
@@ -571,10 +743,7 @@ def _stop_cartridge_sessions(websocket) -> None:
     # Only World Builder is deferred: it is the one cartridge whose
     # session follows a capture lineage. Object Memory and the rest keep
     # the documented rule -- no phone, no session.
-    waiting_for_a_phone = any(
-        observer.resumable_capture() is not None
-        for observer in _frame_observers(websocket)
-    )
+    waiting_for_a_phone = _a_capture_is_waiting_for_its_phone(websocket)
     for name, session in sessions.items():
         try:
             if session.state == "stopped":
@@ -772,6 +941,26 @@ async def _stop_capture(
     and serialising recorder teardown per connection is deliberate.
     """
     supervisor = _capture_workers(websocket)
+    for closed_id in _stop_recording(websocket, reason, owner=owner):
+        try:
+            if supervisor is not None:
+                await asyncio.to_thread(supervisor.capture_closed, closed_id)
+        except Exception:
+            logger.exception(
+                "[Tower][Capture] could not notify the worker supervisor that "
+                "capture %s closed",
+                closed_id,
+            )
+
+
+def _stop_recording(websocket, reason: str, owner=None) -> list:
+    """The inline half of `_stop_capture`: close the recorder, tell the
+    cartridges, and return the ids of the captures that actually closed.
+
+    Synchronous on purpose, and the disconnect path relies on that: it is
+    the part that must have happened before the handler can be cancelled.
+    """
+    closed: list = []
     for observer in _frame_observers(websocket):
         closed_id = None
         try:
@@ -795,9 +984,17 @@ async def _stop_capture(
         if closed_id is None:
             continue
         _tell_cartridges_about_capture(websocket, closed_id, opened=False)
+        closed.append(closed_id)
+    return closed
+
+
+def _notify_captures_closed(websocket, closed_ids) -> None:
+    """`supervisor.capture_closed` for each id, on the calling thread."""
+    supervisor = _capture_workers(websocket)
+    for closed_id in closed_ids:
         try:
             if supervisor is not None:
-                await asyncio.to_thread(supervisor.capture_closed, closed_id)
+                supervisor.capture_closed(closed_id)
         except Exception:
             logger.exception(
                 "[Tower][Capture] could not notify the worker supervisor that "
@@ -980,7 +1177,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         try:
             await channels.close()
         finally:
-            await _stop_capture(
+            # Inline: the recorder is closed before anything can cancel
+            # this task again. See `_tear_down_after_disconnect` for why
+            # the blocking half is not awaited step by step.
+            closed_captures = _stop_recording(
                 websocket, END_REASON_DISCONNECT, owner=connection_token
             )
             # On ANY exit, not only a polite stream_stop, and for the same
@@ -989,7 +1189,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # left running by a dropped connection would hold a model,
             # park a worker, and -- worse -- keep serving a scene of a
             # room whose wearer walked out of range.
-            await _close_cartridge_streams(websocket, connection_token)
             # And the cartridge SESSIONS, when nobody is left to have asked
             # for them.
             #
@@ -1024,5 +1223,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # under its grace, and World Builder's `stop_policy: "request"`
             # asks its builder to finish and returns at once, so a walk
             # already in finalization still completes.
-            if session.live_connections == 0:
-                await asyncio.to_thread(_stop_cartridge_sessions, websocket)
+            last_client = session.live_connections == 0
+            if last_client:
+                # If the stop below is about to leave a World Builder
+                # walk running for its resume grace, come back for it
+                # when that grace is over. Armed here, on the loop,
+                # before the thread: see `_arm_world_builder_follow_up`.
+                _arm_world_builder_follow_up(websocket)
+            await _tear_down_after_disconnect(
+                websocket, connection_token,
+                closed_captures=closed_captures, stop_sessions=last_client,
+            )

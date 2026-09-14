@@ -289,6 +289,11 @@ class _Worker:
     # destroyed by a change meant to make a DIFFERENT worker's grace
     # useful.
     handles_stop_request: bool = False
+    # Set by `request_stop`. An asked-to-stop worker is still ALIVE -- it
+    # is finishing its final build -- but it will not follow a successor,
+    # and chaining one into it loses the rest of the walk. See
+    # `_attach_to_registry`.
+    stop_requested: bool = False
     # The Job Object this worker was placed in, or None off Windows and on
     # a host that refused one. HELD HERE ON PURPOSE: `KILL_ON_JOB_CLOSE`
     # fires when the last handle closes, so the handle living on this
@@ -589,6 +594,7 @@ class CaptureWorkerSupervisor:
                     continue
                 if _ask_to_stop(worker.process, send_signal=False):
                     asked += 1
+                    worker.stop_requested = True
                     logger.info(
                         "[Tower][Worker] asked %s worker pid %s for capture %s "
                         "to stop (stdin closed); it stays registered until it "
@@ -870,7 +876,28 @@ class CaptureWorkerSupervisor:
         if continues is not None:
             root = registry.roots.get(continues)
             worker = registry.workers.get(root) if root is not None else None
-            if worker is not None and worker.is_alive():
+            if worker is not None and worker.is_alive() and worker.stop_requested:
+                # ALIVE, AND NOT FOLLOWING. This worker has been asked to
+                # stop -- `session/stop`, which is what leaving the World
+                # Builder screen sends -- and is spending its last seconds
+                # on a final build. It will never walk into this capture.
+                # Chaining the successor into it recorded a lineage nobody
+                # served: a dress-rehearsal reviewer cut the link, left the
+                # screen during the outage, came back, and watched 1,200
+                # frames get recorded and built by NOBODY while the phone
+                # showed the "success" sentence. So: fall through and start
+                # a builder on this capture. It builds the second half as
+                # its own world, which is a loss the wearer can see rather
+                # than one they cannot.
+                logger.warning(
+                    "[Tower][Worker] capture %s continues %s, but the %s "
+                    "worker pid %s following it has been asked to stop and "
+                    "is finishing; starting a new builder on the successor "
+                    "instead of chaining into a worker that will not follow",
+                    capture_id, continues, registry.spec.name,
+                    worker.process.pid,
+                )
+            elif worker is not None and worker.is_alive():
                 # The existing follower will walk into this capture by
                 # itself. Record the mapping so the NEXT successor --
                 # which names this capture, not the one we spawned on --

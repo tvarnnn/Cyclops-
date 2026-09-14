@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import os
 
-from tower.world_builder.records import FINALIZATION_COMPLETE
+from tower.world_builder.records import FINAL_SOLVE_SOLVED, FINALIZATION_COMPLETE
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
@@ -111,8 +111,15 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None) -> 
     if (
         finalization is not None
         and finalization.get("state") == FINALIZATION_COMPLETE
+        and finalization.get("final_solve") == FINAL_SOLVE_SOLVED
         and has_geometry
     ):
+        # `final_solve == solved` AS WELL, because that is the panel's
+        # rule and the first version of this branch omitted it: a Tower
+        # shut down mid-walk writes `complete` with `final_solve:
+        # skipped`, and the picker said "Complete" over a crashed walk the
+        # panel called "Interrupted". Five record shapes, all built by a
+        # reviewer, all disagreeing.
         # BEFORE the end-reason check, because a completed finalization
         # outranks how the capture ended -- the status producer's own rule
         # (`world_builder.py`, "a completed finalization outranks how the

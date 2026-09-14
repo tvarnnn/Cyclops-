@@ -314,11 +314,12 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # waiting on an answer that never comes. The thread outlives the
         # cancel -- bounded at one per subscribe attempt, which is
         # client-driven and not a 2 Hz loop.
-        snapshot = await asyncio.wait_for(
-            asyncio.to_thread(
-                hub._snapshot_for, cartridge, result_type, world_id, session_id
-            ),
-            timeout=SNAPSHOT_TIMEOUT_SECONDS,
+        # Through the hub's in-flight table, NOT a thread of this call's
+        # own. See `ResultHub.first_snapshot` for the measurement: a
+        # wedged read plus iOS's 2 s stall timeout minted one thread per
+        # reconnect and exhausted the executor in 60 s.
+        snapshot = await hub.first_snapshot(
+            subscription, timeout=SNAPSHOT_TIMEOUT_SECONDS
         )
     except Exception as exc:
         # A subscribe that cannot produce its first snapshot must SAY so.

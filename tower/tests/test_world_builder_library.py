@@ -832,3 +832,34 @@ def test_a_world_json_that_is_a_list_does_not_take_the_listing_down(derived_worl
         assert listing["world_count"] == 0, "a corrupt world was listed"
     finally:
         path.write_text(original, encoding="utf-8")
+
+@pytest.mark.parametrize("end_reason,final_solve", [
+    ("interrupted", "skipped"),
+    ("interrupted", "failed"),
+    ("interrupted", "unavailable"),
+    ("error", "skipped"),
+    ("error", None),
+])
+def test_a_finalized_but_unsolved_walk_is_not_listed_complete(
+    derived_world, end_reason, final_solve
+):
+    """The reorder must mirror the panel EXACTLY, and the first version did not.
+
+    The panel calls a session finished only when finalization is complete
+    AND `final_solve == solved`. Round 20's picker reorder checked only
+    the first, so a Tower shut down mid-walk -- which writes `complete`
+    with `final_solve: skipped` -- listed "Complete" over a crashed walk
+    the panel called "Interrupted". Five shapes, all built by a reviewer,
+    all disagreeing.
+    """
+    from dataclasses import replace
+
+    store, world_id, session_id = derived_world
+    session = store.read_session(world_id, session_id)
+    store.write_session(replace(
+        session, end_reason=end_reason,
+        finalization={"state": "complete", "final_solve": final_solve,
+                      "started_at": 2.0, "updated_at": 3.0, "detail": None},
+    ))
+    row = build_world_listing(store)["worlds"][0]["sessions"][0]
+    assert row["state"] == "interrupted", (end_reason, final_solve, row["state"])

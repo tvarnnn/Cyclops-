@@ -24,6 +24,8 @@ is the WIRING and the STATE MACHINE, which is where every one of the four
 steps actually lived.
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -411,7 +413,25 @@ class TestASessionDoesNotOutliveEveryClient:
             ws.send_json({"type": "ping"})
             ws.receive_json()
 
-        assert client.get(SESSION_URL).json()["state"] == "stopped", (
+        # The stop runs OFF the event loop, on the disconnect teardown
+        # thread (`_tear_down_after_disconnect`: `session.stop()` can wait
+        # out a detach grace, and a five-second stall on the loop is a
+        # stall on every frame the Tower is serving). The test client
+        # cancels the handler in the same breath as it queues the
+        # disconnect, so the handler's own await of that thread is best
+        # effort and this GET can arrive before the thread has finished.
+        # Wait for the stop rather than assert it has already landed. (It
+        # used to sit behind three awaits instead of on a guaranteed
+        # thread, and this test failed six times in eight -- see the
+        # teardown's docstring.)
+        deadline = time.monotonic() + 5.0
+        state = None
+        while time.monotonic() < deadline:
+            state = client.get(SESSION_URL).json()["state"]
+            if state == "stopped":
+                break
+            time.sleep(0.02)
+        assert state == "stopped", (
             "a session nobody is connected to any more must not stay active: "
             "the next capture would attach a producer with nobody asking"
         )

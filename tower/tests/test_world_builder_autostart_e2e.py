@@ -16,6 +16,7 @@ test would be a fake, and a fake is what let the gap exist.
 """
 
 import base64
+import asyncio
 import json
 import time
 
@@ -164,13 +165,25 @@ def test_start_walk_stop_produces_a_world_with_no_manual_step(tower):
         ws.send_json({"type": "ping"})
         ws.receive_json()
 
-    # The capture closed, so the follower observes completion, finalises
-    # and exits on its own. Nothing kills it.
-    _wait_for(
-        lambda: not app.state.capture_workers.status(),
-        90.0,
-        "the worker to finish and be reaped",
-    )
+        # The capture closed, so the follower observes completion,
+        # finalises and exits on its own. Nothing kills it -- WHILE THE
+        # PHONE STAYS ON THE SCREEN, which is what this socket is. It is
+        # held open until the builder is done because that is what the
+        # phone does after Stop (the World Builder screen stays up,
+        # subscribed, until the world is ready) and because the product's
+        # documented answer to "the last client left" is a SOFT stop:
+        # the builder stops observing, closes the session `interrupted`
+        # and skips the final solve (`StopRequest` in
+        # `world_build_session.py`; §14.13 of the handoff). This test
+        # used to close the socket first and passed anyway, because the
+        # test client's cancellation swallowed that stop; once the
+        # teardown was made cancellation-proof the builder was soft-
+        # stopped 0.6 s in, with zero keyframes, five times in five.
+        _wait_for(
+            lambda: not app.state.capture_workers.status(),
+            90.0,
+            "the worker to finish and be reaped",
+        )
 
     worlds = list((tmp_path / "world" / "worlds").iterdir())
     assert len(worlds) == 1, f"expected exactly one world, got {worlds}"
@@ -420,3 +433,181 @@ def test_the_last_client_leaving_does_not_end_a_walk_inside_the_resume_grace(tow
         "inside the resume grace -- the builder's stdin was closed and the "
         "walk ended at the first WiFi blip"
     )
+
+def test_a_deferred_walk_is_stopped_once_its_grace_is_over(tower, monkeypatch):
+    """The deferral is a delay, not an exemption -- and a narrow one.
+
+    Nothing revisited the decision to leave World Builder running for a
+    walk inside its resume grace, so a phone that never came back left
+    the session `active` forever -- and the NEXT phone on ANY screen got
+    a builder attached that nobody asked for, and a second world built
+    from its frames. Reproduced end to end by a reviewer. Once the grace
+    is over and nobody has asked for World Builder since, that walk is
+    stopped.
+
+    THAT walk, and nothing else. The first follow-up re-ran the whole
+    last-client stop, and a reviewer drove it on a real Tower: a phone
+    that never touched World Builder left; a second phone started Object
+    Memory and walked; 106 s later its producer was SIGBREAK'd mid-walk.
+    """
+    from types import SimpleNamespace
+
+    from tower.routes import ws as ws_module
+
+    client, app, tmp_path = tower
+    frames = _frames(12)
+    recorder = app.state.frame_observers[0]
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(frames, start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        _wait_for(app.state.capture_workers.status, 10.0, "the first worker")
+    assert recorder.resumable_capture() is not None
+
+    websocket = SimpleNamespace(app=app)
+    monkeypatch.setattr(ws_module, "RESUME_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(ws_module, "_DEFERRED_STOP_MARGIN_SECONDS", 0.0)
+    sessions = app.state.cartridge_sessions
+    world_builder = sessions["world_builder"]
+    walk = world_builder.snapshot()["session_id"]
+
+    # Another phone's Object Memory, started after the drop: not this
+    # task's business, whatever it decides about World Builder.
+    assert client.post("/cartridges/object_memory/session/start").json()["state"] == "active"
+
+    # Somebody did ask: `session/start` moved `requested_at` -- even
+    # though the session was still active and nothing else changed. Left
+    # alone, even with nobody connected.
+    requested_before = world_builder.snapshot()["requested_at"]
+    assert client.post(f"{WORLD_BUILDER_SESSION_URL}/start").status_code == 200
+    asyncio.run(ws_module._stop_world_builder_after_grace(
+        websocket, walk, requested_before))
+    assert world_builder.state != "stopped", (
+        "a walk somebody had restarted was stopped by the grace follow-up"
+    )
+
+    # A follow-up armed for a DIFFERENT walk finds this one and leaves it.
+    requested_before = world_builder.snapshot()["requested_at"]
+    asyncio.run(ws_module._stop_world_builder_after_grace(
+        websocket, "some-earlier-walk", requested_before))
+    assert world_builder.state != "stopped"
+
+    # Nobody asked since the deferral: stopped, even though some OTHER
+    # client is on the socket now -- and only World Builder.
+    asyncio.run(ws_module._stop_world_builder_after_grace(
+        websocket, walk, requested_before))
+    assert world_builder.state == "stopped", (
+        "a walk nobody asked for again was left active because a different "
+        "client was connected"
+    )
+    assert sessions["object_memory"].state == "active", (
+        "the World Builder follow-up stopped another cartridge's session"
+    )
+
+
+def test_the_grace_follow_up_is_armed_only_for_a_deferred_walk(tower, monkeypatch):
+    """Nothing is armed unless the stop is leaving a World Builder walk
+    running, and a walk gets one clock, not one per drop.
+
+    A reviewer traced that arming on every last-client disconnect (and
+    cancelling the previous task each time) meant a phone reconnecting
+    and dropping every 60 s never let the follow-up fire.
+    """
+    from types import SimpleNamespace
+
+    from tower.routes import ws as ws_module
+
+    client, app, tmp_path = tower
+    websocket = SimpleNamespace(app=app)
+    state = app.state
+
+    async def arm():
+        ws_module._arm_world_builder_follow_up(websocket)
+        return getattr(state, "world_builder_grace_stop", None)
+
+    # World Builder never asked for: nothing to defer, nothing armed.
+    assert asyncio.run(arm()) is None
+
+    # A deferred walk: armed once; a second drop for the same walk keeps
+    # the first task and its deadline.
+    frames = _frames(12)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        for index, data in enumerate(frames, start=1):
+            ws.send_json(_frame_message(index, data))
+            ws.receive_json()
+        _wait_for(app.state.capture_workers.status, 10.0, "the first worker")
+    assert app.state.frame_observers[0].resumable_capture() is not None
+
+    async def arm_twice():
+        ws_module._arm_world_builder_follow_up(websocket)
+        first = state.world_builder_grace_stop
+        ws_module._arm_world_builder_follow_up(websocket)
+        second = state.world_builder_grace_stop
+        same = first is second and not first.done()
+        first.cancel()
+        return same
+
+    assert asyncio.run(arm_twice()), (
+        "a second disconnect for the same walk restarted its grace clock"
+    )
+
+
+def test_a_successor_is_not_chained_into_a_worker_that_was_asked_to_stop(tower):
+    """The rest of the walk was recorded and built by nobody.
+
+    A dress-rehearsal reviewer cut the link, left the World Builder screen
+    during the outage (`session/stop` -> the builder's stdin closed while
+    it sat in `_await_successor`), came back and reconnected. The
+    successor capture was chained into that worker because it was still
+    `is_alive()` -- it was finishing its final build -- and it exited
+    without ever following: 1,200 frames on disk, `health.workers=[]`,
+    while the phone showed the sentence §15 says means success.
+
+    An asked-to-stop worker is alive and not following. A successor that
+    names its lineage must get a builder of its own.
+    """
+    client, app, tmp_path = tower
+    frames = _frames(24)
+    recorder = app.state.frame_observers[0]
+    supervisor = app.state.capture_workers
+
+    with client.websocket_connect("/ws") as first:
+        first.send_json({"type": "stream_start"})
+        for index, data in enumerate(frames[:12], start=1):
+            first.send_json(_frame_message(index, data))
+            first.receive_json()
+        first_capture = recorder.status.capture_id
+        _wait_for(supervisor.status, 10.0, "the first worker")
+        original = supervisor.status()[0]["pid"]
+
+        # The wearer leaves the screen: the builder is ASKED to stop. It
+        # stays registered, alive, finishing -- and will not follow.
+        assert client.post(f"{WORLD_BUILDER_SESSION_URL}/stop").status_code == 200
+
+        # ...and comes back. The app's reconnect gesture is resubscribe,
+        # `session/start`, then `stream_start` if the camera is streaming
+        # -- the start is what reopens the World Builder gate; without it
+        # no builder could attach to anything and this test would prove
+        # nothing.
+        assert client.post(f"{WORLD_BUILDER_SESSION_URL}/start").status_code == 200
+        with client.websocket_connect("/ws") as second:
+            second.send_json({"type": "stream_start"})
+            for index, data in enumerate(frames[12:24], start=13):
+                second.send_json(_frame_message(index, data))
+                second.receive_json()
+            second_capture = recorder.status.capture_id
+            assert second_capture != first_capture
+
+            def a_fresh_builder():
+                return any(
+                    w["pid"] != original and second_capture in w["lineage"]
+                    for w in supervisor.status()
+                )
+            _wait_for(a_fresh_builder, 10.0, "a builder of its own for the successor")
+            assert not any(
+                w["pid"] == original and second_capture in w["lineage"]
+                for w in supervisor.status()
+            ), "the successor was chained into the worker that was asked to stop"
+            second.send_json({"type": "stream_stop"})
