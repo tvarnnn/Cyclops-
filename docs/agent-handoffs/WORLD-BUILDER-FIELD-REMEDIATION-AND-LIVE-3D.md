@@ -31,10 +31,16 @@ it away three separate times.
 | `60ec81c` | fix(world-builder): the defects in the fixes for the defects in the fixes |
 | `feb08a6` | fix(world-builder): the ghost walk, and three ways one cartridge stopped the Tower |
 | `9c52b68` | fix(world-builder): one reconnect is one walk, through the Tower this time |
+| `0a3689f` | fix(tower): the reconnect fix's two holes, the teardown that ran by chance, and the in-flight table's third rewrite |
+| `d8d0530` | fix(tower): the abandonment that could not be reached, the budget that was the deadline, and the follow-up keyed on the ask |
+| `9035c70` | fix(results): the cap that killed the screen, and the four things it hid |
+| `51200df` | fix(results): staleness is how long a result sat, and the cap is per connection |
+| `9ca641a` | fix(results): finished work nobody waits for is freed by the next subscribe |
+| `dc52b2d` | fix(results): the once-per-future record dies with the future; the hub's own timeouts have a type |
 
-Final code SHA **`9c52b68`**, 12 commits, all local — nothing was pushed.
-This document is carried by one further commit on top, which is why it is
-not in the table above.
+Final code SHA **`dc52b2d`**, 18 commits, all local — nothing was pushed.
+This document is carried by its own `docs(handoff)` commits on top, which is
+why they are not in the table above.
 
 **Committed with `--no-verify`, deliberately, and it should be revisited
 before this branch merges.** CLAUDE.md's lane policy says agents commit from
@@ -697,6 +703,8 @@ isolation on an idle machine, so "load-sensitive" was the wrong word, and
 the test and its implementation were both added on this branch — not, as
 claimed, code the campaign never touched. It is still not a regression from
 any of these commits. The claim was wrong; the conclusion was not.
+(Round 21 then found it was not a flake either — a cancellation race in
+the disconnect teardown, fixed there. See §13, round 21.)
 
 **And there is a FAMILY of these, not one.** Across the full-suite runs of
 rounds 16-18, three different teardown tests failed on different runs and
@@ -709,6 +717,11 @@ one passes in isolation — the Document Memory one 5/5, the autostart file
 5/5 and 4/4 under four concurrent copies. None of them references World
 Builder code (Document Memory's only mention of it is a comment about a
 write pattern).
+
+(Rounds 21–23 then found that none of them was load: the first two were a
+cancellation race in the disconnect teardown, the third a test asserting
+an engine release the instant the state flipped. See §13, rounds 21 and
+23.)
 
 **Corrected after round 20.** An earlier version of this paragraph said
 none of them was reachable from anything this campaign changed. Round 19
@@ -1398,6 +1411,524 @@ the harness said what to pin. One test was withdrawn rather than shipped:
 a suite test for the subscribe deadline hung the harness, and a hang is
 worse than a gap.
 
+### Round 21 — two reviewers, four holes in round 20, and a hang the suite found
+
+**Round 20 had fixed the reconnect. Round 21 asked what round 20 had
+broken while doing it, and rehearsed the retest again on the fixed
+tree.** Both reviewers found real defects; the second rehearsal's verdict
+was **ready as §15 is written**, with two HIGHs it wanted fixed anyway.
+
+#### What the attack on round 20 found
+
+| finding | severity | resolution |
+|---|---|---|
+| **The subscribe deadline still leaked a thread per reconnect — and iOS is what drives reconnects.** Round 20 called the leaked thread "bounded at one per subscribe attempt, which is client-driven". iOS's `sendStallTimeout` is 2 s: while a first snapshot stalls, the phone replaces the socket and re-subscribes every ~2.5 s, minting a thread each time. Measured on a real Tower against a wedged read: **24 executor threads in 60 s, then `stream_start` never answered for any phone** — the exhaustion the poll loop had just been cured of, one route over | **HIGH** | the subscribe path rides the poll loop's in-flight table (`ResultHub.first_snapshot`): one thread per target across both paths; twelve subscribes to one wedged target enter the producer **once** |
+| **The reconnect deferral was an exemption, not a delay.** Nothing revisited it, so a wearer whose battery died on the World Builder screen left the session `active` forever, and the NEXT phone to stream on ANY screen got a builder nobody asked for — reproduced end to end, a second world built from a different client's frames with no `session/start` anywhere. `ws.py`'s own justification for the last-client stop describes exactly that failure | **HIGH** | a follow-up task re-runs the stop once the grace has passed |
+| a wedged target held every pass at the full deadline until its subscribers were told — healthy cartridges dropped from ~160 deliveries to 38 in 16 s | MEDIUM | only the futures dispatched THIS pass are waited on; a wedge costs the others nothing after its first pass |
+| a future that finished while its target was unwatched was delivered to the NEXT subscription — a reconnected phone got `rev 1` then **`rev 0`**, 7.5 s old | MEDIUM | discarded and re-dispatched |
+| the picker reorder mirrored the panel's rule incompletely — five record shapes (a Tower shut down mid-walk writes `complete` with `final_solve: skipped`) listed "Complete" over a walk the panel called "Interrupted" | MEDIUM | `final_solve == solved` as well |
+| two phones streaming at once now fuse into one world | — | recorded, §14.25 — there is no signal at supersession time to tell a second phone from a reconnecting one |
+| `AccessDenied` on a holder's start time reads alive even for a legacy lock | LOW | recorded, §14.26 — the safe direction and a narrow door |
+
+#### What the second dress rehearsal found
+
+The reconnect fix held at every timing up to 95 s, through double
+reconnects, flaps, supersession with the old socket then dying, a
+bystander phone, and a reconnect during finalization — **33 real Towers,
+one world every time, zero picker/panel/render disagreements**. It found
+two more holes, both reproduced on a pristine export of the committed tree:
+
+| finding | severity | resolution |
+|---|---|---|
+| **Leaving the screen during an outage lost the rest of the walk silently.** The asked-to-stop builder was still alive (finishing), so the reconnect's successor was chained into it; it exited without following, and **1,200 frames were recorded and built by nobody** while the phone showed the "success" sentence | **HIGH** | a successor is never chained into a worker that has been asked to stop (`_Worker.stop_requested`, set by `request_stop`); it gets a builder of its own. §14.22 amended |
+| **The grace follow-up asked the wrong question.** "Is anybody connected?" — defeated four seconds after the grace: CV Lab connected, the revisit returned, CV Lab's frames got a World Builder nobody asked for. And `changed_at` cannot answer the right question, because a Start sent to a still-active session changes nothing | **HIGH** | `CartridgeSession.requested_at`, moved by every Start; the revisit keys on whether that moved since the deferral, whoever else is on the socket |
+| a Stop tapped while offline never reaches the Tower — "Building (live)" for ~95 s after the wearer's Stop | MEDIUM | phone side; §14.27 |
+| the resume window runs from when the Tower *records* the drop, not from the wearer's loss of link: 130 s and 160 s gaps → two worlds | MEDIUM | §14.28 |
+| a Tower restart mid-walk; Document Memory's 10-minute idle GPU; four §15 text errors | LOW | §14.29–30; §15 corrected |
+
+#### And the suite found a hang in round 21's own first fix
+
+The affected-suites run sat at 52% for 33 minutes, on
+`test_a_partially_deleted_world_reports_honestly_and_does_not_crash` —
+alive by every measure (flat CPU, no children, loop idle) and blocked on
+a `cartridge_result` that never came. The in-flight table had a race of
+its own: the hub's own polling loop and a forced pass (`pump()`, heartbeat
+zero, which **must** deliver) ran concurrently; the forced pass found the
+loop's snapshot already in flight, counted it a failure, and offered
+nothing; the loop's pass then offered under the ordinary heartbeat rule,
+which sends nothing for an unchanged world. Round 20 could not have this
+race because every pass owned its own thread. Three corrections, each
+pinned: passes are serialised; a pending future counts as a failure only
+once it has actually aged past the deadline (the log had been printing
+"has exceeded 10.0s" six milliseconds after the connection opened); and a
+result is discarded as stale only when every subscriber it was computed
+for has gone — not merely because it finished late (that re-dispatched a
+watched target), and not merely because a pass ran while nobody watched
+(no pass may run in that gap at all).
+
+#### And the "flake" was not a flake
+
+The full suite after those fixes failed exactly one test,
+`test_object_memory_lifecycle::test_the_session_stops_when_the_last_connection_closes`
+— the one this document had filed as the load-sensitive family's first
+member, "still not a regression from any of these commits". Run in
+isolation on an idle machine it failed **six times in eight**, in 2.6 s,
+which is not load. The mechanism, traced through Starlette 1.6.0's
+`WebSocketTestSession.__exit__`: the disconnect is queued and the handler
+task is cancelled *in the same breath*, and anyio re-cancels the task at
+every `await` until it exits. The session stop sat at the end of the
+disconnect `finally` behind three awaits — `channels.close()`, the
+supervisor notification, the stream close — so whichever of them
+suspended first took the cancellation, and the `finally` never reached
+the stop. The stream close had already been given exactly this treatment
+by an earlier author ("the thread guarantees the close happens; the await
+is best effort"); the stop had not. It was born racing in `c07ce06`, the
+commit that added the test, at ~29%; this campaign's own off-loop moves
+(`f970788`, `feb08a6`) put two more cancellation points in front of it
+and took it to six in eight.
+
+Under uvicorn a real disconnect is a `WebSocketDisconnect` and the chain
+runs to the end, so the wearer never saw this — the cancellation path is
+app shutdown and the test client. It is fixed where the stream close was
+fixed: the recorder is closed inline, everything blocking a dropped
+connection owes the cartridges (supervisor notification, stream close,
+session stop) runs in order on **one** plain thread started before the
+handler can be cancelled again, and the handler's await of it is best
+effort (`_tear_down_after_disconnect`). The test waits for the stop
+rather than asserting it has already landed, since its GET can still
+outrun the thread. 10/10 after; the pre-fix measurement is its mutation
+proof.
+
+**A faithful harness then failed a test that had been relying on the
+unfaithful one.** The next full run failed
+`test_world_builder_autostart_e2e::test_start_walk_stop_produces_a_world_with_no_manual_step`
+five times in five: `keyframes_accepted == 0`. Its socket closed right
+after Stop, and now that the last-client stop actually lands, the
+builder was soft-stopped 0.6 s in — which is the product's *documented*
+answer to "the last client left" (`StopRequest` in
+`world_build_session.py`: stop observing, close `interrupted`, skip the
+final solve; §14.13 tells the wearer the same thing from the other side)
+and had been the Tower's behaviour under uvicorn all along. The test had
+passed for as long as the test client swallowed that stop. It now holds
+the socket open until the builder is done, which is what the phone
+does. 5/5, the file 3/3, and the rest of the "family" (§14.21's two,
+Document Memory's wind-down, `test_capture_continuity`'s successor
+scan) 3/3 together. **§14.21 is explained by the same race** — the gate
+was shut because the first socket's teardown had stopped the session,
+or not, depending on where the cancellation landed — and is amended.
+
+The full venv suite on that tree: **3152 passed, 35 skipped, 1 xfailed,
+0 failed** (`venv26`, 13:22) — the first fully green run of the campaign,
+because the two "flakes" were the two defects above.
+
+**Twelve mutations across the round, each reverting a fix to the exact
+code it replaced, each caught.**
+
+### Round 22 — two fresh reviewers on round 21, and a BLOCKING one of my own
+
+Round 21's changes were reviewed by two agents who had not seen them:
+one attacking the disconnect teardown and the grace follow-up on a real
+uvicorn Tower, one attacking the publisher's in-flight table. Both found
+real defects. One was the campaign's own worst so far.
+
+#### The teardown reviewer
+
+| finding | severity | resolution |
+|---|---|---|
+| **The grace follow-up stopped EVERY cartridge session, for a phone that was connected and streaming.** It was armed on every last-client disconnect, not only when a deferral had happened, and it re-ran the whole last-client stop with `force_world_builder=True`. Reproduced on a real Tower: phone A connected and left without ever touching World Builder; phone B arrived 5 s later, started Object Memory and walked; at **drop+106 s** the Tower SIGBREAK'd B's producer mid-walk and logged "the last client connection closed, so nobody is asking for it any more" about a phone that was streaming. A World Builder mechanism reaching into another cartridge — the one failure this whole design exists to rule out — shipped inside the fix for a World Builder hole | **BLOCKING** | armed only when the stop is actually leaving a World Builder walk running (`_world_builder_deferral`, decided on the loop before the thread); the follow-up stops **that walk and nothing else**, named by its `session_id`; a different walk, a stopped session, or a re-asked one is left alone. Pinned by a test that runs another cartridge's session beside it |
+| reconnect churn restarted the 105 s clock on every drop, so a phone dropping every 60 s never let it fire | MEDIUM | one clock per deferred walk: a pending follow-up for the same `session_id` is left to its original deadline |
+| the arm/cancel/fire wiring is untested under the TestClient (each socket gets its own loop; the task is cancelled at socket exit) | HIGH | the arming decision is a function and is tested directly (`test_the_grace_follow_up_is_armed_only_for_a_deferred_walk`); the reviewer verified the live wiring on uvicorn |
+| `test_start_walk_stop_produces_a_world_with_no_manual_step` failed deterministically after the teardown fix — bisected to `ws.py` alone | HIGH | already fixed in round 21 (the test holds its socket as the phone does); the reviewer's measurement that under real uvicorn a 2 s walk still solves (kf=4) stands |
+| `last_client` decided before the blocking teardown rather than after — a decide-early/act-late pairing; **measured window 3 ms** | LOW | **declined**: the decision was always made before the stop ran, only the awaits between moved; the window is three orders of magnitude below iOS's ~0.5 s reconnect, and deciding late would let a phone arriving inside it inherit sessions it never asked for |
+
+Checked and found sound by that reviewer: notification order unchanged
+(`capture_closed` → `stream_closed` → session stop, byte-for-byte the old
+order and the polite path's); `stop_requested` cannot be un-set; two
+builders never write one world (the successor mints its own); lifespan
+shutdown serialises against the teardown thread; `requested_at` moves on
+a Start to an active session.
+
+#### The publisher reviewer
+
+| finding | severity | resolution |
+|---|---|---|
+| **A target whose snapshot thread never returns was poisoned for the life of the process**: never re-dispatched, every subscribe joined the dead future and sat **10 s inline in the connection's receive loop** — six consecutive subscribes, three of them after the fault had cleared | **BLOCKING** | a future older than the deadline answers a subscribe immediately; a future older than three deadlines is **abandoned** and the target dispatched afresh |
+| a done future left in the table by a cancelled pass was handed to the next subscription as its first snapshot — **4.0 s old, behind the revision on disk**, and the phone's current cursor classified "stale" | HIGH | `first_snapshot` discards a done future (uncollected ⇒ computed for nobody here); `detach` drains on the last channel |
+| the watcher rule was keyed on subscription ids, which are minted **per connection** — every phone's first subscription is `sub-1`, so a reconnected phone matched the dead socket's watcher and kept the stale result; the shipped test passed only because it named the reconnect `sub-2` | HIGH | keyed on the `Subscription` objects; the test is parametrised with the reused id and a bystander phone that keeps the hub attached |
+| head-of-line: the pass waited for ALL its futures before offering any — CV Lab, Object Memory and Document Memory at **7 deliveries in 20 s (17.5%)** beside a 2.1 s World Builder read; a 10 s blackout for everyone on the first pass that meets a wedge. "Sum" had become "max", which was not a fix | HIGH | `FIRST_COMPLETED` in a loop against a wall-clock budget; each snapshot offered as it lands |
+| process exit hung **300 s** with one wedged snapshot thread: `asyncio.run` joins the default executor | MEDIUM | snapshots run on a daemon thread of their own, bridged back with `call_soon_threadsafe`; the loop exits in under a second beside a wedged thread |
+| an exception raised for a departed subscriber was never retrieved; a departed target's failure count survived a reconnect and escalated after one failure | LOW | `_forget` retrieves; `_failures` pruned every pass |
+
+Checked and found sound: no deadlock and no lock leak (`_pass_lock` is
+released when a pass is cancelled mid-wait); no unbounded growth over
+10 000 churn cycles; one producer entry per wedged target across 6
+subscribes and 67 passes — the round-20 leak is gone; a raising producer
+is retrieved, counted, re-dispatched and escalated; a wedged target does
+not starve the others after its first pass.
+
+#### Twelve mutations, three of them not caught the first time
+
+Every fix reverted in place to the code it replaced, its test run, the
+file restored. **Twelve of twelve load-bearing — after three of the
+tests were sharpened**, and each sharpening was a lesson about what
+another fix was masking: the subscribe-time discard was masked by the
+detach drain (the stale future had to finish *after* the phone left);
+the object-keyed watchers were masked by the drain too (a bystander
+phone has to keep the hub attached — and then by the test's own producer,
+which gated whichever target the loop dispatched first rather than the
+walk's); the unconditional prune was masked by the old conditional one
+firing anyway when the failing target outgrew the set (the returning
+target has to be healthy). A mutation that is "not caught" is a test that
+is not testing what it says, and all three were.
+
+The daemon-thread mutation (snapshots back on the default executor) is
+caught by the loop-exit test — in 120 s, which is the executor join it
+exists to prevent.
+
+The full venv suite on the round-22 tree, run beside two reviewers' own
+Towers and test runs: **3162 passed, 35 skipped, 1 xfailed, 0 failed**
+(`venv27`, 13:50).
+
+### Round 23 — the fourth publisher reviewer, and a dress rehearsal on the committed tree
+
+Round 22 was committed as `0a3689f` and handed to two more agents who had
+not seen it: a fourth attacker for the publisher, and a third dress
+rehearsal driving a real Tower through the retest's own situations. The
+publisher reviewer found that **both of round 22's headline fixes were
+not fixes**.
+
+#### The publisher, fourth pass
+
+| finding | severity | resolution |
+|---|---|---|
+| **The abandonment path was dead code, so the poisoned target was still poisoned.** The sweep sat inside the pass's loop over *watched* targets; the escalation fails every watcher off a wedged target after three deadlines (~11 s), the cap is three deadlines *plus* (30 s), and nothing looks at an unwatched pending future. Round 22's own fast-fail then refused every re-subscribe in 0.00 s: **33 re-subscribes over 100 s against a future 95 s old, all refused; zero abandon log lines.** Round 21's finding, verbatim, with its fix present and unreachable | **BLOCKING** | the sweep runs over every in-flight future, watched or not; a subscribe that meets a future past the cap abandons it and dispatches afresh. Pinned twice: recovery through a subscribe with no watcher left, and abandonment by a pass with only a bystander watched |
+| **Head-of-line blocking was not fixed either.** `FIRST_COMPLETED` offered each snapshot as it landed *within* a pass — but the pass still did not return until its slowest fresh future did, and the loop slept the full poll on top: cadence = slowest + poll. **8 deliveries in 20 s (20%) beside a 2.1 s read; a 10.5 s gap on the first pass to meet a wedge** — the two numbers round 22's comment quoted as the defect it had fixed, reproduced at the same magnitude | **BLOCKING** | the pass's wait budget is the **poll interval** (0.5 s), not the snapshot deadline; a future that outlives it is carried into the next pass and collected done, or counted by its age. The loop subtracts the pass's own wait from its sleep. Pinned by a test written to the symptom — CV Lab's deliveries per second beside a 0.3 s World Builder read, ≥ 70% of ideal (the fixed code measures 85–90%; the old budget measures 50%) |
+| `collect` forgot by *target*, and `first_snapshot` takes no pass lock: a subscribe that ran while a pass was parked in its wait discarded the pass's done future and installed a replacement, which the pass then popped — **two live threads for one target**, the one bound the table exists to hold | HIGH | `_collect(target, future, …)` forgets the entry only if it *is* that future |
+| every failed subscribe left its dead `Subscription` in the watcher set for as long as the wedge lived — 34 in 100 s | MEDIUM | removed on the timeout path |
+| a producer raising `SystemExit` / `KeyboardInterrupt` crossed the thread as itself and the collector caught `Exception`: **the Tower process exited, code 3 / 130** | MEDIUM | converted to a `RuntimeError` failure of that target in the thread |
+| round 22's cadence test asserted the wrong quantity (how soon the fast cartridges were offered *within* one pass) and passed against code at 20% cadence | MEDIUM | replaced by the test above; the reviewer's own two symptom tests fail on round 22 and pass on round 23 |
+| a full traceback per failed subscribe: ~216 log lines a minute under a wedge | LOW | one warning line for a timeout |
+
+Sound, by that reviewer's measurement: the daemon-thread bridge (no leak,
+no unretrieved exception, **shutdown with two wedged threads in 1.02 s** —
+"the strongest thing in the rewrite"; thread-per-dispatch costs 113 µs,
+0.18% of a core at 2 Hz × 8 targets); the `FIRST_COMPLETED` loop does not
+spin, double-collect or lose a late future; the stale-delivery fix holds
+on a real socket for a reused and a fresh subscription id alike (round
+21's own `e2e_stale_reconnect.py` now fails its assertion, correctly); a
+wedge that *clears* is recovered from 0.22 s after it clears.
+
+#### Seven mutations, six caught, and the seventh is the honest one
+
+Each fix reverted in place, its test run, the file restored. Six of
+seven load-bearing. The seventh — the loop sleeping the full poll on
+top of the pass's own wait — is **not caught**, and the reason is
+recorded in the code rather than papered over: a slow future is fresh,
+and waited on, only on the pass that dispatched it, so the extra sleep
+costs one budget per slow dispatch and the cadence test cannot see it.
+It is a refinement kept for correctness of the interval, and the comment
+says so; the fix that carries the measurement is the budget.
+
+#### The third dress rehearsal, on the committed round-22 tree
+
+Thirty-three scenarios on real Towers. **What held:** the round-22
+isolation fix — World Builder stopped at drop+105 s while another
+phone's Object Memory stayed `active` with a live producer through
+drop+205 s, and CV Lab untouched; the reconnect matrix at 0.5/5/30/60 s
+(one world, chained, solved); the result channel across 30 abrupt
+reconnects (zero revision reverts, `cursor_status` never contradicted,
+first snapshots ~0.1 s old, other cartridges' cadence unchanged by a
+World Builder subscription); Stop-then-kill at +2 s finalised
+`complete/solved` (better than the documented soft stop, on a short
+walk); SIGBREAK mid-walk exits in 0.8 s with a recoverable record and no
+zombie. **What it found:**
+
+| finding | severity | resolution |
+|---|---|---|
+| **A re-ask followed by a second drop was never revisited.** Round 22's "once per walk" dedupe keyed on `session_id` alone; a `session/start` on an active session does not change it. Drop → arm (R0) → reconnect with a Start (R1) → drop again → deduplicated against a task that then declined (R1 ≠ R0) and returned; nothing revisited the walk. `active` forever, `workers: []`, and the next phone to stream — asking for nothing — grew a second world. **2/2, no timing subtlety**, and independently in the 20 s flap | **BLOCKING** | round 24: the dedupe key is `(session_id, requested_at)` — the same walk and the same ask keep their clock; a new ask gets a new one, 105 s after *its* drop. Pinned |
+| **A repeated `source_seq` across a chained lineage aborted the final solve.** Keyframe id and image file name were both `source_seq`, which "resets when the glasses session restarts" — the builder now follows a lineage, so one session can see the numbers start again: the later image **overwrote** the earlier one on disk, the journal held two keyframes with one id, and COLMAP died on the duplicate name (`SQLite error: constraint failed` → abort → `final_solve: failed`). Seen in four runs; never when the sequence continued | HIGH | round 24: the engine renumbers onto a monotonic sequence the moment it goes backwards (`wire_seq`/`tx_seq` keep the raw numbers), logs once, and records a `source_seq_restarted` event (a new member of the closed event set; iOS switches on no event kind). Pinned at the engine: ids unique, files unique, image count equals keyframe count, nothing after the restart lost |
+| any phone's `stream_start` inside the 90 s grace is chained into the previous walk — `continues` is decided by the Tower from the single recorder, never read from the client | HIGH as specified | **recorded, §14.31**: there is no signal from the phone; the deferral window *is* the reconnect support, and the follow-up bounds it at 105 s. On the single-phone retest it needs a drop *and* a screen switch while offline, which §14.27 already describes |
+| `/worlds` says "Complete" over a walk whose final solve was skipped or crashed, where the phone shows "Partial" | HIGH as filed | **declined with reasoning**: the listing mirrors the Tower's own lifecycle, which reads `ready` for `stop + complete + geometry` whatever `final_solve` says (`_lifecycle`, the "finished record from a builder that keeps the lock" branch); "Partial" is the *phone's* presentation of the same payload, derived from `final_solve`, and the listing row carries `finalization` so the picker can badge it the same way. Three surfaces, one record, no contradiction between the two Tower ones |
+| the Tower sometimes never exits after "Finished server process" — 5 of ~14 shutdowns under concurrent Towers and builders; alone, 0.4–0.9 s in 16 of 16 | MEDIUM | **recorded, §14.32**; not reproduced in isolation, blocking thread not named |
+| a reconnect gap over 90 s splits the walk into two `Complete` worlds | MEDIUM | already §14.28 |
+| the `stop_requested` branch fell through into "no live worker owns that lineage" — false, and confusing in a field log | LOW | round 24: an `else` |
+| `/worlds` reports `keyframes_accepted: 0` for a live session the status channel shows geometry for — the picker reads `session.json`, which the builder has not flushed | LOW | **recorded, §14.33** |
+
+#### The last of the "family"
+
+The round-23 suite failed one test:
+`test_document_live::TestTheIdleWindDown::test_a_session_whose_stream_closed_stops_itself`,
+the third member of the "load-sensitive family" (§14.21). Two in ten in
+isolation. Same species as the first: `LiveSession._stop_locked` flips
+the state to `stopped` in its step 1 and releases the engine in step 4,
+after the flush and the worker's exit — deliberately, and documented at
+length in the code — and the test asserted the release the instant it
+saw the state, from a different thread than the one doing the stopping.
+It waits for the release now; 10/10. **Every member of the "family" was
+a test asserting the end of a teardown after observing its beginning.
+None was load.**
+
+The full venv suite on the round-23 tree: **3168 passed, 35 skipped, 1 xfailed,
+1 failed** (`venv28`, 13:11) — the one failure being the wind-down test above,
+re-characterised and fixed in this round.
+
+### Round 24 — the fifth publisher reviewer, and what the rehearsal left
+
+| finding | severity | resolution |
+|---|---|---|
+| **The abandon-then-dispatch re-armed the full 10 s inline wait every cap interval.** A subscribe that abandoned a wedge dispatched afresh, which reset the target's age to zero — and then waited the full deadline on its own replacement, inline in the connection's message loop, the loop that answers frames. **25 s of every 30 blocked** at iOS's re-subscribe cadence; on a real socket a `ping` behind the subscribe answered 1.00 s late at t=0 and again at the cap. The repo's own deadline test caught it — with its pre-round-23 input, which round 23 had changed instead of extending the fix | **BLOCKING** | a subscribe that abandons does not wait at all (the fresh thread serves the next one), and the inline wait is capped at `SUBSCRIBE_INLINE_WAIT_SECONDS = 1.5`, below the phone's 2 s stall bound, whatever the deadline. A first snapshot not ready in 1.5 s is `snapshot_failed`; the phone retries |
+| every hub duration was a **wall-clock** difference (`build_hub` hands in `time.time`): a 600 s step back made the cap unreachable for the length of the step and restored the full inline wait; a 10 s step forward aged every in-flight snapshot past its deadline at once and dropped every subscriber three passes later | HIGH | ages, the cap and the remaining wait are on `age_clock=time.monotonic`; the wall clock is for the heartbeat only |
+| abandoned threads grew **+1 per 30 s** for as long as a read stayed wedged (7 in 195 s real time; 120 an hour, each holding the wedged handle) | MEDIUM | the cap doubles per consecutive abandonment of a target — 30, 60, 120 … up to 600 s — and a delivery clears the streak: eight threads over ten simulated minutes against twenty |
+| a healthy-but-slow target lost a whole poll interval per delivery, independent of how slow: a 0.55 s read and a 0.80 s read **both delivered every 1.52 s** — the pass that collected the carried-over future did not dispatch its replacement until the next | MEDIUM | collected and replaced in the same pass |
+| `_run`'s elapsed subtraction removed the sleep floor: a 1 ms poll ran 5,500 passes a second at 134% of a core (test configurations only; production is 0.5 s and unreachable from config) | MEDIUM | the loop sleeps at least a quarter of the interval; the interval is clamped ≥ 1 ms |
+| `ResultHub.polled` had no consumer anywhere and a docstring claiming the suite waited on it | LOW | deleted |
+| an abandoned future that later raised logged "never retrieved" | LOW | a done-callback retrieves it |
+
+Sound, by that reviewer's re-measurement of round 23: the poisoned
+target recovers (fresh dispatches at 35 / 65 / 95 s beside a 100 s
+wedge, via subscribe, and via the pass); **CV Lab, Object Memory and
+Document Memory at 40/40 deliveries per 20 s beside a 2.1 s World
+Builder read and beside a 60 s wedge** (round 22: 7/40), max gap 0.52 s;
+the clobber gone; `SystemExit` from a producer is a counted failure
+with exit 0; watcher growth 0; six warning lines per 100 s of wedge
+instead of 216 a minute.
+
+#### Seven mutations, seven caught
+
+Each fix reverted in place, its test run, the file restored — the
+subscribe waiting on its replacement (caught in 1.3 s), the inline cap
+removed (caught in 10.2 s, which is the wait it exists to prevent), ages
+on the wall clock, no backoff (caught in 102 s of simulated wedge), the
+carried-over future not replaced, the dedupe keyed on the walk alone,
+and no renumbering. Twenty-six mutations across rounds 22–24, twenty-six
+caught, one of them (round 23's loop fold) on record as *not* caught
+because it is a refinement and not a fix.
+
+The full venv suite on the round-24 tree, beside two reviewers' Towers:
+**3175 passed, 35 skipped, 1 xfailed, 0 failed** (`venv29`, 14:02).
+
+
+### Round 25 — the fourth dress rehearsal and the sixth publisher reviewer, on the round-24 tree
+
+#### The rehearsal
+
+Both round-23/24 claims verified on real Towers. The re-ask-then-drop
+hole: World Builder stopped at **drop₂+105.0 s** exactly, the builder
+finalised, a phone streaming at +260 s got no builder, one world
+`Complete/solved`; the 20 s flap ×9 stopped 105.9 s after the last
+drop; a re-ask followed by five minutes of walking was **never**
+stopped (kf 204, 34,051 points). The restarted sequence: 26 images on
+disk = 26 journal rows = 26 distinct ids, one `source_seq_restarted`
+event, `final_solve: solved`, empty `solve.log`. The reconnect matrix,
+Stop-with-socket-held (solved at stop+7.2 s), Stop-then-kill (solved),
+SIGBREAK (0.8 s, recoverable), and — five times over, with two Towers
+and their builders running — **shutdown in 0.74–1.38 s, no hang**. The
+40 s wedge: one snapshot thread for the whole wedge, two after the cap;
+the producer entered twice in 40 s against ~80 subscribe attempts;
+zero pings delayed ≥ 2 s; Document Memory and CV Lab at full cadence
+throughout; a working subscription **0.05 s** after the wedge cleared.
+
+| finding | severity | resolution |
+|---|---|---|
+| **Round 24's 1.5 s inline cap is a cliff, and what is on the far side of it is terminal on the phone.** With the status read slowed to a fixed delay: 1.0 s → 4/4 subscribes answered; 1.6 s, 2.5 s, 9.0 s → 0/4. On iOS, `TowerWorldBuilderClient.apply` maps `snapshot_failed` to `.failed(.towerReportedFailure)` **with no retry** — only `channel_failed` is retried — so a status read anywhere in 1.5–10 s leaves the World Builder screen dead until the socket reconnects. The old 10 s wait self-healed: the socket stalled at 2 s, iOS replaced it, the re-subscribe joined the same future and was answered when it landed. Measured headroom on the retest host's own 163-world root during a live walk: 522 reads, p50 33 ms, p95 46 ms, max 171 ms — 35× — but the file's own comment cites a 2.1 s manifest read under a disk fault | HIGH | **round 25: the cap is removed.** What round 24 was actually curing — the abandon-then-dispatch re-arming the full wait every cap interval — is cured by the "an abandoning subscribe does not wait" rule alone. The inline wait is the deadline again, and a test now pins the phone's constraint: a 2.5 s first snapshot is *answered* |
+| chaining is Tower-decided: a phone asking for nothing but CV Lab inside the 90 s grace joins the walk — 1,012 `frames_observed` against 360 sent by the World Builder phone | HIGH | §14.31, unchanged: needs a signal from the phone |
+| the Saved Worlds badge says "Complete" (caption "no final pass") over a session whose canvas headline is "Partial" — the SIGBREAK'd walk; `WorldListingPresentation.stateBadge`'s own docstring states the invariant this breaks | MEDIUM | **recorded, §14.34**: the listing has no "partial" state and adding one is a contract change the phone must be built against |
+| a wedge of ~11.5 s fails the subscriber off (`channel_failed`, 3 in a row) and the Tower never re-offers; recovery is the phone's re-subscribe, which during the fault met the cap | MEDIUM | with the cap gone, a re-subscribe during a fault waits, stalls the socket, and is answered by the next connection's attempt once the fault clears — the pre-round-24 path, measured working in round 24's own re-run (0.22 s after the fault cleared) |
+| `_abandon_streak` cleared only by a pass delivery, never a successful subscribe (stayed at 1 for 70 s of good reads); entries kept for departed targets | LOW | round 25: cleared on either delivery; pruned with `_failures` |
+| ~120 "could not build the first snapshot" lines a minute from one flapping client during a wedge — shorter lines, same volume | LOW | round 25: one line per target per 30 s |
+| the `TimeoutError` message misreports the wait ("after 0s", "after 20s") | LOW | round 25: it states the wait |
+
+**The single most likely thing to go wrong, by that reviewer:** a WiFi
+outage longer than the 90 s resume grace — two `Complete` worlds of half
+a walk each (§14.28). Second: a drop followed by the phone coming back on
+another screen within 90 s (§14.31).
+
+#### The publisher, sixth pass
+
+The same cap, with the mechanism: a healthy read slower than 1.5 s
+could **never** be subscribed to, because the next subscribe found the
+finished-but-uncollected result and discarded it as stale (round 23's
+rule), dispatched afresh, and timed out again — 0 of 8 at 2.1 s, 0 of 5
+at 1.7 s and 2.4 s, on a real socket, with the phone's `snapshot_failed`
+terminal on the far side. Plus what the cap had hidden:
+
+| finding | severity | resolution |
+|---|---|---|
+| a healthy read slower than the cap is never subscribable (above) | **BLOCKING** | the cap is gone (the rehearsal's finding, above); and a done-uncollected future **younger than the heartbeat** is handed over, not discarded — a 2.1 s read that finished 0.4 s ago for a phone whose socket stalled at 2 s is the freshest state there is; the 4.0 s-old one round 23 was written for is still discarded. Pinned both ways |
+| after a fault clears, a target stays refused for up to **592 s**, silently — recovery needs an abandonment and the backoff cap was 600 s | HIGH | the ceiling is 120 s; `_abandonment_cap` and the constant are pinned ≤ 120 |
+| **client-driven unbounded threads and dicts**: a target is `(cartridge, result_type, world_id, session_id)` and the last two are the client's to choose — 400 distinct `world_id`s against a wedged read → 400 live threads in 0.3 s; four connections at the cap's cadence → 168 threads a minute; none ever swept, because a failed subscribe registers nothing and so starts no poll loop | HIGH | the subscribe path runs the same abandonment sweep the pass does, over every in-flight future; and at most `MAX_IN_FLIGHT_TARGETS = 64` distinct targets may be computing at once (a phone holds a handful; the 65th is refused as `snapshot_failed`, one log line) |
+| `_dispatch` from a subscribe clobbered the watcher set with the new subscription alone; its failure path then emptied it, and the pass discarded the finished snapshot a *registered* watcher was waiting for as "computed for nobody" — an extra full read cycle | MEDIUM | seeded with the target's registered watchers ∪ the new one; a failure removes only the new one |
+| a burst of subscribes to several cartridges blocks the receive loop for the sum of their inline waits (6 s measured at the 1.5 s cap — up to the deadline each without it) | MEDIUM | **recorded, §14.35** — pre-existing since round 20, bounded by the deadline and self-healing through the stall, and the per-connection budget it wants is a route change worth its own review |
+| the quarter-interval floor in the loop was a quarter of a millisecond at a 1 ms test poll (6,000 passes a second, again) | LOW | an absolute 20 ms floor — and the reason it is 20 and not 10 is worth a line: Windows' event-loop clock resolution is 15.6 ms, a timer due inside it is treated as due whenever the loop has anything else ready, the snapshot threads' deliveries keep it ready, and a 10 ms floor measured **0.17 ms** |
+| `snapshot_failed` cannot say "try again" from "give up" | LOW | **recorded, §14.35** — a contract field the phone must be built against |
+| three of round 24's six changes were not pinned (the carried-over test never asserted the delivery; the cap test's window hid a hard-coded cap; nothing pinned the floor or the age-clock default) | MEDIUM | each pinned, and the round-22 stale test now makes its uncollected result 4.0 s old rather than relying on "uncollected" alone |
+
+Sound, by that reviewer: no double dispatch in one pass (instant, 0.12 s,
+0.22 s producers × 25 passes: one dispatch, one thread, ≤ 1 in flight);
+the backoff spacing 32 s / 62 s; a delivery clears the streak; the age
+clock defaults to monotonic and `build_hub` leaves it alone; the
+abandoning subscribe returns in 0.00 s; two subscribes past the cap in
+one iteration → one thread; **CV Lab, Object Memory and Document Memory
+at 39 of 40 beside a 60 s wedge, max gap 0.72 s; cadence for a 0.55 s
+read 0.63 s (round 23: 1.52), for 0.80 s 1.14 s**; the clobber gone;
+`SystemExit` from a producer exits nothing; `asyncio.run` returns in
+1.01 s with two wedged threads; the single-cartridge stall bound holds.
+
+#### Eight mutations, eight caught
+
+The cap back (caught in 1.7 s — the read the phone must be answered
+for), the young result discarded, no sweep from the subscribe path, no
+target cap, the watcher set clobbered, the 600 s ceiling, the fractional
+floor, ages on the wall clock. Thirty-four mutations across rounds
+22–25, thirty-four caught, one on record as a refinement.
+
+The full venv suite on the round-25 tree, beside the seventh publisher
+reviewer's runs: **3182 passed, 35 skipped, 1 xfailed, 0 failed** (`venv30`, 13:13).
+
+
+### Round 26 — the seventh publisher reviewer: the handover that could not fire
+
+Round 25 was committed as `9035c70` and handed to a seventh attacker,
+who re-ran every predecessor's script. The round-25 numbers held —
+recovery 10–118 s (≤ 120), the busy loop at 34 passes a second and 3%
+of a core, isolation at 97.5% of cadence beside a 2.1 s read, 40/40
+beside a wedge, shutdown in 0.52 s, 195/195 tests — and the cap's
+removal answered every single-socket subscribe at 1.4, 2.1 and 3.0 s.
+And then the reviewer drove the *phone's* shape of the same case.
+
+| finding | severity | resolution |
+|---|---|---|
+| **The young-result handover could never fire for the phone it was written for.** It measured age from *dispatch*: a 2.1 s read that finished 0.4 s ago was 2.5 s "old", over the 2 s line, discarded, recomputed — and the phone, which replaces its socket at 2 s, re-subscribed into the same loop forever. **0 of 10 sockets at every read between 2.0 and 2.4 s**, one fresh read per socket, with the screen on a spinner that never ends (iOS disarms its 10 s ack bound on every disconnect). Round 25's justification — "the re-subscribe joins the same future" — was false: the old socket's wait is *cancelled*, and the done future is either forgotten or rejected as old. Proved by a scratch patch: with age measured from completion, socket 2 subscribes at 2.44 s for 2.1 s and 2.35 s reads alike | **BLOCKING** | `_completed_at[target]`, recorded by the dispatch's own done-callback (only while that future is still the table's entry); staleness is how long a result has *sat*, not how long it took. Pinned in real time: a 0.3 s read that finished 0.02 s ago is handed over; one that sat 0.25 s past a 0.1 s heartbeat is not |
+| **the global 64-target cap locked every legitimate phone out** once ~21 hostile connections held it — 70 connections: `in_flight=64`, the phone's instant read refused 15 of 15, `snapshot_failed`, terminal on iOS | **BLOCKING** (given ≥ ~21 hostile connections) | the cap is **per connection**, 8 — the same number as `MAX_SUBSCRIPTIONS_PER_CONNECTION` — with the global wall raised to 256, which no legitimate fleet reaches (32 phones at 8). Pinned: 400 hostile targets on one connection are walled at 8 while a second connection's healthy target is answered |
+| the handover returned the result to the newcomer alone and forgot the target, so every registered watcher of it lost a poll interval (the watcher's connection saw `r3`, `r4`, never `r2`) | MEDIUM | the handover goes through `_collect`: offered to every registered watcher, then returned |
+| the watcher take-back ran only on the timeout path; a phone that replaces its socket *cancels*, so its dead `Subscription` stayed in the set (four retained per wedge) | MEDIUM | taken back on cancellation too |
+| a young done future holding an exception was re-raised uncounted for the length of the heartbeat, through the route's traceback branch | LOW | counted like any failure and the subscribe falls through to a fresh dispatch |
+| the refusal message leaked a Python class name and claimed a read had failed | LOW | it says what happened: how many results this connection already has computing |
+| three round-25 tests passed against wrong implementations — the young test's fake clock never advanced *during* the read; the recovery test asserted only constants; the hostile test *pinned* the global cap | MEDIUM | the young test runs in real time with a read slower than the heartbeat; the recovery test drives a recovery through ten-second attempts; the hostile test walls one connection and answers another |
+
+Sound, by that reviewer: no revision goes backwards and no `cursor_status`
+contradicts its snapshot across a phone-like reconnect; the cross-target
+sweep from a subscribe cannot interleave with a parked pass (no `await`
+inside it; `_collect` forgets by identity); the `_abandon_streak` prune
+does not reset the backoff; 64 (now 256) is unreachable by two real
+phones (≈ 16 targets); the warning rate-limit's keys are length- and
+size-bounded.
+
+#### Six mutations, six caught
+
+Staleness from dispatch again (caught in 1.8 s — the real-time read),
+the handover around the watchers, the cached exception re-raised, the
+cap global again, no take-back on cancellation, the 600 s ceiling with
+the recovery now *driven*. Forty mutations across rounds 22–26, forty
+caught, one on record as a refinement.
+
+The full venv suite on the round-26 tree, beside the eighth publisher
+reviewer's runs: **3185 passed, 35 skipped, 1 xfailed, 0 failed** (`venv31`, 13:16).
+
+
+### Round 27 — the eighth publisher reviewer: the table that filled with finished work
+
+Round 26 was committed as `51200df`. The eighth reviewer re-ran every
+predecessor's script: **every read from 1.0 to 5.0 s in 0.25 s steps
+subscribes** (socket 1 to 2.0 s, socket 2 to 4.25 s, socket 3 beyond),
+the lockout is gone (70 hostile connections, the phone answered 15 of
+15), the cancel leak is gone (0 retained), 198/198 tests. And then found
+that the newest fix had a hole of its own.
+
+| finding | severity | resolution |
+|---|---|---|
+| **Done-but-uncollected futures for targets nobody watches were never swept while no channel was attached** — the pass frees them, the pass runs only with a channel attached, and a channel attaches only after a *successful* subscribe. 300 sockets that each subscribed to a distinct `world_id` and dropped 20 ms later, against a **healthy 0.2 s read**: 256 done futures nobody watched, the global cap reached, every subscribe refused, no channel ever attached, no pass ever ran — the whole result channel disabled by bookkeeping alone, still refused 130 s later. With one phone attached, the same 300 sockets left the table empty | **BLOCKING** | the subscribe path frees done futures nobody is waiting for, before the cap checks. Pinned: 296 subscribe-and-drop sockets against a healthy read, then a phone answered and at most one entry left |
+| `_owner_of` held strong references to closed channels (256 retained, each with its socket) and counted a finished future against its connection — "until one of them finishes" was false | HIGH | `detach` releases the leaving channel's owner references; the strand fix makes the count honest |
+| the 256-target global cap had no test left (round 26 repointed the only one at the per-connection cap) | MEDIUM | a test that walls a 257th distinct connection's wedge |
+| `_collect` could run twice on one future (the young handover and a parked pass), double-counting a failure so two genuine failures tripped the three-strike escalation — a latent window the reviewer could not force naturally | MEDIUM | idempotent per future within a pass |
+| the "honest message" never reached the wire — the route sent the exception's type name | LOW | a `TimeoutError`'s text is sent |
+| three round-26 invariants were unpinned: the completion stamp's identity guard, `_forget` clearing the new tables, the young threshold being the heartbeat rather than the poll | LOW | each pinned |
+
+Sound, by that reviewer: the completion stamp is guarded by identity
+(an abandoned thread returning 100 s late does not re-stamp the
+replacement); `_completed_at` is bounded by `_in_flight`; a mid-close
+channel is safe to offer to; the heartbeat rule neither double-delivers
+nor withholds a first delivery; socket replacement is clean (the old
+channel's dispatches count against the old owner only; the new channel
+is answered); the backoff holds at 45 threads an hour under a permanent
+wedge.
+
+#### Seven mutations, seven caught
+
+The done-unwatched sweep removed, the global cap removed, owner
+references kept on detach, a future collected twice, the late return
+re-stamping the replacement, `_forget` leaving the new tables behind,
+the threshold reduced to the poll. Forty-seven mutations across rounds
+22–27, forty-seven caught, one on record as a refinement.
+
+The full venv suite on the round-27 tree, beside the ninth publisher
+reviewer's runs: **3192 passed, 35 skipped, 1 xfailed, 0 failed** (`venv32`, 12:41).
+
+
+### Round 28 — the ninth publisher reviewer finds no blocking defect
+
+Round 27 was committed as `9ca641a`. The ninth reviewer re-ran every
+predecessor's script — the strand family (9 entries left of 256, the
+phones answered), the phone-shaped sweep (a working subscription at
+every read from 1.0 to 5.0 s), the lockout (0 refused), the cancel
+leak (0 retained), the recovery (30–32 s after a fault clears), the
+isolation (40/40 beside a 60 s wedge), a 45 s churn soak with the sweep
+firing constantly (93–94 of an ideal 90 deliveries to each of four
+phones, max gap 0.52 s), two phones on a 2.1 s read, shutdown in 1.01 s
+beside two wedged threads — and forced the one window round 27 opened
+(a subscribe sweeping a done future a parked pass still holds): no
+`KeyError`, no double offer, no lost delivery, the failure counted once.
+**"No blocking software-side defect found."** The first clean publisher
+pass in nine. What it did find:
+
+| finding | severity | resolution |
+|---|---|---|
+| `_collected` — the once-per-future record — was a plain set cleared only at the start of a pass, and a pass runs only while a channel is attached: the cached-exception handover ends in `snapshot_failed`, which attaches nothing, so with nobody attached it grew for the life of the process (**35,000 retained futures an hour** at a modest rate, each holding its exception, traceback and through it the hub) | HIGH | a `WeakSet`: the record dies with the future. Pinned with pytest's own log capture silenced, since that capture would hold the records itself |
+| the route matched `TimeoutError` to put the hub's message on the wire — and a *producer's* `TimeoutError` (a socket, a lock, a filesystem call) matched too: **534 bytes** of path, errno and pid on the wire, and its traceback lost to the one-line log | MEDIUM | `SnapshotTimeout`, the hub's own type (`TooManyTargetsInFlight` beneath it); the route's message helper puts text on the wire for that type alone, and a producer's own timeout is logged with its traceback and named by type |
+| two round-27 tests pinned less than their names claimed: the detach test would pass if `detach` unowned *every* connection's dispatches; the sweep test never attached a watcher, so the guard that keeps a watched result for its watcher was untested | MEDIUM | both sharpened: a live second connection keeps its wall through another's detach; a registered watcher receives the result another connection's subscribe swept past |
+| the `_forget` test's docstring claimed more than it asserted | LOW | narrowed, naming the tables that outlive a forget and why |
+| **pre-existing, not this round's:** a real wedge *plus* a hostile client cycling open → eight wedged subscribes → close pins the global wall and mints threads without ceiling (1,551 in 3 min), and refuses a legitimate phone 75 of 90 probes — identical on round 26 and round 27; not client-inducible without a disk fault | BLOCKING-class, unchanged | **recorded, §14.36** |
+
+#### Four mutations, four caught
+
+The record held strongly again, the wire text matching any
+`TimeoutError`, `detach` unowning every connection, the sweep freeing a
+watched result. Fifty-one mutations across rounds 22–28, fifty-one
+caught, one on record as a refinement.
+
+The full venv suite on the round-28 tree, beside the tenth publisher
+reviewer's runs: **3196 passed, 35 skipped, 1 xfailed, 0 failed** (`venv33`, 13:22).
+
+#### The tenth publisher reviewer, on the final tree: no blocking defect
+
+Round 28 was committed as `dc52b2d`. The tenth reviewer re-ran the
+whole battery — no `_collected` growth (final 12 against a linear
+35,000/h before), the wire text 61 bytes and type-name only for a
+producer's own timeout, the strand at 9 of 256 with the phones answered,
+a working subscription at every read from 1.0 to 5.0 s, the lockout at
+0 refused, the 45 s churn soak with no stall, isolation at 40/40, the
+shutdown in 1.00 s — and put the `WeakSet` itself under load: 200,000
+futures minted one at a time, 199,999 address reuses, **0 false
+memberships**; the weakref callback runs inside deallocation, before the
+allocator can hand the address out again. **"NO BLOCKING DEFECT."** The
+second consecutive clean pass. What it left, on record and deliberately
+not fixed, because every previous round's newest code was where the next
+defect lived and the retest does not depend on any of these:
+
+| finding | severity | disposition |
+|---|---|---|
+| the one-line-per-30-s log throttle covers the hub's own timeouts; a *producer's* `TimeoutError` now goes to `logger.exception` unthrottled — 60 tracebacks in 15 s from one flapping client against a read that times out (round 27 had throttled it, at the cost of echoing it) | MEDIUM | **§14.37**: route every first-snapshot failure log through the same per-target limiter |
+| `_failures` (and `_abandon_streak`) are pruned only by the pass, so under the same nobody-attached precondition a client minting distinct `world_id`s grows them 1:1 with its attempts (≈ 11.6 MB/h); one successful subscribe zeroes them within 2 s | MEDIUM | **§14.37**: prune on the subscribe path's sweep as well |
+| the `_collected` test asserts the set's *size*, not its *lifetime*: a plain set cleared at the top of `first_snapshot` passes every test and double-counts a failure when a handover and a parked pass both reach one future | MEDIUM (test) | the lifetime assertion is described in §14.37 for whoever touches the file next |
+| the wire-text test is a unit test of the helper; nothing holds the route to calling it | LOW (test) | ditto |
+| `_collect`'s docstring still says "until the next pass begins"; a hardcoded `8`; a process-wide `logger.disabled` in one test; a cancelled task not awaited | LOW | ditto |
+
+
+
+
+
+
+
 **Exonerated by measurement**, against the lead's own stated doubts: the render page is fast (5.3 ms median for 19,329 points, 6.2 ms on a second run — the Chrome timeouts were screenshot artifacts); loop-detection-always is a net win at every *live* horizon (the 22%-fewer-points result did not reproduce); `load_solution`'s eager read projects to ~49 MB peak at 6,000 keyframes; a kill mid-`write_derived` or mid-`append_jsonl` loses no authoritative data; the field artifact is **byte-identical** to its preserved copy (1,542 files, 116,452,684 bytes, 0 mismatches), verified twice.
 
 ---
@@ -1667,6 +2198,20 @@ worse than a gap.
     isolation and 4/4 under four concurrent copies, so it takes real
     suite-level load to show.
 
+    **Diagnosed in round 21, and it was not load.** The test's two
+    sockets are sequential, so at the first one's teardown
+    `live_connections == 0` and the last-client stop is decided; whether
+    it *ran* depended on where Starlette's test client landed its
+    cancellation (§13, round 21). When it ran, the World Builder session
+    was stopped and the gate was shut when the second socket's capture
+    opened — the exact mechanism guessed at below. Under uvicorn a real
+    reconnect keeps `live_connections` at one (the phone is back before
+    uvicorn notices the drop) and, since round 20, the deferral covers
+    the case where the Tower notices first. The field-impact analysis
+    below stands; the "pre-existing, untouched" paragraph is now
+    historical, since the teardown was rewritten to make the stop land
+    every time and the tests hold their sockets the way the phone does.
+
     The one I chased asserts `second_capture in workers[0]["lineage"]`
     after a socket drop and reconnect. When it fails, `len(workers) == 1`
     still passes and the surviving worker's lineage holds only the FIRST
@@ -1709,6 +2254,16 @@ worse than a gap.
     side would mean changing what `session/stop` means. §15 forbids the
     action; this records what happens if it is taken.
 
+    **Amended in round 21.** The worse variant — leaving the screen
+    *during an outage*, then returning and reconnecting — used to lose the
+    rest of the walk **silently**: the successor capture was chained into
+    the asked-to-stop builder because it was still alive (finishing), it
+    exited without following, and 1,200 frames were recorded and built by
+    nobody while the phone showed the "success" sentence. A successor is
+    no longer chained into a worker that has been asked to stop; it gets a
+    builder of its own, so the outcome is now the visible one above (a
+    second world) rather than an invisible loss.
+
 23. **After Stop, the live panel drops to "No world yet / Last saved
     world … finished [Open]" rather than "Saved".** When the world becomes
     ready the unpinned payload flips to `selection: latest`, and
@@ -1733,7 +2288,152 @@ worse than a gap.
     with a real client should confirm the `result_error` arrives.
 
 
+25. **Two phones streaming at once are fused into one world.** A
+    superseding `stream_start` from a second, LIVE socket now ends the
+    first phone's capture as `disconnect` (round 20's reconnect fix), so
+    the second phone's capture chains into it: one session, both wearers'
+    frames, one "Complete" world. Reproduced by a reviewer with two
+    clients. At supersession time the Tower cannot tell a second phone
+    from the same phone reconnecting — in both cases the old socket is
+    still counted live, because uvicorn takes 20–40 s to notice a dead
+    one — so there is no signal to branch on. Before round 20 the same
+    two phones produced two worlds *and* the first phone's later frames
+    still landed in the second capture (pre-existing: `_record_capture`
+    has no owner check). Multi-phone is unsupported; the retest is one
+    wearer. Recorded rather than fixed.
+
+26. **`AccessDenied` on a lock holder's start time reads as alive, even
+    for a legacy lock whose pid may be recycled.** Round 20 made
+    cannot-judge mean alive because the other direction admits a second
+    writer onto one store. The cost: a legacy lock (no `created_at`)
+    whose recycled pid lands on a protected process that hides its start
+    time reads live forever — the round-19 ghost walk through a narrower
+    door. A census of this host found **0 of 349** pids that raise
+    `AccessDenied`, so it is not reproducible here; it needs a
+    protected-process pid. Visible in the pre-flight's
+    `no_world_claims_to_be_building` if it ever happens.
+
+
+27. **A Stop tapped while offline never reaches the Tower.** The phone's
+    `teardownConnection` clears the stream bracket, so `sendStreamStop`
+    becomes a no-op and the reconnect sink reopens only if the camera is
+    streaming; nothing resends the missed stop. Reproduced by the second
+    dress rehearsal: after the link returns, the panel and picker say
+    **Building (live) for ~95 s** after the wearer's Stop, then Finishing,
+    then finished — the world is correct, the wait is not explained. Phone
+    side; recorded.
+
+28. **The reconnect window is 90 s from when the Tower *records* the drop,
+    not from when the wearer loses the link.** The Tower's ping timeout
+    (35–60 s measured here) runs first. Gaps of 12/30/60/85/95 s produced
+    one world; **130 s and 160 s produced two.** §17 item 5 should be read
+    with that in mind: from the wearer's side the budget is roughly two
+    minutes, not ninety seconds, and the picker can read "Building (live)"
+    for ~125 s after a phone has died.
+
+29. **A Tower restart mid-walk.** Graceful (Ctrl+Break): the builder gets
+    `SIGBREAK` → `final solve skipped: hard stop` → picker "Complete · no
+    final pass", panel **Partial**, render the grey unplaced pre-solve
+    build; the second half of the walk is a new world. Hard kill: world 1
+    **Interrupted** with a stale lock naming a dead pid (harmless to later
+    walks — the pid-recycling judgement handles it). Both recoverable with
+    `world_finalize.py`. Reproduced; not previously mentioned anywhere.
+
+30. **Document Memory keeps ~1.4 GB of GPU for ten minutes after the last
+    client leaves** (`DEFAULT_IDLE_STOP_S = 600`, by its own design and
+    documented in its module). Not a World Builder matter; recorded here
+    because a retest operator watching GPU memory after a walk will see
+    it and should not chase it.
+
+
 ---
+
+31. **A stream from ANY phone or screen inside the resume grace is treated
+    as the returning phone.** `continues` is decided by the Tower from
+    its single recorder (`resumable_capture()`); nothing in the client's
+    `stream_start` says "I am the one who dropped". A second phone that
+    streams CV Lab or Object Memory within 90 s of a World Builder
+    phone's drop has its capture chained into the deferred walk and its
+    frames built into that world, until the follow-up stops the walk at
+    drop+105 s (a rehearsal measured 1,016 `frames_observed` against 360
+    sent by the World Builder phone). On the single-phone retest this
+    needs a drop *and* a screen switch while offline (§14.27 — the Stop
+    never reaches the Tower). Closing it needs a signal from the phone
+    or a per-connection ask; both are phone-side changes.
+
+32. **The Tower sometimes does not exit after "Finished server process"
+    when other Towers and builders are running on the machine** — 5 of
+    ~14 shutdowns in a rehearsal (15 s, 30 s, > 60 s, > 120 s, > 300 s);
+    the port is released, the process is not. Alone on the machine it
+    exited in 0.4–0.9 s in 16 of 16 attempts, so the blocking thread was
+    not named. No walk is lost (the record is durable before the hang).
+    If "restart the Tower" is needed during the retest and the process
+    lingers, kill it.
+
+33. **`/worlds` reports `keyframes_accepted: 0` for a walk that is still
+    live** while the status channel shows its geometry: the picker reads
+    `session.json`, which the builder flushes at rebuilds, not per
+    keyframe. The panel is right; the listing catches up at the next
+    flush.
+
+34. **The Saved Worlds badge and the canvas headline can disagree about a
+    walk whose final solve did not run.** A Tower shut down mid-walk
+    (or a final solve that crashed) leaves `complete` with `final_solve:
+    skipped`/`failed` and geometry: the listing state is `complete` (the
+    Tower's own lifecycle says `ready`), so the row badge reads
+    "Complete" with the caption "no final pass", while the canvas
+    derives "Partial" from `final_solve`. The listing row carries
+    `finalization`, so the phone has what it needs to badge the row
+    "Partial" too; a listing-side `partial` state would be a contract
+    change the phone must be built against, and nothing iOS is built
+    here.
+
+35. **A burst of subscribes to several cartridges on one socket blocks
+    that socket's message loop for the sum of their inline first-snapshot
+    waits**, up to the 10 s deadline each, when those reads are all slow
+    or wedged (a disk fault touches every manifest). Pre-existing since
+    round 20 and self-healing — the phone replaces a socket that has
+    stalled 2 s, and the re-subscribes join the futures already running —
+    but a per-connection budget that later subscribes in a burst inherit
+    is the right shape, and it is a route change the result channel's
+    tests should be extended for. Related: `snapshot_failed` carries no
+    "try again" versus "give up"; on the phone it is terminal (`.failed`,
+    no retry — only `channel_failed` is retried), so a `retriable` field
+    is the contract change that would let the Tower answer a slow read
+    quickly without killing the screen. Nothing iOS is built here.
+
+36. **A real wedge plus a hostile client can still pin the result
+    channel's global wall.** With a read genuinely wedged (a disk fault
+    — nothing a client can induce on its own, since a hostile `world_id`
+    returns fast), a client cycling open → eight wedged subscribes →
+    close holds `_in_flight` at the 256 global cap and mints abandoned
+    daemon threads without ceiling (1,551 in three minutes, measured),
+    and a legitimate phone is refused most of its subscribes for as long
+    as the attack and the fault both last. Two independent failures
+    are required, and the per-connection cap, the backoff and the
+    sweeps bound every single-failure case; a ceiling on abandoned
+    threads per target, or an admission budget per source address,
+    is the next layer, and it needs a design pass of its own.
+
+37. **Two bookkeeping corners the final reviewer left, unfixed on
+    purpose.** With *nobody attached* to the result hub (every subscribe
+    failing, so no channel and no poll loop), a client minting distinct
+    `world_id`s grows `_failures` and `_abandon_streak` one entry per
+    attempt (≈ 11.6 MB an hour), and a *producer's* own `TimeoutError`
+    is logged with a full traceback per subscribe rather than once per
+    target per 30 s (60 tracebacks in 15 s from one flapping client).
+    Both self-heal on the first successful subscribe; neither is
+    reachable from a phone on a stable world. The fixes are one line
+    each — prune those two tables in `first_snapshot`'s sweep, and route
+    every first-snapshot failure log through `_LAST_FIRST_SNAPSHOT_WARNING`
+    — and the tests to pin them are: collect a future through the young
+    handover, run an unrelated subscribe, collect it again, and assert
+    the failure was counted once (the `_collected` *lifetime*, which a
+    plain set cleared per subscribe would fail); and drive a producer
+    `TimeoutError` through a real websocket and assert the
+    `snapshot_failed` message carries neither a path nor an errno. They
+    were left because ten consecutive rounds found the newest code to be
+    where the next defect lived, and the retest depends on neither.
 
 ## 15. The physical retest
 
@@ -1748,7 +2448,9 @@ xcodebuild -project Glasses.xcodeproj -scheme Glasses   -destination 'platform=i
 
 (Bare `xcodebuild build` / `test` do not work here: the repo's own handoffs
 use the `-project`/`-scheme`/`-destination` form, and `test` needs a scheme.
-A dress-rehearsal reviewer tried the bare form and it failed.)
+A dress-rehearsal reviewer tried the bare form and it failed. Note also that
+no shared `.xcscheme` is committed, so `-scheme Glasses` relies on Xcode
+having auto-created one on the Mac; if it has not, open the project once.)
 
 **The app MUST be rebuilt from this branch.** **Two** contract ids moved,
 and both are compared for equality:
@@ -1770,7 +2472,9 @@ retest.** `TowerClient.swift` guards the entire streaming path behind
 `sendLifecycleMarker` (1694) inside the one at 1683. Only the CV Lab
 commands (1787+) and the ping (1946) are outside.
 
-Without `stream_start` the Tower never opens a capture (`routes/ws.py:808`),
+Without `stream_start` the Tower never opens a capture (`routes/ws.py`, the
+`stream_start` branch of the message loop — line numbers in this file have
+moved several times; search for the string),
 so no builder attaches and **no world is created at all** — not an empty
 one, nothing to open. `txSequence` and the `tx_seq` field are inside the
 same guard, so this campaign's loss instrumentation is DEBUG-only too. The
@@ -1810,7 +2514,11 @@ the field replay solved with GLOMAP under it), **not** the wrong-Python
 failure — do not abort the retest on that line.
 
 **Two things a dress rehearsal found about the walk itself, before the
-pre-flight.**
+pre-flight** — and a correction from the second rehearsal: *do not* expect
+to "watch Finalizing, then Saved" on the live panel; the sequence you will
+actually see is "Improving…" (with the "worth waiting for Saved" note),
+then the panel dropping to idle with "Last saved world … finished [Open]".
+That drop is the success signal. "Saved" is what Open shows.
 
 - **Never let the socket drop, and never leave the World Builder screen
   mid-walk.** Before round 20 a mid-walk reconnect through the Tower split
@@ -1822,7 +2530,7 @@ pre-flight.**
   the Tower's 90 s resume grace. Leaving the screen sends `session/stop`
   while the capture is open — the first builder ends `interrupted`, and
   coming back attaches a **second** builder that re-reads the capture from
-  frame 0 into a second, whole-walk world (§14.13).
+  frame 0 into a second, whole-walk world (§14.22).
 - **After Stop, the live panel will drop to "No world yet / Nothing is
   being built right now / Last saved world: Walk · … · finished [Open]".
   That is success, not failure — tap Open.** When the world becomes ready
@@ -1914,6 +2622,14 @@ were lost in the air or never sent.
 
 ## 15b. Temporary resources this campaign created
 
+**Two live processes, not files, as of 2026-09-14 03:12:** the round-21
+attack reviewer left two `wedge_tower.py` servers running (`python.exe`
+pids started 02:26:02 and 02:27:45, ~650 MB each, idle). They are that
+reviewer's harness, not the Tower; they hold two ephemeral ports and
+about 1.3 GB. Nothing here depends on them. They were deliberately not
+killed during a liveness check; end them when convenient
+(`Get-Process python | ? {$_.StartTime -lt '03:00'}` will find them).
+
 Filesystem policy rule 9. All under `C:\Users\tvllo\Projects\Glasses-scratch\`;
 nothing at the drive root, nothing in the home directory, no new worktree.
 **None of these were deleted** — rule 14 requires explicit human approval and
@@ -1942,6 +2658,22 @@ eleven, plus five loose files. The full list, `du`-measured:
 | `wb-allcart-soak\` | 29 | The first, abandoned soak attempt. | disposable |
 | `wb-production-walk\` | 7 | The production-argv walk's world and capture. | disposable |
 | `wb-shutdown-time\` | 1 | Shutdown timing. | disposable |
+| `review-r19\` | 12 | Round 19's reviewer runs. | disposable |
+| `wb-audit-2026-09-14\` | 806 | Round 20's document audit: the field walk replayed against the audited tree. | disposable |
+| `wb-review-r20-2026-09-14\` | 398 | Round 21's attack reviewer: the wedged-Tower harness (`wedge_tower.py`, `wedge_client.py`) and its logs. **The source of the 24-threads-in-60-s measurement.** | KEEP until the retest |
+| `wb-retest-2026-09-14\` | 1748 | The second dress rehearsal: 33 Towers' worlds, captures and logs. **The source of the reconnect-timing table and the 130/160 s two-world result (§14.28).** | KEEP until the retest |
+| `r21-baseline-0357\` | 3 | A mis-made export (the package without its tests) from the teardown investigation; nothing depends on it. | disposable |
+| `wb-review-r21-ws-2026-09-14\` | ~400 | Round 22's teardown reviewer: bisect copies, `repro_A2.py` (the follow-up stopping another phone's Object Memory) and the `sitecustomize.py` that strips the editable finder — the pattern every later reviewer reused. | disposable |
+| `wb-review-r21-pub-2026-09-14\` | small | Round 22's publisher reviewer: `exp_poisoned_target.py`, `e2e_stale_reconnect.py`, `exp_slow_head_of_line.py`, `exp_churn.py`. | disposable |
+| `wb-review-r22-pub-2026-09-14\` | small | Round 23's publisher reviewer: `exp_poison2.py`, `exp_pass_duration.py`, `exp_clobber2.py`, `exp_baseexc.py`, `test_r22_review.py`. | disposable |
+| `wb-retest-r22-2026-09-14\` | large | The third dress rehearsal (33 Towers on the round-22 tree): `s_c.py c5` reproduces the re-ask-then-drop hole; `C1/`, `C2/`, `C5b/` hold the logs cited in §13. **KEEP until the retest.** | KEEP until the retest |
+| `wb-review-r23-pub-2026-09-14\` | small | Round 24's publisher reviewer: `d_stall.py`, `c_growth.py`, `b_slow_healthy.py`, `e_busyloop.py`, `test_r23_review.py`. | disposable |
+| `wb-review-r24-pub-2026-09-14\` | small | Round 25's publisher reviewer: `r24_e2e_slow_healthy.py` (the cap's 0-of-8), `r24_hostile_targets.py`, `r24_c_recovery.py`, `r24_watcher_erase.py`. | disposable |
+| `wb-retest-r24-2026-09-14\` | 2100 | The fourth dress rehearsal (round-24 tree): `C5b/`, `C4/`, `SEQ/`, `WEDGE2-*`, `SLOW-stdout.log` (the cap measured against iOS), `SHUT5-stdout.log`. **KEEP until the retest.** | KEEP until the retest |
+| `wb-review-r25-pub-2026-09-14\` | small | The seventh publisher reviewer (round 26): `r25_phone_slow.py` (the phone-shaped sweep every later reviewer re-ran), `r25_lockout.py`, `r25_cancel_leak.py`. | disposable |
+| `wb-review-r26-pub-2026-09-14\` | small | The eighth publisher reviewer (round 27): `r26_strand*.py` (the finished-work strand), `iso/` — the isolated mutation harness that finally defeated the editable install. | disposable |
+| `wb-review-r27-pub-2026-09-14\` | small | The ninth publisher reviewer (round 28): `r27_collected_growth2.py`, `r27_wire_text.py`, `r27_b_forced.py`, `r27_soak.py`, `r27_two_phones.py`, `r27_d_mint.py` (§14.36). | disposable |
+| `wb-review-r28-pub-2026-09-14\` | 29 | The tenth publisher reviewer, the final pass on the round-28 tree: `r28_weakset.py` (200,000 futures), `r28_failures_growth.py`, `r28_logvol.py`, `iso/mutate.py`. | disposable |
 | loose: `recover.json`, `recover2.json`, `recover3.json`, `recover.log`, `horizon-sweep.log` | <1 | The recovery runs' summaries. | disposable |
 
 **1,563 MB in total, of which 403 MB is evidence** (the preserved field
@@ -2076,11 +2808,32 @@ when it was written. Both mechanisms are fixed and re-verified with the
 reviewer's own harness at all four timings (§13, round 20); the verdict
 below is the one that stands after that, not instead of it.
 
+**And with rounds 21–28 on the record too**, because the reconnect fix
+was where the campaign's worst defects lived. Its deferral was an
+exemption (a walk `active` forever); its follow-up stopped **every**
+cartridge's session 105 s after any disconnect — another phone's Object
+Memory producer killed mid-walk, the one failure this architecture
+exists to rule out — and then, dedup'd on the wrong key, was defeated by
+one re-ask; the "load-sensitive flake family" was three real defects;
+and the result channel's in-flight table was rewritten seven times,
+each reviewer finding a real hole in the previous fix (a poisoned target
+with its cure unreachable, a 1.5 s cap that killed the phone's screen, a
+handover measured from the wrong clock, a table that filled with
+finished work). What ended it was not a better fix but the review shape:
+a fresh attacker on every round, each re-running every predecessor's
+experiment, each required to reproduce on a real socket driven like the
+phone. The last two passes on the final tree — the fourth dress
+rehearsal (33 real Towers, both round-23/24 claims verified, no
+blocking) and the ninth and tenth publisher reviewers — found no
+blocking defect. Thirteen more mutations than the rounds have fixes,
+because the reviewers kept finding tests that pinned less than their
+names claimed.
+
 Everything on the Tower side is verified on this machine: the root causes
 are fixed with tests that fail against the old code, the failed field walk
 is recovered by a supported command, a production-argv walk passes end to
 end — twice, the second driven across a real reconnect — the suite is
-green, and **twenty-two** independent review passes have been answered.
+green, and **thirty-eight** independent review passes have been answered.
 
 **Read that number as a warning, not a boast.** Every round found
 something in the newest code, including **five in a row** that found defects
@@ -2120,12 +2873,23 @@ What would most likely disappoint on the day, in order:
 4. **The world is a point cloud, not a surface.** It is coherent, coloured
    and navigable, and it is still dots. The dense lane that would change
    that is written, measured, and unmerged.
-5. **The phone stays offline for more than ~16 seconds.** Its reconnect
-   budget is 5 tries over ~15.5 s (`TowerClient.swift`), then "reconnect
-   given up — use Connect to retry". The Tower now holds the walk open for
-   90 s; the wearer has to tap Connect inside that window or it finalises
-   without them. Argued from the Swift, not run.
-6. **The walk fragments anyway**, because the capture is poor rather than
+5. **The phone stays offline for more than 90 seconds.** The Tower holds
+   the walk open for the 90 s resume grace and not a second more: a
+   reconnect at 95 s made **two `Complete` worlds of half a walk each**,
+   with nothing linking them, in every rehearsal that tried it (§14.28).
+   The phone's own reconnect budget is 5 tries over ~15.5 s
+   (`TowerClient.swift`), then "reconnect given up — use Connect to
+   retry", so the wearer has to tap Connect inside the window. Two
+   dress-rehearsal reviewers independently ranked this the single most
+   likely thing to go wrong on the day — it is the most probable event
+   on a real walk, and it is documented behaviour rather than a defect.
+6. **The wearer comes back on another screen inside those 90 s.** A
+   stream from any screen (or any phone) inside the grace is treated as
+   the returning walk and its frames are built into the world (§14.31);
+   the World Builder session is then stopped at drop+105 s unless the
+   wearer re-enters the World Builder screen. Stay on the World Builder
+   screen through an outage; the procedure says so.
+7. **The walk fragments anyway**, because the capture is poor rather than
    the solver is. 38.5% of the field capture was motion-blurred and 27.2%
    was more than 30% black, and nothing warns the wearer in the moment.
    `tx_seq` will at least say whether frames were lost or never sent.
@@ -2134,8 +2898,8 @@ The first and third need a Mac and a phone. The second is measured and
 mitigated by the procedure, and reducing it further means either a new
 live-path write or a retune that should be measured rather than guessed.
 The fourth needs a decision about scope rather than more evidence. The
-fifth is a phone-side budget read from the Swift and needs the phone to
-confirm; the sixth needs the glasses.
+fifth and sixth are measured on real Towers and need only the wearer to
+know them; the seventh needs the glasses.
 
 **Two things that would have been on this list and are now refused instead
 of suffered**, both found in the last two rounds and both silent before:
