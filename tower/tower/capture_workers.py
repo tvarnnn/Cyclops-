@@ -914,16 +914,21 @@ class CaptureWorkerSupervisor:
                     root,
                 )
                 return False
-            # Either this Tower never saw the predecessor (a restart
-            # mid-walk), or this spec's worker has died. Both mean
-            # nothing is reading this capture FOR THIS SPEC, so follow it.
-            logger.info(
-                "[Tower][Worker] capture %s continues %s but no live %s worker "
-                "owns that lineage; starting one",
-                capture_id,
-                continues,
-                registry.spec.name,
-            )
+            else:
+                # Either this Tower never saw the predecessor (a restart
+                # mid-walk), or this spec's worker has died. Both mean
+                # nothing is reading this capture FOR THIS SPEC, so
+                # follow it. (An `else`, not a fall-through: the
+                # asked-to-stop branch above used to fall into this line
+                # and log "no live worker owns that lineage" about a
+                # worker it had just named as alive.)
+                logger.info(
+                    "[Tower][Worker] capture %s continues %s but no live %s "
+                    "worker owns that lineage; starting one",
+                    capture_id,
+                    continues,
+                    registry.spec.name,
+                )
         elif registry.owner_of(capture_id) is not None:
             # Already followed by this spec. Attaching again would put two
             # producers on one store.

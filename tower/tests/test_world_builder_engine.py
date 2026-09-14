@@ -82,6 +82,52 @@ def _map_session(
     return engine, world_id, session_id, summary
 
 
+class TestARestartedSequence:
+    def test_a_restarted_sequence_overwrites_no_keyframe(
+        self, tmp_path, walk_jpegs, intrinsics
+    ):
+        """The glasses restarted mid-session; every keyframe survives.
+
+        `source_seq` resets when the glasses session restarts, and a
+        builder now follows a capture LINEAGE, so one session can see the
+        numbers start again. The keyframe id and the image file name were
+        both `source_seq`: a repeated number overwrote the earlier image
+        on disk, the journal held two keyframes with one id, and the final
+        solve aborted on a duplicate file name -- "Partial" over a full
+        walk, four times in a dress rehearsal.
+        """
+        store = WorldStore(tmp_path)
+        engine = WorldBuilderEngine(store, backend_name=BACKEND_CLASSICAL)
+        world_id = engine.create_world("Test Room")
+        session_id = engine.start_session(
+            world_id, intrinsics=intrinsics, frame_source="synthetic",
+            declared_size=(WIDTH, HEIGHT),
+        )
+        half = len(walk_jpegs) // 2
+        for index, payload in enumerate(walk_jpegs[:half]):
+            engine.observe(payload, source_seq=index * 7, wire_seq=index)
+        accepted_before = engine._session.keyframes_accepted
+        # The sender restarts: the same numbers again.
+        for index, payload in enumerate(walk_jpegs[half:]):
+            engine.observe(payload, source_seq=index * 7, wire_seq=half + index)
+        summary = engine.stop_session(END_REASON_STOP)
+
+        keyframes = store.read_keyframes(world_id, session_id)
+        ids = [k.keyframe_id for k in keyframes]
+        assert len(ids) == len(set(ids)), "two keyframes share an id"
+        names = [k.image_relpath for k in keyframes]
+        assert len(names) == len(set(names)), "two keyframes share an image file"
+        images = list(store.images_dir(world_id, session_id).glob("*.jpg"))
+        assert len(images) == len(keyframes), (
+            f"{len(keyframes)} keyframes but {len(images)} images on disk"
+        )
+        assert summary.keyframes_accepted > accepted_before, (
+            "nothing after the restart was kept"
+        )
+        seqs = [k.source_seq for k in keyframes]
+        assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+
+
 class TestSessionLifecycle:
     def test_a_full_session_produces_keyframes_and_a_clean_stop(
         self, tmp_path, walk_jpegs, intrinsics

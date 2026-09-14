@@ -105,6 +105,12 @@ MAX_CONSECUTIVE_TARGET_FAILURES = 3
 # afresh, on the chance the fault has cleared. The abandoned thread is a
 # daemon and finishes, or does not, on its own. See `_dispatch`.
 SNAPSHOT_ABANDON_MULTIPLIER = 3
+# The cap doubles per consecutive abandonment of one target, up to this.
+SNAPSHOT_ABANDON_MAX_SECONDS = 600.0
+# The most a subscribe may wait inline for its first snapshot. Below iOS's
+# 2 s send-stall bound, because this wait blocks the connection's message
+# loop. See `ResultHub.first_snapshot`.
+SUBSCRIBE_INLINE_WAIT_SECONDS = 1.5
 
 # Per connection. A client with more than this many open subscriptions is
 # either confused or hostile; either way the answer is a refusal, not
@@ -479,10 +485,22 @@ class ResultHub:
         clock,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
+        age_clock=time.monotonic,
     ) -> None:
         self._snapshot_for = snapshot_for
         self._clock = clock
-        self._poll_seconds = poll_seconds
+        # Every DURATION here -- how long a snapshot has been running, the
+        # subscribe's remaining wait, the abandonment cap -- is measured on
+        # this clock, never on `clock`. `build_hub` hands in `time.time`,
+        # which a reviewer stepped: 600 s backwards left a wedged target
+        # unreachable by the cap for the length of the step, with the
+        # full inline wait restored on every subscribe; 10 s forwards aged
+        # every in-flight snapshot past its deadline at once and dropped
+        # every subscriber three passes later. `clock` is for the
+        # heartbeat and for what the client is told; this is for ages.
+        self._age_clock = age_clock
+        # A sub-millisecond poll is a hot loop, not a setting.
+        self._poll_seconds = max(float(poll_seconds), 0.001)
         self._heartbeat_seconds = heartbeat_seconds
         self._channels: set = set()
         self._task: asyncio.Task | None = None
@@ -496,15 +514,14 @@ class ResultHub:
         self._dispatched_at: dict = {}
         # Passes do not interleave. See `poll_once`.
         self._pass_lock = asyncio.Lock()
+        # How many times in a row a target's snapshot has been abandoned,
+        # for the backoff in `_past_abandonment`. Cleared on a delivery.
+        self._abandon_streak: dict = {}
         # The subscription ids watching each target when its in-flight
         # snapshot was dispatched. A result whose watchers have ALL gone
         # was computed for nobody who is still here. See the discard rule
         # in `_poll_once_locked`.
         self._watchers_at_dispatch: dict = {}
-        # Set after every completed poll pass. Tests wait on this instead
-        # of sleeping, which is what makes them deterministic.
-        self.polled = asyncio.Event()
-
     async def attach(self, channel) -> None:
         self._channels.add(channel)
         if self._task is None:
@@ -576,8 +593,25 @@ class ResultHub:
     async def _run(self) -> None:
         try:
             while True:
+                started = time.monotonic()
                 await self.poll_once()
-                await asyncio.sleep(self._poll_seconds)
+                # The pass may have waited up to `poll_seconds` for its
+                # own fresh futures; that wait counts toward the interval,
+                # so the cadence is the interval and not "pass + poll".
+                # A refinement, not the fix: the fix for the 20%-cadence
+                # measurement is the pass's budget (see `_poll_once_locked`),
+                # and a mutation that restores the full sleep here is NOT
+                # caught by the cadence test, because a slow future is
+                # fresh -- and waited on -- only on the pass that
+                # dispatched it.
+                elapsed = time.monotonic() - started
+                # Never less than a quarter of the interval: a pass that
+                # takes longer than the poll must not turn the loop into
+                # a spin (a reviewer measured 5,500 passes a second at a
+                # 1 ms poll).
+                await asyncio.sleep(
+                    max(self._poll_seconds * 0.25, self._poll_seconds - elapsed)
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -646,15 +680,51 @@ class ResultHub:
         if future is not None and future.done():
             self._forget(target)
             future = None
+        abandoned_here = False
+        if future is not None and self._past_abandonment(target):
+            # A subscribe is a chance to try the target afresh, and it
+            # was the only chance: once the escalation has failed every
+            # watcher off a wedged target, no pass looks at it again, so
+            # the abandon sweep in the pass cannot reach it. The first
+            # version of the cap sat only in the pass -- a reviewer
+            # counted 33 re-subscribes over 100 s against a future 95 s
+            # old, every one refused in 0.00 s. Poisoned for the life of
+            # the process, with the fix for that present and unreachable.
+            self._abandon(target)
+            future = None
+            abandoned_here = True
         if future is None:
             future = self._dispatch(target, subscription, {subscription})
         else:
             self._watchers_at_dispatch.setdefault(target, set()).add(subscription)
-        age = self._clock() - self._dispatched_at.get(target, self._clock())
-        remaining = min(timeout, SNAPSHOT_TIMEOUT_SECONDS - age)
+        age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
+        # THE INLINE WAIT IS BOUNDED BY THE PHONE'S OWN STALL BOUND, not by
+        # the snapshot deadline. This runs in the connection's message
+        # loop; while it waits, no frame on that socket is answered, and
+        # iOS replaces a socket that has stalled 2 s. Waiting the full
+        # 10 s here therefore cost a stalled socket per attempt, and the
+        # abandon-then-dispatch above had reset the age to zero and so
+        # re-armed the full wait every cap interval: a reviewer measured
+        # 25 s of every 30 blocked. A subscribe that cannot be answered
+        # inside `SUBSCRIBE_INLINE_WAIT_SECONDS` is answered
+        # `snapshot_failed` and the fresh thread serves the next one --
+        # and a subscribe that itself abandoned a wedge does not wait at
+        # all, since it knows what it is waiting on.
+        remaining = min(
+            timeout, SUBSCRIBE_INLINE_WAIT_SECONDS, SNAPSHOT_TIMEOUT_SECONDS - age
+        )
+        if abandoned_here:
+            remaining = 0.0
         if remaining > 0:
             await asyncio.wait({future}, timeout=remaining)
         if not future.done():
+            # This subscription will not be registered: take it back out
+            # of the watcher set, or every failed subscribe to a wedged
+            # target leaves a dead `Subscription` there for as long as
+            # the future lives (a reviewer counted 34 in 100 s).
+            watchers = self._watchers_at_dispatch.get(target)
+            if watchers is not None:
+                watchers.discard(subscription)
             raise TimeoutError(
                 f"the first snapshot for {target} is still running after "
                 f"{max(age, 0.0) + max(remaining, 0.0):.0f}s"
@@ -662,6 +732,44 @@ class ResultHub:
         if self._in_flight.get(target) is future:
             self._forget(target)
         return future.result()
+
+    def _abandonment_cap(self, target) -> float:
+        """How long this target's snapshot may run before it is abandoned.
+
+        Doubles with every consecutive abandonment, up to
+        `SNAPSHOT_ABANDON_MAX_SECONDS`: a read that stays wedged is
+        retried at 30 s, 60 s, 120 s ... rather than minting a new daemon
+        thread every 30 s for as long as the fault lasts (a reviewer
+        counted one per 30 s, 120 an hour, each holding the wedged
+        handle). A delivery clears the streak.
+        """
+        streak = self._abandon_streak.get(target, 0)
+        cap = SNAPSHOT_ABANDON_MULTIPLIER * SNAPSHOT_TIMEOUT_SECONDS * (2 ** streak)
+        return min(cap, SNAPSHOT_ABANDON_MAX_SECONDS)
+
+    def _past_abandonment(self, target) -> bool:
+        age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
+        return age >= self._abandonment_cap(target)
+
+    def _abandon(self, target) -> None:
+        """Forget a snapshot that has been running past its abandonment cap.
+        Its thread may still return, into a future nothing references any
+        more -- whose exception, if it raises, is retrieved by the callback
+        so asyncio does not log it as never retrieved."""
+        age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
+        self._abandon_streak[target] = self._abandon_streak.get(target, 0) + 1
+        logger.warning(
+            "[Tower][Results] snapshot for %s has been running for %.0fs; "
+            "giving up on that thread and trying the target afresh "
+            "(abandoned %d time(s) in a row; next cap %.0fs)",
+            target, age, self._abandon_streak[target], self._abandonment_cap(target),
+        )
+        future = self._in_flight.get(target)
+        if future is not None and not future.done():
+            future.add_done_callback(
+                lambda f: None if f.cancelled() else f.exception()
+            )
+        self._forget(target)
 
     def _dispatch(self, target, sample, watchers):
         """Start ONE snapshot for `target` on a thread of its own, and record it.
@@ -696,8 +804,18 @@ class ResultHub:
                     sample.cartridge, sample.result_type,
                     sample.world_id, sample.session_id,
                 )
-            except BaseException as exc:  # noqa: BLE001 -- crosses a thread
+            except Exception as exc:  # noqa: BLE001 -- crosses a thread
                 result, error = None, exc
+            except BaseException as exc:  # noqa: BLE001
+                # A `SystemExit` or `KeyboardInterrupt` raised by a
+                # producer must not cross the thread as itself: the
+                # collector catches `Exception`, and a reviewer measured
+                # the Tower process exiting with code 3 / 130 when it
+                # did. It is a failure of that target, reported as one.
+                result = None
+                error = RuntimeError(
+                    f"the producer raised {type(exc).__name__}"
+                )
             else:
                 error = None
             try:
@@ -711,7 +829,7 @@ class ResultHub:
             target=run, name=f"tower-result-snapshot", daemon=True
         ).start()
         self._in_flight[target] = future
-        self._dispatched_at[target] = self._clock()
+        self._dispatched_at[target] = self._age_clock()
         self._watchers_at_dispatch[target] = set(watchers)
         return future
 
@@ -723,6 +841,44 @@ class ResultHub:
         self._watchers_at_dispatch.pop(target, None)
         if future is not None and future.done() and not future.cancelled():
             future.exception()
+
+    def _collect(self, target, future, moment: float) -> None:
+        """A finished snapshot: freed, then offered or counted.
+
+        THIS future is forgotten, not whatever the table holds for the
+        target now. `first_snapshot` takes no pass lock, so a subscribe
+        that ran while a pass was parked in its wait may have discarded
+        this future's table entry and dispatched a replacement;
+        forgetting by target popped the replacement, and the next pass
+        dispatched a third -- two live threads for one target, measured
+        by a reviewer, which is the one bound this table exists to hold.
+        """
+        if self._in_flight.get(target) is future:
+            self._forget(target)
+        elif not future.cancelled():
+            future.exception()
+        try:
+            snapshot = future.result()
+        except Exception as exc:
+            # One unreadable target must not stop the others, and must
+            # not stop the loop. The producer already turns expected
+            # storage failures into an `unavailable` payload; reaching
+            # here means something genuinely unexpected.
+            logger.exception(
+                "[Tower][Results] could not build a snapshot for %s", target
+            )
+            self._note_failure(
+                target,
+                f"the Tower could not read this cartridge's state; "
+                f"the last failure was {type(exc).__name__}",
+            )
+            return
+        self._failures.pop(target, None)
+        self._abandon_streak.pop(target, None)
+        for channel in list(self._channels):
+            channel.offer(
+                target, snapshot, now=moment, heartbeat=self._heartbeat_seconds
+            )
 
     def _note_failure(self, target, reason: str, *, log=None) -> None:
         """Count one failure for a target, and tell its subscribers after three.
@@ -873,6 +1029,18 @@ class ResultHub:
                 # departed target stays until it finishes, so it can
                 # never be dispatched twice.
                 self._forget(target)
+            elif (
+                not self._in_flight[target].done()
+                and self._past_abandonment(target)
+            ):
+                # ABANDONED -- watched or not. The first version swept
+                # only the watched targets, and a wedged target has no
+                # watchers by the time the cap is reached: the escalation
+                # fails them off after three deadlines (~11 s), the cap is
+                # three deadlines PLUS (30 s), and nothing in between
+                # looks at an unwatched pending future. Dead code, and
+                # the target stayed poisoned.
+                self._abandon(target)
 
         now = self._clock()
         waiting: dict = {}
@@ -882,10 +1050,24 @@ class ResultHub:
             if (
                 future is not None
                 and future.done()
-                and not (
+                and (
                     self._watchers_at_dispatch.get(target, set())
                     & watchers_now.get(target, set())
                 )
+            ):
+                # CARRIED OVER, DONE, STILL WATCHED: collected now AND
+                # replaced now. Finished after its own pass's budget,
+                # for a subscriber who is still here -- the freshest
+                # state there is. The version before this collected it
+                # and did not dispatch its replacement until the NEXT
+                # pass, so a healthy-but-slow target lost a whole poll
+                # interval per delivery: a reviewer measured a 0.55 s
+                # read and a 0.80 s read both delivering every 1.52 s.
+                self._collect(target, future, now)
+                future = None
+            elif (
+                future is not None
+                and future.done()
             ):
                 # DONE, AND EVERYONE IT WAS COMPUTED FOR HAS GONE: discarded.
                 #
@@ -918,19 +1100,6 @@ class ResultHub:
                 # "at most one poll" as the previous comment claimed.
                 self._forget(target)
                 future = None
-            elif future is not None and not future.done():
-                age = now - self._dispatched_at.get(target, now)
-                if age >= SNAPSHOT_ABANDON_MULTIPLIER * SNAPSHOT_TIMEOUT_SECONDS:
-                    # ABANDONED. Its thread may still return, into a
-                    # future nothing references any more.
-                    logger.warning(
-                        "[Tower][Results] snapshot for %s has been running "
-                        "for %.0fs; giving up on that thread and trying "
-                        "the target afresh",
-                        target, age,
-                    )
-                    self._forget(target)
-                    future = None
             if future is None:
                 future = self._dispatch(
                     target, sample, watchers_now.get(target, set())
@@ -941,41 +1110,10 @@ class ResultHub:
         offered: set = set()
 
         def collect(done_futures) -> None:
-            # Done, one way or the other: this target is free for the
-            # next pass whether it succeeded or raised.
             moment = self._clock()
             for future in done_futures:
-                target = waiting[future]
                 offered.add(future)
-                self._forget(target)
-                try:
-                    snapshot = future.result()
-                except Exception as exc:
-                    # One unreadable target must not stop the others, and
-                    # must not stop the loop. The producer already turns
-                    # expected storage failures into an `unavailable`
-                    # payload; reaching here means something genuinely
-                    # unexpected.
-                    logger.exception(
-                        "[Tower][Results] could not build a snapshot for %s",
-                        target,
-                    )
-                    self._note_failure(
-                        target,
-                        f"the Tower could not read this cartridge's state; "
-                        f"the last failure was {type(exc).__name__}",
-                    )
-                    continue
-                self._failures.pop(target, None)
-                for channel in list(self._channels):
-                    channel.offer(
-                        target, snapshot, now=moment,
-                        heartbeat=self._heartbeat_seconds,
-                    )
-
-        # Carried over and already done -- finished after its own pass's
-        # deadline, still watched: the freshest state there is.
-        collect([f for f in waiting if f.done() and f not in fresh])
+                self._collect(waiting[future], future, moment)
 
         # ONLY THE FUTURES DISPATCHED THIS PASS are waited on. A
         # carried-over future that is already past the deadline is not
@@ -990,8 +1128,18 @@ class ResultHub:
         # against a wall-clock budget (the hub's own clock may be a test's
         # frozen one, and a frozen clock must not make this loop wait the
         # full deadline again and again).
+        # The budget is the POLL INTERVAL, not the snapshot deadline: a
+        # pass that waits for its slowest future waits for the slowest
+        # target, and with the loop's sleep on top of it every cartridge
+        # ran at "slowest + poll" -- 20% of cadence beside a 2.1 s read,
+        # and a 10 s blackout for everyone on the first pass to meet a
+        # wedge, both measured twice. A future that outlives the budget
+        # is simply carried into the next pass, where it is collected
+        # done or counted against the deadline by its age.
         pending = set(fresh)
-        budget_ends = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        budget_ends = time.monotonic() + min(
+            self._poll_seconds, SNAPSHOT_TIMEOUT_SECONDS
+        )
         while pending:
             remaining = budget_ends - time.monotonic()
             if remaining <= 0:
@@ -1001,7 +1149,7 @@ class ResultHub:
             )
             collect(done)
 
-        now = self._clock()
+        now = self._age_clock()
         for future, target in waiting.items():
             if future in offered or future.done():
                 continue
@@ -1026,9 +1174,6 @@ class ResultHub:
                     target, SNAPSHOT_TIMEOUT_SECONDS,
                 ),
             )
-
-        self.polled.set()
-        self.polled.clear()
 
 
 def classify_cursor(since_revision, current_revision) -> str:

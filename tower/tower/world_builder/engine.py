@@ -197,6 +197,9 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        # The sequence renumbering. See `observe`.
+        self._seq_offset = 0
+        self._last_effective_seq: int | None = None
         # The size every frame of this session must be. Set by the
         # first frame rather than from the declared size, because
         # the declared size is what the phone SAYS and this is what
@@ -268,6 +271,8 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        self._seq_offset = 0
+        self._last_effective_seq = None
         # The size every frame of this session must be. Set by the
         # first frame rather than from the declared size, because
         # the declared size is what the phone SAYS and this is what
@@ -302,6 +307,39 @@ class WorldBuilderEngine:
             session, frames_observed=session.frames_observed + 1
         )
         session = self._session
+
+        # SEQUENCE NUMBERS RESTART WHEN THE GLASSES DO, AND THE SESSION
+        # DOES NOT. `make_keyframe_id` says it: `source_seq` "resets when
+        # the glasses session restarts". A builder follows a capture
+        # LINEAGE -- the reconnect work of this campaign -- so one session
+        # can now see the sequence start again mid-walk (a re-pair, an app
+        # relaunch inside the resume grace). The keyframe id and the image
+        # file name are both `source_seq`, so a repeated number OVERWROTE
+        # the earlier keyframe's image on disk and gave the journal two
+        # keyframes with one id; the final solve keys COLMAP on the file
+        # name and died with a SQLite constraint abort -- "Partial" over a
+        # full walk, in four of a dress rehearsal's runs. The sequence is
+        # renumbered onto a monotonic one the moment it goes backwards;
+        # `wire_seq` and `tx_seq` keep the raw numbers.
+        effective_seq = source_seq + self._seq_offset
+        if (
+            self._last_effective_seq is not None
+            and effective_seq <= self._last_effective_seq
+        ):
+            self._seq_offset = self._last_effective_seq + 1 - source_seq
+            effective_seq = source_seq + self._seq_offset
+            logger.warning(
+                "[WorldBuilder] source_seq went backwards (%s after %s): the "
+                "sender restarted; renumbering from %s so no keyframe is "
+                "overwritten",
+                source_seq, self._last_effective_seq, effective_seq,
+            )
+            self._events.append(
+                "source_seq_restarted",
+                {"source_seq": source_seq, "renumbered_to": effective_seq},
+            )
+        self._last_effective_seq = effective_seq
+        source_seq = effective_seq
 
         try:
             gray = decode_gray(raw_bytes)

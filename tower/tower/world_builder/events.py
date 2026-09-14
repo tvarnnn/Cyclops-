@@ -41,6 +41,11 @@ EVENT_KINDS = frozenset(
         "mapping_stalled",
         "build_completed",
         "session_stopped",
+        # The sender's `source_seq` went backwards mid-session (the
+        # glasses restarted inside a capture lineage) and the engine
+        # renumbered from there. Payload: `source_seq`, `renumbered_to`.
+        # Informational; no consumer switches on it.
+        "source_seq_restarted",
     }
 )
 

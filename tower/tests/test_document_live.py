@@ -217,7 +217,13 @@ class TestTheIdleWindDown:
 
         assert session.status()["idle_stop_pending"] is True
         assert _wait(lambda: session.status()["state"] == "stopped", timeout=3.0)
-        assert recognisers[0].released == 1
+        # The release FOLLOWS the state: `_stop_locked` flips `stopped` in
+        # its step 1 and releases the engine in step 4, after the flush
+        # and the worker's exit, on purpose -- and this runs on the idle
+        # timer's thread while the assertion runs on this one. Asserting
+        # the release the instant the state showed lost that race about
+        # one run in five, and was filed as load for three rounds.
+        assert _wait(lambda: recognisers[0].released == 1, timeout=3.0)
 
     def test_an_idle_stop_never_runs_ocr_on_the_timer_thread(self, tmp_path, frames):
         """A dwell open when the stream closed is dropped, not read: the

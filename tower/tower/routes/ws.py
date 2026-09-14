@@ -641,12 +641,21 @@ def _arm_world_builder_follow_up(websocket) -> None:
     unless the stop below is actually leaving a World Builder walk
     running, and what is armed stops that walk and nothing else.
 
-    **Once per walk, not once per disconnect.** The same reviewer
+    **Once per walk AND ask, not once per disconnect.** The same reviewer
     traced that a phone in bad WiFi -- reconnecting and dropping every
     60 s -- restarted the 105 s clock on every drop, so the follow-up
-    never fired and the hole it closes stayed open indefinitely. A
+    never fired and the hole it closes stayed open indefinitely. So a
     pending follow-up for the same deferred walk is left to its
-    original deadline; it decides then, on the facts then.
+    original deadline. But NOT when the walk has been asked for again
+    since: the next rehearsal drove drop -> arm -> reconnect with a
+    Start -> drop again, and the second deferral was deduplicated
+    against a task that would then decline (the ask had moved) and
+    never return -- the session sat `active` forever with no phone
+    behind it, and the next phone to stream on that Tower grew a World
+    Builder world nobody asked for. Two out of two, no timing subtlety.
+    The key is `(session_id, requested_at)`: the same walk, the same
+    ask, keeps its clock; a new ask gets a new one, 105 s after ITS
+    drop.
     """
     deferral = _world_builder_deferral(websocket)
     if deferral is None:
@@ -655,10 +664,10 @@ def _arm_world_builder_follow_up(websocket) -> None:
     state = websocket.app.state
     previous = getattr(state, "world_builder_grace_stop", None)
     if previous is not None and not previous.done():
-        if getattr(state, "world_builder_grace_stop_for", None) == session_id:
+        if getattr(state, "world_builder_grace_stop_for", None) == (session_id, requested_at):
             return
         previous.cancel()
-    state.world_builder_grace_stop_for = session_id
+    state.world_builder_grace_stop_for = (session_id, requested_at)
     state.world_builder_grace_stop = asyncio.create_task(
         _stop_world_builder_after_grace(websocket, session_id, requested_at)
     )

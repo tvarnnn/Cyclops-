@@ -553,6 +553,26 @@ def test_the_grace_follow_up_is_armed_only_for_a_deferred_walk(tower, monkeypatc
         "a second disconnect for the same walk restarted its grace clock"
     )
 
+    # ...but a walk ASKED FOR AGAIN in between gets a new clock. A
+    # rehearsal drove drop -> arm -> reconnect with a Start -> drop again:
+    # the second deferral was deduplicated against a task that would then
+    # decline (the ask had moved) and never return, and the session sat
+    # active forever. Two out of two.
+    async def arm_after_a_new_ask():
+        ws_module._arm_world_builder_follow_up(websocket)
+        first = state.world_builder_grace_stop
+        assert client.post(f"{WORLD_BUILDER_SESSION_URL}/start").status_code == 200
+        ws_module._arm_world_builder_follow_up(websocket)
+        second = state.world_builder_grace_stop
+        replaced = second is not first
+        await asyncio.sleep(0)
+        second.cancel()
+        return replaced and first.cancelled()
+
+    assert asyncio.run(arm_after_a_new_ask()), (
+        "a walk asked for again kept the follow-up armed for its previous ask"
+    )
+
 
 def test_a_successor_is_not_chained_into_a_worker_that_was_asked_to_stop(tower):
     """The rest of the walk was recorded and built by nobody.

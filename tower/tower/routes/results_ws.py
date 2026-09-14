@@ -327,11 +327,21 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # the client waiting on a reply that was never coming -- the
         # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
         # available failures because nothing on either side reports it.
-        logger.exception(
-            "[Tower][Results] could not build the first snapshot for %s/%s",
-            cartridge,
-            result_type,
-        )
+        if isinstance(exc, TimeoutError):
+            # One line. A phone retrying every ~2.5 s against a wedged
+            # read logged a full traceback per attempt -- a reviewer
+            # counted 216 lines a minute, indefinitely.
+            logger.warning(
+                "[Tower][Results] could not build the first snapshot for "
+                "%s/%s: %s",
+                cartridge, result_type, exc,
+            )
+        else:
+            logger.exception(
+                "[Tower][Results] could not build the first snapshot for %s/%s",
+                cartridge,
+                result_type,
+            )
         await _error(
             sender,
             ERR_SNAPSHOT_FAILED,
