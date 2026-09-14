@@ -321,7 +321,10 @@ class _SpecRegistry:
 
     def __init__(self, spec: WorkerSpec) -> None:
         self.spec = spec
-        # lineage root capture id -> worker
+        # lineage root capture id -> worker. A worker that `release` has
+        # taken a lineage away from stays here under a key no capture id
+        # maps to, so that everything iterating this table -- reap,
+        # status, shutdown -- still sees it.
         self.workers: dict[str, _Worker] = {}
         # any capture id -> the lineage root that owns it
         self.roots: dict[str, str] = {}
@@ -337,6 +340,32 @@ class _SpecRegistry:
         for capture_id in worker.lineage:
             if self.roots.get(capture_id) == root:
                 del self.roots[capture_id]
+
+    def release(self, root: str) -> _Worker:
+        """Take a lineage away from its worker WITHOUT forgetting the worker.
+
+        For a worker that has been asked to stop: it is alive, finishing
+        its final build, and will follow nothing further -- so it no
+        longer owns any capture's future, and a fresh worker must be free
+        to take the same capture. `_start` registers under the capture
+        id, and simply starting one would overwrite this worker's entry.
+        That is not a bookkeeping nit: the entry holds the record whose
+        `job` handle keeps the process alive on Windows
+        (`KILL_ON_JOB_CLOSE`), so dropping it would kill the very build
+        the soft stop was letting finish -- and off Windows it would make
+        that build an orphan `status`, `/health` and `shutdown` cannot
+        see, which `request_stop` promised would not happen.
+
+        So the worker moves to a key that is not a capture id and keeps
+        being reaped, reported and shut down like any other. The key is
+        opaque; nothing reads it back.
+        """
+        worker = self.workers.pop(root)
+        for capture_id in worker.lineage:
+            if self.roots.get(capture_id) == root:
+                del self.roots[capture_id]
+        self.workers[f"released:{worker.process.pid}:{root}"] = worker
+        return worker
 
 
 class CaptureWorkerSupervisor:
@@ -929,10 +958,37 @@ class CaptureWorkerSupervisor:
                     continues,
                     registry.spec.name,
                 )
-        elif registry.owner_of(capture_id) is not None:
-            # Already followed by this spec. Attaching again would put two
-            # producers on one store.
-            return False
+        else:
+            root = registry.roots.get(capture_id)
+            owner = registry.workers.get(root) if root is not None else None
+            if owner is not None and owner.is_alive() and owner.stop_requested:
+                # THE SAME SHAPE AS THE ASKED-TO-STOP BRANCH ABOVE, reached
+                # through `attach()` instead of a successor capture. The
+                # wearer left the World Builder screen (`session/stop` --
+                # this worker was asked to stop and is finishing its final
+                # build, up to ~90 s on a long walk), came back, and
+                # pressed Start while the capture was still recording.
+                # Answering "already followed" here is what
+                # `CartridgeSession` reads as a Start pressed twice -- fine
+                # -- so the session came up `active` with
+                # `attached_capture_id: null`, frames kept being recorded,
+                # and NOBODY built them. A finishing worker does not own
+                # the future of this capture; take the lineage away from
+                # it (it stays registered until it exits, see `release`)
+                # and start a fresh builder, which builds the rest of the
+                # walk as its own world.
+                logger.warning(
+                    "[Tower][Worker] asked to attach to capture %s, but the %s "
+                    "worker pid %s following it has been asked to stop and is "
+                    "finishing; starting a new builder on it instead of "
+                    "reporting it as already followed",
+                    capture_id, registry.spec.name, owner.process.pid,
+                )
+                registry.release(root)
+            elif owner is not None:
+                # Already followed by this spec. Attaching again would put
+                # two producers on one store.
+                return False
 
         return self._start(registry, capture_id, capture_dir, attach_mode)
 

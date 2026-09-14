@@ -16,6 +16,7 @@ is asked of the OS rather than of a timestamp for the same reason.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
@@ -26,6 +27,8 @@ from tower.world_builder.store import (
     manifest_describing,
     session_has_drawable_geometry,
 )
+
+logger = logging.getLogger(__name__)
 
 WORLDS_CONTRACT = "world_builder.worlds/2026-09-10"
 
@@ -246,16 +249,55 @@ def _sortable(value):
     return (0, ("str", str(value)))
 
 
+def _is_timestamp(value) -> bool:
+    """A finite int or float, and nothing else.
+
+    The contract (WORLD-BUILDER-WORLDS.md §2) types `started_at`,
+    `ended_at`, `created_at` and `updated_at` as numbers, and the phone's
+    decoder holds it to that: `WorldLibrary.swift` decodes the listing
+    as ONE value, so a single row carrying a string where a number was
+    promised fails the whole decode and every world vanishes from Saved
+    Worlds. Not one row -- all of them. The record readers do not coerce
+    (`session_from_json_dict` is `started_at=data["started_at"]`, raw),
+    so what a `session.json` says is what would be served.
+
+    `bool` is refused before the int check because `bool` IS an int. An
+    int too big for a double is refused too: `float(10**400)` raises
+    `OverflowError`, and a Double decoder cannot take it either.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        try:
+            return math.isfinite(float(value))
+        except OverflowError:
+            return False
+    return isinstance(value, float) and math.isfinite(value)
+
+
 def build_world_listing(store: WorldStore) -> dict:
     """Every world with a readable `world.json`, newest first, with its
     sessions oldest first. A world whose sessions cannot be read is listed
     with what could be read; a world that cannot be read at all is left out
-    rather than invented."""
+    rather than invented.
+
+    A record whose timestamps are not the numbers the contract promises
+    counts as unreadable (see `_is_timestamp`): it is omitted, with a
+    warning naming it, rather than served raw for the phone to choke on."""
     worlds = []
     for world_id in store.list_world_ids():
         try:
             world = store.read_world(world_id)
         except (WorldStoreError, OSError, ValueError, KeyError):
+            continue
+        if not (_is_timestamp(world.created_at) and _is_timestamp(world.updated_at)):
+            logger.warning(
+                "[Tower][Worlds] world %s has created_at=%r updated_at=%r; the "
+                "listing contract types both as numbers and the phone rejects "
+                "the whole listing on one such row, so this world is omitted "
+                "like an unreadable one",
+                world_id, world.created_at, world.updated_at,
+            )
             continue
         live = _world_is_live(store, world_id)
         sessions = []
@@ -263,6 +305,24 @@ def build_world_listing(store: WorldStore) -> dict:
             try:
                 session = store.read_session(world_id, session_id)
             except (WorldStoreError, OSError, ValueError, KeyError):
+                continue
+            if not (
+                _is_timestamp(session.started_at)
+                and (session.ended_at is None or _is_timestamp(session.ended_at))
+                # The other field the phone's decoder REQUIRES from a row;
+                # `has_geometry` is computed here and always a bool.
+                and isinstance(session.frame_source, str)
+            ):
+                logger.warning(
+                    "[Tower][Worlds] world %s session %s has started_at=%r "
+                    "ended_at=%r frame_source=%r; the listing contract types "
+                    "the first two as numbers (`ended_at` may be null) and the "
+                    "third as a string, and the phone rejects the whole "
+                    "listing on one such row, so this session is omitted like "
+                    "an unreadable one",
+                    world_id, session_id, session.started_at, session.ended_at,
+                    session.frame_source,
+                )
                 continue
             # The SAME manifest rule the status producer and the geometry
             # route use -- the session's own copy, then the world's but
@@ -327,6 +387,13 @@ def build_world_listing(store: WorldStore) -> dict:
         # A reviewer reproduced it by writing an ISO timestamp string into
         # one `started_at`, immediately after the round that hardened the
         # world sort against the identical shape and did not look up.
+        #
+        # Since the `_is_timestamp` check above, no such row reaches this
+        # sort from this function. `_sortable` stays because its promise
+        # -- a key that cannot raise -- is the sort's own, and the two
+        # guards fail differently: one keeps a bad row out of the phone's
+        # decoder, the other keeps a bad row from taking every good one
+        # down with it.
         sessions.sort(key=lambda s: _sortable(s["started_at"]))
         worlds.append({
             "world_id": world.world_id,

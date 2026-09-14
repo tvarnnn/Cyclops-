@@ -209,6 +209,104 @@ class TestRequestStop:
         ), caplog.text
 
 
+# -- attach after request_stop: a finishing worker is not a follower ---
+
+
+class TestAttachAfterRequestStop:
+    def test_a_start_during_finalization_gets_a_fresh_builder(
+        self, spawn, spawned, tmp_path, no_signals
+    ):
+        """Leave the screen mid-walk, come back, press Start.
+
+        `session/stop` asked the builder to stop; it is alive and spending
+        its last seconds (up to ~90 s on a long walk) on the final build.
+        `attach()` used to answer False -- "already followed" -- which
+        `CartridgeSession` reads as a Start pressed twice, fine: the
+        session came up `active` with `attached_capture_id: null`, the
+        capture kept recording, and nobody built a frame of it. The
+        `continues` branch already refused to chain a successor into an
+        asked-to-stop worker for the same reason; this is the same shape
+        through the other door.
+        """
+        supervisor = CaptureWorkerSupervisor(
+            [_spec("builder", stop_via_stdin=True)], spawn=spawn
+        )
+        directory = _open(supervisor, tmp_path)
+        supervisor.request_stop("builder")
+        assert spawned[0].stdin.closed is True
+
+        started = supervisor.attach("builder", "cap-1", directory)
+
+        assert started is True
+        assert len(spawned) == 2, "a fresh builder must be started on the capture"
+        assert spawned[1].args == spawned[0].args
+        assert spawned[1].stdin.closed is False
+
+    def test_the_finishing_worker_stays_tracked_beside_the_fresh_one(
+        self, spawn, spawned, tmp_path, no_signals
+    ):
+        """`request_stop`'s promise survives the restart.
+
+        The old builder is still finalizing and stays registered until it
+        exits: `status` and `following` keep telling the truth about it,
+        `reap` notices when it finishes, and on Windows the record it
+        lives in is what holds its job open. Registering the fresh worker
+        under the same capture id must not overwrite it -- and the fresh
+        worker, not the finishing one, is what owns the capture from now
+        on.
+        """
+        supervisor = CaptureWorkerSupervisor(
+            [_spec("builder", stop_via_stdin=True)], spawn=spawn
+        )
+        directory = _open(supervisor, tmp_path)
+        supervisor.request_stop("builder")
+        assert supervisor.attach("builder", "cap-1", directory) is True
+        old, new = spawned
+
+        rows = {row["pid"]: row for row in supervisor.status()}
+        assert set(rows) == {old.pid, new.pid}
+        assert rows[old.pid]["capture_id"] == "cap-1"
+        assert rows[new.pid]["capture_id"] == "cap-1"
+        assert supervisor.following("builder") == ["cap-1", "cap-1"]
+
+        # A second Start now IS a Start pressed twice.
+        assert supervisor.attach("builder", "cap-1", directory) is False
+        assert len(spawned) == 2
+
+        # A successor chains into the fresh worker, not the finishing one.
+        successor = tmp_path / "captures" / "cap-2"
+        successor.mkdir(parents=True)
+        supervisor.capture_opened("cap-2", successor, continues="cap-1")
+        assert len(spawned) == 2
+        rows = {row["pid"]: row for row in supervisor.status()}
+        assert rows[new.pid]["lineage"] == ["cap-1", "cap-2"]
+        assert rows[old.pid]["lineage"] == ["cap-1"]
+
+        # The old builder finishes on its own time and is reaped then.
+        old.exit_with(0)
+        assert [row["pid"] for row in supervisor.status()] == [new.pid]
+        assert supervisor.following("builder") == ["cap-1"]
+
+    def test_shutdown_still_reaches_the_finishing_worker(
+        self, spawn, spawned, tmp_path, no_signals
+    ):
+        """An orphan nothing can see is the failure this module exists to
+        prevent; a released worker must still be one `shutdown` stops."""
+        supervisor = CaptureWorkerSupervisor(
+            [_spec("builder", stop_via_stdin=True)], spawn=spawn
+        )
+        directory = _open(supervisor, tmp_path)
+        supervisor.request_stop("builder")
+        supervisor.attach("builder", "cap-1", directory)
+        old, new = spawned
+
+        supervisor.shutdown(grace_seconds=0)
+
+        assert old.terminated is True
+        assert new.terminated is True
+        assert supervisor.status() == []
+
+
 # -- stop_grace_seconds: the spec's own bound --------------------------
 
 

@@ -15,6 +15,7 @@ and the hash off the event loop with no executor of our own.
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
+from tower.results.envelope import json_safe
 from tower.results.world_builder_geometry import (
     build_manifest,
     build_segment,
@@ -44,8 +45,24 @@ def world_listing(request: Request) -> dict:
     Contract `world_builder.worlds/2026-09-10`. Read-only; a directory
     walk over `world.json` / `session.json`, no geometry. Sync `def` like
     the geometry handlers, and for the same reason.
+
+    `json_safe` for the reason `routes/ws.py` applies it to every send:
+    Starlette's `JSONResponse` serialises with `allow_nan=False`, so ONE
+    `NaN` anywhere in the listing is a 500 that loses every world.
+    MEASURED (fastapi 0.141.1, pydantic 2.13.5): that 500 is reached
+    only by a handler with no return annotation. The `-> dict` above
+    sends the payload through pydantic's serialiser first, and its
+    default (`ser_json_inf_nan="null"`) already turns a non-finite float
+    into `null`. So today the wrap changes nothing on the wire; it is
+    here so that the guarantee is this route's own rather than a side
+    effect of an annotation somebody could remove, or of a serialiser
+    default somebody could change. The producer refuses a row whose own
+    timestamps are not numbers, but it passes `finalization` through as
+    the builder wrote it, and a clock can write `NaN` there. `None` is
+    the contract's word for "not established", which is what a
+    non-finite number honestly is.
     """
-    return build_world_listing(_store(request))
+    return json_safe(build_world_listing(_store(request)))
 
 
 @router.get("/worlds/{world_id}/geometry/manifest")

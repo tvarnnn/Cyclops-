@@ -228,6 +228,12 @@ def test_one_malformed_world_does_not_take_the_whole_listing_down(derived_world)
 
     The single-key sort this replaced could not reach it, which is what
     makes it a regression rather than an old wart.
+
+    The bad row no longer reaches the sort at all: `created_at: null` is
+    not the number the contract promises, and serving it would make the
+    phone's decoder drop every world, so the producer omits that world
+    (`_is_timestamp`). What this test guards is unchanged -- the good
+    world is served and nothing raises -- and the count is now one.
     """
     store, world_id, _ = derived_world
     original = json.loads((store.world_dir(world_id) / "world.json").read_text())
@@ -243,7 +249,7 @@ def test_one_malformed_world_does_not_take_the_whole_listing_down(derived_world)
     path.write_text(json.dumps(other))
 
     listing = build_world_listing(store)
-    assert listing["world_count"] == 2, (
+    assert [w["world_id"] for w in listing["worlds"]] == [world_id], (
         "a malformed row took the whole listing with it"
     )
 
@@ -439,6 +445,12 @@ def test_a_malformed_updated_at_does_not_take_the_top_of_the_picker(derived_worl
     world. A reviewer built it against a copy of the real 163-world root
     and watched it take the top row. A malformed value is not evidence of
     recency.
+
+    Since the producer refuses such a row (`_is_timestamp`), the world
+    is not sorted last -- it is not listed at all, because the contract
+    types `updated_at` as a number and the phone's decoder rejects the
+    WHOLE listing on one row that is not. The property this test held
+    -- the real world keeps the top row -- is kept; the count moves.
     """
     store, world_id, _ = derived_world
     original = json.loads((store.world_dir(world_id) / "world.json").read_text())
@@ -450,7 +462,9 @@ def test_a_malformed_updated_at_does_not_take_the_top_of_the_picker(derived_worl
         path.write_text(json.dumps(other))
 
         listing = build_world_listing(store)
-        assert listing["world_count"] == 2, bad
+        assert listing["world_count"] == 1, (
+            f"a world whose updated_at is {bad!r} was served to the phone"
+        )
         assert listing["worlds"][0]["world_id"] == world_id, (
             f"a world whose updated_at is {bad!r} took the top row"
         )
@@ -464,6 +478,12 @@ def test_no_value_of_updated_at_can_take_the_listing_down(derived_world):
     on `GET /worlds` that loses every world. Same trigger as the case the
     tiebreak was written to fix. NaN is here too: it does not raise, it
     silently makes `sort` produce an arbitrary permutation.
+
+    The producer now refuses every one of these but `0` before the sort
+    is reached (`_is_timestamp`; `10**400` is refused too, because the
+    phone's Double decoder cannot take it either), so the listing keeps
+    only the real world. `0` is a finite number and stays. Either way:
+    no raise, and the real world is served.
     """
     store, world_id, _ = derived_world
     original = json.loads((store.world_dir(world_id) / "world.json").read_text())
@@ -483,7 +503,8 @@ def test_no_value_of_updated_at_can_take_the_listing_down(derived_world):
         path.write_text(json.dumps(other))
 
         listing = build_world_listing(store)
-        assert listing["world_count"] == 2, bad
+        assert listing["world_count"] == (2 if bad == 0 else 1), bad
+        assert world_id in [w["world_id"] for w in listing["worlds"]], bad
 
 
 # -- round 18 ----------------------------------------------------------
@@ -522,6 +543,11 @@ def test_one_bad_session_record_does_not_empty_saved_worlds(derived_world):
         assert listing["world_count"] == 1, (
             f"a session whose started_at is {bad!r} emptied the whole listing"
         )
+        # And the bad row itself is not served: the phone decodes the
+        # listing as one value and would drop every world over it.
+        assert [s["session_id"] for s in listing["worlds"][0]["sessions"]] == [
+            session_id
+        ], f"a session whose started_at is {bad!r} was served to the phone"
 
 
 def test_an_infinity_is_not_the_newest_world(derived_world):
@@ -533,6 +559,10 @@ def test_an_infinity_is_not_the_newest_world(derived_world):
     function was written to stop a STRING producing. Reachable from the
     Tower's own writer: `json.dumps` emits the bare `Infinity` token by
     default and `json.loads` reads it back.
+
+    An infinity is not a number the contract admits either, so the
+    producer now omits the world rather than sorting it last; the top
+    row is still the real world's.
     """
     store, world_id, _ = derived_world
     original = json.loads((store.world_dir(world_id) / "world.json").read_text())
@@ -543,10 +573,173 @@ def test_an_infinity_is_not_the_newest_world(derived_world):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(other))
         listing = build_world_listing(store)
-        assert listing["world_count"] == 2, bad
+        assert listing["world_count"] == 1, bad
         assert listing["worlds"][0]["world_id"] == world_id, (
             f"a world whose updated_at is {bad!r} took the top row"
         )
+
+
+# -- the listing is one value to the phone ------------------------------
+
+
+def _write_world_json(store, world_id, **fields):
+    """A `world.json` written by hand, so a field can hold what the
+    dataclass would never let `write_world` produce. Copied from the
+    derived world's record, because `world_from_json_dict` subscripts
+    every field and a partial record is skipped as unreadable -- which
+    is not the omission these tests are about."""
+    record = json.loads((store.world_dir("w0") / "world.json").read_text())
+    record.update(world_id=world_id, created_at=1.0, updated_at=2.0,
+                  session_ids=[])
+    record.update(fields)
+    path = store.world_dir(world_id) / "world.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_a_session_whose_timestamps_are_not_numbers_is_omitted_not_served(
+    derived_world, caplog
+):
+    """One bad row must cost one row, not the whole of Saved Worlds.
+
+    `WorldLibrary.swift` decodes the listing as a single value with
+    `started_at`/`ended_at` typed as numbers; one row carrying a string
+    fails the decode and every world vanishes from the picker. The
+    contract (WORLD-BUILDER-WORLDS.md §2) already says an unreadable
+    session is omitted -- a session whose timestamps are not the numbers
+    it promises is unreadable in exactly the sense that matters. Its
+    siblings, and the other worlds, are still listed; the log names it.
+    """
+    store, world_id, session_id = derived_world
+    store.write_session(Session(session_id="s1", world_id=world_id,
+                                started_at=5.0, ended_at=6.0))
+    store.write_session(Session(session_id="s2", world_id=world_id,
+                                started_at=7.0, ended_at=8.0))
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=9.0,
+                            session_ids=(session_id, "s1", "s2")))
+    _write_world_json(store, "w1", created_at=3.0, updated_at=4.0)
+    store.write_session(Session(session_id="t0", world_id="w1",
+                                started_at=3.0, ended_at=4.0))
+
+    def listed(field, bad):
+        path = store.session_dir(world_id, "s1") / "session.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record[field] = bad
+        path.write_text(json.dumps(record), encoding="utf-8")
+        listing = build_world_listing(store)
+        by_id = {w["world_id"]: w for w in listing["worlds"]}
+        return by_id, [s["session_id"] for s in by_id[world_id]["sessions"]]
+
+    for bad in ("2026-09-11T09:00:00Z", None, True, [], float("nan"),
+                float("inf"), 10**400):
+        with caplog.at_level("WARNING", logger="tower.results.world_builder_library"):
+            caplog.clear()
+            by_id, sessions = listed("started_at", bad)
+        assert sessions == [session_id, "s2"], f"started_at={bad!r}"
+        assert set(by_id) == {world_id, "w1"}, f"started_at={bad!r}"
+        assert [s["session_id"] for s in by_id["w1"]["sessions"]] == ["t0"]
+        assert any(
+            world_id in r.getMessage() and "s1" in r.getMessage()
+            for r in caplog.records
+        ), f"the omission of s1 (started_at={bad!r}) was not logged"
+
+    # Put `started_at` back; `ended_at` may be null but nothing else
+    # that is not a finite number.
+    for bad in ("2026-09-11T09:30:00Z", False, {"a": 1}, float("nan"),
+                float("-inf")):
+        path = store.session_dir(world_id, "s1") / "session.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["started_at"] = 5.0
+        path.write_text(json.dumps(record), encoding="utf-8")
+        by_id, sessions = listed("ended_at", bad)
+        assert sessions == [session_id, "s2"], f"ended_at={bad!r}"
+        assert set(by_id) == {world_id, "w1"}, f"ended_at={bad!r}"
+
+    # A null `ended_at` is an open session, and is served.
+    by_id, sessions = listed("ended_at", None)
+    assert sessions == [session_id, "s1", "s2"]
+
+
+def test_a_world_whose_timestamps_are_not_numbers_is_omitted_not_served(
+    derived_world, caplog
+):
+    """The world-level twin: `created_at`/`updated_at` are numbers or the
+    world is left out, and the worlds beside it are still listed."""
+    store, world_id, _ = derived_world
+    _write_world_json(store, "w2", created_at=3.0, updated_at=4.0)
+
+    for field in ("created_at", "updated_at"):
+        for bad in ("2020-01-01T00:00:00Z", None, True, [], float("nan"),
+                    float("inf"), float("-inf"), 10**400):
+            _write_world_json(store, "w1", **{field: bad})
+            with caplog.at_level(
+                "WARNING", logger="tower.results.world_builder_library"
+            ):
+                caplog.clear()
+                listing = build_world_listing(store)
+            ids = [w["world_id"] for w in listing["worlds"]]
+            assert "w1" not in ids, f"{field}={bad!r} was served to the phone"
+            assert sorted(ids) == [world_id, "w2"], f"{field}={bad!r}"
+            assert listing["world_count"] == 2
+            assert any("w1" in r.getMessage() for r in caplog.records), (
+                f"the omission of w1 ({field}={bad!r}) was not logged"
+            )
+
+    # A finite number is what the contract asks for, and is served.
+    _write_world_json(store, "w1", created_at=0, updated_at=5.5)
+    ids = [w["world_id"] for w in build_world_listing(store)["worlds"]]
+    assert sorted(ids) == [world_id, "w1", "w2"]
+
+
+def test_the_route_serves_200_when_a_world_carries_a_nan_timestamp(derived_world):
+    """`NaN` is not JSON. Served raw, one `updated_at: NaN` reached the
+    phone as `updated_at: null` -- the `-> dict` annotation routes the
+    payload through pydantic, whose serialiser nulls a non-finite float
+    before Starlette's `allow_nan=False` can 500 on it -- and `null`
+    where `WorldLibrary.swift` types a number fails the WHOLE decode:
+    every world gone from Saved Worlds, over one row. The producer omits
+    the world; the route answers 200 with the rest."""
+    store, world_id, _ = derived_world
+    _write_world_json(store, "w1", updated_at=float("nan"))
+    assert "NaN" in (store.world_dir("w1") / "world.json").read_text()
+
+    response = _client(store).get("/worlds")
+
+    assert response.status_code == 200
+    assert [w["world_id"] for w in response.json()["worlds"]] == [world_id]
+
+
+def test_a_nan_the_producer_passes_through_arrives_as_null(derived_world):
+    """The route's own guard, exercised past the producer's. A PIN, not
+    a regression test: it passed before `json_safe` was applied here.
+
+    `finalization` is served as the builder wrote it -- it is the
+    builder's account, and the listing does not retype it -- so a `NaN`
+    inside it reaches the response untouched. Starlette's `JSONResponse`
+    would 500 on it (`allow_nan=False`), and measured, that 500 is what
+    an un-annotated handler gets; this route's `-> dict` sends the
+    payload through pydantic first, which already nulls it. `json_safe`
+    at the route (the same boundary `routes/ws.py` guards) makes `null`
+    -- the contract's word for "not established" -- the route's own
+    promise, so removing the annotation cannot quietly turn this into a
+    500 that loses every world.
+    """
+    from dataclasses import replace
+
+    store, world_id, session_id = derived_world
+    session = store.read_session(world_id, session_id)
+    store.write_session(replace(session, finalization={
+        "state": "complete", "final_solve": "solved",
+        "started_at": float("nan"), "updated_at": 2.0, "detail": None,
+    }))
+    assert "NaN" in store.session_path(world_id, session_id).read_text()
+
+    response = _client(store).get("/worlds")
+
+    assert response.status_code == 200
+    finalization = response.json()["worlds"][0]["sessions"][0]["finalization"]
+    assert finalization["state"] == "complete"
+    assert finalization["started_at"] is None
 
 
 def test_a_manifest_is_judged_by_what_the_reader_needs_of_it(derived_world):
@@ -863,3 +1056,28 @@ def test_a_finalized_but_unsolved_walk_is_not_listed_complete(
     ))
     row = build_world_listing(store)["worlds"][0]["sessions"][0]
     assert row["state"] == "interrupted", (end_reason, final_solve, row["state"])
+
+
+def test_a_session_whose_frame_source_is_not_a_string_is_omitted_not_served(
+    derived_world, caplog
+):
+    """`frame_source` is the other required field on the phone's row decoder
+    (`WorldLibrary.swift`: `json["frame_source"] as? String`), so a record
+    carrying `null` there empties Saved Worlds exactly as a string
+    timestamp did. Same rule: one bad row costs one row."""
+    store, world_id, session_id = derived_world
+    store.write_session(Session(session_id="s1", world_id=world_id,
+                                started_at=5.0, ended_at=6.0))
+    store.write_world(World(world_id=world_id, created_at=1.0, updated_at=9.0,
+                            session_ids=(session_id, "s1")))
+    path = store.session_dir(world_id, "s1") / "session.json"
+    for bad in (None, 3, ["live-capture"]):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["frame_source"] = bad
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with caplog.at_level("WARNING", logger="tower.results.world_builder_library"):
+            caplog.clear()
+            listing = build_world_listing(store)
+        by_id = {w["world_id"]: w for w in listing["worlds"]}
+        assert [s["session_id"] for s in by_id[world_id]["sessions"]] == [session_id], bad
+        assert any("frame_source" in r.getMessage() for r in caplog.records), bad
