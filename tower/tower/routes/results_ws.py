@@ -27,6 +27,7 @@ from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
 from tower.results.publisher import (
     SNAPSHOT_TIMEOUT_SECONDS,
+    SnapshotTimeout,
     LOCK_TIMEOUT_S,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
     SEND_TIMEOUT_S,
@@ -332,7 +333,7 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # the client waiting on a reply that was never coming -- the
         # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
         # available failures because nothing on either side reports it.
-        if isinstance(exc, TimeoutError):
+        if isinstance(exc, SnapshotTimeout):
             # One line, and one line per target per 30 s. A phone
             # retrying every ~2.5 s against a wedged read logged a full
             # traceback per attempt -- a reviewer counted 216 lines a
@@ -360,13 +361,7 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         await _error(
             sender,
             ERR_SNAPSHOT_FAILED,
-            # A timeout says what it waited on and whether this
-            # connection was refused; anything else is named by type,
-            # since its text may be a stack of internals.
-            str(exc) if isinstance(exc, TimeoutError) else (
-                f"the Tower could not read this cartridge's state: "
-                f"{type(exc).__name__}"
-            ),
+            _first_snapshot_failure_message(exc),
             cartridge=cartridge,
             result_type=result_type,
             contract=offer["contract"],
@@ -399,6 +394,25 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # me the scene", and for Scene Understanding it is what starts the
     # detector -- see `tower/scene/live.py`, WHEN IT RUNS.
     channel_holder.watcher_joined(cartridge, subscription.subscription_id)
+
+
+def _first_snapshot_failure_message(exc: BaseException) -> str:
+    """What the phone is told when its first snapshot could not be built.
+
+    The hub's own timeouts and refusals (`SnapshotTimeout`) say what they
+    waited on and whether this connection was refused, and that text is
+    written for the wire. Anything else -- including a `TimeoutError` a
+    PRODUCER raised from a socket or a filesystem call -- is named by
+    type only: its text may be a stack of internals, and a reviewer
+    measured 534 bytes of path, errno and pid going out when the first
+    version matched on `TimeoutError` alone.
+    """
+    if isinstance(exc, SnapshotTimeout):
+        return str(exc)
+    return (
+        f"the Tower could not read this cartridge's state: "
+        f"{type(exc).__name__}"
+    )
 
 
 async def _unsubscribe(message, sender, channel_holder) -> None:

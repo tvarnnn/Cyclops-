@@ -38,6 +38,7 @@ import asyncio
 import logging
 import threading
 import time
+import weakref
 
 from tower.results.contracts import RESULT_TYPE_STATUS
 from tower.results.envelope import ResultEnvelope
@@ -145,10 +146,23 @@ CURSOR_UNRECOGNISED = "unrecognised"
 CURSOR_ABSENT = "absent"
 
 
-class TooManyTargetsInFlight(TimeoutError):
-    """A subscribe refused because `MAX_IN_FLIGHT_TARGETS` snapshots are
-    already running. A `TimeoutError` so the route answers it the same
-    way: `snapshot_failed`, one log line."""
+class SnapshotTimeout(TimeoutError):
+    """The hub's OWN answer to a subscribe it could not satisfy in time:
+    the first snapshot is still running, or past its deadline, or was
+    just abandoned. Its text is written for the wire.
+
+    A distinct type, because a PRODUCER may raise a `TimeoutError` of its
+    own (a socket, a lock, a filesystem call), and a reviewer showed that
+    matching on `TimeoutError` alone put 534 bytes of that producer's
+    internals -- a path, an errno, a pid -- on the wire and lost its
+    traceback to the one-line log. The route matches on this type.
+    """
+
+
+class TooManyTargetsInFlight(SnapshotTimeout):
+    """A subscribe refused because this connection, or the Tower, already
+    has as many snapshots running as it may. Answered like a timeout:
+    `snapshot_failed`, one log line, the text on the wire."""
 
 
 class Subscription:
@@ -544,8 +558,16 @@ class ResultHub:
         # Which connection dispatched each in-flight snapshot, for the
         # per-connection cap. `None` for the poll loop's own dispatches.
         self._owner_of: dict = {}
-        # Futures collected since the last pass began. See `_collect`.
-        self._collected: set = set()
+        # Futures already collected, so the young handover and a parked
+        # pass cannot both count one. WEAK: the record dies with the
+        # future. The first version was a plain set cleared at the start
+        # of each pass -- and a pass runs only while a channel is
+        # attached, so with nobody attached (the cached-exception
+        # handover ends in `snapshot_failed`, which attaches nothing) it
+        # grew for the life of the process: a reviewer measured 35,000
+        # retained futures an hour, each holding its exception, its
+        # traceback and through it the hub.
+        self._collected = weakref.WeakSet()
         # The subscription ids watching each target when its in-flight
         # snapshot was dispatched. A result whose watchers have ALL gone
         # was computed for nobody who is still here. See the discard rule
@@ -880,7 +902,7 @@ class ResultHub:
                 detail = f"is {age:.0f}s old, past the {SNAPSHOT_TIMEOUT_SECONDS:.0f}s deadline"
             else:
                 detail = f"is still running after {waited:.1f}s"
-            raise TimeoutError(f"the first snapshot for {target} {detail}")
+            raise SnapshotTimeout(f"the first snapshot for {target} {detail}")
         if self._in_flight.get(target) is future:
             self._forget(target)
         self._abandon_streak.pop(target, None)
@@ -1114,7 +1136,6 @@ class ResultHub:
         and the loop is also answering frames. A disk stall must cost
         this channel latency, never the frame path.
         """
-        self._collected = set()
         targets = {}
         for channel in self._channels:
             for subscription in channel._subscriptions.values():

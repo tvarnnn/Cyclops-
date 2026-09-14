@@ -2527,7 +2527,11 @@ def test_an_abandoned_threads_late_return_does_not_stamp_the_replacement(monkeyp
 
 
 def test_forgetting_a_target_clears_every_table():
-    """`_forget` is the one place a target leaves, and it leaves all of them."""
+    """`_forget` is the one place a target leaves its in-flight record, and
+    it leaves every table keyed on the target. (`_failures` and
+    `_abandon_streak` deliberately outlive it -- they are the target's
+    history, pruned by the pass -- and `_collected` is keyed on the
+    future and weak.)"""
     import time as _time
 
     hub = ResultHub(lambda *args: _snapshot("x"), clock=_time.monotonic)
@@ -2584,3 +2588,190 @@ def test_the_young_threshold_is_the_heartbeat_not_the_poll():
 
     assert asyncio.run(_run()) == "rev-0"
     assert entered["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Round 28: what the ninth publisher reviewer found (no blocking defect).
+# ---------------------------------------------------------------------------
+
+
+def test_collected_futures_do_not_accumulate_with_nobody_attached():
+    """The once-per-future record must die with the future.
+
+    It was a plain set cleared at the start of each pass; a pass runs only
+    while a channel is attached, and the cached-exception handover ends in
+    `snapshot_failed`, which attaches nothing -- 35,000 retained futures
+    an hour, measured, each holding its exception, its traceback and
+    through it the hub.
+    """
+    import gc
+
+    calls = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:
+            raise RuntimeError("every other read explodes")
+        return _snapshot("fine")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0, heartbeat_seconds=2.0)
+
+    def _sub(n):
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id=f"w{n}",
+            session_id=None, cursor_status=None,
+        )
+
+    # pytest's log capture would keep every `logger.exception` record --
+    # and through its traceback the frame, the closure and the future --
+    # alive for the test; the Tower has no such capture. Silence the
+    # logger so what is measured is the hub's own retention.
+    from tower.results import publisher as publisher_module
+    publisher_module.logger.disabled = True
+
+    async def _run():
+        for n in range(60):
+            target = ("world_builder", "status", f"w{n}", None)
+            future = hub._dispatch(target, _sub(n), set())     # raises
+            for _ in range(200):
+                await asyncio.sleep(0.002)
+                if future.done():
+                    break
+            # The handover finds the cached exception, counts it, and
+            # dispatches afresh -- which succeeds.
+            await hub.first_snapshot(_sub(n), timeout=1.0)
+            del future
+        gc.collect()
+        return len(hub._collected), len(hub._in_flight)
+
+    try:
+        collected, in_flight = asyncio.run(_run())
+    finally:
+        publisher_module.logger.disabled = False
+    assert in_flight == 0
+    assert collected <= 2, f"{collected} collected futures retained with nobody attached"
+
+
+def test_a_producers_own_timeout_is_not_echoed_onto_the_wire():
+    """Only the hub's own timeouts and refusals put their text on the wire;
+    a producer's `TimeoutError` may carry a path, an errno and a pid."""
+    from tower.results.publisher import SnapshotTimeout, TooManyTargetsInFlight
+    from tower.routes.results_ws import _first_snapshot_failure_message
+
+    internals = TimeoutError(r"C:\Users\somebody\world\manifest.json errno 13 pid 4242")
+    assert "manifest.json" not in _first_snapshot_failure_message(internals)
+    assert "TimeoutError" in _first_snapshot_failure_message(internals)
+    assert _first_snapshot_failure_message(SnapshotTimeout("still running after 10.0s")) == (
+        "still running after 10.0s"
+    )
+    assert "already has" in _first_snapshot_failure_message(
+        TooManyTargetsInFlight("this connection already has 8 results being computed")
+    )
+
+
+def test_a_departing_channel_unowns_only_its_own_dispatches():
+    """`detach` releases the leaving channel's owner references and nobody
+    else's: a still-live connection keeps its per-connection count."""
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    never = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+
+    def _sub(world_id):
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id=world_id,
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        leaving = ConnectionChannel(hub, lambda payload: None, lambda: 0.0)
+        staying = ConnectionChannel(hub, lambda payload: None, lambda: 0.0)
+        for n in range(3):
+            with pytest.raises(TimeoutError):
+                await hub.first_snapshot(_sub(f"leaving-{n}"), timeout=0.01, owner=leaving)
+        for n in range(publisher_module.MAX_IN_FLIGHT_PER_CONNECTION):
+            with pytest.raises(TimeoutError):
+                await hub.first_snapshot(_sub(f"staying-{n}"), timeout=0.01, owner=staying)
+        await hub.detach(leaving)
+        owned_by_staying = sum(1 for holder in hub._owner_of.values() if holder is staying)
+        owned_by_leaving = sum(1 for holder in hub._owner_of.values() if holder is leaving)
+        # ...and the staying connection is still at its wall.
+        from tower.results.publisher import TooManyTargetsInFlight
+        with pytest.raises(TooManyTargetsInFlight):
+            await hub.first_snapshot(_sub("staying-more"), timeout=0.01, owner=staying)
+        never.set()
+        return owned_by_staying, owned_by_leaving
+
+    owned_by_staying, owned_by_leaving = asyncio.run(_run())
+    assert owned_by_leaving == 0
+    assert owned_by_staying == 8, "a departing channel unowned another connection's dispatches"
+
+
+def test_the_sweep_leaves_a_watched_result_for_its_watcher():
+    """The subscribe path frees finished work NOBODY is waiting for -- not
+    a result a registered watcher is about to receive."""
+    import threading
+
+    gate = threading.Event()
+    entered = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered["n"] += 1
+        if cartridge == "world_builder":
+            gate.wait(timeout=30)
+            return _snapshot(f"wb-{entered['n']}")
+        return _snapshot("cv")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0, heartbeat_seconds=2.0)
+    wb_target = ("world_builder", "status", "w", None)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    async def _run():
+        watcher = ConnectionChannel(hub, _capture, lambda: 0.0)
+        registered = Subscription(
+            subscription_id="sub-A", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        )
+        await watcher.add(registered)
+        hub._task.cancel()                          # no pass may race this
+        hub._task = None
+        future = hub._dispatch(wb_target, registered, {registered})
+        gate.set()
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if future.done():
+                break
+        wb_entries = entered["n"]
+        # Another connection subscribes to something else: its sweep runs.
+        await hub.first_snapshot(Subscription(
+            subscription_id="sub-1", cartridge="cv_lab",
+            result_type="status", contract="c", world_id=None,
+            session_id=None, cursor_status=None,
+        ), timeout=1.0, owner=object())
+        still_there = hub._in_flight.get(wb_target) is future
+        # The watcher's own pass collects it.
+        await hub.poll_once()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if delivered:
+                break
+        await watcher.close()
+        return still_there, wb_entries
+
+    still_there, wb_entries = asyncio.run(_run())
+    assert still_there, "another connection's subscribe swept a result a watcher was waiting for"
+    # The first delivery is THAT result (later passes may add newer ones).
+    assert [m["payload"]["revision_marker"] for m in delivered][:1] == [f"wb-{wb_entries}"]
