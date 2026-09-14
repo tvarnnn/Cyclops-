@@ -285,8 +285,10 @@ payload has moved. iOS drops the repeats itself.
 `end_reason` (`WorldSessionReport`, `WorldListingSession`) and derives **nothing**
 from it — no "interrupted", no failure, no badge. So the classifier reporting a
 repaired world as `ready` with an `error` `end_reason` arrives on the phone as
-`Saved`, with the Tower's own reason string shown verbatim beside it, and
-nothing on this side contradicts it.
+`Saved`, and nothing on this side contradicts it. (An earlier version of this
+sentence said the Tower's reason string is shown beside it; it is not —
+`modelState(from:)` drops `reason` for `finalized`, and the `.finalized` arm of
+the canvas draws none. Corrected at the 2026-09-14 Mac gate.)
 
 ---
 

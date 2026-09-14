@@ -79,7 +79,7 @@ Added 2026-09-06 on the Mac integration branch, so a saved world can be
 | Query | Type | Meaning |
 |---|---|---|
 | `session_id` | string, optional | The session to draw. Absent: the newest session of the world that has geometry (`has_geometry` in §2) |
-| `max_points` | int 1…200000, optional | Point budget; default 80,000 for a phone. Fractional-stride sampling over every segment, never a prefix |
+| `max_points` | int 1…200000, optional | Point budget; default 40,000 for a phone (`MOBILE_MAX_POINTS` in `tower/results/world_builder_render.py`, set from a measured canvas-fill cliff — 80,000 was the cliff, not a margin). Fractional-stride sampling over every segment, never a prefix |
 
 **200** `text/html`, `Cache-Control: no-store`. A self-contained page: no
 external script, stylesheet, image or fetch, so a web view that refuses

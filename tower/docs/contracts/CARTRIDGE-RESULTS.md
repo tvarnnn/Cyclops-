@@ -323,7 +323,12 @@ keeps working through every one.
 | `consumer_too_slow` | a result was not accepted within the send timeout; **this subscription is now closed** — subscribe again to resume | `subscription_id`, `cartridge`, `result_type` |
 | `channel_failed` | the Tower's shared reader died; **this subscription is now closed** | `subscription_id`, `cartridge`, `result_type` |
 
-Every `result_error` also carries `envelope_contract`.
+Every `result_error` sent in reply to a request also carries
+`envelope_contract`. The two unsolicited ones, `channel_failed` and
+`consumer_too_slow`, do not: they are built by the publisher's send
+loop, which names the subscription and its cartridge/result type and
+nothing more (`tower/results/publisher.py`). A client must not require
+the field on a `result_error`.
 
 `channel_failed` and `consumer_too_slow` are the two that arrive
 unsolicited. On receiving it,
@@ -579,7 +584,7 @@ prose for a person, or null.
 | `unsupported` | this Tower cannot serve World Builder at all | e.g. no world root configured. Do not invite the user to wait |
 | `idle` | Tower is fine, there is nothing to show yet | no worlds, or a world with no sessions |
 | `receiving` | a mapping session is live | a process holds the world's writer lock |
-| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat, and since 2026-09-10 only when `geometry.available` is true — see below |
+| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat, and since 2026-09-10 only when the FIGURES say there is something to wait for — `geometry.element_count > 0` or `trajectory.pose_count > 0`, the same test as iOS `WorldEvidence.hasGeometry`; not `geometry.available`, which is true for a build that solved nothing — see below |
 | `finalized` | capture ended and the stored geometry matches the keyframes | |
 | `interrupted` | the session did not end the way a walk ends: the builder died, was asked to stop mid-walk, recorded an error, or finalization was left unfinished | **`world_snapshot` and `geometry` still describe whatever was built.** `model_state_reason` says what happened; `lifecycle.finalization` says how far finalization got. Added at `/2026-09-06` (the reason the identifier moved) |
 | `failed` | reserved; nothing on disk maps to it since `/2026-09-06` | a client must still decode it |
@@ -1945,12 +1950,17 @@ not a change to the other.
 Supersedes `/2026-09-06`. No word was added and nothing an older phone
 decodes was removed; what changed is that a `model_state` it already
 implements now arrives in a state it did not before. A
-`lifecycle.state: "stopped_unbuilt"` with `geometry.available: false`
-projects to `interrupted` rather than `finalizing`, because there is
-nothing to wait for -- a phone told to wait there waits forever. A client
-that switches on `model_state` needs no change; one that switched on
-`lifecycle.state` and assumed the old projection should read
-`geometry.available` beside it.
+`lifecycle.state: "stopped_unbuilt"` with no drawable figures --
+`geometry.element_count` and `trajectory.pose_count` both zero or absent
+-- projects to `interrupted` rather than `finalizing`, because there is
+nothing to wait for -- a phone told to wait there waits forever. The gate
+is the figures and not `geometry.available`: `engine.build` writes a
+derived tree even when it solved nothing, so `available` is true for a
+world with zero points in it, and gating on it told a wearer to keep
+waiting for exactly that (§10.1). A client that switches on
+`model_state` needs no change; one that switched on `lifecycle.state`
+and assumed the old projection should read the two counts beside it,
+the way iOS `WorldEvidence.hasGeometry` does.
 
 Supersedes `world_builder.status/2026-08-23`. **One field changed
 meaning**, which is why the identifier moved rather than staying put for
