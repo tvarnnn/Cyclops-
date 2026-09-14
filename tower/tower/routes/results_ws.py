@@ -360,8 +360,13 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         await _error(
             sender,
             ERR_SNAPSHOT_FAILED,
-            f"the Tower could not read this cartridge's state: "
-            f"{type(exc).__name__}",
+            # A timeout says what it waited on and whether this
+            # connection was refused; anything else is named by type,
+            # since its text may be a stack of internals.
+            str(exc) if isinstance(exc, TimeoutError) else (
+                f"the Tower could not read this cartridge's state: "
+                f"{type(exc).__name__}"
+            ),
             cartridge=cartridge,
             result_type=result_type,
             contract=offer["contract"],

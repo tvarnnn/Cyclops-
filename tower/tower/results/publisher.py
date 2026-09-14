@@ -544,6 +544,8 @@ class ResultHub:
         # Which connection dispatched each in-flight snapshot, for the
         # per-connection cap. `None` for the poll loop's own dispatches.
         self._owner_of: dict = {}
+        # Futures collected since the last pass began. See `_collect`.
+        self._collected: set = set()
         # The subscription ids watching each target when its in-flight
         # snapshot was dispatched. A result whose watchers have ALL gone
         # was computed for nobody who is still here. See the discard rule
@@ -588,6 +590,14 @@ class ResultHub:
                     self._forget(target)
                 else:
                     self._watchers_at_dispatch[target] = set()
+        # Whatever this channel dispatched is nobody's now: the owner
+        # reference would otherwise keep a closed channel -- and its
+        # socket -- alive for as long as the future lived (a reviewer
+        # counted 256 closed channels retained), and count against a
+        # connection that no longer exists.
+        for target, holder in list(self._owner_of.items()):
+            if holder is channel:
+                self._owner_of[target] = None
 
     async def shutdown(self) -> None:
         """Stop the reader on app teardown. Never raises.
@@ -715,7 +725,21 @@ class ResultHub:
         abandoned_here = False
         for other in list(self._in_flight):
             other_future = self._in_flight[other]
-            if not other_future.done() and self._past_abandonment(other):
+            if other_future.done():
+                # DONE, AND NOBODY IS WAITING FOR IT: freed. The pass
+                # frees these, but the pass runs only while a channel is
+                # attached, and a channel attaches only after a
+                # SUCCESSFUL subscribe. A reviewer drove 300 sockets that
+                # each subscribed to a distinct world_id and dropped 20 ms
+                # later, against a healthy 0.2 s read: 256 done futures
+                # nobody watched, the global cap reached, every subscribe
+                # refused, no channel ever attached, no pass ever ran --
+                # the whole result channel disabled by bookkeeping alone,
+                # still refused 130 s later. The subscriber's own target
+                # is left for the handover below to judge.
+                if other != target and not self._watchers_of(other):
+                    self._forget(other)
+            elif self._past_abandonment(other):
                 self._abandon(other)
                 if other == target:
                     abandoned_here = True
@@ -986,7 +1010,7 @@ class ResultHub:
             future.exception()
 
     def _collect(self, target, future, moment: float) -> None:
-        """A finished snapshot: freed, then offered or counted.
+        """A finished snapshot: freed, then offered or counted. Once.
 
         THIS future is forgotten, not whatever the table holds for the
         target now. `first_snapshot` takes no pass lock, so a subscribe
@@ -995,7 +1019,16 @@ class ResultHub:
         forgetting by target popped the replacement, and the next pass
         dispatched a third -- two live threads for one target, measured
         by a reviewer, which is the one bound this table exists to hold.
+
+        And ONCE per future: the young handover in `first_snapshot` may
+        collect a future a parked pass is about to collect too, and a
+        second collection of a failure counted it twice -- two genuine
+        failures then tripped the three-strike escalation. A future
+        already collected is remembered until the next pass begins.
         """
+        if future in self._collected:
+            return
+        self._collected.add(future)
         if self._in_flight.get(target) is future:
             self._forget(target)
         elif not future.cancelled():
@@ -1081,6 +1114,7 @@ class ResultHub:
         and the loop is also answering frames. A disk stall must cost
         this channel latency, never the frame path.
         """
+        self._collected = set()
         targets = {}
         for channel in self._channels:
             for subscription in channel._subscriptions.values():

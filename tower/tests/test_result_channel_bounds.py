@@ -2331,3 +2331,256 @@ def test_a_cached_exception_is_counted_and_not_re_raised_for_the_heartbeat():
     revision, failures = asyncio.run(_run())
     assert revision == "fine"
     assert failures.get(target) == 1, "the cached exception was not counted as a failure"
+
+
+# ---------------------------------------------------------------------------
+# Round 27: what the eighth publisher reviewer found.
+# ---------------------------------------------------------------------------
+
+
+def test_done_results_nobody_waits_for_do_not_fill_the_table():
+    """Subscribe-and-drop sockets against a HEALTHY read must not disable
+    the channel.
+
+    300 sockets each subscribed to a distinct world_id and dropped 20 ms
+    later; the reads finished for nobody, the table held 256 done futures
+    nobody watched, the global cap was reached, and every later subscribe
+    was refused -- so no channel ever attached, no pass ever ran, and
+    nothing ever swept them. Still refused 130 s later. The subscribe
+    path frees done futures nobody is waiting for.
+    """
+    import time as _time
+
+    from tower.results import publisher as publisher_module
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        _time.sleep(0.05)
+        return _snapshot("fine")
+
+    hub = ResultHub(_snapshot_for, clock=_time.monotonic)
+
+    async def _run():
+        for n in range(publisher_module.MAX_IN_FLIGHT_TARGETS + 40):
+            task = asyncio.ensure_future(hub.first_snapshot(Subscription(
+                subscription_id="sub-1", cartridge="world_builder",
+                result_type="status", contract="c", world_id=f"w{n}",
+                session_id=None, cursor_status=None,
+            ), timeout=10.0, owner=object()))
+            await asyncio.sleep(0.002)
+            task.cancel()                          # the socket drops mid-wait
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await asyncio.sleep(0.3)                   # every read finishes, for nobody
+        stranded = len(hub._in_flight)
+        answered = await hub.first_snapshot(Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="the-phone",
+            session_id=None, cursor_status=None,
+        ), timeout=5.0, owner=object())
+        return stranded, answered.revision, len(hub._in_flight)
+
+    stranded, answered, after = asyncio.run(_run())
+    assert answered == "fine", f"a phone was refused behind {stranded} done results nobody waited for"
+    assert after <= 1, f"{after} entries remain after the sweep"
+
+
+def test_the_global_cap_still_stands_against_pending_wedges():
+    """The global wall (256) refuses a 257th DISTINCT connection's wedge."""
+    import threading
+
+    from tower.results import publisher as publisher_module
+    from tower.results.publisher import TooManyTargetsInFlight
+
+    never = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    limit = publisher_module.MAX_IN_FLIGHT_TARGETS
+
+    async def _run():
+        refused = 0
+        for n in range(limit + 8):
+            try:
+                await hub.first_snapshot(Subscription(
+                    subscription_id="sub-1", cartridge="world_builder",
+                    result_type="status", contract="c", world_id=f"w{n}",
+                    session_id=None, cursor_status=None,
+                ), timeout=0.001, owner=object())   # a new connection each time
+            except TooManyTargetsInFlight:
+                refused += 1
+            except TimeoutError:
+                pass
+        in_flight = len(hub._in_flight)
+        never.set()
+        return refused, in_flight
+
+    refused, in_flight = asyncio.run(_run())
+    assert in_flight == limit
+    assert refused == 8
+
+
+def test_a_closed_channel_is_not_kept_alive_by_its_dispatches():
+    """`detach` drops the owner references of the channel leaving, so a
+    closed channel (and its socket) is not retained for as long as a
+    wedged future lives, and does not count against anyone."""
+    import threading
+
+    never = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+
+    async def _run():
+        channel = ConnectionChannel(hub, lambda payload: None, lambda: 0.0)
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(Subscription(
+                subscription_id="sub-1", cartridge="world_builder",
+                result_type="status", contract="c", world_id="w",
+                session_id=None, cursor_status=None,
+            ), timeout=0.01, owner=channel)
+        assert channel in hub._owner_of.values()
+        await hub.detach(channel)
+        retained = channel in hub._owner_of.values()
+        never.set()
+        return retained
+
+    assert not asyncio.run(_run()), "a detached channel was still referenced as an owner"
+
+
+def test_a_future_is_collected_once():
+    """The young handover and a parked pass may both reach one future; a
+    failure must be counted once, not twice (two genuine failures then
+    tripped the three-strike escalation)."""
+    hub = ResultHub(lambda *args: _snapshot("x"), clock=lambda: 0.0)
+    target = ("world_builder", "status", "w", None)
+
+    async def _run():
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(RuntimeError("once"))
+        hub._in_flight[target] = future
+        hub._dispatched_at[target] = 0.0
+        hub._watchers_at_dispatch[target] = set()
+        hub._collect(target, future, 0.0)
+        hub._collect(target, future, 0.0)
+        return dict(hub._failures)
+
+    assert asyncio.run(_run()).get(target) == 1
+
+
+def test_an_abandoned_threads_late_return_does_not_stamp_the_replacement(monkeypatch):
+    """`_completed_at` for a target's NEW future is never overwritten by
+    the OLD, abandoned future's callback."""
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "SNAPSHOT_TIMEOUT_SECONDS", 1.0)
+    old_gate = threading.Event()
+    entered = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered["n"] += 1
+        if entered["n"] == 1:
+            old_gate.wait(timeout=60)
+        return _snapshot(f"rev-{entered['n']}")
+
+    clock = _fake_clock()
+    hub = ResultHub(_snapshot_for, clock=clock, age_clock=clock)
+    target = ("world_builder", "status", "w", None)
+
+    def _sub():
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(_sub(), timeout=0.01)     # the wedge
+        clock.advance(1.0 * (publisher_module.SNAPSHOT_ABANDON_MULTIPLIER + 1))
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(_sub(), timeout=0.01)     # abandons, re-dispatches
+        replacement = hub._in_flight[target]
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if replacement.done():
+                break
+        stamped = hub._completed_at.get(target)
+        clock.advance(100.0)
+        old_gate.set()                                         # the old thread returns now
+        await asyncio.sleep(0.1)
+        return stamped, hub._completed_at.get(target)
+
+    stamped, after = asyncio.run(_run())
+    assert stamped is not None and after == stamped, (
+        "the abandoned thread's late return re-stamped the replacement's completion"
+    )
+
+
+def test_forgetting_a_target_clears_every_table():
+    """`_forget` is the one place a target leaves, and it leaves all of them."""
+    import time as _time
+
+    hub = ResultHub(lambda *args: _snapshot("x"), clock=_time.monotonic)
+
+    async def _run():
+        await hub.first_snapshot(Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        ), timeout=5.0, owner=object())
+        return {
+            name: len(getattr(hub, name)) for name in (
+                "_in_flight", "_dispatched_at", "_watchers_at_dispatch",
+                "_completed_at", "_owner_of",
+            )
+        }
+
+    sizes = asyncio.run(_run())
+    assert all(size == 0 for size in sizes.values()), sizes
+
+
+def test_the_young_threshold_is_the_heartbeat_not_the_poll():
+    """A result that sat longer than the poll but shorter than the
+    heartbeat is still fresh -- the heartbeat is how old a snapshot the
+    channel itself is content to send."""
+    import time as _time
+
+    entered = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered["n"] += 1
+        return _snapshot(f"rev-{entered['n'] - 1}")
+
+    hub = ResultHub(
+        _snapshot_for, clock=_time.monotonic, poll_seconds=0.05, heartbeat_seconds=0.5,
+    )
+
+    def _sub():
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        target = ("world_builder", "status", "w", None)
+        future = hub._dispatch(target, _sub(), set())
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if future.done():
+                break
+        await asyncio.sleep(0.2)                    # past the poll, inside the heartbeat
+        return (await hub.first_snapshot(_sub(), timeout=1.0)).revision
+
+    assert asyncio.run(_run()) == "rev-0"
+    assert entered["n"] == 1
