@@ -178,6 +178,15 @@ whatever `since_revision` you sent.
 each new socket. Two connections will both see `sub-1`; that is correct and
 they are entirely independent.
 
+**`world_id` and `session_id` on the reply are the request's, verbatim** —
+`null` where the request omitted them — never the world or session the
+Tower *resolved* (that is the payload's `selection` block, §10). A client
+with more than one subscribe outstanding — a pin change while an earlier,
+slower subscribe is still being answered — matches each ack to the subscribe
+it answers by these two fields, and closes an ack whose pin is not the one
+it holds. The Tower has echoed them since the channel existed; stated here
+since 2026-09-14 because the phone now depends on it.
+
 ### Unsubscribing
 
 ```json

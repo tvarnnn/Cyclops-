@@ -946,9 +946,10 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     /// Closes the open subscription, forgets the report it produced, and opens
     /// a new one carrying the pin. The Tower answers a pinned subscribe with a
     /// complete snapshot of that world, so nothing is merged and nothing from
-    /// the live world survives the switch. An id the Tower does not know comes
-    /// back as its own `unsupported`/error wording, which the existing paths
-    /// already render verbatim.
+    /// the live world survives the switch. An id the Tower does not know is
+    /// acknowledged like any other and answered with a `model_state: idle`
+    /// payload whose `model_state_reason` says so — not a `result_error` —
+    /// and the existing paths render that verbatim.
     func inspect(worldID: String, sessionID: String?) {
         pinned = (worldID, sessionID)
         inspection = .inspecting(worldID: worldID)
@@ -1044,14 +1045,14 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         // existing rule; the new one's own ack is what counts.
         if resubscribesUsed < Self.resubscribeBudget {
             resubscribesUsed += 1
-            // The attempt that timed out is written off, or the count would
-            // read the RETRY's own ack as the superseded one: the superseded
-            // rule in `handle(.subscribed)` is count-based, and the subscribe
-            // this bound was armed for may never have reached the wire at
-            // all (`sendResultMessage` swallows a failed send). A late ack
-            // for the written-off attempt is caught there by a different
-            // rule — it arrives after this client already holds a
-            // subscription — and is unsubscribed then.
+            // The attempt that timed out is written off, or the count in
+            // `handle(.subscribed)` would read the RETRY's own ack as the
+            // superseded one — and the subscribe this bound was armed for
+            // may never have reached the wire at all (`sendResultMessage`
+            // swallows a failed send). A late ack for the written-off
+            // attempt is closed there by one of two other rules: it carries
+            // a pin this client no longer holds, or it arrives after this
+            // client already holds a subscription.
             pendingSubscribeAcks = max(0, pendingSubscribeAcks - 1)
             subscribeIfPossible()
             return
@@ -1165,6 +1166,13 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                 // rule then adopted the live subscription under the pin and
                 // unsubscribed the pinned one.
                 if pendingSubscribeAcks > 0 { pendingSubscribeAcks -= 1 }
+                #if DEBUG
+                print(
+                    "[Glasses][WorldBuilder] ack \(ack.subscriptionID) carries pin "
+                        + "\(ack.worldID ?? "nil")/\(ack.sessionID ?? "nil") but this client holds "
+                        + "\(pinned?.worldID ?? "nil")/\(pinned?.sessionID ?? "nil"); closed"
+                )
+                #endif
                 tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
                 retiredSubscriptionIDs.insert(ack.subscriptionID)
                 return

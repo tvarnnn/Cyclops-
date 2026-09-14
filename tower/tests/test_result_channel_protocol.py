@@ -682,3 +682,28 @@ def test_every_payload_key_is_documented(monkeypatch, built):
 
     _walk(envelope)
     assert missing == [], f"undocumented payload keys: {missing}"
+
+
+def test_the_ack_echoes_the_request_pin_verbatim(monkeypatch, built):
+    """The reply's `world_id`/`session_id` are the REQUEST's, never the
+    resolved selection. The phone matches each ack to the subscribe it
+    answers by these two fields -- a pin change while a slower subscribe is
+    still being answered puts two subscribes on one socket, and a count of
+    outstanding acks cannot tell a pinned one from an unpinned one. An echo
+    of the resolved session would make every world-row pin (a world with no
+    session named) refuse its own ack forever."""
+    root, world_id, session_id = built
+    client = make_client(monkeypatch, root)
+    with client.websocket_connect("/ws") as ws:
+        unpinned = subscribe(ws)
+        assert (unpinned["world_id"], unpinned["session_id"]) == (None, None)
+        drain(ws, expect="cartridge_result")
+
+        by_world = subscribe(ws, world_id=world_id)
+        assert (by_world["world_id"], by_world["session_id"]) == (world_id, None), (
+            "a world-row pin names no session; the ack must not fill one in"
+        )
+        drain(ws, expect="cartridge_result")
+
+        pinned = subscribe(ws, world_id=world_id, session_id=session_id)
+        assert (pinned["world_id"], pinned["session_id"]) == (world_id, session_id)
