@@ -10,7 +10,7 @@ handed back as a validated candidate for the next iPhone + glasses walk.
 | **Starting branch** | `integration/all-cartridges-v1` (canonical checkout `~/Projects/Glasses`, no new worktree) |
 | **Starting SHA** | `55bc24c` (the campaign's handoff commit; code SHA `dc52b2d`) |
 | **Windows candidate verified present** | `git cat-file -t dc52b2d` → `commit`; `git cat-file -t 55bc24c` → `commit`; HEAD **was** `55bc24c` on the intended branch, up to date with `origin/integration/all-cartridges-v1`. Nothing to integrate, nothing stale. |
-| **Final Mac SHA** | `fa8861b` (code) — §1 lists the commits, all local, nothing pushed |
+| **Final Mac SHA** | `319172a` — §1 lists the commits, all local, nothing pushed |
 | **Xcode** | 26.6 (17F113) |
 | **macOS** | 26.5.2 (25F84) |
 | **Simulator destinations** | `platform=iOS Simulator,name=iPhone 17 Pro` (lead); `iPhone 17` (a fix agent, to avoid contention) |
@@ -50,10 +50,15 @@ All local, on `integration/all-cartridges-v1`, **nothing pushed**.
 | `a01f864` | fix(world-builder): a Tower read timeout is not a failed walk, and the walk you just finished is not history |
 | `71092a9` | fix(tower): re-entering World Builder attaches a builder, and one bad row does not empty Saved Worlds |
 | `fa8861b` | docs(contracts): four claims the code did not make |
-| _(the next SHA)_ | docs(handoff): this document |
+| `10ef2b9` | docs(handoff): this document, first version |
+| `22ebea5` | fix(world-builder): an ack is matched by its pin, not by counting, and a foreign walk is never remembered as followed |
+| `319172a` | docs(contracts): the ack echoes the request's pin, said out loud and pinned |
+| _(the next SHA)_ | docs(handoff): this document, final |
 
 `git log 55bc24c..HEAD` is the authoritative list. **Final Mac code SHA:
-`fa8861b`.** Committed from the canonical checkout as the brief asked; no
+`319172a`** (Swift: a DEBUG log line and two comments past `22ebea5`; the
+968/0 unit run and the 3/3 UI smoke below are on `22ebea5`'s code, and the
+unit suite was run again on `319172a`: 968/0). Committed from the canonical checkout as the brief asked; no
 commit hooks are configured in this clone, so nothing was bypassed.
 
 ---
@@ -135,7 +140,9 @@ world root above.
 | after this gate's fixes, run 1 | 964 | 1 | `testAnUnmatchedRouteIsNamedAsSuchAndNotRetried` pinned a wearer-facing sentence this gate reworded (it cited a contract section); the assertion was updated to the new sentence |
 | run 2 (same tree) | 964 | 1 | same test — stable, not load-sensitive |
 | run 3 (final tree) | 965 | 0 | |
-| run 4 (final tree `fa8861b`, after the last review fixes) | **967** | **0** | |
+| run 4 (`fa8861b`) | 967 | 0 | |
+| run 5 (`22ebea5`, the pin-aware ack fix) | 968 | 8 (4 tests) | **the three mock Towers were unfaithful**: they acknowledged every subscribe with `world_id: null, session_id: null`, where the real Tower echoes the request's pin (`routes/results_ws.py`), so the new pin rule refused the pinned tests' acks. The mocks echo the request now; the product code did not change |
+| run 6 (`22ebea5`, faithful mocks) | **968** | **0** | |
 
 No `Restarting after unexpected exit, crash, or test timeout` in any run. The
 previous lane's 877 became 965: the campaign's `WorldPresentationTests` (48
@@ -147,7 +154,8 @@ tests) and the tests this gate added (§7).
 |---|---|---|
 | first (under simulator load from a concurrent test agent) | 1 passed / 1 failed / 1 skipped | the failure was `open(cartridge: "World Builder")` on an app that took 85 s to become idle; the skip was the saved-world test finding no "Complete" row — because this gate's badge fix truthfully labels the fixture's `final_solve: skipped` session **"Partial"** |
 | second (alone) | 2 passed / 1 failed | the saved-world test failed at `reveal(Back to live)`: the campaign moved Diagnostics below the fold and "Back to live" is in the top banner, and the test helper only ever swiped **up** — the same helper trap the previous lane had already documented, in the other direction. Fixed in the helper (swipe up for half the budget, then down); the assertion is unchanged |
-| third (final tree `fa8861b`, alone) | **3 passed / 0 failed / 0 skipped** (160 s) | Tower healthy after; no traceback in its log |
+| third (`fa8861b`, alone) | 3 passed / 0 failed / 0 skipped (160 s) | Tower healthy after; no traceback in its log |
+| fourth (`22ebea5`, alone) | **3 passed / 0 failed / 0 skipped** (139 s) | same |
 
 Screenshots from the second run are what found the duplicated "final pass was
 skipped" sentence (§7, fix 14).
@@ -167,7 +175,8 @@ or explained by the same cause:
 **Zero World Builder failures attributable to the campaign or to this gate.**
 The final rerun of the World Builder **and** shared-infrastructure set
 (`test_capture_workers*`, `test_cartridge_session*`, `test_ws_*` added) on
-`fa8861b`: **1238 passed, 13 failed, 19 skipped** — the same 13, by name.
+`fa8861b` (no Tower file changed after it): **1238 passed, 13 failed, 19
+skipped** — the same 13, by name.
 
 ---
 
@@ -276,6 +285,37 @@ campaign's §14.22 described a second world; that is true only once the old
 builder has exited). **Fixed** on the Tower. Also the `#if DEBUG` assessment
 (§8).
 
+**Last fresh reviewer, on the round of fixes above.** One HIGH in the
+ack-timeout retry's second version: the superseded-ack rule counted
+outstanding acks, and a pin change while a timed-out (slow, not lost)
+subscribe was still answerable adopted the *live* retry's ack under the pin
+and unsubscribed the pinned one — the saved-world screen would have drawn
+the live world. **Fixed** in `22ebea5`: the Tower's ack has always echoed the
+request's `world_id`/`session_id`; the phone now decodes them and an ack
+whose pin is not the one held is closed, whatever the count says. One
+MEDIUM: a `snapshot_failed` for a superseded attempt cleared a held
+subscription without closing it (an orphan heartbeating for the socket's
+life). **Fixed.** One LOW: the followed-walk memory was recorded before the
+gate judged the report, so another phone's walk seen as "waiting" could come
+back as "Saved" under Live. **Fixed.** It verified the picker's session
+choice matches the render route's predicate exactly, that no writer leaves
+`frame_source` null, and that each new test fails for its stated reason.
+
+**Final reviewer, on `22ebea5` alone.** **No blocking or high defect.** One
+MEDIUM that is a documentation gap with a misleading failure behind it: the
+phone now depends on the ack echoing the request's pin, and the contract
+never said whose values those were (a Tower echoing the *resolved* session
+would satisfy the doc and be refused by the phone on every attempt, which
+the client would then report as "the Tower did not acknowledge"). Verified
+unreachable with any Tower in this repository's history; **fixed** by
+stating it in `CARTRIDGE-RESULTS.md` §3, a protocol test that pins the echo
+unpinned, by world, and by world-and-session, and a DEBUG log where an ack
+is refused. Two stale comments fixed. It traced the pin rule through every
+ordering of unpinned → pinned → live acks, the superseded-reply guard
+against every subscribe-reply reason the Tower emits, the followed-walk
+gate ordering, and the new test against the pre-commit code (fails for its
+stated reason).
+
 **Fresh reviewer of this gate's own diff.** One HIGH in this gate's first
 version of the ack-timeout retry: the superseded-ack rule is count-based, so
 the retry's own ack could be discarded as the superseded one and the retry
@@ -338,6 +378,7 @@ contracts agree.
 | 16 | `tower/tower/capture_workers.py` | `attach()` on a capture whose owner is alive and `stop_requested` releases that lineage and starts a fresh builder (the finishing worker stays registered, reaped and shut down under an opaque key) |
 | 17 | `tower/tower/results/world_builder_library.py`, `tower/tower/routes/geometry.py` | a session whose `started_at`/`ended_at` are not finite numbers or whose `frame_source` is not a string, and a world whose `created_at`/`updated_at` are not, are omitted with a warning instead of served; the route returns `json_safe(...)` (measured: on this FastAPI/pydantic a NaN was already `null`, not a 500; the wrap makes the guarantee the route's own) |
 | 18 | `CARTRIDGE-RESULTS.md`, `IOS-TO-TOWER-RECONCILIATION.md`, `WORLD-BUILDER-WORLDS.md` | `envelope_contract` on closing errors; the `stopped_unbuilt` projection is on the figures; `mapping_seconds` is null not clamped; `max_points` default 40,000 |
+| 19 | `CartridgeResultChannel.swift`, `TowerWorldBuilderClient.swift`, `WorldSession.swift` | the ack carries its pin and is matched by it; a reply to a superseded attempt while a subscription is held changes nothing; the followed-walk memory is recorded only for a report the gate let through; the three integration mocks echo the request's pin like the Tower |
 
 Tests added: `WorldRenderNavigationErrorTests` (2), `WorldListingBadgeAgreementTests` (4),
 `WorldStageMacGateTests` (3), in `TowerWorldBuilderClientTests`: a lost first
@@ -346,8 +387,9 @@ clears; in `TowerWorldBuilderLiveHistoryTests`: the followed walk presented as
 itself, another session of the same world is history, an expired memory is
 history; `WorldGeometryFetchLifecycleTests` (5), `WorldBuilderViewModelSeedingTests` (2),
 `WorldListLoadLifecycleTests` (2), `WorldBuilderSessionOrderingTests` (1),
-`TowerReconnectGiveUpTests` (2); Tower: `TestAttachAfterRequestStop` (3),
-five listing-robustness tests. Every one was run against the code it replaced
+`TowerReconnectGiveUpTests` (2); in `TowerWorldBuilderClientTests`: a pin
+change during a timed-out retry keeps the pinned subscription; Tower:
+`TestAttachAfterRequestStop` (3), six listing-robustness tests. Every one was run against the code it replaced
 and failed there, except the two `json_safe` pins, which are documented as pins.
 
 ---
@@ -529,13 +571,13 @@ was reused, not modified.
 
 ---
 
-## 13. Final numbers, on `fa8861b`
+## 13. Final numbers, on `319172a`
 
 | | |
 |---|---|
 | Debug build | clean, 0 errors, 0 new warnings |
 | Release build | clean, 0 errors, 7 warnings (the recorded baseline), 0 new |
-| Swift unit tests | **967 executed, 0 failures**, no restarts |
+| Swift unit tests | **968 executed, 0 failures**, no restarts |
 | UI smoke, live Tower | **3 passed, 0 failed, 0 skipped** |
 | Contract checks | AGREEMENT / agreement / clean |
 | Tower, World Builder + shared infrastructure | 1238 passed, 13 environmental failures (unchanged by name from the starting SHA), 19 skipped |
