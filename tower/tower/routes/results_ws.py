@@ -19,6 +19,7 @@ swallowed here and re-surfacing as an uncaught `RuntimeError` from the next
 
 import asyncio
 import logging
+import time
 
 from fastapi import WebSocketDisconnect
 
@@ -58,6 +59,10 @@ ERR_UNAVAILABLE = "cartridge_unavailable"
 ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
 ERR_SNAPSHOT_FAILED = "snapshot_failed"
+# How often the same target's failed first snapshot is logged. Bounded
+# in size as well: cleared when it outgrows a few hundred targets.
+FIRST_SNAPSHOT_WARNING_INTERVAL_S = 30.0
+_LAST_FIRST_SNAPSHOT_WARNING: dict = {}
 
 # How much of a client-supplied identifier comes back in a refusal.
 #
@@ -328,14 +333,24 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
         # available failures because nothing on either side reports it.
         if isinstance(exc, TimeoutError):
-            # One line. A phone retrying every ~2.5 s against a wedged
-            # read logged a full traceback per attempt -- a reviewer
-            # counted 216 lines a minute, indefinitely.
-            logger.warning(
-                "[Tower][Results] could not build the first snapshot for "
-                "%s/%s: %s",
-                cartridge, result_type, exc,
-            )
+            # One line, and one line per target per 30 s. A phone
+            # retrying every ~2.5 s against a wedged read logged a full
+            # traceback per attempt -- a reviewer counted 216 lines a
+            # minute; shortened to one line each it was still 120 a
+            # minute from one flapping client.
+            key = (cartridge, result_type, world_id, session_id)
+            now = time.monotonic()
+            last = _LAST_FIRST_SNAPSHOT_WARNING.get(key)
+            if last is None or now - last >= FIRST_SNAPSHOT_WARNING_INTERVAL_S:
+                _LAST_FIRST_SNAPSHOT_WARNING[key] = now
+                if len(_LAST_FIRST_SNAPSHOT_WARNING) > 256:
+                    _LAST_FIRST_SNAPSHOT_WARNING.clear()
+                logger.warning(
+                    "[Tower][Results] could not build the first snapshot for "
+                    "%s/%s: %s (further failures for this target are not "
+                    "logged for %.0fs)",
+                    cartridge, result_type, exc, FIRST_SNAPSHOT_WARNING_INTERVAL_S,
+                )
         else:
             logger.exception(
                 "[Tower][Results] could not build the first snapshot for %s/%s",

@@ -106,11 +106,18 @@ MAX_CONSECUTIVE_TARGET_FAILURES = 3
 # daemon and finishes, or does not, on its own. See `_dispatch`.
 SNAPSHOT_ABANDON_MULTIPLIER = 3
 # The cap doubles per consecutive abandonment of one target, up to this.
-SNAPSHOT_ABANDON_MAX_SECONDS = 600.0
-# The most a subscribe may wait inline for its first snapshot. Below iOS's
-# 2 s send-stall bound, because this wait blocks the connection's message
-# loop. See `ResultHub.first_snapshot`.
-SUBSCRIBE_INLINE_WAIT_SECONDS = 1.5
+# 120 s, not 600: this is also the longest a target stays refused after a
+# fault CLEARS, because recovery needs an abandonment (a reviewer measured
+# 592 s of silent refusal at 600).
+SNAPSHOT_ABANDON_MAX_SECONDS = 120.0
+# The most distinct targets that may have a snapshot running at once. A
+# target is `(cartridge, result_type, world_id, session_id)` and the last
+# two are the client's to choose: a reviewer subscribed 400 distinct
+# world_ids against a wedged read and got 400 live threads in 0.3 s, none
+# of them ever swept because a failed subscribe registers nothing and so
+# starts no poll loop. Eight subscriptions per connection, a handful of
+# connections: 64 is generous for a phone and a wall for anything else.
+MAX_IN_FLIGHT_TARGETS = 64
 
 # Per connection. A client with more than this many open subscriptions is
 # either confused or hostile; either way the answer is a refusal, not
@@ -128,6 +135,12 @@ CURSOR_MATCHED = "matched"
 CURSOR_STALE = "stale"
 CURSOR_UNRECOGNISED = "unrecognised"
 CURSOR_ABSENT = "absent"
+
+
+class TooManyTargetsInFlight(TimeoutError):
+    """A subscribe refused because `MAX_IN_FLIGHT_TARGETS` snapshots are
+    already running. A `TimeoutError` so the route answers it the same
+    way: `snapshot_failed`, one log line."""
 
 
 class Subscription:
@@ -605,13 +618,18 @@ class ResultHub:
                 # fresh -- and waited on -- only on the pass that
                 # dispatched it.
                 elapsed = time.monotonic() - started
-                # Never less than a quarter of the interval: a pass that
-                # takes longer than the poll must not turn the loop into
-                # a spin (a reviewer measured 5,500 passes a second at a
-                # 1 ms poll).
-                await asyncio.sleep(
-                    max(self._poll_seconds * 0.25, self._poll_seconds - elapsed)
-                )
+                # Never less than 20 ms: a pass that takes longer than
+                # the poll must not turn the loop into a spin. The first
+                # floor was a quarter of the interval, which at a 1 ms
+                # test poll is a quarter of a millisecond -- 6,000 passes
+                # a second, measured. An absolute floor, not a fraction
+                # of the thing being floored -- and ABOVE THE EVENT LOOP'S
+                # CLOCK RESOLUTION, which on Windows is 15.6 ms: a timer
+                # due inside that resolution is treated as already due
+                # whenever the loop has anything else ready, and the
+                # snapshot threads' deliveries keep it ready, so a 10 ms
+                # floor measured 0.17 ms.
+                await asyncio.sleep(max(0.02, self._poll_seconds - elapsed))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -676,11 +694,36 @@ class ResultHub:
           It is discarded and the target dispatched afresh.
         """
         target = subscription.target
+        # The same sweep the pass runs, because a target nobody has
+        # managed to subscribe to has no channel, no poll loop and so no
+        # pass: without this, wedged futures minted by failed subscribes
+        # were never abandoned at all.
+        abandoned_here = False
+        for other in list(self._in_flight):
+            other_future = self._in_flight[other]
+            if not other_future.done() and self._past_abandonment(other):
+                self._abandon(other)
+                if other == target:
+                    abandoned_here = True
         future = self._in_flight.get(target)
         if future is not None and future.done():
+            # DONE AND UNCOLLECTED. Stale if it is OLD -- a reviewer
+            # measured 4.0 s, behind the revision on disk, computed for a
+            # phone that had dropped mid-pass -- and the freshest state
+            # there is if it is YOUNG: a 2.1 s read that finished 0.4 s
+            # ago, for a phone whose socket stalled at 2 s and came back
+            # to re-subscribe. Discarding that one meant dispatching
+            # afresh, stalling again, and never subscribing: 0 of 8 on a
+            # real socket at a healthy 2.1 s read. The line is the
+            # heartbeat, which is how old a snapshot the channel itself
+            # is content to send.
+            age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
+            if age <= max(self._poll_seconds, self._heartbeat_seconds):
+                self._forget(target)
+                self._abandon_streak.pop(target, None)
+                return future.result()
             self._forget(target)
             future = None
-        abandoned_here = False
         if future is not None and self._past_abandonment(target):
             # A subscribe is a chance to try the target afresh, and it
             # was the only chance: once the escalation has failed every
@@ -694,44 +737,80 @@ class ResultHub:
             future = None
             abandoned_here = True
         if future is None:
-            future = self._dispatch(target, subscription, {subscription})
+            if (
+                target not in self._in_flight
+                and len(self._in_flight) >= MAX_IN_FLIGHT_TARGETS
+            ):
+                raise TooManyTargetsInFlight(
+                    f"{len(self._in_flight)} results are already being "
+                    f"computed; not starting one for {target}"
+                )
+            future = self._dispatch(
+                target, subscription, self._watchers_of(target) | {subscription}
+            )
         else:
             self._watchers_at_dispatch.setdefault(target, set()).add(subscription)
         age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
-        # THE INLINE WAIT IS BOUNDED BY THE PHONE'S OWN STALL BOUND, not by
-        # the snapshot deadline. This runs in the connection's message
-        # loop; while it waits, no frame on that socket is answered, and
-        # iOS replaces a socket that has stalled 2 s. Waiting the full
-        # 10 s here therefore cost a stalled socket per attempt, and the
-        # abandon-then-dispatch above had reset the age to zero and so
-        # re-armed the full wait every cap interval: a reviewer measured
-        # 25 s of every 30 blocked. A subscribe that cannot be answered
-        # inside `SUBSCRIBE_INLINE_WAIT_SECONDS` is answered
-        # `snapshot_failed` and the fresh thread serves the next one --
-        # and a subscribe that itself abandoned a wedge does not wait at
-        # all, since it knows what it is waiting on.
-        remaining = min(
-            timeout, SUBSCRIBE_INLINE_WAIT_SECONDS, SNAPSHOT_TIMEOUT_SECONDS - age
-        )
+        # THE INLINE WAIT IS THE SNAPSHOT DEADLINE, and a round of this
+        # campaign that capped it lower is why this comment exists. This
+        # runs in the connection's message loop; while it waits, no frame
+        # on that socket is answered, and iOS replaces a socket that has
+        # stalled 2 s. That looks like a reason to answer within 2 s --
+        # and a 1.5 s cap was shipped, measured, and reverted: on the
+        # phone, `snapshot_failed` is TERMINAL (`.failed`, no retry; only
+        # `channel_failed` is retried), so every healthy read slower than
+        # the cap left the World Builder screen dead for the life of the
+        # connection -- 0 of 8 subscribes at a 2.1 s read, which is this
+        # file's own number for a manifest read under a disk fault. The
+        # stall, by contrast, self-heals: the phone replaces the socket,
+        # the re-subscribe joins the same future, and is answered when it
+        # lands. So the wait is the deadline; what must not happen is
+        # waiting it MORE than once per fault, and that is the rule
+        # below: a subscribe that itself abandoned a wedge does not wait
+        # on its own replacement at all (the abandon reset the age, and
+        # the first version then waited the full deadline again at every
+        # cap interval -- 25 s of every 30 blocked, measured).
+        waited = 0.0
+        remaining = min(timeout, SNAPSHOT_TIMEOUT_SECONDS - age)
         if abandoned_here:
             remaining = 0.0
         if remaining > 0:
+            started = self._age_clock()
             await asyncio.wait({future}, timeout=remaining)
+            waited = self._age_clock() - started
         if not future.done():
             # This subscription will not be registered: take it back out
             # of the watcher set, or every failed subscribe to a wedged
             # target leaves a dead `Subscription` there for as long as
-            # the future lives (a reviewer counted 34 in 100 s).
+            # the future lives (a reviewer counted 34 in 100 s). Only
+            # THIS one: the set was seeded with the target's live
+            # watchers, and the first version clobbered it with just this
+            # subscription and then emptied it here, so the snapshot a
+            # registered watcher was waiting for was discarded as
+            # "computed for nobody".
             watchers = self._watchers_at_dispatch.get(target)
             if watchers is not None:
                 watchers.discard(subscription)
-            raise TimeoutError(
-                f"the first snapshot for {target} is still running after "
-                f"{max(age, 0.0) + max(remaining, 0.0):.0f}s"
-            )
+            if abandoned_here:
+                detail = "was abandoned and dispatched afresh; not waited on"
+            elif remaining <= 0:
+                detail = f"is {age:.0f}s old, past the {SNAPSHOT_TIMEOUT_SECONDS:.0f}s deadline"
+            else:
+                detail = f"is still running after {waited:.1f}s"
+            raise TimeoutError(f"the first snapshot for {target} {detail}")
         if self._in_flight.get(target) is future:
             self._forget(target)
+        self._abandon_streak.pop(target, None)
         return future.result()
+
+    def _watchers_of(self, target) -> set:
+        """Every registered subscription watching `target`, across channels."""
+        watchers: set = set()
+        for channel in self._channels:
+            for subscription in channel._subscriptions.values():
+                if subscription.target == target:
+                    watchers.add(subscription)
+        return watchers
 
     def _abandonment_cap(self, target) -> float:
         """How long this target's snapshot may run before it is abandoned.
@@ -962,6 +1041,12 @@ class ResultHub:
                 target: count
                 for target, count in self._failures.items()
                 if target in targets
+            }
+        if self._abandon_streak:
+            self._abandon_streak = {
+                target: streak
+                for target, streak in self._abandon_streak.items()
+                if target in targets or target in self._in_flight
             }
 
         # ONE SNAPSHOT IN FLIGHT PER TARGET, ALL TARGETS AT ONCE, EACH

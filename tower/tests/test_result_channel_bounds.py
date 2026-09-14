@@ -1104,7 +1104,8 @@ def test_a_snapshot_finished_before_a_subscribe_is_not_its_first_snapshot():
             gate.wait(timeout=30)     # rev-0 outlives the phone that asked
         return _snapshot(marker)
 
-    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    clock = _fake_clock()
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0, age_clock=clock)
 
     def _sub(n):
         return Subscription(
@@ -1129,6 +1130,7 @@ def test_a_snapshot_finished_before_a_subscribe_is_not_its_first_snapshot():
             pass
         gate.set()
         await asyncio.sleep(0.1)         # rev-0 finishes, for nobody
+        clock.advance(4.0)               # ... and sits there, 4.0 s old (the reviewer's number)
         # The phone is back.
         snapshot = await hub.first_snapshot(_sub(2), timeout=1.0)
         return snapshot.revision
@@ -1698,44 +1700,6 @@ def test_a_subscribe_that_abandoned_a_wedge_does_not_wait_on_its_replacement(mon
     assert waited < 0.2, f"the abandoning subscribe waited {waited:.2f}s on its own replacement"
 
 
-def test_the_inline_wait_is_bounded_below_the_phones_stall(monkeypatch):
-    """A first snapshot that is not ready inside `SUBSCRIBE_INLINE_WAIT_SECONDS`
-    is answered `snapshot_failed`, however long the deadline is.
-
-    This wait blocks the connection's message loop, and iOS replaces a
-    socket that has stalled 2 s: a 10 s inline wait cost a replaced
-    socket per attempt, and the frames behind it went unanswered.
-    """
-    import threading
-    import time as _time
-
-    from tower.results import publisher as publisher_module
-
-    monkeypatch.setattr(publisher_module, "SUBSCRIBE_INLINE_WAIT_SECONDS", 0.2)
-    gate = threading.Event()
-
-    def _snapshot_for(cartridge, result_type, world_id, session_id):
-        gate.wait(timeout=30)
-        return _snapshot("late")
-
-    hub = ResultHub(_snapshot_for, clock=_time.monotonic)
-
-    async def _run():
-        started = _time.monotonic()
-        with pytest.raises(TimeoutError):
-            await hub.first_snapshot(Subscription(
-                subscription_id="sub-1", cartridge="world_builder",
-                result_type="status", contract="c", world_id="w",
-                session_id=None, cursor_status=None,
-            ), timeout=10.0)
-        waited = _time.monotonic() - started
-        gate.set()
-        return waited
-
-    waited = asyncio.run(_run())
-    assert 0.15 <= waited < 1.0, f"the inline wait was {waited:.2f}s"
-
-
 def test_ages_are_measured_on_the_age_clock_not_the_wall_clock(monkeypatch):
     """A wall-clock step must not re-poison or mass-fail anything.
 
@@ -1815,10 +1779,10 @@ def test_abandonment_backs_off_for_a_read_that_stays_wedged(monkeypatch):
         never.set()
 
     asyncio.run(_run())
-    # Caps of 3, 6, 12, 24, 48, 96, 192 s (cumulative 381 s) plus the
-    # first dispatch: eight entries over 600 s, against twenty at a flat
-    # 30 s.
-    assert 5 <= entered["n"] <= 9, f"the producer was entered {entered['n']} times in 600 s"
+    # Caps of 3, 6, 12, 24, 48, 96, then 120, 120, 120 s (the ceiling;
+    # cumulative 549 s) plus the first dispatch: about ten entries over
+    # 600 s, against twenty at a flat 30 s.
+    assert 6 <= entered["n"] <= 12, f"the producer was entered {entered['n']} times in 600 s"
 
 
 def test_a_carried_over_snapshot_is_replaced_in_the_pass_that_collects_it():
@@ -1872,3 +1836,300 @@ def test_a_carried_over_snapshot_is_replaced_in_the_pass_that_collects_it():
 
     assert asyncio.run(_run()), "the collecting pass left the target idle until the next one"
     assert entered["n"] >= 2
+    assert [m["payload"]["revision_marker"] for m in delivered][:1] == ["rev-1"], (
+        "the carried-over snapshot was replaced but its delivery was lost"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 25: what the sixth publisher reviewer and the fourth rehearsal found.
+# ---------------------------------------------------------------------------
+
+
+def test_a_slow_but_healthy_first_snapshot_is_answered_not_failed():
+    """A first snapshot slower than the phone's stall bound is still ANSWERED.
+
+    Round 24 capped the inline wait at 1.5 s. On the phone `snapshot_failed`
+    is terminal -- `.failed`, no retry; only `channel_failed` is retried --
+    so every healthy read slower than the cap left the World Builder
+    screen dead for the life of the connection: 0 of 8 subscribes on a
+    real socket at a 2.1 s read. The stall self-heals instead (the phone
+    replaces the socket and the re-subscribe joins the same future). The
+    wait is the deadline; a 1.7 s read is answered.
+    """
+    import time as _time
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        _time.sleep(1.7)
+        return _snapshot("slow-but-fine")
+
+    hub = ResultHub(_snapshot_for, clock=_time.monotonic)
+
+    async def _run():
+        return await hub.first_snapshot(Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        ), timeout=10.0)
+
+    assert asyncio.run(_run()).revision == "slow-but-fine"
+
+
+def test_a_young_uncollected_snapshot_is_handed_over_not_discarded():
+    """A done future younger than the heartbeat is the freshest state there is.
+
+    The phone's socket stalled at 2 s of a 2.1 s read and it came back to
+    re-subscribe; the read had finished 0.4 s earlier, uncollected.
+    Discarding it as "stale" dispatched afresh, stalled again, and never
+    subscribed. Old means older than the heartbeat (a reviewer's 4.0 s
+    case); this one is handed over.
+    """
+    produced = []
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        produced.append(len(produced))
+        return _snapshot(f"rev-{len(produced) - 1}")
+
+    clock = _fake_clock()
+    hub = ResultHub(_snapshot_for, clock=clock, age_clock=clock, heartbeat_seconds=2.0)
+
+    def _sub():
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        target = ("world_builder", "status", "w", None)
+        future = hub._dispatch(target, _sub(), set())     # the dropped phone's read
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            if future.done():
+                break
+        clock.advance(0.4)                                # finished 0.4 s ago
+        young = (await hub.first_snapshot(_sub(), timeout=1.0)).revision
+        future = hub._dispatch(target, _sub(), set())
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            if future.done():
+                break
+        clock.advance(4.0)                                # finished 4.0 s ago
+        old = (await hub.first_snapshot(_sub(), timeout=1.0)).revision
+        return young, old
+
+    young, old = asyncio.run(_run())
+    assert young == "rev-0", "a 0.4 s-old snapshot was discarded and recomputed"
+    assert old == "rev-2", "a 4.0 s-old snapshot was handed over as fresh"
+
+
+def test_recovery_after_a_fault_clears_is_bounded():
+    """A target is never refused for more than `SNAPSHOT_ABANDON_MAX_SECONDS`
+    after its read recovers, whatever the streak.
+
+    Recovery needs an abandonment, and the cap doubled to 600 s: a
+    reviewer measured 592 s of silent refusal after a fault cleared.
+    """
+    from tower.results import publisher as publisher_module
+
+    hub = ResultHub(lambda *args: _snapshot("x"), clock=lambda: 0.0)
+    target = ("world_builder", "status", "w", None)
+    hub._abandon_streak[target] = 9
+    assert hub._abandonment_cap(target) <= 120.0
+    assert publisher_module.SNAPSHOT_ABANDON_MAX_SECONDS <= 120.0
+
+
+def test_distinct_targets_cannot_mint_unbounded_threads():
+    """A client choosing world_ids cannot mint a wedged thread per choice.
+
+    A reviewer subscribed 400 distinct world_ids against a wedged read
+    and got 400 live threads in 0.3 s -- and, because a failed subscribe
+    registers nothing and so starts no poll loop, nothing ever swept them.
+    """
+    import threading
+
+    from tower.results import publisher as publisher_module
+    from tower.results.publisher import TooManyTargetsInFlight
+
+    never = threading.Event()
+    entered = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered["n"] += 1
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+
+    async def _run():
+        refused = 0
+        for n in range(400):
+            try:
+                await hub.first_snapshot(Subscription(
+                    subscription_id="sub-1", cartridge="world_builder",
+                    result_type="status", contract="c", world_id=f"w{n}",
+                    session_id=None, cursor_status=None,
+                ), timeout=0.001)
+            except TooManyTargetsInFlight:
+                refused += 1
+            except TimeoutError:
+                pass
+        in_flight = len(hub._in_flight)
+        never.set()
+        return refused, in_flight
+
+    refused, in_flight = asyncio.run(_run())
+    limit = publisher_module.MAX_IN_FLIGHT_TARGETS
+    assert in_flight <= limit, f"{in_flight} snapshots in flight for one hostile client"
+    assert entered["n"] <= limit
+    assert refused == 400 - limit
+
+
+def test_wedged_futures_minted_by_failed_subscribes_are_swept_by_the_next_subscribe(monkeypatch):
+    """The abandon sweep must not depend on a poll loop that a failed
+    subscribe never started."""
+    import threading
+
+    from tower.results import publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "SNAPSHOT_TIMEOUT_SECONDS", 1.0)
+    never = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    clock = _fake_clock()
+    hub = ResultHub(_snapshot_for, clock=clock, age_clock=clock)
+
+    def _sub(world_id):
+        return Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id=world_id,
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(_sub("first"), timeout=0.01)
+        first = ("world_builder", "status", "first", None)
+        assert first in hub._in_flight
+        clock.advance(1.0 * (publisher_module.SNAPSHOT_ABANDON_MULTIPLIER + 1))
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(_sub("second"), timeout=0.01)
+        swept = first not in hub._in_flight
+        never.set()
+        return swept
+
+    assert asyncio.run(_run()), "a wedge nobody could subscribe to was never abandoned"
+
+
+def test_a_failed_subscribe_does_not_erase_a_registered_watcher():
+    """The watcher set is seeded with the target's live watchers, and a
+    failed subscribe removes only itself.
+
+    `_dispatch` clobbered the set with just the new subscription; the
+    failure path then emptied it, and the pass that met the finished
+    future discarded it as "computed for nobody" while a registered
+    watcher waited -- an extra full read cycle, measured.
+    """
+    import threading
+
+    gate = threading.Event()
+    produced = []
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        produced.append(len(produced))
+        gate.wait(timeout=30)
+        return _snapshot(f"rev-{len(produced) - 1}")
+
+    hub = ResultHub(_snapshot_for, clock=lambda: 0.0)
+    target = ("world_builder", "status", "w", None)
+    delivered = []
+
+    async def _capture(payload):
+        delivered.append(payload)
+
+    def _sub(subscription_id):
+        return Subscription(
+            subscription_id=subscription_id, cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        )
+
+    async def _run():
+        watcher = ConnectionChannel(hub, _capture, lambda: 0.0)
+        registered = _sub("sub-A")
+        await watcher.add(registered)
+        # The target is free (no pass has run yet); a second phone's
+        # subscribe dispatches it and times out.
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(_sub("sub-B"), timeout=0.05)
+        still_watching = registered in hub._watchers_at_dispatch.get(target, set())
+        gate.set()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if delivered:
+                break
+        await watcher.close()
+        return still_watching
+
+    assert asyncio.run(_run()), "the registered watcher was erased by a failed subscribe"
+    assert [m["payload"]["revision_marker"] for m in delivered][:1] == ["rev-0"], (
+        "the snapshot the registered watcher was waiting for was discarded"
+    )
+
+
+def test_the_loop_sleeps_at_least_ten_milliseconds():
+    """A 1 ms poll is a 10 ms loop, not a spin (6,000 passes a second, measured)."""
+    import time as _time
+
+    entered = {"n": 0}
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        entered["n"] += 1
+        return _snapshot("x")
+
+    hub = ResultHub(_snapshot_for, clock=_time.monotonic, poll_seconds=0.001)
+
+    async def _run():
+        channel = ConnectionChannel(hub, lambda payload: None, _time.monotonic)
+        await channel.add(Subscription(
+            subscription_id="sub-1", cartridge="world_builder",
+            result_type="status", contract="c", world_id="w",
+            session_id=None, cursor_status=None,
+        ))
+        await asyncio.sleep(0.3)
+        await channel.close()
+
+    asyncio.run(_run())
+    assert entered["n"] <= 60, f"{entered['n']} passes in 0.3 s at a 1 ms poll"
+
+
+def test_ages_default_to_the_monotonic_clock():
+    """`build_hub` passes only `clock`; the durations must not follow it."""
+    import threading
+
+    never = threading.Event()
+
+    def _snapshot_for(cartridge, result_type, world_id, session_id):
+        never.wait(timeout=60)
+        return _snapshot("never")
+
+    wall = _fake_clock()
+    hub = ResultHub(_snapshot_for, clock=wall)
+    target = ("world_builder", "status", "w", None)
+
+    async def _run():
+        with pytest.raises(TimeoutError):
+            await hub.first_snapshot(Subscription(
+                subscription_id="sub-1", cartridge="world_builder",
+                result_type="status", contract="c", world_id="w",
+                session_id=None, cursor_status=None,
+            ), timeout=0.01)
+        wall.advance(10_000.0)
+        past = hub._past_abandonment(target)
+        never.set()
+        return past
+
+    assert not asyncio.run(_run()), "a wall-clock jump aged a snapshot past its cap"
