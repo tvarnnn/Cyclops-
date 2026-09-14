@@ -324,7 +324,7 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # wedged read plus iOS's 2 s stall timeout minted one thread per
         # reconnect and exhausted the executor in 60 s.
         snapshot = await hub.first_snapshot(
-            subscription, timeout=SNAPSHOT_TIMEOUT_SECONDS
+            subscription, timeout=SNAPSHOT_TIMEOUT_SECONDS, owner=channel
         )
     except Exception as exc:
         # A subscribe that cannot produce its first snapshot must SAY so.

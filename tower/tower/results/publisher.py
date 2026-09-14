@@ -117,7 +117,15 @@ SNAPSHOT_ABANDON_MAX_SECONDS = 120.0
 # of them ever swept because a failed subscribe registers nothing and so
 # starts no poll loop. Eight subscriptions per connection, a handful of
 # connections: 64 is generous for a phone and a wall for anything else.
-MAX_IN_FLIGHT_TARGETS = 64
+MAX_IN_FLIGHT_TARGETS = 256
+# ...and per CONNECTION, which is the bound that matters: the global one
+# above was 64, and a reviewer showed that ~21 hostile connections holding
+# 64 wedged targets refused every legitimate phone's subscribe, on every
+# target, with a reason the phone treats as terminal. A connection may
+# hold `MAX_SUBSCRIPTIONS_PER_CONNECTION` subscriptions; it may have that
+# many snapshots computing at once, and not more. The global cap is a
+# last wall no legitimate fleet reaches (32 phones at 8 each).
+MAX_IN_FLIGHT_PER_CONNECTION = 8
 
 # Per connection. A client with more than this many open subscriptions is
 # either confused or hostile; either way the answer is a refusal, not
@@ -530,6 +538,12 @@ class ResultHub:
         # How many times in a row a target's snapshot has been abandoned,
         # for the backoff in `_past_abandonment`. Cleared on a delivery.
         self._abandon_streak: dict = {}
+        # When each in-flight snapshot COMPLETED (age clock), for the
+        # young-result handover in `first_snapshot`. See there.
+        self._completed_at: dict = {}
+        # Which connection dispatched each in-flight snapshot, for the
+        # per-connection cap. `None` for the poll loop's own dispatches.
+        self._owner_of: dict = {}
         # The subscription ids watching each target when its in-flight
         # snapshot was dispatched. A result whose watchers have ALL gone
         # was computed for nobody who is still here. See the discard rule
@@ -655,7 +669,7 @@ class ResultHub:
                         "reader failure"
                     )
 
-    async def first_snapshot(self, subscription, *, timeout: float):
+    async def first_snapshot(self, subscription, *, timeout: float, owner=None):
         """The snapshot a new subscription is answered with, WITHOUT a new thread
         if one is already computing it.
 
@@ -717,13 +731,37 @@ class ResultHub:
             # real socket at a healthy 2.1 s read. The line is the
             # heartbeat, which is how old a snapshot the channel itself
             # is content to send.
-            age = self._age_clock() - self._dispatched_at.get(target, self._age_clock())
-            if age <= max(self._poll_seconds, self._heartbeat_seconds):
+            #
+            # AGE SINCE IT COMPLETED, NOT SINCE IT WAS DISPATCHED. The
+            # first version measured from dispatch, so a 2.1 s read that
+            # finished 0.4 s ago was 2.5 s "old" -- over the line -- and
+            # the handover written for exactly that phone could never
+            # fire: 0 of 10 sockets at any read between 2.0 and 2.4 s,
+            # measured, with the phone's screen on a spinner that never
+            # ends. A snapshot's staleness is how long it has sat, not
+            # how long it took.
+            #
+            # And handed over THROUGH THE CHANNELS, not around them: the
+            # registered watchers of this target were waiting for this
+            # very result, and returning it to the subscriber alone cost
+            # each of them a poll interval (a reviewer watched `r2` go to
+            # the newcomer and never to the watcher). A cached exception
+            # is counted like any other failure and falls through to a
+            # fresh dispatch rather than being re-raised for the length
+            # of the heartbeat.
+            sat_for = self._age_clock() - self._completed_at.get(
+                target, self._dispatched_at.get(target, self._age_clock())
+            )
+            if sat_for <= max(self._poll_seconds, self._heartbeat_seconds):
+                if future.exception() is None:
+                    self._collect(target, future, self._clock())
+                    self._abandon_streak.pop(target, None)
+                    return future.result()
+                self._collect(target, future, self._clock())
+                future = None
+            else:
                 self._forget(target)
-                self._abandon_streak.pop(target, None)
-                return future.result()
-            self._forget(target)
-            future = None
+                future = None
         if future is not None and self._past_abandonment(target):
             # A subscribe is a chance to try the target afresh, and it
             # was the only chance: once the escalation has failed every
@@ -737,16 +775,25 @@ class ResultHub:
             future = None
             abandoned_here = True
         if future is None:
-            if (
-                target not in self._in_flight
-                and len(self._in_flight) >= MAX_IN_FLIGHT_TARGETS
-            ):
+            mine = (
+                sum(1 for holder in self._owner_of.values() if holder is owner)
+                if owner is not None else 0
+            )
+            if mine >= MAX_IN_FLIGHT_PER_CONNECTION:
                 raise TooManyTargetsInFlight(
-                    f"{len(self._in_flight)} results are already being "
-                    f"computed; not starting one for {target}"
+                    f"this connection already has {mine} results being "
+                    f"computed; not starting one for {target} until one "
+                    f"of them finishes"
+                )
+            if len(self._in_flight) >= MAX_IN_FLIGHT_TARGETS:
+                raise TooManyTargetsInFlight(
+                    f"the Tower already has {len(self._in_flight)} results "
+                    f"being computed; not starting one for {target} until "
+                    f"one of them finishes"
                 )
             future = self._dispatch(
-                target, subscription, self._watchers_of(target) | {subscription}
+                target, subscription,
+                self._watchers_of(target) | {subscription}, owner,
             )
         else:
             self._watchers_at_dispatch.setdefault(target, set()).add(subscription)
@@ -776,7 +823,19 @@ class ResultHub:
             remaining = 0.0
         if remaining > 0:
             started = self._age_clock()
-            await asyncio.wait({future}, timeout=remaining)
+            try:
+                await asyncio.wait({future}, timeout=remaining)
+            except BaseException:
+                # The phone replaced its socket mid-wait -- the ordinary
+                # case for a read slower than its 2 s stall bound -- and
+                # this subscription will never be registered. Take it
+                # back out of the watcher set here too; the first version
+                # did so only on the timeout path, and a reviewer counted
+                # four dead subscriptions retained per wedge.
+                watchers = self._watchers_at_dispatch.get(target)
+                if watchers is not None:
+                    watchers.discard(subscription)
+                raise
             waited = self._age_clock() - started
         if not future.done():
             # This subscription will not be registered: take it back out
@@ -850,7 +909,7 @@ class ResultHub:
             )
         self._forget(target)
 
-    def _dispatch(self, target, sample, watchers):
+    def _dispatch(self, target, sample, watchers, owner=None):
         """Start ONE snapshot for `target` on a thread of its own, and record it.
 
         A plain daemon thread, not `asyncio.to_thread`, for two reasons a
@@ -872,6 +931,8 @@ class ResultHub:
         def deliver(result, error):
             if future.cancelled():
                 return
+            if self._in_flight.get(target) is future:
+                self._completed_at[target] = self._age_clock()
             if error is not None:
                 future.set_exception(error)
             else:
@@ -910,6 +971,7 @@ class ResultHub:
         self._in_flight[target] = future
         self._dispatched_at[target] = self._age_clock()
         self._watchers_at_dispatch[target] = set(watchers)
+        self._owner_of[target] = owner
         return future
 
     def _forget(self, target) -> None:
@@ -918,6 +980,8 @@ class ResultHub:
         future = self._in_flight.pop(target, None)
         self._dispatched_at.pop(target, None)
         self._watchers_at_dispatch.pop(target, None)
+        self._completed_at.pop(target, None)
+        self._owner_of.pop(target, None)
         if future is not None and future.done() and not future.cancelled():
             future.exception()
 
