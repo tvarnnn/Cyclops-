@@ -94,8 +94,25 @@ nonisolated enum WorldListingPresentation {
             switch state {
             case .receiving: return "Building"
             case .finalizing: return "Finishing"
-            case .complete: return "Complete"
-            case .interrupted: return "Interrupted"
+            case .complete:
+                // The same rule `WorldStage.stage` applies to `.finalized`:
+                // a record whose final solve was skipped, failed or
+                // unavailable is what the walk produced WITHOUT its last,
+                // best pass, and the canvas headlines it "Partial". The
+                // listing has no such state word — the Tower's lifecycle
+                // says `ready` regardless — but the row carries
+                // `finalization`, so the row can say what the canvas will.
+                // Before this, a Tower shut down mid-walk listed "Complete ·
+                // no final pass" over a canvas reading "Partial".
+                return WorldFinalSolve(word: session.finalization?.finalSolve).deniesAFinishedWorld
+                    ? "Partial" : "Complete"
+            case .interrupted:
+                // "Interrupted" with geometry opens onto a canvas headlined
+                // "Interrupted"; without geometry the canvas says "Needs
+                // retry" (`WorldStage.stage`, `.interrupted` arm), because
+                // there is nothing to open and walking again is the only
+                // thing that produces another one. The row says the same.
+                return session.hasGeometry ? "Interrupted" : "Needs retry"
             case .unbuilt: return "No geometry"
             default: return state.rawValue
             }
@@ -107,6 +124,25 @@ nonisolated enum WorldListingPresentation {
         if session.isStillOpen { return "still open" }
         if !session.hasGeometry { return "no geometry" }
         return nil
+    }
+
+    /// The caption under a row that cannot be opened, or `nil` for one that
+    /// can. Says which of the three "nothing to open" situations this is,
+    /// because the Tower tells them apart on purpose: a walk still open may
+    /// yet build; a walk that built and whose output is gone is
+    /// `interrupted`; a walk that built nothing is `unbuilt`. The first
+    /// version of this caption said "No geometry was built for this walk"
+    /// under every one of them — including the row whose own badge said a
+    /// build had run.
+    static func noGeometryCaption(for session: WorldListingSession) -> String? {
+        guard !session.hasGeometry else { return nil }
+        if session.isStillOpen {
+            return "No geometry yet. The Tower may still build it for this walk."
+        }
+        if session.state == .interrupted {
+            return "This walk's geometry is no longer on the Tower, so there is nothing to open."
+        }
+        return "No geometry was built for this walk, so there is nothing to open."
     }
 
     /// What to call one session on a row: when the walk started, in the

@@ -266,7 +266,18 @@ struct WorldCanvasView: View {
             diagnostics
 
         case .failed(let failure):
-            headline("World building failed", systemImage: "exclamationmark.triangle.fill")
+            // Two different claims share this state. A `.transport` or
+            // `.timedOut` failure is about the *channel* — the Tower did not
+            // answer this screen's subscription — and says nothing about
+            // whether a world is being built; headlining it "World building
+            // failed" told a wearer whose walk was fine that it was not.
+            // Everything else is the Tower's own report of a failure.
+            switch failure.kind {
+            case .transport, .timedOut:
+                headline("World Builder is not reporting", systemImage: "antenna.radiowaves.left.and.right.slash")
+            case .notSupported, .towerReportedFailure, .undecodableResponse:
+                headline("World building failed", systemImage: "exclamationmark.triangle.fill")
+            }
             detailText(failure.message)
         }
     }

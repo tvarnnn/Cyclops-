@@ -96,6 +96,10 @@ struct WorldPickerView: View {
                 WorldRenderScene(target: target, title: openedTitle, note: openedNote)
             }
             .task { await world.loadWorlds() }
+            // A pull, so a "Finishing" row can become "Complete" without
+            // closing and reopening the sheet — which the caption under a
+            // still-open row promises "a refresh of this list will show".
+            .refreshable { await world.loadWorlds() }
         }
     }
 
@@ -103,8 +107,7 @@ struct WorldPickerView: View {
     /// than from the live snapshot, because the pin's first status report has
     /// usually not arrived by the time this is drawn.
     private var openedTitle: String? {
-        guard let opened else { return nil }
-        return openedEntry.map { WorldListingPresentation.title(for: $0) }
+        openedEntry.map { WorldListingPresentation.title(for: $0) }
     }
 
     /// What the pushed screen says about the world under its caption, or `nil`.
@@ -181,11 +184,20 @@ struct WorldPickerView: View {
     /// picks the newest session with geometry, finds none, and 404s. Tapping it
     /// could only ever land on the Tower's absence prose under a Try again that
     /// this screen cannot make succeed.
+    ///
+    /// **The session is named, not left to the Tower.** With `sessionID: nil`
+    /// the two halves of what opens were resolved by two different rules:
+    /// the render route draws the newest session WITH geometry, while the
+    /// status pin behind it resolves the world's latest session regardless
+    /// — so on a world whose newest walk found nothing, the 3D view drew
+    /// one walk and the panel and Diagnostics under it described another.
+    /// Naming the newest session with geometry here — the same choice the
+    /// render route makes, from the same listing — pins both to one walk.
     @ViewBuilder
     private func worldRow(_ entry: WorldListingEntry) -> some View {
-        if entry.sessions.contains(where: \.hasGeometry) {
+        if let drawable = entry.sessions.last(where: \.hasGeometry) {
             Button {
-                open(worldID: entry.worldID, sessionID: nil)
+                open(worldID: entry.worldID, sessionID: drawable.sessionID)
             } label: {
                 HStack {
                     worldLabel(entry)
@@ -301,9 +313,7 @@ struct WorldPickerView: View {
         } else {
             VStack(alignment: .leading, spacing: 2) {
                 sessionLabel(session)
-                Text(session.isStillOpen
-                     ? "No geometry yet. The Tower may still build it for this walk."
-                     : "No geometry was built for this walk, so there is nothing to open.")
+                Text(WorldListingPresentation.noGeometryCaption(for: session) ?? "")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

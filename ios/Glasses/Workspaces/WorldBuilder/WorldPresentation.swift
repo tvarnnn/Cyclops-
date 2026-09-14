@@ -521,7 +521,16 @@ enum WorldStage: Equatable {
             // `.solved`, `.notReported` and any word this build has not heard
             // of. A record that says nothing about the final solve is an older
             // record, and the world it describes was stored as finished.
-            return evidence?.hasGeometry == true || solve == .solved ? .saved : .needsRetry
+            //
+            // `solve == .solved` stands in for the figures only when there
+            // ARE no figures — an older record that carries none. A record
+            // that carries zeros is not silent: the Tower counted and found
+            // nothing, and a solve reported over an empty build (unreachable
+            // by every path read, and left on record rather than trusted)
+            // must not turn that into "Saved".
+            let figuresAbsent = evidence?.elements == nil && evidence?.poses == nil
+            if evidence?.hasGeometry == true { return .saved }
+            return solve == .solved && figuresAbsent ? .saved : .needsRetry
         case .interrupted:
             return evidence?.hasGeometry == true ? .interrupted : .needsRetry
         case .failed:
@@ -849,19 +858,30 @@ enum WorldReconstruction: Equatable {
             // something that was never coming. That is the permanent
             // "Finalizing" shape with a stronger sentence bolted on.
             //
-            // Same facts, no promise: what is missing is named, and the
-            // wearer is told the phone cannot see anyone working on it.
+            // Same facts, no promise: what is missing is named. Whether
+            // anything is running is NOT said here — the canvas states that
+            // beside the spinner from `buildInProgress`, and this stage is
+            // also reached with a live builder holding the lock over a walk
+            // that has no drawable geometry yet, where "nothing here can see
+            // a build running" would sit directly under a spinner saying
+            // "The Tower is finishing this world."
             return .partial(
                 target,
                 note: "The final pass has not landed for this world, and the "
-                    + "finished version is very different from this one. "
-                    + "Nothing here can see a build running, so it may need "
-                    + "to be built again."
+                    + "finished version is very different from this one."
             )
         case .partial:
+            // NOT `finalSolve.sentence`. The canvas draws that sentence on
+            // its own line directly under this card (`finalSolveNote`), so
+            // putting it here as well printed "The final pass was skipped,
+            // so this world is what the walk produced without it." twice in
+            // a row on the Mac gate's own screenshot — the same "one
+            // question per statement" rule the `.saved` arm above states.
+            // This note says what the ladder knows: the world offered is not
+            // the last word. The record's own account sits beside it.
             return .partial(
                 target,
-                note: finalSolve.sentence ?? "This world did not finish, so it is what the walk "
+                note: "This world did not finish, so it is what the walk "
                     + "produced without a final pass."
             )
         case .interrupted:

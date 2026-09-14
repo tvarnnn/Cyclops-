@@ -94,6 +94,15 @@ final class TowerSmokeUITests: XCTestCase {
     /// occluded still fails. The cost is a flat `settle` seconds on any call
     /// where the element really is below the fold, which raises this helper's
     /// worst case from `timeout` to `timeout + settle`.
+    ///
+    /// **And swipe back down for the second half of the budget.** The same
+    /// trap in the other direction, found at the 2026-09-14 Mac gate: the
+    /// saved-world test reveals Diagnostics (below the fold, several swipes
+    /// down the workspace) and then "Back to live", which sits in the banner
+    /// at the TOP. An up-only loop had scrolled it off the screen to find the
+    /// first and could never bring it back for the second. An element that
+    /// is absent, disabled or genuinely occluded still fails: both halves
+    /// require `exists && isHittable`, and nothing is asserted more weakly.
     @discardableResult
     private func reveal(_ element: XCUIElement, timeout: TimeInterval = 10,
                         settle: TimeInterval = 2) -> Bool {
@@ -102,10 +111,15 @@ final class TowerSmokeUITests: XCTestCase {
             if element.exists && element.isHittable { return true }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let halfway = Date().addingTimeInterval(timeout / 2)
+        while Date() < halfway {
             if element.exists && element.isHittable { return true }
             app.swipeUp(velocity: .slow)
+        }
+        let deadline = Date().addingTimeInterval(timeout / 2)
+        while Date() < deadline {
+            if element.exists && element.isHittable { return true }
+            app.swipeDown(velocity: .slow)
         }
         return element.exists && element.isHittable
     }
@@ -181,10 +195,17 @@ final class TowerSmokeUITests: XCTestCase {
         // A SESSION row, chosen by its badge, rather than the world's own row.
         // Opening a world without naming a session asks the Tower for its
         // `latest` selection, and if that session has no geometry there is no
-        // picture to show. "Complete" is the badge with something to draw.
-        let complete = app.staticTexts["Complete"].firstMatch
+        // picture to show. "Complete" and "Partial" are the two badges with
+        // something to draw: since 2026-09-14 a finished session whose final
+        // solve was skipped or failed is badged "Partial" on the row, the
+        // same word the canvas gives it, and it opens exactly like a
+        // "Complete" one. The Mac fixture's finished session records
+        // `final_solve: skipped`, so it is a "Partial" row.
+        let complete = app.staticTexts.containing(
+            NSPredicate(format: "label IN %@", ["Complete", "Partial"])
+        ).firstMatch
         try XCTSkipUnless(complete.waitForExistence(timeout: 15),
-                          "the Tower's list has no completed session to picture")
+                          "the Tower's list has no finished session to picture")
         XCTAssertTrue(reveal(complete))
 
         // The 3D world opens from the tap itself. No second control.

@@ -674,6 +674,18 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         /// The stored world this report offered instead of a live one, when
         /// its selection was `latest`; `nil` otherwise.
         var recentWorld: WorldRecentReference?
+
+        /// Whether a `latest` offer is the walk `followedWalk` remembers.
+        /// Both ids, not just the world: a world walked twice has one id and
+        /// two sessions, and only the session this screen watched is "the
+        /// walk you just finished".
+        func namesFollowedWalk(_ walk: (worldID: String, sessionID: String?)?) -> Bool {
+            guard let walk, let offered = recentWorld else { return false }
+            // A session id on BOTH sides, or no match: two absent ids are
+            // not the same walk, they are two payloads that did not say.
+            guard let followed = walk.sessionID, let offeredSession = offered.sessionID else { return false }
+            return offered.worldID == walk.worldID && offeredSession == followed
+        }
     }
 
     /// The last thing the Tower said, before the gate.
@@ -723,6 +735,49 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private var pendingSubscribeAcks = 0
     /// Bounds the wait for a `result_subscribed`. See `armSubscribeTimeout`.
     private var subscribeTimeout: Task<Void, Never>?
+    /// A short pause before asking again after `snapshot_failed`. See
+    /// `retryFirstSnapshot`.
+    private var firstSnapshotRetry: Task<Void, Never>?
+    /// The live walk this unpinned subscription was last shown following:
+    /// the world and session of the most recent `live`/`finalizing` report.
+    ///
+    /// ## Why the walk the wearer just finished is not "history"
+    ///
+    /// When a walk's finalization completes the Tower releases the lock,
+    /// nothing is live any more, and the unpinned subscription is answered
+    /// with `selection: latest` — the same world, now finished, offered as
+    /// the most recently updated one on disk. The ownership rule in
+    /// `publishLastReport` is right that history arrives by pinning, not on
+    /// the live subscription; but the world this screen watched go
+    /// "Mapping → Improving" for the last four minutes is not history to the
+    /// person holding the phone. Presenting it as `.idle` — headline "No
+    /// world yet", "Nothing is being built right now", a "Last saved world …
+    /// finished" line — read to a dress-rehearsal reviewer as the world
+    /// vanishing at the exact moment it succeeded, and the field procedure
+    /// had to be rewritten to say "that drop is the success signal; tap
+    /// Open".
+    ///
+    /// So a `latest` that names the walk this subscription was following is
+    /// presented as that walk's own state — `.finalized`, headline "Saved",
+    /// its geometry addressed — under the Live heading it has had all
+    /// along. Any other `latest` is history and stays `.idle` with an Open
+    /// action, exactly as before. Replaced by the next live report, so a
+    /// new walk cannot inherit an old one.
+    ///
+    /// **Kept across a socket drop, and bounded by time instead.** The
+    /// first version cleared this on every disconnect, and an adversarial
+    /// reviewer pointed out what that costs on the day: a WiFi drop during
+    /// the ~3-minute finalization whose reconnect lands after the lock is
+    /// released meets `latest` with no memory — the very idle-with-Open
+    /// shape this exists to prevent, on the walk it was written for. So the
+    /// memory survives the socket and expires instead: a walk followed
+    /// within `followedWalkLifetime` still counts; older than that, a
+    /// `latest` naming it is history. Long enough for the finalization and
+    /// a reconnect budget on either side of it; short enough that the app
+    /// opened the next morning does not put yesterday's walk under Live.
+    private var followedWalk: (worldID: String, sessionID: String?, at: Date)?
+    /// Internal so a test can shorten it to zero.
+    static var followedWalkLifetime: TimeInterval = 30 * 60
     /// Which subscribe attempt a timeout belongs to. Without it, a timeout
     /// armed for one attempt can fire into a later one that is legitimately
     /// still waiting.
@@ -826,6 +881,9 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // has nothing left to bound. Leaving it armed would report a
             // timeout against a connection the reconnect path already owns.
             disarmSubscribeTimeout()
+            firstSnapshotRetry?.cancel()
+            firstSnapshotRetry = nil
+            // `followedWalk` deliberately survives this; see its lifetime.
             return
         }
         resubscribesUsed = 0
@@ -919,6 +977,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         }
         isSubscribing = false
         disarmSubscribeTimeout()
+        firstSnapshotRetry?.cancel()
+        firstSnapshotRetry = nil
         lastReport = nil
         subscribeIfPossible()
     }
@@ -974,18 +1034,113 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         isSubscribing = false
         lastReport = nil
         sessionBinding = bindingWithNoReport
+        // Asked again, within the same budget `channel_failed` spends, before
+        // it becomes a failure. The Tower answers a subscribe only once it
+        // has a first snapshot, and its own inline deadline for that is the
+        // same ten seconds as this bound: a read that takes nine and a half
+        // — a manifest on a busy disk, mid-finalization — used to lose the
+        // screen to "World building failed" over a walk that was fine. The
+        // superseded ack, if it arrives late, is unsubscribed by the
+        // existing rule; the new one's own ack is what counts.
+        if resubscribesUsed < Self.resubscribeBudget {
+            resubscribesUsed += 1
+            // The attempt that timed out is written off, or the count would
+            // read the RETRY's own ack as the superseded one: the superseded
+            // rule in `handle(.subscribed)` is count-based, and the subscribe
+            // this bound was armed for may never have reached the wire at
+            // all (`sendResultMessage` swallows a failed send). A late ack
+            // for the written-off attempt is caught there by a different
+            // rule — it arrives after this client already holds a
+            // subscription — and is unsubscribed then.
+            pendingSubscribeAcks = max(0, pendingSubscribeAcks - 1)
+            subscribeIfPossible()
+            return
+        }
         state = .failed(
             CartridgeFailure(
                 kind: .timedOut,
                 message: """
                     The Tower did not acknowledge the World Builder subscription \
-                    within \(subscribeAckTimeout.components.seconds) seconds. \
+                    within \(subscribeAckTimeout.components.seconds) seconds, \
+                    \(Self.resubscribeBudget + 1) times on one connection. \
                     The connection is still open, so this is the Tower not \
-                    answering rather than the network being gone.
+                    answering rather than the network being gone. The walk \
+                    itself is unaffected: the builder runs on the Tower whether \
+                    or not this screen can read it.
                     """
             )
         )
     }
+
+    /// `snapshot_failed`: the Tower could not produce a FIRST snapshot for
+    /// this subscription — a status read still running at its deadline, or
+    /// this connection already having its quota of reads in flight. Nothing
+    /// was opened, and nothing about the walk is implied.
+    ///
+    /// ## Why this is retried, and what it used to do
+    ///
+    /// The Tower's result hub was rebuilt (2026-09-10 to -14) around a phone
+    /// that asks again: a read that finished after the deadline is handed
+    /// to the *next* subscribe while it is still young, and every one of
+    /// its rehearsals measured recovery "on the phone's re-subscribe". This
+    /// client never re-subscribed. It mapped the reply to
+    /// `.failed(.towerReportedFailure)`, which the canvas headlined
+    /// **"World building failed"** and the stage ladder rendered as *"Needs
+    /// retry — nothing usable came of this session … walking the space
+    /// again is what produces another one"* — a Tower-side read timeout
+    /// presented as a failed walk, with no way back short of a socket
+    /// replacement. Two reviewers of the 2026-09-14 Mac gate found it
+    /// independently.
+    ///
+    /// Bounded by the same budget `channel_failed` spends, so a Tower that
+    /// refuses every subscribe still becomes visible rather than a loop;
+    /// and paused for a moment first, so a wedged read is not hammered at
+    /// the socket's full rate. What is said when the budget is gone is the
+    /// truth about the *channel*, not about the world.
+    private func retryFirstSnapshot(after message: String) {
+        subscriptionID = nil
+        isSubscribing = false
+        disarmSubscribeTimeout()
+        guard resubscribesUsed < Self.resubscribeBudget else {
+            lastReport = nil
+            sessionBinding = bindingWithNoReport
+            state = .failed(
+                CartridgeFailure(
+                    kind: .transport,
+                    message: """
+                        The Tower could not produce a first World Builder report \
+                        \(Self.resubscribeBudget + 1) times on this connection \
+                        (\(message)). The walk itself is unaffected: the builder \
+                        runs on the Tower whether or not this screen can read it. \
+                        Reconnecting is what resolves it.
+                        """
+                )
+            )
+            return
+        }
+        resubscribesUsed += 1
+        lastReport = nil
+        sessionBinding = bindingWithNoReport
+        state = .awaitingFirstUpdate
+        let attempt = subscribeAttempt
+        firstSnapshotRetry?.cancel()
+        firstSnapshotRetry = Task { [weak self] in
+            try? await Task.sleep(for: Self.firstSnapshotRetryDelay)
+            guard !Task.isCancelled, let self else { return }
+            // A newer subscribe, an ack, or a lost socket has already moved
+            // things on; this retry belongs to none of them.
+            guard attempt == self.subscribeAttempt, self.subscriptionID == nil,
+                  !self.isSubscribing, self.tower.status == .online
+            else { return }
+            self.subscribeIfPossible()
+        }
+    }
+
+    /// Long enough that a read which finished just after its deadline is
+    /// still "young" when the re-ask arrives (the Tower hands such a result
+    /// over rather than recomputing it), short enough that a screen is not
+    /// left waiting for it. Internal so a test can shorten it.
+    static var firstSnapshotRetryDelay: Duration = .seconds(1)
 
     // MARK: Result channel
 
@@ -998,6 +1153,18 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
 
         case .subscribed(let ack):
             guard ack.cartridge == WorldBuilderResultContract.towerCartridge else { return }
+            if subscriptionID != nil, pendingSubscribeAcks == 0 {
+                // An ack for a subscribe this client stopped waiting for — a
+                // bound expired, the attempt was written off and retried, and
+                // the retry has already been answered. Both carried the same
+                // pin, so the one that landed first is the one kept; this one
+                // the Tower opened for nobody, so close it and drop whatever
+                // it queues. Without this branch the Tower would heartbeat
+                // two subscriptions for one screen.
+                tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
+                retiredSubscriptionIDs.insert(ack.subscriptionID)
+                return
+            }
             if pendingSubscribeAcks > 1 {
                 // An ack for a subscribe this client has already superseded
                 // with a newer one — a pin changed before the Tower answered.
@@ -1185,6 +1352,14 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         )
     }
 
+    /// `followedWalk`, unless it has expired.
+    private var currentFollowedWalk: (worldID: String, sessionID: String?)? {
+        guard let walk = followedWalk,
+              Date().timeIntervalSince(walk.at) <= Self.followedWalkLifetime
+        else { return nil }
+        return (walk.worldID, walk.sessionID)
+    }
+
     private func publishLastReport() {
         guard let report = lastReport else { return }
 
@@ -1204,7 +1379,11 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         // keeps the gate as the only judge, because a Tower that has not said
         // how it chose has not said the world is stored, either. A pinned
         // report is history by construction and the selection is not read.
-        if pinned == nil, report.selection.isHistoryOfferedAsLive {
+        //
+        // With one exception, argued at `followedWalk`: a `latest` that
+        // names the walk this subscription was just following is that
+        // walk, finished, and is presented as itself.
+        if pinned == nil, report.selection.isHistoryOfferedAsLive, !report.namesFollowedWalk(currentFollowedWalk) {
             recentWorld = report.recentWorld
             let binding = bindingWithNoReport
             sessionBinding = binding
@@ -1212,6 +1391,14 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             return
         }
         recentWorld = nil
+        if pinned == nil, !report.selection.isHistoryOfferedAsLive, let worldID = report.worldID {
+            switch report.state {
+            case .receiving, .finalizing:
+                followedWalk = (worldID, report.sessionID, Date())
+            case .unsupported, .idle, .awaitingFirstUpdate, .finalized, .interrupted, .failed:
+                break
+            }
+        }
 
         let binding = WorldSessionGate.binding(
             isCaptureBracketOpen: isCaptureBracketOpen,
@@ -1322,7 +1509,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
                         kind: .transport,
                         message: """
                             The Tower closed this world's result subscription \
-                            \(Self.resubscribeBudget) times on one connection. \
+                            \(Self.resubscribeBudget + 1) times on one connection. \
                             Reconnecting is what resolves it.
                             """
                     )
@@ -1350,7 +1537,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         case "contract_mismatch", "unknown_cartridge", "unknown_result_type":
             state = .failed(CartridgeFailure(kind: .notSupported, message: error.message))
         case "snapshot_failed":
-            state = .failed(CartridgeFailure(kind: .towerReportedFailure, message: error.message))
+            retryFirstSnapshot(after: error.message)
+            return
         default:
             state = .failed(CartridgeFailure(kind: .transport, message: error.message))
         }
