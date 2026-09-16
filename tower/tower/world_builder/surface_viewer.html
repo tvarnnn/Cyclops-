@@ -185,21 +185,35 @@ function worldUp(cams){
   return dot3(up, fallback) > Math.cos(35 * Math.PI / 180) ? up : fallback;
 }
 
-/* The opening camera: the recorded pose that sees the most surface at a
-   comfortable distance, and whose own position is inside the surface's box.
-   The middle of the walk is arbitrary; a pose outside the box (the wearer
-   stood where reconstruction later failed) opens on the back of a wall. */
+/* The opening camera: the recorded pose whose view takes in the MOST OF THE
+   RECONSTRUCTION, by surface area, among poses standing inside the surface's
+   box. Nothing else is scored.
+
+   It used to prefer the pose seeing the most surface "at a comfortable
+   distance" (a Gaussian around the median scene depth), which on the
+   canonical world opened at pose 14 of 198 looking down at the desk: the one
+   direction in which the reconstruction was good. A viewer that opens on its
+   best angle is flattering the reconstruction to the person who has to judge
+   it. The rule now counts area, not vertices, because decimation spends
+   vertices on detail (a keyboard) rather than on extent (a wall). There is
+   no occlusion test, so area behind a wall counts; that errs towards views
+   that show more of the room, including its holes. */
 function chooseOpening(mesh, cams){
   if (!cams.length) return -1;
-  const step = Math.max(1, Math.floor(mesh.nV / 3000));
-  const P = [];
-  for (let i = 0; i < mesh.nV; i += step){
-    P.push([mesh.lo[0] + mesh.pos[i*3]   / 65535 * mesh.span[0],
-            mesh.lo[1] + mesh.pos[i*3+1] / 65535 * mesh.span[1],
-            mesh.lo[2] + mesh.pos[i*3+2] / 65535 * mesh.span[2]]);
+  const nF = mesh.nI / 3;
+  const fstep = Math.max(1, Math.floor(nF / 6000));
+  const P = [], A = [];
+  const vtx = i => [mesh.lo[0] + mesh.pos[i*3]   / 65535 * mesh.span[0],
+                    mesh.lo[1] + mesh.pos[i*3+1] / 65535 * mesh.span[1],
+                    mesh.lo[2] + mesh.pos[i*3+2] / 65535 * mesh.span[2]];
+  let total = 0;
+  for (let f = 0; f < nF; f += fstep){
+    const a = vtx(mesh.idx[f*3]), b = vtx(mesh.idx[f*3+1]), c = vtx(mesh.idx[f*3+2]);
+    const u = [b[0]-a[0], b[1]-a[1], b[2]-a[2]], v = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    const area = 0.5 * Math.hypot(u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]);
+    P.push([(a[0]+b[0]+c[0])/3, (a[1]+b[1]+c[1])/3, (a[2]+b[2]+c[2])/3]);
+    A.push(area); total += area;
   }
-  const want = CONFIG.median_scene_depth
-    || 0.2 * Math.hypot(mesh.span[0], mesh.span[1], mesh.span[2]);
   const pad = 0.02;
   let best = Math.floor(cams.length / 2), bestScore = -1;
   for (let ci = 0; ci < cams.length; ci++){
@@ -211,17 +225,15 @@ function chooseOpening(mesh, cams){
     }
     if (!inside) continue;
     const f = norm3([c[3],c[4],c[5]]);
-    let seen = 0, depthSum = 0;
-    for (const p of P){
+    let seen = 0;
+    for (let i = 0; i < P.length; i++){
+      const p = P[i];
       const d = [p[0]-c[0], p[1]-c[1], p[2]-c[2]];
       const r = Math.hypot(d[0],d[1],d[2]);
       if (r < 1e-6) continue;
-      if (dot3(d, f) / r > 0.6){ seen++; depthSum += r; }
+      if (dot3(d, f) / r > 0.6) seen += A[i];
     }
-    if (seen < 20) continue;
-    const md = depthSum / seen;
-    const z = Math.log(md / want) / 0.7;
-    const score = (seen / P.length) * Math.exp(-0.5 * z * z);
+    const score = total > 0 ? seen / total : 0;
     if (score > bestScore){ bestScore = score; best = ci; }
   }
   return best;
@@ -625,8 +637,15 @@ function main(){
   if (CONFIG.quality === "live") bits.push("still building as you walk");
   if (used && offered) bits.push(used + " of " + offered + " keyframes");
   if (!CONFIG.current && CONFIG.currency_reason) bits.push(String(CONFIG.currency_reason));
-  let note = "Surfaces appear only where cameras measured them, so gaps are "
-           + "places nothing looked, not walls that are missing.";
+  // What a gap means, as measured on the canonical capture (surface-r2):
+  // of the depth the cameras measured with no surface near it, about half
+  // was outvoted by other views that saw past it, a quarter lacked the
+  // evidence of two agreeing views, and a quarter was removed as a
+  // contradicted or back-facing fold. Almost none was "nobody looked".
+  let note = "Surfaces appear only where at least two camera views measured "
+           + "them and did not contradict each other. A gap is either a place "
+           + "nothing looked or a place the views disagreed about, so a gap is "
+           + "not proof that nothing is there.";
   if ((CONFIG.scale_state || "unknown") === "unknown")
     note += " Scale is unknown, so distances here are relative.";
   const cap = document.getElementById("caption");
