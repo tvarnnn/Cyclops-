@@ -581,8 +581,15 @@ CAPTION_BEHIND = ("This picture is BEHIND the newest keyframes: the Tower has "
 # zooms. Touch (added 2026-09-06 for the phone): one finger orbits, two
 # fingers pinch to zoom and drag to pan. `touch-action: none` keeps the
 # page from scrolling or zooming underneath the canvas.
+#
+# The CSP meta tag repeats the route's response header INSIDE the page, and
+# it is the copy that matters on the phone: iOS drops the response headers
+# and calls `loadHTMLString(_:baseURL: nil)`, and WebKit enforces a meta CSP
+# in that document but never saw the header. It sits right after
+# `<meta charset>`; `wb-representation` must stay inside the first 4096
+# characters, where the phone reads the rung.
 _CANVAS_VIEWER = r"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="wb-representation" content="sparse"><title>__TITLE__</title>
+<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><meta name="wb-representation" content="sparse"><title>__TITLE__</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
 :root{--bg:__PRODUCT_BG__;--fg:#1c1b19;--bar:#e9e7e2;--sub:#55524d;--edge:#d2cec7;--warn:#a4400a}

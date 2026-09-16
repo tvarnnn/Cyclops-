@@ -81,6 +81,7 @@ Added 2026-09-06 on the Mac integration branch, so a saved world can be
 | `session_id` | string, optional | The session to draw. Absent: the newest session of the world that has geometry (`has_geometry` in §2) |
 | `max_points` | int 1…200000, optional | Point budget, and only a point budget. **Sparse:** default 40,000 for a phone (`MOBILE_MAX_POINTS` in `tower/results/world_builder_render.py`, set from a measured canvas-fill cliff — 80,000 was the cliff, not a margin). Fractional-stride sampling over every segment, never a prefix. **Dense:** default 393,216 (a 6 MB binary buffer), met by a coarser voxel grid over the whole extent rather than by sampling; an explicit value is honoured as a cap. **Surface:** the mesh is not points, so this selects the level-of-detail rung whose triangle budget it fits rather than thinning vertices |
 | `representation` | `auto` \| `sparse` \| `dense` \| `surface`, optional | Which reconstruction to serve, as a ladder: `surface` → `dense` → `sparse`. `auto` (default) serves the best rung the session actually has. A named value starts the walk at its own rung and falls through to worse ones, **except** that naming a rung the session does not have at all returns **404** rather than silently serving a different one — a caller that pinned a representation is comparing, and a silent substitution would corrupt the comparison. **422** outside this set. The rung actually served is stated in the page and in `GET /worlds` |
+| `view` | `product` \| `diagnostics`, optional | Which rendering the **sparse** page opens in: the product view (default) or the solver's segment-coloured diagnostics view. Honoured server-side, because a `loadHTMLString` client has no `location.search`. An unrecognised value opens the product view, never a 422. **`view=diagnostics` with `representation=auto` serves the sparse page** — only the sparse page has the diagnostics rendering, so starting the ladder at the surface would answer "open the solver's view" with a surface. A pinned `representation` still wins |
 
 **200** `text/html`, `Cache-Control: no-store`. A self-contained page: no
 external script, stylesheet, image or fetch, so a web view that refuses
@@ -129,7 +130,7 @@ set.
 3. Composed on request, cached nowhere: a world under construction changes with every build, and the client bypasses its own cache for the same reason the geometry routes ask it to.
 4. `world_id` passes the same containment guard as the geometry routes (`contained_world_id`): an id that resolves outside the world root is "no world", and a non-canonical spelling is answered as the world it names.
 5. **One derived manifest per world, not per session.** `derived/manifest.json` records the digest of the *last* build, so in a world with two built sessions the older one's placements no longer bind to it: that session renders with every segment apart, labelled `unbound`, and the BEHIND caption — which is the truthful reading of a tree the current build did not produce, not a defect in the session. `GET /worlds` still answers `has_geometry: true` for it. A per-session manifest is the fix and belongs to the store, not to this route.
-6. The response carries `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'` — the promise above, enforced by the browser as well as kept by the producer.
+6. The response carries `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'` — the promise above, enforced by the browser as well as kept by the producer — **and every page carries the same policy as a `<meta http-equiv="Content-Security-Policy">` right after `<meta charset>`**, which is the only form a `loadHTMLString` client enforces: iOS drops the response headers, and its navigation policy sees navigations, not an `<img>` or a `fetch`. All three pages (sparse, dense, surface) carry it, and it never pushes `wb-representation` out of the first 4096 characters.
 
 ## 4a. `GET /worlds/{world_id}/render/revision` — has a better picture been built?
 
@@ -141,29 +142,52 @@ page to find out.
 | param | type | meaning |
 |---|---|---|
 | `session_id` | string, optional | as §4; resolved the same way |
+| `view` | string, optional | as §4. `view=diagnostics` reports the **sparse** rung, because that is the page §4 serves for it. A client showing the diagnostics rendering has nothing to follow and should not ask (the iOS app does not) |
 
-**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str}`,
+**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str, "live": bool}`,
 `Cache-Control: no-store`. **404** exactly when §4 would 404.
+
+`live` (additive, 2026-09-16) is `true` while something is building **this
+session**: the world's writer lock is held by a live builder and this session is
+the one it is writing (record still open, or finalization still `pending`), or
+this session's surface or dense stage reports `running` from a live process.
+See rule 6 for what `false` does and does not promise.
 
 Every page §4 serves carries the same two values in its head, within its first
 4096 characters:
 
     <meta name="wb-representation" content="surface">
-    <meta name="wb-revision" content="surface:1789551234.56">
+    <meta name="wb-revision" content="<session_id>/surface:1789551234.56">
 
 ### Rules
 
-1. `revision` is **opaque**. Compare for equality only.
+1. `revision` is **opaque**. Compare for equality only. A client that needs the
+   rung reads `representation`, never a prefix of `revision`.
 2. It changes when the page §4 would serve changes rung, or when the surface or
-   dense artifact behind the served rung is rebuilt.
-3. The sparse rung's revision is the constant `sparse`. The derived tree is
-   rewritten every few keyframes during a walk, and a picture that reloaded on
-   each of those would be unusable to look at; the step the wearer is waiting
-   for — up the ladder — still changes it.
+   dense artifact behind the served rung is rebuilt, or when the session §4
+   would choose changes: every revision is prefixed with the chosen session id.
+3. The sparse rung's revision is the constant `<session_id>/sparse`. The derived
+   tree is rewritten every few keyframes during a walk, and a picture that
+   reloaded on each of those would be unusable to look at; the step the wearer
+   is waiting for — up the ladder — still changes it.
 4. The endpoint decides the rung by the same artifact checks as
    `has_geometry` in §2 rather than by composing the page. The two can disagree
-   only when an artifact passes its header check and then fails to parse; a
-   client that records the revision before comparing pages pays one extra page
-   fetch for that, not a loop.
-5. A client must treat **404 from this route as "nothing to follow"** — it is
-   also what a Tower older than the route answers — and keep the picture it has.
+   only when an artifact passes its header check and then fails to parse (the
+   Tower logs that loudly at `ERROR`); a client that remembers the revision it
+   acted on, as well as the one stamped into the page it got, pays one extra
+   page fetch for that, not a loop.
+5. **A 404 whose `detail` is FastAPI's `Not Found`** — no such route, which is
+   what a Tower older than this route answers — means **nothing to follow**:
+   stop asking and keep the picture on screen. **A 404 with one of §4's own
+   sentences may be transient** ("no geometry yet" is what a world mid-build
+   can answer while its derived tree is being replaced): keep the picture and
+   ask again at the next interval.
+6. **`live: false` means "slow down", not "stop".** The builder releases the
+   world lock at the end of finalization and only then starts the final surface
+   and dense stages, so there is a short window — up to the length of a
+   registration — in which nothing is marked running and a better picture is
+   still coming. A client backs off while `live` is `false` (the iOS app: 10 s
+   doubling to a 120 s ceiling, back to 10 s whenever the revision changes or
+   `live` is `true`) and keeps polling at its base interval while it is `true`.
+   A finished world therefore costs one request every two minutes, not every
+   ten seconds.

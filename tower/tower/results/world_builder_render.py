@@ -286,7 +286,83 @@ def build_render_revision(store: WorldStore, world_id: str,
     return {"session_id": chosen, "representation": rung,
             # The session is in the revision, so an open picture whose session
             # the Tower chose notices when the Tower would choose a newer one.
-            "revision": f"{chosen}/{render_revision(store, world_id, chosen, rung)}"}
+            "revision": f"{chosen}/{render_revision(store, world_id, chosen, rung)}",
+            "live": session_build_running(store, world_id, chosen)}
+
+
+def _stage_running(status_path, is_stale) -> bool:
+    """Whether a surface or dense stage's `status.json` says `running` and the
+    process that wrote it is still that process."""
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(status, dict) or status.get("state") != "running":
+        return False
+    try:
+        return not is_stale(status)
+    except Exception:  # noqa: BLE001 -- a liveness probe must not 500 the route
+        return False
+
+
+def session_build_running(store: WorldStore, world_id: str, session_id: str) -> bool:
+    """Whether something is building THIS session right now, so its revision
+    may still change.
+
+    Three facts, any one of which is enough:
+
+    1. The world's writer lock is held by a live builder (the listing's `live`,
+       same probe) AND this session is the one it is writing: its record is
+       still open, or its finalization is still `pending`. The lock is per
+       world, so an older, finished session of a world being walked again is
+       not live.
+    2. The surface stage's `status.json` for this session says `running` and
+       its process is alive.
+    3. The same for the dense stage.
+
+    **Not a promise that nothing will change when it is false.** The builder
+    releases the world lock at the end of finalization and only THEN starts
+    the final surface and dense stages (`scripts/world_build_session.py`), so
+    there is a gap of up to a registration's length in which this answers
+    `false` and a better picture is still coming. A client must therefore
+    slow down on `false`, not stop -- `WORLD-BUILDER-WORLDS.md` §4a rule 6.
+    Never raises: a probe that cannot read something answers `false`, which
+    costs a client latency, never a 500.
+    """
+    try:
+        from tower.results.world_builder_library import _world_is_live  # noqa: PLC0415
+        from tower.world_builder.records import FINALIZATION_PENDING  # noqa: PLC0415
+
+        if _world_is_live(store, world_id):
+            session = store.read_session(world_id, session_id)
+            finalization = session.finalization or {}
+            if session.ended_at is None or finalization.get("state") == FINALIZATION_PENDING:
+                return True
+    except Exception:  # noqa: BLE001 -- see the docstring
+        logger.debug("[Tower][WorldBuilder] world lock probe failed for %s", world_id,
+                     exc_info=True)
+    world_dir = store.world_dir(world_id)
+    try:
+        from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+            status_is_stale as surface_status_is_stale,
+        )
+
+        if _stage_running(world_dir / "surface" / session_id / "status.json",
+                          surface_status_is_stale):
+            return True
+    except Exception:  # noqa: BLE001 -- a surface module that will not import
+        logger.debug("[Tower][WorldBuilder] surface liveness probe failed", exc_info=True)
+    try:
+        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+            status_is_stale as dense_status_is_stale,
+        )
+
+        if _stage_running(world_dir / "dense" / session_id / "status.json",
+                          dense_status_is_stale):
+            return True
+    except Exception:  # noqa: BLE001 -- a dense module that will not import
+        logger.debug("[Tower][WorldBuilder] dense liveness probe failed", exc_info=True)
+    return False
 
 
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
@@ -349,6 +425,19 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         except SurfaceViewerUnavailable as exc:
             if representation == REPRESENTATION_SURFACE:
                 raise WorldRenderUnavailable(exc.reason) from None
+            if surface_artifact_drawable(store, world_id, chosen):
+                # The revision route (§4a) decides the rung by this same
+                # header check, so it is now telling the phone "surface"
+                # about a page stamped with a lower rung. The phone pays one
+                # fetch per rebuild for that, not a loop, but the operator
+                # must hear about an artifact that passes its check and still
+                # cannot be drawn.
+                logger.error(
+                    "[Tower][WorldBuilder] surface artifact for %s/%s passes its "
+                    "header check but the page could not be built (%s); serving a "
+                    "lower rung while the revision route reports surface",
+                    world_id, chosen, exc.reason,
+                )
         except Exception:  # noqa: BLE001 -- never lose the world to a surface bug
             logger.exception(
                 "[Tower][WorldBuilder] surface viewer failed for %s; falling back",
@@ -402,6 +491,14 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         except DenseViewerUnavailable as exc:
             if representation == REPRESENTATION_DENSE:
                 raise WorldRenderUnavailable(exc.reason) from None
+            if dense_artifact_drawable(store, world_id, chosen):
+                # Same disagreement as the surface rung above, one rung down.
+                logger.error(
+                    "[Tower][WorldBuilder] dense artifact for %s/%s passes its "
+                    "header check but the page could not be built (%s); serving "
+                    "sparse while the revision route reports dense",
+                    world_id, chosen, exc.reason,
+                )
         except Exception:  # noqa: BLE001 -- never lose the sparse page to a dense bug
             logger.exception(
                 "[Tower][WorldBuilder] dense viewer failed for %s; serving sparse",

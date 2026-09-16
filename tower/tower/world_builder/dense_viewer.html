@@ -2,15 +2,19 @@
   World Builder dense viewer.
 
   One self-contained page. No external script, no external style, no font, no
-  image, no fetch. In a BROWSER that is enforced: the route serves it under
-  `default-src 'none'` with only 'unsafe-inline' for script and style.
-  ON THE PHONE IT IS NOT. iOS fetches this page with URLSession, drops the
-  response headers, and calls loadHTMLString with a null baseURL, so no CSP
-  applies at all -- what blocks a fetch there is the navigation delegate and
-  the unresolvable relative URLs, which this file does not control. Inline is
-  still the only shape that works in both, and the server-side escaping is the
-  only defence against a closing script tag smuggled through the config.
-  See dense_render.py.
+  image, no fetch. That is enforced twice, with the same policy
+  (`default-src 'none'` with only 'unsafe-inline' for script and style):
+  in a BROWSER by the route's Content-Security-Policy response header, and
+  ON THE PHONE by the <meta http-equiv> tag in the head below. iOS fetches
+  this page with URLSession, drops the response headers, and calls
+  loadHTMLString with a null baseURL, so the header never reaches WebKit
+  there; the meta tag is the only form of the policy a loadHTMLString
+  document enforces, and without it an absolute-URL subresource would
+  load (the navigation delegate sees navigations, not <img> or fetch).
+  Keep the tag right after <meta charset>, and keep wb-representation
+  inside the first 4096 characters: the phone reads the rung from there.
+  The server-side escaping is still the only defence against a closing
+  script tag smuggled through the config. See dense_render.py.
 
   Up on screen is -y. The world's up_axis is "unknown" and the cameras are
   OpenCV's (x right, y DOWN, z forward), so assuming +y or +z is up would stand
@@ -20,6 +24,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="wb-representation" content="dense">
 <title>World Builder — dense</title>
