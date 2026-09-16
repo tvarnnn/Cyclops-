@@ -21,18 +21,43 @@ about where geometry comes from.
 
 ## 2. What this artifact CLAIMS
 
-1. **Every triangle stands where cameras measured something.** A cell emits
-   surface only where accumulated evidence reached `min_weight`. Weight is
-   accumulated per observation and scaled by the incidence cosine, the frame's
-   own gate score, and an inverse-square depth falloff.
+1. **Every triangle stands where at least two frames measured something, and
+   was not contradicted.** Three tests, all of which a triangle passes:
+   - *Field evidence at every corner.* A marching cube emits only if all
+     eight corner voxels reached `min_weight`. Weight is accumulated per
+     observation and scaled by the incidence cosine, the frame's own gate
+     score, and an inverse-square depth falloff capped at `max_near_boost`
+     (so one close frame CAN reach `min_weight` alone; weight is not a frame
+     count).
+   - *Distinct frames.* At least `min_support_frames` (2) distinct frames
+     measured depth within their truncation of the face.
+   - *Not seen through, not seen from behind.* Frames that measured depth
+     beyond the face number fewer than `contradiction_ratio` (2) times the
+     supporting frames, and at least one supporting frame is on the face's
+     front side.
 2. **Space that was never measured is absent, not closed.** Unobserved cells
-   keep zero weight and emit no triangle. The surface stops at the edge of
-   what was seen. A hole in this mesh means "nobody looked", and that is
-   information.
-3. **Free space was carved.** Where a camera measured depth `d` along a ray,
-   everything nearer than `d` was recorded as empty. Geometry that a later
-   view saw through is removed, which is why a hand or an animal that moved
-   during the walk does not survive as a ghost.
+   keep zero weight, and no cube with an unobserved corner emits. The surface
+   stops at the edge of what was seen.
+
+   **The converse is NOT claimed: a hole does not mean "nobody looked".** A
+   hole is either space no frame measured, or space the frames disagreed
+   about. Measured on the canonical capture (`b2a75ab4...`, 349 frames): of
+   the depth samples the cameras measured (every valid pixel, 6-pixel
+   stride), 26.4% have no surface within 0.18 units. Of those in the review's
+   in-range band, 49% lie where other frames saw past them (the field was
+   carved), 24% lack `min_weight` of agreeing evidence, 24% sit at a zero
+   crossing whose faces were removed by the tests in claim 1 or pruned as
+   small islands, 2% lie behind another frame's surface, and 0.4% were never
+   integrated. A reader must not present
+   a gap as proof of empty space.
+3. **Free space was counted along the whole ray.** Where a camera measured
+   depth `d`, everything nearer than `d` was recorded as empty: blended into
+   the field within `max_carve_voxels` in front of that surface, and counted
+   per face along the entire ray (claim 1). A thing near the camera that
+   other frames saw straight through -- a hand, the wearer's lap -- does not
+   survive. On the canonical capture the faces within 0.5 units of the walked
+   path went from 2,330 (all contradicted) to 0. A thing that moved but that
+   no other frame looked through is not detected.
 4. **The coordinate frame is the solve's**, identical to
    `solve/<session>/solution.json`: world-to-camera poses, `x_cam = R·X + t`,
    OpenCV axes with y down. It is NOT the frame `world.json`'s
@@ -138,7 +163,9 @@ distinguishable from corruption.
 | `input_digest` | the solve this was built from; compare with the live solve to detect staleness |
 | `params_digest` | input digest plus every parameter that affects the result |
 | `params` | the full parameter set, including `quality` |
-| `median_scene_depth` | the median depth the cameras measured; every length below is a fraction of it |
+| `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
+| `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `min(max(floor, rel * d), trunc_max_voxels * voxel)`; `truncation` is that band at the scene scale |
+| `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason |
 | `voxel`, `truncation` | in scene units |
 | `frames_used`, `frames_offered` | how much of the walk contributed |
 | `vertices`, `faces` | of level 0 |
@@ -146,12 +173,20 @@ distinguishable from corruption.
 | `canonical_level`, `mobile_level` | which rung is the archive and which the phone gets |
 | `seconds` | per stage |
 | `scale` | inherited verbatim, with a note saying so |
-| `closure` | the sentence stating that unobserved space is absent |
+| `closure` | the sentence stating that unobserved space is absent, and that a hole may also be space the frames disagreed about |
 
 `params.quality` is `live` or `final`. A live artifact is coarser — twice the
 voxel, one level of detail, a lighter smoothing pass, `min_weight` 1.5 rather
 than 2.0 — because it is built during the walk against the gap between global
-solves. **The evidence rule is not relaxed for live**; only the resolution is.
+solves. The two-frame and contradiction tests are the same for live.
+
+**Where depth is used does not depend on the scene scale.** Each frame's depth
+is used out to `anchor_depth_multiple` (1.5) times that frame's own farthest
+fitted sparse anchor, so a live build and the final build bound depth the same
+way. The scene scale still sets the voxel, and it still moves with what the
+walk has seen: on the canonical capture a build over the first 100 / 150 / 264
+keyframes had 1.09x / 1.14x / 1.09x the final scale (it was 1.27x / 1.39x /
+1.20x when it was a sampled dense-depth median).
 The final build replaces the live one in the same directory, because the
 product question is always "the best available reconstruction of this
 session".
