@@ -135,6 +135,7 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
         "current": bool(currency.get("current")),
         "currency_reason": currency.get("reason"),
         "cameras": _camera_path(store, world_id, session_id),
+        "up": _camera_up(store, world_id, session_id),
     }
     return raw, config
 
@@ -166,9 +167,41 @@ def _camera_path(store, world_id: str, session_id: str) -> list:
         centre = -R.T @ t
         forward = R.T @ np.array([0.0, 0.0, 1.0])
         out.append([round(float(v), 5) for v in (*centre, *forward)])
-    # A few hundred is plenty to step through and keeps the page small.
-    step = max(1, len(out) // 240)
+    # A few hundred is plenty to step through and keeps the page small. The
+    # ceiling division is what makes 240 a cap: floor division gave a step of 1
+    # for any walk under 480 keyframes and sent all of them.
+    step = max(1, -(-len(out) // 240))
     return out[::step]
+
+
+def _camera_up(store, world_id: str, session_id: str) -> list | None:
+    """The walk's own up direction, as the mean of every camera's -y axis.
+
+    The solve's gauge has no declared vertical (`up_axis` is "unknown"), and a
+    viewer that assumes world -Y is up tilts the horizon by however far this
+    solve's frame is rotated -- 14.3 degrees on the canonical world. A wearer
+    holds their head near level, so the average camera up is the vertical to
+    within a few degrees, and it is measured rather than assumed.
+    """
+    from tower.world_builder.global_solve import load_solution
+
+    try:
+        solution = load_solution(store, world_id, session_id)
+    except Exception:  # noqa: BLE001 -- the page can estimate its own
+        return None
+    if solution is None or not solution.poses:
+        return None
+    import numpy as np
+
+    ups = []
+    for pose in solution.poses.values():
+        R = np.array(pose["rotation"], float).reshape(3, 3)
+        ups.append(R.T @ np.array([0.0, -1.0, 0.0]))
+    mean = np.mean(ups, axis=0)
+    norm = float(np.linalg.norm(mean))
+    if norm < 1e-6:
+        return None
+    return [round(float(v), 6) for v in mean / norm]
 
 
 def build_surface_page(store, world_id: str, session_id: str, *,
@@ -188,8 +221,9 @@ def build_surface_page(store, world_id: str, session_id: str, *,
     # `max_points` is the worlds contract's budget knob and must not be
     # ignored just because this representation is not made of points. It was
     # dropped on the dense path once and `max_points=1` returned a 6 MB page.
-    # Here it selects a coarser rung: three bytes a point is the conversion
-    # the contract's own wording implies, and it only ever moves downwards.
+    # Here it selects a coarser rung, converted at the dense point format's
+    # 16 bytes a point so one `max_points` buys a comparable page on either
+    # rung, and it only ever moves the budget downwards.
     if max_points is not None:
         budget_bytes = min(budget_bytes, max(1, int(max_points)) * 16)
 
