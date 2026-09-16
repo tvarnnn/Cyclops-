@@ -481,7 +481,8 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 |---|---|
 | same revision | nothing; no page is fetched |
 | a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision) | fetches the page and swaps it in |
-| a new revision of the **same or a lower rung** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera |
+| a new revision of the **same rung** with `live: false` (the finished build after Stop) | fetches the page and swaps it in: a world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
+| a new revision of the **same or a lower rung** otherwise | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera |
 | a revision whose page could not be drawn on this phone | never swaps it in or offers it again |
 | `404` with FastAPI's `{"detail": "Not Found"}` | stops following for this screen (a Tower older than the route) |
 | any other `404`, another status, or a transport error | keeps the picture and asks again next interval |

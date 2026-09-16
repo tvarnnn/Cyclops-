@@ -4581,6 +4581,18 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: nil, to: .sparse))
     }
 
+    func testTheFinishedSurfaceReplacesTheLiveOneWithoutAsking() {
+        func swaps(_ shown: WorldRenderRepresentation?, _ rung: WorldRenderRepresentation?, live: Bool?) -> Bool {
+            WorldRenderViewerModel.swapsBySelf(
+                shown: shown, latest: WorldRenderRevision(revision: "s1/x", representation: rung, live: live))
+        }
+        XCTAssertTrue(swaps(.surface, .surface, live: false), "the final build after Stop is shown, not offered")
+        XCTAssertFalse(swaps(.surface, .surface, live: true), "a live rebuild is offered")
+        XCTAssertFalse(swaps(.surface, .surface, live: nil), "a Tower that does not say is not taken as finished")
+        XCTAssertTrue(swaps(.sparse, .surface, live: true), "a better rung is always swapped in")
+        XCTAssertFalse(swaps(.surface, .sparse, live: false), "a finished build never downgrades the picture")
+    }
+
     func testTheFollowerSlowsDownOnlyWhileNothingIsBuilding() {
         let base = Duration.seconds(10)
         let ceiling = Duration.seconds(120)

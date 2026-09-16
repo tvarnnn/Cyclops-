@@ -23,7 +23,7 @@ Do not work in the canonical checkout.
 |---|---|---|
 | M1 | Tower serves the sparse page for `view=diagnostics`; the phone does not follow a diagnostics target; Details text depends on the rung | §3, §5.9 |
 | M2 | A refreshed page that fails to draw (watchdog, `didFail`, kill budget) puts the previous page back and that revision is never retried | §2, §5.5 |
-| M3 | Only a better rung swaps by itself; a same-rung rebuild shows *"A newer reconstruction is ready. Show it"* | §2, §5.4 |
+| M3 | Only a better rung, or a same-rung build the Tower says is finished (`live: false`), swaps by itself; a live same-rung rebuild shows *"A newer reconstruction is ready. Show it"* | §2, §5.4 |
 | M4 | Only `{"detail":"Not Found"}` ends following; other 404s are retried | §2, §3, §5.10 |
 | M5 | WebContent kills count within a 60 s window | §2, §5.6 |
 | m1 | Every revision is `<session>/<rung…>` | §3 |
@@ -86,7 +86,7 @@ xcodebuild -project Glasses.xcodeproj -scheme Glasses \
 
 Expect:
 - 8 tests in `WorldRenderRepresentationTests` (unchanged);
-- **18** in `WorldRenderRevisionTests`: 6 pure (address, page stamp, body decode, upgrade order, poll interval, termination window) and 12 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop);
+- **19** in `WorldRenderRevisionTests`: 7 pure (address, page stamp, body decode, upgrade order, finished-build swap, poll interval, termination window) and 12 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop);
 - `WorldRenderViewerTests` unchanged, all green.
 
 The follower tests no longer hang on a regression: every wait is bounded at
@@ -184,7 +184,7 @@ Console.app streaming the device, filtered for `WebContent`, `jetsam`, `Glasses`
    - when the rung first **improves** (sparse → surface), the picture swaps by itself, once;
    - after that, each surface rebuild shows the button *"A newer reconstruction is ready. Show it"* and does **not** move the camera (review M3). Count the rebuilds offered, and tap the button at least twice: each tap swaps the page and resets the camera, and the button disappears;
    - count of full `GET …/render`: must equal 1 + rung improvements + taps (+ at most one per rebuild if the Tower logged the m9 ERROR);
-   - after Stop: polls continue through finalization, the final surface is offered (or swapped, if the rung improved), and once finalization is done the poll gaps grow 10 → 20 → 40 → 80 → 120 s and stay at 120 s. Record the gaps.
+   - after Stop: polls continue through finalization, the final surface (built after Stop, `live: false`) is **swapped in by itself** without a tap, once, and once finalization is done the poll gaps grow 10 → 20 → 40 → 80 → 120 s and stay at 120 s. Record the gaps.
 5. **A swap that cannot be drawn** (review M2). During §5.4, at each swap or tap, watch Console for WebContent termination. If a swap is killed past its budget or takes over 20 s, the **previous picture must come back** (a brief "Drawing the world…" then the old picture) and that revision must not be offered again. Record the WebContent footprint before and after each swap, and any revert. If none happens naturally, optionally serve L1 pages from the Tower (larger) to provoke one, and record the result.
 6. **Backgrounding** (physical phone, surface world open, not walking). Lock 2 min, unlock; repeat 4 times, **at least 60 s apart**. After each unlock record: picture back without reload / context-restored message then picture / full reload / *"…ran out of memory N times…"*. The failure message must not appear from kills spread over minutes (review M5). If it does, record the times.
 7. **Retry path.** Tower stopped, open a world: failure with Try again. Start the Tower, tap Try again; the picture draws. Leave it 3 min. In the Tower log, revision polls come from **one** loop, with gaps 10, 20, 40, 80, 120 s (a finished world, `live: false`).

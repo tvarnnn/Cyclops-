@@ -629,9 +629,7 @@ final class WorldRenderViewerModel: ObservableObject {
                 live: latest.live, changed: isNew
             )
             guard isNew else { continue }
-            if WorldRenderRepresentation.isUpgrade(
-                from: state.representation, to: latest.representation
-            ) {
+            if Self.swapsBySelf(shown: state.representation, latest: latest) {
                 await refresh(to: latest.revision)
             } else {
                 handledRevision = latest.revision
@@ -639,6 +637,27 @@ final class WorldRenderViewerModel: ObservableObject {
                 newerPictureAvailable = true
             }
         }
+    }
+
+    /// Whether a new revision replaces the page without asking.
+    ///
+    /// A better rung always does. So does a build of the same rung that the
+    /// Tower says is FINISHED (`live == false`): that is the final surface
+    /// built after Stop, a world does not rebuild again after it, and a wearer
+    /// who stopped walking should see the finished world rather than a button.
+    /// A same-rung build while the walk is live is offered, because live builds
+    /// land on every solve and a swap resets the camera mid-look. Nothing
+    /// replaces a page with a worse rung by itself.
+    nonisolated static func swapsBySelf(
+        shown: WorldRenderRepresentation?, latest: WorldRenderRevision
+    ) -> Bool {
+        if WorldRenderRepresentation.isUpgrade(from: shown, to: latest.representation) {
+            return true
+        }
+        let downgrade = WorldRenderRepresentation.isUpgrade(
+            from: latest.representation, to: shown
+        )
+        return !downgrade && latest.live == false
     }
 
     /// How long to wait before the next ask.
