@@ -1082,8 +1082,8 @@ def frontier_fill_faces(V, F, G, quantum: float):
     e = np.sort(np.concatenate([Fw[:, [0, 1]], Fw[:, [1, 2]], Fw[:, [2, 0]]]), axis=1)
     _, inv, cnt = np.unique(e, axis=0, return_inverse=True, return_counts=True)
     inv = inv.reshape(-1)
-    _, face_id = np.unique(np.sort(Fw, axis=1), axis=0, return_inverse=True)
-    pair = np.unique(np.stack([inv, np.tile(face_id.reshape(-1), 3)], 1), axis=0)
+    _, triangle_key = np.unique(np.sort(Fw, axis=1), axis=0, return_inverse=True)
+    pair = np.unique(np.stack([inv, np.tile(triangle_key.reshape(-1), 3)], 1), axis=0)
     distinct = np.bincount(pair[:, 0], minlength=len(cnt))
     open_per_face = (distinct == 1)[inv].reshape(3, -1).sum(0)
 
