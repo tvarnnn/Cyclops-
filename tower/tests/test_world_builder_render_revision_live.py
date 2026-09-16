@@ -137,6 +137,48 @@ def test_a_running_surface_stage_is_live_after_the_lock_is_gone(derived_world):
     assert R.session_build_running(store, world_id, session_id) is True
 
 
+def test_a_stage_that_has_published_its_manifest_is_not_live_before_ok(derived_world):
+    """Review 3, R5. A build writes its manifest, prunes, and only then `ok`. A
+    poll in that gap saw the new revision with `live: true`, so the phone offered
+    the finished world instead of swapping it in, and the `live: false` poll
+    after it was not new. The manifest being newer than the `running` status
+    is the build having published."""
+    store, world_id, session_id = derived_world
+    for stage in ("surface", "dense"):
+        _write_status(store, world_id, session_id, stage,
+                      state="running", pid=os.getpid(), updated_at=time.time())
+        root = store.world_dir(world_id) / stage / session_id
+        status_ns = (root / "status.json").stat().st_mtime_ns
+        manifest = root / "manifest.json"
+        # an OLDER manifest, from the previous build: still live
+        manifest.write_text(json.dumps({"built_at": 1.0}), encoding="utf-8")
+        os.utime(manifest, ns=(status_ns - 10**9, status_ns - 10**9))
+        assert R.session_build_running(store, world_id, session_id) is True, stage
+        # this build's manifest, published after its `running` status: not live
+        os.utime(manifest, ns=(status_ns + 10**9, status_ns + 10**9))
+        assert R.session_build_running(store, world_id, session_id) is False, stage
+        # and the next build's `running` status makes it live again
+        _write_status(store, world_id, session_id, stage,
+                      state="running", pid=os.getpid(), updated_at=time.time())
+        os.utime(root / "status.json", ns=(status_ns + 2 * 10**9, status_ns + 2 * 10**9))
+        assert R.session_build_running(store, world_id, session_id) is True, stage
+        (root / "status.json").write_text(json.dumps({"state": "ok"}), encoding="utf-8")
+
+
+def test_the_surface_stage_publishes_its_manifest_before_ok():
+    """The probe above reads "manifest newer than running" as published, which
+    is only sound while every `running` write precedes the manifest write and
+    `ok` follows it. Pinned on the source, since the order is the contract."""
+    import inspect
+
+    from tower.world_builder import surface_pipeline
+
+    body = inspect.getsource(surface_pipeline.surfacify)
+    publish = body.index("_write_manifest(root")
+    assert body.rindex("state=STATE_RUNNING", 0, publish) < publish
+    assert body.index("_status(root, state=STATE_OK", publish) > publish
+
+
 def test_a_running_dense_stage_is_live(derived_world):
     store, world_id, session_id = derived_world
     _write_status(store, world_id, session_id, "dense",

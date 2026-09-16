@@ -846,6 +846,31 @@ def test_representation_sparse_forces_the_old_page_even_when_dense_exists(tmp_pa
     assert "World Builder — dense" not in html
 
 
+def test_the_diagnostic_view_is_the_sparse_page_even_when_dense_exists(tmp_path):
+    """Review 3, R3: `view=diagnostics` arrives with `representation=auto` and
+    starts the ladder at sparse, but the dense rung was gated on the
+    representation, so a densified world served the dense page there -- while
+    the revision route, asked the same question, answered sparse."""
+    import re
+
+    from tower.results.world_builder_render import (
+        build_render_revision,
+        build_world_render,
+    )
+
+    store = _world_with_geometry(tmp_path, dense=True)
+    html = build_world_render(store, "w1", "s1", view="diagnostics")
+    assert "World Builder — dense" not in html
+    declared = re.search(r'<meta name="wb-representation" content="([a-z]+)">', html)
+    assert declared is not None and declared.group(1) == "sparse"
+    revision = build_render_revision(store, "w1", "s1", view="diagnostics")
+    assert revision["representation"] == "sparse"
+    stamp = re.search(r'<meta name="wb-revision" content="([^"]+)">', html)
+    assert stamp is not None and stamp.group(1) == revision["revision"]
+    # and the product view of the same world still gets the dense rung
+    assert "World Builder — dense" in build_world_render(store, "w1", "s1")
+
+
 def test_a_broken_dense_artifact_never_costs_the_world_its_sparse_page(tmp_path):
     """A dense bug must degrade to the picture that already worked, not to a
     404. The sparse reconstruction is complete and correct either way."""

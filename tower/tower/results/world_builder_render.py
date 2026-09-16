@@ -320,12 +320,31 @@ def build_render_revision(store: WorldStore, world_id: str,
 
 def _stage_running(status_path, is_stale) -> bool:
     """Whether a surface or dense stage's `status.json` says `running` and the
-    process that wrote it is still that process."""
+    process that wrote it is still that process.
+
+    **A manifest written after the `running` status means the build has
+    published**, and is not live any more even though `ok` has not landed yet.
+    Both stages write the manifest, then prune, then `ok` -- and a revision
+    poll in that gap saw the NEW revision with `live: true`. The phone offered
+    it instead of swapping it in, recorded it as handled, and the `live: false`
+    poll that followed was not new: no auto-swap after Stop (review 3, R5).
+    Every `running` write precedes the manifest of the same build, so "manifest
+    newer than status" can only mean "this build already published". Writing
+    `ok` first instead would claim a result that is not on disk yet if the
+    process dies between the two.
+    """
     try:
+        status_stat = status_path.stat()
         status = json.loads(status_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     if not isinstance(status, dict) or status.get("state") != "running":
+        return False
+    try:
+        manifest_mtime = (status_path.parent / "manifest.json").stat().st_mtime_ns
+    except OSError:
+        manifest_mtime = None
+    if manifest_mtime is not None and manifest_mtime > status_stat.st_mtime_ns:
         return False
     try:
         return not is_stale(status)
@@ -475,7 +494,11 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
                 world_id,
             )
 
-    if representation != REPRESENTATION_SPARSE:
+    # Gated on where the walk STARTED, not on the representation asked for:
+    # `view=diagnostics` arrives as `auto` and starts at sparse, and gating on
+    # `representation != sparse` served it the dense page whenever a dense
+    # artifact existed -- while the revision route said sparse (review 3, R3).
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_DENSE):
         # THE IMPORT IS OUTSIDE THE try THAT CATCHES ITS EXCEPTION.
         #
         # `DenseViewerUnavailable` used to be bound by an import inside the
