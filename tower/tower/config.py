@@ -519,6 +519,22 @@ class Settings:
     # solver produced a solution.
     world_solve: bool = True
 
+    # Dense reconstruction after Stop. OFF, and the default is the decision.
+    #
+    # The stage turns the sparse solve into a per-pixel point cloud and is what
+    # makes a saved world recognisable rather than a scatter of feature points.
+    # It is also the most expensive thing this Tower can be asked to do: about
+    # 2.4 GB of VRAM and two to four minutes of GPU per world, on a card four
+    # other cartridges share. That runs AFTER the world lock is released, so it
+    # blocks no capture -- but it does compete for the GPU with whatever the
+    # wearer does next.
+    #
+    # Until this existed the only way to get a dense artifact was to run
+    # scripts/world_densify.py by hand, which is not a supported product path.
+    # Now it is one setting, and it is off so that turning it on is somebody's
+    # decision rather than a surprise.
+    world_densify: bool = False
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -565,6 +581,7 @@ def get_settings() -> Settings:
         ),
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
+        world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),

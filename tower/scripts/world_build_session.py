@@ -564,6 +564,107 @@ def child_environment() -> dict:
     return interpreter_environment()
 
 
+class BackgroundSurface:
+    """The live surface reconstruction, as a CHILD this builder owns.
+
+    Why it is driven by the SOLVE and not by keyframes. During a walk the only
+    geometry worth reconstructing from is the global solution: the per-segment
+    chain fragments -- 34 segments on a measured walk, the largest holding 13.6%
+    -- and a field built from it would place the same wall in several places at
+    several scales. GLOMAP puts nearly every keyframe in one component. So a
+    live surface job is launched when a background solve LANDS, and at no other
+    time. Between solves the surface is honestly unchanged rather than
+    dishonestly growing.
+
+    Why a child process rather than a thread. The builder observes frames on one
+    thread and a GPU job in that thread would stall ingestion. The child also
+    gives a stop something to kill: `close()` from the builder's `finally`
+    leaves nothing behind, which is the lesson `BackgroundSolver` was written
+    for after an orphaned solve ran on for 32 s past its parent.
+
+    One at a time, and never concurrently with the solve it depends on -- the
+    card is shared, and a surface job competing with the next solve delays the
+    thing that makes the NEXT surface better.
+    """
+
+    def __init__(self, *, root: Path, world_id: str, session_id: str,
+                 script: Path | None = None, spawn=None):
+        self.root = root
+        self.world_id = world_id
+        self.session_id = session_id
+        self.script = Path(script) if script is not None             else TOWER_ROOT / "scripts" / "world_surface.py"
+        self._spawn = spawn if spawn is not None else subprocess.Popen
+        self._child = None
+        self._launches = 0
+        self._log = None
+
+    @property
+    def running(self) -> bool:
+        return self._child is not None and self._child.poll() is None
+
+    @property
+    def launches(self) -> int:
+        return self._launches
+
+    @property
+    def child_pid(self) -> int | None:
+        return self._child.pid if self._child is not None else None
+
+    def _reap(self) -> None:
+        if self._child is not None and self._child.poll() is not None:
+            self._child = None
+            if self._log is not None:
+                self._log.close()
+                self._log = None
+
+    def maybe_launch(self, store: WorldStore, *, solver_running: bool) -> bool:
+        self._reap()
+        if self.running or solver_running:
+            return False
+        log_dir = self.root / "worlds" / self.world_id / "surface" / self.session_id
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._log = open(log_dir / "surface.log", "ab")
+        except OSError:
+            self._log = None
+        argv = [
+            python_executable(), str(self.script),
+            "--root", str(self.root), "--world", self.world_id,
+            "--session", self.session_id, "--live", "--force",
+        ]
+        self._child = self._spawn(
+            argv, cwd=str(TOWER_ROOT), stdout=self._log or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT, env=child_environment(),
+            stdin=subprocess.DEVNULL,
+        )
+        self._launches += 1
+        logger.info(
+            "[Tower][WorldBuilder] live surface %s launched (pid %s)",
+            self._launches, self._child.pid,
+        )
+        return True
+
+    def close(self) -> None:
+        """Terminate rather than abandon. A live surface is disposable: the
+        final one replaces it, so there is nothing to wait for at Stop.
+
+        `_terminate_process_tree` and not `Popen.terminate`, because the child
+        is a python launcher that spawns the real interpreter: killing only the
+        launcher leaves the GPU job running and the lock file held.
+        """
+        self._reap()
+        if self._child is None:
+            return
+        try:
+            _terminate_process_tree(self._child)
+        except Exception:  # noqa: BLE001 -- teardown must not mask the real exit
+            logger.exception("[Tower][WorldBuilder] could not stop the live surface child")
+        self._child = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+
 class BackgroundSolver:
     """Every global solve this builder runs, as a CHILD it owns.
 
@@ -1304,6 +1405,33 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
+        "--surface",
+        action="store_true",
+        help="reconstruct a surface: coarsely during the walk, whenever a "
+             "background solve lands, and at full resolution after Stop. "
+             "Needs --solve.",
+    )
+    parser.add_argument(
+        "--surface-script",
+        type=Path,
+        default=None,
+        help="override the live surface child's script (tests)",
+    )
+    parser.add_argument(
+        "--densify",
+        action="store_true",
+        help=(
+            "After the final build and the final solve, reconstruct a dense "
+            "point cloud from the solved cameras and persist it under "
+            "<world>/dense/<session>. Runs once, at the end, in this process "
+            "-- never on the frame path. It reads the world's own redacted "
+            "keyframe imagery, adds an artifact nothing else reads, and "
+            "changes neither derived/ nor the world's scale semantics, so a "
+            "failure leaves exactly the world you would have had. Costs "
+            "minutes: skipped outright on a hard stop."
+        ),
+    )
+    parser.add_argument(
         "--stop-on-stdin-close",
         action="store_true",
         help=(
@@ -1558,6 +1686,15 @@ def main(argv=None) -> int:
             capture_dirs=capture_dirs, script=args.solve_script,
         )
     background_solves = args.solve and args.solve_every > 0
+    # The live surface needs a global solve to exist at all, so it is only
+    # constructed when background solves are on. With `--solve-every 0` there
+    # is one solve, at the end, and nothing to show during the walk.
+    surfacer = None
+    if args.surface and background_solves:
+        surfacer = BackgroundSurface(
+            root=args.root.resolve(), world_id=world_id, session_id=session_id,
+            script=args.surface_script,
+        )
 
     # THE LIFECYCLE, IN ONE PLACE, AND IT UNWINDS.
     #
@@ -1660,6 +1797,12 @@ def main(argv=None) -> int:
                 )
                 if background_solves:
                     solver.maybe_launch(store, accepted, sources)
+                # A solve landing is the one moment the live surface can be
+                # rebuilt from geometry worth trusting, so the launch is here
+                # and not on a keyframe count. It is asked AFTER the solver,
+                # so a solve that is due wins the card.
+                if surfacer is not None and solve_landed:
+                    surfacer.maybe_launch(store, solver_running=solver.running)
         observe_seconds = time.perf_counter() - started
 
         # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?
@@ -1843,6 +1986,11 @@ def main(argv=None) -> int:
         if isinstance(exc, KeyboardInterrupt):
             exit_code = 130
     finally:
+        if surfacer is not None:
+            # Before the solver, because the live surface is the disposable
+            # one: whatever it was part-way through is replaced by the final
+            # build below, and leaving it holding the GPU would slow that down.
+            surfacer.close()
         if solver is not None:
             solver.close()
         try:
@@ -1919,6 +2067,73 @@ def main(argv=None) -> int:
                 "reason": "the global solve placed these segments",
             }
         )
+
+    # Dense reconstruction last, because it is the most expensive thing here
+    # and the least load-bearing: every other artifact is already on disk and
+    # complete before it starts. It is skipped rather than truncated on a hard
+    # stop -- the Job Object kills this tree on a 30-second grace and a
+    # half-written dense tree would be worse than none. Its own stages are
+    # checkpointed, so a later `scripts/world_densify.py` resumes rather than
+    # restarting.
+    if args.densify:
+        if stop_request.hard_asked_for():
+            report["dense"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_request.source}) during finalization",
+            }
+        elif not (solve_report or {}).get("solved"):
+            report["dense"] = {
+                "attempted": False,
+                "reason": "dense reconstruction needs a global solve; there is none",
+            }
+        else:
+            from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
+
+            dense_result = densify(
+                store, world_id, session_id,
+                should_stop=stop_request.hard_asked_for,
+            )
+            report["dense"] = {"attempted": True, **dense_result.as_dict()}
+
+    # The final surface, last of all and for the same reasons the dense stage
+    # is second to last: everything load-bearing is already on disk, and this
+    # is the most expensive thing here. It runs AFTER the dense stage so the
+    # two share one depth stage rather than each paying for it -- whichever
+    # runs first computes the per-frame depth maps and the other reads them.
+    #
+    # Skipped rather than truncated on a hard stop. The Job Object kills this
+    # tree on a 30-second grace and a half-written surface would be worse than
+    # none, which is why the artifact is published atomically and why the
+    # format checks its own length on read.
+    if args.surface:
+        if stop_request.hard_asked_for():
+            report["surface"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_request.source}) during finalization",
+            }
+        elif not (solve_report or {}).get("solved"):
+            report["surface"] = {
+                "attempted": False,
+                "reason": "a surface needs a global solve; there is none",
+            }
+        else:
+            from tower.world_builder.surface_pipeline import surfacify  # noqa: PLC0415
+
+            surface_result = surfacify(
+                store, world_id, session_id,
+                # `force`, because the live stage has almost certainly left a
+                # COARSE artifact for this same solve behind. Without it the
+                # "already built from this solve" short-circuit would see a
+                # matching digest and keep the walk-time reconstruction as the
+                # finished world -- the exact failure the final stage exists
+                # to prevent. The parameters differ, so the params digest
+                # differs too and the short-circuit would not in fact fire;
+                # this is belt and braces on the thing that would be worst to
+                # get wrong.
+                force=True,
+                should_stop=stop_request.hard_asked_for,
+            )
+            report["surface"] = {"attempted": True, **surface_result.as_dict()}
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

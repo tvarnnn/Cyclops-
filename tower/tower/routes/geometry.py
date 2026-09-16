@@ -117,6 +117,14 @@ def world_render(
     # web process knows a world builder only through the adapter below.
     # The adapter owns what "no view asked for" means.
     view: str | None = Query(default=None),
+    # Which reconstruction to serve. "auto" is the product default and means
+    # the best one this session actually has -- surface, then dense points,
+    # then sparse. The named values exist so a developer, a test, or the
+    # diagnostics screen can pin one and compare; naming a representation
+    # the session does not have falls back rather than failing, because the
+    # caller asking for a better picture should never get no picture.
+    representation: str = Query(
+        default="auto", pattern="^(auto|sparse|dense|surface)$"),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -133,7 +141,7 @@ def world_render(
     try:
         html = build_world_render(
             _store(request), world_id, session_id, max_points=max_points,
-            view=view,
+            view=view, representation=representation,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None

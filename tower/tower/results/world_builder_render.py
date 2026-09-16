@@ -20,6 +20,8 @@ second at the mobile point budget).
 
 from __future__ import annotations
 
+import logging
+
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import (
     DEFAULT_MAX_POINTS,
@@ -32,6 +34,8 @@ from tower.world_builder.store import (
     WorldStoreError,
     session_has_drawable_geometry,
 )
+
+logger = logging.getLogger(__name__)
 
 # A phone draws every point on a 2-D canvas on every gesture, so the
 # budget is lower than the operator's 200k default. Fractional-stride
@@ -162,9 +166,39 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
     return candidates[-1][1]
 
 
+class _ViewerModuleMissing(Exception):
+    """Stands in for a viewer's own "unavailable" type when its module did
+    not import at all.
+
+    The rungs below deliberately put the import OUTSIDE the `try` that
+    catches its exception, because binding the exception name inside that
+    `try` meant a broken viewer module left the name unbound and the
+    `except` clause raised `NameError` instead of falling back. Binding it
+    to `None` instead trades that for `TypeError: catching classes that do
+    not inherit from BaseException` -- the same failure with a different
+    word. It has to be bound to a real exception class, and one nothing
+    raises, so the clause is legal and never matches.
+    """
+
+
+REPRESENTATION_AUTO = "auto"
+REPRESENTATION_SPARSE = "sparse"
+REPRESENTATION_DENSE = "dense"
+REPRESENTATION_SURFACE = "surface"
+
+# The fallback ladder, best first. `auto` walks it and serves the first rung
+# this session actually has; a named representation starts the walk at its own
+# rung so "give me dense" never silently serves something better or worse
+# without saying so. The rung that is reached is reported in the page and in
+# the worlds listing, so "what am I looking at" is never a guess.
+REPRESENTATION_LADDER = (REPRESENTATION_SURFACE, REPRESENTATION_DENSE,
+                         REPRESENTATION_SPARSE)
+
+
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
                        max_points: int | None = None,
-                       view: str | None = None) -> str:
+                       view: str | None = None,
+                       representation: str = REPRESENTATION_AUTO) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -179,6 +213,95 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
+    # Walk the ladder from the requested rung down. A session that has a
+    # surface gets the surface, because that is the whole point of having
+    # built one; one that has only points gets points; every world built
+    # before either stage existed falls through to the sparse page unchanged.
+    wanted = (representation if representation in REPRESENTATION_LADDER
+              else REPRESENTATION_SURFACE)
+    start = REPRESENTATION_LADDER.index(wanted)
+
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE):
+        # Same shape as the dense rung below, and for the same reason: the
+        # import sits OUTSIDE the try that catches its exception, so a
+        # surface module that will not import degrades to the next rung
+        # instead of raising a NameError out of the except clause.
+        try:
+            from tower.world_builder.surface_render import (  # noqa: PLC0415
+                SurfaceViewerUnavailable,
+                build_surface_page,
+            )
+        except Exception:  # noqa: BLE001 -- a surface module that will not import
+            logger.exception(
+                "[Tower][WorldBuilder] the surface viewer module did not import "
+                "for %s; falling back", world_id,
+            )
+            SurfaceViewerUnavailable = _ViewerModuleMissing  # noqa: N806
+            build_surface_page = None
+        try:
+            if build_surface_page is None:
+                raise RuntimeError("surface viewer unavailable")
+            return build_surface_page(store, world_id, chosen,
+                                      max_points=max_points)
+        except SurfaceViewerUnavailable as exc:
+            if representation == REPRESENTATION_SURFACE:
+                raise WorldRenderUnavailable(exc.reason) from None
+        except Exception:  # noqa: BLE001 -- never lose the world to a surface bug
+            logger.exception(
+                "[Tower][WorldBuilder] surface viewer failed for %s; falling back",
+                world_id,
+            )
+
+    if representation != REPRESENTATION_SPARSE:
+        # THE IMPORT IS OUTSIDE THE try THAT CATCHES ITS EXCEPTION.
+        #
+        # `DenseViewerUnavailable` used to be bound by an import inside the
+        # same `try` whose first `except` names it. If that import raised --
+        # the one class of bug the fallback below exists for, a broken dense
+        # module -- Python evaluated the first except clause, hit a NameError
+        # on the unbound name, and propagated THAT. Later clauses of the same
+        # try are not tried, so the "never lose the sparse page to a dense bug"
+        # fallback never ran and the route returned 500.
+        try:
+            from tower.world_builder.dense import (  # noqa: PLC0415
+                POINT_STRIDE_BYTES,
+            )
+            from tower.world_builder.dense_render import (  # noqa: PLC0415
+                MOBILE_BYTE_BUDGET,
+                DenseViewerUnavailable,
+                build_dense_page,
+            )
+        except Exception:  # noqa: BLE001 -- a dense module that will not import
+            logger.exception(
+                "[Tower][WorldBuilder] the dense viewer module did not import "
+                "for %s; serving sparse", world_id,
+            )
+            DenseViewerUnavailable = _ViewerModuleMissing  # noqa: N806
+            build_dense_page = None
+
+        try:
+            if build_dense_page is None:
+                raise RuntimeError("dense viewer unavailable")
+
+            # `max_points` is validated by the route and must not then be
+            # ignored: the worlds contract calls it "point budget", and a
+            # client that asks for fewer points has to get fewer. It was
+            # dropped on this path, so `max_points=1` returned 295,000 points
+            # and a 6 MB page. Converted to the byte budget this viewer speaks,
+            # and only ever downwards -- the phone default stays the default.
+            budget = MOBILE_BYTE_BUDGET
+            if max_points is not None:
+                budget = min(budget, max(1, int(max_points)) * POINT_STRIDE_BYTES)
+            return build_dense_page(store, world_id, chosen, budget_bytes=budget)
+        except DenseViewerUnavailable as exc:
+            if representation == REPRESENTATION_DENSE:
+                raise WorldRenderUnavailable(exc.reason) from None
+        except Exception:  # noqa: BLE001 -- never lose the sparse page to a dense bug
+            logger.exception(
+                "[Tower][WorldBuilder] dense viewer failed for %s; serving sparse",
+                world_id,
+            )
+
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
         return render_html(store, world_id, chosen, max_points=budget,

@@ -1,0 +1,469 @@
+"""The surface stage, tested by outcome.
+
+The scene is synthetic and its answer is known by construction: a box room
+with a slab in it, seen by cameras placed around the inside. That makes it
+possible to ask the questions that matter -- is there surface where a camera
+looked, is there NO surface where none did, does a thing that moved get
+carved away -- rather than asserting that some function returned something.
+
+The refusals are tested as outcomes too. A stage that cannot run has to say
+so and leave nothing behind; the whole point of the artifact discipline is
+that a half-written reconstruction never becomes the world.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+
+import numpy as np
+import pytest
+
+from tower.world_builder import surface as S
+
+
+# ---------------------------------------------------------------------------
+# a synthetic room, and cameras that look at it
+# ---------------------------------------------------------------------------
+
+ROOM = 3.0          # half-extent of the room, in scene units
+WALL_Z = ROOM       # the far wall
+
+
+def _camera(K_f=300.0, w=160, h=120):
+    return np.array([[K_f, 0, w / 2], [0, K_f, h / 2], [0, 0, 1.0]]), w, h
+
+
+def _look_from(eye, target, up=(0.0, -1.0, 0.0)):
+    """World-to-camera (R, t) for a camera at `eye`, OpenCV axes."""
+    eye = np.asarray(eye, float)
+    z = np.asarray(target, float) - eye
+    z /= np.linalg.norm(z)
+    x = np.cross(z, np.asarray(up, float))
+    x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    R_wc = np.stack([x, y, z], axis=1)        # columns
+    R = R_wc.T                                # world-to-camera
+    return R, -R @ eye
+
+
+def _render_box_depth(R, t, K, w, h, *, slab=None):
+    """Exact depth of a box room (and an optional slab) by ray casting.
+
+    Analytic rather than rasterised, so the test's ground truth has no
+    reconstruction in it.
+    """
+    C = -R.T @ t
+    uu, vv = np.meshgrid(np.arange(w) + 0.5, np.arange(h) + 0.5)
+    dirs_cam = np.stack([(uu - K[0, 2]) / K[0, 0],
+                         (vv - K[1, 2]) / K[1, 1],
+                         np.ones_like(uu)], -1)
+    dirs = dirs_cam @ R                       # R^T applied on the right
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
+
+    best = np.full((h, w), np.inf)
+
+    def slab_hit(lo, hi):
+        nonlocal best
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t0 = (lo - C) / dirs
+            t1 = (hi - C) / dirs
+        tmin = np.minimum(t0, t1).max(axis=-1)
+        tmax = np.maximum(t0, t1).min(axis=-1)
+        hit = (tmax >= np.maximum(tmin, 1e-6))
+        cand = np.where(hit, np.where(tmin > 1e-6, tmin, tmax), np.inf)
+        best = np.minimum(best, np.where(np.isfinite(cand), cand, np.inf))
+
+    # the room is the inside of a box: its far side is what a ray hits
+    slab_hit(np.array([-ROOM, -ROOM, -ROOM]), np.array([ROOM, ROOM, ROOM]))
+    if slab is not None:
+        slab_hit(np.asarray(slab[0], float), np.asarray(slab[1], float))
+    depth = best * dirs_cam[..., 2] / np.linalg.norm(dirs_cam, axis=-1)
+    return np.where(np.isfinite(depth), depth, np.nan).astype(np.float32)
+
+
+def _fuse(views, *, params=None, voxel=0.05, trunc=None, slab=None,
+          device="cpu"):
+    import torch
+
+    torch_dev = torch.device(device)
+    params = params or S.SurfaceParams()
+    K, w, h = _camera()
+    trunc = trunc if trunc is not None else 4 * voxel
+    vol = S.SurfaceVolume(voxel, trunc, device=torch_dev)
+
+    prepared = []
+    for eye, target, view_slab in views:
+        R, t = _look_from(eye, target)
+        d = _render_box_depth(R, t, K, w, h, slab=view_slab)
+        zt = torch.as_tensor(d, device=torch_dev)
+        ok = torch.isfinite(zt) & (zt > 1e-3)
+        rgb = torch.full((h, w, 3), 200.0, device=torch_dev)
+        prepared.append((zt, ok, rgb,
+                         torch.as_tensor(R, device=torch_dev).float(),
+                         torch.as_tensor(t, device=torch_dev).float()))
+
+    keys = [vol.blocks_for_depth(z, ok, R, t, K) for z, ok, _, R, t in prepared]
+    vol.reserve(torch.cat(keys))
+    for z, ok, rgb, R, t in prepared:
+        vol.integrate(z, ok, rgb, R, t, K, params=params)
+    return vol
+
+
+def _ring(n=8, radius=1.6, slab=None):
+    out = []
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        eye = np.array([radius * math.cos(a), 0.0, radius * math.sin(a)])
+        out.append((eye, eye * 3.0, slab))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the format
+# ---------------------------------------------------------------------------
+
+
+class TestTheMeshFormatIsSelfChecking:
+    """A torn artifact must be refused on read, not misread.
+
+    This is the `BadZipFile` lesson expressed in a format: the reader lives
+    in a different process from the writer, and the failure that ended a
+    795-keyframe session was a file that looked plausible until it did not.
+    """
+
+    def _mesh(self, n_v=400, n_f=700):
+        rng = np.random.default_rng(7)
+        V = (rng.normal(size=(n_v, 3)) * 2).astype(np.float32)
+        F = rng.integers(0, n_v, size=(n_f, 3)).astype(np.int64)
+        C = rng.integers(0, 256, size=(n_v, 3)).astype(np.uint8)
+        return V, F, C
+
+    def test_a_mesh_survives_the_round_trip(self):
+        V, F, C = self._mesh()
+        N = S.vertex_normals(V, F)
+        V2, F2, C2, N2 = S.read_mesh_bytes(S.write_mesh_bytes(V, F, C, N))
+        assert np.array_equal(F, F2)
+        assert np.array_equal(C, C2)
+        span = float((V.max(0) - V.min(0)).max())
+        # positions are quantised to 16 bits across the mesh's own box
+        assert np.abs(V - V2).max() < span / 30000
+
+    def test_quantisation_is_far_finer_than_the_voxel_it_describes(self):
+        """The compression must not be visible in the geometry."""
+        V, F, C = self._mesh()
+        V2, _, _, _ = S.read_mesh_bytes(S.write_mesh_bytes(V, F, C))
+        span = float((V.max(0) - V.min(0)).max())
+        voxel = span / 200        # a generous voxel for a scene this size
+        assert np.abs(V - V2).max() < voxel / 100
+
+    @pytest.mark.parametrize("cut", ["header", "half", "one_byte"])
+    def test_a_truncated_buffer_is_refused(self, cut):
+        V, F, C = self._mesh()
+        buf = S.write_mesh_bytes(V, F, C)
+        sliced = {"header": buf[:10], "half": buf[:len(buf) // 2],
+                  "one_byte": buf[:-1]}[cut]
+        with pytest.raises(S.SurfaceUnavailable):
+            S.read_mesh_bytes(sliced)
+
+    def test_a_foreign_buffer_is_refused(self):
+        with pytest.raises(S.SurfaceUnavailable):
+            S.read_mesh_bytes(b"NOTAMESH" + b"\0" * 64)
+
+    def test_a_future_schema_is_refused_rather_than_guessed(self):
+        V, F, C = self._mesh()
+        buf = bytearray(S.write_mesh_bytes(V, F, C))
+        buf[20:24] = (S.SURFACE_SCHEMA_VERSION + 1).to_bytes(4, "little")
+        with pytest.raises(S.SurfaceUnavailable):
+            S.read_mesh_bytes(bytes(buf))
+
+    def test_an_empty_mesh_is_a_legal_artifact(self):
+        """An honest "nothing was reconstructed" must round-trip, because the
+        alternative is a reader that cannot distinguish it from corruption."""
+        buf = S.write_mesh_bytes(np.zeros((0, 3), np.float32),
+                                 np.zeros((0, 3), np.int64), None)
+        V, F, C, N = S.read_mesh_bytes(buf)
+        assert len(V) == 0 and len(F) == 0
+
+    def test_small_meshes_use_16_bit_indices(self):
+        """Same face count, different vertex count: the index width is the
+        only thing that may differ, and it must narrow when it safely can."""
+        header, per_vertex = 48, 9        # uint16[3] position + uint8[3] colour
+        faces = 120
+        small = len(S.write_mesh_bytes(*self._mesh(n_v=100, n_f=faces)))
+        big = len(S.write_mesh_bytes(*self._mesh(n_v=70000, n_f=faces)))
+        assert small - header - 100 * per_vertex == faces * 3 * 2
+        assert big - header - 70000 * per_vertex == faces * 3 * 4
+
+
+# ---------------------------------------------------------------------------
+# the field
+# ---------------------------------------------------------------------------
+
+
+class TestSurfaceAppearsOnlyWhereACameraLooked:
+
+    def test_a_watched_wall_becomes_surface(self):
+        vol = _fuse([(np.array([0.0, 0.0, -1.5]), np.array([0.0, 0.0, 5.0]), None)])
+        V, F, C = vol.extract_mesh(min_weight=0.5)
+        assert len(F) > 0, "a camera looking straight at a wall produced no surface"
+        # the wall it looked at is at z = +ROOM
+        near_wall = np.abs(V[:, 2] - WALL_Z) < 0.25
+        assert near_wall.mean() > 0.5
+
+    def test_space_no_camera_measured_stays_absent(self):
+        """The whole claim of the format. One camera looking one way must not
+        produce a closed room."""
+        vol = _fuse([(np.array([0.0, 0.0, -1.5]), np.array([0.0, 0.0, 5.0]), None)])
+        V, F, C = vol.extract_mesh(min_weight=0.5)
+        behind = V[:, 2] < -ROOM + 0.3
+        assert behind.mean() < 0.02, (
+            "surface appeared on the wall behind the camera, which nothing "
+            "observed -- the extractor is closing over unobserved space")
+
+    def test_evidence_threshold_gates_the_surface(self):
+        vol = _fuse([(np.array([0.0, 0.0, -1.5]), np.array([0.0, 0.0, 5.0]), None)])
+        _, few, _ = vol.extract_mesh(min_weight=0.5)
+        _, many, _ = vol.extract_mesh(min_weight=50.0)
+        assert len(many) < len(few)
+
+    def test_more_viewpoints_produce_more_surface(self):
+        """The live promise: the scene fills in as the wearer keeps looking."""
+        counts = []
+        for n in (1, 3, 8):
+            vol = _fuse(_ring(n=n))
+            _, F, _ = vol.extract_mesh(min_weight=0.5)
+            counts.append(len(F))
+        assert counts[0] < counts[1] < counts[2], counts
+
+
+class TestFreeSpaceCarving:
+
+    def test_a_thing_that_moved_away_is_carved_out(self):
+        """A slab present in one frame and gone in the rest must not survive.
+
+        This is the dog, and the wearer's hands. A point pipeline keeps them
+        because every point was genuinely measured once; a field deletes them
+        because later frames measured the emptiness they left behind.
+
+        The cameras are placed explicitly rather than taken from `_ring`,
+        because the test camera has a 15 degree half-angle and ring cameras
+        looking outward never see through each other's subject -- the first
+        version of this test created no ghost at all and asserted on it.
+        Here four cameras on one side look straight through the slab's
+        position at the far wall, which is exactly the evidence carving needs.
+        """
+        slab = (np.array([2.0, -0.45, -0.45]), np.array([2.4, 0.45, 0.45]))
+        far = np.array([3.0, 0.0, 0.0])
+
+        views = [(np.array([1.0, 0.0, 0.0]), far, slab)]          # sees it
+        for dy, dz in ((0.0, 0.0), (0.25, 0.0), (0.0, 0.25), (-0.2, -0.2)):
+            views.append((np.array([-1.6, dy, dz]), far, None))   # sees through
+
+        in_slab = lambda V: np.all(
+            (V > slab[0] - 0.12) & (V < slab[1] + 0.12), axis=1)
+
+        V_on, _, _ = _fuse(views, params=S.SurfaceParams(carve=True)
+                           ).extract_mesh(min_weight=0.5)
+        V_off, _, _ = _fuse(views, params=S.SurfaceParams(carve=False)
+                            ).extract_mesh(min_weight=0.5)
+
+        ghost_on, ghost_off = int(in_slab(V_on).sum()), int(in_slab(V_off).sum())
+        assert ghost_off > 0, "the test did not manage to create a ghost at all"
+        assert ghost_on < ghost_off * 0.5, (
+            f"carving left {ghost_on} of {ghost_off} ghost vertices; a thing "
+            f"seen once and then seen through should not survive")
+
+    def test_carving_does_not_delete_a_surface_everything_agrees_on(self):
+        """The other half of the claim. Carving that ate real geometry would
+        pass the test above and be useless."""
+        views = [(np.array([-1.6, dy, dz]), np.array([3.0, 0.0, 0.0]), None)
+                 for dy, dz in ((0.0, 0.0), (0.25, 0.0), (0.0, 0.25), (-0.2, -0.2))]
+        on = len(_fuse(views, params=S.SurfaceParams(carve=True)
+                       ).extract_mesh(min_weight=0.5)[1])
+        off = len(_fuse(views, params=S.SurfaceParams(carve=False)
+                        ).extract_mesh(min_weight=0.5)[1])
+        assert on > off * 0.8, (
+            f"carving cut the agreed surface from {off} to {on} faces")
+
+
+class TestTruncationMustExceedTheDisagreement:
+    """The finding that decided coverage, kept as a regression.
+
+    Frames disagree with each other by a few percent of scene depth. If the
+    truncation band is narrower than that disagreement, a frame that ran long
+    writes free space exactly where a correct frame wrote surface, and the two
+    erase each other. A narrower truncation is not a tighter reconstruction.
+    """
+
+    def _noisy(self, rel_error, trunc_voxels, voxel=0.05):
+        import torch
+
+        rng = np.random.default_rng(3)
+        K, w, h = _camera()
+        vol = S.SurfaceVolume(voxel, trunc_voxels * voxel, device=torch.device("cpu"))
+        prepared = []
+        for eye, target, _ in _ring(n=10):
+            R, t = _look_from(eye, target)
+            d = _render_box_depth(R, t, K, w, h)
+            d = d * (1.0 + rng.normal(0, rel_error))      # per-frame scale error
+            zt = torch.as_tensor(d, device=vol.dev)
+            ok = torch.isfinite(zt) & (zt > 1e-3)
+            prepared.append((zt, ok, torch.full((h, w, 3), 200.0, device=vol.dev),
+                             torch.as_tensor(R, device=vol.dev).float(),
+                             torch.as_tensor(t, device=vol.dev).float()))
+        vol.reserve(torch.cat([vol.blocks_for_depth(z, ok, R, t, K)
+                               for z, ok, _, R, t in prepared]))
+        for z, ok, rgb, R, t in prepared:
+            vol.integrate(z, ok, rgb, R, t, K, params=S.SurfaceParams())
+        _, F, _ = vol.extract_mesh(min_weight=0.5)
+        return len(F)
+
+    def test_a_truncation_narrower_than_the_error_loses_surface(self):
+        # median depth here is about 3 units, so 3% is ~0.09 -- wider than a
+        # 1-voxel (0.05) band and narrower than an 8-voxel one
+        narrow = self._noisy(0.03, trunc_voxels=1.0)
+        wide = self._noisy(0.03, trunc_voxels=8.0)
+        assert wide > narrow * 1.2, (
+            f"narrow truncation kept {narrow} faces and wide kept {wide}; the "
+            f"frames were supposed to carve each other out at the narrow band")
+
+    def test_truncation_is_raised_to_the_measured_error(self):
+        p = S.SurfaceParams(trunc_voxels=3.0, trunc_error_multiple=2.0)
+        # 2.3% of a 4.07 scene is 0.094; two of those is 0.187, well over
+        # three voxels of 0.024
+        got = S.truncation_for(p, voxel=0.0244, median_depth=4.07,
+                               median_held_out_rel=0.023)
+        assert got == pytest.approx(2.0 * 0.023 * 4.07, rel=1e-6)
+
+    def test_truncation_never_falls_below_the_voxel_floor(self):
+        p = S.SurfaceParams(trunc_voxels=3.0, trunc_error_multiple=2.0)
+        got = S.truncation_for(p, voxel=0.05, median_depth=4.0,
+                               median_held_out_rel=0.0001)
+        assert got == pytest.approx(0.15)
+
+    def test_a_world_with_no_measured_error_still_gets_a_truncation(self):
+        p = S.SurfaceParams()
+        assert S.truncation_for(p, 0.02, 4.0, None) == pytest.approx(0.06)
+
+
+class TestEveryLengthScalesWithTheScene:
+    """The gauge is arbitrary: `global_solve` never calls `normalize()`, and
+    the same room has solved to a ten-unit extent and a three-hundred-unit
+    one. A parameter expressed in absolute units would shatter one and
+    collapse the other."""
+
+    def test_the_same_scene_at_two_gauges_reconstructs_the_same_way(self):
+        import torch
+
+        def faces_at(gauge):
+            K, w, h = _camera()
+            p = S.SurfaceParams()
+            voxel = p.voxel_frac * 3.0 * gauge
+            vol = S.SurfaceVolume(voxel, 4 * voxel, device=torch.device("cpu"))
+            prepared = []
+            for eye, target, _ in _ring(n=4):
+                R, t = _look_from(eye, target)
+                d = _render_box_depth(R, t, K, w, h) * gauge
+                R2, t2 = R, t * gauge
+                zt = torch.as_tensor(d, device=vol.dev)
+                ok = torch.isfinite(zt) & (zt > 1e-3)
+                prepared.append((zt, ok, torch.full((h, w, 3), 200.0, device=vol.dev),
+                                 torch.as_tensor(R2, device=vol.dev).float(),
+                                 torch.as_tensor(t2, device=vol.dev).float()))
+            vol.reserve(torch.cat([vol.blocks_for_depth(z, ok, R, t, K)
+                                   for z, ok, _, R, t in prepared]))
+            for z, ok, rgb, R, t in prepared:
+                vol.integrate(z, ok, rgb, R, t, K, params=p)
+            _, F, _ = vol.extract_mesh(min_weight=0.5)
+            return len(F)
+
+        small, large = faces_at(1.0), faces_at(12.0)
+        assert large == pytest.approx(small, rel=0.15), (
+            f"the same room reconstructed to {small} faces at one gauge and "
+            f"{large} at another; a length is absolute somewhere")
+
+
+class TestBlockKeysRefuseToAlias:
+    """`voxel_reduce` learned this the hard way: outside the keyable range two
+    cells share a key and the reduction silently MERGES them, averaging points
+    from opposite ends of a scene into one."""
+
+    def test_a_coordinate_outside_the_range_raises(self):
+        import torch
+
+        bc = torch.tensor([[1 << 22, 0, 0]], dtype=torch.int64)
+        with pytest.raises(S.SurfaceUnavailable):
+            S.block_key(bc)
+
+    def test_keys_round_trip_inside_the_range(self):
+        import torch
+
+        bc = torch.tensor([[-5, 12, 900], [0, 0, 0], [7, -3, 1]], dtype=torch.int64)
+        assert torch.equal(S.block_coords(S.block_key(bc)), bc)
+
+
+# ---------------------------------------------------------------------------
+# mesh cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestMeshCleanup:
+
+    def _two_components(self):
+        """One big grid and one tiny detached triangle."""
+        n = 12
+        xs, ys = np.meshgrid(np.arange(n), np.arange(n))
+        V = np.stack([xs.ravel(), ys.ravel(), np.zeros(n * n)], 1).astype(np.float32)
+        F = []
+        for i in range(n - 1):
+            for j in range(n - 1):
+                a = i * n + j
+                F += [[a, a + 1, a + n], [a + 1, a + n + 1, a + n]]
+        F = np.array(F, np.int64)
+        V2 = np.vstack([V, np.array([[50, 50, 0], [51, 50, 0], [50, 51, 0]], np.float32)])
+        F2 = np.vstack([F, np.array([[len(V), len(V) + 1, len(V) + 2]], np.int64)])
+        C = np.full((len(V2), 3), 128, np.uint8)
+        return V2, F2, C
+
+    def test_a_tiny_island_is_dropped(self):
+        V, F, C = self._two_components()
+        V2, F2, C2, stats = drop = S.drop_small_components(V, F, C, 0.01)
+        assert stats["components"] == 2
+        assert stats["dropped"] == 1
+        assert len(F2) == len(F) - 1
+        assert V2.max() < 40, "the far island survived"
+
+    def test_nothing_is_dropped_when_the_threshold_is_off(self):
+        V, F, C = self._two_components()
+        _, F2, _, stats = S.drop_small_components(V, F, C, 0.0)
+        assert len(F2) == len(F)
+
+    def test_smoothing_moves_vertices_without_collapsing_the_model(self):
+        V, F, C = self._two_components()
+        V2, moved = S.taubin_smooth(V, F, iterations=6, lam=0.5, mu=-0.53)
+        assert moved >= 0
+        before = np.ptp(V[:144], axis=0)
+        after = np.ptp(V2[:144], axis=0)
+        # Taubin's expanding pass is what stops a Laplacian smooth from
+        # shrinking the room; allow a little loss, not a collapse
+        assert (after[:2] > before[:2] * 0.9).all(), (before, after)
+
+    def test_smoothing_is_a_no_op_at_zero_iterations(self):
+        V, F, C = self._two_components()
+        V2, moved = S.taubin_smooth(V, F, 0, 0.5, -0.53)
+        assert moved == 0.0
+        assert np.array_equal(V, V2)
+
+
+class TestVertexNormals:
+
+    def test_a_flat_sheet_has_one_normal(self):
+        V = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], np.float32)
+        F = np.array([[0, 1, 2], [1, 3, 2]], np.int64)
+        N = S.vertex_normals(V, F)
+        assert np.allclose(np.abs(N[:, 2]), 1.0, atol=1e-5)
+
+    def test_an_empty_mesh_has_no_normals_and_does_not_raise(self):
+        N = S.vertex_normals(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64))
+        assert N.shape == (0, 3)

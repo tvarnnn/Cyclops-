@@ -125,7 +125,29 @@ FILL_VALUE = 0
 # 1439 -> 1437, keyframes 5 -> 5, points 1634 -> 1627.
 JPEG_QUALITY = 90
 
-DEFAULT_MODEL_PATH = Path("models") / "face_detection_yunet_2023mar.onnx"
+MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+
+# WHERE THE WEIGHTS ARE, INDEPENDENTLY OF WHERE THE PROCESS WAS STARTED.
+#
+# This used to be `Path("models") / MODEL_FILENAME`, resolved against the
+# current working directory. A Tower or a script started from anywhere but
+# `tower/` therefore found no model, `FaceRedactor.available` was False, and
+# the consequence is not an error: `engine.py` logs a warning and persists the
+# keyframe UNREDACTED, and `redact()` returns the original bytes labelled
+# `none`. So a privacy transformation was silently conditional on a caller's
+# cwd. It was found when a batch script run from a scratch directory refused
+# 429 of 429 frames -- refusing is the safe direction, and only the dense
+# stage's own check made it visible at all.
+#
+# The package's own location is the honest anchor: `tower/tower/world_builder/`
+# -> `tower/models/`. The cwd-relative path is still tried, so an existing
+# deployment that relies on it keeps working, and the environment override
+# still wins over both.
+_PACKAGE_MODEL_PATH = Path(__file__).resolve().parents[2] / "models" / MODEL_FILENAME
+_CWD_MODEL_PATH = Path("models") / MODEL_FILENAME
+
+# Kept as the name other modules and tests import.
+DEFAULT_MODEL_PATH = _PACKAGE_MODEL_PATH
 
 
 @dataclass(frozen=True)
@@ -153,7 +175,10 @@ def model_path() -> Path | None:
     if override:
         candidate = Path(override.strip())
         return candidate if candidate.exists() else None
-    return DEFAULT_MODEL_PATH if DEFAULT_MODEL_PATH.exists() else None
+    for candidate in (_PACKAGE_MODEL_PATH, _CWD_MODEL_PATH):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class FaceRedactor:

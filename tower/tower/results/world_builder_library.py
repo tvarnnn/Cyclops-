@@ -65,6 +65,47 @@ def _has_geometry(store: WorldStore, world_id: str, session_id: str, manifest) -
     return session_has_drawable_geometry(store, world_id, session_id, manifest)
 
 
+def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """What dense reconstruction this session has, or None.
+
+    ADDITIVE, and the contract identifier deliberately does not move. iOS
+    parses these payloads with `JSONSerialization` into `[String: Any]` and
+    reads them key by key, so a key it does not know is a key it never looks
+    at -- but it equality-tests `contract` on the first line of every guard, so
+    bumping that would empty the gallery on every older build. A world with no
+    dense artifact reports `null` and behaves exactly as it does today.
+    """
+    from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+        dense_currency,
+        read_dense_manifest,
+    )
+
+    manifest = read_dense_manifest(store, world_id, session_id)
+    if not manifest:
+        return None
+    levels = manifest.get("levels") or []
+    canonical = manifest.get("canonical_level", 0)
+    mobile = manifest.get("mobile_level", len(levels) - 1)
+    return {
+        "format": manifest.get("format"),
+        "levels": len(levels),
+        "canonical_points": (levels[canonical]["points"]
+                             if canonical < len(levels) else None),
+        "mobile_points": (levels[mobile]["points"] if mobile < len(levels) else None),
+        # Repeated from the manifest rather than re-derived. The dense stage
+        # makes no scale claim the sparse solve did not already make.
+        "scale": manifest.get("scale"),
+        # Whether this cloud was fused against the solve now on disk. False
+        # after a re-solve; None when it cannot be known, which is not the
+        # same thing and must not be shown as staleness. The render page
+        # carries the same fact as a caption; this is so a gallery can mark it
+        # without fetching an 8 MB page.
+        "solve_current": dense_currency(
+            store, world_id, session_id, manifest,
+            include_derived=False).get("solve_current"),
+    }
+
+
 def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> int:
     """How many keyframes the journal holds, whatever the record says.
 
@@ -371,6 +412,9 @@ def build_world_listing(store: WorldStore) -> dict:
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.
                 "finalization": session.finalization,
+                # Additive, and null on every world built before the dense
+                # stage existed: what dense reconstruction this session holds.
+                "dense": _dense_summary(store, world_id, session_id),
             })
         # `_sortable` HERE TOO, and its absence here was the whole
         # argument for it thirty lines below.

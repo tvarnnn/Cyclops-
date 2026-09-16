@@ -1,0 +1,548 @@
+# World Builder dense reconstruction — established facts
+
+- Lane branch: `world-builder/dense-reconstruction-v1`
+- Worktree: `C:\Users\tvllo\Projects\Glasses-worktrees\wb-dense`
+- Scratch: `C:\Users\tvllo\Projects\Glasses-scratch\wb-dense`
+- Branched from `integration/all-cartridges-v1` @ `9e939a3`
+- Date: 2026-09-08
+
+Everything here was measured on this machine. Where a figure came from a
+subagent, the report it came from is named.
+
+> **Sections 1-10 are a build log and their numbers are dated.** They record
+> what was measured while the stage was being designed, under whatever
+> configuration was current at the time -- including a different depth network.
+> **Section 11 is the shipped configuration, re-measured on all seven worlds
+> after the branch stopped moving.** Quote section 11. Where an earlier section
+> conflicts with it, section 11 is right and the earlier one is kept because the
+> reasoning it supports is still the reasoning that was used.
+
+---
+
+## 1. The baseline, and the two separate reasons it is not recognizable
+
+`scripts/world_inspect.py` on the reference world `7d31e8d7acde46808b7a31f1b7bc211e`:
+
+| quantity | value |
+| --- | --- |
+| frames observed | 1371 |
+| keyframes accepted | 438 |
+| pose status | 395 solved, 34 anchor, 9 unavailable |
+| sparse points | 14,953 |
+| segments | 34 |
+| scale state | `unknown` — no unit at all |
+
+`scripts/world_render.py` draws those points **coloured by segment index**. Two
+distinct problems are visible in that render and they should not be conflated:
+
+1. **Density.** 14.9k points recovered from 436 posed 359x639 views. Those views
+   hold roughly 98 million pixel observations, so the sparse reconstruction
+   retains about **0.015%** of the available visual evidence. That is the
+   headroom the mission asked about.
+2. **Colour.** `solution.npz` already carries a per-point `rgb` array. The
+   renderer ignores it, and the contract admits it: `WORLD-BUILDER-GEOMETRY.md`
+   says colour is *"not yet carried on the chunk"*. Re-rendering the same 14.9k
+   points with their true RGB already reveals planar structure that the
+   segment-coloured render destroys.
+
+So the sparse appearance was never evidence that the input data is thin.
+
+## 2. The global solve is a sound backbone — keep it
+
+`solve/<session>/solution.json` reports `solver: "glomap"`, 438 keyframes, 436
+poses, **2 components** (429 and 7). The 34-segment mosaic under `derived/` is
+the older fragment-registration path; the global solve is a single
+reconstruction, and it is good:
+
+| quantity | value |
+| --- | --- |
+| per-frame median reprojection error | **0.753 px** (p90 1.006, worst 1.859) |
+| observations | 184,982 |
+| observations per frame, median | 405 |
+| track length | median 5, p90 24, max 298 |
+| camera-centre extent | 10.2 x 8.4 x 13.9 world units |
+
+There is no reason to replace this. The dense work builds on top of it.
+
+## 3. Pose convention — verified, and NOT what `world.json` declares
+
+`world.json` declares `pose_type: "T_world_camera"` and says the stored
+translation is the camera centre. That describes the **derived** tree.
+`solve/solution.json` uses the opposite convention, which matters enormously to
+anything that back-projects pixels.
+
+Tested by projecting the solved 3-D points into each frame and comparing against
+the stored `observation_xy`:
+
+| candidate | median error |
+| --- | --- |
+| `R @ X + t` | **0.615 px** |
+| `R @ (X - t)` | 110.7 px |
+| `R.T @ X + t` | 169.9 px |
+| `R.T @ (X - t)` | 262.3 px |
+
+So in `solution.json`, `rotation` is `R_camera_world` and `translation` is
+COLMAP's `tvec` — exactly COLMAP's convention. Camera centre is `C = -R.T @ t`.
+This is codified in `proto/solveio.py`, whose `unproject` then `project` round
+trip is exact to 0.00000 px.
+
+**This discrepancy between the two artifacts is a documentation bug worth
+fixing**, independent of the dense work.
+
+## 4. Calibration and resolution — the hard ceiling
+
+There is a genuine self-calibration, not an assumption:
+
+```
+model pinhole_radtan
+fx 438.225  fy 437.778  cx 174.877  cy 323.380
+dist [0.14395, -0.92780, 0.00151, 0.00233, 1.29980]
+calibrated 360x640, reprojection RMS 0.289 px over 511 views
+```
+
+`cv2.getOptimalNewCameraMatrix(alpha=0)` plus the ROI crop reproduces the
+solver's camera **exactly**: PINHOLE 359x639, fx 465.71872, fy 465.05395,
+cx 176.43702, cy 322.13759, ROI offset (0, 0).
+
+**Every frame in the corpus is 360x640 portrait — 0.23 MP.** All 97 captures,
+45,594 frames, one JPEG quantization table (report 01). This is the native
+capture, not a downscaled working copy. It fixes the honest resolution ceiling
+at roughly 6.4 mm per pixel at 3 m, with 1–3 cm depth noise (report 06).
+Therefore **2–3 cm voxels are truthful and 5 mm voxels would be fabricated**.
+
+## 5. Environment — three blockers found, two fixed
+
+| finding | status |
+| --- | --- |
+| `import cv2` raised `missing configuration file: config.py` | **FIXED.** `config.py` and `config-3.py` had been deleted from `site-packages/cv2/`. Their exact source was recovered from the surviving `__pycache__` bytecode and rewritten. cv2 5.0.0 now imports. 27 modules depend on it, including the World Builder pipeline. |
+| seven declared dependencies missing: `certifi`, `anyio`, `click`, `colorama`, `contourpy`, `annotated-types`, `annotated-doc` | **FIXED** by `pip install`. `pip check` is now clean. Tower could not have started before this: `fastapi` needs `annotated-doc` and `uvicorn` needs `click`. |
+| `pycolmap.has_cuda` is `False` | **REAL.** Calling `patch_match_stereo` raises *"Dense stereo reconstruction requires CUDA or HIP"*. The pycolmap Windows wheel has no CUDA and upstream says CUDA wheels are Linux-only. The fix is the prebuilt `colmap-x64-windows-cuda.zip` 4.2.0 binary, which statically links cudart and needs no toolkit (report 06). |
+
+GPU works: RTX 5070, compute capability **(12, 0)**, and this torch build lists
+`sm_120` in `get_arch_list()`. But there is **no MSVC and no CUDA toolkit newer
+than 11.8**, so *compiling* a CUDA extension is impossible today (report 05).
+That constraint, rather than model quality, eliminates several strong options.
+
+## 6. Licence constraints — several obvious choices are unusable
+
+This is a product, so licences are load-bearing:
+
+- **Depth Anything V2 Large and Base are CC-BY-NC-4.0.** The first prototype was
+  built on Large and must be replaced before shipping. V2 **Small is Apache-2.0**.
+- Original INRIA 3DGS and the forks Mip-Splatting, 2DGS, GOF, RaDe-GS,
+  3DGS-MCMC, Scaffold-GS, Octree-GS, AbsGS and Pixel-GS are **all
+  non-commercial**. `gsplat` (Apache-2.0) reimplements most of them as flags.
+- OpenMVS is **AGPL-3.0**, which matters for a networked Tower.
+- VGGT-Omega is FAIR Noncommercial; Pi3 weights are CC-BY-NC; Depth Anything 3's
+  *default* checkpoint is CC-BY-NC while BASE and SMALL are permissive.
+- Clean: `gsplat`, Brush (Apache-2.0), MoGe (MIT), Metric3D v2 (BSD-2),
+  LingBot-Map (Apache-2.0), COLMAP (BSD).
+
+## 7. What the corpus actually contains
+
+From report 01 (all 97 captures) and report 03 (all 162 worlds):
+
+- 97 captures, 45,594 frames, 0.95 GiB, 80.6 minutes of wall clock over 7 days.
+- Frame integrity is perfect: journal record count equals JPEG count for all 97.
+- **No intrinsics, no IMU, no orientation, no depth and no GPS in the captures.**
+  Self-calibration is mandatory. Timestamps are Tower receipt time, not sensor
+  time.
+- Of 162 worlds, **only 7 hold a real global solve**. 96 are empty shells and 41
+  are incremental-only builds with `placed: 0`.
+- The corpus is dominated by a **seated first-person view of a phone and a
+  laptop screen**, across two environments. Only about 8,000–12,000 frames in
+  8–10 captures carry real translation, and none of those captures had been
+  solved before this lane started.
+- Scale is arbitrary, and **the gauge is not normalised at all**. An early
+  reading attributed the reference world's tidy 10 x 8 x 14 extent to COLMAP's
+  `Normalize()`. That was wrong: `global_solve.py` never calls it. Solving eight
+  further captures produced gauges from a ten-unit extent to a **340 x 70 x 175**
+  one for the same kind of walk, so the reference world's tidy numbers were luck.
+  Two consequences: **use component 0 only**, since components are solved
+  independently and share no unit; and express **every** length as a fraction of
+  that component's own median scene depth, never in absolute world units.
+
+## 8. iOS reality — the viewer is ours to change
+
+From report 07:
+
+- There is **no `Codable` conformance anywhere** in the iOS target. Every World
+  Builder payload is parsed with `JSONSerialization` into `[String: Any]` and
+  read key by key, so unknown keys are ignored. Checked-in fixtures carrying
+  three unread keys prove it. **Additive `world.json` fields are safe.**
+- What does break it: bumping the `contract` identifier; re-typing an existing
+  field, since `json["points"] as? [[Double]]` is a whole-array cast so a single
+  `null` refuses the entire chunk, meaning colour must arrive as a **sibling**
+  key; or removing any guarded field.
+- **iOS renders 2-D dots.** No SceneKit, RealityKit, Metal or ARKit anywhere.
+  The native gallery draws 2x2-pt ellipses at top-down `(x, z)`, discarding `y`.
+- **The saved-world viewer is a `WKWebView` over HTML returned by
+  `GET /worlds/{id}/render`.** Tower therefore owns the viewer, and a real 3-D
+  renderer needs no Swift change. The route's CSP forbids every external
+  resource, so the page must be entirely inline.
+- `up_axis: "unknown"` is the stated reason the viewer is 2-D. Changing its
+  value is safe; removing the key is not.
+
+## 9. Architecture facts that constrain where a dense stage can live
+
+From report 02:
+
+- World Builder is **not an in-process cartridge**. It is a supervised child
+  process (`scripts/world_build_session.py`) that tails a capture directory and
+  itself spawns a grandchild for the global solve. `cartridge_runtime.py`
+  contains zero references to `world_builder`.
+- **`build()` is not Stop-only — it runs every 4 keyframes.** A dense stage must
+  not hook there.
+- The hook point is `scripts/world_build_session.py`, after the final build.
+  **This bullet used to say the writer lock is held and `finalization` is still
+  `pending`, and that describes a design that was not built.** What shipped
+  runs densify AFTER the `finally:` block that marks finalization complete and
+  releases the world -- deliberately, because holding the writer lock for the
+  minutes this takes would block a new capture on the same world. For the whole
+  dense run the world reports `ready` and the session `complete`, and
+  `dense/status.json` is the only record that anything is still running.
+- **`stop_grace_seconds = 30.0`** plus a Windows Job Object kills the whole
+  process tree. A minutes-long dense job needs a raised grace, checkpointing, or
+  an explicit skip-on-hard-stop.
+- **There is no migration machinery**: `require_schema` refuses any version but
+  1. A dense artifact must therefore be **additive and optional**, following the
+  existing `support.json` and `placements.json` precedent.
+
+---
+
+## 10. Corrections and later findings
+
+Recorded separately because each overturned something believed earlier in this
+lane, and in every case the wrong version was the more tempting one.
+
+### 10.1 The gauge is not normalised
+
+See section 7. Believed normalised to extent 10; it is not normalised at all.
+
+### 10.2 Most of the apparent "fusion error" was the evaluation renderer
+
+Held-out rendered depth from the fused cloud missed the sparse points by 6.3%,
+against 3.0% for the per-frame depth feeding it. That looked like fusion
+doubling the error. It was not:
+
+| what was measured | signed relative error |
+| --- | --- |
+| per-frame aligned depth, 345 frames | **+0.03% median** (mean -0.45%, 45% near) |
+| fused cloud rendered with 0.5 px splats | -2.9% |
+| fused cloud rendered with 1.0 px splats | -5.6% |
+| fused cloud rendered with 1.6 px splats | -6.0% |
+| fused cloud rendered with 2.5 px splats | -6.4% |
+
+The per-frame depth is **unbiased**. The bias is a function of splat radius, and
+its sign is toward the camera in 100% of frames, because a fat splat spills onto
+neighbouring pixels and a z-buffer keeps the nearest of them, which on any
+slanted surface is nearer than the truth. The geometry is about as good as the
+depth maps feeding it. The evaluator now measures depth from a separate
+near-point render, while appearance keeps the fat splat it needs for coverage.
+
+The lesson worth keeping: the evaluation renderer is part of the measurement
+apparatus, and it can be the thing that is wrong.
+
+### 10.3 Averaging agreeing cameras genuinely helps
+
+On identical held-out views:
+
+| | reference camera only | averaged over agreeing cameras |
+| --- | --- | --- |
+| rendered depth error, median | 7.42% | **6.32%** |
+| rendered depth error, p90 | 10.24% | **8.23%** |
+| PSNR | 14.87 | **15.22** |
+| voxels from the same 35.2 M points | 10.63 M | **8.73 M** |
+
+18% of the points were redundant surface thickness. Fewer points AND better
+depth is the signature of a real improvement rather than a trade.
+
+### 10.4 The face redactor fires on hands, and it is expensive here
+
+`redaction.py` runs YuNet at confidence 0.30, a documented compromise: below 0.2
+it fires on face-free frames, above 0.4 it misses small faces and faces on
+screens. On this corpus that compromise is costly. Over 77 frames of one
+capture, the filled area was:
+
+| | fraction of frame filled |
+| --- | --- |
+| median | 0.4% |
+| mean | 8.6% |
+| p90 | 33.0% |
+| worst | 57.8% |
+
+22 of 77 frames lose more than a tenth of the image, and inspection shows the
+boxes sitting on **the wearer's hands and on carpet**, not on faces.
+
+This is pre-existing rather than caused by the dense work: the same fill is
+baked into the keyframe images the sparse solve already used, and an earlier
+handoff measured it costing about 100 solved poses. But it hurts a dense stage
+far more, and the damage is not confined to the filled pixels:
+
+| redaction fill | frames | held-out residual, median | pass the 8% gate |
+| --- | --- | --- | --- |
+| under 1% | 37 | 6.9% | 65% |
+| 1-10% | 16 | 6.1% | 62% |
+| 10-30% | 13 | 10.3% | 46% |
+| over 30% | 7 | 34.8% | **0%** |
+
+A solid black rectangle drags the network's depth estimate for the whole frame,
+not only its own region. So the dense stage does two separate things: it
+**inpaints** the fill before the network sees it, to protect the rest of the
+frame, and it still **masks the fill out** of the reconstruction afterwards,
+because whatever the network puts there is invention. The region stays a hole.
+
+Worth doing properly later: have the redactor persist its boxes alongside the
+keyframe, so consumers read what was removed instead of re-deriving it from the
+pixels.
+
+### 10.5 The solver's own convention documentation is correct
+
+Section 3 says `world.json`'s `pose_convention` block does not describe
+`solve/solution.json`. That stands, but `global_solve.py` itself is explicit and
+right: it annotates the field as `R_cw` and computes `centre = -r_wc @ t_cw`.
+The mismatch is between `world.json`, which describes the derived tree, and the
+solve artifact. It is a documentation gap, not a solver bug.
+
+
+---
+
+## 11. The shipped configuration, measured on all seven worlds
+
+**Read this section before quoting any number from this lane.** Everything above
+it was measured while the stage was being built, on whatever configuration was
+current that hour, and the default depth network changed late. An adversarial
+review made that its blocking finding, and it was right: a table describing a
+model the product no longer runs is worse than no table.
+
+So every world in the corpus was densified again, from scratch, with the
+configuration that is actually on the branch -- MoGe-2 ViT-L, `tau` 0.05, the
+exact redaction fill mask, bounded extrapolation, `gate_rel` 0.08 -- and scored
+the same way each time. These are those numbers.
+
+### 11.1 Per world
+
+Re-derived after the fit stopped being anchored on inpainted pixels (D21).
+Every row is that world's own `manifest.json` and `align.json`.
+
+| world | what it is | posed | used | held-out residual | L0 points | L0 size |
+| --- | --- | --- | --- | --- | --- | --- |
+| `7d31e8d7` | desk and shelf | 429 | 344 | 2.4% | 8.48 M | 136 MB |
+| `1b8812b1` | widest traverse | 438 | 314 | 2.7% | 9.35 M | 150 MB |
+| `672578d0` | bedroom, closet, desk | 425 | 306 | 3.5% | 14.96 M | 239 MB |
+| `37e497f8` | bedroom | 196 | 139 | 3.5% | 5.23 M | 84 MB |
+| `fc58a64d` | end-to-end replay | 198 | 175 | 4.0% | 8.81 M | 141 MB |
+| `ecc02df1` | dresser | 77 | 55 | 4.3% | 2.21 M | 35 MB |
+| `a378331a` | closet | 201 | 114 | 4.9% | 5.31 M | 85 MB |
+| `6427900d` | bathroom, tight | 266 | 139 | 5.0% | 3.89 M | 62 MB |
+
+Peak VRAM for the depth stage is **2.4 GB**. Everything else is CPU and RAM.
+
+**The residual column is gate-conditioned** -- it is the median over the frames
+that PASSED, so it improves as the gate tightens and the reconstruction gets
+worse. §11.3 prints both ends.
+
+### 11.2 The fused cloud, rendered at held-out cameras
+
+The whole cloud re-rendered from cameras the fusion did not privilege, with
+depth read out of the render. Every row is an `eval.json` beside the artifact,
+written by `proto/score_cloud.py --out`.
+
+**All eight rows now score the same object.** An earlier version of this table
+scored `fused.npz` on six worlds and `points_l0.bin` on the two that had been
+pruned -- an accident of which runs used `--keep-intermediates`, not a choice.
+The two clouds differ by the packing stage's percentile trim, about 1.2%, so
+the mixed rows were not comparable to each other.
+
+| world | points scored | depth error, median | depth error, p90 | pixel coverage |
+| --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk and shelf) | 8.58 M | 2.5% | 16.5% | 98.1% |
+| `ecc02df1` (dresser) | 2.23 M | 3.2% | 5.2% | 96.8% |
+| `1b8812b1` (widest traverse) | 9.47 M | 3.6% | 6.0% | 97.2% |
+| `fc58a64d` (end-to-end replay) | 8.92 M | 4.3% | 5.4% | 83.8% |
+| `a378331a` (closet) | 5.38 M | 4.4% | 5.5% | 60.7% |
+| `6427900d` (bathroom, tight) | 3.94 M | 4.4% | **59.9%** | 71.4% |
+| `672578d0` (bedroom, closet, desk) | 15.14 M | 5.1% | **47.4%** | 97.9% |
+| `37e497f8` (bedroom) | 5.29 M | 5.6% | 7.6% | 96.2% |
+
+**The p90 column is the honest part.** Two worlds carry a tail an order of
+magnitude above their own median: the tight bathroom, where the walk never gets
+far enough from a surface for two cameras to disagree usefully, and the
+three-room chain, where the far end of a long room is reconstructed from a
+handful of distant frames. The median says the reconstruction is good and the
+p90 says part of it is not; the confidence channel is what separates them.
+
+Coverage says the same from the other side. The closet and the bathroom cover
+61-71% of a held-out frame where every other world covers 84-98%. Tight spaces
+are the weakest case and the reason is structural: consensus needs baseline
+between cameras and a small room does not offer any.
+
+### 11.3 What the gate does to the number
+
+The held-out residual quoted in 11.1 is the median **of the frames that passed
+the 8% gate**. It is therefore a property of the gate as much as of the
+reconstruction, and it improves as the gate tightens while the reconstruction
+gets worse. Both ends, from `proto/gate_sensitivity.py` over the shipped
+artifacts; the bracketed count is frames surviving that gate.
+
+| world | posed | all frames | gate 0.16 | **gate 0.08 (shipped)** | gate 0.04 | gate 0.02 |
+|---|---|---|---|---|---|---|
+| `7d31e8d7` | 429 | 2.4% (407) | 2.2% (358) | **2.1% (344)** | 1.9% (290) | 1.3% (154) |
+| `1b8812b1` | 438 | 2.7% (369) | 2.5% (342) | **2.4% (314)** | 2.1% (248) | 1.4% (112) |
+| `672578d0` | 425 | 3.5% (359) | 3.3% (329) | **3.2% (307)** | 2.7% (211) | 1.7% (30) |
+| `37e497f8` | 196 | 3.5% (171) | 3.4% (159) | **3.1% (139)** | 2.5% (98) | 1.7% (26) |
+| `fc58a64d` | 198 | 4.0% (187) | 4.0% (184) | **3.9% (175)** | 3.3% (92) | 1.9% (4) |
+| `ecc02df1` | 77 | 4.3% (75) | 4.0% (63) | **3.7% (55)** | 2.8% (31) | 1.9% (4) |
+| `a378331a` | 201 | 4.9% (150) | 4.7% (136) | **4.4% (114)** | 3.3% (47) | 1.6% (1) |
+| `6427900d` | 266 | 5.0% (203) | 4.7% (184) | **3.9% (140)** | 2.5% (73) | 1.2% (21) |
+
+Tighten to 2% and the "accuracy" becomes 1.2-1.9% while the closet keeps ONE
+frame. So: quote the all-frames column when describing the pipeline, quote a
+gate column only when comparing two configurations at the same gate, and never
+quote the best world as the pipeline's figure.
+
+The gate now moves the number by 0.1-1.1 points depending on the world, against
+0.2-1.6 before the fit was cleaned up (D21) and up to 3.4 under the previous
+depth network. As the fit gets more honest, the gate has less to do.
+
+### 11.4 What changed against the previous default, and what did not
+
+The seven-world run above is the same seven worlds the stage had already
+produced with Depth Anything V2 Small, so the comparison is like for like.
+
+| | V2-Small | MoGe-2 ViT-L |
+| --- | --- | --- |
+| held-out residual, best world | 3.0% | 2.6% |
+| held-out residual, worst world | 8.7% | 5.4% |
+| frames passing the gate, `1b8812b1` | 247 / 438 | 303 / 438 |
+| frames passing the gate, `672578d0` | 218 / 425 | 298 / 425 |
+| L0 points, `1b8812b1` | 5.80 M | 8.65 M |
+| peak VRAM | 0.85 GB | 2.4 GB |
+| wall clock, `1b8812b1` | 7 min | 3.4 min |
+
+More frames survive, so more of the room is reconstructed, and the frames that
+survive are better aligned. The wall clock fell despite a 45x slower network
+because the earlier figure was measured on a contended GPU; treat both as
+upper bounds.
+
+**What did not change: the gate still drops 30-50% of posed frames.** 303 of
+438, 132 of 266, 50 of 77. That is disclosed in `frames_dropped`, in the
+manifest and in the CLI's own output, and it is the number to quote when
+someone asks how much of the walk the reconstruction uses. It is better than
+the 43-64% the previous model dropped, and it is still most of a third.
+### 11.5 Standing where the wearer stood does not always show what they saw
+
+An independent visual reviewer, given only the comparison sheets and no
+engineering context, found columns where the reconstruction rendered from a
+capture pose shows **a different part of the dwelling** than the photograph
+taken from that pose, and read it as fabricated geometry.
+
+**An earlier version of this section claimed to refute that. It did not, and
+the way it failed is worth more than the conclusion it reached.** It measured
+exactly one of the two ways a render can be wrong, and it measured the one that
+supported the answer it wanted. What follows is both directions.
+
+`proto/seethrough.py` samples 45 poses across six worlds. Each anchor is a
+sparse point the solve says that frame observes.
+
+| | poses right? | render too FAR (a hole) | render too NEAR (occupying empty space) | no render at all |
+| --- | --- | --- | --- | --- |
+| `7d31e8d7` (desk) | 0.76 px median | 1.5% median | 1.1% median | small |
+| `672578d0` (three rooms) | sub-pixel | 2.8% median, 7.6% p90 | **7.9% median, 86.5% p90, 100% max** | **up to 28.8%** |
+
+**The poses are right, and that part stands.** Sub-pixel reprojection on every
+frame sampled, worst 1.66 px. Nothing is in the wrong room.
+
+**But the pose test proves less than it looks.** It reprojects the exact points
+the bundle adjustment optimised, using the exact pose it produced. It cannot be
+large unless the solve failed to converge, and it is blind to gauge drift.
+Empirically it predicts nothing about the errors that matter: Spearman
+correlation with depth error **0.127 (p = 0.71)**, and with the in-front rate
+**0.109 (p = 0.75)**. The frame with 100% of its anchors occluded has the
+second-worst reprojection in the sample at 1.65 px, and a frame with none has
+1.43 px.
+
+**And on the three-room world the reviewer was closer to right than this
+section was.** Dense geometry rendered *nearer* than a triangulated point the
+solve says is directly visible is **2.8x more common at the median** than the
+see-through failure, reaches 86.5% at p90 and 100% on one sampled frame. That
+is opaque geometry standing in space the solve says is empty, which is the
+reviewer's allegation and not an honest hole.
+
+**Two further limits, stated because the earlier version did not.** Both rates
+are computed only where the render produced something, so up to 28.8% of a
+frame's anchors -- the holes the section is about -- are dropped from the
+statistic. And 6 of 45 poses has a Wilson 95% interval of **[6.3%, 26.2%]**, so
+"13%" is a point estimate from a fixed-stride sample, not a measurement of the
+poses the reviewer actually flagged.
+
+**Where that leaves it.** Nothing is misplaced. Some of what looks wrong is a
+missing near surface. Some of it, on at least one world, is dense geometry in
+front of where the solve says nothing is -- and this section does not establish
+which mechanism dominates in the frames a person objected to. It is not settled.
+
+### 11.6 The large planar surfaces are real, and the evidence for it was weaker than claimed
+
+The same reviewer made two claims that cannot both be true of the same surfaces:
+that no world has a wall or a ceiling, and that the large smooth surfaces are
+curved extrapolation sprayed into unobserved space.
+
+`proto/planarity.py` RANSACs the largest planar structures out of the fused
+cloud. **An earlier version of this section read its output as settling the
+question. A null control shows most of that reading was circular.**
+
+**What does not survive.** The script picks inliers by `|d| < 0.004 * extent`
+and then reports the RMS and p95 of `|d|` over those same inliers. Both are
+functions of the threshold. Running the identical procedure on **uniform random
+points** in each world's own bounding box:
+
+| | RMS / extent | p95 / extent | plane share of cloud |
+| --- | --- | --- | --- |
+| `672578d0` real | 0.0011-0.0012 | 0.0037-0.0038 | **28.0%** |
+| `672578d0` uniform noise | 0.0011-0.0012 | 0.0038 | 7.5% |
+| `7d31e8d7` real | 0.0011-0.0012 | 0.0038 | **26.6%** |
+| `7d31e8d7` uniform noise | 0.0011-0.0012 | 0.0038 | 8.4% |
+
+Identical to four decimal places on structureless noise. "Flat to one part in a
+thousand of the scene" was a statement about the number 0.004.
+
+"They are not curved" was **never measured at all**: a surface curving by less
+than the tolerance is admitted as a plane, and the script fits no quadric. The
+reviewer's word was *curve*, and the tolerance is exactly the band that would
+absorb it.
+
+**What does survive, and it is the part that matters.** Real clouds put
+**26-30%** of their points in large planes against **7.5-8.4%** for noise. That
+is a real signal and noise does not produce it. And the confidence separation is
+real -- corrected for a baseline error the earlier version made, which compared
+planes against a whole-cloud mean that *includes* the planes:
+
+| | plane points | non-plane points | noise control |
+| --- | --- | --- | --- |
+| `672578d0` mean confidence | **6.71** | 5.97 | 6.20 vs 6.18 |
+| `7d31e8d7` mean confidence | **6.81** | 6.25 | 6.40 vs 6.39 |
+
+**But confidence is evidence, not proof, and this lane's own source says so.**
+`redaction_fill_mask`'s comment: *"multi-view consensus will not always catch
+it, because the SAME detector fires on the SAME object from several nearby
+frames -- so several cameras agree on geometry that is really a black box."*
+`pack_percentile`'s: *"surviving consensus because several nearby frames made
+the SAME error."* And the fusion picks the ten *nearest* cameras -- the ten most
+similar viewpoints, the set most likely to share a deterministic network's
+error. The earlier version of this section argued that a fabricated surface
+cannot carry high confidence. Two comments in this repository say it can.
+
+**And six planes are not six surfaces.** Comparing the normals afterwards, four
+of the desk world's six lie within 7 degrees of each other and two of those sit
+1.7 plane-thicknesses apart -- one surface split across RANSAC rounds. The
+honest count there is about four surfaces in three orientations. The three-room
+world is genuinely diverse: 14 of its 15 plane pairs are more than 15 degrees
+apart, spread across 45% of the scene extent.
+
+**Where that leaves it.** There is real large planar structure, better supported
+than the rest of the cloud, and far more of it than noise produces. Whether any
+particular large surface is an observed wall or a consensus of correlated
+errors is **not** decided by these numbers, and the reviewer's specific claim
+about curvature is untested. The enclosure being incomplete -- the claim that
+survived -- is unaffected.
+

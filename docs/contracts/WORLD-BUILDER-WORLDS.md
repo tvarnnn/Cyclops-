@@ -79,18 +79,38 @@ Added 2026-09-06 on the Mac integration branch, so a saved world can be
 | Query | Type | Meaning |
 |---|---|---|
 | `session_id` | string, optional | The session to draw. Absent: the newest session of the world that has geometry (`has_geometry` in §2) |
-| `max_points` | int 1…200000, optional | Point budget; default 40,000 for a phone (`MOBILE_MAX_POINTS` in `tower/results/world_builder_render.py`, set from a measured canvas-fill cliff — 80,000 was the cliff, not a margin). Fractional-stride sampling over every segment, never a prefix |
+| `max_points` | int 1…200000, optional | Point budget, and only a point budget. **Sparse:** default 40,000 for a phone (`MOBILE_MAX_POINTS` in `tower/results/world_builder_render.py`, set from a measured canvas-fill cliff — 80,000 was the cliff, not a margin). Fractional-stride sampling over every segment, never a prefix. **Dense:** default 393,216 (a 6 MB binary buffer), met by a coarser voxel grid over the whole extent rather than by sampling; an explicit value is honoured as a cap. **Surface:** the mesh is not points, so this selects the level-of-detail rung whose triangle budget it fits rather than thinning vertices |
+| `representation` | `auto` \| `sparse` \| `dense` \| `surface`, optional | Which reconstruction to serve, as a ladder: `surface` → `dense` → `sparse`. `auto` (default) serves the best rung the session actually has. A named value starts the walk at its own rung and falls through to worse ones, **except** that naming a rung the session does not have at all returns **404** rather than silently serving a different one — a caller that pinned a representation is comparing, and a silent substitution would corrupt the comparison. **422** outside this set. The rung actually served is stated in the page and in `GET /worlds` |
 
 **200** `text/html`, `Cache-Control: no-store`. A self-contained page: no
 external script, stylesheet, image or fetch, so a web view that refuses
 every navigation but the initial one shows it whole. One finger orbits,
 two fingers pinch to zoom and drag to pan; on a desktop, drag / wheel /
-shift-drag. A `<select>` switches between the drawable spaces: the shared
-world frame(s) first, then every unregistered segment in its own frame and
-own scale, named as such. The page carries a caption saying what it is —
-*sparse structure-from-motion output: triangulated feature points and
-camera poses; not a surface, not a mesh, not metric scale* — and a second
-line when the derived tree is behind the newest keyframes.
+shift-drag.
+
+**The route serves one of two pages and they differ, deliberately.** This
+section described only the sparse one until the dense viewer shipped; what
+follows is both.
+
+*The sparse page.* A `<select>` switches between the drawable spaces: the
+shared world frame(s) first, then every unregistered segment in its own frame
+and own scale, named as such. Its caption is *sparse structure-from-motion
+output: triangulated feature points and camera poses; not a surface, not a
+mesh, not metric scale.*
+
+*The dense page.* One cloud in the world frame, so there is no space selector:
+a dense artifact is built for a single solve component and the format refuses
+to composite two, because nothing normalises them and they share no unit. Its
+caption is *dense reconstruction: per-pixel depth from a neural network,
+anchored to the structure-from-motion solve and kept only where several
+cameras agreed; not a surface, not a mesh, not metric scale* — a different
+sentence because the sparse one would be false of it. It adds a line when the
+page is coarser than the artifact on disk, and it names face redaction as a
+cause of emptiness.
+
+Both carry a BEHIND line when what they draw is not current — the dense page
+distinguishes *behind the newest keyframes* from *built against an earlier
+solve*; see `WORLD-BUILDER-DENSE.md` §10.
 
 **404** with a `detail` the phone shows verbatim, for exactly these:
 no world root configured; no such world; no such session in that world;
@@ -99,7 +119,8 @@ geometry yet. The last two are what a world still being built or solved
 answers: the client's response is to say so and offer to try again, not to
 treat it as an error in the world.
 
-**422** for a `max_points` outside its range.
+**422** for a `max_points` outside its range, or a `representation` outside its
+set.
 
 ### Rules
 
