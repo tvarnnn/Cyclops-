@@ -846,6 +846,31 @@ def test_representation_sparse_forces_the_old_page_even_when_dense_exists(tmp_pa
     assert "World Builder — dense" not in html
 
 
+def test_the_diagnostic_view_is_the_sparse_page_even_when_dense_exists(tmp_path):
+    """Review 3, R3: `view=diagnostics` arrives with `representation=auto` and
+    starts the ladder at sparse, but the dense rung was gated on the
+    representation, so a densified world served the dense page there -- while
+    the revision route, asked the same question, answered sparse."""
+    import re
+
+    from tower.results.world_builder_render import (
+        build_render_revision,
+        build_world_render,
+    )
+
+    store = _world_with_geometry(tmp_path, dense=True)
+    html = build_world_render(store, "w1", "s1", view="diagnostics")
+    assert "World Builder — dense" not in html
+    declared = re.search(r'<meta name="wb-representation" content="([a-z]+)">', html)
+    assert declared is not None and declared.group(1) == "sparse"
+    revision = build_render_revision(store, "w1", "s1", view="diagnostics")
+    assert revision["representation"] == "sparse"
+    stamp = re.search(r'<meta name="wb-revision" content="([^"]+)">', html)
+    assert stamp is not None and stamp.group(1) == revision["revision"]
+    # and the product view of the same world still gets the dense rung
+    assert "World Builder — dense" in build_world_render(store, "w1", "s1")
+
+
 def test_a_broken_dense_artifact_never_costs_the_world_its_sparse_page(tmp_path):
     """A dense bug must degrade to the picture that already worked, not to a
     404. The sparse reconstruction is complete and correct either way."""
@@ -1145,8 +1170,63 @@ def test_a_backend_whose_package_is_missing_refuses_by_name():
 
     for cls in (dense.MoGeBackend, dense.DepthAnything3Backend):
         src = inspect.getsource(cls._load)
-        assert "DenseUnavailable" in src, cls.__name__
+        assert "DepthModelUnavailable" in src, cls.__name__
         assert "--backend" in src, cls.__name__
+        # and the weights go through the loader that names a missing model
+        assert "load_hub_weights" in src, cls.__name__
+
+
+def test_weights_that_are_neither_cached_nor_downloadable_name_the_model(tmp_path, monkeypatch):
+    """Review 3, R7: offline on a machine that never fetched the weights, the
+    hub raises `LocalEntryNotFoundError`, which the surface stage recorded as an
+    ordinary failure and the live worker relaunched every solve."""
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    from tower.world_builder import dense
+
+    monkeypatch.setattr(dense, "hub_model_cache", lambda model_id: tmp_path / "hub" / "m")
+
+    def offline():
+        raise LocalEntryNotFoundError("cannot find the requested files in the local cache")
+
+    with pytest.raises(dense.DepthModelUnavailable) as caught:
+        dense.load_hub_weights("moge2-vitl", "Ruicheng/moge-2-vitl", offline)
+    assert isinstance(caught.value, dense.DenseUnavailable)
+    message = str(caught.value)
+    assert "Ruicheng/moge-2-vitl" in message
+    assert str(tmp_path / "hub" / "m") in message
+
+    # any other failure is not dressed up as "unavailable"
+    def broken():
+        raise RuntimeError("a real bug")
+
+    with pytest.raises(RuntimeError):
+        dense.load_hub_weights("moge2-vitl", "Ruicheng/moge-2-vitl", broken)
+
+
+def test_a_first_run_download_is_logged_with_its_size_and_time(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from tower.world_builder import dense
+
+    cache = tmp_path / "hub" / "models--x--y"
+    monkeypatch.setattr(dense, "hub_model_cache", lambda model_id: cache)
+
+    def download():
+        (cache / "blobs").mkdir(parents=True)
+        (cache / "blobs" / "model.pt").write_bytes(b"x" * 3_000_000)
+        return "model"
+
+    with caplog.at_level(logging.INFO, logger=dense.logger.name):
+        assert dense.load_hub_weights("n", "x/y", download) == "model"
+    assert any("downloaded depth model x/y" in r.getMessage() and "3 MB" in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    # a cached model logs no download
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=dense.logger.name):
+        dense.load_hub_weights("n", "x/y", lambda: "model")
+    assert not any("downloaded" in r.getMessage() for r in caplog.records)
 
 
 def test_no_backend_assumes_a_gpu_is_present():

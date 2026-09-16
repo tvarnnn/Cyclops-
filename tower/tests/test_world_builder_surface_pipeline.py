@@ -1328,7 +1328,7 @@ class TestTheLiveWorkerOnlyBuildsWhatChanged:
 
 def test_a_missing_depth_network_is_unavailable_and_permanent(tmp_path, monkeypatch):
     from tower.world_builder import dense_pipeline
-    from tower.world_builder.dense import DenseUnavailable
+    from tower.world_builder.dense import DepthModelUnavailable as DenseUnavailable
 
     store = _synthetic_world(tmp_path)
     dense = store.world_dir(WORLD) / "dense" / SESSION
@@ -1343,6 +1343,30 @@ def test_a_missing_depth_network_is_unavailable_and_permanent(tmp_path, monkeypa
     result = SP.surfacify(store, WORLD, SESSION, params=_params())
     assert result.state == SP.STATE_UNAVAILABLE
     assert result.permanent
+
+
+def test_a_refusal_about_the_session_is_not_a_machine_that_cannot_build(tmp_path, monkeypatch):
+    """Review 3, e2e m2: every `DenseUnavailable` was marked permanent and
+    worded "cannot build a surface on this machine", including a refusal about
+    one session's camera -- which disabled live surfaces for the whole walk."""
+    from tower.world_builder import dense_pipeline
+    from tower.world_builder.dense import DenseUnavailable
+
+    store = _synthetic_world(tmp_path)
+    dense = store.world_dir(WORLD) / "dense" / SESSION
+    align = json.loads((dense / "align.json").read_text())
+    align["input_digest"] = "some-other-solve"
+    (dense / "align.json").write_text(json.dumps(align))
+
+    def wrong_camera(*a, **kw):
+        raise DenseUnavailable("undistorted ROI is 10x10 but the solve camera is 20x20")
+
+    monkeypatch.setattr(dense_pipeline, "run_depth_stage", wrong_camera)
+    result = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert result.state == SP.STATE_UNAVAILABLE
+    assert not result.permanent
+    status = json.loads((store.world_dir(WORLD) / "surface" / SESSION / "status.json").read_text())
+    assert not status.get("permanent")
 
 
 def test_the_final_surface_runs_before_the_dense_stage_prunes_its_depth():
@@ -1801,3 +1825,13 @@ class TestThePhoneBudgetBoundsThePage:
         a = S.SurfaceParams().digest_fields()
         b = S.SurfaceParams(mobile_page_bytes=1).digest_fields()
         assert a != b
+
+
+def test_a_build_that_builds_nothing_says_so(tmp_path):
+    """The CLI printed an ordinary summary with "0.0s total" for a no-op."""
+    store = _synthetic_world(tmp_path)
+    first = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert first.state == "ok" and first.detail != SP.ALREADY_BUILT
+    again = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert again.state == "ok"
+    assert again.detail == SP.ALREADY_BUILT

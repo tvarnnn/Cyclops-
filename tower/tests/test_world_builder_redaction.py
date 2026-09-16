@@ -808,6 +808,84 @@ def test_a_real_face_covering_more_than_a_quarter_of_the_frame_is_filled():
     assert int(out[300, 155].max()) == 0, "the middle of a close face was not filled"
 
 
+# -- a box over a quarter of the frame, cut by the frame edge (plausibility3) --
+#
+# Review 3, R1. A close face cut by the edge is what a detector sees worst at
+# reduced resolution, so "found again at native, 1/2 or 1/4" left such faces on
+# disk: 4 of 594 off-frame composites, 32 of a 3,232 held-out set. At the edge,
+# facelike landmarks are enough again.
+
+
+def test_a_facelike_large_box_at_the_frame_edge_is_filled_without_a_second_look():
+    from tower.world_builder.redaction import EDGE_MARGIN, box_near_frame_edge
+
+    for box in (
+        (-40.0, 20.0, 263.0, 263.0),                    # crosses the left edge
+        (0.0, 20.0, 263.0, 263.0),                      # touches it
+        (100.0, 360.0 - 263.0 - 17.0, 263.0, 263.0),    # within 5% of the bottom
+    ):
+        assert box_near_frame_edge(box, (360, 640)), box
+        boxes = _gate([(box, _facelike_landmarks(box))], detections_at_one={})
+        assert len(boxes) == 1, f"a close face cut by the edge was left unfilled: {box}"
+    assert EDGE_MARGIN == 0.05
+
+
+def test_an_interior_large_box_still_needs_a_second_look():
+    """The edge rule must not quietly become plausibility1 everywhere: the
+    wall-and-PC-tower box was interior."""
+    from tower.world_builder.redaction import box_near_frame_edge
+
+    box = (100.0, 40.0, 263.0, 263.0)     # 40 px from the top: outside 5% (18 px)
+    assert not box_near_frame_edge(box, (360, 640))
+    assert _gate([(box, _facelike_landmarks(box))], detections_at_one={}) == []
+
+
+def test_a_large_box_at_the_edge_with_unfacelike_landmarks_still_needs_a_second_look():
+    box = (0.0, 20.0, 263.0, 263.0)
+    assert _gate([(box, _hand_landmarks(box))], detections_at_one={}) == []
+    assert len(_gate([(box, _hand_landmarks(box))],
+                     detections_at_one={0.5: [(box, _hand_landmarks(box))]})) == 1
+
+
+def test_a_real_close_face_cut_by_the_frame_edge_is_filled():
+    """End to end, real detector, a 360x640 portrait frame: a face 420 px wide
+    whose top half is above the frame, as someone leaning into the wearer is.
+    YuNet finds it at 2x (a box crossing the top edge, ~35% of the frame) and at
+    no reduced scale, so plausibility2 filled none of it."""
+    from tower.world_builder.redaction import (
+        LARGE_BOX_AREA_FRACTION,
+        LARGE_BOX_CORROBORATION_SCALES,
+        _iou,
+        box_area_fraction,
+        box_near_frame_edge,
+    )
+
+    face = cv2.cvtColor((skimage_data.lfw_subset()[30] * 255).astype(np.uint8),
+                        cv2.COLOR_GRAY2BGR)
+    patch = cv2.resize(face, (420, 420), interpolation=cv2.INTER_CUBIC)
+    frame = cv2.resize(_room(), (360, 640))
+    x0, y0 = -30, -197
+    frame[0:y0 + 420, 0:360] = patch[-y0:, -x0:-x0 + 360]
+
+    redactor = FaceRedactor()
+    raw = redactor._raw_detect(frame, 2)
+    large = [b for b, _ in raw if box_area_fraction(b, frame.shape) > LARGE_BOX_AREA_FRACTION]
+    assert large, "precondition: the detection is a large box"
+    assert all(box_near_frame_edge(b, frame.shape) for b in large), "precondition: at the edge"
+    for scale in LARGE_BOX_CORROBORATION_SCALES:
+        again = redactor._raw_detect(frame, scale)
+        assert not any(_iou(b, a) >= 0.30 for b in large for a, _ in again), (
+            f"precondition: plausibility2 would have corroborated this at {scale}")
+
+    result = redactor.redact(_encode(frame))
+    out = cv2.imdecode(np.frombuffer(result.image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    assert result.regions >= 1
+    # the face's in-frame part: centre columns, from the top edge to the mouth
+    face_region = out[0:int(y0 + 0.8 * 420), int(x0 + 0.2 * 420):int(x0 + 0.8 * 420)]
+    assert float((face_region.max(axis=2) <= 8).mean()) >= 0.8, (
+        "a close face cut by the frame edge was left on disk")
+
+
 # -- one failed frame must not be laundered by the next success ---------
 
 

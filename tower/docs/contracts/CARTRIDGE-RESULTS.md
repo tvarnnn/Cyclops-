@@ -854,10 +854,11 @@ is absent.
 **No imagery is offered, and none will be under this contract.** Since
 2026-08-23 keyframes are **face-redacted before they are written**, and
 `redaction` reports what the session recorded — e.g.
-`faces-detected-and-filled/yunet-2023mar@0.30+plausibility2`, naming the
+`faces-detected-and-filled/yunet-2023mar@0.30+plausibility3`, naming the
 detector, its threshold, and the version of the plausibility gate its
-detections pass before being filled (older sessions record `+plausibility1`,
-or no suffix at all). That is a **process** claim ("this detector's hits were
+detections pass before being filled (older sessions record `+plausibility2`,
+`+plausibility1`, or no suffix at all; `docs/contracts/WORLD-BUILDER-IOS.md`
+describes each gate). That is a **process** claim ("this detector's hits were
 filled"), never an outcome claim: the detector has measured false
 negatives on heavily occluded and ~90°-rotated faces. Sessions captured
 before that date keep `none` forever.

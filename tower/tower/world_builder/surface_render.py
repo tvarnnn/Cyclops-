@@ -192,7 +192,7 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
         "current": bool(currency.get("current")),
         "currency_reason": currency.get("reason"),
         "cameras": _camera_path(store, world_id, session_id),
-        "up": _camera_up(store, world_id, session_id),
+        "up": _world_up(store, world_id, session_id, vertices, faces),
     }
     return raw, config
 
@@ -229,6 +229,83 @@ def _camera_path(store, world_id: str, session_id: str) -> list:
     # for any walk under 480 keyframes and sent all of them.
     step = max(1, -(-len(out) // 240))
     return out[::step]
+
+
+def _world_up(store, world_id: str, session_id: str, vertices, faces) -> list | None:
+    """The vertical the page levels its horizon to.
+
+    Seeded by the cameras (`_camera_up`) and then measured on the surface
+    itself. A wearer at a desk looks down, and the mean camera up leans toward
+    what they looked at -- 26 degrees on the canonical world, which the phone
+    showed as a rolled room. Floors, ceilings and table tops are the surface's
+    own evidence of the vertical, and walls are the check: on the canonical
+    world the refinement took the median wall tilt from 13.1 to 4.6 degrees and
+    the median horizontal-surface tilt from 24.0 to 8.4 (area-weighted).
+
+    The refinement is kept only when the surface supports it: enough
+    near-horizontal area, a bounded move from the seed, and walls that end up
+    no less vertical than the seed left them. Otherwise the camera estimate
+    stands, as before.
+    """
+    seed = _camera_up(store, world_id, session_id)
+    if seed is None:
+        return None
+    refined = surface_up(vertices, faces, seed)
+    return seed if refined is None else refined
+
+
+def surface_up(vertices, faces, seed, *, cone_deg: float = 30.0,
+               min_horizontal_fraction: float = 0.10,
+               max_move_deg: float = 45.0) -> list | None:
+    """Refine `seed` toward the area-weighted normal of near-horizontal faces,
+    or return None when the surface does not support a refinement."""
+    import numpy as np
+
+    V = np.asarray(vertices, np.float64)
+    F = np.asarray(faces, np.int64)
+    u0 = np.asarray(seed, np.float64)
+    if len(F) == 0 or not np.isfinite(u0).all() or np.linalg.norm(u0) < 1e-9:
+        return None
+    u0 = u0 / np.linalg.norm(u0)
+    cross = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    area = np.linalg.norm(cross, axis=1)
+    total = float(area.sum())
+    if not total > 0:
+        return None
+    n = cross / np.maximum(area, 1e-30)[:, None]
+    cos_cone = float(np.cos(np.radians(cone_deg)))
+    cos_wall = float(np.cos(np.radians(60.0)))
+
+    def wall_tilt(u):
+        dots = np.abs(n @ u)
+        wall = dots < cos_wall
+        if not wall.any():
+            return None
+        # The area-weighted MEAN tilt: a median over a few large walls can sit
+        # on the one wall a bad vertical happens to leave upright.
+        ang = np.arcsin(np.clip(dots[wall], 0.0, 1.0))
+        return float((ang * area[wall]).sum() / area[wall].sum())
+
+    u = u0
+    for _ in range(5):
+        dots = n @ u
+        horizontal = np.abs(dots) > cos_cone
+        if area[horizontal].sum() < min_horizontal_fraction * total:
+            return None
+        m = (n[horizontal] * np.sign(dots[horizontal])[:, None]
+             * area[horizontal][:, None]).sum(axis=0)
+        norm = float(np.linalg.norm(m))
+        if norm < 1e-12:
+            return None
+        u = m / norm
+    if u @ u0 < 0:
+        u = -u
+    if np.degrees(np.arccos(np.clip(u @ u0, -1.0, 1.0))) > max_move_deg:
+        return None
+    before, after = wall_tilt(u0), wall_tilt(u)
+    if before is not None and (after is None or after > before):
+        return None
+    return [round(float(v), 6) for v in u]
 
 
 def _camera_up(store, world_id: str, session_id: str) -> list | None:

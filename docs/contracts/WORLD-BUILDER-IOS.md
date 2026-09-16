@@ -315,16 +315,19 @@ calibration to 640×360 frames rather than silently scaling the world by the
 ratio.
 
 **Redaction is a process claim, never an outcome claim.** The recorded value is
-`faces-detected-and-filled/yunet-2023mar@0.30+plausibility2` for sessions
-captured with the current Tower; older sessions may record `+plausibility1`
-or no suffix (`faces-detected-and-filled/yunet-2023mar@0.30`). The suffix
-names a gate that runs on each detection before it is filled. Under
-`plausibility2`: a box under 2% of the frame is always filled; a box of 2–25%
+`faces-detected-and-filled/yunet-2023mar@0.30+plausibility3` for sessions
+captured with the current Tower; older sessions may record `+plausibility2`,
+`+plausibility1` or no suffix (`faces-detected-and-filled/yunet-2023mar@0.30`).
+The suffix names a gate that runs on each detection before it is filled. Under
+`plausibility3`: a box under 2% of the frame is always filled; a box of 2–25%
 must have facelike landmarks, and from 5% must also be found again at native
 resolution; a box over 25% must be found again at native, 1/2 or 1/4
-resolution (its landmarks carry no evidence at that size); landmarks too
-broken to judge always fill. `plausibility1` differed only above 25%, where
-facelike landmarks alone filled the box. The gate exists because on real
+resolution (its landmarks carry no evidence at that size), **except** that one
+touching or within 5% (of the frame's short side) of the frame edge is also
+filled on facelike landmarks alone, because a close face cut by the edge is
+found at no reduced scale; landmarks too broken to judge always fill.
+`plausibility2` lacked the edge exception. `plausibility1` differed above 25%
+everywhere, where facelike landmarks alone filled the box. The gate exists because on real
 captures 220 of 240 detections were not faces (hands, a cup, bare wall) and
 blacked out 12.6% of every frame; it changes what is filled, not the
 detector or its threshold. Nothing parses any of these values. Never "redacted", "anonymised"
@@ -490,12 +493,32 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 | The Tower says | The app does |
 |---|---|
 | same revision | nothing; no page is fetched |
-| a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision) | fetches the page and swaps it in |
-| a new revision of the **same rung** with `live: false`, when the screen was opened on a **named session** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
-| a new revision of the **same rung** otherwise (live, the Tower did not say, or no session named: the Tower then picks the newest session, which may be another walk) | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |
+| a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision), of the **same walk** | fetches the page and swaps it in |
+| a new revision of the **same rung** with `live: false`, of the **same walk** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
+| a new revision of the **same rung** otherwise (live, or the Tower did not say), or **any** new revision of a better or same rung from **another walk** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |
 | a new revision of a **worse rung** | nothing: not swapped, and not offered as "newer" |
 | a revision whose page could not be drawn on this phone | never swaps it in or offers it again |
-| any revision of a rung whose pages failed to draw **twice** on this screen | not fetched, swapped or offered; "Try again" (`load()`) forgets the refusals |
+| any revision of a rung that **two refreshes up to it** failed to draw on this screen | not fetched, swapped or offered, except that a **finished** build (`live: false`) of that rung is tried **once** per screen. A failure of the rung already on screen does not count (that rung drew here, so its rebuild failing is memory pressure), and a refresh of the rung that draws forgets its failures |
+
+"The same walk" means the screen was opened on a named session, or the
+revision's session (the part before `/`, §4a) is the session of the page on
+screen. With no session named the Tower answers its newest session with
+geometry, which can be another walk; nothing from it replaces the world the
+reader opened without a tap.
+
+**What was fetched decides, not what was polled.** A refresh (automatic or
+tapped) that fetches a page of a **worse rung** than the one on screen does not
+swap it in: a tapped offer whose build has since become undrawable on the
+Tower, or a fetch racing a manifest replace, is served points. A fetched page
+that differs from the one on screen **only in its `wb-revision` stamp** is the
+same picture and is not swapped in either: a page composed while the Tower
+could not read the manifest carries no stamp (WORLDS §4a rule 7), and the same
+page a moment later does.
+
+**After a refresh could not be drawn** the previous page is back and the screen
+is ready, so the caption shows *"A newer reconstruction could not be drawn on
+this phone. Try again"*. It calls `load()`, which fetches the page again and
+forgets every refused revision and rung. A later refresh that draws removes it.
 | `404` with FastAPI's `{"detail": "Not Found"}` | stops following for this screen (a Tower older than the route) |
 | any other `404`, another status, or a transport error | keeps the picture and asks again next interval |
 
@@ -511,7 +534,7 @@ fetch leaves the page. A fetched page that fails to draw before it reports
 finished — the 20 s render watchdog, `didFail`, or the content process being
 killed past its budget — puts the previous page back (with a fresh kill budget,
 since it already drew once) and refuses that revision, and the rung after its
-second such failure. A refresh reaches the failure view only if the restored
+second such failure going up to it. A refresh reaches the failure view only if the restored
 page then fails to draw as well. **Not covered:** a page that reports finished
 (`didFinish`) and is killed afterwards, for example on the first frames of a
 large mesh; the fallback is released at `didFinish`, so that kill goes to the

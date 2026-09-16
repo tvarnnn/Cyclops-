@@ -1,7 +1,10 @@
 # Mac validation: the saved-world viewer after the iOS review fixes
 
-Branch `world-builder/reconstruction-final-review1` (worktree
-`Glasses-worktrees/wb-final-recon-r1` on Windows). This supersedes the scratch
+Branch `world-builder/reconstruction-final-v1`, at **the final SHA named in
+`docs/agent-handoffs/WORLD-BUILDER-RECONSTRUCTION-FINAL.md`**. Validate that
+commit and no other: the review branches (`…-review1` to `…-review4`) are
+intermediate states, and `-review1` in particular lacks every review-2 and
+review-3 fix this checklist expects. This supersedes the scratch
 checklist `Glasses-scratch/wb-final-recon/review-ios/MAC-VALIDATION.md`, which
 was written against 97e75eb before the review's fixes; that file is kept as it
 was. The review itself is `Glasses-scratch/wb-final-recon/review-ios/REVIEW.md`.
@@ -38,13 +41,23 @@ Do not work in the canonical checkout.
 | r2 m5 | A finished same-rung build swaps by itself only when the screen names a session; the Tower never answers `surface:None` | §2, §3 |
 | r2 m6 | A worse rung is neither swapped nor offered; an offer is withdrawn when the Tower reports the shown revision again | §2 |
 | r2 t1 | The refusal test now fails if the refusal is deleted (a new revision whose page carries the refused stamp) | §2 |
+| r3 R1 | A face box over 25% of the frame that touches the frame edge (within 5% of the short side) is filled on facelike landmarks, as well as on re-detection; the session label is `+plausibility3` | Tower tests only |
+| r3 R2 | Only refreshes UP to a rung count towards refusing it; a refresh of the rung that draws forgets its failures; a finished (`live: false`) build of a refused rung is tried once; after a revert the caption offers *"A newer reconstruction could not be drawn on this phone. Try again"* | §2, §5.5 |
+| r3 R3 | `view=diagnostics` serves the sparse page even when a dense artifact exists | §3, §5.9 |
+| r3 R5 | `live` turns false as soon as a stage's manifest is newer than its `running` status, so the finished world after Stop is swapped in, not offered | §5.4 |
+| r3 R7 | A depth model that is neither cached nor downloadable is `unavailable` and permanent for the walk, naming the model and the cache; a first download is logged with its size and time | §3 |
+| r3 iOS | A fetched page of a worse rung is never swapped in (tap or race); a page differing only in its `wb-revision` stamp is not swapped over itself; with no session named, nothing from another walk swaps by itself | §2 |
 
 ## 0. Check out the exact commit
 
+The branch has to be pushed before a Mac can fetch it; if `git fetch` does not
+deliver `origin/world-builder/reconstruction-final-v1`, stop and ask for it.
+
 ```sh
 cd ~/Projects/Glasses && git fetch --all
-git worktree add ~/Projects/Glasses-worktrees/wb-final-recon world-builder/reconstruction-final-review1
-cd ~/Projects/Glasses-worktrees/wb-final-recon && git rev-parse HEAD      # the commit named in the handoff
+FINAL=<the final SHA named in docs/agent-handoffs/WORLD-BUILDER-RECONSTRUCTION-FINAL.md>
+git worktree add ~/Projects/Glasses-worktrees/wb-final-recon origin/world-builder/reconstruction-final-v1
+cd ~/Projects/Glasses-worktrees/wb-final-recon && git rev-parse HEAD      # must equal $FINAL
 python3 -c "import pathlib,sys; bad=[p for p in pathlib.Path('.').rglob('*') if p.is_file() and p.suffix in {'.html','.swift','.py','.md'} and b'\x00' in p.read_bytes()]; print(bad); sys.exit(bool(bad))"
 ```
 
@@ -74,6 +87,9 @@ Most likely spots if the build fails, most likely first:
 - `WorldRenderWebView.Coordinator`: `nonisolated static let terminationWindow` / `nonisolated static func recentTerminations` on a main-actor class.
 - Tests: the nested `@MainActor private final class Flag` inside `WorldRenderRevisionTests`, and `Task { @MainActor in await follow.value; ended.value = true }`.
 - Tests: `XCTAssertEqual(next(.seconds(10), live: true), .seconds(10), …)` — implicit-member `Duration` in the second argument.
+- `WorldRenderRepresentation.withoutRevisionStamp`: `html.prefix(4096).range(of:)` (a `Substring` range) passed to `String.removeSubrange`.
+- `pageEvent(.rendered)`: `if fallback != nil, let rung = state.representation` — `!= nil` on an optional labelled tuple.
+- `revertRefresh()`: `rung != WorldRenderRepresentation.declared(in:)`, a non-optional compared with an optional.
 
 ## 2. Unit tests (no Tower)
 
@@ -91,8 +107,8 @@ xcodebuild -project Glasses.xcodeproj -scheme Glasses \
 
 Expect:
 - **9** tests in `WorldRenderRepresentationTests` (review 2 added the caption-retraction test);
-- **23** in `WorldRenderRevisionTests`: 8 pure (address, page stamp, body decode, upgrade order, finished-build swap, finished-build swap only for a named session, poll interval, termination window) and 15 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts and a new revision carrying the refused stamp is not swapped in again; a rung that failed twice is not fetched again; a worse rung is neither swapped nor offered; a stale offer is withdrawn; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop). The refusal test and the twice-failed-rung test each wait up to 3 s on a bounded poll that, on a regression, times out rather than hangs;
-- `WorldRenderViewerTests` unchanged, all green.
+- **29** in `WorldRenderRevisionTests`: 9 pure (address, page stamp, body decode, upgrade order, finished-build swap, nothing from another walk swaps by itself, a revision's session and a page without its stamp, poll interval, termination window) and 20 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts and a new revision carrying the refused stamp is not swapped in again; a rung that failed twice is not fetched again; a worse rung is neither swapped nor offered; failures of the rung on screen do not refuse it; the finished build of a refused rung is tried once and Try again lifts the refusal; tapping an offer never swaps in a worse rung; a page that only gained its stamp is not swapped in; with no session named only the walk on screen swaps by itself; a stale offer is withdrawn; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop). The refusal tests each wait up to 3 s on a bounded poll that, on a regression, times out rather than hangs;
+- **20** in `WorldRenderViewerTests`, unchanged, all green.
 
 The follower tests no longer hang on a regression: every wait is bounded at
 2–3 s and fails an assertion instead.
@@ -117,14 +133,47 @@ Record pass/fail per class, the time `WorldRenderRevisionTests` took (expect a
 few seconds), any failure in the 5 repeats (name the test), and the full-suite
 totals against base 869d715.
 
-## 3. Tower on the Mac, with a world that has all three rungs
+## 3. Tower on the Mac, with a world that has a built surface
 
-A Mac cannot build surfaces. Copy world `b2a75ab40d2d415d8d6ef5e4d5f0fb3d`
-(session `a8c6817e14a74e3c977fccfcdacad595`, surface L2 ≈3.7 MB page) as whole
-directories from the Windows canonical checkout's
-`tower\data\world_builder\worlds\` to
-`~/Projects/Glasses-scratch/wb-final-recon-mac/worlds/`, plus the synthetic
-sparse-only fixture from `Glasses-scratch/wb-cv-sim/`.
+A Mac cannot build surfaces, and **the canonical world on Windows does not have
+one yet**: `tower\data\world_builder\worlds\b2a75ab40d2d415d8d6ef5e4d5f0fb3d\`
+holds only `derived`, `sessions`, `solve` and `world.json`. A copy of that
+directory as it stands has no surface rung, so §3 would answer `sparse` and §4's
+surface caption check would fail against the data, not the app.
+
+**First, on the Windows Tower, on the final SHA, before the phone test**, build
+the surface of session `a8c6817e14a74e3c977fccfcdacad595` (from `tower\`, with the
+Tower's venv interpreter; `<root>` is the world root the Tower is configured
+with, e.g. the canonical checkout's absolute `tower\data\world_builder`):
+
+```powershell
+.venv\Scripts\python.exe scripts\world_surface.py --root <root> --world b2a75ab40d2d415d8d6ef5e4d5f0fb3d --session a8c6817e14a74e3c977fccfcdacad595
+```
+
+It adds `dense\a8c6817e…\` (the depth stage's alignment and cache, not a dense
+artifact) and `surface\a8c6817e…\` beside the world's existing data, and does
+not modify any existing file. It needs the MoGe-2 depth model
+(`Ruicheng/moge-2-vitl`, about 1.3 GB) in the Hugging Face cache. The Windows
+Tower machine has it. On a fresh machine, **pre-seed the cache while online**
+before any walk or build:
+
+```sh
+python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('Ruicheng/moge-2-vitl', 'model.pt'))"
+```
+
+Without it, an offline build reports `unavailable` naming the model and the
+cache (and a walk stops launching live surfaces for the rest of that walk);
+online, the first build downloads it and logs `downloaded depth model … MB in …
+s`. Record the build's printed levels: expect about **229k triangles** at the
+phone level (L2) and a phone page of about **6.2 MB** (6,174,107 bytes measured
+on this world, under the 6 MiB budget).
+
+Then copy world `b2a75ab40d2d415d8d6ef5e4d5f0fb3d` as whole directories,
+**including the new `surface\` and `dense\`**, to
+`~/Projects/Glasses-scratch/wb-final-recon-mac/worlds/worlds/`, plus the
+synthetic sparse-only fixture from `Glasses-scratch/wb-cv-sim/`. This world has
+no dense rung (only `world_densify.py` builds one, and it is off by default), so
+`&representation=dense` below answers 404; that is expected.
 
 ```sh
 cd ~/Projects/Glasses-worktrees/wb-final-recon/tower
@@ -141,7 +190,7 @@ W=b2a75ab40d2d415d8d6ef5e4d5f0fb3d; S=a8c6817e14a74e3c977fccfcdacad595; T=http:/
 curl -s -D - "$T/worlds/$W/render/revision?session_id=$S"
 #   200, Cache-Control: no-store, {"session_id": S, "representation": "surface", "revision": "S/surface:…", "live": false}
 curl -s "$T/worlds/$W/render/revision?session_id=$S&view=diagnostics"     # representation "sparse", revision "S/sparse"
-for q in "" "&representation=dense" "&representation=sparse"; do
+for q in "" "&representation=dense" "&representation=sparse"; do            # dense: 404 on this world
   curl -s "$T/worlds/$W/render?session_id=$S$q" -o /tmp/p.html; wc -c < /tmp/p.html
   head -c 4096 /tmp/p.html | grep -c 'http-equiv="Content-Security-Policy"'          # 1 for EVERY rung (m6)
   head -c 4096 /tmp/p.html | grep -o '<meta name="wb-[a-z]*" content="[^"]*">'        # both tags inside 4096
@@ -151,10 +200,12 @@ curl -s "$T/worlds/$W/render/nope"; echo                                   # {"d
 curl -s "$T/worlds/nope/render/revision"; echo                             # {"detail":"no world 'nope'"} -> the phone retries
 ```
 
-Record: page size per rung; the two meta values; that the revision JSON's
-`revision` equals the surface page's `wb-revision` (**must be equal**); that the
-CSP meta count is 1 on all three rungs; the rung for `view=diagnostics` (must be
-`sparse`); `live` (must be `false` with autobuild off).
+Record: page size per rung (surface about 6.2 MB); the two meta values; that
+the revision JSON's `revision` equals the surface page's `wb-revision` (**must
+be equal**); that the CSP meta count is 1 on the surface and sparse rungs; the
+rung for `view=diagnostics` (must be `sparse`; since review 3 R3 it is sparse
+even on a world that also has a dense artifact); `live` (must be `false` with
+autobuild off).
 
 ## 4. UI smoke in the Simulator against that Tower
 
@@ -188,9 +239,9 @@ Console.app streaming the device, filtered for `WebContent`, `jetsam`, `Glasses`
    - Tower log times of each `GET …/render/revision`: about one every **10 s** while walking (`live: true`);
    - when the rung first **improves** (sparse → surface), the picture swaps by itself, once;
    - after that, each surface rebuild shows the button *"A newer reconstruction is ready. Show it"* and does **not** move the camera (review M3). Count the rebuilds offered, and tap the button at least twice: each tap swaps the page and resets the camera, and the button disappears;
-   - count of full `GET …/render`: must equal 1 + rung improvements + taps (+ at most one per rebuild if the Tower logged the m9 ERROR);
+   - count of full `GET …/render`: must equal 1 + rung improvements + taps + 1 for the finished surface swapped in after Stop (+ at most one per rebuild if the Tower logged the m9 ERROR);
    - after Stop: polls continue through finalization, the final surface (built after Stop, `live: false`) is **swapped in by itself** without a tap, once, and once finalization is done the poll gaps grow 10 → 20 → 40 → 80 → 120 s and stay at 120 s. Record the gaps.
-5. **A swap that cannot be drawn** (review M2). During §5.4, at each swap or tap, watch Console for WebContent termination. If a swap is killed past its budget or takes over 20 s, the **previous picture must come back** (a brief "Drawing the world…" then the old picture) and that revision must not be offered again. Record the WebContent footprint before and after each swap, and any revert. If none happens naturally, optionally serve L1 pages from the Tower (larger) to provoke one, and record the result.
+5. **A swap that cannot be drawn** (review M2). During §5.4, at each swap or tap, watch Console for WebContent termination. If a swap is killed past its budget or takes over 20 s, the **previous picture must come back** (a brief "Drawing the world…" then the old picture) and that revision must not be offered again. Record the WebContent footprint before and after each swap, and any revert. If none happens naturally, optionally serve L1 pages from the Tower (larger) to provoke one, and record the result. After a revert the caption shows *"A newer reconstruction could not be drawn on this phone. Try again"*; tap it once and record whether the page is fetched again and draws. A same-rung rebuild that fails does not stop the finished surface after Stop from being swapped in (review 3, R2).
 6. **Backgrounding** (physical phone, surface world open, not walking). Lock 2 min, unlock; repeat 4 times, **at least 60 s apart**. After each unlock record: picture back without reload / context-restored message then picture / full reload / *"…ran out of memory N times…"*. The failure message must not appear from kills spread over minutes (review M5). If it does, record the times.
 7. **Retry path.** Tower stopped, open a world: failure with Try again. Start the Tower, tap Try again; the picture draws. Leave it 3 min. In the Tower log, revision polls come from **one** loop, with gaps 10, 20, 40, 80, 120 s (a finished world, `live: false`).
 8. **Dismissal.** Open a world, wait 15 s, close. No `/render/revision` request after the close.
@@ -210,7 +261,8 @@ handoff; do not delete it without explicit approval.
 | HEAD validated | |
 | Xcode / Simulator / device iOS | |
 | Build result, warnings (new vs 8) | |
-| `WorldRenderRepresentationTests` 8 / `WorldRenderRevisionTests` 18 / `WorldRenderViewerTests` | |
+| `WorldRenderRepresentationTests` 9 / `WorldRenderRevisionTests` 29 / `WorldRenderViewerTests` 20 | |
+| Windows `world_surface.py` levels (L2 triangles), surface page bytes | |
 | 5× repeat flakes | |
 | Full `GlassesTests` totals vs base | |
 | revision JSON == page `wb-revision`; `live` value | |

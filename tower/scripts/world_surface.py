@@ -202,6 +202,8 @@ def main() -> int:
             failures += 1
             cannot_run_here = cannot_run_here or bool(result.permanent)
             continue
+        if result.detail:
+            print(f"  {result.detail}")
         print(f"  frames {result.frames_used}/{result.frames_offered} used")
         print(f"  voxel {result.voxel:.5f}  truncation {result.trunc:.5f} "
               f"({result.trunc / result.voxel:.1f} voxels)")

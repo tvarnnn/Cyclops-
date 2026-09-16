@@ -37,7 +37,7 @@ from typing import Callable
 import numpy as np
 
 from tower.storage import write_bytes_atomic, write_json_atomic
-from tower.world_builder.dense import DenseUnavailable
+from tower.world_builder.dense import DenseUnavailable, DepthModelUnavailable
 from tower.world_builder.surface import (
     STAGE_DEPTH,
     STAGE_FUSE,
@@ -532,15 +532,34 @@ def surfacify(store, world_id: str, session_id: str, *,
     except SurfaceUnavailable as exc:
         _status(root, state=STATE_UNAVAILABLE, detail=exc.reason)
         return SurfaceResult(state=STATE_UNAVAILABLE, detail=exc.reason)
-    except DenseUnavailable as exc:
-        # The depth network is missing on this machine. That is a
-        # configuration, not a crash: say so once, without a traceback, and
-        # mark it permanent so the live worker stops trying every solve.
+    except DepthModelUnavailable as exc:
+        # The depth network cannot run on this machine: not installed, or its
+        # weights neither cached nor downloadable. That is a configuration, not
+        # a crash: say so once, without a traceback, and mark it permanent so
+        # the live worker stops relaunching a child every solve.
+        #
+        # PERMANENT EVEN WHEN THE CAUSE IS "OFFLINE", deliberately. "Permanent"
+        # disables only THIS walk's live surfaces (`BackgroundSurface._reap`);
+        # the final build after Stop, `world_surface.py`, and the next walk all
+        # try again, so a network that comes back is used at the next of those.
+        # What it gives up is a live surface later in the same walk -- and a
+        # retry that did succeed would start a 1.3 GB download in a below-
+        # normal-priority child, over the link the glasses' frames arrive on,
+        # which the Stop then kills.
         reason = str(exc)
         logger.warning("[Tower][WorldBuilder][surface] %s/%s cannot build a "
                        "surface on this machine: %s", world_id, session_id, reason)
         _status(root, state=STATE_UNAVAILABLE, detail=reason, permanent=True)
         return SurfaceResult(state=STATE_UNAVAILABLE, detail=reason, permanent=True)
+    except DenseUnavailable as exc:
+        # A refusal about THIS session's inputs (a camera the poses were not
+        # solved in, say). Unavailable, but nothing about the machine: the
+        # next session may build, so it is not permanent.
+        reason = str(exc)
+        logger.warning("[Tower][WorldBuilder][surface] %s/%s cannot build a "
+                       "surface for this session: %s", world_id, session_id, reason)
+        _status(root, state=STATE_UNAVAILABLE, detail=reason)
+        return SurfaceResult(state=STATE_UNAVAILABLE, detail=reason)
     except Exception as exc:  # noqa: BLE001 -- recorded, never swallowed silently
         logger.exception("[Tower][WorldBuilder][surface] %s/%s failed",
                          world_id, session_id)
@@ -1099,6 +1118,11 @@ def _discard_unpublished(root: Path, levels: list) -> None:
             pass
 
 
+# The `detail` of a result that built nothing because the artifact on disk is
+# already this solve's, with these parameters.
+ALREADY_BUILT = "already built from this solve with these parameters (--force rebuilds)"
+
+
 def _already_built(root: Path, digest, pdigest, force: bool):
     if force:
         return None
@@ -1117,7 +1141,9 @@ def _already_built(root: Path, digest, pdigest, force: bool):
     if not levels or not all(level_file_whole(root, lv) for lv in levels):
         return None
     return SurfaceResult(
-        state=STATE_OK, frames_used=man.get("frames_used", 0),
+        state=STATE_OK,
+        detail=ALREADY_BUILT,
+        frames_used=man.get("frames_used", 0),
         frames_offered=man.get("frames_offered", 0),
         vertices=man.get("vertices", 0), faces=man.get("faces", 0),
         voxel=man.get("voxel", 0.0), trunc=man.get("truncation", 0.0),
