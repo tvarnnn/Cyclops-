@@ -491,6 +491,82 @@ class TestBlockAllocationIsTheSameSetMadeCheaply:
         assert keys.untyped_storage().nbytes() == keys.numel() * keys.element_size()
 
 
+class TestExtractionVisitsOnlyTilesThatHoldField:
+    """Marching cubes must iterate the field, not its bounding box.
+
+    The tile list was the full bounding grid: the product of three extents.
+    The real 795-keyframe field walk had 1,925,280 tiles of which 383 held a
+    block, and spent 520 s of mesh stage against 5 s of fusion. The
+    replacement is only acceptable if it is the SAME tile set the old loop
+    found non-empty -- including tiles that see a block only through their
+    one-block halo, which is where a careless version silently changes the
+    seams.
+    """
+
+    TILE = 12
+
+    @staticmethod
+    def _full_grid_non_empty(bc, lo, hi, tile):
+        """The previous loop's behaviour, brute force: every tile of the
+        bounding grid whose (tile + 1)^3 block window holds a block."""
+        out = []
+        for x in range(int(lo[0]), int(hi[0]) + 1, tile):
+            for y in range(int(lo[1]), int(hi[1]) + 1, tile):
+                for z in range(int(lo[2]), int(hi[2]) + 1, tile):
+                    d = bc - np.array([x, y, z])
+                    if np.any(np.all((d >= 0) & (d <= tile), axis=1)):
+                        out.append((x, y, z))
+        return out
+
+    def test_it_is_exactly_the_non_empty_part_of_the_full_grid(self):
+        rng = np.random.default_rng(11)
+        bc = rng.integers(-45, 45, size=(300, 3))
+        # blocks on tile boundaries, read by the previous tile's halo, on one,
+        # two and three axes at once
+        bc = np.vstack([bc, [[-45 + 12, 0, 0], [-45 + 24, -45 + 12, 0],
+                             [-45 + 36, -45 + 24, -45 + 12]]])
+        lo, hi = bc.min(0), bc.max(0)
+        assert S.occupied_tiles(bc, lo, hi, self.TILE) == \
+            self._full_grid_non_empty(bc, lo, hi, self.TILE)
+
+    def test_a_restricted_box_still_sees_blocks_just_outside_it(self):
+        """The live path passes `only_blocks`: the box comes from those, but
+        the tiles read the WHOLE field, so a block just past the box's corner
+        is still read through the halo of the box's last tile."""
+        rng = np.random.default_rng(5)
+        allb = rng.integers(0, 60, size=(400, 3))
+        sel = allb[:40]
+        lo, hi = sel.min(0), sel.max(0)
+        assert S.occupied_tiles(allb, lo, hi, self.TILE) == \
+            self._full_grid_non_empty(allb, lo, hi, self.TILE)
+
+    def test_a_diagonal_walk_skips_almost_all_of_its_box(self):
+        t = np.arange(0, 900)
+        bc = np.stack([t, t, t], 1)                 # a thin diagonal line
+        lo, hi = bc.min(0), bc.max(0)
+        got = S.occupied_tiles(bc, lo, hi, self.TILE)
+        grid = len(range(0, 900, self.TILE)) ** 3
+        assert len(got) < grid / 100             # 519 of 421,875
+        assert got == sorted(got)                   # the old loop's order
+
+    def test_the_mesh_is_unchanged(self, monkeypatch):
+        """End to end on the synthetic room: identical arrays either way."""
+        vol = _fuse(_ring(n=6))
+        new = vol.extract_mesh(min_weight=0.5)
+
+        def full_grid(bc, lo, hi, tile):
+            return [(x, y, z)
+                    for x in range(int(lo[0]), int(hi[0]) + 1, tile)
+                    for y in range(int(lo[1]), int(hi[1]) + 1, tile)
+                    for z in range(int(lo[2]), int(hi[2]) + 1, tile)]
+
+        monkeypatch.setattr(S, "occupied_tiles", full_grid)
+        old = vol.extract_mesh(min_weight=0.5)
+        assert len(new[1]) > 0
+        for a, b in zip(new, old):
+            assert np.array_equal(a, b)
+
+
 # ---------------------------------------------------------------------------
 # mesh cleanup
 # ---------------------------------------------------------------------------

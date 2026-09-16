@@ -333,6 +333,54 @@ def block_coords(key, *, offset: int = _KEY_OFFSET, span: int = _KEY_SPAN):
     return torch.stack([x, y, z], 1) - offset
 
 
+def occupied_tiles(bc, lo, hi, tile_blocks: int) -> list[tuple[int, int, int]]:
+    """The extraction tiles that hold at least one block, in grid order.
+
+    Extraction used to walk the full bounding grid of tiles -- the product of
+    three extents -- and pay a device round trip for every tile, including the
+    ones that hold nothing. A walk's surface grows with its length; its
+    bounding box grows with the product of its extents, and the SfM gauge's
+    axes are arbitrary, so even a straight corridor is in general a diagonal
+    one. Measured: a diagonal synthetic walk's tile grid grew as frames^2.98
+    while its occupied tiles grew as frames^1.0, and the real 795-keyframe field
+    walk (`52ed8e0a`), whose component 0 has a few far-flung frames, had a
+    1007 x 2288 x 1440-block box: 1,925,280 tiles of which 383 held a block.
+    Its mesh stage took 520 s against 5 s of fusion, all of it proving that
+    empty tiles are empty.
+
+    This returns exactly the tiles the old loop would have found non-empty, in
+    the same order, so the mesh is unchanged. The subtle part is the HALO: a
+    tile reads `tile_blocks + 1` blocks per axis, so a block whose coordinate
+    sits exactly on a tile boundary is also read by the previous tile, and that
+    tile must be kept too -- dropping it would silently change the triangles
+    along every seam.
+    """
+    bc = np.asarray(bc, np.int64).reshape(-1, 3)
+    lo = np.asarray(lo, np.int64)
+    hi = np.asarray(hi, np.int64)
+    if not len(bc):
+        return []
+    kmax = (hi - lo) // tile_blocks
+    q = bc - lo
+    f = np.floor_divide(q, tile_blocks)
+    on_edge = (q - f * tile_blocks) == 0
+    cands = [f]
+    for mask in range(1, 8):
+        axes = [a for a in range(3) if mask >> a & 1]
+        sel = np.all(on_edge[:, axes], axis=1)
+        if sel.any():
+            g = f[sel].copy()
+            g[:, axes] -= 1
+            cands.append(g)
+    k = np.concatenate(cands)
+    k = k[np.all((k >= 0) & (k <= kmax), axis=1)]
+    if not len(k):
+        return []
+    k = np.unique(k, axis=0)                  # lexicographic: the old x, y, z loop order
+    origins = lo + k * tile_blocks
+    return [tuple(int(v) for v in o) for o in origins]
+
+
 # ---------------------------------------------------------------------------
 # the field
 # ---------------------------------------------------------------------------
@@ -635,10 +683,7 @@ class SurfaceVolume:
         lo, hi = bc_sel.min(0), bc_sel.max(0)
 
         Vs, Fs, Cs, Gs, nv = [], [], [], [], 0
-        tiles = [(x, y, z)
-                 for x in range(int(lo[0]), int(hi[0]) + 1, tile_blocks)
-                 for y in range(int(lo[1]), int(hi[1]) + 1, tile_blocks)
-                 for z in range(int(lo[2]), int(hi[2]) + 1, tile_blocks)]
+        tiles = occupied_tiles(bc_all, lo, hi, tile_blocks)
         nb = tile_blocks + 1                       # one block of halo
         n = nb * BLOCK
         r = torch.arange(nb, device=self.dev, dtype=torch.int64)
