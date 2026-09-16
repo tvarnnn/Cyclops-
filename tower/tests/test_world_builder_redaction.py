@@ -434,17 +434,10 @@ def test_every_true_positive_in_the_capture_still_passes():
     to the bands makes any of them fail, the change is wrong however much it
     improves the pixel count.
     """
-    from tower.world_builder.redaction import (
-        MAX_BOX_AREA_FRACTION,
-        box_area_fraction,
-        landmarks_are_facelike,
-    )
+    from tower.world_builder.redaction import landmark_verdict
 
     for box, landmarks, score, what in PORTRAIT + LIVE_FACES:
-        assert landmarks_are_facelike(box, landmarks), f"{what} was rejected"
-        assert box_area_fraction(box, (640, 360)) <= MAX_BOX_AREA_FRACTION, (
-            f"{what} was rejected as too large"
-        )
+        assert landmark_verdict(box, landmarks) is True, f"{what} was rejected"
 
 
 def test_the_geometry_is_free_of_head_roll():
@@ -479,27 +472,6 @@ def test_the_geometry_is_free_of_head_roll():
                 f"{key} moved by {turned[key] - value:.4f} at {degrees} degrees"
             )
         assert landmarks_are_facelike(box, rotated)
-
-
-def test_a_detection_that_covers_the_frame_is_not_a_face():
-    """The measured worst case: 47.8% of the frame in one raw box, which after
-    the head dilation blacked out 93.8% of a frame whose content is a wall, a
-    PC tower and carpet.
-
-    The bound is not tight. The largest raw box over 840 composited faces is
-    30.1% of the frame and the 95th percentile is 19.9% -- a face about 20 cm
-    from the lens -- so the cap sits above every face this was measured on.
-    """
-    from tower.world_builder.redaction import (
-        MAX_BOX_AREA_FRACTION,
-        box_area_fraction,
-    )
-
-    worst = (3.0, -64.1, 318.8, 345.2)          # keyframe 51, score 0.32
-    assert box_area_fraction(worst, (640, 360)) > MAX_BOX_AREA_FRACTION
-
-    arms_length = (100.0, 150.0, 200.0, 256.0)  # 22% of the frame
-    assert box_area_fraction(arms_length, (640, 360)) <= MAX_BOX_AREA_FRACTION
 
 
 def test_degenerate_landmarks_are_rejected_not_crashed_on():
@@ -647,3 +619,200 @@ def test_a_small_detection_with_unfacelike_landmarks_is_still_filled():
     assert large_box[2] * large_box[3] / (640 * 360) >= LANDMARK_TEST_ABOVE_AREA
     redactor._raw_detect = lambda image, upscale: [(large_box, large_lm)]
     assert redactor._detect(frame) == [], "the landmark test stopped running"
+
+
+# -- a gate that cannot judge must fill ---------------------------------
+#
+# Found by an adversarial review of the gate above. Each of the first three
+# returned `[]` -- no fill -- before the fix.
+
+
+def _box_of_area(fraction, width=640, height=360):
+    import math
+
+    side = math.sqrt(fraction * width * height)
+    return (100.0, 20.0, side, side)
+
+
+def _facelike_landmarks(box):
+    x, y, w, h = box
+    return [x + .3 * w, y + .4 * h, x + .7 * w, y + .4 * h, x + .5 * w, y + .6 * h,
+            x + .35 * w, y + .8 * h, x + .65 * w, y + .8 * h]
+
+
+def _hand_landmarks(box):
+    """The keyframe-324 hand, mapped into `box`: measurably not a face."""
+    (hx, hy, hw, hh), hand, _score, _what = HANDS[2]
+    x, y, w, h = box
+    out = []
+    for i in range(0, len(hand), 2):
+        out += [x + (hand[i] - hx) / hw * w, y + (hand[i + 1] - hy) / hh * h]
+    return out
+
+
+def _gate(detections_at_two, detections_at_one=None):
+    redactor = FaceRedactor()
+
+    def _raw(image, upscale):
+        if upscale == 1 and detections_at_one is not None:
+            return list(detections_at_one)
+        return list(detections_at_two)
+
+    redactor._raw_detect = _raw
+    return redactor._detect(_room())
+
+
+def test_coincident_eye_landmarks_on_a_large_box_are_filled():
+    """YuNet collapses both eyes onto one point on a near-profile face. The
+    geometry is then undefined, which is no judgement at all -- and was being
+    read as "not a face". Nothing corroborates it here either, on purpose.
+    """
+    from tower.world_builder.redaction import landmark_verdict
+
+    box = _box_of_area(0.04)
+    x, y, w, h = box
+    eyes_coincide = [x + .5 * w, y + .4 * h, x + .5 * w, y + .4 * h,
+                     x + .6 * w, y + .6 * h, x + .45 * w, y + .8 * h,
+                     x + .6 * w, y + .8 * h]
+    assert landmark_verdict(box, eyes_coincide) is None
+    assert len(_gate([(box, eyes_coincide)], detections_at_one=[])) == 1
+
+
+def test_non_finite_landmarks_on_a_large_box_are_filled():
+    from tower.world_builder.redaction import landmark_verdict
+
+    box = _box_of_area(0.04)
+    nan = float("nan")
+    good = _facelike_landmarks(box)
+    for landmarks in ([nan] * 10, good[:4] + [nan] + good[5:], [float("inf")] * 10):
+        assert landmark_verdict(box, landmarks) is None
+        assert len(_gate([(box, landmarks)], detections_at_one=[])) == 1, (
+            f"landmarks {landmarks} made the gate skip the fill"
+        )
+
+
+def test_a_box_that_is_not_a_number_fills_the_frame_rather_than_raising():
+    """Raising here is not neutral: `redact` would persist the ORIGINAL bytes."""
+    nan = float("nan")
+    boxes = _gate([((nan, 10.0, 50.0, 60.0), [0.0] * 10)], detections_at_one=[])
+    assert boxes == [(0.0, 0.0, 640.0, 360.0)]
+
+
+# -- a box over a quarter of the frame ----------------------------------
+
+
+def test_a_facelike_box_over_a_quarter_of_the_frame_is_filled_uncorroborated():
+    """Someone leaning into the wearer. The old hard cap never filled this."""
+    box = _box_of_area(0.30)
+    assert len(_gate([(box, _facelike_landmarks(box))], detections_at_one=[])) == 1
+
+
+def test_an_unfacelike_box_over_a_quarter_is_filled_if_corroborated():
+    box = _box_of_area(0.30)
+    hand = _hand_landmarks(box)
+    assert len(_gate([(box, hand)], detections_at_one=[(box, hand)])) == 1
+
+
+def test_an_unfacelike_uncorroborated_box_over_a_quarter_is_dropped():
+    """Only a box that fails BOTH pieces of face evidence goes unfilled."""
+    from tower.world_builder.redaction import landmark_verdict
+
+    box = _box_of_area(0.30)
+    hand = _hand_landmarks(box)
+    assert landmark_verdict(box, hand) is False
+    assert _gate([(box, hand)], detections_at_one=[]) == []
+
+
+# -- one failed frame must not be laundered by the next success ---------
+
+
+def test_one_unredacted_keyframe_makes_the_whole_session_unredacted(
+    tmp_path, monkeypatch
+):
+    """`redact` never raises: when detection throws on one frame it returns
+    the ORIGINAL bytes labelled `none`, and those are persisted. The session
+    label used to be whatever the LAST keyframe got, so the next clean frame
+    restored `faces-detected-and-filled/...`, and the dense stage -- which
+    trusts `images/` as-is for any session not labelled `none` -- read the raw
+    frame as a redacted keyframe.
+
+    Real engine, real redactor; `_detect` throws on the second keyframe only.
+    Then the dense stage's own reader is asked what it would do with that frame.
+    """
+    from tests import synthetic_scene as ss
+    from tower.world_builder import redaction as RD
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    calls = {"n": 0}
+    real_detect = RD.FaceRedactor._detect
+
+    def flaky(self, image):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("detector fault on one frame")
+        return real_detect(self, image)
+
+    monkeypatch.setattr(RD.FaceRedactor, "_detect", flaky)
+
+    width, height = 480, 360
+    matrix = ss.camera_matrix(width, height)
+    intrinsics = CameraIntrinsics(
+        source="self_calibrated", model="pinhole",
+        fx=float(matrix[0, 0]), fy=float(matrix[1, 1]),
+        cx=float(matrix[0, 2]), cy=float(matrix[1, 2]),
+        calibrated_width=width, calibrated_height=height,
+    )
+    frames = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(14, step=0.09), matrix, width, height
+    )
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store, redactor_factory=RD.FaceRedactor)
+    world_id = engine.create_world("laundering")
+    session_id = engine.start_session(
+        world_id, intrinsics=intrinsics, frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    for index, image in enumerate(frames):
+        engine.observe(ss.encode_jpeg(image), source_seq=index)
+    engine.stop_session()
+
+    assert calls["n"] >= 3, "precondition: a success followed the failure"
+    session = store.read_session(world_id, session_id)
+    assert session.redaction == RD.REDACTION_NONE, (
+        f"a keyframe was persisted unredacted but the session says "
+        f"{session.redaction!r}"
+    )
+
+    failed = store.read_keyframes(world_id, session_id)[1]
+    trusted = session.redaction != RD.REDACTION_NONE
+    _data, origin, _mask = keyframe_image_bytes(
+        store, world_id, session_id, failed.keyframe_id, None,
+        RD.FaceRedactor(), keyframes_are_redacted=trusted,
+    )
+    assert origin != "world-keyframe", (
+        "the dense stage read the unredacted frame as a redacted keyframe"
+    )
+
+
+def test_a_session_with_no_failures_keeps_its_redaction_label(tmp_path):
+    """The sticky label must not demote a clean session."""
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.store import WorldStore
+
+    matrix = ss.camera_matrix(WIDTH, HEIGHT)
+    frames = ss.render_sequence(
+        ss.furnished_room(), ss.strafe(6, step=0.09), matrix, WIDTH, HEIGHT
+    )
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    world_id = engine.create_world("clean")
+    session_id = engine.start_session(world_id, frame_source="synthetic")
+    for index, image in enumerate(frames):
+        engine.observe(_encode(image), source_seq=index)
+    engine.stop_session()
+
+    assert store.read_session(world_id, session_id).redaction == FaceRedactor().label

@@ -187,15 +187,31 @@ MOUTH_TO_EYE_BAND = (0.40, 1.25)        # mouth width over eye sep
 # test at all. 3% would start exempting hands.
 LANDMARK_TEST_ABOVE_AREA = 0.02
 
-# 2. A FACE DOES NOT COVER THE FRAME.
+# 2. A BOX THAT COVERS THE FRAME NEEDS NO EXTRA EVIDENCE, BUT IT NEEDS SOME.
 #
 # The largest raw box among 840 composited faces is 30.1% of the frame and the
-# 95th percentile is 19.9% -- that is a face about 20 cm from the lens, which
-# is already closer than a person stands. The largest false box is 47.8%, and
-# after HEAD_DILATION it took 93.8% of a frame whose content is a wall, a PC
-# tower and carpet. The cap is set at 25% so that it is above every composited
-# face, not at the tightest value that would have helped this capture.
-MAX_BOX_AREA_FRACTION = 0.25
+# 95th percentile is 19.9%. The largest false box is 47.8%, and after
+# HEAD_DILATION it took 93.8% of a frame whose content is a wall, a PC tower
+# and carpet.
+#
+# This used to be a hard cap: above 25%, never filled. That left a real face
+# closer than about 20 cm -- someone leaning into the wearer -- on disk, and a
+# review refused it as a trade. So above 25% the box is now filled if EITHER
+# piece of face evidence holds: its landmarks lie like a face, or the detector
+# finds it again at native resolution. Only a box that fails BOTH is dropped.
+#
+# THIS IS NOT FREE, and the cost is recorded here so it is not rediscovered.
+# Every one of the 40 false boxes over 25% on the canonical capture has
+# facelike landmarks -- a box that large spreads its five points like a face
+# whatever is inside it -- so for big boxes the landmark evidence is always
+# present and this rule fills all of them. Over the 398 raw frames the filled
+# fraction goes from 1.83% (hard cap) to 7.51%, frames over 50% filled from 1
+# to 31, the worst frame is 93.2% (keyframe 188, a wall and crutches), and 6
+# rather than 12 of the 13 fill-caused dense refusals come back. What it buys:
+# composited real faces with a box over 25% of the frame go from 0 of 65
+# filled to 65 of 65. Requiring BOTH pieces of evidence instead would fill 64
+# of 65 at 2.57% (REDACTION.md, section 12); that choice was not taken.
+LARGE_BOX_AREA_FRACTION = 0.25
 
 # 3. A BIG CLAIM ON THE FRAME HAS TO SURVIVE BEING LOOKED AT AGAIN, SMALLER.
 #
@@ -313,6 +329,28 @@ def landmarks_are_facelike(box, landmarks) -> bool:
     if not lo <= g["mouth_to_eye"] <= hi:
         return False
     return True
+
+
+def landmark_verdict(box, landmarks):
+    """True (facelike), False (measurably not), or None (cannot be judged).
+
+    The distinction is the whole point. `landmarks_are_facelike` folds "cannot
+    judge" into False, which is right for a yes/no question and wrong for a
+    gate: YuNet collapses both eyes onto one point on a near-profile face, and
+    a NaN compares False against every band. Both used to DROP the fill. A gate
+    that cannot judge must fill, so the caller needs the third answer.
+    """
+    import math
+
+    try:
+        values = [float(v) for v in box] + [float(v) for v in landmarks]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 14 or not all(math.isfinite(v) for v in values):
+        return None
+    if landmark_geometry(box, landmarks) is None:
+        return None
+    return landmarks_are_facelike(box, landmarks)
 
 
 def box_area_fraction(box, frame_shape) -> float:
@@ -531,24 +569,46 @@ class FaceRedactor:
         head dilation is a deliberate over-reach and a test applied after it
         would be measuring the over-reach rather than the detection.
         """
-        kept = []
+        # (box, may_be_dropped_if_uncorroborated). Everything not in this list
+        # was refused by a MEASURED landmark verdict; everything in it is
+        # filled unless the second look is asked and says no.
+        candidates = []
         for box, landmarks in self._raw_detect(image, UPSCALE):
             area = box_area_fraction(box, image.shape)
-            if (area >= LANDMARK_TEST_ABOVE_AREA
-                    and not landmarks_are_facelike(box, landmarks)):
+            if area < LANDMARK_TEST_ABOVE_AREA:
+                candidates.append((box, False))
                 continue
-            if area > MAX_BOX_AREA_FRACTION:
+            verdict = landmark_verdict(box, landmarks)
+            if verdict is None:
+                # Degenerate or non-finite landmarks: no judgement was made, so
+                # nothing may be dropped on the strength of one. Fill.
+                candidates.append((box, False))
+            elif area > LARGE_BOX_AREA_FRACTION:
+                # Either piece of face evidence fills a frame-covering box.
+                # Facelike: fill. Not facelike: fill only if corroborated.
+                candidates.append((box, not verdict))
+            elif not verdict:
                 continue
-            kept.append(box)
-        if not kept:
+            else:
+                candidates.append(
+                    (box, area >= CORROBORATE_ABOVE_AREA)
+                )
+        if not candidates:
             return []
 
-        if any(box_area_fraction(b, image.shape) >= CORROBORATE_ABOVE_AREA
-               for b in kept):
-            kept = self._corroborate(image, kept)
+        kept = self._corroborate(image, candidates)
 
         boxes = []
+        import math
+
+        height, width = image.shape[:2]
         for x, y, w, h in kept:
+            if not all(math.isfinite(float(v)) for v in (x, y, w, h)):
+                # A detection whose box is not a number cannot be located, only
+                # believed. Fill the frame rather than raise, which would
+                # persist the ORIGINAL bytes.
+                boxes.append((0.0, 0.0, float(width), float(height)))
+                continue
             # Dilate about the centre: a face box is not a head.
             cx, cy = x + w / 2.0, y + h / 2.0
             w *= HEAD_DILATION
@@ -556,14 +616,21 @@ class FaceRedactor:
             boxes.append((cx - w / 2.0, cy - h / 2.0, w, h))
         return boxes
 
-    def _corroborate(self, image, kept: list) -> list:
-        """Ask again at native resolution about the boxes claiming the frame.
+    def _corroborate(self, image, candidates: list) -> list:
+        """Ask again at native resolution about the boxes that need it.
+
+        `candidates` is (box, needs_corroboration). A box that does not need it
+        -- small, unjudgeable, or large and facelike -- is kept without the
+        second pass even being run.
 
         FAILS TOWARDS FILLING. If the second pass cannot be run at all -- a
         detector that throws, a resize that fails -- every box is kept. The
         cost of an unnecessary fill is pixels; the cost of a skipped one is a
         face on disk, and those are not the same kind of mistake.
         """
+        kept = [box for box, _ in candidates]
+        if not any(needs for _, needs in candidates):
+            return kept
         try:
             # This leaves the detector sized for the native frame; the next
             # call at UPSCALE sees a size change and re-targets, which is the
@@ -577,10 +644,11 @@ class FaceRedactor:
             return kept
 
         survivors = []
-        for box in kept:
-            if box_area_fraction(box, image.shape) < CORROBORATE_ABOVE_AREA:
-                # Small enough that it could be a distant bystander, which is
-                # precisely what the second look is bad at seeing. Exempt.
+        for box, needs in candidates:
+            if not needs:
+                # Small enough that it could be a distant bystander (which is
+                # precisely what the second look is bad at seeing), or already
+                # carrying face evidence, or unjudgeable. Exempt.
                 survivors.append(box)
                 continue
             if any(_iou(box, other) >= CORROBORATION_IOU for other, _ in second):

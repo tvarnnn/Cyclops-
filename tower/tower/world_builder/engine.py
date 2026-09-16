@@ -38,7 +38,7 @@ from tower.world_builder.keyframes import (
     KeyframePolicy,
     KeyframeSelector,
 )
-from tower.world_builder.redaction import FaceRedactor
+from tower.world_builder.redaction import REDACTION_NONE, FaceRedactor
 from tower.world_builder.records import (
     FINAL_SOLVE_PENDING,
     FINALIZATION_PENDING,
@@ -260,6 +260,9 @@ class WorldBuilderEngine:
 
         self._session = session
         self._redactor = self._redactor_factory()
+        # See _persist_keyframe: once any keyframe of this session has been
+        # written unredacted, the session can never again say otherwise.
+        self._unredacted_keyframes = 0
         if not self._redactor.available:
             logger.warning(
                 "[Tower][WorldBuilder] persisting UNREDACTED keyframes: %s",
@@ -1230,11 +1233,38 @@ class WorldBuilderEngine:
             ),
         )
         self._store.append_keyframe(session.world_id, keyframe)
-        if self._session.redaction != redaction.label:
-            # The session records what was APPLIED, not what was
-            # configured. A redactor that is present but failing must not
-            # leave the session claiming its imagery was filtered.
-            self._session = replace(self._session, redaction=redaction.label)
+        # The session records what was APPLIED, not what was configured, and
+        # it records the WEAKEST thing applied to any of its keyframes.
+        #
+        # This used to be "whatever the last keyframe got". `redact` never
+        # raises: when detection throws on one frame it hands back the
+        # ORIGINAL bytes labelled `none`, and those are what was just written.
+        # The next frame that redacted cleanly then rewrote the session label,
+        # and the dense and surface stages -- which trust `images/` as-is for
+        # any session not labelled `none` -- read that raw frame as a redacted
+        # keyframe and fused it. One later success laundered one failure.
+        #
+        # So `none` is sticky. It is a session-wide demotion rather than a
+        # per-keyframe record, and that is deliberate: the dense stage already
+        # handles a `none` session by redacting every keyframe itself before
+        # reading a pixel, and refusing any frame it cannot redact. The cost of
+        # one bad frame is therefore recomputation, not lost frames, and it
+        # needs no schema change that every reader of `keyframes.jsonl` would
+        # have to learn to honour before it was safe.
+        if redaction.label == REDACTION_NONE:
+            self._unredacted_keyframes += 1
+            if self._unredacted_keyframes == 1 and self._redactor.available:
+                logger.warning(
+                    "[Tower][WorldBuilder] keyframe %s persisted UNREDACTED (%s); "
+                    "session %s is recorded as redaction=none from here on",
+                    keyframe.keyframe_id, redaction.unavailable_reason,
+                    session.session_id,
+                )
+        label = (
+            REDACTION_NONE if self._unredacted_keyframes else redaction.label
+        )
+        if self._session.redaction != label:
+            self._session = replace(self._session, redaction=label)
         # The bytes as well as the record: they are what the live solve
         # must see, because they are what a rebuild will read back.
         return keyframe, image_bytes
