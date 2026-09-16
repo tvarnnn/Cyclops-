@@ -462,6 +462,11 @@ def surfacify(store, world_id: str, session_id: str, *,
         return SurfaceResult(state=STATE_UNAVAILABLE, detail=detail)
 
     try:
+        # Sweep what earlier builds of this session left unnamed -- a pack
+        # that was killed, levels superseded long enough ago -- whether or not
+        # this build then publishes. Otherwise a killed final pack, which no
+        # later build of the session follows, kept its orphans forever.
+        _sweep_unnamed_levels(root)
         solution = load_solution(store, world_id, session_id)
         if solution is None:
             return _unavailable(root, "no global solution for this session")
@@ -516,6 +521,7 @@ def surfacify(store, world_id: str, session_id: str, *,
             return result
 
         scale = _scale_note(store, world_id)
+        _mark_superseded(root, {lv["file"] for lv in result.levels})
         _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
                         scale_source)
         _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
@@ -713,9 +719,18 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         # The keys just computed always belong to `vol`'s voxel: the loop only
         # coarsens when it will go round again, so it never reserves keys from
         # the previous voxel size on its last pass.
-        if (params.max_blocks <= 0 or allk.numel() <= params.max_blocks
-                or attempt == attempts - 1):
+        if params.max_blocks <= 0 or allk.numel() <= params.max_blocks:
             break
+        if attempt == attempts - 1:
+            # The budget is what stands between a pathological walk and an
+            # out-of-memory failure, so the last attempt does not quietly
+            # reserve over it. Refused by name; the previous surface stands.
+            reason = (f"the walk still needs {allk.numel()} blocks after "
+                      f"coarsening the voxel x{coarsened:.2f} over {attempts} "
+                      f"attempts, over the block budget of {params.max_blocks}; "
+                      "not built")
+            logger.warning("[Tower][WorldBuilder][surface] %s", reason)
+            return _unavailable(root, reason)
         # At least 10% a round: once the band's shell radius is a whole number of
         # blocks, block count stops following voxel area smoothly and a pure
         # square-root step can stall just above the budget.
@@ -730,6 +745,10 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                         trunc_max=params.trunc_max_voxels * voxel)
     vol.reserve(allk)
     del allk
+    # The band a sample at the scene scale actually got, cap included --
+    # `truncation_for` is the uncapped request and overstated it whenever the
+    # frames' error asked for more than `trunc_max_voxels`.
+    trunc = float(vol.trunc_at(float(median_depth)))
 
     used = 0
     for i, (z, ok, img, R, tt, w) in enumerate(cached):
@@ -786,6 +805,16 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         V, F, C = keep_faces(V, F, C, keep)
     del views
     if not len(F):
+        if evidence_stats and evidence_stats.get("faces_in"):
+            s = evidence_stats
+            return _unavailable(
+                root, f"the evidence filter removed all {s['faces_in']} faces the "
+                      f"field emitted: {s.get('dropped_support', 0)} were measured by "
+                      f"fewer than {params.min_support_frames} distinct frames, "
+                      f"{s.get('dropped_contradicted', 0)} were seen past by at least "
+                      f"{params.contradiction_ratio:g}x as many frames as measured "
+                      f"them, and {s.get('dropped_back_facing', 0)} were seen only "
+                      "from behind")
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
                   "a surface")
@@ -813,6 +842,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         if _stopped(should_stop):
             # Pack is the longest stage and outlasts a hard stop's grace; it
             # must notice the stop between levels, not only at the end.
+            _discard_unpublished(root, levels)
             return _stop(root, STAGE_PACK, seconds)
         # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
         Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(*source, target)
@@ -826,7 +856,9 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     if _stopped(should_stop):
         # A stop that arrived while the last level was being decimated. The
         # levels are on disk under this build's own names, but no manifest
-        # names them, so nothing reads them and the previous surface stands.
+        # names them, so nothing reads them and the previous surface stands --
+        # and since nothing ever will, they are removed now.
+        _discard_unpublished(root, levels)
         return _stop(root, STAGE_PACK, seconds)
     seconds[STAGE_PACK] = round(time.time() - t, 2)
 
@@ -848,7 +880,14 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
 def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
                     scale_source=None):
     filled = params.fill_radius_voxels() > 0
+    try:
+        detail = json.loads(result.detail) if result.detail else None
+    except ValueError:
+        detail = None
     write_json_atomic(root / "manifest.json", {
+        # The contract's table described `detail.*` keys that only ever
+        # reached `status.json`, which the next status write replaces.
+        "detail": detail,
         "schema_version": SURFACE_SCHEMA_VERSION,
         # WORLD-BUILDER-SURFACE.md section 3: filling unobserved space breaks
         # the format identifier rather than quietly relaxing its promise.
@@ -925,13 +964,51 @@ def level_file_whole(root: Path, entry: dict) -> Path | None:
     return path
 
 
-def _prune_superseded_levels(root: Path, keep: set, older_than_s: float = 120.0) -> None:
+PRUNE_GRACE_S = 120.0
+STAGING_GRACE_S = 600.0
+
+
+def _mark_superseded(root: Path, keep: set) -> None:
+    """Stamp the files the manifest about to be replaced names with NOW.
+
+    The prune grace below is measured on a file's mtime, and a level's mtime
+    was its WRITE time: a previous build older than the grace lost its files
+    the instant the next manifest landed, and a reader between reading that
+    manifest and reading its level got `SurfaceUnavailable` (review 2, I1).
+    Stamped BEFORE the new manifest is written, so a crash in between can
+    only lengthen the grace, never skip it.
+    """
+    try:
+        previous = json.loads((root / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(previous, dict):
+        return
+    now = time.time()
+    for entry in previous.get("levels") or []:
+        path = level_file(root, entry)
+        if path is None or path.name in keep:
+            continue
+        try:
+            os.utime(path, (now, now))
+        except OSError:
+            pass
+
+
+def _prune_superseded_levels(root: Path, keep: set,
+                             older_than_s: float = PRUNE_GRACE_S) -> None:
     """Remove level files no current manifest names, once they are old.
 
     Not immediately: a reader that read the previous manifest a moment ago is
     still entitled to that manifest's files. Two minutes is far longer than any
     page composition, and far shorter than the gap between builds that matters
-    for disk.
+    for disk. "Old" counts from SUPERSESSION (`_mark_superseded`), not from
+    when the file was written. A level no manifest ever named -- a pack that
+    was stopped or killed -- has only its write time, and no reader.
+
+    Staging files of a killed level write (`write_bytes_atomic` does not clean
+    up after `TerminateProcess`) are removed once they are older than any
+    level write takes; nothing reads a staging file.
     """
     now = time.time()
     for path in root.glob("mesh_l*.bin"):
@@ -941,6 +1018,45 @@ def _prune_superseded_levels(root: Path, keep: set, older_than_s: float = 120.0)
             if now - path.stat().st_mtime >= older_than_s:
                 path.unlink()
         except OSError:
+            pass
+    for path in root.glob("mesh_l*.bin.p*.tmp"):
+        try:
+            if now - path.stat().st_mtime >= STAGING_GRACE_S:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _sweep_unnamed_levels(root: Path) -> None:
+    """`_prune_superseded_levels` against the manifest on disk now, if it reads.
+
+    Only when it reads: an unreadable manifest names nothing, and pruning
+    against an empty keep set would delete the published surface.
+    """
+    try:
+        current = json.loads((root / "manifest.json").read_text())
+    except FileNotFoundError:
+        current = {"levels": []}
+    except (OSError, ValueError):
+        return
+    if not isinstance(current, dict):
+        return
+    keep = set()
+    for entry in current.get("levels") or []:
+        path = level_file(root, entry)
+        if path is None:
+            return
+        keep.add(path.name)
+    _prune_superseded_levels(root, keep)
+
+
+def _discard_unpublished(root: Path, levels: list) -> None:
+    """Remove the level files a stopped pack wrote. No manifest names them, so
+    no reader can hold them."""
+    for entry in levels:
+        try:
+            (root / entry["file"]).unlink()
+        except (OSError, KeyError, TypeError):
             pass
 
 

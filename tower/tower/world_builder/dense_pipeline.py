@@ -181,13 +181,29 @@ def _status(root: Path, **fields) -> None:
 
 
 def status_is_stale(status: dict) -> bool:
-    """True when a status says `running` but its process is gone."""
+    """True when a status says `running` but its process is gone -- or its pid
+    now belongs to a process that started after the status was written.
+
+    A bare pid probe here left `live: true` on `/render/revision` for as long
+    as a recycled pid lived after a densify was killed (review 2, I2). The
+    locks and the surface status already asked the store's question; the dense
+    status now does too, from `updated_at`, which `_status` writes on every
+    state.
+    """
     if not status or status.get("state") != STATE_RUNNING:
         return False
     pid = status.get("pid")
     if not isinstance(pid, int):
         return True
-    return not _pid_is_running(pid)
+    from tower.world_builder.store import _holder_is_running  # noqa: PLC0415
+
+    written = status.get("updated_at")
+    if not isinstance(written, (int, float)):
+        written = None
+    try:
+        return not _holder_is_running(pid, None, lock_written_at=written)
+    except Exception:  # noqa: BLE001 -- "running" is the recoverable answer
+        return False
 
 
 def _stopped(should_stop) -> bool:

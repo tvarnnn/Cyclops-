@@ -80,6 +80,24 @@ def choose_level(manifest: dict, budget_bytes: int) -> dict:
     return min(levels, key=lambda lv: lv["bytes"])
 
 
+def evidence_filter_ran(manifest: dict) -> bool:
+    """Whether this artifact's faces went through the per-face frame tests.
+
+    Read off the manifest, because the page's caption promises "at least two
+    camera views" and a surface built before the filter existed made no such
+    test: its `params` carry neither key. A manifest that records the filter's
+    own stats (`detail.evidence_filter`) is believed first."""
+    detail = manifest.get("detail")
+    if isinstance(detail, dict) and "evidence_filter" in detail:
+        return detail["evidence_filter"] is not None
+    params = manifest.get("params") or {}
+    try:
+        return (int(params.get("min_support_frames") or 0) > 0
+                or float(params.get("contradiction_ratio") or 0) > 0)
+    except (TypeError, ValueError):
+        return False
+
+
 def build_surface_payload(store, world_id: str, session_id: str, *,
                           budget_bytes: int = MOBILE_BYTE_BUDGET,
                           level: int | None = None):
@@ -119,6 +137,7 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
     currency = surface_currency(store, world_id, session_id, manifest)
     scale = manifest.get("scale") or {}
     config = {
+        "evidence_filter": evidence_filter_ran(manifest),
         "world_id": world_id,
         "session_id": session_id,
         "format": manifest.get("format"),

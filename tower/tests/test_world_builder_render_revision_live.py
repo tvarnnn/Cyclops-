@@ -189,3 +189,14 @@ def test_the_meta_policy_is_the_response_header(derived_world):
                                   params={"session_id": session_id})
     header = response.headers["content-security-policy"]
     assert f'content="{header}"' in response.text[:4096]
+
+
+def test_a_running_dense_stage_whose_pid_was_recycled_is_not_live(derived_world):
+    """Review 2, I2. A densify killed mid-run leaves `running`; once Windows
+    hands its pid to a later process, a bare pid probe said `live: true` for as
+    long as that process lived. This process started after a status written a
+    day ago, so it cannot have written it."""
+    store, world_id, session_id = derived_world
+    _write_status(store, world_id, session_id, "dense",
+                  state="running", pid=os.getpid(), updated_at=time.time() - 86400)
+    assert R.session_build_running(store, world_id, session_id) is False

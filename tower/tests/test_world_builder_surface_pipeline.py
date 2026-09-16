@@ -1527,3 +1527,195 @@ class TestTheFillMaskSurvivesALiveBuild:
         assert not SP._depth_cache_usable(a, dense, solution, DenseParams())
         # densify's own cache test is the key
         assert f"fill{FILL_RULE}" in _depth_cache_key("d", DenseParams())
+
+
+# ---------------------------------------------------------------------------
+# review 2: the prune grace, orphans, the budget's last attempt, the manifest
+# ---------------------------------------------------------------------------
+
+
+class TestAReaderOfThePreviousManifestKeepsItsFiles:
+    """Review 2, I1. The grace was measured from each level's WRITE time, so a
+    previous build older than two minutes lost its levels the instant the next
+    manifest landed, and a reader between the manifest and the level got
+    `SurfaceUnavailable` -- a downgraded page, and on the phone an offer to
+    replace a surface with points."""
+
+    def test_a_reader_holding_the_previous_manifest_can_read_its_level(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        assert SP.surfacify(store, WORLD, SESSION, params=_params()).state == SP.STATE_OK
+        root = SP.surface_dir(store, WORLD, SESSION)
+        held = _manifest(store)
+        past = time.time() - 600          # an ordinary gap before the final build
+        for lv in held["levels"]:
+            os.utime(root / lv["file"], (past, past))
+
+        second = SP.surfacify(store, WORLD, SESSION, force=True,
+                              params=_params(min_weight=0.8))
+        assert second.state == SP.STATE_OK
+        assert _manifest(store)["built_at"] != held["built_at"]
+        assert SP.read_surface_level(store, WORLD, SESSION, 0, manifest=held)
+
+    def test_superseded_levels_go_once_the_grace_after_supersession_has_passed(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        root = SP.surface_dir(store, WORLD, SESSION)
+        first = _manifest(store)
+        SP.surfacify(store, WORLD, SESSION, force=True, params=_params(min_weight=0.8))
+        old = [root / lv["file"] for lv in first["levels"]]
+        assert all(p.exists() for p in old)
+        past = time.time() - SP.PRUNE_GRACE_S - 5    # superseded long enough ago
+        for p in old:
+            os.utime(p, (past, past))
+        SP.surfacify(store, WORLD, SESSION, force=True, params=_params(min_weight=0.7))
+        assert not any(p.exists() for p in old)
+
+
+class TestNothingUnnamedIsLeftBehind:
+    """Review 2, I7. A stop between levels returned without removing the
+    levels it had written, and the prune ran only after a later SUCCESSFUL
+    publish -- which a final build that was stopped never gets. Staging files
+    of a killed write were never pruned at all."""
+
+    def test_a_stop_during_pack_removes_the_levels_it_wrote(self, tmp_path):
+        import unittest.mock as mock
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        before = _manifest(store)
+        root = SP.surface_dir(store, WORLD, SESSION)
+        wrote = []
+        real = SP.write_bytes_atomic
+
+        def spy(path, write):
+            real(path, write)
+            wrote.append(path)
+
+        def stop_after_the_first_level():
+            try:
+                in_pack = json.loads((root / "status.json").read_text()).get("stage") == "pack"
+            except (OSError, ValueError):
+                return False
+            return in_pack and bool(wrote)
+
+        with mock.patch.object(SP, "write_bytes_atomic", spy):
+            result = SP.surfacify(store, WORLD, SESSION, force=True,
+                                  params=_params(min_weight=0.8),
+                                  should_stop=stop_after_the_first_level)
+        assert result.state == SP.STATE_STOPPED
+        assert wrote, "fixture: the stop came before any level was written"
+        assert not any(p.exists() for p in wrote)
+        named = {lv["file"] for lv in before["levels"]}
+        assert {p.name for p in root.glob("mesh_l*.bin")} == named
+
+    def test_a_killed_packs_files_are_swept_by_the_next_run_even_one_that_builds_nothing(
+            self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        root = SP.surface_dir(store, WORLD, SESSION)
+        named = {lv["file"] for lv in _manifest(store)["levels"]}
+        orphan = root / "mesh_l0.deadbeef.bin"
+        staging = root / "mesh_l1.deadbeef.bin.p1234.abcdef01.tmp"
+        fresh_staging = root / "mesh_l1.cafe.bin.p1234.abcdef02.tmp"
+        for p in (orphan, staging, fresh_staging):
+            p.write_bytes(b"torn")
+        old = time.time() - SP.STAGING_GRACE_S - 5
+        for p in (orphan, staging):
+            os.utime(p, (old, old))
+
+        again = SP.surfacify(store, WORLD, SESSION, params=_params())   # already built
+        assert again.state == SP.STATE_OK
+        assert not orphan.exists() and not staging.exists()
+        assert fresh_staging.exists(), "a staging file young enough to be in flight stays"
+        assert all((root / n).exists() for n in named)
+
+    def test_an_unreadable_manifest_sweeps_nothing(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        root = SP.surface_dir(store, WORLD, SESSION)
+        files = list(root.glob("mesh_l*.bin"))
+        old = time.time() - 3600
+        for p in files:
+            os.utime(p, (old, old))
+        (root / "manifest.json").write_text("{torn", encoding="utf-8")
+        SP._sweep_unnamed_levels(root)
+        assert all(p.exists() for p in files)
+
+
+class TestTheBudgetIsABudget:
+    """Review 2, S7. On its last attempt the coarsening loop reserved whatever
+    the pass computed, over budget, silently -- the out-of-memory failure the
+    budget exists to prevent."""
+
+    def test_a_walk_the_budget_cannot_hold_is_refused_by_name(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        before = _manifest(store)
+        result = SP.surfacify(store, WORLD, SESSION, force=True,
+                              params=_params(max_blocks=1))
+        assert result.state == SP.STATE_UNAVAILABLE
+        assert "block budget of 1" in result.detail
+        assert _manifest(store) == before, "the previous surface stands"
+
+
+class TestTheManifestSaysWhatWasUsed:
+
+    def test_truncation_is_the_band_used_cap_included(self, tmp_path):
+        """Review 2, S6.2: `truncation_for` is uncapped, and the manifest
+        recorded it even when `trunc_max_voxels` cut every sample's band."""
+        store = _synthetic_world(tmp_path)
+        params = _params(trunc_voxels=1.0, trunc_max_voxels=2.0, trunc_error_multiple=40.0)
+        assert SP.surfacify(store, WORLD, SESSION, params=params).state == SP.STATE_OK
+        man = _manifest(store)
+        uncapped = S.truncation_for(params, man["voxel"], man["median_scene_depth"], 0.01)
+        assert uncapped > 2.0 * man["voxel"] * 1.5, "fixture: the cap binds"
+        assert man["truncation"] == pytest.approx(2.0 * man["voxel"])
+
+    def test_a_build_the_evidence_filter_emptied_says_so(self, tmp_path):
+        """Review 2, S6.3. Every face removed by the filter was reported as
+        "the fused field held no cell with enough evidence"."""
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        before = _manifest(store)
+        result = SP.surfacify(store, WORLD, SESSION, force=True,
+                              params=_params(min_support_frames=2))
+        assert result.state == SP.STATE_UNAVAILABLE
+        assert "evidence filter removed all" in result.detail, result.detail
+        assert "fewer than 2 distinct frames" in result.detail
+        assert _manifest(store)["built_at"] == before["built_at"]
+
+
+class TestTheCaptionPromisesOnlyWhatTheArtifactDid:
+    """Review 2, S6.5. The page says "at least two camera views" for every
+    surface, including one built before the per-face filter existed."""
+
+    def test_a_filtered_build_says_so_in_its_manifest_and_its_page(self, tmp_path):
+        from tower.world_builder.surface_render import build_surface_payload
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        man = _manifest(store)
+        assert man["detail"]["evidence_filter"]["faces_in"] > 0
+        _raw, config = build_surface_payload(store, WORLD, SESSION)
+        assert config["evidence_filter"] is True
+
+    def test_a_surface_built_before_the_filter_does_not_claim_two_views(self, tmp_path):
+        from tower.world_builder.surface_render import build_surface_payload
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        path = SP.surface_dir(store, WORLD, SESSION) / "manifest.json"
+        man = json.loads(path.read_text())
+        man.pop("detail")
+        for key in ("min_support_frames", "contradiction_ratio", "drop_back_facing"):
+            man["params"].pop(key)
+        path.write_text(json.dumps(man))
+        _raw, config = build_surface_payload(store, WORLD, SESSION)
+        assert config["evidence_filter"] is False
+
+    def test_the_template_keys_the_two_view_sentence_on_it(self):
+        from tower.world_builder.surface_render import viewer_template_path
+
+        html = viewer_template_path().read_text(encoding="utf-8")
+        at = html.index("at least two camera views")
+        assert "CONFIG.evidence_filter" in html[at - 300:at]

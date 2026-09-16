@@ -642,10 +642,16 @@ function main(){
   // was outvoted by other views that saw past it, a quarter lacked the
   // evidence of two agreeing views, and a quarter was removed as a
   // contradicted or back-facing fold. Almost none was "nobody looked".
-  let note = "Surfaces appear only where at least two camera views measured "
-           + "them and did not contradict each other. A gap is either a place "
-           + "nothing looked or a place the views disagreed about, so a gap is "
-           + "not proof that nothing is there.";
+  // The two-view sentence only for an artifact whose manifest says the
+  // per-face evidence filter ran; a surface built before it existed is
+  // described by what it did do.
+  let note = (CONFIG.evidence_filter
+              ? "Surfaces appear only where at least two camera views measured "
+                + "them and did not contradict each other. "
+              : "Surfaces appear only where the cameras' fused measurements "
+                + "reached the evidence threshold. ")
+           + "A gap is either a place nothing looked or a place the views "
+           + "disagreed about, so a gap is not proof that nothing is there.";
   if ((CONFIG.scale_state || "unknown") === "unknown")
     note += " Scale is unknown, so distances here are relative.";
   const cap = document.getElementById("caption");

@@ -419,7 +419,7 @@ nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
             // section 2 claim 2: a gap is NOT proof that nobody looked. On the
             // canonical capture most measured depth with no surface near it
             // was outvoted or lacked a second agreeing view.
-            return "Surfaces the Tower reconstructed from the walk, only where at least two camera views measured them and agreed. A gap is not proof that nothing is there. Not to scale."
+            return "Surfaces the Tower reconstructed from the walk, only where the cameras measured them. A gap is not proof that nothing is there. Not to scale."
         case .dense:
             return "Points the Tower measured densely from the walk. Not a surface, and not to scale."
         case .sparse:

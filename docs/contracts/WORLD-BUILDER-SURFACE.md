@@ -121,8 +121,18 @@ A build is published as a unit. Each build writes its levels under its own
 `levels[].file` with their byte counts. Readers resolve a level only through
 the manifest and refuse a file whose size disagrees. A build killed during
 packing therefore leaves orphan level files that nothing names, and the
-previous manifest keeps pointing at the previous build's whole set. Level
-files no manifest names are pruned once they are two minutes old. A manifest
+previous manifest keeps pointing at the previous build's whole set.
+
+**Pruning.** A reader that has read a manifest may still read that manifest's
+levels for at least two minutes after a newer manifest **replaces** it. The
+grace counts from supersession, not from when the files were written: the
+builder stamps the replaced manifest's level files just before it writes the
+new manifest. Level files no current manifest names are pruned once that grace
+has passed. Pruning runs after each successful publish, and also at the start
+of every build of the session, including one that finds the session already
+built. A stopped pack removes the levels it wrote, since no manifest names
+them. Staging files left by a killed write are pruned once they are ten
+minutes old. A manifest that cannot be read prunes nothing. A manifest
 written before per-build names (no `file` key) still resolves to
 `mesh_lN.bin`. This is not decoration — a torn
 `solution.npz` read across processes ended a session holding 795 keyframes
@@ -173,9 +183,11 @@ distinguishable from corruption.
 | `params_digest` | input digest plus every parameter that affects the result |
 | `params` | the full parameter set, including `quality` |
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
-| `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `min(max(floor, rel * d), trunc_max_voxels * voxel)`; `truncation` is that band at the scene scale |
-| `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason |
-| `voxel`, `truncation` | in scene units |
+| `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |
+| `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `max(floor, min(rel * d, trunc_max_voxels * voxel))` when `rel > 0` (the floor wins over the cap), and `floor` alone when `rel` is 0 |
+| `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason; `null` when the filter did not run |
+| `detail.voxel_coarsened_by` | how far the block budget (`params.max_blocks`) coarsened the voxel. A walk the budget cannot hold after 12 coarsening attempts is refused (`unavailable`, naming the budget) rather than built over it |
+| `voxel`, `truncation` | in scene units. `truncation` is the band a sample at the scene scale actually got, cap included (manifests written before 2026-09-16 recorded the uncapped request) |
 | `frames_used`, `frames_offered` | how much of the walk contributed |
 | `vertices`, `faces` | of level 0 |
 | `levels` | per level: level, vertices, faces, bytes |
