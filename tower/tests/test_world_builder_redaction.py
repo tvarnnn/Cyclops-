@@ -650,16 +650,32 @@ def _hand_landmarks(box):
     return out
 
 
-def _gate(detections_at_two, detections_at_one=None):
+def _gate(detections_at_two, detections_at_one=None, *, raises_at=()):
+    """Run `_detect` on scripted detector output.
+
+    `detections_at_one` is what every OTHER scale returns -- native, 1/2, 1/4 --
+    or a dict {scale: detections}; a scale missing from the dict finds nothing.
+    `raises_at` lists scales whose pass throws.
+    """
+    from tower.world_builder.redaction import UPSCALE
+
     redactor = FaceRedactor()
+    asked = []
 
     def _raw(image, upscale):
-        if upscale == 1 and detections_at_one is not None:
-            return list(detections_at_one)
-        return list(detections_at_two)
+        asked.append(upscale)
+        if upscale in raises_at:
+            raise RuntimeError(f"pass at {upscale} fell over")
+        if upscale == UPSCALE or detections_at_one is None:
+            return list(detections_at_two)
+        if isinstance(detections_at_one, dict):
+            return list(detections_at_one.get(upscale, []))
+        return list(detections_at_one)
 
     redactor._raw_detect = _raw
-    return redactor._detect(_room())
+    boxes = redactor._detect(_room())
+    _gate.asked = asked
+    return boxes
 
 
 def test_coincident_eye_landmarks_on_a_large_box_are_filled():
@@ -699,28 +715,97 @@ def test_a_box_that_is_not_a_number_fills_the_frame_rather_than_raising():
 
 
 # -- a box over a quarter of the frame ----------------------------------
+#
+# Landmark geometry carries no evidence at this size: all 40 false boxes over
+# 25% on the canonical capture are "facelike". What does is being found again at
+# another resolution -- native, 1/2 or 1/4 -- which a genuinely large face
+# survives (65 of 65 composited close faces) and a wall rarely does (6 of 40).
 
 
-def test_a_facelike_box_over_a_quarter_of_the_frame_is_filled_uncorroborated():
-    """Someone leaning into the wearer. The old hard cap never filled this."""
+def test_a_facelike_box_over_a_quarter_is_not_filled_on_its_landmarks_alone():
+    """The rule that stored a plain wall and a PC tower fully black."""
     box = _box_of_area(0.30)
-    assert len(_gate([(box, _facelike_landmarks(box))], detections_at_one=[])) == 1
+    assert _gate([(box, _facelike_landmarks(box))], detections_at_one=[]) == []
 
 
-def test_an_unfacelike_box_over_a_quarter_is_filled_if_corroborated():
+def test_a_box_over_a_quarter_is_filled_when_found_again_at_any_scale():
     box = _box_of_area(0.30)
-    hand = _hand_landmarks(box)
-    assert len(_gate([(box, hand)], detections_at_one=[(box, hand)])) == 1
+    for scale in (1.0, 0.5, 0.25):
+        for landmarks in (_facelike_landmarks(box), _hand_landmarks(box)):
+            boxes = _gate([(box, landmarks)],
+                          detections_at_one={scale: [(box, landmarks)]})
+            assert len(boxes) == 1, (
+                f"a large box found again at scale {scale} was not filled"
+            )
 
 
-def test_an_unfacelike_uncorroborated_box_over_a_quarter_is_dropped():
-    """Only a box that fails BOTH pieces of face evidence goes unfilled."""
-    from tower.world_builder.redaction import landmark_verdict
-
+def test_a_large_box_found_again_elsewhere_does_not_count():
+    """Corroboration means the SAME place, not any detection at all."""
     box = _box_of_area(0.30)
-    hand = _hand_landmarks(box)
-    assert landmark_verdict(box, hand) is False
-    assert _gate([(box, hand)], detections_at_one=[]) == []
+    elsewhere = (500.0, 300.0, 40.0, 50.0)
+    boxes = _gate([(box, _facelike_landmarks(box))],
+                  detections_at_one={s: [(elsewhere, _facelike_landmarks(elsewhere))]
+                                     for s in (1.0, 0.5, 0.25)})
+    assert boxes == []
+
+
+def test_a_large_box_is_filled_if_any_corroboration_pass_cannot_run():
+    """FAILS TOWARDS FILLING, per scale: one broken pass is not a "no"."""
+    box = _box_of_area(0.30)
+    for scale in (1.0, 0.5, 0.25):
+        boxes = _gate([(box, _facelike_landmarks(box))], detections_at_one={},
+                      raises_at=(scale,))
+        assert len(boxes) == 1, f"a pass failing at {scale} dropped the fill"
+
+
+def test_unjudgeable_landmarks_fill_a_large_box_without_any_second_look():
+    box = _box_of_area(0.30)
+    nan = float("nan")
+    boxes = _gate([(box, [nan] * 10)], detections_at_one={})
+    assert len(boxes) == 1
+    assert _gate.asked == [2], "an unjudgeable box was sent for corroboration"
+
+
+def test_the_downscaled_pass_reports_boxes_in_original_pixels():
+    """A pass at 1/4 must come back in the same coordinates as the pass at 2,
+    or every IoU it is compared on is meaningless."""
+    frame, (x, y, size) = _frame_with_face(size=150, at=(200, 60))
+    redactor = FaceRedactor()
+    full = redactor._raw_detect(frame, 2)
+    quarter = redactor._raw_detect(frame, 0.25)
+    assert full and quarter, "precondition: the face is found at both scales"
+    from tower.world_builder.redaction import _iou
+
+    best = max(_iou(a, b) for a, _ in full for b, _ in quarter)
+    assert best >= 0.5, f"the 1/4 pass disagrees with the 2x pass (IoU {best:.2f})"
+
+
+def test_a_real_face_covering_more_than_a_quarter_of_the_frame_is_filled():
+    """End to end, real detector, the capture's own 360x640 portrait frame: a
+    tightly cropped face ~20 cm from the lens, whose detector box is ~30% of
+    the frame -- so it goes down the large-box branch, not the easy one."""
+    from tower.world_builder.redaction import (
+        LARGE_BOX_AREA_FRACTION,
+        box_area_fraction,
+    )
+
+    face = skimage_data.astronaut()[40:160, 170:290]
+    patch = cv2.cvtColor(
+        cv2.resize(face, (300, 300), interpolation=cv2.INTER_CUBIC),
+        cv2.COLOR_RGB2BGR,
+    )
+    frame = cv2.resize(_room(), (360, 640))
+    frame[150:450, 5:305] = patch
+
+    redactor = FaceRedactor()
+    raw = redactor._raw_detect(frame, 2)
+    assert any(box_area_fraction(b, frame.shape) > LARGE_BOX_AREA_FRACTION
+               for b, _ in raw), "precondition: the detection is a large box"
+
+    result = redactor.redact(_encode(frame))
+    out = cv2.imdecode(np.frombuffer(result.image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    assert result.regions >= 1
+    assert int(out[300, 155].max()) == 0, "the middle of a close face was not filled"
 
 
 # -- one failed frame must not be laundered by the next success ---------

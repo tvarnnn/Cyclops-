@@ -194,24 +194,39 @@ LANDMARK_TEST_ABOVE_AREA = 0.02
 # HEAD_DILATION it took 93.8% of a frame whose content is a wall, a PC tower
 # and carpet.
 #
-# This used to be a hard cap: above 25%, never filled. That left a real face
-# closer than about 20 cm -- someone leaning into the wearer -- on disk, and a
-# review refused it as a trade. So above 25% the box is now filled if EITHER
-# piece of face evidence holds: its landmarks lie like a face, or the detector
-# finds it again at native resolution. Only a box that fails BOTH is dropped.
+# Two rules have been tried here and both were wrong, so both are recorded.
 #
-# THIS IS NOT FREE, and the cost is recorded here so it is not rediscovered.
-# Every one of the 40 false boxes over 25% on the canonical capture has
-# facelike landmarks -- a box that large spreads its five points like a face
-# whatever is inside it -- so for big boxes the landmark evidence is always
-# present and this rule fills all of them. Over the 398 raw frames the filled
-# fraction goes from 1.83% (hard cap) to 7.51%, frames over 50% filled from 1
-# to 31, the worst frame is 93.2% (keyframe 188, a wall and crutches), and 6
-# rather than 12 of the 13 fill-caused dense refusals come back. What it buys:
-# composited real faces with a box over 25% of the frame go from 0 of 65
-# filled to 65 of 65. Requiring BOTH pieces of evidence instead would fill 64
-# of 65 at 2.57% (REDACTION.md, section 12); that choice was not taken.
+# A hard cap (above 25%, never filled) left a real face closer than about
+# 20 cm -- someone leaning into the wearer -- on disk: 0 of 65 composited close
+# faces filled.
+#
+# "Facelike landmarks OR found again at native resolution" then filled 65 of
+# 65, but landmark geometry carries NO evidence at this size: all 40 false
+# boxes over 25% on the canonical capture are "facelike", because a box that
+# large spreads its five points like a face whatever is inside it. So the rule
+# filled every large box: 7.51% of the capture's pixels, 31 frames over half
+# black, and a replay keyframe of a plain wall and a PC tower stored fully black.
+#
+# What does carry evidence is the one thing a genuinely large face is best at:
+# being seen at LOW resolution. A face filling a third of the frame is still a
+# 90-px face at a quarter of the resolution, while a coincidence of texture
+# spread over that area usually dissolves. Measured over the same 40 false
+# boxes and 65 close composited faces (REDACTION.md, section 13):
+#
+#     re-detected at    false boxes kept   close faces filled   filled pixels
+#     native                  4 / 40             64 / 65             2.57%
+#     1/2                     1 / 40             65 / 65             1.99%
+#     1/4                     2 / 40             65 / 65             2.19%
+#     any of the three        6 / 40             65 / 65             2.72%
+#
+# The union is used, not the cheapest single scale: each scale misses faces the
+# others see (native missed one composite that 1/2 and 1/4 found), a composite
+# set is 65 frontal faces rather than every close face there is, and the cost of
+# the union over the best single scale is 0.7 points of fill. Landmark geometry
+# is NOT consulted for a large box, except that landmarks too broken to judge
+# still fill it without asking.
 LARGE_BOX_AREA_FRACTION = 0.25
+LARGE_BOX_CORROBORATION_SCALES = (1.0, 0.5, 0.25)
 
 # 3. A BIG CLAIM ON THE FRAME HAS TO SURVIVE BEING LOOKED AT AGAIN, SMALLER.
 #
@@ -232,7 +247,12 @@ CORROBORATION_IOU = 0.30
 
 # Named in the session label, so a reader of an old world can tell which
 # imagery went through the gate and which predates it.
-PLAUSIBILITY_ID = "plausibility1"
+#
+# plausibility1: landmark bands, native corroboration from 5%, and above 25%
+#                facelike OR native-corroborated (53be0c3).
+# plausibility2: the same, except above 25% the landmarks are ignored and the
+#                box must be found again at native, 1/2 or 1/4 resolution.
+PLAUSIBILITY_ID = "plausibility2"
 
 MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 
@@ -520,12 +540,12 @@ class FaceRedactor:
             image_bytes=encoded.tobytes(), label=self.label, regions=len(boxes)
         )
 
-    def _raw_detect(self, image, upscale: int) -> list:
+    def _raw_detect(self, image, upscale) -> list:
         """(box, landmarks) pairs in ORIGINAL image coordinates.
 
-        The upscale is a parameter because the corroboration pass below looks
-        at the same frame at a different one, and both have to come back in
-        the same coordinates to be compared.
+        The upscale is a parameter because the corroboration passes below look
+        at the same frame at other scales -- including below 1 -- and every
+        pass has to come back in the same coordinates to be compared.
         """
         import cv2
 
@@ -533,12 +553,18 @@ class FaceRedactor:
         if upscale == 1:
             scaled = image
         else:
+            target = (max(1, int(round(width * upscale))),
+                      max(1, int(round(height * upscale))))
             scaled = cv2.resize(
                 image,
-                (width * upscale, height * upscale),
-                interpolation=cv2.INTER_CUBIC,
+                target,
+                # Area averaging to shrink: cubic aliases, and aliasing is
+                # exactly the texture coincidence this pass exists to dissolve.
+                interpolation=cv2.INTER_CUBIC if upscale > 1 else cv2.INTER_AREA,
             )
         size = (scaled.shape[1], scaled.shape[0])
+        scale_x = size[0] / float(width)
+        scale_y = size[1] / float(height)
         # One detector, re-targeted. Building a second one per frame was
         # measured at 8 ms and this runs on every keyframe.
         if self._detector is None:
@@ -557,8 +583,11 @@ class FaceRedactor:
             return []
         out = []
         for face in faces:
-            box = tuple(float(v) / upscale for v in face[:4])
-            landmarks = [float(v) / upscale for v in face[4:14]]
+            box = (float(face[0]) / scale_x, float(face[1]) / scale_y,
+                   float(face[2]) / scale_x, float(face[3]) / scale_y)
+            landmarks = []
+            for i in range(4, 14, 2):
+                landmarks += [float(face[i]) / scale_x, float(face[i + 1]) / scale_y]
             out.append((box, landmarks))
         return out
 
@@ -569,30 +598,30 @@ class FaceRedactor:
         head dilation is a deliberate over-reach and a test applied after it
         would be measuring the over-reach rather than the detection.
         """
-        # (box, may_be_dropped_if_uncorroborated). Everything not in this list
-        # was refused by a MEASURED landmark verdict; everything in it is
-        # filled unless the second look is asked and says no.
+        # (box, scales). Everything not in this list was refused by a MEASURED
+        # landmark verdict; everything in it is filled unless `scales` is
+        # non-empty and the detector finds it again at none of them.
         candidates = []
         for box, landmarks in self._raw_detect(image, UPSCALE):
             area = box_area_fraction(box, image.shape)
             if area < LANDMARK_TEST_ABOVE_AREA:
-                candidates.append((box, False))
+                candidates.append((box, ()))
                 continue
             verdict = landmark_verdict(box, landmarks)
             if verdict is None:
                 # Degenerate or non-finite landmarks: no judgement was made, so
                 # nothing may be dropped on the strength of one. Fill.
-                candidates.append((box, False))
+                candidates.append((box, ()))
             elif area > LARGE_BOX_AREA_FRACTION:
-                # Either piece of face evidence fills a frame-covering box.
-                # Facelike: fill. Not facelike: fill only if corroborated.
-                candidates.append((box, not verdict))
+                # The landmark verdict carries no evidence at this size; only
+                # being found again at some other resolution does.
+                candidates.append((box, LARGE_BOX_CORROBORATION_SCALES))
             elif not verdict:
                 continue
+            elif area >= CORROBORATE_ABOVE_AREA:
+                candidates.append((box, (1.0,)))
             else:
-                candidates.append(
-                    (box, area >= CORROBORATE_ABOVE_AREA)
-                )
+                candidates.append((box, ()))
         if not candidates:
             return []
 
@@ -617,40 +646,41 @@ class FaceRedactor:
         return boxes
 
     def _corroborate(self, image, candidates: list) -> list:
-        """Ask again at native resolution about the boxes that need it.
+        """Ask again, at other resolutions, about the boxes that need it.
 
-        `candidates` is (box, needs_corroboration). A box that does not need it
-        -- small, unjudgeable, or large and facelike -- is kept without the
-        second pass even being run.
+        `candidates` is (box, scales). A box with no scales -- small enough to
+        be a distant bystander, or unjudgeable -- is kept without a second pass
+        being run. Otherwise it is kept if ANY of its scales finds it again.
+        Each scale is run at most once per frame, and only if some box asks.
 
-        FAILS TOWARDS FILLING. If the second pass cannot be run at all -- a
-        detector that throws, a resize that fails -- every box is kept. The
-        cost of an unnecessary fill is pixels; the cost of a skipped one is a
-        face on disk, and those are not the same kind of mistake.
+        FAILS TOWARDS FILLING. If a pass cannot be run at all -- a detector
+        that throws, a resize that fails -- every box that asked for that scale
+        is kept. The cost of an unnecessary fill is pixels; the cost of a
+        skipped one is a face on disk, and those are not the same kind of
+        mistake.
         """
-        kept = [box for box, _ in candidates]
-        if not any(needs for _, needs in candidates):
-            return kept
-        try:
-            # This leaves the detector sized for the native frame; the next
-            # call at UPSCALE sees a size change and re-targets, which is the
-            # same path DAT's ladder already takes.
-            second = self._raw_detect(image, 1)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[Tower][Redaction] corroboration pass failed; keeping every "
-                "detection"
-            )
-            return kept
+        passes = {}
+
+        def found_at(box, scale):
+            if scale not in passes:
+                try:
+                    # This leaves the detector sized for another scale; the
+                    # next call at UPSCALE sees a size change and re-targets,
+                    # which is the same path DAT's ladder already takes.
+                    passes[scale] = self._raw_detect(image, scale)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[Tower][Redaction] corroboration pass at scale %s "
+                        "failed; keeping the detection", scale,
+                    )
+                    passes[scale] = None
+            second = passes[scale]
+            if second is None:
+                return True
+            return any(_iou(box, other) >= CORROBORATION_IOU for other, _ in second)
 
         survivors = []
-        for box, needs in candidates:
-            if not needs:
-                # Small enough that it could be a distant bystander (which is
-                # precisely what the second look is bad at seeing), or already
-                # carrying face evidence, or unjudgeable. Exempt.
-                survivors.append(box)
-                continue
-            if any(_iou(box, other) >= CORROBORATION_IOU for other, _ in second):
+        for box, scales in candidates:
+            if not scales or any(found_at(box, s) for s in scales):
                 survivors.append(box)
         return survivors
