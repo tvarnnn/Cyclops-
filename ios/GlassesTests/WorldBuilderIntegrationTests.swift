@@ -4462,12 +4462,15 @@ final class WorldBuilderSessionControllerTests: XCTestCase {
 }
 
 
-/// An open picture replaces itself when the Tower builds a better one, and
-/// never loses the world on screen trying.
+/// An open picture replaces itself when the Tower builds a better RUNG, offers
+/// a rebuild of the same rung, and never loses the world on screen trying --
+/// not to a failed fetch, and not to a page the phone cannot draw.
 @MainActor
 final class WorldRenderRevisionTests: XCTestCase {
 
     private static let host = URL(string: "http://stub.invalid")!
+    private static let pagePath = "/worlds/w1/render"
+    private static let revisionPath = "/worlds/w1/render/revision"
 
     private func client() -> WorldRenderClient {
         WorldRenderClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession())
@@ -4480,8 +4483,11 @@ final class WorldRenderRevisionTests: XCTestCase {
             + "</head><body></body></html>"
     }
 
-    private func revisionBody(_ revision: String) -> String {
-        #"{"session_id": "s1", "representation": "surface", "revision": ""# + revision + #""}"#
+    /// The §4a body. `live` defaults to true so a test's polls stay at the
+    /// injected interval rather than backing off.
+    private func revisionBody(_ rung: String, _ revision: String, live: Bool = true) -> String {
+        "{\"session_id\": \"s1\", \"representation\": \"\(rung)\", "
+            + "\"revision\": \"\(revision)\", \"live\": \(live)}"
     }
 
     private func waitUntil(timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool) async -> Bool {
@@ -4492,6 +4498,49 @@ final class WorldRenderRevisionTests: XCTestCase {
         }
         return condition()
     }
+
+    @MainActor
+    private final class Flag {
+        var value = false
+    }
+
+    /// Whether `follow` has returned within `timeout`. Bounded, so a follower
+    /// that regressed into looping fails an assertion instead of hanging the
+    /// whole test run on `await follow.value` (review m3).
+    private func returns(_ follow: Task<Void, Never>, within timeout: TimeInterval = 2) async -> Bool {
+        let ended = Flag()
+        Task { @MainActor in
+            await follow.value
+            ended.value = true
+        }
+        return await waitUntil(timeout: timeout) { ended.value }
+    }
+
+    /// Cancel a follower and wait for it to be gone. Not just `cancel()`: a
+    /// request it already handed to `URLSession` could otherwise reach the
+    /// stub after the NEXT test's `reset` and break its counts (review m4).
+    private func stop(_ follow: Task<Void, Never>) async {
+        follow.cancel()
+        let ended = await returns(follow)
+        XCTAssertTrue(ended, "a cancelled follower must end")
+    }
+
+    private func readyModel(
+        page html: String, revision: String, view: WorldRenderView = .product
+    ) async -> WorldRenderViewerModel {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.pagePath: (200, html),
+            Self.revisionPath: (200, revision),
+        ])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: "s1", view: view), client: client())
+        model.revisionPollInterval = .milliseconds(20)
+        await model.load()
+        model.pageEvent(.rendered)
+        return model
+    }
+
+    // MARK: Pure
 
     func testTheRevisionAddressKeepsTheSessionAndDropsTheView() {
         let target = WorldRenderTarget(worldID: "w1", sessionID: "s1", view: .diagnostics)
@@ -4505,76 +4554,247 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertNil(WorldRenderViewerState.ready(html: "<html><head></head></html>").revision)
     }
 
+    func testTheRevisionBodyNamesItsRungAndWhetherABuildIsLive() throws {
+        let full = try WorldRenderClient.decodeRevision(Data(revisionBody("dense", "s1/dense:7", live: false).utf8))
+        XCTAssertEqual(full, WorldRenderRevision(revision: "s1/dense:7", representation: .dense, live: false))
+
+        let bare = try WorldRenderClient.decodeRevision(Data(#"{"revision": "s1/sparse"}"#.utf8))
+        XCTAssertEqual(bare, WorldRenderRevision(revision: "s1/sparse", representation: nil, live: nil),
+                       "a rung or a liveness the Tower did not send is unknown, not invented")
+
+        let unknownRung = try WorldRenderClient.decodeRevision(
+            Data(#"{"revision": "s1/splat:1", "representation": "splat"}"#.utf8))
+        XCTAssertNil(unknownRung.representation)
+
+        XCTAssertThrowsError(try WorldRenderClient.decodeRevision(Data(#"{"representation": "surface"}"#.utf8)))
+    }
+
+    func testOnlyABetterRungIsAnUpgrade() {
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .surface))
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .dense))
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .dense, to: .surface))
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: nil, to: .surface))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .surface, to: .surface))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .sparse))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .surface, to: .dense))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .dense, to: nil))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: nil, to: .sparse))
+    }
+
+    func testTheFollowerSlowsDownOnlyWhileNothingIsBuilding() {
+        let base = Duration.seconds(10)
+        let ceiling = Duration.seconds(120)
+        func next(_ current: Duration, live: Bool?, changed: Bool = false) -> Duration {
+            WorldRenderViewerModel.nextPollInterval(
+                after: current, base: base, ceiling: ceiling, live: live, changed: changed)
+        }
+        XCTAssertEqual(next(.seconds(10), live: true), .seconds(10), "a live build is followed at the base interval")
+        XCTAssertEqual(next(.seconds(10), live: false), .seconds(20))
+        XCTAssertEqual(next(.seconds(20), live: nil), .seconds(40), "a Tower that does not say is treated as idle")
+        XCTAssertEqual(next(.seconds(80), live: false), .seconds(120), "capped")
+        XCTAssertEqual(next(.seconds(120), live: false), .seconds(120), "capped, and never a stop")
+        XCTAssertEqual(next(.seconds(120), live: false, changed: true), .seconds(10), "a change resets it")
+        XCTAssertEqual(next(.seconds(120), live: true), .seconds(10), "a build starting resets it")
+    }
+
+    func testTerminationsCountOnlyWithinTheWindow() {
+        let now = Date()
+        let times = [now.addingTimeInterval(-600), now.addingTimeInterval(-61), now.addingTimeInterval(-59), now]
+        let recent = WorldRenderWebView.Coordinator.recentTerminations(times, now: now, window: 60)
+        XCTAssertEqual(recent, [now.addingTimeInterval(-59), now],
+                       "kills spread over a long walk must not add up to 'too large to draw'")
+        XCTAssertEqual(WorldRenderWebView.Coordinator.terminationWindow, 60)
+    }
+
+    // MARK: Following
+
     func testABetterPictureReplacesTheOneOnScreen() async {
-        StubbedGeometryProtocol.reset(routes: [
-            "/worlds/w1/render": (200, page("sparse", "sparse")),
-            "/worlds/w1/render/revision": (200, revisionBody("sparse")),
-        ])
-        let model = WorldRenderViewerModel(
-            target: WorldRenderTarget(worldID: "w1", sessionID: "s1"), client: client())
-        model.revisionPollInterval = .milliseconds(20)
-        await model.load()
-        model.pageEvent(.rendered)
-
+        let model = await readyModel(page: page("sparse", "sparse"), revision: revisionBody("sparse", "sparse"))
         let follow = Task { await model.followRevisions() }
-        defer { follow.cancel() }
 
-        StubbedGeometryProtocol.set(route: "/worlds/w1/render", to: (200, page("surface", "surface:2")))
-        StubbedGeometryProtocol.set(route: "/worlds/w1/render/revision", to: (200, revisionBody("surface:2")))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:2")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:2")))
 
         let replaced = await waitUntil { model.state.representation == .surface }
         XCTAssertTrue(replaced, "the surface built during the walk never reached the screen")
         XCTAssertTrue(model.state.isRendering, "a new page is drawn under the same bound as the first")
+        XCTAssertFalse(model.newerPictureAvailable, "a better rung is swapped in, not offered")
+        await stop(follow)
+    }
+
+    /// Review M3: a surface is rebuilt on every global solve, and swapping it
+    /// in by itself reset the reader's camera about once a minute.
+    func testANewerBuildOfTheSameRungIsOfferedNotSwapped() async {
+        let shown = page("surface", "surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:1"))
+        let follow = Task { await model.followRevisions() }
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:2")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:2")))
+
+        let offered = await waitUntil { model.newerPictureAvailable }
+        XCTAssertTrue(offered, "a newer surface was never offered")
+        try? await Task.sleep(for: .milliseconds(100))
+        await stop(follow)
+        XCTAssertEqual(model.state, .ready(html: shown), "the picture on screen was replaced without asking")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
+                       "offering a picture downloads nothing; only load() fetched the page")
+
+        await model.showNewerPicture()
+        XCTAssertEqual(model.state, .rendering(html: page("surface", "surface:2")))
+        XCTAssertFalse(model.newerPictureAvailable)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2)
     }
 
     func testAnUnchangedRevisionFetchesNoPage() async {
-        StubbedGeometryProtocol.reset(routes: [
-            "/worlds/w1/render": (200, page("surface", "surface:1")),
-            "/worlds/w1/render/revision": (200, revisionBody("surface:1")),
-        ])
-        let model = WorldRenderViewerModel(
-            target: WorldRenderTarget(worldID: "w1", sessionID: "s1"), client: client())
-        model.revisionPollInterval = .milliseconds(20)
-        await model.load()
-        model.pageEvent(.rendered)
+        let shown = page("surface", "surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:1"))
         let follow = Task { await model.followRevisions() }
-        try? await Task.sleep(for: .milliseconds(200))
-        follow.cancel()
-        XCTAssertEqual(model.state, .ready(html: page("surface", "surface:1")))
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 3 }
+        await stop(follow)
+        XCTAssertTrue(polled, "it did poll")
+        XCTAssertEqual(model.state, .ready(html: shown))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1, "only load() fetched the page")
+        XCTAssertFalse(model.newerPictureAvailable)
+    }
+
+    /// Review m9: the revision route can say "surface" about a page the Tower
+    /// then serves as a lower rung. One extra download per rebuild, not one
+    /// per poll.
+    func testARevisionThePageDoesNotCarryCostsOneFetchNotALoop() async {
+        let shown = page("sparse", "s1/sparse")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "s1/surface:5"))
+        let follow = Task { await model.followRevisions() }
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 6 }
+        await stop(follow)
+        XCTAssertTrue(polled)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2,
+                       "load() plus exactly one refresh that found the same page")
+        XCTAssertEqual(model.state, .ready(html: shown))
     }
 
     func testAFailedRefreshKeepsTheWorldOnScreen() async {
-        StubbedGeometryProtocol.reset(routes: [
-            "/worlds/w1/render": (200, page("sparse", "sparse")),
-            "/worlds/w1/render/revision": (200, revisionBody("surface:9")),
-        ])
+        let shown = page("sparse", "sparse")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:9"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (500, "boom"))
+        let follow = Task { await model.followRevisions() }
+        let tried = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.pagePath) >= 2 }
+        await stop(follow)
+        XCTAssertTrue(tried, "a refresh was never attempted, so this test proved nothing")
+        XCTAssertEqual(model.state, .ready(html: shown), "a refresh that failed must not take the world away")
+    }
+
+    /// Review M2: the likeliest failure of a swap is the one the feature exists
+    /// for -- a bigger rung running the content process out of memory.
+    func testARefreshThePhoneCannotDrawPutsTheOldPictureBack() async {
+        let shown = page("sparse", "sparse")
+        let better = page("surface", "surface:2")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:2"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, better))
+        let follow = Task { await model.followRevisions() }
+
+        let swapped = await waitUntil { model.state == .rendering(html: better) }
+        XCTAssertTrue(swapped)
+        model.pageEvent(.gaveUpAfterTerminations(3))
+        XCTAssertEqual(model.state, .rendering(html: shown), "the page that drew is put back, not a failure")
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: shown))
+
+        // The refused revision is still what the Tower reports. It must not be
+        // fetched and swapped in again.
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
+        await stop(follow)
+        XCTAssertTrue(pollsLater)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2, "load() and one refresh; no second try")
+        XCTAssertEqual(model.state, .ready(html: shown))
+        XCTAssertFalse(model.newerPictureAvailable, "a refused revision is not offered either")
+    }
+
+    func testARefreshThatNeverFinishesDrawingPutsTheOldPictureBack() async {
+        let shown = page("sparse", "sparse")
+        let better = page("dense", "dense:4")
+        let model = await readyModel(page: shown, revision: revisionBody("dense", "dense:4"))
+        model.renderTimeout = .milliseconds(150)
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, better))
+        let follow = Task { await model.followRevisions() }
+
+        let swapped = await waitUntil { model.state == .rendering(html: better) }
+        XCTAssertTrue(swapped)
+        let reverted = await waitUntil { model.state == .rendering(html: shown) }
+        XCTAssertTrue(reverted, "the watchdog reported a failure instead of putting the old page back")
+        model.pageEvent(.rendered)
+        await stop(follow)
+        XCTAssertEqual(model.state, .ready(html: shown))
+    }
+
+    /// The fallback exists only for an automatic refresh. A first page that
+    /// cannot be drawn still says so.
+    func testAFirstPageThatCannotBeDrawnStillFails() async {
+        StubbedGeometryProtocol.reset(routes: [Self.pagePath: (200, page("surface", "surface:1"))])
         let model = WorldRenderViewerModel(
             target: WorldRenderTarget(worldID: "w1", sessionID: "s1"), client: client())
-        model.revisionPollInterval = .milliseconds(20)
         await model.load()
-        model.pageEvent(.rendered)
-        StubbedGeometryProtocol.set(route: "/worlds/w1/render", to: (500, "boom"))
-        let follow = Task { await model.followRevisions() }
-        try? await Task.sleep(for: .milliseconds(200))
-        follow.cancel()
-        XCTAssertEqual(model.state, .ready(html: page("sparse", "sparse")),
-                       "a refresh that failed must not take the world away")
+        model.pageEvent(.failed("boom"))
+        XCTAssertNotNil(model.state.failureMessage)
     }
 
     func testATowerWithoutTheRouteEndsTheFollowing() async {
-        StubbedGeometryProtocol.reset(routes: [
-            "/worlds/w1/render": (200, page("sparse", "sparse")),
-            "/worlds/w1/render/revision": (404, #"{"detail": "Not Found"}"#),
-        ])
-        let model = WorldRenderViewerModel(
-            target: WorldRenderTarget(worldID: "w1", sessionID: "s1"), client: client())
+        let model = await readyModel(page: page("sparse", "sparse"), revision: #"{"detail": "Not Found"}"#)
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (404, #"{"detail": "Not Found"}"#))
         model.revisionPollInterval = .milliseconds(10)
-        await model.load()
-        model.pageEvent(.rendered)
-        // `followRevisions` must RETURN on its own here; if it kept polling,
-        // this await would hang and the test would time out.
         let follow = Task { await model.followRevisions() }
-        await follow.value
+        let ended = await returns(follow)
+        follow.cancel()
+        XCTAssertTrue(ended, "followRevisions must RETURN on its own after an unmatched-route 404")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.revisionPath), 1,
+                       "it asked once and stopped (at 10 ms a loop would have asked ~200 times)")
         XCTAssertEqual(model.state, .ready(html: page("sparse", "sparse")))
+    }
+
+    /// Review M4: "no geometry yet" is one of §4's own sentences, and a world
+    /// mid-build can answer it for a moment. It must not end following.
+    func testAContractWorded404IsAskedAgainNotFinal() async {
+        let model = await readyModel(page: page("sparse", "sparse"), revision: "")
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (
+            404, #"{"detail": "session 's1' of world 'w1' has no geometry yet"}"#))
+        let follow = Task { await model.followRevisions() }
+
+        let askedAgain = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 3 }
+        XCTAssertTrue(askedAgain, "a transient 404 ended the following")
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:3")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:3")))
+        let replaced = await waitUntil { model.state.representation == .surface }
+        await stop(follow)
+        XCTAssertTrue(replaced, "the picture built after the 404 never reached the screen")
+    }
+
+    /// Review M1: the diagnostics page is always the sparse one, so following
+    /// it against the product ladder would refetch it on every rebuild.
+    func testADiagnosticsPictureIsNotFollowed() async {
+        let model = await readyModel(
+            page: page("sparse", "sparse"), revision: revisionBody("surface", "surface:1"), view: .diagnostics)
+        let follow = Task { await model.followRevisions() }
+        let ended = await returns(follow)
+        follow.cancel()
+        XCTAssertTrue(ended, "a diagnostics picture has nothing to follow")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.revisionPath), 0)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1)
+    }
+
+    /// Dismissing the sheet cancels the screen's `.task`; the loop must end.
+    func testCancellingTheFollowerEndsIt() async {
+        let model = await readyModel(page: page("surface", "surface:1"), revision: revisionBody("surface", "surface:1"))
+        let follow = Task { await model.followRevisions() }
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 1 }
+        XCTAssertTrue(polled)
+        follow.cancel()
+        let ended = await returns(follow)
+        XCTAssertTrue(ended, "a cancelled follower kept running after the screen went away")
+        let asked = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.revisionPath), asked,
+                       "no request after the follower ended")
     }
 }

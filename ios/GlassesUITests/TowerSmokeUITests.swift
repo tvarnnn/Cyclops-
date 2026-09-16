@@ -225,6 +225,20 @@ final class TowerSmokeUITests: XCTestCase {
         // would pin a page that is being rewritten on the other side.
         let webView = app.webViews.firstMatch
         XCTAssertTrue(webView.waitForExistence(timeout: 30), "the Tower's page rendered inside the WKWebView")
+
+        // The caption above proves the push, not the page: its "not to scale"
+        // predicate also matches the caption shown while the page is still
+        // being fetched. The rung caption is only on screen once the app has
+        // read `wb-representation` out of the Tower's page, which is the one
+        // thing only a real Tower can prove. The prefixes are the first words
+        // of `WorldRenderRepresentation.caption(for:)` for surface, dense and
+        // sparse, in that order.
+        let rungCaption = app.staticTexts.containing(NSPredicate(
+            format: "label BEGINSWITH %@ OR label BEGINSWITH %@ OR label BEGINSWITH %@",
+            "Surfaces the Tower reconstructed", "Points the Tower measured densely",
+            "Points the Tower measured from the walk"
+        )).firstMatch
+        XCTAssertTrue(rungCaption.waitForExistence(timeout: 30), "the caption read the page's rung")
         attach("3d-world")
 
         // The canvas takes a gesture without the screen moving under it.

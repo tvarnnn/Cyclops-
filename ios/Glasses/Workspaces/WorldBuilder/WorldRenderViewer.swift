@@ -91,6 +91,20 @@ nonisolated enum WorldRenderFetchError: Error, Equatable {
     case transport(String)
 }
 
+/// What `GET /worlds/{id}/render/revision` said, `WORLD-BUILDER-WORLDS.md` §4a.
+nonisolated struct WorldRenderRevision: Equatable, Sendable {
+    /// Opaque. Compared for equality only (§4a rule 1).
+    let revision: String
+    /// The rung that revision would serve, or `nil` for a value this app does
+    /// not know. Read from the payload rather than from the revision, which
+    /// is opaque: this is what decides whether a new picture replaces the one
+    /// on screen by itself or is only offered.
+    let representation: WorldRenderRepresentation?
+    /// Whether the Tower is building this session right now. `nil` when the
+    /// Tower did not say. `false` means "slow down", not "stop" (§4a rule 6).
+    let live: Bool?
+}
+
 /// Fetches the viewer page over HTTP, as a string.
 ///
 /// ## Why `URLSession` fetches the page and the web view only renders it
@@ -145,15 +159,20 @@ nonisolated struct WorldRenderClient {
         return html
     }
 
-    /// Which picture the Tower would serve now, as an opaque revision, or
-    /// `nil` when there is no revision to follow.
+    /// Which picture the Tower would serve now, or `nil` when there is no
+    /// revision to follow.
     ///
     /// A few hundred bytes, so an open picture can learn that a better one was
     /// built -- during a walk the surface is rebuilt each time a global solve
-    /// lands -- without re-downloading megabytes to find out. `nil` covers a
-    /// Tower older than the route and a session that has gone; both mean the
-    /// picture on screen is the last one there is.
-    func revision(for target: WorldRenderTarget) async throws -> String? {
+    /// lands -- without re-downloading megabytes to find out.
+    ///
+    /// `nil` means ONLY a Tower without the route: a 404 whose detail is
+    /// FastAPI's own `Not Found`. Every other 404 is one of §4's sentences --
+    /// "no geometry yet" among them, which a world mid-build can answer while
+    /// its derived tree is replaced -- and is thrown, so the follower asks
+    /// again rather than giving up for the life of the screen
+    /// (`WORLD-BUILDER-WORLDS.md` §4a rule 5).
+    func revision(for target: WorldRenderTarget) async throws -> WorldRenderRevision? {
         guard let url = Self.revisionURL(for: target, baseURL: baseURL) else {
             throw WorldRenderFetchError.badAddress
         }
@@ -168,16 +187,32 @@ nonisolated struct WorldRenderClient {
             throw WorldRenderFetchError.transport(error.localizedDescription)
         }
         if let http = response as? HTTPURLResponse {
-            if http.statusCode == 404 { return nil }
+            if http.statusCode == 404 {
+                let detail = Self.detail(in: data)
+                if detail == WorldRenderFetchError.unmatchedRouteDetail { return nil }
+                throw WorldRenderFetchError.absent(detail: detail)
+            }
             if !(200..<300).contains(http.statusCode) {
                 throw WorldRenderFetchError.towerError(status: http.statusCode)
             }
         }
+        return try Self.decodeRevision(data)
+    }
+
+    /// The revision route's body. Split out so the decoding is tested without
+    /// a stubbed session.
+    static func decodeRevision(_ data: Data) throws -> WorldRenderRevision {
         guard
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let revision = json["revision"] as? String, !revision.isEmpty
         else { throw WorldRenderFetchError.undecodable }
-        return revision
+        let representation = (json["representation"] as? String)
+            .flatMap(WorldRenderRepresentation.init(rawValue:))
+        return WorldRenderRevision(
+            revision: revision,
+            representation: representation,
+            live: json["live"] as? Bool
+        )
     }
 
     /// The revision route's address: the page's own path plus `/revision`,
@@ -327,10 +362,29 @@ enum WorldRenderViewerState: Equatable {
 /// to say "Not a surface" unconditionally, which was true of every page the
 /// Tower could serve until it could serve a surface. A caption that denies what
 /// is on screen is the same failure as one that overclaims.
-nonisolated enum WorldRenderRepresentation: String, Equatable {
+nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
     case surface
     case dense
     case sparse
+
+    /// Whether a page of rung `latest` is a better picture than one of rung
+    /// `shown`: sparse (or unknown) < dense < surface. Only an improvement
+    /// replaces the picture on screen by itself; a rebuild of the same rung
+    /// is offered instead, because a swap reloads the page and resets the
+    /// reader's camera mid-look.
+    static func isUpgrade(
+        from shown: WorldRenderRepresentation?, to latest: WorldRenderRepresentation?
+    ) -> Bool {
+        rank(latest) > rank(shown)
+    }
+
+    private static func rank(_ representation: WorldRenderRepresentation?) -> Int {
+        switch representation {
+        case .surface: return 2
+        case .dense: return 1
+        case .sparse, nil: return 0
+        }
+    }
 
     /// The rung a page declares, or `nil` for a page that declares none -- every
     /// page from a Tower that predates the declaration.
@@ -478,19 +532,59 @@ final class WorldRenderViewerModel: ObservableObject {
     /// alive for the length of the timeout.
     private var renderWatchdog: Task<Void, Never>?
 
-    /// How often an open picture asks whether a better one has been built.
+    /// How often an open picture asks whether a better one has been built,
+    /// while the Tower says it is building.
     ///
     /// Ten seconds against a live surface that is rebuilt when a global solve
     /// lands -- tens of seconds apart on a real walk -- so a new picture is on
-    /// screen within one interval of existing, and a saved world, which never
-    /// changes, costs one tiny request per interval while it is open.
-    /// Injectable so a test proves the behaviour in milliseconds.
+    /// screen within one interval of existing. Injectable so a test proves the
+    /// behaviour in milliseconds.
     var revisionPollInterval: Duration = .seconds(10)
 
-    /// The revision last established for the page on screen. Starts as the
-    /// one stamped into the page, so a build that lands between fetching the
-    /// page and the first poll is still noticed.
+    /// The longest the follower waits between asks when nothing is building.
+    ///
+    /// A saved, finished world never changes, and asking every ten seconds for
+    /// as long as it is open keeps the radio awake for nothing. So while the
+    /// Tower answers `live: false` and the revision stays put, the interval
+    /// doubles up to this. It is a ceiling and not a stop, because `false` is
+    /// not a promise: the Tower starts the final surface a few seconds AFTER it
+    /// releases the world lock (`WORLD-BUILDER-WORLDS.md` §4a rule 6), and a
+    /// follower that stopped there would miss the picture the walk was for.
+    var revisionPollCeiling: Duration = .seconds(120)
+
+    /// The revision stamped into the page on screen (or, for a page that
+    /// carries none, the one that led to it). Starts as the page's own stamp, so
+    /// a build that lands between fetching the page and the first poll is still
+    /// noticed.
     private var shownRevision: String?
+
+    /// The last revision the follower ACTED on: fetched, offered, or found to
+    /// change nothing. Separate from `shownRevision` because the two can differ
+    /// for good -- the Tower's revision route can say "surface" about a page it
+    /// then serves as a lower rung (§4a rule 4) -- and comparing only with the
+    /// page's stamp would download that page again on every poll.
+    private var handledRevision: String?
+
+    /// Revisions whose page could not be drawn on this phone. Never offered or
+    /// swapped in again by the follower; only the reader's own "Try again" can
+    /// fetch one.
+    private var refusedRevisions: Set<String> = []
+
+    /// The page that was on screen when an automatic refresh replaced it, and
+    /// the revision it carried, kept until the replacement reports drawn. A
+    /// refresh that cannot be drawn -- watchdog, `didFail`, or the content
+    /// process running out of memory, which is exactly what a larger rung does
+    /// -- returns to it instead of to a failure.
+    private var fallback: (html: String, revision: String?)?
+
+    /// A newer build of the SAME rung, waiting for the reader to ask for it.
+    ///
+    /// Published so the scene can show a button. A same-rung rebuild is not
+    /// swapped in by itself: a swap reloads the page, which covers it with the
+    /// "Drawing" overlay and resets the camera and the walk/orbit mode, and a
+    /// surface is rebuilt on every global solve during a walk.
+    @Published private(set) var newerPictureAvailable = false
+    private var pendingRevision: String?
 
     init(target: WorldRenderTarget, client: WorldRenderClient = WorldRenderClient()) {
         self.target = target
@@ -502,37 +596,80 @@ final class WorldRenderViewerModel: ObservableObject {
     /// Runs in the screen's `.task`, so it ends when the screen goes. Asks only
     /// while a page is actually on screen (`.ready`): a page still drawing, or a
     /// failure the reader is reading, is left alone. Returns for good when the
-    /// Tower has no revision to follow.
+    /// Tower has no revision route, and never starts for the diagnostics
+    /// rendering: that page is always the sparse one, and §4a would compare it
+    /// with the product ladder's revision and refetch it on every rebuild.
+    ///
+    /// A better RUNG replaces the page by itself; a rebuild of the same rung
+    /// sets `newerPictureAvailable` and waits for `showNewerPicture()`.
     func followRevisions() async {
+        guard target.view == .product else { return }
+        var interval = revisionPollInterval
         while !Task.isCancelled {
-            try? await Task.sleep(for: revisionPollInterval)
+            try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { return }
             guard case .ready = state else { continue }
             if shownRevision == nil { shownRevision = state.revision }
-            let latest: String?
+            let latest: WorldRenderRevision?
             do {
                 latest = try await client.revision(for: target)
             } catch {
-                // A dropped request is not a reason to change anything on
-                // screen; the next interval asks again.
+                // A dropped request, or one of §4's own 404 sentences, is not a
+                // reason to change anything on screen; the next interval asks
+                // again.
                 continue
             }
             guard !Task.isCancelled else { return }
             guard let latest else { return }
-            if latest != shownRevision {
-                await refresh(to: latest)
+            let isNew = latest.revision != shownRevision
+                && latest.revision != handledRevision
+                && !refusedRevisions.contains(latest.revision)
+            interval = Self.nextPollInterval(
+                after: interval, base: revisionPollInterval, ceiling: revisionPollCeiling,
+                live: latest.live, changed: isNew
+            )
+            guard isNew else { continue }
+            if WorldRenderRepresentation.isUpgrade(
+                from: state.representation, to: latest.representation
+            ) {
+                await refresh(to: latest.revision)
+            } else {
+                handledRevision = latest.revision
+                pendingRevision = latest.revision
+                newerPictureAvailable = true
             }
         }
+    }
+
+    /// How long to wait before the next ask.
+    ///
+    /// Back to `base` whenever the revision changed or the Tower is building;
+    /// otherwise double, up to `ceiling`. A Tower that does not say (`nil`) is
+    /// treated as not building: slower, never silent.
+    nonisolated static func nextPollInterval(
+        after current: Duration, base: Duration, ceiling: Duration, live: Bool?, changed: Bool
+    ) -> Duration {
+        if changed || live == true { return base }
+        return min(max(current * 2, base), ceiling)
+    }
+
+    /// Swap in the newer same-rung picture the reader asked for.
+    func showNewerPicture() async {
+        guard let revision = pendingRevision, case .ready = state else { return }
+        pendingRevision = nil
+        newerPictureAvailable = false
+        await refresh(to: revision)
     }
 
     /// Fetch the newer page and put it on screen, or leave the old one.
     ///
     /// Never `.fetching` and never `.failed`: the reader is looking at a world,
-    /// and a refresh that fails must not take it away. `renderAttempt` is NOT
-    /// bumped, so the web view's content-process kill budget is not reset by
-    /// an automatic refresh -- a page too large for the phone must still stop
-    /// being retried. The revision is recorded before the pages are compared,
-    /// so a revision that does not change the page costs one fetch, not a loop.
+    /// and a refresh that fails must not take it away -- not the fetch, and not
+    /// the draw either (see `fallback`). `renderAttempt` is NOT bumped, so the
+    /// web view's content-process kill budget is not reset by an automatic
+    /// refresh. The page's own stamped revision is recorded, not the polled one,
+    /// so a build that lands between the poll and the fetch costs no second
+    /// download.
     private func refresh(to revision: String) async {
         let html: String
         do {
@@ -541,11 +678,40 @@ final class WorldRenderViewerModel: ObservableObject {
             return
         }
         guard !Task.isCancelled, case .ready(let current) = state else { return }
-        shownRevision = revision
-        guard html != current else { return }
+        handledRevision = revision
+        let stamped = WorldRenderViewerState.ready(html: html).revision ?? revision
+        guard html != current else {
+            shownRevision = stamped
+            return
+        }
+        guard !refusedRevisions.contains(stamped) else { return }
+        // Whatever was offered is superseded by the page now on its way.
+        pendingRevision = nil
+        newerPictureAvailable = false
         renderWatchdog?.cancel()
+        fallback = (html: current, revision: shownRevision)
+        shownRevision = stamped
         state = .rendering(html: html)
         startRenderWatchdog()
+    }
+
+    /// Put the last drawn page back after an automatic refresh failed to draw.
+    ///
+    /// Returns `false` when there is nothing to fall back to -- no refresh was
+    /// in flight, or the fallback page itself is what failed -- and the caller
+    /// reports the failure as before. Bounded: the refused revision is never
+    /// swapped in again, and `fallback` is consumed here.
+    private func revertRefresh() -> Bool {
+        guard let previous = fallback else { return false }
+        fallback = nil
+        if let refused = shownRevision { refusedRevisions.insert(refused) }
+        if let handled = handledRevision { refusedRevisions.insert(handled) }
+        shownRevision = previous.revision
+        // A fresh kill budget for a page that already drew once on this phone.
+        renderAttempt += 1
+        state = .rendering(html: previous.html)
+        startRenderWatchdog()
+        return true
     }
 
     // No `deinit` cancelling the watchdog, deliberately. It captures `[weak
@@ -560,6 +726,10 @@ final class WorldRenderViewerModel: ObservableObject {
         renderWatchdog?.cancel()
         renderWatchdog = nil
         renderAttempt += 1
+        fallback = nil
+        pendingRevision = nil
+        newerPictureAvailable = false
+        handledRevision = nil
         state = .fetching
         do {
             let html = try await client.page(for: target)
@@ -590,6 +760,7 @@ final class WorldRenderViewerModel: ObservableObject {
             // screen underneath a reader who has started reading the message.
             guard case .rendering(let html) = state else { return }
             state = .ready(html: html)
+            fallback = nil
         case .reloadingAfterTermination:
             // Back to a bounded wait, with the overlay over it. Truthful: the
             // page really is being drawn again.
@@ -597,11 +768,13 @@ final class WorldRenderViewerModel: ObservableObject {
             state = .rendering(html: html)
             startRenderWatchdog()
         case .failed(let detail):
+            if revertRefresh() { return }
             state = .failed(
                 message: "The Tower's page arrived but could not be drawn: \(detail)",
                 retryable: true
             )
         case .gaveUpAfterTerminations(let count):
+            if revertRefresh() { return }
             // Retryable, and the sentence says why it stopped on its own.
             // Memory pressure is transient — closing another app can genuinely
             // change the answer — so this is not a control that cannot work.
@@ -615,7 +788,8 @@ final class WorldRenderViewerModel: ObservableObject {
         }
     }
 
-    /// Fail truthfully if the page never reports finishing.
+    /// Fail truthfully if the page never reports finishing -- or, when the page
+    /// that did not finish was an automatic refresh, put the previous one back.
     ///
     /// The message says the fetch succeeded, because it did — blaming the Tower
     /// for a page it delivered would send the reader to the wrong machine.
@@ -624,6 +798,7 @@ final class WorldRenderViewerModel: ObservableObject {
         renderWatchdog = Task { [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled, let self, self.state.isRendering else { return }
+            if self.revertRefresh() { return }
             self.state = .failed(
                 message: "The Tower's page arrived but did not finish drawing. This world may be "
                     + "too large to render on this phone.",
@@ -732,14 +907,33 @@ struct WorldRenderWebView: UIViewRepresentable {
         /// retries is enough for a transient kill — another app spiking, a
         /// backgrounded return — and short of a loop.
         ///
-        /// Counted for the life of this coordinator, **not** reset by a
-        /// successful `didFinish`: a page that renders and then OOMs on the
-        /// first gesture is the same failure arriving later, and resetting
-        /// would make the budget unbounded again for exactly that case. A
-        /// deliberate retry does reset it, because that is the reader asking
-        /// for a fresh budget with full knowledge; see `load(_:attempt:into:)`.
+        /// Counted over a **sliding window** (`terminationWindow`), **not**
+        /// reset by a successful `didFinish`: a page that renders and then
+        /// OOMs on the first gesture is the same failure arriving later, and
+        /// resetting on `didFinish` would make the budget unbounded again for
+        /// exactly that case. A page that kills the process on load kills it
+        /// three times well inside a minute and is still stopped.
+        ///
+        /// It was counted for the life of the coordinator, and that was wrong
+        /// once this screen became one a wearer keeps open for a whole walk:
+        /// iOS routinely kills a backgrounded app's WebContent process, so
+        /// three pocket-locks spread over twenty minutes read "too large to
+        /// draw on this phone" over a world that drew fine each time.
+        ///
+        /// A deliberate retry resets it, because that is the reader asking for
+        /// a fresh budget with full knowledge; see `load(_:attempt:into:)`.
         private static let reloadBudget = 2
-        private var terminations = 0
+        nonisolated static let terminationWindow: TimeInterval = 60
+        private var terminationTimes: [Date] = []
+
+        /// The terminations that still count at `now`: those less than
+        /// `window` seconds old. Pure, so the window is tested without a
+        /// `WKWebView`.
+        nonisolated static func recentTerminations(
+            _ times: [Date], now: Date, window: TimeInterval
+        ) -> [Date] {
+            times.filter { now.timeIntervalSince($0) < window }
+        }
 
         func load(_ html: String, attempt: Int, into webView: WKWebView) {
             guard loaded != html || loadedAttempt != attempt else { return }
@@ -747,7 +941,7 @@ struct WorldRenderWebView: UIViewRepresentable {
             if loadedAttempt != attempt {
                 // A new attempt is the reader asking again, knowingly. Fresh
                 // budget.
-                terminations = 0
+                terminationTimes = []
             }
             loadedAttempt = attempt
             reload(into: webView)
@@ -840,12 +1034,17 @@ struct WorldRenderWebView: UIViewRepresentable {
         /// so put it back rather than leaving the reader a black rectangle
         /// with nothing to do but Close and reopen.
         ///
-        /// **Up to `reloadBudget` times.** Past that the page is not put back
-        /// and the reader is told, because a page that kills the process on
-        /// load kills it again on the reload, and an unbounded loop of that is
-        /// a blank screen plus a warm phone.
+        /// **Up to `reloadBudget` times within `terminationWindow`.** Past that
+        /// the page is not put back and the reader is told, because a page
+        /// that kills the process on load kills it again on the reload, and an
+        /// unbounded loop of that is a blank screen plus a warm phone.
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            terminations += 1
+            let now = Date()
+            terminationTimes = Self.recentTerminations(
+                terminationTimes, now: now, window: Self.terminationWindow
+            )
+            terminationTimes.append(now)
+            let terminations = terminationTimes.count
             guard terminations <= Self.reloadBudget else {
                 onEvent?(.gaveUpAfterTerminations(terminations))
                 return
@@ -986,6 +1185,16 @@ struct WorldRenderScene: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            // A rebuild of the rung on screen is offered, never forced: the
+            // swap reloads the page and resets the camera the reader is using.
+            // A better rung replaces the picture without asking.
+            if model.newerPictureAvailable {
+                Button("A newer reconstruction is ready. Show it") {
+                    Task { await model.showNewerPicture() }
+                }
+                .font(.caption)
+                .accessibilityIdentifier("world-render-newer-picture")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16)
@@ -1110,8 +1319,19 @@ struct WorldRenderScene: View {
                 // world screen's Diagnostics section uses that, so a reader who
                 // wants the solver's view gets it without first loading the
                 // one they did not ask for.
-                Text("The page's own Diagnostics button, above, switches to the solver's view of this session without fetching anything. The solver's geometry is also drawn in full under Diagnostics on the world screen.")
-                    .fixedSize(horizontal: false, vertical: true)
+                //
+                // Only the SPARSE page has that button. A surface or dense
+                // page has none, and a sentence pointing "above" at a button
+                // that is not there is the false copy an iOS review found. A
+                // page with no declared rung is from a Tower older than the
+                // ladder, whose only page was the sparse one.
+                if model.state.representation == .sparse || model.state.representation == nil {
+                    Text("The page's own Diagnostics button, above, switches to the solver's view of this session without fetching anything. The solver's geometry is also drawn in full under Diagnostics on the world screen.")
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("The solver's own view of this session is under Diagnostics on the world screen.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)

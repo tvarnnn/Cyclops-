@@ -451,3 +451,65 @@ set it are on the DEBUG-only frame path, and Release has no capture control on
 any screen. The binding is therefore permanently `.none` there, and the Tower's
 own state is the whole answer, which is correct: a build with no capture cannot
 be looking at the wrong one.
+
+## 10. The saved-world picture (`WorldRenderViewer.swift`)
+
+Consumes `WORLD-BUILDER-WORLDS.md` §4 (the page) and §4a (its revision). Added
+2026-09-16 after an adversarial review of the viewer. Nothing below has been
+compiled or run on a device yet; `docs/agent-handoffs/` names the Mac checks.
+
+**The page.** `WorldRenderClient.page(for:)` fetches the HTML with `URLSession`
+and hands the string to a `WKWebView` with `loadHTMLString(_:baseURL: nil)`: no
+origin, one navigation, every other navigation refused. The response headers
+never reach WebKit, so the Tower's CSP reaches the phone only as the
+`<meta http-equiv>` tag every page carries (§4 rule 6).
+
+**The caption follows the page.** The native caption above the web view reads
+the page's `<meta name="wb-representation">` from its first 4096 characters:
+*Surfaces the Tower reconstructed…* (surface), *Points the Tower measured
+densely…* (dense), *Points the Tower measured from the walk…* (sparse), and a
+rung-neutral *What the Tower reconstructed from the walk. Not to scale.* before
+the page arrives or for a page that declares nothing. Details says the page's
+own Diagnostics button switches views **only** on a sparse (or undeclared) page;
+on a surface or dense page it points at the world screen's Diagnostics instead.
+
+**Following.** While a page is on screen (`.ready`), the screen's `.task` asks
+`GET /worlds/{id}/render/revision` and compares the answer with the revision
+stamped into the page (`wb-revision`) and with the last revision it acted on:
+
+| The Tower says | The app does |
+|---|---|
+| same revision | nothing; no page is fetched |
+| a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision) | fetches the page and swaps it in |
+| a new revision of the **same or a lower rung** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera |
+| a revision whose page could not be drawn on this phone | never swaps it in or offers it again |
+| `404` with FastAPI's `{"detail": "Not Found"}` | stops following for this screen (a Tower older than the route) |
+| any other `404`, another status, or a transport error | keeps the picture and asks again next interval |
+
+The interval is 10 s while the payload says `live: true`, and doubles to a
+120 s ceiling while it says `false` (or says nothing), back to 10 s on any
+change. It never stops on `live: false`, because the Tower starts the final
+surface a few seconds after it releases the world lock (§4a rule 6).
+A diagnostics target (`view=diagnostics`) is not followed at all: its page is
+always the sparse one.
+
+**A refresh never takes the world away.** A failed fetch leaves the page. A
+fetched page that then fails to draw — the 20 s render watchdog, `didFail`, or
+the content process being killed past its budget — puts the previous page back
+(with a fresh kill budget, since it already drew once) and refuses that
+revision. A refresh reaches the failure view only if the restored page then
+fails to draw as well.
+
+**Content-process kills** are counted within a sliding 60 s window, not for
+the life of the screen: up to two reloads, and the third kill inside a minute
+reports "too large to draw on this phone". Kills spread over a long walk, such
+as iOS reclaiming a backgrounded app's WebContent process, do not add up.
+
+**Known and accepted.** When a surface or dense artifact passes its header
+check but its page cannot be built, the revision route reports the better rung
+while the page is stamped lower; the app pays one page download per rebuild
+for that, not one per poll, and the Tower logs it at `ERROR`. A swap briefly
+holds the old and new page strings plus the old document's heap; for the
+default L2 surface (≈3.7 MB) that is fine, and for a Tower configured to serve
+larger pages it is the likeliest moment for a WebContent kill, which the
+fallback above then absorbs.
