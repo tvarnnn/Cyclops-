@@ -1837,6 +1837,14 @@ def main(argv=None) -> int:
                     else:
                         surfacer.poll(store)
         observe_seconds = time.perf_counter() - started
+        if surfacer is not None:
+            # The walk is over, so a live surface still building is already
+            # obsolete: the final one after the final solve replaces it. Left
+            # running it competed with finalization -- on a real-time replay
+            # of the canonical walk the last live build finished 39 s after
+            # Stop, while the final solve waited. Ended here rather than only
+            # in the `finally`, which runs after finalization.
+            surfacer.close()
 
         # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?
         #
