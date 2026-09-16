@@ -148,9 +148,17 @@ class SurfaceParams:
     more volume."""
 
     # -- surface cleanup ----------------------------------------------------
-    min_component_frac: float = 0.0008
+    min_component_frac: float = 0.0001
     """Connected components smaller than this fraction of the largest are
-    dropped as noise."""
+    dropped as noise.
+
+    Measured on a WELDED mesh. It was 0.0008 when the tile seams were never
+    welded, and "the largest component" was then one tile of wall -- 151,693
+    faces -- rather than the room, 1,858,865; so 0.0008 in practice meant
+    islands under ~120 faces, and that is what the renders were judged at.
+    On the welded mesh 0.0008 would mean ~1,500 faces and delete 15% more
+    real surface; 0.0001 is ~190 faces, the strictness that was actually
+    approved, now measured against the right component."""
 
     smooth_iterations: int = 6
     smooth_lambda: float = 0.5
@@ -229,7 +237,7 @@ class SurfaceParams:
             lod_face_targets=(0, 120_000),
             canonical_level=0,
             mobile_level=1,
-            min_component_frac=0.002,
+            min_component_frac=0.0003,
             quality="live",
         )
         base.update(overrides)
@@ -1156,6 +1164,44 @@ def extract_sealed(vol: SurfaceVolume, min_weight: float, fill: EnclosedFill, *,
 # ---------------------------------------------------------------------------
 # mesh cleanup
 # ---------------------------------------------------------------------------
+
+
+def weld_mesh(V, F, C, quantum: float):
+    """Merge the duplicate vertices and triangles the tile seams produce.
+
+    `extract_mesh` runs marching cubes per tile with one block of halo, so
+    every cube in a halo is meshed twice, by its own tile and by its
+    neighbour. The copies come from identical voxel values and land on the
+    same positions to within float rounding, but nothing merged them. On the
+    canonical world that was 587,178 duplicate triangles -- 18.3% of the mesh
+    -- and it did three quiet kinds of damage: component pruning measured
+    "largest" against a single tile and deleted real surface a seam had cut
+    off, smoothing let the two copies of each seam vertex drift apart, and a
+    phone was sent every seam twice.
+
+    Positions are snapped to a `quantum` grid only to decide identity; the
+    surviving vertex keeps its own float position. Two triangles are the same
+    triangle when they have the same three vertices in any order.
+    """
+    V = np.asarray(V)
+    F = np.asarray(F, np.int64)
+    empty_stats = {"vertices_merged": 0, "faces_duplicate": 0, "faces_degenerate": 0}
+    if not len(F):
+        return V, F, C, empty_stats
+    key = np.round(V / quantum).astype(np.int64)
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    F2 = inverse[F]
+    degenerate = ((F2[:, 0] == F2[:, 1]) | (F2[:, 1] == F2[:, 2])
+                  | (F2[:, 0] == F2[:, 2]))
+    F2 = F2[~degenerate]
+    _, keep = np.unique(np.sort(F2, axis=1), axis=0, return_index=True)
+    n_before = len(F2)
+    F2 = F2[np.sort(keep)]
+    stats = {"vertices_merged": int(len(V) - len(first)),
+             "faces_duplicate": int(n_before - len(F2)),
+             "faces_degenerate": int(degenerate.sum())}
+    return (V[first], F2, None if C is None else np.asarray(C)[first], stats)
 
 
 def drop_small_components(V, F, C, min_frac: float):

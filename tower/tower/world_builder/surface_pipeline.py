@@ -51,6 +51,7 @@ from tower.world_builder.surface import (
     decimate,
     depth_validity,
     drop_small_components,
+    weld_mesh,
     extract_sealed,
     fill_enclosed,
     taubin_smooth,
@@ -567,6 +568,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                       "sealed_only": params.fill_sealed_only, **seal}
     else:
         V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
+    V, F, C, weld_stats = weld_mesh(V, F, C, quantum=voxel * 1e-3)
     if not len(F):
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
@@ -596,6 +598,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
         detail=json.dumps({"components": comp_stats,
                            "median_vertex_move_voxels": round(moved / voxel, 3),
+                           "weld": weld_stats,
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
 

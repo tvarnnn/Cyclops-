@@ -555,3 +555,66 @@ class TestVertexNormals:
     def test_an_empty_mesh_has_no_normals_and_does_not_raise(self):
         N = S.vertex_normals(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64))
         assert N.shape == (0, 3)
+
+
+
+class TestTheTileSeamsAreWelded:
+    """Extraction meshes every halo cube twice, once per tile. Unwelded, the
+    canonical world carried 587,178 duplicate triangles (18.3%), and pruning
+    measured "the largest component" against one tile of wall."""
+
+    def _wall_across_tiles(self):
+        import torch
+
+        # a flat wall long enough to cross several extraction tiles
+        K, w, h = _camera(K_f=120.0, w=240, h=120)
+        vol = S.SurfaceVolume(0.05, 0.2, device=torch.device("cpu"))
+        prepared = []
+        for x in (-2.0, -1.0, 0.0, 1.0, 2.0):
+            R, t = _look_from((x, 0.0, 0.0), (x, 0.0, ROOM))
+            d = _render_box_depth(R, t, K, w, h)
+            zt = torch.as_tensor(d)
+            ok = torch.isfinite(zt)
+            prepared.append((zt, ok, torch.full((h, w, 3), 180.0),
+                             torch.as_tensor(R).float(), torch.as_tensor(t).float()))
+        vol.reserve(torch.cat([vol.blocks_for_depth(z, ok, R, t, K)
+                               for z, ok, _, R, t in prepared]))
+        for z, ok, rgb, R, t in prepared:
+            vol.integrate(z, ok, rgb, R, t, K, params=S.SurfaceParams())
+        return vol, vol.extract_mesh(min_weight=0.5, tile_blocks=2)
+
+    def test_duplicates_are_removed_and_nothing_else(self):
+        vol, (V, F, C) = self._wall_across_tiles()
+        V2, F2, C2, stats = S.weld_mesh(V, F, C, quantum=vol.voxel * 1e-3)
+        assert stats["faces_duplicate"] > 0, "the fixture never crossed a tile seam"
+        assert len(F2) == len(F) - stats["faces_duplicate"] - stats["faces_degenerate"]
+        assert len(np.unique(np.sort(F2, axis=1), axis=0)) == len(F2)
+        assert len(C2) == len(V2)
+
+    def test_the_wall_is_one_component_once_welded(self):
+        vol, (V, F, C) = self._wall_across_tiles()
+        V2, F2, C2, _ = S.weld_mesh(V, F, C, quantum=vol.voxel * 1e-3)
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        def count(v, f):
+            e0 = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+            e1 = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
+            g = coo_matrix((np.ones(len(e0)), (e0, e1)), shape=(len(v), len(v)))
+            n, labels = connected_components(g, directed=False)
+            return len(np.unique(labels[f[:, 0]]))
+
+        assert count(V, F) > count(V2, F2)
+        assert count(V2, F2) <= 2
+
+    def test_welding_twice_changes_nothing(self):
+        vol, (V, F, C) = self._wall_across_tiles()
+        once = S.weld_mesh(V, F, C, quantum=vol.voxel * 1e-3)
+        twice = S.weld_mesh(once[0], once[1], once[2], quantum=vol.voxel * 1e-3)
+        assert np.array_equal(once[1], twice[1])
+        assert twice[3]["faces_duplicate"] == 0 and twice[3]["vertices_merged"] == 0
+
+    def test_an_empty_mesh_welds_to_an_empty_mesh(self):
+        V, F, C, stats = S.weld_mesh(np.zeros((0, 3)), np.zeros((0, 3), np.int64),
+                                     None, quantum=0.001)
+        assert len(F) == 0 and stats["faces_duplicate"] == 0
