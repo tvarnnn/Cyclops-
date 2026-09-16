@@ -662,3 +662,84 @@ def test_the_dense_template_declares_dense():
     from tower.world_builder.dense_render import viewer_template_path
 
     assert _declared(viewer_template_path().read_text(encoding="utf-8")) == "dense"
+
+
+# ---------------------------------------------------------------------------
+# the revision: how an open picture learns a better one was built
+# ---------------------------------------------------------------------------
+
+
+def _meta(html, name):
+    import re
+
+    m = re.search(rf'<meta name="{name}" content="([^"]*)">', html[:4096])
+    return m.group(1) if m else None
+
+
+def test_every_served_page_carries_the_revision_the_endpoint_reports(tmp_path):
+    from tower.results.world_builder_render import (
+        build_render_revision,
+        build_world_render,
+    )
+
+    store = _synthetic_world(tmp_path)
+    sparse = build_world_render(store, WORLD, SESSION)
+    rev = build_render_revision(store, WORLD, SESSION)
+    assert rev["representation"] == "sparse"
+    assert _meta(sparse, "wb-revision") == rev["revision"]
+
+    SP.surfacify(store, WORLD, SESSION, params=_params())
+    surface = build_world_render(store, WORLD, SESSION)
+    rev2 = build_render_revision(store, WORLD, SESSION)
+    assert rev2["representation"] == "surface"
+    assert _meta(surface, "wb-revision") == rev2["revision"]
+    assert rev2["revision"] != rev["revision"], "stepping up the ladder must change it"
+
+
+def test_a_rebuilt_surface_changes_the_revision(tmp_path):
+    from tower.results.world_builder_render import build_render_revision
+
+    store = _synthetic_world(tmp_path)
+    SP.surfacify(store, WORLD, SESSION, params=_params())
+    first = build_render_revision(store, WORLD, SESSION)["revision"]
+    time.sleep(0.01)
+    SP.surfacify(store, WORLD, SESSION, params=_params(min_weight=0.8))
+    assert build_render_revision(store, WORLD, SESSION)["revision"] != first
+
+
+def test_the_sparse_revision_does_not_churn_with_every_build(tmp_path):
+    """The derived tree is rewritten every few keyframes during a walk. A
+    picture that reloaded on each of those would be unusable to look at."""
+    from tower.results.world_builder_render import build_render_revision
+
+    store = _synthetic_world(tmp_path)
+    first = build_render_revision(store, WORLD, SESSION)["revision"]
+    derived = store.derived_dir(WORLD) / SESSION
+    (derived / "points.json").write_text(json.dumps({"points": [
+        {"segment_index": 0, "xyz": [0.3 * i, 0.1, 2.0], "rgb": [1, 2, 3]}
+        for i in range(20)]}))
+    assert build_render_revision(store, WORLD, SESSION)["revision"] == first
+
+
+def test_the_revision_route_answers_and_404s_like_the_page(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from tower.routes.geometry import router
+
+    store = _synthetic_world(tmp_path)
+    SP.surfacify(store, WORLD, SESSION, params=_params())
+    app = FastAPI()
+    app.include_router(router)
+    app.state.world_root = tmp_path
+    client = TestClient(app)
+
+    ok = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION})
+    assert ok.status_code == 200
+    assert ok.headers["cache-control"] == "no-store"
+    body = ok.json()
+    assert body["representation"] == "surface" and body["revision"].startswith("surface:")
+    assert len(ok.content) < 512
+
+    missing = client.get("/worlds/nope/render/revision")
+    assert missing.status_code == 404

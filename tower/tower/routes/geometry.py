@@ -13,7 +13,7 @@ and the hash off the event loop with no executor of our own.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from tower.results.envelope import json_safe
 from tower.results.world_builder_geometry import (
@@ -25,6 +25,7 @@ from tower.results.world_builder_library import build_world_listing
 from tower.results.world_builder_render import (
     MAX_POINTS_CEILING,
     WorldRenderUnavailable,
+    build_render_revision,
     build_world_render,
 )
 
@@ -88,6 +89,25 @@ def geometry_segment(
     if chunk is None:
         raise HTTPException(status_code=404, detail="no such segment")
     return chunk
+
+
+@router.get("/worlds/{world_id}/render/revision")
+def world_render_revision(
+    world_id: str, request: Request,
+    session_id: str | None = Query(default=None),
+) -> JSONResponse:
+    """Which picture `GET /worlds/{id}/render` would serve now, as a revision.
+
+    Contract `WORLD-BUILDER-WORLDS.md` §4a. A few hundred bytes, so the phone
+    can keep a picture open during a walk and learn that a better one has been
+    built without re-downloading megabytes to find out. The revision it is
+    compared with is stamped into the page it already has.
+    """
+    try:
+        payload = build_render_revision(_store(request), world_id, session_id)
+    except WorldRenderUnavailable as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from None
+    return JSONResponse(json_safe(payload), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/worlds/{world_id}/render", response_class=HTMLResponse)

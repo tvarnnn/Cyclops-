@@ -1188,6 +1188,17 @@ def reconstruction_drawable(store, world_id, session_id) -> bool:
             or _dense_drawable(world_dir / "dense" / session_id))
 
 
+def surface_artifact_drawable(store, world_id, session_id) -> bool:
+    """Whether this session's surface artifact would render. See
+    `reconstruction_drawable`."""
+    return _surface_drawable(store.world_dir(world_id) / "surface" / session_id)
+
+
+def dense_artifact_drawable(store, world_id, session_id) -> bool:
+    """Whether this session's dense point artifact would render."""
+    return _dense_drawable(store.world_dir(world_id) / "dense" / session_id)
+
+
 def _read_manifest_quietly(path):
     try:
         man = json.loads(path.read_text(encoding="utf-8"))

@@ -130,3 +130,40 @@ set.
 4. `world_id` passes the same containment guard as the geometry routes (`contained_world_id`): an id that resolves outside the world root is "no world", and a non-canonical spelling is answered as the world it names.
 5. **One derived manifest per world, not per session.** `derived/manifest.json` records the digest of the *last* build, so in a world with two built sessions the older one's placements no longer bind to it: that session renders with every segment apart, labelled `unbound`, and the BEHIND caption — which is the truthful reading of a tree the current build did not produce, not a defect in the session. `GET /worlds` still answers `has_geometry: true` for it. A per-session manifest is the fix and belongs to the store, not to this route.
 6. The response carries `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'` — the promise above, enforced by the browser as well as kept by the producer.
+
+## 4a. `GET /worlds/{world_id}/render/revision` — has a better picture been built?
+
+Additive. A client may keep a picture from §4 open while the Tower is still
+building the session — during a walk the surface is rebuilt each time a global
+solve lands — and ask this, a few hundred bytes, instead of re-downloading the
+page to find out.
+
+| param | type | meaning |
+|---|---|---|
+| `session_id` | string, optional | as §4; resolved the same way |
+
+**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str}`,
+`Cache-Control: no-store`. **404** exactly when §4 would 404.
+
+Every page §4 serves carries the same two values in its head, within its first
+4096 characters:
+
+    <meta name="wb-representation" content="surface">
+    <meta name="wb-revision" content="surface:1789551234.56">
+
+### Rules
+
+1. `revision` is **opaque**. Compare for equality only.
+2. It changes when the page §4 would serve changes rung, or when the surface or
+   dense artifact behind the served rung is rebuilt.
+3. The sparse rung's revision is the constant `sparse`. The derived tree is
+   rewritten every few keyframes during a walk, and a picture that reloaded on
+   each of those would be unusable to look at; the step the wearer is waiting
+   for — up the ladder — still changes it.
+4. The endpoint decides the rung by the same artifact checks as
+   `has_geometry` in §2 rather than by composing the page. The two can disagree
+   only when an artifact passes its header check and then fails to parse; a
+   client that records the revision before comparing pages pays one extra page
+   fetch for that, not a loop.
+5. A client must treat **404 from this route as "nothing to follow"** — it is
+   also what a Tower older than the route answers — and keep the picture it has.

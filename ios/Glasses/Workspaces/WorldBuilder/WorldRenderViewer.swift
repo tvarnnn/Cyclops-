@@ -145,6 +145,55 @@ nonisolated struct WorldRenderClient {
         return html
     }
 
+    /// Which picture the Tower would serve now, as an opaque revision, or
+    /// `nil` when there is no revision to follow.
+    ///
+    /// A few hundred bytes, so an open picture can learn that a better one was
+    /// built -- during a walk the surface is rebuilt each time a global solve
+    /// lands -- without re-downloading megabytes to find out. `nil` covers a
+    /// Tower older than the route and a session that has gone; both mean the
+    /// picture on screen is the last one there is.
+    func revision(for target: WorldRenderTarget) async throws -> String? {
+        guard let url = Self.revisionURL(for: target, baseURL: baseURL) else {
+            throw WorldRenderFetchError.badAddress
+        }
+        let request = URLRequest(
+            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10
+        )
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw WorldRenderFetchError.transport(error.localizedDescription)
+        }
+        if let http = response as? HTTPURLResponse {
+            if http.statusCode == 404 { return nil }
+            if !(200..<300).contains(http.statusCode) {
+                throw WorldRenderFetchError.towerError(status: http.statusCode)
+            }
+        }
+        guard
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let revision = json["revision"] as? String, !revision.isEmpty
+        else { throw WorldRenderFetchError.undecodable }
+        return revision
+    }
+
+    /// The revision route's address: the page's own path plus `/revision`,
+    /// with the session and without `view`, which does not change what is
+    /// built.
+    static func revisionURL(for target: WorldRenderTarget, baseURL: URL) -> URL? {
+        guard
+            let page = url(for: target, baseURL: baseURL),
+            var components = URLComponents(url: page, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.percentEncodedPath += "/revision"
+        let kept = (components.queryItems ?? []).filter { $0.name == "session_id" }
+        components.queryItems = kept.isEmpty ? nil : kept
+        return components.url
+    }
+
     /// The route's address, or `nil` when an id will not go into a URL.
     ///
     /// The id is percent-encoded as **one** path component by hand.
@@ -259,6 +308,11 @@ enum WorldRenderViewerState: Equatable {
     var representation: WorldRenderRepresentation? {
         html.flatMap(WorldRenderRepresentation.declared(in:))
     }
+
+    /// The revision the Tower stamped into the page on screen, if any.
+    var revision: String? {
+        html.flatMap { WorldRenderRepresentation.meta(named: "wb-revision", in: $0) }
+    }
 }
 
 /// Which rung of the Tower's reconstruction ladder a page is.
@@ -281,16 +335,23 @@ nonisolated enum WorldRenderRepresentation: String, Equatable {
     /// The rung a page declares, or `nil` for a page that declares none -- every
     /// page from a Tower that predates the declaration.
     static func declared(in html: String) -> WorldRenderRepresentation? {
-        // A plain scan, not a parser: the tag is written by the Tower, in the
-        // head, in one fixed spelling, and the page can be megabytes long, so
-        // only its first few kilobytes are looked at.
+        meta(named: "wb-representation", in: html).flatMap(WorldRenderRepresentation.init(rawValue:))
+    }
+
+    /// The `content` of a `<meta name=...>` the Tower wrote into the head.
+    ///
+    /// A plain scan, not a parser: the tags are written by the Tower, in the
+    /// head, in one fixed spelling, and the page can be megabytes long, so
+    /// only its first few kilobytes are looked at.
+    static func meta(named name: String, in html: String) -> String? {
         let head = html.prefix(4096)
-        guard let marker = head.range(of: "name=\"wb-representation\" content=\"") else {
+        guard let marker = head.range(of: "name=\"\(name)\" content=\"") else {
             return nil
         }
         let rest = head[marker.upperBound...]
         guard let end = rest.firstIndex(of: "\"") else { return nil }
-        return WorldRenderRepresentation(rawValue: String(rest[..<end]))
+        let value = String(rest[..<end])
+        return value.isEmpty ? nil : value
     }
 
     /// The caption for a page of this rung, or for a page not yet known.
@@ -417,9 +478,74 @@ final class WorldRenderViewerModel: ObservableObject {
     /// alive for the length of the timeout.
     private var renderWatchdog: Task<Void, Never>?
 
+    /// How often an open picture asks whether a better one has been built.
+    ///
+    /// Ten seconds against a live surface that is rebuilt when a global solve
+    /// lands -- tens of seconds apart on a real walk -- so a new picture is on
+    /// screen within one interval of existing, and a saved world, which never
+    /// changes, costs one tiny request per interval while it is open.
+    /// Injectable so a test proves the behaviour in milliseconds.
+    var revisionPollInterval: Duration = .seconds(10)
+
+    /// The revision last established for the page on screen. Starts as the
+    /// one stamped into the page, so a build that lands between fetching the
+    /// page and the first poll is still noticed.
+    private var shownRevision: String?
+
     init(target: WorldRenderTarget, client: WorldRenderClient = WorldRenderClient()) {
         self.target = target
         self.client = client
+    }
+
+    /// Keep the picture current for as long as the screen is open.
+    ///
+    /// Runs in the screen's `.task`, so it ends when the screen goes. Asks only
+    /// while a page is actually on screen (`.ready`): a page still drawing, or a
+    /// failure the reader is reading, is left alone. Returns for good when the
+    /// Tower has no revision to follow.
+    func followRevisions() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: revisionPollInterval)
+            guard !Task.isCancelled else { return }
+            guard case .ready = state else { continue }
+            if shownRevision == nil { shownRevision = state.revision }
+            let latest: String?
+            do {
+                latest = try await client.revision(for: target)
+            } catch {
+                // A dropped request is not a reason to change anything on
+                // screen; the next interval asks again.
+                continue
+            }
+            guard !Task.isCancelled else { return }
+            guard let latest else { return }
+            if latest != shownRevision {
+                await refresh(to: latest)
+            }
+        }
+    }
+
+    /// Fetch the newer page and put it on screen, or leave the old one.
+    ///
+    /// Never `.fetching` and never `.failed`: the reader is looking at a world,
+    /// and a refresh that fails must not take it away. `renderAttempt` is NOT
+    /// bumped, so the web view's content-process kill budget is not reset by
+    /// an automatic refresh -- a page too large for the phone must still stop
+    /// being retried. The revision is recorded before the pages are compared,
+    /// so a revision that does not change the page costs one fetch, not a loop.
+    private func refresh(to revision: String) async {
+        let html: String
+        do {
+            html = try await client.page(for: target)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled, case .ready(let current) = state else { return }
+        shownRevision = revision
+        guard html != current else { return }
+        renderWatchdog?.cancel()
+        state = .rendering(html: html)
+        startRenderWatchdog()
     }
 
     // No `deinit` cancelling the watchdog, deliberately. It captures `[weak
@@ -440,6 +566,7 @@ final class WorldRenderViewerModel: ObservableObject {
             guard !Task.isCancelled else { return }
             // Not `.ready`. The page has arrived; nothing has drawn it yet.
             state = .rendering(html: html)
+            shownRevision = state.revision
             startRenderWatchdog()
         } catch let error as WorldRenderFetchError {
             // A dismissed sheet cancels the task mid-fetch; that is not a
@@ -837,7 +964,10 @@ struct WorldRenderScene: View {
         // there is nothing for a `.task(id:)` to key on; a second rendering of
         // the same world is a second screen, and the page's own button switches
         // in place without fetching at all.
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.followRevisions()
+        }
     }
 
     private var caption: some View {

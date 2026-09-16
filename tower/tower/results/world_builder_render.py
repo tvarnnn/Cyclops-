@@ -20,7 +20,10 @@ second at the mobile point budget).
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from html import escape as html_escape
 
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import (
@@ -32,7 +35,9 @@ from tower.results.world_builder_library import _sortable
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
+    dense_artifact_drawable,
     session_has_drawable_geometry,
+    surface_artifact_drawable,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,6 +200,83 @@ REPRESENTATION_LADDER = (REPRESENTATION_SURFACE, REPRESENTATION_DENSE,
                          REPRESENTATION_SPARSE)
 
 
+_REPRESENTATION_META = re.compile(
+    r'<meta name="wb-representation" content="([a-z]+)">')
+
+
+def render_revision(store: WorldStore, world_id: str, session_id: str,
+                    rung: str) -> str:
+    """An opaque string that changes exactly when the page for `rung` would.
+
+    The phone keeps a saved-world picture open while the Tower is still
+    building it -- during a walk the live surface is rebuilt each time a global
+    solve lands -- and asks this to learn whether a better picture exists
+    without downloading a multi-megabyte page to find out.
+
+    The sparse rung's revision is a CONSTANT on purpose. The derived tree is
+    rewritten every few keyframes, and a picture that reloaded itself that
+    often would be unusable to look at; what the wearer is waiting for is the
+    step UP the ladder, which does change the revision because the rung is in
+    it.
+    """
+    if rung == REPRESENTATION_SURFACE:
+        path = store.world_dir(world_id) / "surface" / session_id / "manifest.json"
+        try:
+            built = json.loads(path.read_text(encoding="utf-8")).get("built_at")
+        except (OSError, ValueError, AttributeError):
+            built = None
+        return f"surface:{built}"
+    if rung == REPRESENTATION_DENSE:
+        path = store.world_dir(world_id) / "dense" / session_id / "manifest.json"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        return f"dense:{stamp}"
+    return REPRESENTATION_SPARSE
+
+
+def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
+                    html: str) -> str:
+    """Write the page's own revision into its head, beside its rung.
+
+    So the phone knows which revision it is showing from the page itself, with
+    no second request -- and so no race in which a build lands between
+    fetching a page and asking what revision it was.
+    """
+    match = _REPRESENTATION_META.search(html, 0, 4096)
+    if match is None:
+        return html
+    revision = render_revision(store, world_id, session_id, match.group(1))
+    tag = f'<meta name="wb-revision" content="{html_escape(revision, quote=True)}">'
+    return html[:match.end()] + tag + html[match.end():]
+
+
+def build_render_revision(store: WorldStore, world_id: str,
+                          session_id: str | None) -> dict:
+    """What `GET /worlds/{id}/render` would serve now, as a revision.
+
+    Walks the same ladder in the same order, but by the artifact checks the
+    Saved Worlds listing uses rather than by composing the page. The two can
+    disagree only when an artifact passes its header check and then fails to
+    parse, and that disagreement costs one extra page fetch, not a loop: the
+    phone records the revision it was told before comparing pages.
+    """
+    contained = contained_world_id(store, world_id)
+    if contained is None:
+        raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
+    world_id = contained
+    chosen = resolve_session(store, world_id, session_id)
+    if surface_artifact_drawable(store, world_id, chosen):
+        rung = REPRESENTATION_SURFACE
+    elif dense_artifact_drawable(store, world_id, chosen):
+        rung = REPRESENTATION_DENSE
+    else:
+        rung = REPRESENTATION_SPARSE
+    return {"session_id": chosen, "representation": rung,
+            "revision": render_revision(store, world_id, chosen, rung)}
+
+
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
                        max_points: int | None = None,
                        view: str | None = None,
@@ -241,8 +323,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         try:
             if build_surface_page is None:
                 raise RuntimeError("surface viewer unavailable")
-            return build_surface_page(store, world_id, chosen,
-                                      max_points=max_points)
+            page = build_surface_page(store, world_id, chosen, max_points=max_points)
+            return _stamp_revision(store, world_id, chosen, page)
         except SurfaceViewerUnavailable as exc:
             if representation == REPRESENTATION_SURFACE:
                 raise WorldRenderUnavailable(exc.reason) from None
@@ -292,7 +374,9 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
             budget = MOBILE_BYTE_BUDGET
             if max_points is not None:
                 budget = min(budget, max(1, int(max_points)) * POINT_STRIDE_BYTES)
-            return build_dense_page(store, world_id, chosen, budget_bytes=budget)
+            return _stamp_revision(store, world_id, chosen,
+                                   build_dense_page(store, world_id, chosen,
+                                                    budget_bytes=budget))
         except DenseViewerUnavailable as exc:
             if representation == REPRESENTATION_DENSE:
                 raise WorldRenderUnavailable(exc.reason) from None
@@ -304,8 +388,9 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
 
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
-        return render_html(store, world_id, chosen, max_points=budget,
+        page = render_html(store, world_id, chosen, max_points=budget,
                            view=view or VIEW_PRODUCT)
+        return _stamp_revision(store, world_id, chosen, page)
     except FileNotFoundError:
         # Raced a `clear_derived` between the existence check and the read.
         # Worded here rather than from the exception: the phone shows the
