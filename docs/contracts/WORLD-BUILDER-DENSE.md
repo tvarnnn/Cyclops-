@@ -207,6 +207,21 @@ directory unconditionally.
 records what the **session** said about redaction rather than the label of the
 redactor that happened to be loaded at densify time.
 
+**The fill mask (§4 refusal 3) is the same whichever path was taken.** It marks
+every pixel that is fill rather than what the camera saw. It is the difference
+against the raw capture frame when that frame is readable. When the raw frame is
+not readable, a build that trusts the stored keyframe uses the shape-gated guess
+on that keyframe. A build that re-redacted the keyframe (path 3) uses that guess
+united with the exact difference its own re-redaction made.
+
+Path 3 is every live build during a walk, because the session records its
+applied label only at Stop. It used to difference against the *stored*
+keyframe, which already carries the engine's fill, so its mask was empty
+wherever the engine had filled a face. The final build after Stop then reused
+that empty mask by image hash. The rule is versioned as `fill_rule` on each
+record and on the stage, and it is part of the depth cache key. A prediction or
+a cached stage made under another rule is not reused.
+
 ## 8. `GET /worlds` — the `dense` object
 
 Additive, per session, `null` on every world built before the dense stage.
