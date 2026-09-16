@@ -260,6 +260,101 @@ class DenseUnavailable(RuntimeError):
     """The world cannot be densified, and the reason is not a bug."""
 
 
+class DepthModelUnavailable(DenseUnavailable):
+    """This MACHINE cannot run the depth network right now: its package, torch,
+    or its weights are missing, or the backend is not one this Tower knows.
+
+    Separate from `DenseUnavailable` because the two call for different
+    responses. A session-specific refusal (a camera the poses were not solved
+    in, too few frames passing the gate) says nothing about the next session,
+    while this says every later build on this machine will fail the same way
+    until someone installs something or the network comes back -- which is
+    what lets the surface stage mark it permanent and the live worker stop
+    relaunching a child that cannot succeed (review 3, e2e m1 and m2).
+    """
+
+
+# The Hugging Face hub raises these when the weights are neither in the local
+# cache nor downloadable: offline (HF_HUB_OFFLINE, or no route to the hub) on a
+# machine that never fetched them. Resolved lazily so importing this module
+# never needs huggingface_hub.
+def _weights_missing_errors() -> tuple:
+    errors = []
+    try:
+        from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: PLC0415
+
+        errors.append(LocalEntryNotFoundError)
+    except ImportError:
+        pass
+    try:
+        from huggingface_hub.errors import OfflineModeIsEnabled  # noqa: PLC0415
+
+        errors.append(OfflineModeIsEnabled)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+def hub_model_cache(model_id: str) -> Path | None:
+    """Where the hub keeps `model_id`'s files on this machine, or None."""
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE  # noqa: PLC0415
+    except ImportError:
+        return None
+    return Path(HF_HUB_CACHE) / ("models--" + model_id.replace("/", "--"))
+
+
+def _tree_bytes(path: Path | None) -> int:
+    if path is None:
+        return 0
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            try:
+                st = item.lstat()
+            except OSError:
+                continue
+            if not item.is_symlink() and item.is_file():
+                total += st.st_size
+    except OSError:
+        pass
+    return total
+
+
+def load_hub_weights(name: str, model_id: str, load: Callable[[], object]):
+    """Run `load` (a `from_pretrained`), turning "the weights are not here and
+    cannot be fetched" into `DepthModelUnavailable` naming the model and the
+    cache, and logging what a first-run download cost.
+
+    The default backend's weights are about 1.3 GB and are fetched on first
+    use. Before this, a machine that was offline on its first walk raised the
+    hub's own `LocalEntryNotFoundError`, which the surface stage recorded as an
+    ordinary failure, so the live worker relaunched a child on every solve.
+    """
+    cache = hub_model_cache(model_id)
+    before = _tree_bytes(cache)
+    t0 = time.time()
+    missing = _weights_missing_errors()
+    try:
+        model = load()
+    except Exception as exc:  # noqa: BLE001 -- re-raised unless it is the one case
+        if missing and isinstance(exc, missing):
+            raise DepthModelUnavailable(
+                f"depth model {model_id!r} (backend {name!r}) is not in the "
+                f"Hugging Face cache ({cache}) and could not be downloaded: "
+                f"{type(exc).__name__}. Connect this machine to the internet "
+                "for its first build (about 1.3 GB for the default model), or "
+                "pre-seed the cache, then build again"
+            ) from None
+        raise
+    grown = _tree_bytes(cache) - before
+    if grown > 1_000_000:
+        logger.info("[Tower][WorldBuilder][dense] downloaded depth model %s: "
+                    "%.0f MB in %.0f s into %s", model_id, grown / 1e6,
+                    time.time() - t0, cache)
+    return model
+
+
 # ---------------------------------------------------------------------------
 # depth backends
 # ---------------------------------------------------------------------------
@@ -371,20 +466,22 @@ class MoGeBackend(DepthBackend):
     def _load(self):
         if self._model is not None:
             return
-        import torch
-
         try:
+            import torch
             from moge.model.v2 import MoGeModel
         except ImportError as exc:
-            raise DenseUnavailable(
-                f"backend {self.name!r} needs the `moge` package, which is not "
-                f"installed ({exc}). Install it, or pass a different --backend"
+            raise DepthModelUnavailable(
+                f"backend {self.name!r} needs the `moge` package and torch, "
+                f"which are not installed ({exc}). Install them, or pass a "
+                "different --backend"
             ) from None
 
         # The device is chosen, never assumed: a Tower without a GPU should fall
         # back rather than raise a CUDA error from inside a finalization step.
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = MoGeModel.from_pretrained(self.model_id).to(self._device).eval()
+        self._model = load_hub_weights(
+            self.name, self.model_id,
+            lambda: MoGeModel.from_pretrained(self.model_id)).to(self._device).eval()
         self._torch = torch
         logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s) on %s",
                     self.name, self.licence, self._device)
@@ -432,19 +529,20 @@ class DepthAnything3Backend(DepthBackend):
     def _load(self):
         if self._model is not None:
             return
-        import torch
-
         try:
+            import torch
             from depth_anything_3.api import DepthAnything3
         except ImportError as exc:
-            raise DenseUnavailable(
-                f"backend {self.name!r} needs the `depth-anything-3` package, "
-                f"which is not installed ({exc}). Install it, or pass a "
-                "different --backend"
+            raise DepthModelUnavailable(
+                f"backend {self.name!r} needs the `depth-anything-3` package "
+                f"and torch, which are not installed ({exc}). Install them, or "
+                "pass a different --backend"
             ) from None
 
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = DepthAnything3.from_pretrained(self.model_id).to(self._device).eval()
+        self._model = load_hub_weights(
+            self.name, self.model_id,
+            lambda: DepthAnything3.from_pretrained(self.model_id)).to(self._device).eval()
         logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s) on %s, window %d",
                     self.name, self.licence, self._device, self.window_size)
         self._torch = torch
@@ -524,7 +622,7 @@ def make_backend(name: str) -> DepthBackend:
     try:
         return _BACKENDS[name]()
     except KeyError:
-        raise DenseUnavailable(
+        raise DepthModelUnavailable(
             f"unknown depth backend {name!r}; available: {', '.join(available_backends())}"
         ) from None
 

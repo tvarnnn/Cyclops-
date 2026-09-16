@@ -1170,8 +1170,63 @@ def test_a_backend_whose_package_is_missing_refuses_by_name():
 
     for cls in (dense.MoGeBackend, dense.DepthAnything3Backend):
         src = inspect.getsource(cls._load)
-        assert "DenseUnavailable" in src, cls.__name__
+        assert "DepthModelUnavailable" in src, cls.__name__
         assert "--backend" in src, cls.__name__
+        # and the weights go through the loader that names a missing model
+        assert "load_hub_weights" in src, cls.__name__
+
+
+def test_weights_that_are_neither_cached_nor_downloadable_name_the_model(tmp_path, monkeypatch):
+    """Review 3, R7: offline on a machine that never fetched the weights, the
+    hub raises `LocalEntryNotFoundError`, which the surface stage recorded as an
+    ordinary failure and the live worker relaunched every solve."""
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    from tower.world_builder import dense
+
+    monkeypatch.setattr(dense, "hub_model_cache", lambda model_id: tmp_path / "hub" / "m")
+
+    def offline():
+        raise LocalEntryNotFoundError("cannot find the requested files in the local cache")
+
+    with pytest.raises(dense.DepthModelUnavailable) as caught:
+        dense.load_hub_weights("moge2-vitl", "Ruicheng/moge-2-vitl", offline)
+    assert isinstance(caught.value, dense.DenseUnavailable)
+    message = str(caught.value)
+    assert "Ruicheng/moge-2-vitl" in message
+    assert str(tmp_path / "hub" / "m") in message
+
+    # any other failure is not dressed up as "unavailable"
+    def broken():
+        raise RuntimeError("a real bug")
+
+    with pytest.raises(RuntimeError):
+        dense.load_hub_weights("moge2-vitl", "Ruicheng/moge-2-vitl", broken)
+
+
+def test_a_first_run_download_is_logged_with_its_size_and_time(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from tower.world_builder import dense
+
+    cache = tmp_path / "hub" / "models--x--y"
+    monkeypatch.setattr(dense, "hub_model_cache", lambda model_id: cache)
+
+    def download():
+        (cache / "blobs").mkdir(parents=True)
+        (cache / "blobs" / "model.pt").write_bytes(b"x" * 3_000_000)
+        return "model"
+
+    with caplog.at_level(logging.INFO, logger=dense.logger.name):
+        assert dense.load_hub_weights("n", "x/y", download) == "model"
+    assert any("downloaded depth model x/y" in r.getMessage() and "3 MB" in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    # a cached model logs no download
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=dense.logger.name):
+        dense.load_hub_weights("n", "x/y", lambda: "model")
+    assert not any("downloaded" in r.getMessage() for r in caplog.records)
 
 
 def test_no_backend_assumes_a_gpu_is_present():
