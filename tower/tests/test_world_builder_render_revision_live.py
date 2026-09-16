@@ -59,6 +59,11 @@ def test_the_route_honours_view_diagnostics(derived_world, monkeypatch):
     revision and refetched on every rebuild."""
     store, world_id, session_id = derived_world
     monkeypatch.setattr(R, "surface_artifact_drawable", lambda *_args: True)
+    # A manifest to read the revision from: a surface with none is answered as
+    # absent now, never as `surface:None` (review 2, iOS m5).
+    manifest = store.world_dir(world_id) / "surface" / session_id / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"built_at": 1.0}), encoding="utf-8")
     client = _client(store)
 
     product = client.get(f"/worlds/{world_id}/render/revision",

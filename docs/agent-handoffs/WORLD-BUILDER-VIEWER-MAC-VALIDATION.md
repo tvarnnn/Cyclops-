@@ -33,6 +33,11 @@ Do not work in the canonical checkout.
 | m6 | CSP `<meta http-equiv>` in the sparse and dense pages (surface already had it) | §3 |
 | m7 | `WORLD-BUILDER-IOS.md` §10 describes the viewer | read it |
 | m8 | §4a payload carries `live`; the phone polls every 10 s while live and backs off to 120 s otherwise (never stops) | §3, §5.4, §5.7 |
+| r2 S1 | The native surface caption no longer says gaps are where nothing looked; it reads *"…only where the cameras measured them. A gap is not proof that nothing is there. Not to scale."* (prefix unchanged for the UI smoke test) | §2, §5.1 |
+| r2 m4 | A rung whose pages failed to draw twice is not fetched, swapped or offered again until "Try again" | §2, §5.5 |
+| r2 m5 | A finished same-rung build swaps by itself only when the screen names a session; the Tower never answers `surface:None` | §2, §3 |
+| r2 m6 | A worse rung is neither swapped nor offered; an offer is withdrawn when the Tower reports the shown revision again | §2 |
+| r2 t1 | The refusal test now fails if the refusal is deleted (a new revision whose page carries the refused stamp) | §2 |
 
 ## 0. Check out the exact commit
 
@@ -85,8 +90,8 @@ xcodebuild -project Glasses.xcodeproj -scheme Glasses \
 ```
 
 Expect:
-- 8 tests in `WorldRenderRepresentationTests` (unchanged);
-- **19** in `WorldRenderRevisionTests`: 7 pure (address, page stamp, body decode, upgrade order, finished-build swap, poll interval, termination window) and 12 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop);
+- **9** tests in `WorldRenderRepresentationTests` (review 2 added the caption-retraction test);
+- **23** in `WorldRenderRevisionTests`: 8 pure (address, page stamp, body decode, upgrade order, finished-build swap, finished-build swap only for a named session, poll interval, termination window) and 15 that drive the follower (better rung swaps; same rung offered then swapped on `showNewerPicture`; unchanged revision fetches no page; a revision the page does not carry costs one fetch; failed fetch keeps the page; kill-budget failure reverts and a new revision carrying the refused stamp is not swapped in again; a rung that failed twice is not fetched again; a worse rung is neither swapped nor offered; a stale offer is withdrawn; watchdog failure reverts; a first page that cannot draw still fails; unmatched-route 404 ends following after one request; contract-worded 404 is retried; diagnostics target not followed; cancellation ends the loop). The refusal test and the twice-failed-rung test each wait up to 3 s on a bounded poll that, on a regression, times out rather than hangs;
 - `WorldRenderViewerTests` unchanged, all green.
 
 The follower tests no longer hang on a regression: every wait is bounded at

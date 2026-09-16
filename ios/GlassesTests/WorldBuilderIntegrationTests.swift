@@ -4593,6 +4593,18 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertFalse(swaps(.surface, .sparse, live: false), "a finished build never downgrades the picture")
     }
 
+    /// Review 2, iOS m5(b). With no session in the target the Tower answers the
+    /// newest session with geometry, so a same-rung revision while nothing is
+    /// building can be another walk's world.
+    func testAFinishedBuildIsSwappedInByItselfOnlyForANamedSession() {
+        let finished = WorldRenderRevision(revision: "s2/surface:1", representation: .surface, live: false)
+        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sessionNamed: true))
+        XCTAssertFalse(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sessionNamed: false))
+        let better = WorldRenderRevision(revision: "s2/surface:1", representation: .surface, live: true)
+        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .sparse, latest: better, sessionNamed: false),
+                      "a better rung is still swapped in")
+    }
+
     func testTheFollowerSlowsDownOnlyWhileNothingIsBuilding() {
         let base = Duration.seconds(10)
         let ceiling = Duration.seconds(120)
@@ -4716,11 +4728,97 @@ final class WorldRenderRevisionTests: XCTestCase {
         // fetched and swapped in again.
         let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
         let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
-        await stop(follow)
         XCTAssertTrue(pollsLater)
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2, "load() and one refresh; no second try")
         XCTAssertEqual(model.state, .ready(html: shown))
         XCTAssertFalse(model.newerPictureAvailable, "a refused revision is not offered either")
+
+        // Review 2, t1: everything above also holds with the refusal deleted,
+        // because `handledRevision` alone stops a refetch of the same polled
+        // value. What only the refusal stops: the Tower reports a NEW revision
+        // while the page it serves still carries the refused stamp (§4a rule 4:
+        // the route and the page can disagree). The page is fetched once, its
+        // stamp is recognised, and it is not swapped in again.
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:3")))
+        let refetched = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.pagePath) >= 3 }
+        XCTAssertTrue(refetched, "fixture: the new revision was never acted on")
+        // While a page is being drawn the follower does not poll, so these
+        // polls only happen if the refused page stayed off screen.
+        let afterRefetch = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsResumed = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= afterRefetch + 3
+        }
+        await stop(follow)
+        XCTAssertTrue(pollsResumed, "the follower stopped polling: the refused page was put back on screen")
+        XCTAssertEqual(model.state, .ready(html: shown), "the page that could not be drawn was swapped in again")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 3, "fetched once, not per poll")
+        XCTAssertFalse(model.newerPictureAvailable)
+    }
+
+    /// Review 2, iOS m4. Refusal was per revision, so a rung too large for the
+    /// phone was downloaded, killed and reverted again on every live build.
+    /// Twice refused, the rung is left alone until the reader asks.
+    func testARungThatFailedToDrawTwiceIsNotFetchedAgain() async {
+        let shown = page("sparse", "sparse")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:2"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:2")))
+        let follow = Task { await model.followRevisions() }
+
+        for build in 2...3 {
+            if build == 3 {
+                StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:3")))
+                StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:3")))
+            }
+            let swapped = await waitUntil { model.state == .rendering(html: page("surface", "surface:\(build)")) }
+            XCTAssertTrue(swapped, "build \(build) was never tried")
+            model.pageEvent(.gaveUpAfterTerminations(3))
+            model.pageEvent(.rendered)
+            XCTAssertEqual(model.state, .ready(html: shown))
+        }
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 3)
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "surface:4")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:4")))
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
+        await stop(follow)
+        XCTAssertTrue(pollsLater)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 3, "a third surface was downloaded")
+        XCTAssertEqual(model.state, .ready(html: shown))
+        XCTAssertFalse(model.newerPictureAvailable)
+    }
+
+    /// Review 2, iOS m6. A worse rung was offered as "A newer reconstruction is
+    /// ready", and tapping it replaced a surface with points.
+    func testAWorseRungIsNeitherSwappedNorOffered() async {
+        let shown = page("surface", "surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:1"))
+        let follow = Task { await model.followRevisions() }
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("sparse", "sparse")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("sparse", "sparse")))
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
+        await stop(follow)
+        XCTAssertTrue(pollsLater)
+        XCTAssertFalse(model.newerPictureAvailable, "a downgrade was offered as newer")
+        XCTAssertEqual(model.state, .ready(html: shown))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1)
+    }
+
+    /// Review 2, iOS m6: an offer whose revision is no longer what the Tower
+    /// reports goes away.
+    func testAnOfferThatIsNoLongerCurrentIsWithdrawn() async {
+        let shown = page("surface", "surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "surface:1"))
+        let follow = Task { await model.followRevisions() }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:2")))
+        let offered = await waitUntil { model.newerPictureAvailable }
+        XCTAssertTrue(offered)
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "surface:1")))
+        let withdrawn = await waitUntil { !model.newerPictureAvailable }
+        await stop(follow)
+        XCTAssertTrue(withdrawn, "the button outlived its reason")
+        XCTAssertEqual(model.state, .ready(html: shown))
     }
 
     func testARefreshThatNeverFinishesDrawingPutsTheOldPictureBack() async {

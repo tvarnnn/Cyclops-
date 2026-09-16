@@ -191,3 +191,10 @@ Every page §4 serves carries the same two values in its head, within its first
    `live` is `true`) and keeps polling at its base interval while it is `true`.
    A finished world therefore costs one request every two minutes, not every
    ten seconds.
+7. **A surface whose manifest cannot be read at that moment is answered as the
+   next rung, never as a surface with no revision.** A read that races the
+   replace of a landing build is retried; if it still fails, the rung falls to
+   dense or sparse for that one request, and a page composed in that moment
+   carries no `wb-revision` rather than a false one. A client that does not
+   step down the ladder by itself (the iOS app neither swaps nor offers a worse rung,
+   `WORLD-BUILDER-IOS.md` §10) sees nothing change.

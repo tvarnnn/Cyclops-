@@ -574,6 +574,15 @@ final class WorldRenderViewerModel: ObservableObject {
     /// fetch one.
     private var refusedRevisions: Set<String> = []
 
+    /// How many automatic refreshes of each rung failed to draw, and the rungs
+    /// that have failed twice. A rung too large for this phone used to be
+    /// refused per REVISION, so every live build of it was downloaded, killed
+    /// and reverted again (review 2, iOS m4). Twice, not once: one failure can
+    /// be memory another app was holding. Cleared by `load()`, which is also
+    /// what "Try again" does.
+    private var rungDrawFailures: [WorldRenderRepresentation: Int] = [:]
+    private var refusedRungs: Set<WorldRenderRepresentation> = []
+
     /// The page that was on screen when an automatic refresh replaced it, and
     /// the revision it carried, kept until the replacement reports drawn. A
     /// refresh that cannot be drawn -- watchdog, `didFail`, or the content
@@ -625,6 +634,12 @@ final class WorldRenderViewerModel: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let latest else { return }
+            if latest.revision == shownRevision, newerPictureAvailable {
+                // The build that was offered is no longer what the Tower would
+                // serve; the button must not outlive its reason.
+                pendingRevision = nil
+                newerPictureAvailable = false
+            }
             let isNew = latest.revision != shownRevision
                 && latest.revision != handledRevision
                 && !refusedRevisions.contains(latest.revision)
@@ -633,7 +648,22 @@ final class WorldRenderViewerModel: ObservableObject {
                 live: latest.live, changed: isNew
             )
             guard isNew else { continue }
-            if Self.swapsBySelf(shown: state.representation, latest: latest) {
+            if let rung = latest.representation, refusedRungs.contains(rung) {
+                // This phone could not draw that rung twice; neither swapped
+                // nor offered. "Try again" still can.
+                handledRevision = latest.revision
+                continue
+            }
+            if WorldRenderRepresentation.isUpgrade(from: latest.representation, to: state.representation) {
+                // A worse rung than the one on screen -- a surface briefly
+                // undrawable on the Tower, a pruned artifact -- is not "a newer
+                // reconstruction" and is not offered as one (review 2, iOS m6).
+                handledRevision = latest.revision
+                continue
+            }
+            if Self.swapsBySelf(
+                shown: state.representation, latest: latest, sessionNamed: target.sessionID != nil
+            ) {
                 await refresh(to: latest.revision)
             } else {
                 handledRevision = latest.revision
@@ -652,8 +682,14 @@ final class WorldRenderViewerModel: ObservableObject {
     /// A same-rung build while the walk is live is offered, because live builds
     /// land on every solve and a swap resets the camera mid-look. Nothing
     /// replaces a page with a worse rung by itself.
+    ///
+    /// The finished-build swap needs `sessionNamed`. With no session in the
+    /// target the Tower picks the newest session with geometry, so a same-rung
+    /// revision seen while nothing is building can be ANOTHER walk's world, and
+    /// swapping it in without asking would replace the world the reader opened
+    /// (review 2, iOS m5). It is offered instead.
     nonisolated static func swapsBySelf(
-        shown: WorldRenderRepresentation?, latest: WorldRenderRevision
+        shown: WorldRenderRepresentation?, latest: WorldRenderRevision, sessionNamed: Bool = true
     ) -> Bool {
         if WorldRenderRepresentation.isUpgrade(from: shown, to: latest.representation) {
             return true
@@ -661,7 +697,7 @@ final class WorldRenderViewerModel: ObservableObject {
         let downgrade = WorldRenderRepresentation.isUpgrade(
             from: latest.representation, to: shown
         )
-        return !downgrade && latest.live == false
+        return !downgrade && latest.live == false && sessionNamed
     }
 
     /// How long to wait before the next ask.
@@ -729,6 +765,11 @@ final class WorldRenderViewerModel: ObservableObject {
         fallback = nil
         if let refused = shownRevision { refusedRevisions.insert(refused) }
         if let handled = handledRevision { refusedRevisions.insert(handled) }
+        if let rung = state.representation {
+            let failures = rungDrawFailures[rung, default: 0] + 1
+            rungDrawFailures[rung] = failures
+            if failures >= 2 { refusedRungs.insert(rung) }
+        }
         shownRevision = previous.revision
         // A fresh kill budget for a page that already drew once on this phone.
         renderAttempt += 1
@@ -753,6 +794,8 @@ final class WorldRenderViewerModel: ObservableObject {
         pendingRevision = nil
         newerPictureAvailable = false
         handledRevision = nil
+        rungDrawFailures = [:]
+        refusedRungs = []
         state = .fetching
         do {
             let html = try await client.page(for: target)

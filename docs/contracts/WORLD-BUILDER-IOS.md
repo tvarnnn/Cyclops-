@@ -491,9 +491,11 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 |---|---|
 | same revision | nothing; no page is fetched |
 | a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision) | fetches the page and swaps it in |
-| a new revision of the **same rung** with `live: false` (the finished build after Stop) | fetches the page and swaps it in: a world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
-| a new revision of the **same or a lower rung** otherwise | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera |
+| a new revision of the **same rung** with `live: false`, when the screen was opened on a **named session** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
+| a new revision of the **same rung** otherwise (live, the Tower did not say, or no session named: the Tower then picks the newest session, which may be another walk) | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |
+| a new revision of a **worse rung** | nothing: not swapped, and not offered as "newer" |
 | a revision whose page could not be drawn on this phone | never swaps it in or offers it again |
+| any revision of a rung whose pages failed to draw **twice** on this screen | not fetched, swapped or offered; "Try again" (`load()`) forgets the refusals |
 | `404` with FastAPI's `{"detail": "Not Found"}` | stops following for this screen (a Tower older than the route) |
 | any other `404`, another status, or a transport error | keeps the picture and asks again next interval |
 
@@ -504,12 +506,16 @@ surface a few seconds after it releases the world lock (§4a rule 6).
 A diagnostics target (`view=diagnostics`) is not followed at all: its page is
 always the sparse one.
 
-**A refresh never takes the world away.** A failed fetch leaves the page. A
-fetched page that then fails to draw — the 20 s render watchdog, `didFail`, or
-the content process being killed past its budget — puts the previous page back
-(with a fresh kill budget, since it already drew once) and refuses that
-revision. A refresh reaches the failure view only if the restored page then
-fails to draw as well.
+**A refresh does not take the world away while it is being drawn.** A failed
+fetch leaves the page. A fetched page that fails to draw before it reports
+finished — the 20 s render watchdog, `didFail`, or the content process being
+killed past its budget — puts the previous page back (with a fresh kill budget,
+since it already drew once) and refuses that revision, and the rung after its
+second such failure. A refresh reaches the failure view only if the restored
+page then fails to draw as well. **Not covered:** a page that reports finished
+(`didFinish`) and is killed afterwards, for example on the first frames of a
+large mesh; the fallback is released at `didFinish`, so that kill goes to the
+failure view (review 2, iOS m2).
 
 **Content-process kills** are counted within a sliding 60 s window, not for
 the life of the screen: up to two reloads, and the third kill inside a minute
@@ -521,6 +527,7 @@ check but its page cannot be built, the revision route reports the better rung
 while the page is stamped lower; the app pays one page download per rebuild
 for that, not one per poll, and the Tower logs it at `ERROR`. A swap briefly
 holds the old and new page strings plus the old document's heap; for the
-default L2 surface (≈3.7 MB) that is fine, and for a Tower configured to serve
+default phone surface page (sized to the 6 MiB page budget,
+`WORLD-BUILDER-SURFACE.md` §8) that is fine, and for a Tower configured to serve
 larger pages it is the likeliest moment for a WebContent kill, which the
 fallback above then absorbs.

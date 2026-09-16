@@ -1719,3 +1719,33 @@ class TestTheCaptionPromisesOnlyWhatTheArtifactDid:
         html = viewer_template_path().read_text(encoding="utf-8")
         at = html.index("at least two camera views")
         assert "CONFIG.evidence_filter" in html[at - 300:at]
+
+
+def test_an_unreadable_surface_manifest_is_never_a_surface_none_revision(tmp_path, monkeypatch):
+    """Review 2, iOS m5(c). The revision read the manifest with a bare
+    `read_text`; on Windows a read racing the replace of a landing build
+    raised, and the route answered `surface:None` -- which the phone took for
+    a new build of the same rung, and when the page's own stamp hit the same
+    race, swapped to an identical mesh and back."""
+    from tower.results.world_builder_render import build_render_revision, build_world_render
+    from pathlib import Path
+
+    from tower.world_builder import store as store_module
+
+    store = _synthetic_world(tmp_path)
+    SP.surfacify(store, WORLD, SESSION, params=_params())
+    good = build_render_revision(store, WORLD, SESSION)
+    assert good["representation"] == "surface"
+
+    # what a read that lost every retry to a replace returns
+    real = store_module._read_json_past_a_replace
+    monkeypatch.setattr(
+        store_module, "_read_json_past_a_replace",
+        lambda path, **kw: (None if Path(path).parent.parent.name == "surface"
+                         else real(path, **kw)))
+    rev = build_render_revision(store, WORLD, SESSION)
+    assert "None" not in rev["revision"]
+    assert rev["representation"] != "surface", "answered as absent: the next rung"
+    page = build_world_render(store, WORLD, SESSION)
+    assert _meta(page, "wb-representation") == "surface"
+    assert _meta(page, "wb-revision") is None, "no stamp rather than a false one"

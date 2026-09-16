@@ -206,7 +206,7 @@ _REPRESENTATION_META = re.compile(
 
 
 def render_revision(store: WorldStore, world_id: str, session_id: str,
-                    rung: str) -> str:
+                    rung: str) -> str | None:
     """An opaque string that changes exactly when the page for `rung` would.
 
     The phone keeps a saved-world picture open while the Tower is still
@@ -219,14 +219,29 @@ def render_revision(store: WorldStore, world_id: str, session_id: str,
     often would be unusable to look at; what the wearer is waiting for is the
     step UP the ladder, which does change the revision because the rung is in
     it.
+
+    `None` for a surface whose manifest cannot be read now, never
+    `"surface:None"`. A bare read racing the `os.replace` of a landing build
+    fails on Windows, and the phone took that string for a new same-rung
+    revision: one needless page download, and when the page's own stamp hit
+    the same race, a swap onto an identical mesh and a second swap back
+    (review 2, iOS m5). The read now survives a replace; what still fails is
+    reported as no surface revision, and the caller answers the next rung.
     """
     if rung == REPRESENTATION_SURFACE:
+        from tower.world_builder.store import _read_json_past_a_replace  # noqa: PLC0415
+
         path = store.world_dir(world_id) / "surface" / session_id / "manifest.json"
+        if not path.exists():
+            # Every page asks for every rung's revision; a world with no
+            # surface must not pay the replace-retry backoff for it.
+            return None
         try:
-            built = json.loads(path.read_text(encoding="utf-8")).get("built_at")
-        except (OSError, ValueError, AttributeError):
-            built = None
-        return f"surface:{built}"
+            manifest = _read_json_past_a_replace(path)
+        except ValueError:
+            manifest = None
+        built = manifest.get("built_at") if isinstance(manifest, dict) else None
+        return None if built is None else f"surface:{built}"
     if rung == REPRESENTATION_DENSE:
         path = store.world_dir(world_id) / "dense" / session_id / "manifest.json"
         try:
@@ -254,8 +269,14 @@ def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
     # the phone -- told it already had the latest -- never fetched the final
     # surface. Read before, the same race stamps a NEW page with an OLD
     # revision, which costs the phone one extra fetch and is always safe.
-    revision = ((revisions or {}).get(rung)
-                or f"{session_id}/{render_revision(store, world_id, session_id, rung)}")
+    revision = (revisions or {}).get(rung)
+    if revision is None:
+        own = render_revision(store, world_id, session_id, rung)
+        if own is None:
+            # No stamp rather than a false one: the phone then records the
+            # revision it polled, which is what it did before pages carried one.
+            return html
+        revision = f"{session_id}/{own}"
     tag = f'<meta name="wb-revision" content="{html_escape(revision, quote=True)}">'
     return html[:match.end()] + tag + html[match.end():]
 
@@ -275,18 +296,25 @@ def build_render_revision(store: WorldStore, world_id: str,
         raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
+    revision = None
     if view == VIEW_DIAGNOSTICS:
         rung = REPRESENTATION_SPARSE
-    elif surface_artifact_drawable(store, world_id, chosen):
+    elif (surface_artifact_drawable(store, world_id, chosen)
+          and (revision := render_revision(
+              store, world_id, chosen, REPRESENTATION_SURFACE)) is not None):
+        # A surface whose manifest cannot be read right now is answered as
+        # absent -- the next rung -- never as `surface:None`.
         rung = REPRESENTATION_SURFACE
     elif dense_artifact_drawable(store, world_id, chosen):
         rung = REPRESENTATION_DENSE
     else:
         rung = REPRESENTATION_SPARSE
+    if rung != REPRESENTATION_SURFACE:
+        revision = render_revision(store, world_id, chosen, rung)
     return {"session_id": chosen, "representation": rung,
             # The session is in the revision, so an open picture whose session
             # the Tower chose notices when the Tower would choose a newer one.
-            "revision": f"{chosen}/{render_revision(store, world_id, chosen, rung)}",
+            "revision": f"{chosen}/{revision}",
             "live": session_build_running(store, world_id, chosen)}
 
 
@@ -387,8 +415,11 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     # surface gets the surface, because that is the whole point of having
     # built one; one that has only points gets points; every world built
     # before either stage existed falls through to the sparse page unchanged.
-    revisions = {rung: f"{chosen}/{render_revision(store, world_id, chosen, rung)}"
-                 for rung in REPRESENTATION_LADDER}
+    revisions = {}
+    for rung in REPRESENTATION_LADDER:
+        own = render_revision(store, world_id, chosen, rung)
+        if own is not None:
+            revisions[rung] = f"{chosen}/{own}"
     wanted = (representation if representation in REPRESENTATION_LADDER
               else REPRESENTATION_SURFACE)
     # The solver's diagnostic view IS the sparse page -- only it has the
