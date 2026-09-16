@@ -1099,6 +1099,11 @@ def _discard_unpublished(root: Path, levels: list) -> None:
             pass
 
 
+# The `detail` of a result that built nothing because the artifact on disk is
+# already this solve's, with these parameters.
+ALREADY_BUILT = "already built from this solve with these parameters (--force rebuilds)"
+
+
 def _already_built(root: Path, digest, pdigest, force: bool):
     if force:
         return None
@@ -1117,7 +1122,9 @@ def _already_built(root: Path, digest, pdigest, force: bool):
     if not levels or not all(level_file_whole(root, lv) for lv in levels):
         return None
     return SurfaceResult(
-        state=STATE_OK, frames_used=man.get("frames_used", 0),
+        state=STATE_OK,
+        detail=ALREADY_BUILT,
+        frames_used=man.get("frames_used", 0),
         frames_offered=man.get("frames_offered", 0),
         vertices=man.get("vertices", 0), faces=man.get("faces", 0),
         voxel=man.get("voxel", 0.0), trunc=man.get("truncation", 0.0),

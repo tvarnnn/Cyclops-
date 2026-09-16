@@ -1801,3 +1801,13 @@ class TestThePhoneBudgetBoundsThePage:
         a = S.SurfaceParams().digest_fields()
         b = S.SurfaceParams(mobile_page_bytes=1).digest_fields()
         assert a != b
+
+
+def test_a_build_that_builds_nothing_says_so(tmp_path):
+    """The CLI printed an ordinary summary with "0.0s total" for a no-op."""
+    store = _synthetic_world(tmp_path)
+    first = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert first.state == "ok" and first.detail != SP.ALREADY_BUILT
+    again = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert again.state == "ok"
+    assert again.detail == SP.ALREADY_BUILT
