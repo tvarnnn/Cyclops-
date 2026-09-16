@@ -71,21 +71,31 @@ by observation:
 <world>/surface/<session>/
     manifest.json        what is here, how it was built, what it claims
     status.json          the stage's state, with the pid that wrote it
-    mesh_l0.bin          level 0, the archive
-    mesh_l1.bin          level 1
-    mesh_l2.bin          level 2, what a phone is sent
+    mesh_l0.<build>.bin  level 0, the archive
+    mesh_l1.<build>.bin  level 1
+    mesh_l2.<build>.bin  level 2, what a phone is sent
     .surface.lock        held while a build runs
     surface.log          the live child's output, when the builder ran one
 ```
 
 Every file is published atomically: the bytes are written to a staging path
 and renamed only once whole. A reader therefore sees either the previous
-artifact or the new one, never a torn one. This is not decoration — a torn
+artifact or the new one, never a torn one.
+
+A build is published as a unit. Each build writes its levels under its own
+`<build>` id, and `manifest.json` -- written last -- names them in
+`levels[].file` with their byte counts. Readers resolve a level only through
+the manifest and refuse a file whose size disagrees. A build killed during
+packing therefore leaves orphan level files that nothing names, and the
+previous manifest keeps pointing at the previous build's whole set. Level
+files no manifest names are pruned once they are two minutes old. A manifest
+written before per-build names (no `file` key) still resolves to
+`mesh_lN.bin`. This is not decoration — a torn
 `solution.npz` read across processes ended a session holding 795 keyframes
 and 26,634 points on 2026-09-09, and `mesh_l*.bin` has exactly the same
 writer-in-one-process, reader-in-another shape.
 
-## 5. `mesh_lN.bin` — the wire format
+## 5. `mesh_lN.<build>.bin` — the wire format
 
 Little-endian throughout. One self-describing buffer.
 
