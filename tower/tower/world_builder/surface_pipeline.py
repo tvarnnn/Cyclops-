@@ -298,6 +298,13 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams) -> bool:
         return False
     if cached.get("backend") != dparams.backend:
         return False
+    # Fill masks made under an earlier rule may be the empty masks a live build
+    # used to save over engine-filled faces (review 2, I6). Refit; the
+    # predictions of that stage are not reused either (`reusable_predictions`).
+    from tower.world_builder.dense_pipeline import FILL_RULE  # noqa: PLC0415
+
+    if cached.get("fill_rule") != FILL_RULE:
+        return False
     records = [r for r in cached.get("records", []) if r.get("ok")]
     if not records:
         return False

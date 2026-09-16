@@ -48,6 +48,7 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
     import cv2
 
     from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import FILL_RULE
     from tower.world_builder.global_solve import Solution, workspace_for, write_solution
     from tower.world_builder.records import CameraIntrinsics, Session, World
     from tower.world_builder.store import WorldStore
@@ -142,11 +143,12 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
             records.append({"ki": i, "kid": kid, "ok": True, "a": 1.0, "b": 0.0,
                             "held_out_rel": 0.01,
                             "image_sha1": hashlib.sha1(enc.tobytes()).hexdigest(),
+                            "fill_rule": FILL_RULE,
                             **({"z_sparse_min": zrange[i][0], "z_sparse_max": zrange[i][1]}
                                if anchors else {})})
         (dense / "align.json").write_text(json.dumps({
             "kind": "depth", "camera": camera, "backend": DenseParams().backend,
-            "input_digest": digest, "records": records}))
+            "input_digest": digest, "fill_rule": FILL_RULE, "records": records}))
     return store
 
 
@@ -1387,3 +1389,138 @@ def test_a_prediction_is_not_reused_once_its_keyframe_image_changes(tmp_path, mo
                           gate_rel=0.08, backend=_CountingBackend.name)
     assert _CountingBackend.calls == 1, (
         "exactly the one keyframe whose image changed is predicted again")
+
+
+# ---------------------------------------------------------------------------
+# the fill mask does not depend on whether the engine or the stage redacted
+# ---------------------------------------------------------------------------
+
+_APPLIED = "faces-detected-and-filled/yunet-2023mar@0.30+plausibility1"
+
+
+class _NoFaceRedactor:
+    """Available, and finds nothing: `redact` hands back the input bytes under
+    the applied label, exactly as `FaceRedactor._redact` does with no boxes."""
+
+    available = True
+    unavailable_reason = None
+    label = _APPLIED
+
+    def redact(self, data):
+        from tower.world_builder.redaction import RedactionResult
+
+        return RedactionResult(image_bytes=data, label=_APPLIED, regions=0)
+
+
+class TestTheFillMaskSurvivesALiveBuild:
+    """Review 2, I6. During a walk the session record says `none`, so a live
+    build re-redacted every stored keyframe and took the fill mask as the
+    difference against the STORED image -- empty wherever the engine had
+    already filled a face, because both images carry the same black
+    rectangle. After Stop the image hash still matched, and the final surface
+    reused that empty mask: network depth invented across the fill rectangle
+    was fused into the saved world. Measured on canonical keyframes, 48 of 100
+    frames lost their fill this way."""
+
+    def _world(self, tmp_path, monkeypatch, label, *, with_raw):
+        import cv2
+        import dataclasses
+
+        from tower.world_builder import global_solve as GS
+        from tower.world_builder import redaction as RD
+        from tower.world_builder.dense import register_backend
+
+        register_backend(_CountingBackend.name, _CountingBackend)
+        monkeypatch.setattr(RD, "FaceRedactor", _NoFaceRedactor)
+
+        def identity_maps(_intrinsics, width, height):
+            xs, ys = np.meshgrid(np.arange(width, dtype=np.float32),
+                                 np.arange(height, dtype=np.float32))
+            return xs, ys, (0, 0, width, height), None
+
+        monkeypatch.setattr(GS, "_undistort_maps", identity_maps)
+        store = _synthetic_world(tmp_path)
+        kf = store.images_dir(WORLD, SESSION) / f"{0:08d}.jpg"
+        img = cv2.imdecode(np.frombuffer(kf.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+        if with_raw:
+            # The capture frame the engine redacted: textured where the face was.
+            raw = img.copy()
+            raw[30:90, 40:120] = np.random.default_rng(1).integers(
+                60, 250, size=raw[30:90, 40:120].shape, dtype=np.uint8)
+            raw_path = tmp_path / "raw-00000000.jpg"
+            raw_path.write_bytes(cv2.imencode(".png", raw)[1].tobytes())
+            ws = store.world_dir(WORLD) / "solve" / SESSION
+            (ws / "sources.json").write_text(json.dumps(
+                {"sources": {f"{SESSION}:{0:08d}": str(raw_path)}}))
+        img[30:90, 40:120] = 0                          # the engine's fill
+        kf.write_bytes(cv2.imencode(".png", img)[1].tobytes())
+        s = store.read_session(WORLD, SESSION)
+        store.write_session(dataclasses.replace(s, redaction=label))
+        align_path = store.world_dir(WORLD) / "dense" / SESSION / "align.json"
+        a = json.loads(align_path.read_text())
+        a["backend"] = _CountingBackend.name
+        align_path.write_text(json.dumps(a))
+        return store, align_path
+
+    def _build(self, store, align_path, solve):
+        from tower.world_builder.global_solve import load_solution
+
+        a = json.loads(align_path.read_text())
+        a["input_digest"] = a["digest"] = solve        # another solve: refit
+        align_path.write_text(json.dumps(a))
+        _CountingBackend.calls = 0
+        SP.ensure_depth_stage(store, WORLD, SESSION, load_solution(store, WORLD, SESSION),
+                              store.read_session(WORLD, SESSION).intrinsics,
+                              gate_rel=0.08, backend=_CountingBackend.name)
+        fill = np.load(align_path.parent / "work" / "depth" / "00000_fill.npy")
+        return float(fill.mean()), _CountingBackend.calls
+
+    @pytest.mark.parametrize("with_raw", [False, True], ids=["no-raw-frame", "raw-frame"])
+    def test_the_final_build_after_a_live_build_masks_the_engines_fill(
+            self, tmp_path, monkeypatch, with_raw):
+        import dataclasses
+
+        store, align = self._world(tmp_path / "fresh", monkeypatch, _APPLIED,
+                                   with_raw=with_raw)
+        fresh, _ = self._build(store, align, "earlier")
+        assert fresh > 0.2, "the rectangle is 25% of the frame"
+
+        store, align = self._world(tmp_path / "walk", monkeypatch, "none",
+                                   with_raw=with_raw)
+        live, _ = self._build(store, align, "earlier")
+        s = store.read_session(WORLD, SESSION)
+        store.write_session(dataclasses.replace(s, redaction=_APPLIED))
+        final, predicted = self._build(store, align, "the-final-solve")
+
+        assert predicted == 0, "the live build's prediction is still reused"
+        assert live == pytest.approx(fresh, abs=0.01), "the live build saw the fill"
+        assert final == pytest.approx(fresh, abs=0.01), (
+            "the saved world masks the same fill a fresh final build would")
+
+    def test_a_prediction_made_under_an_earlier_fill_rule_is_not_offered(self, tmp_path):
+        from tower.world_builder.dense_pipeline import reusable_predictions
+
+        store = _synthetic_world(tmp_path)
+        align_path = store.world_dir(WORLD) / "dense" / SESSION / "align.json"
+        a = json.loads(align_path.read_text())
+        backend = a["backend"]
+        assert len(reusable_predictions(align_path, backend)) == len(a["records"])
+        for r in a["records"]:
+            r.pop("fill_rule")
+        align_path.write_text(json.dumps(a))
+        assert reusable_predictions(align_path, backend) == {}
+
+    def test_a_depth_stage_made_under_an_earlier_fill_rule_is_not_a_cache(self, tmp_path):
+        from tower.world_builder.dense import DenseParams
+        from tower.world_builder.dense_pipeline import FILL_RULE, _depth_cache_key
+        from tower.world_builder.global_solve import load_solution
+
+        store = _synthetic_world(tmp_path)
+        dense = store.world_dir(WORLD) / "dense" / SESSION
+        a = json.loads((dense / "align.json").read_text())
+        solution = load_solution(store, WORLD, SESSION)
+        assert SP._depth_cache_usable(a, dense, solution, DenseParams())
+        a.pop("fill_rule")
+        assert not SP._depth_cache_usable(a, dense, solution, DenseParams())
+        # densify's own cache test is the key
+        assert f"fill{FILL_RULE}" in _depth_cache_key("d", DenseParams())

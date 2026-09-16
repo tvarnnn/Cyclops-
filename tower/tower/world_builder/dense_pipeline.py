@@ -123,6 +123,7 @@ def _depth_cache_key(digest, params: DenseParams) -> str:
     """
     return "|".join(str(x) for x in (
         digest, params.backend, params.component, params.min_sparse_points,
+        f"fill{FILL_RULE}",
     ))
 
 
@@ -295,17 +296,54 @@ def _undistorted_image(ki: int, work: Path):
     return cv2.imread(str(p)) if p.exists() else None
 
 
-def _fill_mask_for(redacted: bytes, raw: bytes | None):
-    """Exactly which pixels the redactor filled, by difference. None if unknown."""
+# WHICH RULE PRODUCED A FRAME'S `_fill.npy`. Part of the depth cache key and of
+# every per-frame record, so a mask made under an earlier rule -- and the
+# prediction made alongside it -- is never reused under this one.
+#
+#   (absent)  the difference against whatever image was re-redacted. A live
+#             build during a walk re-redacts the STORED keyframe, which already
+#             carries the engine's fill, so the difference was empty wherever
+#             the engine had filled a face -- and the final build after Stop
+#             reused that empty mask by image hash (review 2, I6).
+#   2         the fill is measured against what the CAMERA saw: the raw capture
+#             frame when it is readable, otherwise the exact difference of this
+#             re-redaction united with the shape-gated guess on the image
+#             itself, which is what a build that never re-redacted uses.
+FILL_RULE = 2
+
+
+def _fill_mask_for(redacted: bytes, raw: bytes | None, stored: bytes | None = None):
+    """Which pixels of `redacted` are redaction fill rather than camera pixels.
+
+    Exactly, by difference against the raw frame, when that is readable. Else,
+    when `stored` is given -- the keyframe on disk that `redacted` was produced
+    from by a re-redaction -- the difference against it (this re-redaction's
+    own fill, exactly) united with the shape-gated guess on `redacted` (the
+    fill that was already in `stored`, which no difference against `stored`
+    can see). Else None, and the caller guesses on the image, as it always has.
+    Undilated either way; the caller dilates.
+    """
     import cv2
 
-    if raw is None:
+    if raw is None and stored is None:
         return None
-    a = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     b = cv2.imdecode(np.frombuffer(redacted, np.uint8), cv2.IMREAD_COLOR)
-    if a is None or b is None or a.shape != b.shape:
+    if b is None:
         return None
-    return redaction_fill_mask(b, a, dilate_px=0)
+    if raw is not None:
+        a = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        if a is not None and a.shape == b.shape:
+            return redaction_fill_mask(b, a, dilate_px=0)
+    if stored is None:
+        return None
+    guess = redaction_fill_mask(b, None, dilate_px=0)
+    if stored is redacted or stored == redacted:
+        # Nothing was filled by this re-redaction; all of the fill predates it.
+        return guess
+    s = cv2.imdecode(np.frombuffer(stored, np.uint8), cv2.IMREAD_COLOR)
+    if s is None or s.shape != b.shape:
+        return guess
+    return guess | redaction_fill_mask(b, s, dilate_px=0)
 
 
 def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str,
@@ -379,7 +417,12 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
                 # down from the one it was written to fix.
                 return None, "refused-redaction-failed", None
             filled = result.image_bytes
-            return filled, "world-keyframe-redacted-here", _fill_mask_for(filled, data)
+            # Against the RAW frame, not against `data`: during a walk the
+            # session record says `none` although the engine has usually
+            # filled the faces already, and a difference against the stored
+            # image cannot see a fill both images share (FILL_RULE).
+            return (filled, "world-keyframe-redacted-here",
+                    _fill_mask_for(filled, raw_bytes, stored=data))
         except OSError:
             pass
     if raw_bytes is None:
@@ -566,7 +609,7 @@ def run_depth_stage(
         if _stopped(should_stop):
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
                     "camera": cam, "targets": len(targets), "image_origins": origins,
-                    "kind": backend.kind}
+                    "kind": backend.kind, "fill_rule": FILL_RULE}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
@@ -594,6 +637,7 @@ def run_depth_stage(
                 ki, kid, pose, disp, fill_u, fill_fraction, "reused-prediction",
                 solution, obs_kf, obs_pt, K, W, H, params, backend, work)
             record["image_sha1"] = image_sha1
+            record["fill_rule"] = FILL_RULE
             records.append(record)
             continue
         origins[origin] = origins.get(origin, 0) + 1
@@ -655,6 +699,7 @@ def run_depth_stage(
             ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
             obs_kf, obs_pt, K, W, H, params, backend, work)
         record["image_sha1"] = image_sha1
+        record["fill_rule"] = FILL_RULE
         records.append(record)
 
     if progress:
@@ -666,6 +711,7 @@ def run_depth_stage(
                "targets": len(targets), "backend": backend.name,
                "backend_licence": backend.licence, "kind": backend.kind,
                "stopped_after": None,
+               "fill_rule": FILL_RULE,
                "image_origins": origins,
                "redaction": session_redaction,
                "keyframes_were_redacted_at_capture": keyframes_are_redacted,
@@ -761,11 +807,14 @@ def reusable_predictions(align_path: Path, backend: str) -> dict:
     if cached.get("backend") != backend:
         return {}
     # (kid, image hash): a record written before hashes were recorded offers
-    # nothing, and costs one fresh prediction rather than a wrong reuse.
+    # nothing, and costs one fresh prediction rather than a wrong reuse. Nor
+    # does one whose fill mask was made under an earlier FILL_RULE: its
+    # `_fill.npy` may be the empty mask of review 2's I6, and the reuse would
+    # carry it into every later build of the session.
     return {int(r["ki"]): (r["kid"], r["image_sha1"])
             for r in cached.get("records") or []
             if isinstance(r, dict) and r.get("kid") and r.get("ki") is not None
-            and r.get("image_sha1")}
+            and r.get("image_sha1") and r.get("fill_rule") == FILL_RULE}
 
 
 def run_fuse_stage(
