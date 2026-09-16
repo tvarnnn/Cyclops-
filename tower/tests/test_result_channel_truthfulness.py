@@ -486,7 +486,15 @@ def test_keyframe_imagery_is_reported_present_but_never_fetchable(
     # What the SESSION recorded, not a constant. Keyframes are now
     # face-redacted before they are written, and a hardcoded "none" here
     # survived that change for exactly as long as it took someone to look.
-    assert images["redaction"] == "faces-detected-and-filled/yunet-2023mar@0.30"
+    #
+    # Compared against the redactor's OWN label rather than a literal, because
+    # the literal went stale the moment the redactor changed: the plausibility
+    # gate that removed 85% of the filled pixels also changed the label, which
+    # is exactly what naming the process in it is for.
+    from tower.world_builder.redaction import FaceRedactor
+
+    assert images["redaction"] == FaceRedactor().label
+    assert images["redaction"].startswith("faces-detected-and-filled/yunet-")
     assert images["fetchable"] is False
     assert "id" not in images and "url" not in images
     # Unfetchable REGARDLESS. A best-effort filter with measured false

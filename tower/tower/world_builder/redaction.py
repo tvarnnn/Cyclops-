@@ -125,6 +125,99 @@ FILL_VALUE = 0
 # 1439 -> 1437, keyframes 5 -> 5, points 1634 -> 1627.
 JPEG_QUALITY = 90
 
+# WHAT THE DETECTOR FIRES ON WHEN THERE IS NO FACE, AND WHAT TO DO ABOUT IT
+# ------------------------------------------------------------------------
+# The claim above -- "0 false positives on 40 face-free frames" -- was measured
+# on SYNTHETIC room renders. On a real capture it does not hold, and the gap is
+# not marginal. Re-measured on the canonical world's 398 raw source frames
+# (`Glasses-scratch/wb-final-recon/redaction/`):
+#
+#     240 detections at 0.30, of which 20 are a face. Precision 8.3%.
+#     81 are the wearer's own HAND holding a phone or on a keyboard.
+#     135 are scene: a printed cup logo, a lit PC case, bare wall, carpet,
+#     a doorway, a pile of laundry, a desk edge.
+#     12.6% of every pixel in the capture was filled; 92 frames lost more
+#     than 20% of themselves, 38 more than 50%, the worst 93.8%.
+#
+# The 20 true positives are a printed portrait of a man hanging on the bedroom
+# wall. There is no live face anywhere in the 398 keyframes, and none in the
+# 53 841 frames of the whole capture corpus either.
+#
+# THE OBVIOUS FIX IS THE WRONG ONE. "A face has texture, a blank wall does not,
+# so reject low-contrast detections" inverts the data here: the real faces are
+# the LOW-contrast detections (median within-box contrast 12.2) and the false
+# ones are the high-contrast ones (hand 36.3, scene 30.9). AUC 0.096 -- that
+# test is a better than 9-to-1 detector of the wrong class. Raising CONFIDENCE
+# is nearly as bad: 0.35 already costs two of the twenty true positives and
+# 0.40 costs four, because a small, dim, real face scores no better than a cup.
+#
+# What does separate them is three things the detector already knows, or can
+# be asked again cheaply.
+
+# 1. THE FIVE LANDMARKS HAVE TO LIE LIKE A FACE.
+#
+# YuNet returns the two eyes, the nose and the two mouth corners with every
+# box, at no extra cost, and on a false positive they are usually nonsense --
+# a nose 6.5 eye-separations off the midline, a mouth above the eyes. Measured
+# over the 20 in-situ faces and 517 composited real faces, and widened, because
+# 100 frontal LFW faces and one portrait are a floor on the real spread and not
+# a description of it. Each band is (min, max); all five must hold.
+#
+# These are ratios of landmark distances, so they do not move with exposure,
+# resolution or the DAT ladder, and because the vertical ones are measured
+# along the eye line's own perpendicular, head ROLL is free.
+EYE_SEPARATION_BAND = (0.15, 0.62)      # over box width; faces 0.186..0.535
+MAX_NOSE_OFFSET = 0.80                  # over eye sep; faces 0.000..0.647
+EYE_TO_NOSE_BAND = (0.25, 1.60)         # over eye sep; faces 0.361..1.279
+NOSE_TO_MOUTH_BAND = (0.20, 1.90)       # over eye sep; faces 0.299..1.557
+MOUTH_TO_EYE_BAND = (0.40, 1.25)        # mouth width over eye sep
+
+# ...BUT ONLY WHERE IT CAN BE AFFORDED. A small detection is exempt and kept.
+#
+# The bands were set from frontal faces and one portrait; the case they cover
+# worst is a DISTANT bystander in three-quarter view, whose five landmarks YuNet
+# places least cleanly. That risk lives entirely in small boxes. The pixels the
+# test buys back live entirely in large ones: the wearer's hands are never
+# smaller than 2.68% of the frame (81 of 81, median 9.05%). Measured over the
+# 398 raw frames, exempting everything under 2% leaves the filled fraction at
+# 1.83% -- unchanged to two decimals -- recovers the same 12 of 13 fill-caused
+# refusals, and lets back exactly ONE extra false positive. At 2% a face is
+# about 65 px wide, roughly a metre from the lens; 95% of the 73 real faces
+# measured (portrait and live) are smaller, so they never meet the landmark
+# test at all. 3% would start exempting hands.
+LANDMARK_TEST_ABOVE_AREA = 0.02
+
+# 2. A FACE DOES NOT COVER THE FRAME.
+#
+# The largest raw box among 840 composited faces is 30.1% of the frame and the
+# 95th percentile is 19.9% -- that is a face about 20 cm from the lens, which
+# is already closer than a person stands. The largest false box is 47.8%, and
+# after HEAD_DILATION it took 93.8% of a frame whose content is a wall, a PC
+# tower and carpet. The cap is set at 25% so that it is above every composited
+# face, not at the tightest value that would have helped this capture.
+MAX_BOX_AREA_FRACTION = 0.25
+
+# 3. A BIG CLAIM ON THE FRAME HAS TO SURVIVE BEING LOOKED AT AGAIN, SMALLER.
+#
+# Detecting the same frame at UPSCALE 1 instead of 2 keeps 80% of the in-situ
+# faces and 88.9% of the composited ones, but only 23.7% of the scene false
+# positives: a real face is an object and survives resampling, a coincidence
+# of a few pixels does not. Applied to everything it would cost real recall on
+# SMALL faces (20% survive at 24 px wide, 80% at 35 px) -- which is exactly
+# what UPSCALE 2 exists to find. So it is applied only where the detection is
+# big enough that losing it cannot be a distant bystander AND big enough to
+# matter for the pixels: at 5% of the frame a face is ~95 px wide, and every
+# composited face at or above that width survived the second look.
+#
+# The second pass runs at UPSCALE 1, costs about a quarter of the first, and
+# only runs at all when a large detection survived the first two tests.
+CORROBORATE_ABOVE_AREA = 0.05
+CORROBORATION_IOU = 0.30
+
+# Named in the session label, so a reader of an old world can tell which
+# imagery went through the gate and which predates it.
+PLAUSIBILITY_ID = "plausibility1"
+
 MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 
 # WHERE THE WEIGHTS ARE, INDEPENDENTLY OF WHERE THE PROCESS WAS STARTED.
@@ -148,6 +241,96 @@ _CWD_MODEL_PATH = Path("models") / MODEL_FILENAME
 
 # Kept as the name other modules and tests import.
 DEFAULT_MODEL_PATH = _PACKAGE_MODEL_PATH
+
+
+def landmark_geometry(box, landmarks) -> dict:
+    """The five landmarks as ratios, in the face's own frame.
+
+    `box` is (x, y, w, h) and `landmarks` the five (x, y) pairs YuNet returns
+    with it, in the order (right eye, left eye, nose, right mouth corner, left
+    mouth corner) -- "right" being the viewer's left.
+
+    Every quantity is a RATIO, so nothing here moves with exposure, resolution
+    or DAT's adaptive ladder. The two vertical ones are measured along the
+    perpendicular to the eye line rather than along the image's y-axis, so a
+    head tilted 45 degrees scores exactly as an upright one: roll is free, and
+    the detector is documented to hold through that much tilt.
+
+    Returns `None` for a degenerate detection -- one whose two eyes are on top
+    of each other -- which is itself a finding about the detection.
+    """
+    import numpy as np
+
+    x, y, w, h = (float(v) for v in box)
+    pts = np.asarray(landmarks, dtype=float).reshape(5, 2)
+    right_eye, left_eye, nose, right_mouth, left_mouth = pts
+    eye = left_eye - right_eye
+    eye_separation = float(np.hypot(*eye))
+    if eye_separation <= 1e-6 or w <= 0 or h <= 0:
+        return None
+
+    axis = eye / eye_separation
+    down = np.array([-axis[1], axis[0]])
+    if float(np.dot(down, (0.0, 1.0))) < 0:
+        down = -down
+    eye_mid = (left_eye + right_eye) / 2.0
+    mouth_mid = (right_mouth + left_mouth) / 2.0
+
+    return {
+        "eye_separation": eye_separation / w,
+        "nose_offset": abs(float(np.dot(nose - eye_mid, axis))) / eye_separation,
+        "eye_to_nose": float(np.dot(nose - eye_mid, down)) / eye_separation,
+        "nose_to_mouth": float(np.dot(mouth_mid - nose, down)) / eye_separation,
+        "mouth_to_eye": float(np.hypot(*(left_mouth - right_mouth)))
+        / eye_separation,
+    }
+
+
+def landmarks_are_facelike(box, landmarks) -> bool:
+    """Do the five landmarks lie the way a face's do?
+
+    This is the cheapest of the three tests and the one that removes the
+    wearer's own hands, which are the largest single class of false positive
+    on this corpus: a hand holding a phone puts YuNet's "nose" a median 0.89
+    eye-separations off the midline against 0.14 for a real face, and its
+    "mouth" 1.40 below the nose against 0.60.
+    """
+    g = landmark_geometry(box, landmarks)
+    if g is None:
+        return False
+    lo, hi = EYE_SEPARATION_BAND
+    if not lo <= g["eye_separation"] <= hi:
+        return False
+    if g["nose_offset"] > MAX_NOSE_OFFSET:
+        return False
+    lo, hi = EYE_TO_NOSE_BAND
+    if not lo <= g["eye_to_nose"] <= hi:
+        return False
+    lo, hi = NOSE_TO_MOUTH_BAND
+    if not lo <= g["nose_to_mouth"] <= hi:
+        return False
+    lo, hi = MOUTH_TO_EYE_BAND
+    if not lo <= g["mouth_to_eye"] <= hi:
+        return False
+    return True
+
+
+def box_area_fraction(box, frame_shape) -> float:
+    """The raw detection's area as a fraction of the frame, before dilation."""
+    height, width = frame_shape[:2]
+    if height <= 0 or width <= 0:
+        return 0.0
+    return (float(box[2]) * float(box[3])) / float(width * height)
+
+
+def _iou(a, b) -> float:
+    ax0, ay0, ax1, ay1 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    bx0, by0, bx1, by1 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0)) * max(
+        0.0, min(ay1, by1) - max(ay0, by0)
+    )
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -221,13 +404,21 @@ class FaceRedactor:
     def label(self) -> str:
         """The value a session records for imagery this redactor wrote.
 
-        Names the detector and its threshold rather than asserting an
-        outcome. "redacted" alone would invite a reader to infer
-        completeness the detector cannot support.
+        Names the detector, its threshold AND the plausibility gate rather
+        than asserting an outcome. "redacted" alone would invite a reader to
+        infer completeness the detector cannot support.
+
+        The gate is in the label because it changes what was filled. A reader
+        who saw only `yunet-2023mar@0.30` would look up that detector's recall
+        and over-estimate this imagery; the suffix tells them a filter ran
+        after it, and which one.
         """
         if not self.available:
             return REDACTION_NONE
-        return f"faces-detected-and-filled/{DETECTOR_ID}@{CONFIDENCE:.2f}"
+        return (
+            f"faces-detected-and-filled/{DETECTOR_ID}@{CONFIDENCE:.2f}"
+            f"+{PLAUSIBILITY_ID}"
+        )
 
     def redact(self, image_bytes: bytes) -> RedactionResult:
         """Fill every detected face. Returns the ORIGINAL bytes on failure.
@@ -291,36 +482,107 @@ class FaceRedactor:
             image_bytes=encoded.tobytes(), label=self.label, regions=len(boxes)
         )
 
-    def _detect(self, image) -> list:
+    def _raw_detect(self, image, upscale: int) -> list:
+        """(box, landmarks) pairs in ORIGINAL image coordinates.
+
+        The upscale is a parameter because the corroboration pass below looks
+        at the same frame at a different one, and both have to come back in
+        the same coordinates to be compared.
+        """
         import cv2
 
         height, width = image.shape[:2]
-        scaled = cv2.resize(
-            image,
-            (width * UPSCALE, height * UPSCALE),
-            interpolation=cv2.INTER_CUBIC,
-        )
+        if upscale == 1:
+            scaled = image
+        else:
+            scaled = cv2.resize(
+                image,
+                (width * upscale, height * upscale),
+                interpolation=cv2.INTER_CUBIC,
+            )
         size = (scaled.shape[1], scaled.shape[0])
+        # One detector, re-targeted. Building a second one per frame was
+        # measured at 8 ms and this runs on every keyframe.
         if self._detector is None:
             self._detector = cv2.FaceDetectorYN.create(
                 str(self._path), "", size, CONFIDENCE, NMS_THRESHOLD, TOP_K
             )
             self._size = size
         elif size != self._size:
-            # DAT's adaptive ladder can change resolution mid-stream.
+            # DAT's adaptive ladder can change resolution mid-stream, and the
+            # corroboration pass changes it deliberately.
             self._detector.setInputSize(size)
             self._size = size
 
         _, faces = self._detector.detect(scaled)
         if faces is None:
             return []
+        out = []
+        for face in faces:
+            box = tuple(float(v) / upscale for v in face[:4])
+            landmarks = [float(v) / upscale for v in face[4:14]]
+            out.append((box, landmarks))
+        return out
+
+    def _detect(self, image) -> list:
+        """The boxes to fill: detected, judged plausible, then dilated.
+
+        Order matters. The plausibility tests run on the RAW box, because the
+        head dilation is a deliberate over-reach and a test applied after it
+        would be measuring the over-reach rather than the detection.
+        """
+        kept = []
+        for box, landmarks in self._raw_detect(image, UPSCALE):
+            area = box_area_fraction(box, image.shape)
+            if (area >= LANDMARK_TEST_ABOVE_AREA
+                    and not landmarks_are_facelike(box, landmarks)):
+                continue
+            if area > MAX_BOX_AREA_FRACTION:
+                continue
+            kept.append(box)
+        if not kept:
+            return []
+
+        if any(box_area_fraction(b, image.shape) >= CORROBORATE_ABOVE_AREA
+               for b in kept):
+            kept = self._corroborate(image, kept)
 
         boxes = []
-        for face in faces:
-            x, y, w, h = (float(value) / UPSCALE for value in face[:4])
+        for x, y, w, h in kept:
             # Dilate about the centre: a face box is not a head.
             cx, cy = x + w / 2.0, y + h / 2.0
             w *= HEAD_DILATION
             h *= HEAD_DILATION
             boxes.append((cx - w / 2.0, cy - h / 2.0, w, h))
         return boxes
+
+    def _corroborate(self, image, kept: list) -> list:
+        """Ask again at native resolution about the boxes claiming the frame.
+
+        FAILS TOWARDS FILLING. If the second pass cannot be run at all -- a
+        detector that throws, a resize that fails -- every box is kept. The
+        cost of an unnecessary fill is pixels; the cost of a skipped one is a
+        face on disk, and those are not the same kind of mistake.
+        """
+        try:
+            # This leaves the detector sized for the native frame; the next
+            # call at UPSCALE sees a size change and re-targets, which is the
+            # same path DAT's ladder already takes.
+            second = self._raw_detect(image, 1)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Tower][Redaction] corroboration pass failed; keeping every "
+                "detection"
+            )
+            return kept
+
+        survivors = []
+        for box in kept:
+            if box_area_fraction(box, image.shape) < CORROBORATE_ABOVE_AREA:
+                # Small enough that it could be a distant bystander, which is
+                # precisely what the second look is bad at seeing. Exempt.
+                survivors.append(box)
+                continue
+            if any(_iou(box, other) >= CORROBORATION_IOU for other, _ in second):
+                survivors.append(box)
+        return survivors
