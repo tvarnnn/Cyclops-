@@ -189,3 +189,96 @@ class TestANearGhostIsNotEmitted:
         assert ghost.sum() > 0, "the fixture did not produce a near ghost to remove"
         assert not (ghost & keep).any(), (
             f"{int((ghost & keep).sum())} faces of a thing five frames saw through survived")
+
+
+class TestTheContradictionTestIsARatio:
+    """Review 2, S2. The contract said a hand other frames saw through "does not
+    survive". The rule is `through >= contradiction_ratio x support`, and
+    consecutive keyframes often hold the same hand. Pinned both ways so the
+    contract's wording cannot drift from it again."""
+
+    SLAB = ((-0.06, -0.06, -0.52), (0.06, 0.06, -0.48))
+
+    def _hand(self, n_saw, n_through):
+        views = [(np.array([dx, 0.0, -1.0]), np.array([dx, 0.0, 5.0]), self.SLAB)
+                 for dx in (0.0, 0.02, -0.02)[:n_saw]]
+        views += [(np.array([dx, dy, -2.0]), np.array([dx, dy, 5.0]), None)
+                  for dx, dy in ((0, 0), (0.01, 0), (0, 0.01), (-0.01, 0),
+                                 (0, -0.01))[:n_through]]
+        V, F, keep, stats = TestANearGhostIsNotEmitted()._extract(views)
+        hand = TestANearGhostIsNotEmitted._in(V, F, self.SLAB)
+        assert hand.sum() > 0, "the fixture did not produce the near thing"
+        return float(keep[hand].mean())
+
+    def test_two_that_saw_it_against_four_that_saw_past_it_is_removed(self):
+        assert self._hand(2, 4) == 0.0
+
+    def test_three_that_saw_it_against_five_that_saw_past_it_stays(self):
+        # 5 < 2 x 3: the documented limit of the rule, not a wish.
+        assert self._hand(3, 5) > 0.9
+
+
+class TestASurfaceIsKeptOnlyFromItsFront:
+    """Review 2, S5. `drop_back_facing` took the shipped canonical area seen from
+    behind from 18% to 0.6%, and no test failed with it switched off."""
+
+    @staticmethod
+    def _wall_views():
+        return [(np.array([dx, dy, -1.0]), np.array([dx, dy, 5.0]), None)
+                for dx, dy in ((0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25))]
+
+    def _filter(self, V, F, **kw):
+        import torch
+
+        tv, K = _views_tensors(self._wall_views())
+        voxel = 0.02
+        params = S.SurfaceParams(**kw)
+        return S.evidence_filter(np.asarray(V, np.float32), np.asarray(F), tv, K,
+                                 lambda d: torch.full_like(d, 3 * voxel), params,
+                                 torch.device("cpu"))
+
+    def test_a_face_every_supporting_camera_sees_from_behind_is_removed(self):
+        s = 0.05
+        # Two triangles on the measured wall, the same place, opposite windings.
+        # The one whose normal points at the cameras (-z) is the wall's front.
+        V = [(-s, -s, ROOM), (s, -s, ROOM), (-s, s, ROOM),
+             (-s, -s, ROOM), (-s, s, ROOM), (s, -s, ROOM)]
+        F = [(0, 1, 2), (3, 4, 5)]
+        n0 = np.cross(np.subtract(V[1], V[0]), np.subtract(V[2], V[0]))
+        n1 = np.cross(np.subtract(V[4], V[3]), np.subtract(V[5], V[3]))
+        assert n0[2] > 0 > n1[2], "fixture: face 0 faces away from the cameras"
+
+        keep, stats = self._filter(V, F)
+        assert list(keep) == [False, True], stats
+        assert stats["dropped_back_facing"] == 1
+        # and it is that rule, not the support count, that removed it
+        keep_off, _ = self._filter(V, F, drop_back_facing=False)
+        assert list(keep_off) == [True, True]
+
+    def test_a_thin_board_seen_from_both_sides_keeps_both_faces(self):
+        import torch
+
+        from tests.test_world_builder_surface import _fuse
+
+        voxel = 0.01
+        thick = 2 * voxel
+        board = ((-0.5, -0.5, 0.0), (0.5, 0.5, thick))
+        offs = ((0, 0), (0.05, 0), (0, 0.05), (-0.05, -0.03))
+        views = [(np.array([dx, dy, -1.2]), np.array([dx, dy, 5.0]), board) for dx, dy in offs]
+        views += [(np.array([dx, dy, 1.2]), np.array([dx, dy, -5.0]), board) for dx, dy in offs]
+        params = S.SurfaceParams()
+        vol = _fuse(views, voxel=voxel, trunc=params.trunc_voxels * voxel, params=params)
+        V, F, _C = vol.extract_mesh(params.min_weight)
+        V, F, _C, _ = S.weld_mesh(V, F, _C, voxel * 1e-3)
+        tv, K = _views_tensors(views)
+        keep, stats = S.evidence_filter(V, F, tv, K, vol.trunc_at, params,
+                                        torch.device("cpu"))
+        c = V[F].mean(axis=1)
+        centre = ((np.abs(c[:, 0]) < 0.3) & (np.abs(c[:, 1]) < 0.3)
+                  & (np.abs(c[:, 2] - thick / 2) < 0.1))
+        n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+        toward_minus = centre & (n[:, 2] < 0)
+        toward_plus = centre & (n[:, 2] > 0)
+        assert toward_minus.sum() > 100 and toward_plus.sum() > 100, "fixture"
+        assert keep[toward_minus].mean() > 0.9, stats
+        assert keep[toward_plus].mean() > 0.9, stats

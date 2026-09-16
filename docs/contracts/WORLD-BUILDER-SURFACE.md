@@ -53,11 +53,20 @@ about where geometry comes from.
 3. **Free space was counted along the whole ray.** Where a camera measured
    depth `d`, everything nearer than `d` was recorded as empty: blended into
    the field within `max_carve_voxels` in front of that surface, and counted
-   per face along the entire ray (claim 1). A thing near the camera that
-   other frames saw straight through -- a hand, the wearer's lap -- does not
-   survive. On the canonical capture the faces within 0.5 units of the walked
-   path went from 2,330 (all contradicted) to 0. A thing that moved but that
-   no other frame looked through is not detected.
+   per face along the entire ray (claim 1).
+
+   **What that removes is a ratio, not every hand.** A face is removed when
+   the frames that saw past it number at least `contradiction_ratio` (2)
+   times the frames that measured it: `through >= 2 x support`. A thing near
+   the camera -- a hand, the wearer's lap -- is removed only when that holds.
+   Consecutive keyframes often hold the same hand, so a hand that 3 frames
+   measured and 5 saw past (5 < 6) **survives**. So does a hand that no other
+   frame looked through. The rule also cannot tell "saw past it" from "could
+   not resolve it": a thin structure that close frames measured and distant
+   frames smoothed into the background can be removed.
+
+   One measurement, not a property: on the canonical capture, the faces within
+   0.5 units of the walked path went from 2,330 (all contradicted) to 0.
 4. **The coordinate frame is the solve's**, identical to
    `solve/<session>/solution.json`: world-to-camera poses, `x_cam = R·X + t`,
    OpenCV axes with y down. It is NOT the frame `world.json`'s

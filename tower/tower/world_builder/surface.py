@@ -17,8 +17,11 @@ answer. Three things follow:
     instead of being adjudicated per point.
   * Free space is evidence too. A camera measuring depth d along a ray has also
     measured that everything nearer than d is empty. Carving that emptiness
-    removes flying pixels, floaters, and anything that moved between frames --
-    a hand, a pet -- because a later view sees through where it was.
+    removes flying pixels and floaters, and `evidence_filter` removes a thing
+    that moved between frames -- a hand, a pet -- WHEN the views that saw
+    through where it was outnumber the views that measured it by
+    `contradiction_ratio` (2:1). One held through three frames and looked past
+    by five stays.
 
 What this deliberately does NOT do is close holes. Space no camera measured
 keeps zero weight and emits no triangle; the surface stops at the edge of what
@@ -218,10 +221,16 @@ class SurfaceParams:
 
     max_near_boost: float = 4.0
     """Ceiling on the falloff's weight for a pixel NEARER than its frame's
-    median depth. It was 4.0, and a pixel at half its frame's median depth --
-    a hand, a lap, the edge of the desk under the glasses -- then counted as
-    four pixels, so one close frame at a good angle reached `min_weight` on
-    its own. Near is where glasses see the wearer; it earns no extra vote."""
+    median depth. At 4.0 a pixel at half its frame's median depth -- a hand, a
+    lap, the edge of the desk under the glasses -- counts as four pixels, so
+    one close frame at a good angle CAN reach `min_weight` on its own. That is
+    not what stops a one-frame surface: `min_support_frames` is, per face, as a
+    count of distinct frames.
+
+    Clamping this at 1 was measured and rejected (surface-r2): it removed 16%
+    of the surface area, all of it supported by at least two frames and not
+    contradicted -- the bed sheet and pieces of floor -- and removed no face
+    near the walked path that the frame count had not already removed."""
 
     drop_back_facing: bool = True
     """Remove a face whose normal points away from EVERY frame that supports
@@ -243,7 +252,13 @@ class SurfaceParams:
     space into the field only within `max_carve_voxels` of each frame's own
     surface, so a hand half a metre from the camera was never carved by the
     frames that looked past it at a wall three metres away; the count sees the
-    whole ray. 0 disables the test."""
+    whole ray. 0 disables the test.
+
+    It is a RATIO, so it does not remove every hand: one that 3 frames measured
+    and 5 saw past (5 < 2 x 3) stays, and consecutive keyframes often hold the
+    same hand. Nor can it tell a frame that saw past a thing from one that
+    could not resolve it: a thin pole two near frames measured is removed if
+    four distant frames smoothed it into the wall behind."""
 
     # -- surface cleanup ----------------------------------------------------
     min_component_frac: float = 0.0001
@@ -1433,6 +1448,9 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     that look straight past it at the room. On the canonical capture every
     face within 0.5 units of the walked path was contradicted 2:1 and all of
     them survived fusion.
+
+    The contradiction test is the ratio above and nothing stronger: a near
+    thing measured by more than half as many frames as saw past it stays.
 
     Returns (keep mask over faces, stats).
     """

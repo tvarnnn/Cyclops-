@@ -158,7 +158,10 @@ def _params(**kw):
     `min_support_frames=1` because this fixture's eight cameras look OUTWARD
     from the centre with a 30-degree field, so every wall patch is measured by
     exactly one frame by construction. The two-frame rule is tested on
-    fixtures built to have overlap (`TestEvidenceIsCountedByFrame`)."""
+    fixtures built to have overlap, in `test_world_builder_surface_evidence.py`:
+    `TestANearGhostIsNotEmitted`, `TestTheContradictionTestIsARatio`,
+    `TestASurfaceIsKeptOnlyFromItsFront`, and through `surfacify` at the
+    default count in `TestAFarMeasuredWallIsKept`."""
     base = dict(voxel_frac=0.02, lod_face_targets=(0, 1500), canonical_level=0,
                 mobile_level=1, smooth_iterations=2, min_weight=0.5,
                 min_component_frac=0.0, min_support_frames=1)
