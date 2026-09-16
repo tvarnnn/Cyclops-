@@ -4476,11 +4476,14 @@ final class WorldRenderRevisionTests: XCTestCase {
         WorldRenderClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession())
     }
 
-    private func page(_ rung: String, _ revision: String) -> String {
+    /// A page of `rung` stamped `revision`. Its body differs per revision
+    /// unless `body` is given, as two real builds' pages do: pages that differ
+    /// ONLY in the stamp are the same picture (review 3, iOS MINOR-3).
+    private func page(_ rung: String, _ revision: String, body: String? = nil) -> String {
         "<!doctype html><html><head><meta charset=\"utf-8\">"
             + "<meta name=\"wb-representation\" content=\"\(rung)\">"
             + "<meta name=\"wb-revision\" content=\"\(revision)\">"
-            + "</head><body></body></html>"
+            + "</head><body>\(body ?? revision)</body></html>"
     }
 
     /// The §4a body. `live` defaults to true so a test's polls stay at the
@@ -4488,6 +4491,14 @@ final class WorldRenderRevisionTests: XCTestCase {
     private func revisionBody(_ rung: String, _ revision: String, live: Bool = true) -> String {
         "{\"session_id\": \"s1\", \"representation\": \"\(rung)\", "
             + "\"revision\": \"\(revision)\", \"live\": \(live)}"
+    }
+
+    /// A page as the Tower composes it when it could not read the manifest:
+    /// its rung, and no `wb-revision` (§4a rule 7).
+    private func unstampedPage(_ rung: String) -> String {
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<meta name=\"wb-representation\" content=\"\(rung)\">"
+            + "</head><body></body></html>"
     }
 
     private func waitUntil(timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool) async -> Bool {
@@ -4526,14 +4537,14 @@ final class WorldRenderRevisionTests: XCTestCase {
     }
 
     private func readyModel(
-        page html: String, revision: String, view: WorldRenderView = .product
+        page html: String, revision: String, view: WorldRenderView = .product, sessionID: String? = "s1"
     ) async -> WorldRenderViewerModel {
         StubbedGeometryProtocol.reset(routes: [
             Self.pagePath: (200, html),
             Self.revisionPath: (200, revision),
         ])
         let model = WorldRenderViewerModel(
-            target: WorldRenderTarget(worldID: "w1", sessionID: "s1", view: view), client: client())
+            target: WorldRenderTarget(worldID: "w1", sessionID: sessionID, view: view), client: client())
         model.revisionPollInterval = .milliseconds(20)
         await model.load()
         model.pageEvent(.rendered)
@@ -4584,7 +4595,8 @@ final class WorldRenderRevisionTests: XCTestCase {
     func testTheFinishedSurfaceReplacesTheLiveOneWithoutAsking() {
         func swaps(_ shown: WorldRenderRepresentation?, _ rung: WorldRenderRepresentation?, live: Bool?) -> Bool {
             WorldRenderViewerModel.swapsBySelf(
-                shown: shown, latest: WorldRenderRevision(revision: "s1/x", representation: rung, live: live))
+                shown: shown, latest: WorldRenderRevision(revision: "s1/x", representation: rung, live: live),
+                sameWalk: true)
         }
         XCTAssertTrue(swaps(.surface, .surface, live: false), "the final build after Stop is shown, not offered")
         XCTAssertFalse(swaps(.surface, .surface, live: true), "a live rebuild is offered")
@@ -4593,16 +4605,29 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertFalse(swaps(.surface, .sparse, live: false), "a finished build never downgrades the picture")
     }
 
-    /// Review 2, iOS m5(b). With no session in the target the Tower answers the
-    /// newest session with geometry, so a same-rung revision while nothing is
-    /// building can be another walk's world.
-    func testAFinishedBuildIsSwappedInByItselfOnlyForANamedSession() {
+    /// Review 2, iOS m5(b), and review 3, iOS MINOR-4. With no session in the
+    /// target the Tower answers the newest session with geometry, so a new
+    /// revision -- finished build or better rung -- can be another walk's world.
+    func testNothingFromAnotherWalkIsSwappedInByItself() {
         let finished = WorldRenderRevision(revision: "s2/surface:1", representation: .surface, live: false)
-        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sessionNamed: true))
-        XCTAssertFalse(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sessionNamed: false))
+        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sameWalk: true))
+        XCTAssertFalse(WorldRenderViewerModel.swapsBySelf(shown: .surface, latest: finished, sameWalk: false))
         let better = WorldRenderRevision(revision: "s2/surface:1", representation: .surface, live: true)
-        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .sparse, latest: better, sessionNamed: false),
-                      "a better rung is still swapped in")
+        XCTAssertTrue(WorldRenderViewerModel.swapsBySelf(shown: .sparse, latest: better, sameWalk: true))
+        XCTAssertFalse(WorldRenderViewerModel.swapsBySelf(shown: .sparse, latest: better, sameWalk: false),
+                       "a better rung of another walk is offered, not swapped in")
+    }
+
+    func testARevisionNamesItsSessionAndAStampIsNotPartOfThePicture() {
+        XCTAssertEqual(WorldRenderRepresentation.session(of: "s1/surface:2"), "s1")
+        XCTAssertNil(WorldRenderRepresentation.session(of: "sparse"))
+        XCTAssertNil(WorldRenderRepresentation.session(of: nil))
+        XCTAssertEqual(WorldRenderRepresentation.withoutRevisionStamp(page("surface", "s1/surface:2", body: "")),
+                       unstampedPage("surface"))
+        XCTAssertEqual(WorldRenderRepresentation.withoutRevisionStamp(unstampedPage("surface")),
+                       unstampedPage("surface"))
+        XCTAssertNotEqual(WorldRenderRepresentation.withoutRevisionStamp(page("surface", "s1/surface:2", body: "")),
+                          unstampedPage("dense"))
     }
 
     func testTheFollowerSlowsDownOnlyWhileNothingIsBuilding() {
@@ -4803,6 +4828,134 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertFalse(model.newerPictureAvailable, "a downgrade was offered as newer")
         XCTAssertEqual(model.state, .ready(html: shown))
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1)
+    }
+
+    /// Review 3, R2. A rebuild of the rung already on screen that fails to draw
+    /// is memory pressure, not a rung too large for this phone -- that rung drew
+    /// here. Two such failures refused the rung for the life of the screen, and
+    /// the finished world after Stop was then silently marked handled.
+    func testFailuresOfTheRungOnScreenDoNotRefuseIt() async {
+        let shown = page("surface", "s1/surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "s1/surface:1"))
+        let follow = Task { await model.followRevisions() }
+
+        for build in 2...3 {
+            StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:\(build)")))
+            StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:\(build)")))
+            let offered = await waitUntil { model.newerPictureAvailable }
+            XCTAssertTrue(offered, "live build \(build) was never offered")
+            await model.showNewerPicture()
+            XCTAssertEqual(model.state, .rendering(html: page("surface", "s1/surface:\(build)")))
+            model.pageEvent(.gaveUpAfterTerminations(3))
+            model.pageEvent(.rendered)
+            XCTAssertEqual(model.state, .ready(html: shown))
+            XCTAssertTrue(model.newerPictureRefused, "a reverted refresh offers Try again")
+        }
+
+        let finished = page("surface", "s1/surface:4")
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, finished))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:4", live: false)))
+        let swapped = await waitUntil { model.state == .rendering(html: finished) }
+        await stop(follow)
+        XCTAssertTrue(swapped, "the finished surface after Stop was hidden by two failed live rebuilds")
+        model.pageEvent(.rendered)
+        XCTAssertFalse(model.newerPictureRefused, "a refresh that drew clears the Try again")
+    }
+
+    /// Review 3, R2. A rung this phone refused still gets ONE try when the
+    /// Tower says the build is finished, and only one; "Try again" forgets it.
+    func testTheFinishedBuildOfARefusedRungIsTriedOnceAndTryAgainLiftsTheRefusal() async {
+        let shown = page("sparse", "s1/sparse")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "s1/surface:2"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:2")))
+        let follow = Task { await model.followRevisions() }
+
+        for build in 2...4 {
+            let live = build < 4
+            if build > 2 {
+                StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:\(build)")))
+                StubbedGeometryProtocol.set(
+                    route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:\(build)", live: live)))
+            }
+            let swapped = await waitUntil { model.state == .rendering(html: page("surface", "s1/surface:\(build)")) }
+            XCTAssertTrue(swapped, "build \(build) was never tried")
+            model.pageEvent(.gaveUpAfterTerminations(3))
+            model.pageEvent(.rendered)
+            XCTAssertEqual(model.state, .ready(html: shown))
+        }
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 4,
+                       "load(), two live builds, and one try of the finished build")
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:5")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:5", live: false)))
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
+        await stop(follow)
+        XCTAssertTrue(pollsLater)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 4, "a second finished build was downloaded")
+        XCTAssertTrue(model.newerPictureRefused, "the reader is offered Try again on the ready screen")
+
+        await model.load()
+        XCTAssertFalse(model.newerPictureRefused)
+        XCTAssertEqual(model.state, .rendering(html: page("surface", "s1/surface:5")))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 5)
+    }
+
+    /// Review 3, iOS MINOR-2. The offer was made while the Tower served a
+    /// surface; by the tap it serves points. The page decides, not the offer.
+    func testTappingAnOfferNeverSwapsInAWorseRung() async {
+        let shown = page("surface", "s1/surface:1")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "s1/surface:1"))
+        let follow = Task { await model.followRevisions() }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:2")))
+        let offered = await waitUntil { model.newerPictureAvailable }
+        await stop(follow)
+        XCTAssertTrue(offered)
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("sparse", "s1/sparse")))
+        await model.showNewerPicture()
+        XCTAssertEqual(model.state, .ready(html: shown), "a tap replaced a surface with points")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2)
+    }
+
+    /// Review 3, iOS MINOR-3. A page composed while the Tower could not read the
+    /// manifest has no stamp; the same page fetched again has one. It is the
+    /// same picture and must not be swapped in over itself.
+    func testAPageThatOnlyGainedItsStampIsNotSwappedIn() async {
+        let shown = unstampedPage("surface")
+        let model = await readyModel(page: shown, revision: revisionBody("surface", "s1/surface:1", live: false))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:1", body: "")))
+        let follow = Task { await model.followRevisions() }
+        let fetched = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.pagePath) >= 2 }
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 4 }
+        await stop(follow)
+        XCTAssertTrue(fetched, "fixture: the unstamped page's first poll was not acted on")
+        XCTAssertTrue(pollsLater)
+        XCTAssertEqual(model.state, .ready(html: shown), "an identical mesh was swapped in over itself")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2, "one fetch, not one per poll")
+    }
+
+    /// Review 3, iOS MINOR-4 and T-1, through the follower rather than the pure
+    /// function: with no session named, a better rung from ANOTHER walk is
+    /// offered, while the walk on screen still swaps by itself.
+    func testWithNoSessionNamedOnlyTheWalkOnScreenSwapsBySelf() async {
+        let shown = page("sparse", "s1/sparse")
+        let model = await readyModel(page: shown, revision: revisionBody("sparse", "s1/sparse"), sessionID: nil)
+        let follow = Task { await model.followRevisions() }
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s2/surface:1")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s2/surface:1", live: false)))
+        let offered = await waitUntil { model.newerPictureAvailable }
+        XCTAssertTrue(offered, "another walk's surface was not offered")
+        XCTAssertEqual(model.state, .ready(html: shown), "another walk's surface replaced the world by itself")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1)
+
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, page("surface", "s1/surface:1")))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:1", live: false)))
+        let swapped = await waitUntil { model.state == .rendering(html: page("surface", "s1/surface:1")) }
+        await stop(follow)
+        XCTAssertTrue(swapped, "the walk on screen's own surface was not swapped in")
     }
 
     /// Review 2, iOS m6: an offer whose revision is no longer what the Tower

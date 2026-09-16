@@ -408,6 +408,30 @@ nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
         return value.isEmpty ? nil : value
     }
 
+    /// `html` with the Tower's `wb-revision` stamp taken out of its head.
+    ///
+    /// Two pages that differ only in that stamp are the same picture. A page
+    /// composed while the Tower could not read its manifest carries no stamp
+    /// (`WORLD-BUILDER-WORLDS.md` §4a rule 7), and the same page fetched a
+    /// moment later carries one -- which compared unequal, so the follower
+    /// swapped an identical mesh in, with the "Drawing" overlay and a camera
+    /// reset (review 3, iOS MINOR-3).
+    static func withoutRevisionStamp(_ html: String) -> String {
+        guard let value = meta(named: "wb-revision", in: html),
+              let range = html.prefix(4096).range(of: "<meta name=\"wb-revision\" content=\"\(value)\">")
+        else { return html }
+        var unstamped = html
+        unstamped.removeSubrange(range)
+        return unstamped
+    }
+
+    /// The session a revision names. The Tower writes every revision as
+    /// `<session>/<rung revision>` (§4a); `nil` for one with no session in it.
+    static func session(of revision: String?) -> String? {
+        guard let revision, let slash = revision.firstIndex(of: "/") else { return nil }
+        return String(revision[..<slash])
+    }
+
     /// The caption for a page of this rung, or for a page not yet known.
     ///
     /// Every variant keeps "not to scale" in it, because the one claim no rung
@@ -570,18 +594,37 @@ final class WorldRenderViewerModel: ObservableObject {
     private var handledRevision: String?
 
     /// Revisions whose page could not be drawn on this phone. Never offered or
-    /// swapped in again by the follower; only the reader's own "Try again" can
-    /// fetch one.
+    /// swapped in again by the follower; only the reader's own "Try again"
+    /// (`newerPictureRefused`, then `load()`) can fetch one.
     private var refusedRevisions: Set<String> = []
 
-    /// How many automatic refreshes of each rung failed to draw, and the rungs
-    /// that have failed twice. A rung too large for this phone used to be
-    /// refused per REVISION, so every live build of it was downloaded, killed
-    /// and reverted again (review 2, iOS m4). Twice, not once: one failure can
-    /// be memory another app was holding. Cleared by `load()`, which is also
-    /// what "Try again" does.
+    /// How many refreshes to each rung failed to draw, and the rungs that have
+    /// failed twice. A rung too large for this phone used to be refused per
+    /// REVISION, so every live build of it was downloaded, killed and reverted
+    /// again (review 2, iOS m4). Twice, not once: one failure can be memory
+    /// another app was holding.
+    ///
+    /// Only a failure to go UP a rung counts -- a page of the rung already on
+    /// screen drew on this phone, so its rebuild failing is pressure, not size
+    /// -- and a refresh of the rung that does draw forgets its failures. Both
+    /// were missing, so two transient failures in a walk refused the rung for
+    /// the life of the screen (review 3, R2). Cleared by `load()`.
     private var rungDrawFailures: [WorldRenderRepresentation: Int] = [:]
     private var refusedRungs: Set<WorldRenderRepresentation> = []
+
+    /// Refused rungs a FINISHED build (`live == false`) has already been let
+    /// through once. The finished world after Stop is the picture the walk was
+    /// for, and the capture that was competing for memory has stopped; it gets
+    /// one more try per rung, and only one, so a rung that really is too large
+    /// is not downloaded on every poll of a saved world.
+    private var finishedBuildRetried: Set<WorldRenderRepresentation> = []
+
+    /// A refresh could not be drawn and the previous page was put back. Published
+    /// so the scene can offer "Try again" (`load()`), which forgets every
+    /// refusal. A reverted screen is `.ready`, where the failure view and its
+    /// button are not shown, so without this the refusals could only be lifted
+    /// by closing the screen (review 3, R2).
+    @Published private(set) var newerPictureRefused = false
 
     /// The page that was on screen when an automatic refresh replaced it, and
     /// the revision it carried, kept until the replacement reports drawn. A
@@ -649,10 +692,16 @@ final class WorldRenderViewerModel: ObservableObject {
             )
             guard isNew else { continue }
             if let rung = latest.representation, refusedRungs.contains(rung) {
-                // This phone could not draw that rung twice; neither swapped
-                // nor offered. "Try again" still can.
-                handledRevision = latest.revision
-                continue
+                if latest.live == false, !finishedBuildRetried.contains(rung) {
+                    // The finished build gets one more try (see
+                    // `finishedBuildRetried`), and goes through every rule below.
+                    finishedBuildRetried.insert(rung)
+                } else {
+                    // This phone could not draw that rung twice; neither
+                    // swapped nor offered. "Try again" still can.
+                    handledRevision = latest.revision
+                    continue
+                }
             }
             if WorldRenderRepresentation.isUpgrade(from: latest.representation, to: state.representation) {
                 // A worse rung than the one on screen -- a surface briefly
@@ -661,9 +710,13 @@ final class WorldRenderViewerModel: ObservableObject {
                 handledRevision = latest.revision
                 continue
             }
-            if Self.swapsBySelf(
-                shown: state.representation, latest: latest, sessionNamed: target.sessionID != nil
-            ) {
+            // With no session named the Tower answers its newest session with
+            // geometry, which can be another walk; the session in the revision
+            // is what tells the two apart.
+            let sameWalk = target.sessionID != nil
+                || WorldRenderRepresentation.session(of: latest.revision)
+                    == WorldRenderRepresentation.session(of: shownRevision)
+            if Self.swapsBySelf(shown: state.representation, latest: latest, sameWalk: sameWalk) {
                 await refresh(to: latest.revision)
             } else {
                 handledRevision = latest.revision
@@ -683,21 +736,25 @@ final class WorldRenderViewerModel: ObservableObject {
     /// land on every solve and a swap resets the camera mid-look. Nothing
     /// replaces a page with a worse rung by itself.
     ///
-    /// The finished-build swap needs `sessionNamed`. With no session in the
-    /// target the Tower picks the newest session with geometry, so a same-rung
-    /// revision seen while nothing is building can be ANOTHER walk's world, and
-    /// swapping it in without asking would replace the world the reader opened
-    /// (review 2, iOS m5). It is offered instead.
+    /// Nothing swaps by itself unless `sameWalk`: the screen names its session,
+    /// or the revision names the session already on screen. With no session in
+    /// the target the Tower picks the newest session with geometry, so a new
+    /// revision -- a better rung as much as a finished build -- can be ANOTHER
+    /// walk's world, and swapping it in without asking would replace the world
+    /// the reader opened (review 2, iOS m5; review 3, iOS MINOR-4). It is
+    /// offered instead. No default: a caller that forgets to say was the
+    /// regression a review could not see (review 3, T-1).
     nonisolated static func swapsBySelf(
-        shown: WorldRenderRepresentation?, latest: WorldRenderRevision, sessionNamed: Bool = true
+        shown: WorldRenderRepresentation?, latest: WorldRenderRevision, sameWalk: Bool
     ) -> Bool {
+        guard sameWalk else { return false }
         if WorldRenderRepresentation.isUpgrade(from: shown, to: latest.representation) {
             return true
         }
         let downgrade = WorldRenderRepresentation.isUpgrade(
             from: latest.representation, to: shown
         )
-        return !downgrade && latest.live == false && sessionNamed
+        return !downgrade && latest.live == false
     }
 
     /// How long to wait before the next ask.
@@ -739,10 +796,21 @@ final class WorldRenderViewerModel: ObservableObject {
         guard !Task.isCancelled, case .ready(let current) = state else { return }
         handledRevision = revision
         let stamped = WorldRenderViewerState.ready(html: html).revision ?? revision
-        guard html != current else {
+        guard html != current,
+              WorldRenderRepresentation.withoutRevisionStamp(html)
+                != WorldRenderRepresentation.withoutRevisionStamp(current)
+        else {
+            // The same picture, possibly now carrying the stamp it lacked.
             shownRevision = stamped
             return
         }
+        // The page is what decides, not the poll that led to it. A tapped offer
+        // whose build has since become undrawable on the Tower, or a fetch that
+        // raced a manifest replace, is served a lower rung, and swapping that in
+        // replaced a surface with points (review 3, iOS MINOR-2 and e2e m4).
+        guard !WorldRenderRepresentation.isUpgrade(
+            from: WorldRenderRepresentation.declared(in: html), to: state.representation
+        ) else { return }
         guard !refusedRevisions.contains(stamped) else { return }
         // Whatever was offered is superseded by the page now on its way.
         pendingRevision = nil
@@ -765,11 +833,13 @@ final class WorldRenderViewerModel: ObservableObject {
         fallback = nil
         if let refused = shownRevision { refusedRevisions.insert(refused) }
         if let handled = handledRevision { refusedRevisions.insert(handled) }
-        if let rung = state.representation {
+        if let rung = state.representation,
+           rung != WorldRenderRepresentation.declared(in: previous.html) {
             let failures = rungDrawFailures[rung, default: 0] + 1
             rungDrawFailures[rung] = failures
             if failures >= 2 { refusedRungs.insert(rung) }
         }
+        newerPictureRefused = true
         shownRevision = previous.revision
         // A fresh kill budget for a page that already drew once on this phone.
         renderAttempt += 1
@@ -796,6 +866,8 @@ final class WorldRenderViewerModel: ObservableObject {
         handledRevision = nil
         rungDrawFailures = [:]
         refusedRungs = []
+        finishedBuildRetried = []
+        newerPictureRefused = false
         state = .fetching
         do {
             let html = try await client.page(for: target)
@@ -826,6 +898,13 @@ final class WorldRenderViewerModel: ObservableObject {
             // screen underneath a reader who has started reading the message.
             guard case .rendering(let html) = state else { return }
             state = .ready(html: html)
+            if fallback != nil, let rung = state.representation {
+                // A refresh to this rung DREW. Whatever failed it before has
+                // passed; a later failure starts counting again.
+                rungDrawFailures[rung] = nil
+                refusedRungs.remove(rung)
+                newerPictureRefused = false
+            }
             fallback = nil
         case .reloadingAfterTermination:
             // Back to a bounded wait, with the overlay over it. Truthful: the
@@ -1260,6 +1339,16 @@ struct WorldRenderScene: View {
                 }
                 .font(.caption)
                 .accessibilityIdentifier("world-render-newer-picture")
+            }
+            // After a refresh could not be drawn the old picture is back and
+            // the screen is `.ready`, so the failure view's "Try again" is not
+            // there. This is that control: `load()` forgets every refusal.
+            if model.newerPictureRefused {
+                Button("A newer reconstruction could not be drawn on this phone. Try again") {
+                    Task { await model.load() }
+                }
+                .font(.caption)
+                .accessibilityIdentifier("world-render-retry-refused")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
