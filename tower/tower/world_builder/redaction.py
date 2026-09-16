@@ -228,6 +228,41 @@ LANDMARK_TEST_ABOVE_AREA = 0.02
 LARGE_BOX_AREA_FRACTION = 0.25
 LARGE_BOX_CORROBORATION_SCALES = (1.0, 0.5, 0.25)
 
+# 2b. EXCEPT AT THE FRAME EDGE, WHERE A REAL FACE IS CUT AND LOSES THE EVIDENCE.
+#
+# The composites behind the table above were faces placed wholly inside the
+# frame. A person leaning into the wearer is usually cut by the frame edge, and
+# a cut face is exactly what YuNet sees worst at reduced resolution: the part
+# that would make it a face at 1/4 is outside the image. Review 3 pasted close
+# faces 5% off each edge: plausibility2 left 4 of 594 composites unfilled that
+# plausibility1 had filled, and on a larger held-out set (every LFW face and the
+# astronaut, 300-500 px wide, cut by each edge, 3,232 composites) it left 32.
+# On 3 of the first 4 no scale found ANY box, native included.
+#
+# So a large box within EDGE_MARGIN of the frame edge -- 5% of the short side,
+# 18 px on 360x640 -- goes back to plausibility1's rule: facelike landmarks OR
+# found again. Padding the frame before the smaller passes and low-confidence
+# re-detection were measured too, and each still lost faces the edge rule
+# fills. Measured (REDACTION.md section 14, fix-r4/r1_margin.py):
+#
+#                   raw fill  >50% frames  worst   close  off-frame lost  held-out lost
+#   plausibility1     7.51%        31      93.2%   65/65      0 / 594        0 / 3232
+#   plausibility2     2.72%         6      79.8%   65/65      4 / 594       32 / 3232
+#   edge <= 0 px      5.73%        20      93.2%   65/65      2 / 594        4 / 3232
+#   edge <= 5% (this) 5.99%        22      93.2%   65/65      0 / 594        1 / 3232
+#   edge <= 10%       7.21%        29      93.2%   65/65      0 / 594        0 / 3232
+#
+# The price is stated, not hidden: 25 of the capture's 40 false large boxes
+# touch an edge, so this gives back most of plausibility2's pixels (2.72% ->
+# 5.99%, and keyframe 188 is 93.2% black again). It is paid because the cost of
+# an unnecessary fill is pixels, and the cost of a skipped one is a face on disk.
+# 10% would recover the last held-out face (a box 23 px from the left edge whose
+# face is cut at the BOTTOM -- the box is misplaced, not truncated) at the cost of
+# almost every remaining false box, and adding a confidence-0.10 re-detection at
+# 1/2 or 1/4 recovers it at 6.58% fill and 25 frames over half black. That one
+# face is recorded as a known miss instead.
+EDGE_MARGIN = 0.05
+
 # 3. A BIG CLAIM ON THE FRAME HAS TO SURVIVE BEING LOOKED AT AGAIN, SMALLER.
 #
 # Detecting the same frame at UPSCALE 1 instead of 2 keeps 80% of the in-situ
@@ -252,7 +287,9 @@ CORROBORATION_IOU = 0.30
 #                facelike OR native-corroborated (53be0c3).
 # plausibility2: the same, except above 25% the landmarks are ignored and the
 #                box must be found again at native, 1/2 or 1/4 resolution.
-PLAUSIBILITY_ID = "plausibility2"
+# plausibility3: the same, except that a box over 25% within EDGE_MARGIN of the
+#                frame edge is filled on facelike landmarks OR being found again.
+PLAUSIBILITY_ID = "plausibility3"
 
 MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 
@@ -379,6 +416,17 @@ def box_area_fraction(box, frame_shape) -> float:
     if height <= 0 or width <= 0:
         return 0.0
     return (float(box[2]) * float(box[3])) / float(width * height)
+
+
+def box_near_frame_edge(box, frame_shape, margin: float = None) -> bool:
+    """Whether the raw box touches, crosses, or comes within `margin` (a
+    fraction of the frame's SHORT side) of any frame edge."""
+    height, width = frame_shape[:2]
+    margin = EDGE_MARGIN if margin is None else margin
+    slack = margin * min(width, height)
+    x, y, w, h = (float(v) for v in box)
+    return (x <= slack or y <= slack
+            or x + w >= width - slack or y + h >= height - slack)
 
 
 def _iou(a, b) -> float:
@@ -613,9 +661,14 @@ class FaceRedactor:
                 # nothing may be dropped on the strength of one. Fill.
                 candidates.append((box, ()))
             elif area > LARGE_BOX_AREA_FRACTION:
-                # The landmark verdict carries no evidence at this size; only
-                # being found again at some other resolution does.
-                candidates.append((box, LARGE_BOX_CORROBORATION_SCALES))
+                if verdict and box_near_frame_edge(box, image.shape):
+                    # A close face cut by the frame edge can be found at no
+                    # other scale (EDGE_MARGIN): facelike is enough here.
+                    candidates.append((box, ()))
+                else:
+                    # The landmark verdict carries no evidence at this size;
+                    # only being found again at some other resolution does.
+                    candidates.append((box, LARGE_BOX_CORROBORATION_SCALES))
             elif not verdict:
                 continue
             elif area >= CORROBORATE_ABOVE_AREA:

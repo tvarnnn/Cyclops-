@@ -315,16 +315,19 @@ calibration to 640×360 frames rather than silently scaling the world by the
 ratio.
 
 **Redaction is a process claim, never an outcome claim.** The recorded value is
-`faces-detected-and-filled/yunet-2023mar@0.30+plausibility2` for sessions
-captured with the current Tower; older sessions may record `+plausibility1`
-or no suffix (`faces-detected-and-filled/yunet-2023mar@0.30`). The suffix
-names a gate that runs on each detection before it is filled. Under
-`plausibility2`: a box under 2% of the frame is always filled; a box of 2–25%
+`faces-detected-and-filled/yunet-2023mar@0.30+plausibility3` for sessions
+captured with the current Tower; older sessions may record `+plausibility2`,
+`+plausibility1` or no suffix (`faces-detected-and-filled/yunet-2023mar@0.30`).
+The suffix names a gate that runs on each detection before it is filled. Under
+`plausibility3`: a box under 2% of the frame is always filled; a box of 2–25%
 must have facelike landmarks, and from 5% must also be found again at native
 resolution; a box over 25% must be found again at native, 1/2 or 1/4
-resolution (its landmarks carry no evidence at that size); landmarks too
-broken to judge always fill. `plausibility1` differed only above 25%, where
-facelike landmarks alone filled the box. The gate exists because on real
+resolution (its landmarks carry no evidence at that size), **except** that one
+touching or within 5% (of the frame's short side) of the frame edge is also
+filled on facelike landmarks alone, because a close face cut by the edge is
+found at no reduced scale; landmarks too broken to judge always fill.
+`plausibility2` lacked the edge exception. `plausibility1` differed above 25%
+everywhere, where facelike landmarks alone filled the box. The gate exists because on real
 captures 220 of 240 detections were not faces (hands, a cup, bare wall) and
 blacked out 12.6% of every frame; it changes what is filled, not the
 detector or its threshold. Nothing parses any of these values. Never "redacted", "anonymised"
