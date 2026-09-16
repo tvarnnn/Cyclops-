@@ -16,6 +16,7 @@ depth network and the questions are about behaviour:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -52,6 +53,7 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
     K, w, h = _camera()
     store.write_session(Session(
         session_id=SESSION, world_id=WORLD, started_at=1.0,
+        redaction="faces-detected-and-filled/yunet-2023mar@0.30+plausibility1",
         intrinsics=CameraIntrinsics(
             source="self_calibrated", model="pinhole", fx=float(K[0, 0]),
             fy=float(K[1, 1]), cx=float(K[0, 2]), cy=float(K[1, 2]),
@@ -103,8 +105,15 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
                     np.zeros(d.shape, bool))
             img = np.full((h, w, 3), 150 + 10 * (i % 3), np.uint8)
             cv2.imwrite(str(dense / "work" / "undist" / f"{i:05d}.jpg"), img)
+            # The world's own keyframe image, and the hash a prediction is
+            # bound to: a prediction is reused only for the image it came from.
+            images = store.images_dir(WORLD, SESSION)
+            images.mkdir(parents=True, exist_ok=True)
+            ok_jpg, enc = cv2.imencode(".jpg", img)
+            (images / f"{kid.rsplit(':', 1)[-1]}.jpg").write_bytes(enc.tobytes())
             records.append({"ki": i, "kid": kid, "ok": True, "a": 1.0, "b": 0.0,
-                            "held_out_rel": 0.01})
+                            "held_out_rel": 0.01,
+                            "image_sha1": hashlib.sha1(enc.tobytes()).hexdigest()})
         (dense / "align.json").write_text(json.dumps({
             "kind": "depth", "camera": camera, "backend": DenseParams().backend,
             "input_digest": digest, "records": records}))
@@ -214,9 +223,10 @@ class TestACompletedBuildIsReusedAndRebuiltExactlyWhenItShouldBe:
         SP.surfacify(store, WORLD, SESSION, params=_params())
         root = SP.surface_dir(store, WORLD, SESSION)
         first = _manifest(store)["built_at"]
-        (root / "mesh_l1.bin").unlink()
+        level1 = SP.level_file(root, _manifest(store)["levels"][1])
+        level1.unlink()
         SP.surfacify(store, WORLD, SESSION, params=_params())
-        assert (root / "mesh_l1.bin").exists()
+        assert SP.level_file_whole(root, _manifest(store)["levels"][1]) is not None
         assert _manifest(store)["built_at"] != first
 
     def test_pruned_depth_maps_are_not_trusted_as_a_cache(self, tmp_path):
@@ -743,7 +753,8 @@ def test_the_revision_route_answers_and_404s_like_the_page(tmp_path):
     assert ok.status_code == 200
     assert ok.headers["cache-control"] == "no-store"
     body = ok.json()
-    assert body["representation"] == "surface" and body["revision"].startswith("surface:")
+    assert body["representation"] == "surface"
+    assert body["revision"].startswith(f"{SESSION}/surface:")
     assert len(ok.content) < 512
 
     missing = client.get("/worlds/nope/render/revision")
@@ -847,8 +858,8 @@ class TestTheDepthCacheBelongsToOneSolve:
         align["records"][0]["kid"] = "someone-else:00000000"
         (dense / "align.json").write_text(json.dumps(align))
         mapping = reusable_predictions(dense / "align.json", _CountingBackend.name)
-        assert mapping[0] == "someone-else:00000000"
-        assert mapping[0] != f"{SESSION}:{0:08d}"
+        assert mapping[0][0] == "someone-else:00000000"
+        assert mapping[0][0] != f"{SESSION}:{0:08d}"
 
     def test_another_backends_predictions_are_never_offered(self, tmp_path):
         from tower.world_builder.dense_pipeline import reusable_predictions
@@ -989,3 +1000,354 @@ class TestTheFieldHasABudget:
 
         SP.surfacify(store, WORLD, SESSION, params=_params(), progress=progress)
         assert "fuse" in seen
+
+
+
+# ---------------------------------------------------------------------------
+# the systems review, pinned: each class names the finding it closes
+# ---------------------------------------------------------------------------
+
+
+class TestABuildIsPublishedAsAUnit:
+    """M1. Every build wrote `mesh_l<n>.bin` and the manifest last, so a stop or
+    a kill between those writes left new levels under an old manifest: the page
+    served one surface while the revision and the listing described another."""
+
+    def test_levels_carry_their_builds_own_names(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        levels = _manifest(store)["levels"]
+        names = [lv["file"] for lv in levels]
+        assert len(set(names)) == len(names)
+        suffixes = {n.split(".", 1)[1] for n in names}
+        assert len(suffixes) == 1, "one build, one suffix"
+
+    def test_a_second_build_does_not_touch_the_first_builds_files(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        root = SP.surface_dir(store, WORLD, SESSION)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        first = _manifest(store)
+        first_bytes = {lv["file"]: (root / lv["file"]).read_bytes() for lv in first["levels"]}
+        SP.surfacify(store, WORLD, SESSION, params=_params(min_weight=0.8), force=True)
+        for name, data in first_bytes.items():
+            assert (root / name).read_bytes() == data, "a recent build's files were rewritten"
+
+    def test_a_stop_during_pack_publishes_nothing_new(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        before = _manifest(store)
+        root = SP.surface_dir(store, WORLD, SESSION)
+
+        def stop_in_pack():
+            try:
+                return json.loads((root / "status.json").read_text()).get("stage") == "pack"
+            except (OSError, ValueError):
+                return False
+
+        result = SP.surfacify(store, WORLD, SESSION, params=_params(min_weight=0.8),
+                              force=True, should_stop=stop_in_pack)
+        assert result.state == SP.STATE_STOPPED
+        assert _manifest(store) == before
+        for lv in before["levels"]:
+            assert SP.level_file_whole(root, lv) is not None
+
+    def test_a_level_whose_size_does_not_match_its_manifest_is_refused(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        root = SP.surface_dir(store, WORLD, SESSION)
+        entry = _manifest(store)["levels"][0]
+        path = SP.level_file(root, entry)
+        path.write_bytes(path.read_bytes() + b"\0" * 16)
+        with pytest.raises(S.SurfaceUnavailable):
+            SP.read_surface_level(store, WORLD, SESSION, 0)
+        assert SP.level_file_whole(root, entry) is None
+
+    def test_a_manifest_cannot_name_a_file_outside_its_directory(self, tmp_path):
+        root = tmp_path
+        for bad in ("../x.bin", "..\\x.bin", "/etc/x.bin", ".hidden.bin", "x.json"):
+            assert SP.level_file(root, {"level": 0, "file": bad, "bytes": 1}) is None
+
+    def test_superseded_levels_are_pruned_only_once_old(self, tmp_path):
+        import os as _os
+
+        root = tmp_path
+        (root / "mesh_l0.old.bin").write_bytes(b"x")
+        (root / "mesh_l0.new.bin").write_bytes(b"y")
+        SP._prune_superseded_levels(root, {"mesh_l0.new.bin"})
+        assert (root / "mesh_l0.old.bin").exists(), "a reader may still hold that manifest"
+        past = time.time() - 3600
+        _os.utime(root / "mesh_l0.old.bin", (past, past))
+        SP._prune_superseded_levels(root, {"mesh_l0.new.bin"})
+        assert not (root / "mesh_l0.old.bin").exists()
+        assert (root / "mesh_l0.new.bin").exists()
+
+
+class TestAnIncompleteDepthStageIsNotACache:
+    """M2. A stop mid-depth left an align.json holding only the frames reached,
+    and it was trusted: a surface from 3 of 8 frames under the full digest."""
+
+    def test_a_stopped_stage_is_not_usable(self, tmp_path):
+        from tower.world_builder.dense import DenseParams
+        from tower.world_builder.global_solve import load_solution
+
+        store = _synthetic_world(tmp_path)
+        dense = store.world_dir(WORLD) / "dense" / SESSION
+        align = json.loads((dense / "align.json").read_text())
+        align["stopped_after"] = 3
+        assert not SP._depth_cache_usable(
+            align, dense, load_solution(store, WORLD, SESSION), DenseParams())
+
+    def test_a_cache_that_names_no_backend_is_not_usable(self, tmp_path):
+        from tower.world_builder.dense import DenseParams
+        from tower.world_builder.global_solve import load_solution
+
+        store = _synthetic_world(tmp_path)
+        dense = store.world_dir(WORLD) / "dense" / SESSION
+        align = json.loads((dense / "align.json").read_text())
+        align.pop("backend")
+        assert not SP._depth_cache_usable(
+            align, dense, load_solution(store, WORLD, SESSION), DenseParams())
+
+    def test_densify_does_not_name_a_stopped_stage(self):
+        import inspect
+
+        from tower.world_builder import dense_pipeline
+
+        body = inspect.getsource(dense_pipeline.densify)
+        i = body.index('align["input_digest"] = digest')
+        assert 'if align.get("stopped_after") is None:' in body[max(0, i - 400):i]
+
+    def test_a_different_backend_is_not_already_built(self, tmp_path):
+        import inspect
+
+        body = inspect.getsource(SP.surfacify)
+        assert "backend or DenseParams().backend" in body
+
+
+class TestThePageIsStampedWithTheRevisionReadBeforeIt:
+    """M3. Read after composition, a build landing in between stamped the OLD
+    page with the NEW revision; the phone believed it had the final surface."""
+
+    def test_a_build_landing_mid_composition_stamps_the_older_revision(self, tmp_path, monkeypatch):
+        from tower.results import world_builder_render as R
+        from tower.world_builder import surface_render
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        before = R.build_render_revision(store, WORLD, SESSION)["revision"]
+        real = surface_render.build_surface_page
+
+        def page_then_rebuild(*a, **kw):
+            html = real(*a, **kw)
+            time.sleep(0.01)
+            SP.surfacify(store, WORLD, SESSION, params=_params(min_weight=0.8), force=True)
+            return html
+
+        monkeypatch.setattr(surface_render, "build_surface_page", page_then_rebuild)
+        html = R.build_world_render(store, WORLD, SESSION)
+        after = R.build_render_revision(store, WORLD, SESSION)["revision"]
+        assert after != before
+        assert _meta(html, "wb-revision") == before, (
+            "the page must carry the revision it was composed under, so the "
+            "phone sees the newer one as newer")
+
+
+class TestLocksSurvivePidReuse:
+    """M4. A killed live child leaves its lock; if its pid is reused before the
+    final build asks, a bare pid probe calls the lock live and the final build
+    is refused."""
+
+    def test_a_lock_older_than_the_process_holding_its_pid_is_stale(self, tmp_path):
+        root = tmp_path / "surface" / "s1"
+        root.mkdir(parents=True)
+        lock_path = root / ".surface.lock"
+        # our own pid is certainly running -- but it did not write a lock a
+        # day before this process started
+        lock_path.write_text(json.dumps({"pid": os.getpid(), "at": 0}))
+        day_ago = time.time() - 86400
+        os.utime(lock_path, (day_ago, day_ago))
+        lock = SP._SurfaceLock(root)
+        assert lock.acquire()
+        lock.release()
+
+    def test_a_running_status_older_than_its_pid_is_stale(self):
+        assert SP.status_is_stale({"state": "running", "pid": os.getpid(),
+                                   "updated_at": time.time() - 86400})
+        assert not SP.status_is_stale({"state": "running", "pid": os.getpid(),
+                                       "updated_at": time.time()})
+
+    def test_a_fresh_lock_by_a_live_process_is_respected(self, tmp_path):
+        root = tmp_path / "surface" / "s1"
+        a, b = SP._SurfaceLock(root), SP._SurfaceLock(root)
+        assert a.acquire()
+        assert not b.acquire()
+        a.release()
+
+
+class TestTheFormatRefusesImpossibleIndices:
+
+    def _buf(self, n_i_override=None, bad_index=False):
+        V = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32)
+        F = np.array([[0, 1, 2]], np.int64)
+        buf = bytearray(S.write_mesh_bytes(V, F, None))
+        if bad_index:
+            buf[-2:] = (7).to_bytes(2, "little")
+        if n_i_override is not None:
+            buf[12:16] = n_i_override.to_bytes(4, "little")
+        return bytes(buf)
+
+    def test_an_index_count_that_is_not_triangles_is_refused(self):
+        with pytest.raises(S.SurfaceUnavailable):
+            S.read_mesh_bytes(self._buf(n_i_override=2)[:-2])
+
+    def test_an_index_past_the_vertices_is_refused(self):
+        with pytest.raises(S.SurfaceUnavailable):
+            S.read_mesh_bytes(self._buf(bad_index=True))
+
+
+class TestTheDiagnosticViewIsTheSparsePage:
+    """iOS review: "open the solver's view" sends view=diagnostics and got the
+    surface, and the app's text describing a diagnostics rendering was false."""
+
+    def test_diagnostics_serves_sparse_even_with_a_surface(self, tmp_path):
+        from tower.results.world_builder_render import (
+            build_render_revision,
+            build_world_render,
+        )
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        html = build_world_render(store, WORLD, SESSION, view="diagnostics")
+        assert _declared(html) == "sparse"
+        rev = build_render_revision(store, WORLD, SESSION, view="diagnostics")
+        assert rev["representation"] == "sparse"
+        assert _meta(html, "wb-revision") == rev["revision"]
+
+    def test_an_explicit_representation_still_wins(self, tmp_path):
+        from tower.results.world_builder_render import build_world_render
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params())
+        html = build_world_render(store, WORLD, SESSION, view="diagnostics",
+                                  representation="surface")
+        assert _declared(html) == "surface"
+
+
+class TestTheLiveWorkerOnlyBuildsWhatChanged:
+
+    def _surfacer(self, tmp_path, spawned, code=None):
+        from scripts.world_build_session import BackgroundSurface
+
+        def spawn(argv, **kw):
+            script = ("import time; time.sleep(120)" if code is None
+                      else f"import sys; sys.exit({code})")
+            proc = subprocess.Popen([sys.executable, "-c", script],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            spawned.append(proc)
+            return proc
+
+        return BackgroundSurface(root=tmp_path, world_id=WORLD, session_id=SESSION,
+                                 spawn=spawn)
+
+    def _solution(self, tmp_path, text):
+        path = tmp_path / "worlds" / WORLD / "solve" / SESSION / "solution.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_a_solve_that_published_nothing_new_builds_nothing(self, tmp_path):
+        spawned = []
+        s = self._surfacer(tmp_path, spawned)
+        try:
+            self._solution(tmp_path, "{}")
+            assert s.solve_landed(None)
+            spawned[0].kill()
+            spawned[0].wait(timeout=10)
+            assert not s.solve_landed(None), "same solution file, nothing to rebuild"
+            time.sleep(0.02)
+            self._solution(tmp_path, '{"new": 1}')
+            assert s.solve_landed(None)
+        finally:
+            s.close()
+
+    def test_a_machine_without_the_depth_network_stops_trying(self, tmp_path):
+        from scripts.world_build_session import SURFACE_EXIT_CANNOT_RUN_HERE
+
+        spawned = []
+        s = self._surfacer(tmp_path, spawned, code=SURFACE_EXIT_CANNOT_RUN_HERE)
+        self._solution(tmp_path, "{}")
+        assert s.solve_landed(None)
+        spawned[0].wait(timeout=10)
+        time.sleep(0.02)
+        self._solution(tmp_path, '{"new": 1}')
+        assert not s.solve_landed(None)
+        assert len(spawned) == 1
+
+
+def test_a_missing_depth_network_is_unavailable_and_permanent(tmp_path, monkeypatch):
+    from tower.world_builder import dense_pipeline
+    from tower.world_builder.dense import DenseUnavailable
+
+    store = _synthetic_world(tmp_path)
+    dense = store.world_dir(WORLD) / "dense" / SESSION
+    align = json.loads((dense / "align.json").read_text())
+    align["input_digest"] = "some-other-solve"
+    (dense / "align.json").write_text(json.dumps(align))
+
+    def no_network(*a, **kw):
+        raise DenseUnavailable("depth backend 'moge2-vitl' is not installed")
+
+    monkeypatch.setattr(dense_pipeline, "run_depth_stage", no_network)
+    result = SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert result.state == SP.STATE_UNAVAILABLE
+    assert result.permanent
+
+
+def test_the_final_surface_runs_before_the_dense_stage_prunes_its_depth():
+    import inspect
+
+    import scripts.world_build_session as B
+
+    src = inspect.getsource(B.main)
+    assert src.index("surfacify(") < src.index("densify(")
+
+
+
+def test_a_prediction_is_not_reused_once_its_keyframe_image_changes(tmp_path, monkeypatch):
+    """Systems review: reuse was keyed on the keyframe id alone, so a keyframe
+    re-redacted or replaced since kept its old pixels' depth and colour."""
+    from tower.world_builder.dense import register_backend
+    from tower.world_builder.global_solve import load_solution
+
+    _CountingBackend.calls = 0
+    register_backend(_CountingBackend.name, _CountingBackend)
+    store = _synthetic_world(tmp_path, digest="final-solve")
+    dense = store.world_dir(WORLD) / "dense" / SESSION
+    align = json.loads((dense / "align.json").read_text())
+    align["backend"] = _CountingBackend.name
+    align["input_digest"] = "an-earlier-solve"
+    (dense / "align.json").write_text(json.dumps(align))
+
+    import cv2
+
+    from tower.world_builder import global_solve as GS
+
+    def identity_maps(_intrinsics, width, height):
+        # The synthetic camera is already a pinhole; the real rectification
+        # would trim a pixel of ROI, which is a different refusal's business.
+        xs, ys = np.meshgrid(np.arange(width, dtype=np.float32),
+                             np.arange(height, dtype=np.float32))
+        return xs, ys, (0, 0, width, height), None
+
+    monkeypatch.setattr(GS, "_undistort_maps", identity_maps)
+    changed = store.images_dir(WORLD, SESSION) / f"{0:08d}.jpg"
+    ok, enc = cv2.imencode(".jpg", np.full((120, 160, 3), 40, np.uint8))
+    changed.write_bytes(enc.tobytes())
+
+    solution = load_solution(store, WORLD, SESSION)
+    SP.ensure_depth_stage(store, WORLD, SESSION, solution,
+                          store.read_session(WORLD, SESSION).intrinsics,
+                          gate_rel=0.08, backend=_CountingBackend.name)
+    assert _CountingBackend.calls == 1, (
+        "exactly the one keyframe whose image changed is predicted again")

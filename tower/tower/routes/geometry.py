@@ -95,6 +95,7 @@ def geometry_segment(
 def world_render_revision(
     world_id: str, request: Request,
     session_id: str | None = Query(default=None),
+    view: str | None = Query(default=None),
 ) -> JSONResponse:
     """Which picture `GET /worlds/{id}/render` would serve now, as a revision.
 
@@ -104,7 +105,7 @@ def world_render_revision(
     compared with is stamped into the page it already has.
     """
     try:
-        payload = build_render_revision(_store(request), world_id, session_id)
+        payload = build_render_revision(_store(request), world_id, session_id, view=view)
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None
     return JSONResponse(json_safe(payload), headers={"Cache-Control": "no-store"})

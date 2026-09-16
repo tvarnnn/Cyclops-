@@ -101,7 +101,8 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
         raise SurfaceViewerUnavailable(f"the surface has no level {level}")
 
     try:
-        raw = read_surface_level(store, world_id, session_id, chosen["level"])
+        raw = read_surface_level(store, world_id, session_id, chosen["level"],
+                                 manifest=manifest)
     except SurfaceUnavailable as exc:
         raise SurfaceViewerUnavailable(exc.reason) from None
     # Parse it here rather than trusting the manifest's counts. A torn or

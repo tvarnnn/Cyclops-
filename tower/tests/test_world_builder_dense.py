@@ -1079,7 +1079,9 @@ def test_liveness_uses_the_stores_probe_not_os_kill():
 
     assert "os.kill" not in inspect.getsource(dense_pipeline._DenseLock)
     assert "os.kill" not in inspect.getsource(dense_pipeline.status_is_stale)
-    assert "_pid_is_running" in inspect.getsource(dense_pipeline._DenseLock._stale)
+    # The store's probe, and since the systems review its recycled-pid form:
+    # a process that started after the lock was written did not write it.
+    assert "_holder_is_running" in inspect.getsource(dense_pipeline._DenseLock._stale)
 
 
 def test_the_fill_fallback_requires_a_rectangle_not_merely_darkness():

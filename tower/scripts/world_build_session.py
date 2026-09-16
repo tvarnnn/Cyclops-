@@ -564,6 +564,11 @@ def child_environment() -> dict:
     return interpreter_environment()
 
 
+# `scripts/world_surface.py` exits with this when the stage cannot run on
+# this machine at all, as opposed to cannot run on this session yet.
+SURFACE_EXIT_CANNOT_RUN_HERE = 4
+
+
 class BackgroundSurface:
     """The live surface reconstruction, as a CHILD this builder owns.
 
@@ -607,6 +612,9 @@ class BackgroundSurface:
         self._launches = 0
         self._log = None
         self._stale = False
+        self._built_from = None
+        self._pending_stamp = None
+        self._disabled = False
 
     @property
     def running(self) -> bool:
@@ -617,18 +625,40 @@ class BackgroundSurface:
         return self._launches
 
     def solve_landed(self, store: WorldStore) -> bool:
-        """A newer solve exists. Build against it now, or as soon as the
-        surface already building is done."""
+        """A solve finished. If it published a NEW solution, build against it
+        now, or as soon as the surface already building is done.
+
+        A finished solve is not necessarily a new solution: a solve child that
+        crashed or found nothing to add still "finishes". Rebuilding the surface
+        for it costs a GPU minute and changes nothing, so the solution file's
+        own stamp is compared with the one last built from.
+        """
+        stamp = self._solution_stamp()
+        if stamp is not None and stamp == self._built_from:
+            return False
+        self._pending_stamp = stamp
         self._stale = True
         return self.poll(store)
+
+    def _solution_stamp(self):
+        path = (self.root / "worlds" / self.world_id / "solve" / self.session_id
+                / "solution.json")
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
 
     def poll(self, store: WorldStore) -> bool:
         """Launch the pending rebuild if one is owed and nothing is running."""
         self._reap()
-        if not self._stale or self.running:
+        if not self._stale or self.running or self._disabled:
             return False
         self._stale = False
-        return self.maybe_launch(store)
+        launched = self.maybe_launch(store)
+        if launched:
+            self._built_from = self._pending_stamp
+        return launched
 
     @property
     def child_pid(self) -> int | None:
@@ -636,6 +666,14 @@ class BackgroundSurface:
 
     def _reap(self) -> None:
         if self._child is not None and self._child.poll() is not None:
+            if self._child.returncode == SURFACE_EXIT_CANNOT_RUN_HERE:
+                # The depth network is not installed on this machine. Every
+                # later solve would launch a child that fails the same way;
+                # say so once and stop.
+                self._disabled = True
+                logger.warning(
+                    "[Tower][WorldBuilder] live surface cannot run on this "
+                    "machine; no further live surfaces this walk")
             self._child = None
             if self._log is not None:
                 self._log.close()
@@ -2109,38 +2147,12 @@ def main(argv=None) -> int:
             }
         )
 
-    # Dense reconstruction last, because it is the most expensive thing here
-    # and the least load-bearing: every other artifact is already on disk and
-    # complete before it starts. It is skipped rather than truncated on a hard
-    # stop -- the Job Object kills this tree on a 30-second grace and a
-    # half-written dense tree would be worse than none. Its own stages are
-    # checkpointed, so a later `scripts/world_densify.py` resumes rather than
-    # restarting.
-    if args.densify:
-        if stop_request.hard_asked_for():
-            report["dense"] = {
-                "attempted": False,
-                "reason": f"hard stop ({stop_request.source}) during finalization",
-            }
-        elif not (solve_report or {}).get("solved"):
-            report["dense"] = {
-                "attempted": False,
-                "reason": "dense reconstruction needs a global solve; there is none",
-            }
-        else:
-            from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
-
-            dense_result = densify(
-                store, world_id, session_id,
-                should_stop=stop_request.hard_asked_for,
-            )
-            report["dense"] = {"attempted": True, **dense_result.as_dict()}
-
-    # The final surface, last of all and for the same reasons the dense stage
-    # is second to last: everything load-bearing is already on disk, and this
-    # is the most expensive thing here. It runs AFTER the dense stage so the
-    # two share one depth stage rather than each paying for it -- whichever
-    # runs first computes the per-frame depth maps and the other reads them.
+    # The final surface, after everything load-bearing is on disk. It runs
+    # BEFORE the dense stage, and the order is not cosmetic: the dense stage
+    # prunes the per-frame depth work when it finishes, so a surface built
+    # after it found every prediction gone and ran the depth network again over
+    # the whole walk. Built first, it computes the depth stage and names it for
+    # this solve, and the dense stage then reuses it by its cache key.
     #
     # Skipped rather than truncated on a hard stop. The Job Object kills this
     # tree on a 30-second grace and a half-written surface would be worse than
@@ -2175,6 +2187,45 @@ def main(argv=None) -> int:
                 should_stop=stop_request.hard_asked_for,
             )
             report["surface"] = {"attempted": True, **surface_result.as_dict()}
+            if not args.densify and surface_result.state == "ok":
+                # The per-frame depth work is ~0.5 GB for a walk and nothing in
+                # the product reads it once the final surface exists; a later
+                # rebuild recomputes it. The dense stage prunes its own when on.
+                from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+                    dense_dir,
+                    prune_intermediates,
+                )
+
+                report["surface"]["depth_work_pruned_bytes"] = prune_intermediates(
+                    dense_dir(store, world_id, session_id))
+
+    # Dense reconstruction last (after the surface, which shares its depth
+    # stage), because it is the most expensive thing here
+    # and the least load-bearing: every other artifact is already on disk and
+    # complete before it starts. It is skipped rather than truncated on a hard
+    # stop -- the Job Object kills this tree on a 30-second grace and a
+    # half-written dense tree would be worse than none. Its own stages are
+    # checkpointed, so a later `scripts/world_densify.py` resumes rather than
+    # restarting.
+    if args.densify:
+        if stop_request.hard_asked_for():
+            report["dense"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_request.source}) during finalization",
+            }
+        elif not (solve_report or {}).get("solved"):
+            report["dense"] = {
+                "attempted": False,
+                "reason": "dense reconstruction needs a global solve; there is none",
+            }
+        else:
+            from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
+
+            dense_result = densify(
+                store, world_id, session_id,
+                should_stop=stop_request.hard_asked_for,
+            )
+            report["dense"] = {"attempted": True, **dense_result.as_dict()}
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

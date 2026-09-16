@@ -22,6 +22,7 @@ as it ignores `solve/`.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -220,7 +221,15 @@ class _DenseLock:
         # the signal-based probe is a console-signal call on Windows and reports a
         # freshly dead process as still alive -- which would strand the lock
         # for good.
-        return not _pid_is_running(pid)
+        # Same recycled-pid guard as the surface lock: a process that started
+        # after this lock was written did not write it.
+        from tower.world_builder.store import _holder_is_running  # noqa: PLC0415
+
+        try:
+            written = self.path.stat().st_mtime
+        except OSError:
+            return True
+        return not _holder_is_running(pid, None, lock_written_at=written)
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -533,9 +542,9 @@ def run_depth_stage(
     #
     # `prior` above resumes whole RECORDS, and a record carries the frame's
     # affine fit to the solve's sparse points -- valid only for the solve it
-    # was fitted against. `reuse_predictions` is the other half: `{ki: kid}`
-    # of frames whose raw network output on disk is known to be for that
-    # keyframe from this backend. The network's output depends only on the
+    # was fitted against. `reuse_predictions` is the other half:
+    # `{ki: (kid, image_sha1)}` of frames whose raw network output on disk is
+    # known to be for that keyframe's exact image from this backend. The network's output depends only on the
     # keyframe image, so it is loaded instead of re-predicted and the fit is
     # computed afresh against THIS solve. During a walk each live surface is
     # built from a new solve over more keyframes; without this, every one of
@@ -564,23 +573,29 @@ def run_depth_stage(
         pred_path = work / "depth" / f"{ki:05d}_pred.npy"
         fill_path = work / "depth" / f"{ki:05d}_fill.npy"
         undist_path = work / "undist" / f"{ki:05d}.jpg"
-        if (reuse_predictions.get(int(ki)) == kid and pred_path.exists()
-                and fill_path.exists() and undist_path.exists()):
-            disp = np.load(pred_path).astype(np.float32)
-            fill_u = np.load(fill_path)
-            fill_fraction = float(fill_u.mean())
-            origin = "reused-prediction"
-            origins[origin] = origins.get(origin, 0) + 1
-            reused += 1
-            records.append(_fit_record(
-                ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
-                obs_kf, obs_pt, K, W, H, params, backend, work))
-            continue
 
         data, origin, exact_fill = keyframe_image_bytes(
             store, world_id, session_id, kid, sources.get(kid), redactor,
             keyframes_are_redacted=keyframes_are_redacted,
         )
+        image_sha1 = hashlib.sha1(data).hexdigest() if data is not None else None
+        # A prediction is reused only for the SAME IMAGE, not merely the same
+        # keyframe id: a keyframe re-redacted or replaced since would otherwise
+        # keep the old pixels' depth, fill mask and colour.
+        offered = reuse_predictions.get(int(ki))
+        if (image_sha1 is not None and offered == (kid, image_sha1)
+                and pred_path.exists() and fill_path.exists() and undist_path.exists()):
+            disp = np.load(pred_path).astype(np.float32)
+            fill_u = np.load(fill_path)
+            fill_fraction = float(fill_u.mean())
+            origins["reused-prediction"] = origins.get("reused-prediction", 0) + 1
+            reused += 1
+            record = _fit_record(
+                ki, kid, pose, disp, fill_u, fill_fraction, "reused-prediction",
+                solution, obs_kf, obs_pt, K, W, H, params, backend, work)
+            record["image_sha1"] = image_sha1
+            records.append(record)
+            continue
         origins[origin] = origins.get(origin, 0) + 1
         if data is None:
             records.append({"ki": int(ki), "ok": False, "why": f"image {origin}"})
@@ -636,9 +651,11 @@ def run_depth_stage(
         # against this solve -- too few sparse points yet -- still has its
         # prediction for the next solve to fit against.
         np.save(pred_path, disp.astype(np.float16))
-        records.append(_fit_record(
+        record = _fit_record(
             ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
-            obs_kf, obs_pt, K, W, H, params, backend, work))
+            obs_kf, obs_pt, K, W, H, params, backend, work)
+        record["image_sha1"] = image_sha1
+        records.append(record)
 
     if progress:
         progress(STAGE_DEPTH, len(targets), len(targets))
@@ -743,8 +760,12 @@ def reusable_predictions(align_path: Path, backend: str) -> dict:
         return {}
     if cached.get("backend") != backend:
         return {}
-    return {int(r["ki"]): r["kid"] for r in cached.get("records") or []
-            if isinstance(r, dict) and r.get("kid") and r.get("ki") is not None}
+    # (kid, image hash): a record written before hashes were recorded offers
+    # nothing, and costs one fresh prediction rather than a wrong reuse.
+    return {int(r["ki"]): (r["kid"], r["image_sha1"])
+            for r in cached.get("records") or []
+            if isinstance(r, dict) and r.get("kid") and r.get("ki") is not None
+            and r.get("image_sha1")}
 
 
 def run_fuse_stage(
@@ -1297,9 +1318,12 @@ def densify(
                                     progress=progress, prior=prior,
                                     reuse_predictions=reusable_predictions(
                                         align_path, params.backend))
-            align["digest"] = digest
-            align["input_digest"] = digest
-            align["cache_key"] = _depth_cache_key(digest, params)
+            if align.get("stopped_after") is None:
+                # Only a COMPLETE stage names its solve. A stopped one written
+                # under the digest was trusted as a finished cache.
+                align["digest"] = digest
+                align["input_digest"] = digest
+                align["cache_key"] = _depth_cache_key(digest, params)
             _write_json(align_path, align)
             seconds[STAGE_DEPTH] = time.time() - t
             if align.get("stopped_after") is not None:

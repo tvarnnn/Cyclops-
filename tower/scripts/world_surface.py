@@ -191,6 +191,7 @@ def main() -> int:
 
     params = _params_from_args(args)
     failures = 0
+    cannot_run_here = False
     for world_id, sid in targets:
         print(f"=== {world_id} / {sid} ===", flush=True)
         t = time.time()
@@ -199,6 +200,7 @@ def main() -> int:
         if result.state != STATE_OK:
             print(f"  {result.state}: {result.detail}")
             failures += 1
+            cannot_run_here = cannot_run_here or bool(result.permanent)
             continue
         print(f"  frames {result.frames_used}/{result.frames_offered} used")
         print(f"  voxel {result.voxel:.5f}  truncation {result.trunc:.5f} "
@@ -207,6 +209,10 @@ def main() -> int:
             print(f"  L{lv['level']}: {lv['faces']:,} faces, "
                   f"{lv['bytes'] / 1e6:.1f} MB")
         print(f"  {time.time() - t:.1f}s total  {result.seconds}")
+    if cannot_run_here:
+        # Distinct from an ordinary failure, so the builder's live worker can
+        # stop relaunching (SURFACE_EXIT_CANNOT_RUN_HERE in world_build_session).
+        return 4
     return 1 if failures and failures == len(targets) else 0
 
 

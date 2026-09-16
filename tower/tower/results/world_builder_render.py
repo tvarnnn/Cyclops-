@@ -28,6 +28,7 @@ from html import escape as html_escape
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import (
     DEFAULT_MAX_POINTS,
+    VIEW_DIAGNOSTICS,
     VIEW_PRODUCT,
     render_html,
 )
@@ -237,7 +238,7 @@ def render_revision(store: WorldStore, world_id: str, session_id: str,
 
 
 def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
-                    html: str) -> str:
+                    html: str, revisions: dict | None = None) -> str:
     """Write the page's own revision into its head, beside its rung.
 
     So the phone knows which revision it is showing from the page itself, with
@@ -247,13 +248,20 @@ def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
     match = _REPRESENTATION_META.search(html, 0, 4096)
     if match is None:
         return html
-    revision = render_revision(store, world_id, session_id, match.group(1))
+    rung = match.group(1)
+    # `revisions` is read BEFORE the page is composed. Read after, a build
+    # landing between the two stamped an OLD page with the NEW revision, and
+    # the phone -- told it already had the latest -- never fetched the final
+    # surface. Read before, the same race stamps a NEW page with an OLD
+    # revision, which costs the phone one extra fetch and is always safe.
+    revision = ((revisions or {}).get(rung)
+                or f"{session_id}/{render_revision(store, world_id, session_id, rung)}")
     tag = f'<meta name="wb-revision" content="{html_escape(revision, quote=True)}">'
     return html[:match.end()] + tag + html[match.end():]
 
 
 def build_render_revision(store: WorldStore, world_id: str,
-                          session_id: str | None) -> dict:
+                          session_id: str | None, view: str | None = None) -> dict:
     """What `GET /worlds/{id}/render` would serve now, as a revision.
 
     Walks the same ladder in the same order, but by the artifact checks the
@@ -267,14 +275,18 @@ def build_render_revision(store: WorldStore, world_id: str,
         raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
-    if surface_artifact_drawable(store, world_id, chosen):
+    if view == VIEW_DIAGNOSTICS:
+        rung = REPRESENTATION_SPARSE
+    elif surface_artifact_drawable(store, world_id, chosen):
         rung = REPRESENTATION_SURFACE
     elif dense_artifact_drawable(store, world_id, chosen):
         rung = REPRESENTATION_DENSE
     else:
         rung = REPRESENTATION_SPARSE
     return {"session_id": chosen, "representation": rung,
-            "revision": render_revision(store, world_id, chosen, rung)}
+            # The session is in the revision, so an open picture whose session
+            # the Tower chose notices when the Tower would choose a newer one.
+            "revision": f"{chosen}/{render_revision(store, world_id, chosen, rung)}"}
 
 
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
@@ -299,8 +311,17 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     # surface gets the surface, because that is the whole point of having
     # built one; one that has only points gets points; every world built
     # before either stage existed falls through to the sparse page unchanged.
+    revisions = {rung: f"{chosen}/{render_revision(store, world_id, chosen, rung)}"
+                 for rung in REPRESENTATION_LADDER}
     wanted = (representation if representation in REPRESENTATION_LADDER
               else REPRESENTATION_SURFACE)
+    # The solver's diagnostic view IS the sparse page -- only it has the
+    # diagnostic rendering -- so asking for it with no representation pinned
+    # starts the ladder at sparse. Starting at the surface served the surface
+    # for "open the solver's view", and the app's text describing a
+    # diagnostics rendering was false.
+    if view == VIEW_DIAGNOSTICS and representation == REPRESENTATION_AUTO:
+        wanted = REPRESENTATION_SPARSE
     start = REPRESENTATION_LADDER.index(wanted)
 
     if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE):
@@ -324,7 +345,7 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
             if build_surface_page is None:
                 raise RuntimeError("surface viewer unavailable")
             page = build_surface_page(store, world_id, chosen, max_points=max_points)
-            return _stamp_revision(store, world_id, chosen, page)
+            return _stamp_revision(store, world_id, chosen, page, revisions)
         except SurfaceViewerUnavailable as exc:
             if representation == REPRESENTATION_SURFACE:
                 raise WorldRenderUnavailable(exc.reason) from None
@@ -376,7 +397,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
                 budget = min(budget, max(1, int(max_points)) * POINT_STRIDE_BYTES)
             return _stamp_revision(store, world_id, chosen,
                                    build_dense_page(store, world_id, chosen,
-                                                    budget_bytes=budget))
+                                                    budget_bytes=budget),
+                                   revisions)
         except DenseViewerUnavailable as exc:
             if representation == REPRESENTATION_DENSE:
                 raise WorldRenderUnavailable(exc.reason) from None
@@ -390,7 +412,7 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     try:
         page = render_html(store, world_id, chosen, max_points=budget,
                            view=view or VIEW_PRODUCT)
-        return _stamp_revision(store, world_id, chosen, page)
+        return _stamp_revision(store, world_id, chosen, page, revisions)
     except FileNotFoundError:
         # Raced a `clear_derived` between the existence check and the read.
         # Worded here rather than from the exception: the phone shows the

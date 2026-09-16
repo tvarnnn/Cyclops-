@@ -1216,8 +1216,14 @@ def _level_files_whole(root, levels, name) -> bool:
         level, size = lv.get("level"), lv.get("bytes")
         if not isinstance(level, int) or not isinstance(size, int):
             return False
+        # A level may name its own file (surface builds published as a unit);
+        # it must be a bare name in this directory. Otherwise the legacy name.
+        fname = lv.get("file", name.format(level))
+        if (not isinstance(fname, str) or "/" in fname or "\\" in fname
+                or fname.startswith(".")):
+            return False
         try:
-            if (root / name.format(level)).stat().st_size != size:
+            if (root / fname).stat().st_size != size:
                 return False
         except OSError:
             return False
@@ -1243,7 +1249,8 @@ def _surface_drawable(root) -> bool:
     if not _level_files_whole(root, levels, "mesh_l{}.bin"):
         return False
     try:
-        with open(root / f"mesh_l{levels[-1]['level']}.bin", "rb") as handle:
+        last = levels[-1]
+        with open(root / last.get("file", f"mesh_l{last['level']}.bin"), "rb") as handle:
             head = handle.read(_HEADER.size)
         magic, _nv, n_i, _flags, version, *_box = _HEADER.unpack(head)
     except (OSError, Exception):  # noqa: BLE001 -- short or foreign header

@@ -301,6 +301,10 @@ class SurfaceResult:
     levels: list = field(default_factory=list)
     seconds: dict = field(default_factory=dict)
     stopped_after: str | None = None
+    permanent: bool = False
+    """True when the stage cannot run on this machine at all -- the depth
+    network is not installed -- as opposed to cannot run on this session yet.
+    The live worker stops relaunching on it rather than failing every solve."""
 
     def as_dict(self) -> dict:
         return {
@@ -309,6 +313,7 @@ class SurfaceResult:
             "vertices": self.vertices, "faces": self.faces, "blocks": self.blocks,
             "voxel": self.voxel, "trunc": self.trunc, "levels": self.levels,
             "seconds": self.seconds, "stopped_after": self.stopped_after,
+            "permanent": self.permanent,
         }
 
 
@@ -1423,6 +1428,9 @@ def read_mesh_bytes(buf: bytes):
     hi = np.array(box[3:], np.float32)
     span = np.maximum(hi - lo, 1e-9)
 
+    if n_i % 3:
+        raise SurfaceUnavailable(
+            f"surface mesh buffer has {n_i} indices, not a whole number of triangles")
     has_n = bool(flags & FLAG_HAS_NORMALS)
     idx_dtype = np.uint16 if flags & FLAG_INDEX_U16 else np.uint32
     off = _HEADER.size
@@ -1440,5 +1448,7 @@ def read_mesh_bytes(buf: bytes):
         N = np.frombuffer(buf, np.int8, n_v * 3, off).reshape(-1, 3).astype(np.float32) / 127.0
         off += n_v * 3
     F = np.frombuffer(buf, idx_dtype, n_i, off).reshape(-1, 3).astype(np.int64)
+    if len(F) and (int(F.max()) >= n_v or int(F.min()) < 0):
+        raise SurfaceUnavailable("surface mesh buffer indexes a vertex it does not have")
     V = lo + (q.astype(np.float32) / 65535.0) * span
     return V, F, C, N

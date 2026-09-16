@@ -37,6 +37,7 @@ from typing import Callable
 import numpy as np
 
 from tower.storage import write_bytes_atomic, write_json_atomic
+from tower.world_builder.dense import DenseUnavailable
 from tower.world_builder.surface import (
     STAGE_DEPTH,
     STAGE_FUSE,
@@ -75,6 +76,23 @@ def surface_dir(store, world_id: str, session_id: str) -> Path:
     return store.world_dir(world_id) / "surface" / session_id
 
 
+def _holder_alive(pid, written_at) -> bool:
+    """Whether the process that WROTE a lock or status is still that process.
+
+    A bare pid probe is not enough on Windows, where pids are recycled
+    quickly: a live surface child killed at Stop leaves its lock behind, and
+    if its pid is reused before the final build asks, the final build is
+    refused as "already running" and the world keeps its coarse live mesh.
+    The store's own guard answers the real question -- a process that started
+    clearly after the file was written cannot have written it.
+    """
+    from tower.world_builder.store import _holder_is_running  # noqa: PLC0415
+
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    return _holder_is_running(pid, None, lock_written_at=written_at)
+
+
 def _pid_is_running(pid: int) -> bool:
     from tower.world_builder.dense_pipeline import _pid_is_running as probe
 
@@ -109,7 +127,7 @@ def status_is_stale(status: dict) -> bool:
     pid = status.get("pid")
     if not isinstance(pid, int):
         return True
-    return not _pid_is_running(pid)
+    return not _holder_alive(pid, status.get("updated_at"))
 
 
 class _SurfaceLock:
@@ -130,9 +148,10 @@ class _SurfaceLock:
     def _stale(self) -> bool:
         try:
             pid = int(json.loads(self.path.read_text()).get("pid", -1))
-        except (OSError, ValueError, AttributeError):
+            written = self.path.stat().st_mtime
+        except (OSError, ValueError, AttributeError, TypeError):
             return True
-        return not _pid_is_running(pid)
+        return not _holder_alive(pid, written)
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,13 +161,27 @@ class _SurfaceLock:
             except FileExistsError:
                 if not self._stale():
                     return False
+                # Ask AGAIN immediately before removing it. Two contenders can
+                # both judge the same dead lock stale; the one that loses the
+                # race would otherwise unlink the winner's fresh lock and both
+                # would hold it. The window left is one read wide, and the
+                # check after creation below closes most of that too.
+                if not self._stale():
+                    return False
                 try:
                     self.path.unlink()
                 except OSError:
                     return False
                 continue
+            token = f"{os.getpid()}-{time.time_ns()}"
             with os.fdopen(fd, "w") as handle:
-                json.dump({"pid": os.getpid(), "at": time.time()}, handle)
+                json.dump({"pid": os.getpid(), "at": time.time(), "token": token}, handle)
+            try:
+                mine = json.loads(self.path.read_text()).get("token") == token
+            except (OSError, ValueError, AttributeError):
+                mine = False
+            if not mine:
+                return False
             self.held = True
             return True
         return False
@@ -253,7 +286,13 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams) -> bool:
     named = cached.get("input_digest") or cached.get("digest")
     if named != solution.input_digest:
         return False
-    if cached.get("backend") not in (None, dparams.backend):
+    # AN INTERRUPTED STAGE IS NOT A COMPLETE ONE. A stop mid-depth leaves an
+    # `align.json` holding only the frames reached; trusting it built a
+    # surface from 3 of 8 frames under the full solve's digest, and every
+    # later run kept it.
+    if cached.get("stopped_after") is not None:
+        return False
+    if cached.get("backend") != dparams.backend:
         return False
     records = [r for r in cached.get("records", []) if r.get("ok")]
     if not records:
@@ -394,7 +433,11 @@ def surfacify(store, world_id: str, session_id: str, *,
             return _unavailable(root, "session has no intrinsics")
 
         digest = solution.input_digest
-        pdigest = _params_digest(params, digest)
+        from tower.world_builder.dense import DenseParams  # noqa: PLC0415
+
+        # The depth backend changes every triangle; a request for a different
+        # network must not be answered "already built".
+        pdigest = _params_digest(params, digest) + "|" + (backend or DenseParams().backend)
 
         done = _already_built(root, digest, pdigest, force)
         if done is not None:
@@ -436,6 +479,7 @@ def surfacify(store, world_id: str, session_id: str, *,
 
         scale = _scale_note(store, world_id)
         _write_manifest(root, result, params, digest, pdigest, median_depth, scale)
+        _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
         _status(root, state=STATE_OK, input_digest=digest,
                 params_digest=pdigest, result=result.as_dict())
         return result
@@ -443,6 +487,15 @@ def surfacify(store, world_id: str, session_id: str, *,
     except SurfaceUnavailable as exc:
         _status(root, state=STATE_UNAVAILABLE, detail=exc.reason)
         return SurfaceResult(state=STATE_UNAVAILABLE, detail=exc.reason)
+    except DenseUnavailable as exc:
+        # The depth network is missing on this machine. That is a
+        # configuration, not a crash: say so once, without a traceback, and
+        # mark it permanent so the live worker stops trying every solve.
+        reason = str(exc)
+        logger.warning("[Tower][WorldBuilder][surface] %s/%s cannot build a "
+                       "surface on this machine: %s", world_id, session_id, reason)
+        _status(root, state=STATE_UNAVAILABLE, detail=reason, permanent=True)
+        return SurfaceResult(state=STATE_UNAVAILABLE, detail=reason, permanent=True)
     except Exception as exc:  # noqa: BLE001 -- recorded, never swallowed silently
         logger.exception("[Tower][WorldBuilder][surface] %s/%s failed",
                          world_id, session_id)
@@ -535,12 +588,17 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # Allocation is about a second since key-space expansion, so a second pass
     # is cheap, and it happens before a byte of field exists.
     coarsened = 1.0
-    for _attempt in range(6):
+    attempts = 7
+    for attempt in range(attempts):
         keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt, frames.K)
                 for z, ok, _img, R, tt, _w in cached]
         allk = torch.unique(torch.cat(keys))
         del keys
-        if params.max_blocks <= 0 or allk.numel() <= params.max_blocks:
+        # The keys just computed always belong to `vol`'s voxel: the loop only
+        # coarsens when it will go round again, so it never reserves keys from
+        # the previous voxel size on its last pass.
+        if (params.max_blocks <= 0 or allk.numel() <= params.max_blocks
+                or attempt == attempts - 1):
             break
         factor = math.sqrt(allk.numel() / params.max_blocks) * 1.05
         coarsened *= factor
@@ -606,18 +664,36 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
 
     t = time.time()
     _status(root, state=STATE_RUNNING, stage=STAGE_PACK)
+    # A BUILD IS PUBLISHED AS A UNIT. Each build writes its levels under names
+    # of its own, and the manifest -- written last, atomically, by the caller --
+    # names them. Before this every build wrote `mesh_l<n>.bin`, so a stop or a
+    # kill between levels, or between the last level and the manifest, left new
+    # levels under an old manifest: the page served one surface while the
+    # revision and the listing described another, and a later run reported
+    # "already built" over it. Now a reader following any manifest reads only
+    # the files that manifest was published with.
+    build_id = f"{time.time_ns():x}{os.getpid():x}"
     levels = []
     source = (V, F, C)
     for level, target in enumerate(params.lod_face_targets):
+        if _stopped(should_stop):
+            # Pack is the longest stage and outlasts a hard stop's grace; it
+            # must notice the stop between levels, not only at the end.
+            return _stop(root, STAGE_PACK, seconds)
         # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
         Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(*source, target)
         source = (Vl, Fl, Cl)
         N = vertex_normals(Vl, Fl)
         buf = write_mesh_bytes(Vl, Fl, Cl, N)
-        write_bytes_atomic(root / f"mesh_l{level}.bin",
-                           lambda handle, data=buf: handle.write(data))
+        name = f"mesh_l{level}.{build_id}.bin"
+        write_bytes_atomic(root / name, lambda handle, data=buf: handle.write(data))
         levels.append({"level": level, "vertices": int(len(Vl)),
-                       "faces": int(len(Fl)), "bytes": len(buf)})
+                       "faces": int(len(Fl)), "bytes": len(buf), "file": name})
+    if _stopped(should_stop):
+        # A stop that arrived while the last level was being decimated. The
+        # levels are on disk under this build's own names, but no manifest
+        # names them, so nothing reads them and the previous surface stands.
+        return _stop(root, STAGE_PACK, seconds)
     seconds[STAGE_PACK] = round(time.time() - t, 2)
 
     return SurfaceResult(
@@ -673,6 +749,59 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
     })
 
 
+def level_file(root: Path, entry: dict) -> Path | None:
+    """The file a manifest's level entry names, or None if it names none safely.
+
+    Manifests written before builds were published as a unit carry no `file`
+    and used `mesh_l<n>.bin`. A `file` must be a bare name inside this
+    directory: a manifest is data, and a path in it is not followed anywhere.
+    """
+    if not isinstance(entry, dict) or not isinstance(entry.get("level"), int):
+        return None
+    name = entry.get("file")
+    if name is None:
+        name = f"mesh_l{entry['level']}.bin"
+    if (not isinstance(name, str) or "/" in name or "\\" in name
+            or name.startswith(".") or not name.endswith(".bin")):
+        return None
+    return root / name
+
+
+def level_file_whole(root: Path, entry: dict) -> Path | None:
+    """`level_file`, and only if the file on disk is exactly the size the
+    manifest recorded. Byte counts drive which level a phone is sent; a level
+    trusted without this was served at 339,912 bytes under a 4,294-byte
+    budget."""
+    path = level_file(root, entry)
+    if path is None or not isinstance(entry.get("bytes"), int):
+        return None
+    try:
+        if path.stat().st_size != entry["bytes"]:
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def _prune_superseded_levels(root: Path, keep: set, older_than_s: float = 120.0) -> None:
+    """Remove level files no current manifest names, once they are old.
+
+    Not immediately: a reader that read the previous manifest a moment ago is
+    still entitled to that manifest's files. Two minutes is far longer than any
+    page composition, and far shorter than the gap between builds that matters
+    for disk.
+    """
+    now = time.time()
+    for path in root.glob("mesh_l*.bin"):
+        if path.name in keep:
+            continue
+        try:
+            if now - path.stat().st_mtime >= older_than_s:
+                path.unlink()
+        except OSError:
+            pass
+
+
 def _already_built(root: Path, digest, pdigest, force: bool):
     if force:
         return None
@@ -688,8 +817,7 @@ def _already_built(root: Path, digest, pdigest, force: bool):
     if man.get("params_digest") != pdigest:
         return None
     levels = man.get("levels") or []
-    if not levels or not all((root / f"mesh_l{i}.bin").exists()
-                             for i in range(len(levels))):
+    if not levels or not all(level_file_whole(root, lv) for lv in levels):
         return None
     return SurfaceResult(
         state=STATE_OK, frames_used=man.get("frames_used", 0),
@@ -720,13 +848,32 @@ def read_surface_manifest(store, world_id: str, session_id: str) -> dict | None:
     return man
 
 
-def read_surface_level(store, world_id: str, session_id: str, level: int) -> bytes:
-    path = surface_dir(store, world_id, session_id) / f"mesh_l{level}.bin"
+def read_surface_level(store, world_id: str, session_id: str, level: int,
+                       manifest: dict | None = None) -> bytes:
+    """The bytes of one level, as the manifest that describes it names them.
+
+    Read through the manifest, and checked against its byte count, so a level
+    from another build -- or a torn one -- is refused here and the ladder falls
+    to the next rung rather than serving it.
+    """
+    root = surface_dir(store, world_id, session_id)
+    man = manifest if manifest is not None else read_surface_manifest(
+        store, world_id, session_id)
+    entry = next((lv for lv in (man or {}).get("levels") or []
+                  if isinstance(lv, dict) and lv.get("level") == level), None)
+    path = level_file_whole(root, entry) if entry is not None else None
+    if path is None:
+        raise SurfaceUnavailable(
+            f"surface level {level} is not readable for this session")
     try:
-        return path.read_bytes()
+        data = path.read_bytes()
     except OSError as exc:
         raise SurfaceUnavailable(
             f"surface level {level} is not readable for this session") from exc
+    if len(data) != entry["bytes"]:
+        raise SurfaceUnavailable(
+            f"surface level {level} changed while it was being read")
+    return data
 
 
 def surface_currency(store, world_id: str, session_id: str,
