@@ -239,6 +239,25 @@ stated in the page and in `GET /worlds`.
 representation is comparing, and a silent substitution would corrupt the
 comparison.
 
+**The phone budget bounds the page, not the mesh.** The page inlines the
+chosen level base64-encoded (4/3 of its bytes) beside the viewer and its
+configuration. The served level is the largest whose **page** fits
+`MOBILE_BYTE_BUDGET` (6 MiB). The estimate is the template's size plus a
+64 KiB configuration allowance; if the composed page still exceeds the budget,
+the level is chosen once more with the measured overhead. The pack stage makes
+`mobile_level` fit that page. `lod_face_targets[mobile_level]` is a ceiling:
+the level is decimated again from its parent, scaled by the byte overshoot,
+until its page fits `params.mobile_page_bytes`. `detail.mobile_page_fit`
+records the result.
+
+Before this, the budget was applied to the mesh bytes. Live replay D's
+299,999-face phone level (5.88 MB) was served as a 7.89 MB page. Re-running
+the phone-level step on that walk's final surface gives 232,086 faces and a
+6.16 MB (5.87 MiB) page. A surface packed before this has no fitting level; it
+is served its smallest level, over budget, until it is rebuilt.
+`mobile_page_bytes` is in the params digest, so such a surface is not "already
+built".
+
 ## 9. Rebuilding
 
 Derived, and rebuildable from authoritative data alone:

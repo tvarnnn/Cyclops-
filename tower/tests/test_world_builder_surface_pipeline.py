@@ -1749,3 +1749,55 @@ def test_an_unreadable_surface_manifest_is_never_a_surface_none_revision(tmp_pat
     page = build_world_render(store, WORLD, SESSION)
     assert _meta(page, "wb-representation") == "surface"
     assert _meta(page, "wb-revision") is None, "no stamp rather than a false one"
+
+
+class TestThePhoneBudgetBoundsThePage:
+    """Live replay D: the budget was applied to the mesh bytes, the page inlines
+    the mesh base64-encoded, and a 5.88 MB level shipped as a 7.89 MB page
+    against a 6 MiB budget."""
+
+    def test_a_level_is_chosen_by_the_page_it_makes(self):
+        from tower.world_builder.surface_render import (
+            MOBILE_BYTE_BUDGET,
+            choose_level,
+            page_bytes_for_mesh,
+        )
+
+        mib = 1024 * 1024
+        manifest = {"levels": [{"level": 0, "bytes": 44 * mib},
+                               {"level": 1, "bytes": int(5.6 * mib)},
+                               {"level": 2, "bytes": int(4.2 * mib)}]}
+        assert manifest["levels"][1]["bytes"] < MOBILE_BYTE_BUDGET, "fixture: the mesh fits"
+        assert page_bytes_for_mesh(manifest["levels"][1]["bytes"]) > MOBILE_BYTE_BUDGET
+        assert choose_level(manifest, MOBILE_BYTE_BUDGET)["level"] == 2
+
+    def test_the_pack_stage_makes_the_phone_level_fit_its_page(self, tmp_path):
+        from tower.world_builder.surface_render import (
+            build_surface_page,
+            mesh_bytes_for_page,
+            page_overhead_bytes,
+        )
+
+        store = _synthetic_world(tmp_path)
+        SP.surfacify(store, WORLD, SESSION, params=_params(mobile_page_bytes=0))
+        free = _manifest(store)["levels"][1]
+        assert free["faces"] > 400, "fixture: a phone level worth shrinking"
+        budget = page_overhead_bytes() + (4 * free["bytes"] // 3) // 2
+
+        result = SP.surfacify(store, WORLD, SESSION, force=True,
+                              params=_params(mobile_page_bytes=budget))
+        assert result.state == SP.STATE_OK
+        man = _manifest(store)
+        phone = man["levels"][man["mobile_level"]]
+        fit = man["detail"]["mobile_page_fit"]
+        assert fit["fits"] and fit["decimations"] >= 1
+        assert phone["bytes"] <= mesh_bytes_for_page(budget)
+        assert phone["faces"] < free["faces"]
+        assert phone["faces"] > 0.3 * free["faces"], "the largest that fits, not a token mesh"
+        page = build_surface_page(store, WORLD, SESSION, budget_bytes=budget)
+        assert len(page.encode("utf-8")) <= budget
+
+    def test_the_phone_page_budget_is_part_of_what_was_built(self):
+        a = S.SurfaceParams().digest_fields()
+        b = S.SurfaceParams(mobile_page_bytes=1).digest_fields()
+        assert a != b

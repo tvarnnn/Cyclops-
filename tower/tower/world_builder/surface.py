@@ -68,6 +68,12 @@ byte layout is unchanged; the promise is not, so the name is not either, and
 every reader that checks for `SURFACE_FORMAT` refuses a filled artifact until
 someone decides it should not."""
 SURFACE_SCHEMA_VERSION = 1
+
+# What a phone is sent is a PAGE: the viewer template, its configuration, and
+# the mobile level's mesh base64-encoded inside it, which is 4/3 of the mesh's
+# bytes. The budget was once applied to the mesh bytes alone, and a 5.88 MB
+# level shipped as a 7.89 MB page (live replay D).
+MOBILE_PAGE_BYTES = 6 * 1024 * 1024
 MESH_MAGIC = b"WBSURF01"
 
 STAGE_DEPTH = "depth"
@@ -311,7 +317,8 @@ class SurfaceParams:
     # -- level of detail ----------------------------------------------------
     lod_face_targets: tuple[int, ...] = (0, 600_000, 300_000)
     """Faces per level; 0 means "no decimation". Level 0 is the archive,
-    level 2 is what a phone is sent. Each level is decimated from the one
+    level 2 is what a phone is sent, and its target is a ceiling: the pack
+    stage decimates it further until the page fits `mobile_page_bytes`. Each level is decimated from the one
     before it, not from level 0: decimation grows as faces^1.37, and on a
     20-30 minute walk decimating every level from the full mesh projected to
     41-72 minutes of packing alone."""
@@ -328,6 +335,13 @@ class SurfaceParams:
 
     mobile_level: int = 2
     canonical_level: int = 0
+
+    mobile_page_bytes: int = MOBILE_PAGE_BYTES
+    """The PAGE a phone is sent must fit this, and the pack stage makes the
+    `mobile_level` the largest decimation of its parent level that does:
+    `lod_face_targets[mobile_level]` is then a ceiling, not the answer. At
+    the canonical world's ~19.6 bytes a face, 6 MiB of page is about 238k
+    faces. 0 disables the fit (the target is used as given)."""
 
     component: int = 0
     """Only the reference component. Components share no unit, so fusing two
@@ -387,7 +401,7 @@ class SurfaceParams:
             self.contradiction_ratio, self.drop_back_facing, self.min_component_frac,
             self.smooth_iterations, self.smooth_lambda, self.smooth_mu,
             self.lod_face_targets, self.component, self.quality,
-            self.max_blocks, "lod-cascade",
+            self.max_blocks, "lod-cascade", ("mobile-page", self.mobile_page_bytes),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,

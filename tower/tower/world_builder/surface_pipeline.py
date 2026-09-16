@@ -838,6 +838,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     build_id = f"{time.time_ns():x}{os.getpid():x}"
     levels = []
     source = (V, F, C)
+    mobile_fit = None
     for level, target in enumerate(params.lod_face_targets):
         if _stopped(should_stop):
             # Pack is the longest stage and outlasts a hard stop's grace; it
@@ -845,10 +846,14 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             _discard_unpublished(root, levels)
             return _stop(root, STAGE_PACK, seconds)
         # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
+        parent = source
         Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(*source, target)
-        source = (Vl, Fl, Cl)
         N = vertex_normals(Vl, Fl)
         buf = write_mesh_bytes(Vl, Fl, Cl, N)
+        if level == params.mobile_level and params.mobile_page_bytes > 0:
+            Vl, Fl, Cl, buf, mobile_fit = _fit_mobile_page(
+                parent, (Vl, Fl, Cl), buf, target, params.mobile_page_bytes)
+        source = (Vl, Fl, Cl)
         name = f"mesh_l{level}.{build_id}.bin"
         write_bytes_atomic(root / name, lambda handle, data=buf: handle.write(data))
         levels.append({"level": level, "vertices": int(len(Vl)),
@@ -873,8 +878,42 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                            "truncation_floor": band_floor(voxel),
                            "truncation_rel": trel,
                            "evidence_filter": evidence_stats,
+                           "mobile_page_fit": mobile_fit,
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
+
+
+def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4):
+    """The phone level, decimated from its parent until its PAGE fits.
+
+    The largest level that fits, not a fixed face count: each attempt scales
+    the face count by the byte overshoot (bytes per face barely move under
+    decimation), with 2% of margin, from the same parent -- never from the
+    previous attempt, which would compound decimation error. A mesh that still
+    does not fit after `attempts` is kept and the record says so; the page
+    chooser then serves the smallest level there is.
+    """
+    from tower.world_builder.surface_render import (  # noqa: PLC0415
+        mesh_bytes_for_page,
+        page_bytes_for_mesh,
+    )
+
+    budget = mesh_bytes_for_page(page_bytes)
+    Vl, Fl, Cl = mesh
+    tries = 0
+    while len(buf) > budget and len(Fl) > 1 and tries < attempts:
+        fit = max(1, int(len(Fl) * budget / len(buf) * 0.98))
+        Vl, Fl, Cl = decimate(*parent, fit)
+        buf = write_mesh_bytes(Vl, Fl, Cl, vertex_normals(Vl, Fl))
+        tries += 1
+    record = {"page_budget_bytes": int(page_bytes), "mesh_budget_bytes": int(budget),
+              "face_target": int(target), "faces": int(len(Fl)),
+              "mesh_bytes": len(buf), "page_bytes_estimate": page_bytes_for_mesh(len(buf)),
+              "decimations": tries, "fits": len(buf) <= budget}
+    if not record["fits"]:
+        logger.warning("[Tower][WorldBuilder][surface] the phone level is %d bytes, over "
+                       "the %d a %d-byte page allows", len(buf), budget, page_bytes)
+    return Vl, Fl, Cl, buf, record
 
 
 def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,

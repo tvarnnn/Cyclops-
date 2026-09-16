@@ -20,7 +20,11 @@ import json
 import logging
 from pathlib import Path
 
-from tower.world_builder.surface import SurfaceUnavailable, read_mesh_bytes
+from tower.world_builder.surface import (
+    MOBILE_PAGE_BYTES,
+    SurfaceUnavailable,
+    read_mesh_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +32,38 @@ logger = logging.getLogger(__name__)
 # and that number has never run in a WKWebView. A mesh is cheaper per visible
 # surface than a point cloud is -- 150k triangles cover what a million points
 # only speckle -- so the same budget buys a great deal more here.
-MOBILE_BYTE_BUDGET = 6 * 1024 * 1024
+#
+# IT BOUNDS THE PAGE, not the mesh. The mesh is inlined base64-encoded, 4/3 of
+# its bytes, beside the viewer and its configuration; budgeting the mesh alone
+# served a 7.89 MB page for a 5.88 MB level (live replay D).
+MOBILE_BYTE_BUDGET = MOBILE_PAGE_BYTES
+
+# The configuration inlined beside the mesh: the camera path (at most 240
+# poses), the level list, the currency sentence. About 20 KiB on the canonical
+# world; the allowance is generous because under-estimating it is the failure.
+PAGE_CONFIG_ALLOWANCE = 64 * 1024
+
+
+def page_overhead_bytes() -> int:
+    """Everything in a surface page except the base64 mesh, estimated."""
+    try:
+        template = viewer_template_path().stat().st_size
+    except OSError:
+        template = 64 * 1024
+    return int(template) + PAGE_CONFIG_ALLOWANCE
+
+
+def page_bytes_for_mesh(mesh_bytes: int, overhead: int | None = None) -> int:
+    """The page a mesh of `mesh_bytes` makes."""
+    overhead = page_overhead_bytes() if overhead is None else int(overhead)
+    return overhead + 4 * ((int(mesh_bytes) + 2) // 3)
+
+
+def mesh_bytes_for_page(page_bytes: int, overhead: int | None = None) -> int:
+    """The largest mesh whose page fits `page_bytes`."""
+    overhead = page_overhead_bytes() if overhead is None else int(overhead)
+    return max(0, (int(page_bytes) - overhead) // 4 * 3)
+
 
 TOKEN_CONFIG = "__WB_SURFACE_CONFIG__"
 TOKEN_MESH = "__WB_SURFACE_MESH__"
@@ -63,8 +98,8 @@ def js_object_literal(value: dict) -> str:
     )
 
 
-def choose_level(manifest: dict, budget_bytes: int) -> dict:
-    """The largest level whose bytes fit the budget, else the smallest there is.
+def choose_level(manifest: dict, budget_bytes: int, overhead: int | None = None) -> dict:
+    """The largest level whose PAGE fits the budget, else the smallest there is.
 
     Never returns nothing. A world whose coarsest level still exceeds the
     budget is served anyway and the page says the budget was exceeded -- the
@@ -74,7 +109,8 @@ def choose_level(manifest: dict, budget_bytes: int) -> dict:
               if isinstance(lv.get("bytes"), int)]
     if not levels:
         raise SurfaceViewerUnavailable("the surface manifest lists no levels")
-    fitting = [lv for lv in levels if lv["bytes"] <= budget_bytes]
+    fitting = [lv for lv in levels
+               if page_bytes_for_mesh(lv["bytes"], overhead) <= budget_bytes]
     if fitting:
         return max(fitting, key=lambda lv: lv["bytes"])
     return min(levels, key=lambda lv: lv["bytes"])
@@ -100,7 +136,8 @@ def evidence_filter_ran(manifest: dict) -> bool:
 
 def build_surface_payload(store, world_id: str, session_id: str, *,
                           budget_bytes: int = MOBILE_BYTE_BUDGET,
-                          level: int | None = None):
+                          level: int | None = None,
+                          overhead: int | None = None):
     """Return (mesh bytes, config dict) for one session's best fitting level."""
     from tower.world_builder.surface_pipeline import (
         read_surface_level,
@@ -114,7 +151,7 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
             "this session has no surface reconstruction")
 
     chosen = (next((lv for lv in manifest["levels"] if lv["level"] == level), None)
-              if level is not None else choose_level(manifest, budget_bytes))
+              if level is not None else choose_level(manifest, budget_bytes, overhead))
     if chosen is None:
         raise SurfaceViewerUnavailable(f"the surface has no level {level}")
 
@@ -224,6 +261,11 @@ def _camera_up(store, world_id: str, session_id: str) -> list | None:
     return [round(float(v), 6) for v in mean / norm]
 
 
+def _compose(template: str, raw: bytes, config: dict) -> str:
+    page = template.replace(TOKEN_CONFIG, js_object_literal(config))
+    return page.replace(TOKEN_MESH, base64.b64encode(raw).decode("ascii"))
+
+
 def build_surface_page(store, world_id: str, session_id: str, *,
                        budget_bytes: int = MOBILE_BYTE_BUDGET,
                        level: int | None = None,
@@ -249,8 +291,17 @@ def build_surface_page(store, world_id: str, session_id: str, *,
 
     raw, config = build_surface_payload(
         store, world_id, session_id, budget_bytes=budget_bytes, level=level)
-    page = template.replace(TOKEN_CONFIG, js_object_literal(config))
-    page = page.replace(TOKEN_MESH, base64.b64encode(raw).decode("ascii"))
+    page = _compose(template, raw, config)
+    size = len(page.encode("utf-8"))
+    if level is None and size > budget_bytes:
+        # The overhead was an estimate; with the real one, a smaller level may
+        # fit. Chosen again once, never looped.
+        overhead = size - 4 * ((len(raw) + 2) // 3)
+        raw2, config2 = build_surface_payload(
+            store, world_id, session_id, budget_bytes=budget_bytes, overhead=overhead)
+        if config2["level"] != config["level"]:
+            raw, config = raw2, config2
+            page = _compose(template, raw, config)
     logger.info(
         "[Tower][WorldBuilder][surface] viewer for %s/%s: level %s, %s faces, "
         "%.1f MB of page", world_id, session_id, config["level"],
