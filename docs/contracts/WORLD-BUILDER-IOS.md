@@ -466,7 +466,11 @@ never reach WebKit, so the Tower's CSP reaches the phone only as the
 
 **The caption follows the page.** The native caption above the web view reads
 the page's `<meta name="wb-representation">` from its first 4096 characters:
-*Surfaces the Tower reconstructed…* (surface), *Points the Tower measured
+*Surfaces the Tower reconstructed from the walk, only where at least two camera
+views measured them and agreed. A gap is not proof that nothing is there. Not to
+scale.* (surface -- quoted whole, because the sentence it replaced, "Gaps are
+places nothing looked", is the claim `WORLD-BUILDER-SURFACE.md` §2 claim 2
+retracts), *Points the Tower measured
 densely…* (dense), *Points the Tower measured from the walk…* (sparse), and a
 rung-neutral *What the Tower reconstructed from the walk. Not to scale.* before
 the page arrives or for a page that declares nothing. Details says the page's

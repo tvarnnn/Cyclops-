@@ -1192,6 +1192,18 @@ final class WorldRenderRepresentationTests: XCTestCase {
         XCTAssertFalse(text.localizedCaseInsensitiveContains("not a surface"))
     }
 
+    /// Review 2, S1. The page and the contract retracted "gaps are places
+    /// nothing looked"; this caption sits directly above the page and kept
+    /// saying it. A hole is also where the views disagreed.
+    func testTheSurfaceCaptionDoesNotPresentAGapAsProofNobodyLooked() {
+        let text = WorldRenderRepresentation.caption(for: .surface)
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("nothing looked"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("gaps are places"))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("not proof"))
+        XCTAssertTrue(text.hasPrefix("Surfaces the Tower reconstructed"),
+                      "TowerSmokeUITests finds the surface rung by this prefix")
+    }
+
     func testThePointCaptionsStillRefuseToCallPointsASurface() {
         for rung in [WorldRenderRepresentation.dense, .sparse] {
             XCTAssertTrue(WorldRenderRepresentation.caption(for: rung).contains("Not a surface"))
