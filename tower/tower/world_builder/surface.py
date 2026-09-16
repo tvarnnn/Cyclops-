@@ -198,7 +198,20 @@ class SurfaceParams:
     # -- level of detail ----------------------------------------------------
     lod_face_targets: tuple[int, ...] = (0, 600_000, 150_000)
     """Faces per level; 0 means "no decimation". Level 0 is the archive,
-    level 2 is what a phone is sent."""
+    level 2 is what a phone is sent. Each level is decimated from the one
+    before it, not from level 0: decimation grows as faces^1.37, and on a
+    20-30 minute walk decimating every level from the full mesh projected to
+    41-72 minutes of packing alone."""
+
+    max_blocks: int = 360_000
+    """The field's budget, in 8^3 blocks: ~3.4 GiB of field at 20 bytes a
+    voxel, which with the frames held in host memory fits a 12 GB card with
+    room for the depth network and the viewer's host. A walk that would
+    allocate more gets a coarser voxel, chosen before the field is allocated
+    and recorded in the manifest, rather than an out-of-memory failure. Block
+    count follows the area of surface seen, not the number of frames -- 132
+    frames of a tight bathroom made 380k blocks -- so this binds on big or
+    cluttered spaces and on long walks alike. The canonical world is 234k."""
 
     mobile_level: int = 2
     canonical_level: int = 0
@@ -258,6 +271,7 @@ class SurfaceParams:
             self.depth_falloff, self.min_component_frac,
             self.smooth_iterations, self.smooth_lambda, self.smooth_mu,
             self.lod_face_targets, self.component, self.quality,
+            self.max_blocks, "lod-cascade",
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,

@@ -942,3 +942,50 @@ def test_the_surface_can_be_turned_off_and_needs_the_solve():
     no_solve = _world_build_spec(_settings(world_solve=False))
     assert "--surface" not in off.argv
     assert "--surface" not in no_solve.argv
+
+
+class TestTheFieldHasABudget:
+    """A 20-30 minute walk projected to exhaust a 12 GB card past ~900 frames
+    of new space. A walk that would exceed the budget gets a coarser voxel,
+    recorded, instead of an out-of-memory failure."""
+
+    def test_an_over_budget_walk_is_coarsened_and_says_so(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        free = SP.surfacify(store, WORLD, SESSION, params=_params())
+        free_voxel = _manifest(store)["voxel"]
+        free_blocks = free.blocks
+
+        tight = SP.surfacify(store, WORLD, SESSION, force=True,
+                             params=_params(max_blocks=max(1, free_blocks // 4)))
+        assert tight.state == SP.STATE_OK
+        man = _manifest(store)
+        detail = json.loads(tight.detail)
+        assert tight.blocks <= max(1, free_blocks // 4)
+        assert man["voxel"] > free_voxel * 1.5
+        assert detail["voxel_coarsened_by"] > 1.5
+        assert man["faces"] > 0
+
+    def test_a_walk_within_budget_is_untouched(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        result = SP.surfacify(store, WORLD, SESSION, params=_params())
+        assert json.loads(result.detail)["voxel_coarsened_by"] == 1.0
+
+    def test_every_level_after_the_first_is_decimated_from_its_predecessor(self, tmp_path):
+        import inspect
+
+        body = inspect.getsource(SP._build)
+        assert "decimate(*source, target)" in body
+
+    def test_the_status_names_the_stage_that_is_running(self, tmp_path):
+        store = _synthetic_world(tmp_path)
+        seen = []
+        root = SP.surface_dir(store, WORLD, SESSION)
+
+        def progress(stage, done, total):
+            try:
+                seen.append(json.loads((root / "status.json").read_text()).get("stage"))
+            except (OSError, ValueError):
+                pass
+
+        SP.surfacify(store, WORLD, SESSION, params=_params(), progress=progress)
+        assert "fuse" in seen

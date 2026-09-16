@@ -81,10 +81,16 @@ class TestOptIn:
         assert S.SurfaceParams.live().fill_radius_voxels() == 0
 
     def test_existing_artifacts_keep_their_digest(self):
-        """Adding the option must not rebuild every surface already on disk."""
+        """Adding the option must not rebuild every surface already on disk:
+        with the fill off, the digest carries no fill field at all. (Its
+        length is not pinned -- other parameters that DO change the output,
+        like the block budget, rightly join it.)"""
         p = S.SurfaceParams()
-        assert len(p.digest_fields()) == 20
-        assert "fill" not in p.digest_fields()
+        off = p.digest_fields()
+        assert "fill" not in off
+        assert p.fill_gap_frac not in off[len(off) - 2:]
+        on = S.SurfaceParams(fill_gap_frac=0.024).digest_fields()
+        assert on[:len(off)] == off, "turning the fill on must only append"
 
     def test_turning_it_on_changes_the_digest(self):
         on = S.SurfaceParams(fill_gap_frac=0.024)

@@ -27,6 +27,7 @@ is in the format and not in the reader's caller.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import time
@@ -513,28 +514,50 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     vol = SurfaceVolume(voxel, trunc, device=device)
 
     t = time.time()
-    # Prepare each frame ONCE and hold it on the device. Allocation and
-    # integration are two passes over the same frames, and decoding a JPEG and
-    # a depth map twice cost more than all the fusion arithmetic put together
-    # -- 296 s against 10 s of actual integration. Held compactly (float16
-    # depth, uint8 colour, bool mask) a 400-keyframe walk is well under a
-    # gigabyte beside a 2 GiB field.
-    cached, keys = [], []
+    _status(root, state=STATE_RUNNING, stage=STAGE_FUSE)
+    # Prepare each frame ONCE. Allocation and integration are two passes over
+    # the same frames, and decoding a JPEG and a depth map twice cost more than
+    # all the fusion arithmetic put together -- 296 s against 10 s. Held
+    # compactly and in HOST memory: on the GPU they cost 1.84 MiB a frame, which
+    # on a 20-30 minute walk is 5-8 GiB of VRAM the field needs.
+    cached = []
     for z, ok, img, R, tt, w in frames.prepared(params, median_depth, device):
-        keys.append(vol.blocks_for_depth(z, ok, R, tt, frames.K))
-        cached.append((z.to(torch.float16), ok, img.to(torch.uint8),
-                       R, tt, w.to(torch.float16)))
+        cached.append((z.to(torch.float16).cpu(), ok.cpu(), img.to(torch.uint8).cpu(),
+                       R, tt, w.to(torch.float16).cpu()))
         if _stopped(should_stop):
             return _stop(root, STAGE_FUSE, seconds)
-    if not keys:
+    if not cached:
         return _unavailable(root, "no frame produced usable depth")
-    vol.reserve(torch.cat(keys))
-    del keys
+
+    # Allocate within the block budget. If the walk's surface would need more
+    # blocks than `max_blocks`, coarsen the voxel -- block count scales with
+    # surface AREA, so by the square root of the overshoot -- and ask again.
+    # Allocation is about a second since key-space expansion, so a second pass
+    # is cheap, and it happens before a byte of field exists.
+    coarsened = 1.0
+    for _attempt in range(6):
+        keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt, frames.K)
+                for z, ok, _img, R, tt, _w in cached]
+        allk = torch.unique(torch.cat(keys))
+        del keys
+        if params.max_blocks <= 0 or allk.numel() <= params.max_blocks:
+            break
+        factor = math.sqrt(allk.numel() / params.max_blocks) * 1.05
+        coarsened *= factor
+        voxel *= factor
+        trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
+        logger.info("[Tower][WorldBuilder][surface] %d blocks exceeds the budget of "
+                    "%d; voxel coarsened x%.2f to %.5f", allk.numel(),
+                    params.max_blocks, coarsened, voxel)
+        vol = SurfaceVolume(voxel, trunc, device=device)
+    vol.reserve(allk)
+    del allk
 
     used = 0
     for i, (z, ok, img, R, tt, w) in enumerate(cached):
-        vol.integrate(z.float(), ok, img.float(), R, tt, frames.K,
-                      params=params, weight_img=w.float())
+        vol.integrate(z.to(device).float(), ok.to(device), img.to(device).float(),
+                      R, tt, frames.K, params=params,
+                      weight_img=w.to(device).float())
         used += 1
         if progress is not None and i % 25 == 0:
             progress(STAGE_FUSE, i, len(frames))
@@ -542,6 +565,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             return _stop(root, STAGE_FUSE, seconds)
     del cached
     seconds[STAGE_FUSE] = round(time.time() - t, 2)
+    _status(root, state=STATE_RUNNING, stage=STAGE_MESH)
 
     t = time.time()
     fill_stats = None
@@ -581,9 +605,13 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         return _stop(root, STAGE_MESH, seconds)
 
     t = time.time()
+    _status(root, state=STATE_RUNNING, stage=STAGE_PACK)
     levels = []
+    source = (V, F, C)
     for level, target in enumerate(params.lod_face_targets):
-        Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(V, F, C, target)
+        # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
+        Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(*source, target)
+        source = (Vl, Fl, Cl)
         N = vertex_normals(Vl, Fl)
         buf = write_mesh_bytes(Vl, Fl, Cl, N)
         write_bytes_atomic(root / f"mesh_l{level}.bin",
@@ -599,6 +627,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         detail=json.dumps({"components": comp_stats,
                            "median_vertex_move_voxels": round(moved / voxel, 3),
                            "weld": weld_stats,
+                           "voxel_coarsened_by": round(coarsened, 4),
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
 
