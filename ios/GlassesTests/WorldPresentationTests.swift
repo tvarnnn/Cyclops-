@@ -1153,3 +1153,64 @@ final class WorldStageMacGateTests: XCTestCase {
         }
     }
 }
+
+
+/// The caption under the viewer follows the rung the Tower served.
+///
+/// It used to say "Not a surface" unconditionally. Once the Tower serves a
+/// surface that sentence denies what is on screen, which is as wrong as a
+/// caption that overclaims.
+@MainActor
+final class WorldRenderRepresentationTests: XCTestCase {
+    private func page(_ rung: String) -> String {
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<meta name=\"wb-representation\" content=\"\(rung)\">"
+            + "<title>x</title></head><body></body></html>"
+    }
+
+    func testEachRungIsReadFromThePage() {
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("surface")), .surface)
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("dense")), .dense)
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("sparse")), .sparse)
+    }
+
+    func testAPageFromAnOlderTowerDeclaresNothing() {
+        XCTAssertNil(WorldRenderRepresentation.declared(in: "<html><head></head></html>"))
+    }
+
+    func testAnUnknownRungIsNotGuessed() {
+        XCTAssertNil(WorldRenderRepresentation.declared(in: page("splat")))
+    }
+
+    func testTheTagIsOnlyLookedForInTheHead() {
+        let late = String(repeating: " ", count: 5000) + page("surface")
+        XCTAssertNil(WorldRenderRepresentation.declared(in: late))
+    }
+
+    func testTheSurfaceCaptionDoesNotDenyTheSurface() {
+        let text = WorldRenderRepresentation.caption(for: .surface)
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("not a surface"))
+    }
+
+    func testThePointCaptionsStillRefuseToCallPointsASurface() {
+        for rung in [WorldRenderRepresentation.dense, .sparse] {
+            XCTAssertTrue(WorldRenderRepresentation.caption(for: rung).contains("Not a surface"))
+        }
+    }
+
+    func testNoCaptionClaimsAScale() {
+        let rungs: [WorldRenderRepresentation?] = [.surface, .dense, .sparse, nil]
+        for rung in rungs {
+            XCTAssertTrue(
+                WorldRenderRepresentation.caption(for: rung).localizedCaseInsensitiveContains("not to scale"),
+                "caption for \(String(describing: rung)) must not imply a size"
+            )
+        }
+    }
+
+    func testTheStateReadsTheRungOffItsPage() {
+        XCTAssertEqual(WorldRenderViewerState.ready(html: page("surface")).representation, .surface)
+        XCTAssertEqual(WorldRenderViewerState.rendering(html: page("dense")).representation, .dense)
+        XCTAssertNil(WorldRenderViewerState.fetching.representation)
+    }
+}

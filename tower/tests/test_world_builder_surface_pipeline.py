@@ -623,3 +623,42 @@ class TestASurfaceIsGeometry:
         man["faces"] = 0
         path.write_text(json.dumps(man))
         assert not session_has_drawable_geometry(store, WORLD, SESSION)
+
+
+# ---------------------------------------------------------------------------
+# every rung declares itself
+#
+# The phone's native caption follows the rung the page declares. The app used
+# to caption every page "Not a surface"; now it reads
+# <meta name="wb-representation"> from the first 4096 characters of the page
+# and says what is shown, so every rung must declare itself, in the head.
+# ---------------------------------------------------------------------------
+
+
+def _declared(html):
+    import re
+
+    m = re.search(r'name="wb-representation" content="([a-z]+)"', html[:4096])
+    return m.group(1) if m else None
+
+
+def test_the_surface_page_declares_surface(tmp_path):
+    from tower.world_builder.surface_render import build_surface_page
+
+    store = _synthetic_world(tmp_path)
+    SP.surfacify(store, WORLD, SESSION, params=_params())
+    assert _declared(build_surface_page(store, WORLD, SESSION)) == "surface"
+
+
+def test_the_sparse_page_declares_sparse(tmp_path):
+    from tower.results.world_builder_render import build_world_render
+
+    store = _synthetic_world(tmp_path)
+    assert _declared(build_world_render(store, WORLD, SESSION,
+                                        representation="sparse")) == "sparse"
+
+
+def test_the_dense_template_declares_dense():
+    from tower.world_builder.dense_render import viewer_template_path
+
+    assert _declared(viewer_template_path().read_text(encoding="utf-8")) == "dense"

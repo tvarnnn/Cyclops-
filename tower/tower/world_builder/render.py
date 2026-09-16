@@ -582,7 +582,7 @@ CAPTION_BEHIND = ("This picture is BEHIND the newest keyframes: the Tower has "
 # fingers pinch to zoom and drag to pan. `touch-action: none` keeps the
 # page from scrolling or zooming underneath the canvas.
 _CANVAS_VIEWER = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<html><head><meta charset="utf-8"><meta name="wb-representation" content="sparse"><title>__TITLE__</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
 :root{--bg:__PRODUCT_BG__;--fg:#1c1b19;--bar:#e9e7e2;--sub:#55524d;--edge:#d2cec7;--warn:#a4400a}

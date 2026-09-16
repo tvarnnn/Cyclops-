@@ -254,6 +254,61 @@ enum WorldRenderViewerState: Equatable {
         if case .failed(_, let retryable) = self { return retryable }
         return false
     }
+
+    /// Which reconstruction the Tower's page is, once there is a page.
+    var representation: WorldRenderRepresentation? {
+        html.flatMap(WorldRenderRepresentation.declared(in:))
+    }
+}
+
+/// Which rung of the Tower's reconstruction ladder a page is.
+///
+/// The Tower serves the best reconstruction a session has -- a surface, then
+/// dense points, then the sparse points -- and each page names its rung in a
+/// `<meta name="wb-representation">` tag. It is read from the page itself,
+/// rather than from a response header, so `WorldRenderClient.page(for:)` keeps
+/// its signature and every stub of it keeps working.
+///
+/// It exists for ONE sentence: the caption under the viewer. That caption used
+/// to say "Not a surface" unconditionally, which was true of every page the
+/// Tower could serve until it could serve a surface. A caption that denies what
+/// is on screen is the same failure as one that overclaims.
+nonisolated enum WorldRenderRepresentation: String, Equatable {
+    case surface
+    case dense
+    case sparse
+
+    /// The rung a page declares, or `nil` for a page that declares none -- every
+    /// page from a Tower that predates the declaration.
+    static func declared(in html: String) -> WorldRenderRepresentation? {
+        // A plain scan, not a parser: the tag is written by the Tower, in the
+        // head, in one fixed spelling, and the page can be megabytes long, so
+        // only its first few kilobytes are looked at.
+        let head = html.prefix(4096)
+        guard let marker = head.range(of: "name=\"wb-representation\" content=\"") else {
+            return nil
+        }
+        let rest = head[marker.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return WorldRenderRepresentation(rawValue: String(rest[..<end]))
+    }
+
+    /// The caption for a page of this rung, or for a page not yet known.
+    ///
+    /// Every variant keeps "not to scale" in it, because the one claim no rung
+    /// can make yet is a real-world size: scale is unknown on every world.
+    static func caption(for representation: WorldRenderRepresentation?) -> String {
+        switch representation {
+        case .surface:
+            return "Surfaces the Tower reconstructed from the walk, only where the cameras measured them. Gaps are places nothing looked. Not to scale."
+        case .dense:
+            return "Points the Tower measured densely from the walk. Not a surface, and not to scale."
+        case .sparse:
+            return "Points the Tower measured from the walk, with the camera path through them. Not a surface, and not to scale."
+        case nil:
+            return "What the Tower reconstructed from the walk. Not to scale."
+        }
+    }
 }
 
 /// Something the page itself did, reported by the web view's delegate.
@@ -793,10 +848,11 @@ struct WorldRenderScene: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            // True of the product rendering and of the diagnostics one, and
-            // true whether the Tower colours by photometric RGB or by segment
-            // index. "Not a surface" is the load-bearing half.
-            Text("Points the Tower measured from the walk, with the camera path through them. Not a surface, and not to scale.")
+            // Follows the page. "Not a surface" was load-bearing while every
+            // page was points; the Tower can now serve a surface, and a caption
+            // that denies what is on screen is as wrong as one that overclaims.
+            // Before the page arrives it claims neither.
+            Text(WorldRenderRepresentation.caption(for: model.state.representation))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

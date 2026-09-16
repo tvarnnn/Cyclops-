@@ -209,8 +209,12 @@ final class TowerSmokeUITests: XCTestCase {
         XCTAssertTrue(reveal(complete))
 
         // The 3D world opens from the tap itself. No second control.
+        //
+        // Pinned on "not to scale", the one phrase every rung's caption
+        // shares: the caption now follows the page, and a surface is not "Not
+        // a surface". What must hold on every rung is that no size is claimed.
         let caption = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+            NSPredicate(format: "label CONTAINS[c] %@", "not to scale")
         ).firstMatch
         XCTAssertTrue(tap(complete, until: caption.exists),
                       "tapping a session opens its 3D world, with no further tap")
@@ -347,7 +351,7 @@ final class TowerSmokeUITests: XCTestCase {
         // And tapping it leads nowhere: no 3D screen, so no caption from one.
         noGeometry.tap()
         let caption = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+            NSPredicate(format: "label CONTAINS[c] %@", "not to scale")
         ).firstMatch
         XCTAssertFalse(caption.waitForExistence(timeout: 3),
                        "a session with nothing to draw must not push a 3D screen")
