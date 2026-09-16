@@ -107,10 +107,15 @@ by observation:
     status.json          the stage's state, with the pid that wrote it
     mesh_l0.<build>.bin  level 0, the archive
     mesh_l1.<build>.bin  level 1
-    mesh_l2.<build>.bin  level 2, what a phone is sent
+    mesh_l2.<build>.bin  level 2, the final build's phone level
     .surface.lock        held while a build runs
     surface.log          the live child's output, when the builder ran one
 ```
+
+A final build has three levels and `mobile_level` 2. A live build has two
+(`lod_face_targets` `(0, 120000)`, `mobile_level` 1): `mesh_l0` and a 120k-face
+`mesh_l1`. The phone is sent the largest level whose page fits the budget (§8),
+which is not necessarily `mobile_level`.
 
 Every file is published atomically: the bytes are written to a staging path
 and renamed only once whole. A reader therefore sees either the previous
@@ -180,7 +185,7 @@ distinguishable from corruption.
 | `format` | `wb-surface-mesh/1` |
 | `schema_version` | 1 |
 | `input_digest` | the solve this was built from; compare with the live solve to detect staleness |
-| `params_digest` | input digest plus every parameter that affects the result |
+| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle). Recomputing it from `params` alone does not reproduce it |
 | `params` | the full parameter set, including `quality` |
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
 | `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |
@@ -197,9 +202,9 @@ distinguishable from corruption.
 | `closure` | the sentence stating that unobserved space is absent, and that a hole may also be space the frames disagreed about |
 
 `params.quality` is `live` or `final`. A live artifact is coarser — twice the
-voxel, one level of detail, a lighter smoothing pass, `min_weight` 1.5 rather
-than 2.0 — because it is built during the walk against the gap between global
-solves. The two-frame and contradiction tests are the same for live.
+voxel, two levels of detail rather than three, a lighter smoothing pass,
+`min_weight` 1.5 rather than 2.0 — because it is built during the walk against
+the gap between global solves. The two-frame and contradiction tests are the same for live.
 
 **Where depth is used does not depend on the scene scale.** Each frame's depth
 is used out to `anchor_depth_multiple` (1.5) times that frame's own farthest
@@ -210,7 +215,29 @@ keyframes had 1.09x / 1.14x / 1.09x the final scale (it was 1.27x / 1.39x /
 1.20x when it was a sampled dense-depth median).
 The final build replaces the live one in the same directory, because the
 product question is always "the best available reconstruction of this
-session".
+session". **Exception:** the final surface needs the final global solve. When
+that solve fails or solves nothing, no final surface is built, and the saved
+world keeps the last live artifact (`params.quality: live`) from an earlier
+background solve; the finalization report says why.
+
+**States.** `status.json` `state` is `running`, `ok`, `stopped`, `failed` or
+`unavailable`. `unavailable` with `permanent: true` means **this machine** cannot
+run the depth network: its package or torch is not installed, the backend is
+unknown, or its weights are neither in the Hugging Face cache nor downloadable
+(offline on a machine that never fetched them; the default `moge2-vitl` is about
+1.3 GB). The detail names the model and the cache. `world_surface.py` exits 4
+for it, and the builder stops launching live surfaces **for the rest of that
+walk**; the final build after Stop, `world_surface.py`, and the next walk all
+try again, so a network that returns is used then. A refusal about one
+session's inputs (for example a camera the poses were not solved in) is
+`unavailable` without `permanent`. A first download of the weights is logged
+with its size and time.
+
+**`live` in the revision route turns false once the build has published.** A
+build writes its manifest, prunes superseded levels, and only then writes `ok`.
+A stage whose `manifest.json` is newer than its `running` `status.json` is not
+reported live (`WORLD-BUILDER-WORLDS.md` §4a), so a poll in that gap sees the
+finished build with `live: false`.
 
 ## 7. Staleness
 
@@ -232,7 +259,9 @@ non-current geometry.
 value starts the walk at its own rung. A rung whose module fails to import, or
 whose artifact is unreadable, falls through to the next one — the viewer never
 loses the world to a bug in a better renderer. The rung actually served is
-stated in the page and in `GET /worlds`.
+stated in the page (`<meta name="wb-representation">`) and by
+`GET /worlds/{id}/render/revision`; the `GET /worlds` listing does **not** state
+it (its per-session `dense` object is the only artifact summary there).
 
 `representation=surface` on a session that has no surface at all returns
 **404** rather than silently serving points: a caller that pinned a
@@ -256,7 +285,21 @@ the phone-level step on that walk's final surface gives 232,086 faces and a
 6.16 MB (5.87 MiB) page. A surface packed before this has no fitting level; it
 is served its smallest level, over budget, until it is rebuilt.
 `mobile_page_bytes` is in the params digest, so such a surface is not "already
-built".
+built". Rebuilding it re-predicts depth for every frame as well, because the
+dense fill-mask rule (`FILL_RULE`) also moved and invalidates the depth cache:
+about 50-70 s of GPU for 400 keyframes.
+
+**`max_points` floors at the smallest level.** It lowers the page budget to
+`max_points x 16` bytes, but when no level fits, the smallest level is served,
+over that budget. The phone level is normally already the smallest, so
+`max_points` cannot make a surface page smaller than the default one; it can
+only keep a larger level from being chosen. `level=` requests are not bounded.
+
+**The dense rung is not held to the page budget.** Its 6 MB budget is on the
+binary point buffer, which the page inlines base64-encoded (4/3 of its size): the
+canonical densified world's dense page measured 8,028,516 bytes. Known and
+accepted, because the dense stage is off by default (`TOWER_WORLD_DENSIFY=false`)
+and `auto` serves it only on a densified world with no surface.
 
 **The vertical is an estimate, stated as one.** The solve declares no up
 (`up_axis: unknown`). The page's configuration carries `up`, seeded by the
