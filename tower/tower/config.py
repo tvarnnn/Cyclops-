@@ -535,6 +535,17 @@ class Settings:
     # decision rather than a surprise.
     world_densify: bool = False
 
+    # Surface reconstruction: ON, and that default is also the decision.
+    #
+    # The saved world IS the reconstruction. A coarse surface is rebuilt during
+    # the walk whenever a background solve lands, and the full one after Stop,
+    # so the wearer watches the room assemble and Saved Worlds opens a surface
+    # rather than a cloud of feature points. It shares the depth stage with
+    # `world_densify` when both are on. It needs the solve, and degrades to the
+    # sparse picture -- never to no picture -- when the depth network is not
+    # installed.
+    world_surface: bool = True
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -582,6 +593,7 @@ def get_settings() -> Settings:
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
         world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
+        world_surface=_flag("TOWER_WORLD_SURFACE", default=True),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),

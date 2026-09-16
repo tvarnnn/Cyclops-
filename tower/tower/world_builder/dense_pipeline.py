@@ -443,6 +443,7 @@ def run_depth_stage(
     store, world_id: str, session_id: str, solution, intrinsics, params: DenseParams,
     root: Path, *, should_stop=None, progress: Callable[[str, int, int], None] | None = None,
     prior: dict | None = None,
+    reuse_predictions: dict | None = None,
 ) -> dict:
     """Undistort, predict depth, and align every posed keyframe in the component.
 
@@ -528,6 +529,20 @@ def run_depth_stage(
     if done:
         logger.info('[Tower][WorldBuilder][dense] resuming depth: %d frames already done',
                     len(done))
+    # PREDICTIONS ARE REUSABLE ACROSS SOLVES; FITS ARE NOT.
+    #
+    # `prior` above resumes whole RECORDS, and a record carries the frame's
+    # affine fit to the solve's sparse points -- valid only for the solve it
+    # was fitted against. `reuse_predictions` is the other half: `{ki: kid}`
+    # of frames whose raw network output on disk is known to be for that
+    # keyframe from this backend. The network's output depends only on the
+    # keyframe image, so it is loaded instead of re-predicted and the fit is
+    # computed afresh against THIS solve. During a walk each live surface is
+    # built from a new solve over more keyframes; without this, every one of
+    # them re-predicted every frame -- 200 s of GPU on a 400-keyframe walk --
+    # and with only a digest check it silently kept the old fits instead.
+    reuse_predictions = reuse_predictions or {}
+    reused = 0
     records: list[dict] = []
     t0 = time.time()
     obs_kf = solution.observations[:, 0]
@@ -545,6 +560,22 @@ def run_depth_stage(
                     "kind": backend.kind}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
+
+        pred_path = work / "depth" / f"{ki:05d}_pred.npy"
+        fill_path = work / "depth" / f"{ki:05d}_fill.npy"
+        undist_path = work / "undist" / f"{ki:05d}.jpg"
+        if (reuse_predictions.get(int(ki)) == kid and pred_path.exists()
+                and fill_path.exists() and undist_path.exists()):
+            disp = np.load(pred_path).astype(np.float32)
+            fill_u = np.load(fill_path)
+            fill_fraction = float(fill_u.mean())
+            origin = "reused-prediction"
+            origins[origin] = origins.get(origin, 0) + 1
+            reused += 1
+            records.append(_fit_record(
+                ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
+                obs_kf, obs_pt, K, W, H, params, backend, work))
+            continue
 
         data, origin, exact_fill = keyframe_image_bytes(
             store, world_id, session_id, kid, sources.get(kid), redactor,
@@ -601,77 +632,19 @@ def run_depth_stage(
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         disp = backend.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-        m = obs_kf == ki
-        if int(m.sum()) < params.min_sparse_points:
-            records.append({"ki": int(ki), "ok": False,
-                            "why": f"only {int(m.sum())} sparse observations"})
-            continue
-        uv = solution.observation_xy[m].astype(np.float64)
-        R = np.asarray(pose["rotation"], float).reshape(3, 3)
-        t = np.asarray(pose["translation"], float)
-        _, zc = project(R, t, K, solution.xyz[obs_pt[m]].astype(np.float64))
-        g = ((zc > 1e-3) & (uv[:, 0] >= 0) & (uv[:, 0] < W - 1)
-             & (uv[:, 1] >= 0) & (uv[:, 1] < H - 1))
-        if int(g.sum()) < params.min_sparse_points:
-            records.append({"ki": int(ki), "ok": False,
-                            "why": f"only {int(g.sum())} sparse points inside the frame"})
-            continue
-        ui = np.clip(np.rint(uv[g, 0]).astype(int), 0, W - 1)
-        vi = np.clip(np.rint(uv[g, 1]).astype(int), 0, H - 1)
-        # THE FIT MUST NOT BE ANCHORED ON PIXELS NOBODY OBSERVED.
-        #
-        # `fill_u` marks what the face redactor blacked out and what this stage
-        # then handed to an inpainter. Masking those pixels out of the CLOUD
-        # afterwards -- which `run_fuse_stage` does -- removes the invented
-        # points but not the invented FIT they produced, and (a, b) is a global
-        # per-frame scale and offset applied to every surviving pixel. A fit
-        # derived from invention was being applied to the real scene.
-        #
-        # It was not rare. On the widest traverse, 25.3% of fit anchors landed
-        # in inpainted pixels on average, 30 gate-passing frames had over half
-        # their anchors there, and nine had essentially all of them -- one at
-        # 1.000, whose stored keyframe is entirely black, and which scored a
-        # 1.88% held-out residual against the world's 2.9% median.
-        #
-        # THE GATE COULD NOT SEE IT, AND PREFERRED IT. Both halves of the
-        # held-out split come from the same anchors in the same invented
-        # region, and a TELEA inpaint is a smooth interpolant that an affine
-        # model fits very well -- so more invention scored better. Re-anchoring
-        # those 30 frames on clean points alone moves the depth by a median
-        # 12.8% and a maximum of 467%, and three of them flip to a negative `a`,
-        # the value the fusion stage explicitly refuses.
-        clean = ~fill_u[vi, ui].astype(bool)
-        n_clean = int(clean.sum())
-        if n_clean < params.min_sparse_points:
-            records.append({"ki": int(ki), "ok": False,
-                            "why": (f"only {n_clean} sparse anchors outside the "
-                                    "redaction fill"),
-                            "anchors_total": int(g.sum()),
-                            "redaction_fill_fraction": fill_fraction})
-            continue
-        ui, vi = ui[clean], vi[clean]
-        zc_fit = zc[g][clean]
-        a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc_fit, backend.kind)
-        # float16: the depth values run 0.2-40 in world units and the pipeline's
-        # own error is a few percent, so three significant digits is far more
-        # than the evidence supports -- and it halves the largest thing this
-        # stage writes.
-        np.save(work / "depth" / f"{ki:05d}.npy", disp.astype(np.float16))
-        records.append({"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
-                        "n_points": int(g.sum()), "held_out_rel": ho,
-                        # From the CLEAN anchors, for the same reason the fit
-                        # is: a bound computed from invented pixels bounds
-                        # nothing.
-                        "z_sparse_min": float(np.min(zc_fit)),
-                        "z_sparse_max": float(np.max(zc_fit)),
-                        "anchors_used": int(len(zc_fit)),
-                        "anchors_in_fill": int(g.sum()) - int(len(zc_fit)),
-                        "redaction_fill_fraction": fill_fraction,
-                        "image_origin": origin})
+        # Saved BEFORE the fit, under its own name, so a frame whose fit fails
+        # against this solve -- too few sparse points yet -- still has its
+        # prediction for the next solve to fit against.
+        np.save(pred_path, disp.astype(np.float16))
+        records.append(_fit_record(
+            ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
+            obs_kf, obs_pt, K, W, H, params, backend, work))
 
     if progress:
         progress(STAGE_DEPTH, len(targets), len(targets))
+    if reused:
+        logger.info("[Tower][WorldBuilder][dense] depth: %d of %d predictions "
+                    "reused from an earlier solve and refitted", reused, len(targets))
     payload = {"records": records, "seconds": time.time() - t0, "camera": cam,
                "targets": len(targets), "backend": backend.name,
                "backend_licence": backend.licence, "kind": backend.kind,
@@ -683,6 +656,95 @@ def run_depth_stage(
                    getattr(redactor, "label", None) if redactor.available else None)}
     _write_json(root / "align.json", payload)
     return payload
+
+
+def _fit_record(ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
+                obs_kf, obs_pt, K, W, H, params, backend, work) -> dict:
+    """Fit one frame's depth prediction to THIS solve's sparse points.
+
+    Separated from prediction so that a prediction made during an earlier
+    solve can be fitted again against a later one. The body is the depth
+    stage's original fit, moved and unchanged in what it computes.
+    """
+    m = obs_kf == ki
+    if int(m.sum()) < params.min_sparse_points:
+        return {"ki": int(ki), "kid": kid, "ok": False,
+                "why": f"only {int(m.sum())} sparse observations"}
+    uv = solution.observation_xy[m].astype(np.float64)
+    R = np.asarray(pose["rotation"], float).reshape(3, 3)
+    t = np.asarray(pose["translation"], float)
+    _, zc = project(R, t, K, solution.xyz[obs_pt[m]].astype(np.float64))
+    g = ((zc > 1e-3) & (uv[:, 0] >= 0) & (uv[:, 0] < W - 1)
+         & (uv[:, 1] >= 0) & (uv[:, 1] < H - 1))
+    if int(g.sum()) < params.min_sparse_points:
+        return {"ki": int(ki), "kid": kid, "ok": False,
+                "why": f"only {int(g.sum())} sparse points inside the frame"}
+    ui = np.clip(np.rint(uv[g, 0]).astype(int), 0, W - 1)
+    vi = np.clip(np.rint(uv[g, 1]).astype(int), 0, H - 1)
+    # THE FIT MUST NOT BE ANCHORED ON PIXELS NOBODY OBSERVED.
+    #
+    # `fill_u` marks what the face redactor blacked out and what this stage
+    # then handed to an inpainter. Masking those pixels out of the CLOUD
+    # afterwards -- which `run_fuse_stage` does -- removes the invented
+    # points but not the invented FIT they produced, and (a, b) is a global
+    # per-frame scale and offset applied to every surviving pixel. A fit
+    # derived from invention was being applied to the real scene.
+    #
+    # It was not rare. On the widest traverse, 25.3% of fit anchors landed
+    # in inpainted pixels on average, 30 gate-passing frames had over half
+    # their anchors there, and nine had essentially all of them -- one at
+    # 1.000, whose stored keyframe is entirely black, and which scored a
+    # 1.88% held-out residual against the world's 2.9% median.
+    #
+    # THE GATE COULD NOT SEE IT, AND PREFERRED IT. Both halves of the
+    # held-out split come from the same anchors in the same invented
+    # region, and a TELEA inpaint is a smooth interpolant that an affine
+    # model fits very well -- so more invention scored better. Re-anchoring
+    # those 30 frames on clean points alone moves the depth by a median
+    # 12.8% and a maximum of 467%, and three of them flip to a negative `a`,
+    # the value the fusion stage explicitly refuses.
+    clean = ~fill_u[vi, ui].astype(bool)
+    n_clean = int(clean.sum())
+    if n_clean < params.min_sparse_points:
+        return {"ki": int(ki), "kid": kid, "ok": False,
+                "why": (f"only {n_clean} sparse anchors outside the "
+                                "redaction fill"),
+                "anchors_total": int(g.sum()),
+                "redaction_fill_fraction": fill_fraction}
+    ui, vi = ui[clean], vi[clean]
+    zc_fit = zc[g][clean]
+    a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc_fit, backend.kind)
+    # float16: the depth values run 0.2-40 in world units and the pipeline's
+    # own error is a few percent, so three significant digits is far more
+    # than the evidence supports -- and it halves the largest thing this
+    # stage writes.
+    np.save(work / "depth" / f"{ki:05d}.npy", disp.astype(np.float16))
+    return {"ki": int(ki), "kid": kid, "ok": True, "a": a, "b": b,
+                    "n_points": int(g.sum()), "held_out_rel": ho,
+                    # From the CLEAN anchors, for the same reason the fit
+                    # is: a bound computed from invented pixels bounds
+                    # nothing.
+                    "z_sparse_min": float(np.min(zc_fit)),
+                    "z_sparse_max": float(np.max(zc_fit)),
+                    "anchors_used": int(len(zc_fit)),
+                    "anchors_in_fill": int(g.sum()) - int(len(zc_fit)),
+                    "redaction_fill_fraction": fill_fraction,
+                    "image_origin": origin}
+
+
+def reusable_predictions(align_path: Path, backend: str) -> dict:
+    """`{ki: kid}` for every frame an earlier depth stage predicted with this
+    backend, read off its `align.json`. Empty when there is none or it cannot
+    be read; the depth stage then predicts every frame, which is slower and
+    never wrong."""
+    try:
+        cached = json.loads(align_path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if cached.get("backend") != backend:
+        return {}
+    return {int(r["ki"]): r["kid"] for r in cached.get("records") or []
+            if isinstance(r, dict) and r.get("kid") and r.get("ki") is not None}
 
 
 def run_fuse_stage(
@@ -1224,7 +1286,7 @@ def densify(
                 else:
                     logger.info(
                         "[Tower][WorldBuilder][dense] depth cache is for %r, now "
-                        "asked for %r: recomputing", cached.get("cache_key"), want,
+                        "asked for %r: refitting", cached.get("cache_key"), want,
                     )
             except (OSError, ValueError):
                 align = None
@@ -1232,8 +1294,11 @@ def densify(
             t = time.time()
             align = run_depth_stage(store, world_id, session_id, solution, intrinsics,
                                     params, root, should_stop=should_stop,
-                                    progress=progress, prior=prior)
+                                    progress=progress, prior=prior,
+                                    reuse_predictions=reusable_predictions(
+                                        align_path, params.backend))
             align["digest"] = digest
+            align["input_digest"] = digest
             align["cache_key"] = _depth_cache_key(digest, params)
             _write_json(align_path, align)
             seconds[STAGE_DEPTH] = time.time() - t

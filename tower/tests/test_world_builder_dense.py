@@ -482,7 +482,10 @@ def test_dense_never_reads_the_solve_workspace_images():
         dense_pipeline.keyframe_image_bytes.__doc__
     import inspect
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     assert 'solve_images' not in body
     assert 'keyframe_image_bytes(' in body
 
@@ -1109,7 +1112,10 @@ def test_raw_pixels_never_leave_the_privacy_boundary():
 
     from tower.world_builder import dense_pipeline
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     assert "raw_bytes" not in body
     assert "exact_fill" in body
 
@@ -1202,7 +1208,10 @@ def test_the_depth_stage_reads_the_sessions_redaction_record():
 
     from tower.world_builder import dense_pipeline
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     assert "read_session" in body
     assert "REDACTION_NONE" in body
     assert "keyframes_are_redacted=keyframes_are_redacted" in body
@@ -1215,7 +1224,10 @@ def test_align_records_the_sessions_redaction_not_the_loaded_redactors_label():
 
     from tower.world_builder import dense_pipeline
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     assert '"redaction": session_redaction' in body
     assert '"keyframes_were_redacted_at_capture"' in body
 
@@ -1845,7 +1857,10 @@ def test_the_fit_excludes_anchors_inside_the_redaction_fill():
 
     from tower.world_builder import dense_pipeline
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     fit = body.index("align_frame(")
     head = body[:fit]
     # the mask has to be consulted BEFORE the fit, not only in fusion
@@ -1861,7 +1876,10 @@ def test_a_frame_with_too_few_clean_anchors_is_refused_not_fitted():
 
     from tower.world_builder import dense_pipeline
 
-    body = inspect.getsource(dense_pipeline.run_depth_stage)
+    # The fit moved into `_fit_record` so a prediction can be refitted
+    # against a later solve; the claim is about the depth stage as a whole.
+    body = (inspect.getsource(dense_pipeline.run_depth_stage)
+            + inspect.getsource(dense_pipeline._fit_record))
     assert "sparse anchors outside the" in body
     # and the extrapolation bound comes from the same clean anchors
     assert '"z_sparse_min": float(np.min(zc_fit))' in body

@@ -43,6 +43,15 @@ from dataclasses import dataclass, field
 import numpy as np
 
 SURFACE_FORMAT = "wb-surface-mesh/1"
+SURFACE_FORMAT_ENCLOSED_FILL = "wb-surface-mesh/1+enclosed-fill"
+"""The identifier an artifact built with `fill_gap_frac > 0` must carry.
+
+`WORLD-BUILDER-SURFACE.md` section 3: any change that fills unobserved space
+must break the format identifier, because a reader that sees
+`wb-surface-mesh/1` is entitled to believe every triangle was measured. The
+byte layout is unchanged; the promise is not, so the name is not either, and
+every reader that checks for `SURFACE_FORMAT` refuses a filled artifact until
+someone decides it should not."""
 SURFACE_SCHEMA_VERSION = 1
 MESH_MAGIC = b"WBSURF01"
 
@@ -150,6 +159,34 @@ class SurfaceParams:
     removes the marching-cubes staircase without the volume loss plain
     Laplacian smoothing causes."""
 
+    # -- enclosed-hole fill (OPT-IN, default off) ----------------------------
+    fill_gap_frac: float = 0.0
+    """Widest gap the enclosed-hole fill may close, as a fraction of median
+    scene depth. 0 disables it, and 0 is the default: this is the one step
+    that writes surface where no frame measured any, so it stays off until a
+    person has reviewed the tinted diagnostic of exactly what it adds.
+
+    When on, an unobserved voxel is filled only if marches along at least
+    `fill_enclose_dirs` of the 26 axis/diagonal directions reach observed
+    field within `fill_gap_frac` -- the capture BRACKETED it -- and the
+    value written is a Laplace interpolation of the surrounding field at
+    exactly `min_weight`, never more.
+
+    Measured on the b2a75ab4 capture at 0.018 (3 voxels): unsealed it adds
+    63k faces (+2.0%), 77% of them in patches that still own an open rim --
+    frontier growth, not closure. Sealed it adds 8k faces (+0.25%) and does
+    not visibly change how the room reads, because the dark speckle a viewer
+    sees is lace at the edge of what was observed, not bracketed holes. That
+    is the reason this is off."""
+
+    fill_enclose_dirs: int = 22
+    """Of the 26 directions, how many must reach observed field."""
+
+    fill_sealed_only: bool = True
+    """After extraction, revert in the field every filled patch that still
+    owns an open boundary edge (`extract_sealed`): it did not close a hole,
+    it grew a frontier or left a sliver wall. Turning this off ships that."""
+
     # -- level of detail ----------------------------------------------------
     lod_face_targets: tuple[int, ...] = (0, 600_000, 150_000)
     """Faces per level; 0 means "no decimation". Level 0 is the archive,
@@ -199,8 +236,13 @@ class SurfaceParams:
         return cls(**base)
 
     def digest_fields(self) -> tuple:
-        """The parameters a cached artifact must match to be reusable."""
-        return (
+        """The parameters a cached artifact must match to be reusable.
+
+        The fill fields are appended only when the fill is on, so artifacts
+        built before the option existed keep their digest and are not rebuilt
+        for a parameter they never used.
+        """
+        base = (
             self.voxel_frac, self.trunc_voxels, self.trunc_error_multiple,
             self.min_weight, self.carve, self.carve_weight,
             self.max_carve_voxels, self.edge_rel, self.max_grazing_deg,
@@ -209,6 +251,18 @@ class SurfaceParams:
             self.smooth_iterations, self.smooth_lambda, self.smooth_mu,
             self.lod_face_targets, self.component, self.quality,
         )
+        if self.fill_gap_frac > 0:
+            base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
+                           self.fill_sealed_only)
+        return base
+
+    def fill_radius_voxels(self) -> int:
+        """March length in voxels for the configured closable gap; 0 = off."""
+        if self.fill_gap_frac <= 0:
+            return 0
+        # A gap closes cleanly only when a corner voxel can see across all
+        # of it, so the march radius is the gap's full width, not half.
+        return max(1, int(math.floor(self.fill_gap_frac / self.voxel_frac + 1e-9)))
 
 
 @dataclass
@@ -388,11 +442,36 @@ class SurfaceVolume:
 
         r = int(math.ceil(self.trunc / (self.voxel * BLOCK))) + 1
         bc = torch.floor(Xw / (self.voxel * BLOCK)).to(torch.int64)
+        # The shell a pixel touches depends only on the block the pixel lands
+        # in, so collapse pixels to blocks BEFORE expanding the shell, and
+        # expand in key space rather than coordinate space. A key is affine in
+        # its block coordinate -- key(c + o) == key(c) + key(o) - key(0) -- so
+        # the shell of every block is its key plus one constant per offset,
+        # and deduplication is a 1-D sort instead of `unique(dim=0)`'s
+        # lexicographic row sort over (pixels x shell x 3) int64.
+        #
+        # The row form was the dominant cost of the whole surface stage and it
+        # grew with the CUBE of truncation/voxel: at a shell radius of 4 it
+        # built a 43.7M-row table per keyframe, peaked at 3 GiB per call, took
+        # 530 s of an 873 s build, and once died inside the sort with
+        # `cudaErrorIllegalAddress`. Measured paired on real frames: 57x
+        # faster at r=3, 119x at r=4, 1.6-3.0 GiB -> 27-53 MiB per call
+        # (`Glasses-scratch/wb-final-recon/scaling/SCALING.md`). The block set
+        # is identical, key for key and in the same order.
+        #
+        # The range guard stays exact: the shell's EXTREMES, not only its
+        # centres, must be keyable, which is what the row form checked.
+        block_key(torch.stack([bc.min(0).values - r, bc.max(0).values + r]))
+        centre = torch.unique(block_key(bc))
         offs = torch.arange(-r, r + 1, device=dev)
         oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
-        off = torch.stack([ox, oy, oz], -1).reshape(-1, 3)
-        cand = (bc.unsqueeze(1) + off.unsqueeze(0)).reshape(-1, 3)
-        return block_key(torch.unique(cand, dim=0))
+        koff = (ox.reshape(-1) * _KEY_SPAN + oy.reshape(-1)) * _KEY_SPAN + oz.reshape(-1)
+        # `.clone()` is load-bearing. On CUDA, `torch.unique` returns a view
+        # narrowed out of its full-length sort buffer, so the returned keys
+        # keep (centres x shell) int64 alive -- and the offline build holds
+        # every frame's keys until `reserve`. Without it the peak allocation
+        # of a 346-frame build rose by 823 MiB.
+        return torch.unique((centre.unsqueeze(1) + koff.unsqueeze(0)).reshape(-1)).clone()
 
     # -- integration --------------------------------------------------------
 
@@ -513,7 +592,7 @@ class SurfaceVolume:
     # -- extraction ---------------------------------------------------------
 
     def extract_mesh(self, min_weight: float, *, tile_blocks: int = 12,
-                     only_blocks=None, progress=None):
+                     only_blocks=None, progress=None, tag=None):
         """Marching cubes over the observed part of the field only.
 
         A cell emits a triangle only when every vertex it interpolates sits in
@@ -523,12 +602,18 @@ class SurfaceVolume:
 
         `only_blocks` restricts extraction to a block set, which is how the
         live path re-meshes just what changed.
+
+        `tag`, a (n_blocks, 512) bool tensor such as the one `fill_enclosed`
+        returns, is sampled at every emitted vertex; when it is given the
+        return is (V, F, C, G) with G the per-vertex flag, otherwise (V, F, C).
         """
         import torch
         from skimage import measure
 
         empty = (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64),
                  np.zeros((0, 3), np.uint8))
+        if tag is not None:
+            empty = empty + (np.zeros(0, bool),)
         if self.n_blocks == 0:
             return empty
 
@@ -541,7 +626,7 @@ class SurfaceVolume:
             return empty
         lo, hi = bc_sel.min(0), bc_sel.max(0)
 
-        Vs, Fs, Cs, nv = [], [], [], 0
+        Vs, Fs, Cs, Gs, nv = [], [], [], [], 0
         tiles = [(x, y, z)
                  for x in range(int(lo[0]), int(hi[0]) + 1, tile_blocks)
                  for y in range(int(lo[1]), int(hi[1]) + 1, tile_blocks)
@@ -607,7 +692,12 @@ class SurfaceVolume:
 
             dc = torch.zeros((n * n * n, 3), dtype=torch.float32, device=self.dev)
             dc[dest] = self.rgb[bidx].reshape(-1, 3)
-            cq = dc[lin[torch.as_tensor(used, device=self.dev)]].cpu().numpy()
+            used_t = torch.as_tensor(used, device=self.dev)
+            cq = dc[lin[used_t]].cpu().numpy()
+            if tag is not None:
+                dg = torch.zeros(n * n * n, dtype=torch.bool, device=self.dev)
+                dg[dest] = tag[bidx].reshape(-1).to(self.dev)
+                Gs.append(dg[lin[used_t]].cpu().numpy())
 
             world = (verts[used] + np.array([bx, by, bz]) * BLOCK + 0.5) * self.voxel
             Vs.append(world.astype(np.float32))
@@ -619,7 +709,10 @@ class SurfaceVolume:
 
         if not Vs:
             return empty
-        return np.concatenate(Vs), np.concatenate(Fs), np.concatenate(Cs)
+        out = (np.concatenate(Vs), np.concatenate(Fs), np.concatenate(Cs))
+        if tag is not None:
+            out = out + (np.concatenate(Gs),)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +777,380 @@ def truncation_for(params: SurfaceParams, voxel: float, median_depth: float,
         need = params.trunc_error_multiple * float(median_held_out_rel) * median_depth
         trunc = max(trunc, need)
     return trunc
+
+
+# ---------------------------------------------------------------------------
+# enclosed-hole fill (opt-in)
+# ---------------------------------------------------------------------------
+#
+# Why in the field and not on the mesh. A mesh hole-filler sees a loop of
+# boundary edges and cannot tell "a few pixels failed the validity mask here,
+# but frames on every side measured this surface" from "this is the edge of
+# what anyone looked at". The field can: a voxel no frame gave evidence for,
+# surrounded by voxels frames did give evidence for, is a gap the capture
+# bracketed. A voxel with evidence on one side only is the edge of knowledge.
+#
+# Three guards, each found by measurement rather than assumed:
+#
+#   * "Bracketed" is decided against ORIGINAL evidence only. A voxel filled by
+#     an earlier tile never counts as observed for a later one; otherwise the
+#     fill feeds itself outward across tile borders.
+#   * A gap is only closed cleanly when the march radius is at least the gap's
+#     WIDTH, not half of it: a voxel in the corner of a gap must see across the
+#     whole gap along the diagonal. Between one and two radii the 26-direction
+#     test fills the middle and leaves the corners, and marching cubes turns
+#     the boundary between a filled voxel and an unfilled one into a sliver
+#     wall that no camera saw. `SurfaceParams.fill_radius_voxels` therefore
+#     sets radius = gap / voxel.
+#   * After extraction, a filled patch that still owns an open boundary edge
+#     did not close anything -- it grew a frontier or left a sliver -- and is
+#     REVERTED IN THE FIELD, then re-extracted, rather than cut off the mesh.
+#     Cutting it off the mesh also removes the ring of measured triangles
+#     whose vertices happened to round into a filled voxel, so a rejected fill
+#     would leave the hole bigger than it found it.
+
+_DIRS26 = tuple((i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1)
+                for k in (-1, 0, 1) if (i, j, k) != (0, 0, 0))
+
+
+def _shift(t, s: int, ax: int):
+    """`torch.roll` without the wrap-around: what enters from outside is zero.
+
+    A tile is a window onto a larger field. Rolling would let the far edge of
+    the window stand in for the near side's neighbour -- evidence from
+    somewhere else entirely -- so every shift here is a padded one.
+    """
+    import torch
+
+    if s == 0:
+        return t
+    n = t.shape[ax]
+    out = torch.zeros_like(t)
+    if abs(s) >= n:
+        return out
+    if s > 0:
+        out.narrow(ax, s, n - s).copy_(t.narrow(ax, 0, n - s))
+    else:
+        out.narrow(ax, 0, n + s).copy_(t.narrow(ax, -s, n + s))
+    return out
+
+
+def _enclosure_hits(obs, radius: int):
+    """Per voxel: how many of the 26 directions reach `obs` within `radius`."""
+    import torch
+
+    hits = torch.zeros(obs.shape, dtype=torch.uint8, device=obs.device)
+    for d in _DIRS26:
+        acc = torch.zeros_like(obs)
+        cur = obs
+        for _ in range(radius):
+            for ax in (0, 1, 2):
+                cur = _shift(cur, -d[ax], ax)
+            acc |= cur
+        hits += acc.to(torch.uint8)
+    return hits
+
+
+def _diffuse(val, col, known, fill, iters: int):
+    """Jacobi Laplace solve inside `fill`, `known` held fixed as Dirichlet data.
+
+    The surrounding zero crossing is continued across the gap and nothing
+    else is asserted; a linear field (a plane) is reproduced exactly. Colour
+    rides along so a closed hole takes the colour of the surface it continues
+    rather than black. Filled voxels start from 0 (no opinion), not from their
+    stored value, which for an unobserved voxel is the allocation default of
+    +1 and drags the recovered crossing half a voxel toward the camera.
+    """
+    import torch
+
+    val = torch.where(fill, torch.zeros_like(val), val)
+    src = (known | fill).to(torch.float32)
+    fill3 = fill.unsqueeze(-1)
+    for _ in range(iters):
+        acc = torch.zeros_like(val)
+        cacc = torch.zeros_like(col)
+        cnt = torch.zeros_like(val)
+        for ax in (0, 1, 2):
+            for s in (1, -1):
+                ss = _shift(src, s, ax)
+                acc += _shift(val, s, ax) * ss
+                cacc += _shift(col, s, ax) * ss.unsqueeze(-1)
+                cnt += ss
+        safe = cnt.clamp(min=1e-6)
+        val = torch.where(fill, acc / safe, val)
+        col = torch.where(fill3, cacc / safe.unsqueeze(-1), col)
+    return val, col
+
+
+@dataclass
+class EnclosedFill:
+    """What `fill_enclosed` wrote, and what was there before it.
+
+    `tag` marks every filled voxel, (n_blocks, 512). The backup rows hold the
+    ORIGINAL tsdf / weight / colour of every block the fill touched, sorted by
+    block index, so any part of the fill can be taken back out exactly.
+    """
+
+    tag: object
+    blocks: object
+    tsdf: object
+    w: object
+    rgb: object
+
+    @property
+    def voxels(self) -> int:
+        return int(self.tag.sum())
+
+
+def fill_enclosed(vol: SurfaceVolume, min_weight: float, radius: int,
+                  need_dirs: int = 22, *, iters: int | None = None,
+                  tile_blocks: int = 10, progress=None) -> EnclosedFill:
+    """Fill unobserved voxels the capture bracketed. Mutates `vol`.
+
+    A filled voxel gets weight exactly `min_weight` -- the least evidence that
+    still emits -- so it can never outvote a measured one, and a measured
+    voxel is never modified.
+    """
+    import torch
+
+    dev = vol.dev
+    tag = torch.zeros((vol.n_blocks, BLOCK_VOXELS), dtype=torch.bool, device=dev)
+    empty_rows = (torch.zeros(0, dtype=torch.int64, device=dev),
+                  torch.zeros((0, BLOCK_VOXELS), device=dev),
+                  torch.zeros((0, BLOCK_VOXELS), device=dev),
+                  torch.zeros((0, BLOCK_VOXELS, 3), device=dev))
+    if vol.n_blocks == 0 or radius <= 0:
+        return EnclosedFill(tag, *empty_rows)
+    # Jacobi converges in roughly (gap width)^2 sweeps; a closable gap is at
+    # most `radius` voxels wide, so this is a margin, not a guess.
+    iters = 2 * (radius + 2) ** 2 if iters is None else int(iters)
+    # Shifts are padded, not wrapped, so the halo only has to give the march
+    # its full reach from any core voxel.
+    halo = int(math.ceil(radius / BLOCK)) + 1
+    nb = tile_blocks + 2 * halo
+    n = nb * BLOCK
+
+    bc_all = block_coords(vol.keys).cpu().numpy()
+    lo, hi = bc_all.min(0), bc_all.max(0)
+    tiles = [(x, y, z)
+             for x in range(int(lo[0]), int(hi[0]) + 1, tile_blocks)
+             for y in range(int(lo[1]), int(hi[1]) + 1, tile_blocks)
+             for z in range(int(lo[2]), int(hi[2]) + 1, tile_blocks)]
+
+    r = torch.arange(nb, device=dev, dtype=torch.int64)
+    si, sj, sk = torch.meshgrid(r, r, r, indexing="ij")
+    slot_off = torch.stack([si.reshape(-1), sj.reshape(-1), sk.reshape(-1)], 1)
+    core_slot = ((slot_off >= halo) & (slot_off < halo + tile_blocks)).all(1)
+    v = torch.arange(BLOCK_VOXELS, device=dev, dtype=torch.int64)
+    vx, vy, vz = v % BLOCK, (v // BLOCK) % BLOCK, v // (BLOCK * BLOCK)
+    voxel_off = vx * n * n + vy * n + vz            # block z*64+y*8+x -> [x][y][z]
+    slot_base = (slot_off[:, 0] * n * n + slot_off[:, 1] * n + slot_off[:, 2]) * BLOCK
+
+    backups = []
+    for ti, (bx, by, bz) in enumerate(tiles):
+        origin = torch.tensor([bx - halo, by - halo, bz - halo],
+                              dtype=torch.int64, device=dev)
+        idx = vol.lookup(block_key(slot_off + origin))
+        present = torch.nonzero(idx >= 0, as_tuple=False).squeeze(1)
+        if present.numel() == 0 or not bool(core_slot[present].any()):
+            continue
+        bidx = idx[present]
+        dest = (slot_base[present].unsqueeze(1) + voxel_off.unsqueeze(0)).reshape(-1)
+
+        dw = torch.zeros(n * n * n, dtype=torch.float32, device=dev)
+        dw[dest] = vol.w[bidx].reshape(-1)
+        dg = torch.zeros(n * n * n, dtype=torch.bool, device=dev)
+        dg[dest] = tag[bidx].reshape(-1)
+        obs = ((dw >= min_weight) & ~dg).reshape(n, n, n)   # ORIGINAL evidence
+        if not bool(obs.any()):
+            continue
+        alloc = torch.zeros(n * n * n, dtype=torch.bool, device=dev)
+        alloc[dest] = True
+        fill = ((~obs) & alloc.reshape(n, n, n)
+                & (_enclosure_hits(obs, radius) >= need_dirs))
+        core_present = core_slot[present]
+        cdest = dest.reshape(-1, BLOCK_VOXELS)[core_present].reshape(-1)
+        f = fill.reshape(-1)[cdest]
+        if not bool(f.any()):
+            continue
+
+        dt = torch.ones(n * n * n, dtype=torch.float32, device=dev)
+        dt[dest] = vol.tsdf[bidx].reshape(-1)
+        dc = torch.zeros((n * n * n, 3), dtype=torch.float32, device=dev)
+        dc[dest] = vol.rgb[bidx].reshape(-1, 3)
+        nv, nc = _diffuse(dt.reshape(n, n, n), dc.reshape(n, n, n, 3), obs, fill, iters)
+
+        cb = bidx[core_present]
+        fb = f.reshape(-1, BLOCK_VOXELS)
+        cbt = cb[fb.any(1)]
+        backups.append((cbt, vol.tsdf[cbt].clone(), vol.w[cbt].clone(),
+                        vol.rgb[cbt].clone()))
+        vol.tsdf[cb] = torch.where(f, nv.reshape(-1)[cdest],
+                                   vol.tsdf[cb].reshape(-1)).reshape(-1, BLOCK_VOXELS)
+        vol.w[cb] = torch.where(f, torch.full(f.shape, float(min_weight), device=dev),
+                                vol.w[cb].reshape(-1)).reshape(-1, BLOCK_VOXELS)
+        vol.rgb[cb] = torch.where(f.unsqueeze(1), nc.reshape(-1, 3)[cdest],
+                                  vol.rgb[cb].reshape(-1, 3)).reshape(-1, BLOCK_VOXELS, 3)
+        tag[cb] |= fb
+        if progress is not None and ti % 50 == 0:
+            progress(STAGE_MESH, ti, len(tiles))
+
+    if not backups:
+        return EnclosedFill(tag, *empty_rows)
+    blocks = torch.cat([b[0] for b in backups])
+    order = torch.argsort(blocks)
+    return EnclosedFill(tag, blocks[order],
+                        torch.cat([b[1] for b in backups])[order],
+                        torch.cat([b[2] for b in backups])[order],
+                        torch.cat([b[3] for b in backups])[order])
+
+
+def revert_fill_near(vol: SurfaceVolume, fill: EnclosedFill, points,
+                     reach_voxels: int = 2) -> int:
+    """Restore the original field for filled voxels near `points`.
+
+    Returns how many voxels were reverted. Their tag is cleared, so a later
+    extraction no longer counts surface there as filled -- because there is
+    none.
+    """
+    import torch
+
+    dev = vol.dev
+    P = torch.as_tensor(np.asarray(points, np.float32).reshape(-1, 3), device=dev)
+    if P.numel() == 0 or fill.blocks.numel() == 0:
+        return 0
+    base = torch.unique(torch.floor(P / vol.voxel).to(torch.int64), dim=0)
+    r = torch.arange(-reach_voxels, reach_voxels + 1, device=dev)
+    ox, oy, oz = torch.meshgrid(r, r, r, indexing="ij")
+    off = torch.stack([ox.reshape(-1), oy.reshape(-1), oz.reshape(-1)], 1)
+    reverted = 0
+    for s in range(0, base.shape[0], 20000):
+        vox = torch.unique((base[s:s + 20000].unsqueeze(1) + off.unsqueeze(0))
+                           .reshape(-1, 3), dim=0)
+        bc = torch.div(vox, BLOCK, rounding_mode="floor")
+        loc = vox - bc * BLOCK
+        flat = loc[:, 2] * BLOCK * BLOCK + loc[:, 1] * BLOCK + loc[:, 0]
+        bidx = vol.lookup(block_key(bc))
+        ok = bidx >= 0
+        bidx, flat = bidx[ok], flat[ok]
+        hit = fill.tag[bidx, flat]
+        bidx, flat = bidx[hit], flat[hit]
+        if bidx.numel() == 0:
+            continue
+        row = torch.searchsorted(fill.blocks, bidx)
+        vol.tsdf[bidx, flat] = fill.tsdf[row, flat]
+        vol.w[bidx, flat] = fill.w[row, flat]
+        vol.rgb[bidx, flat] = fill.rgb[row, flat]
+        fill.tag[bidx, flat] = False
+        reverted += int(bidx.numel())
+    return reverted
+
+
+def frontier_fill_faces(V, F, G, quantum: float):
+    """Faces in filled patches that still own an open boundary edge.
+
+    The mesh is welded first (tile seams duplicate vertices), and an edge is
+    open when exactly one DISTINCT triangle uses it: a tile halo emits a
+    second copy of every triangle it shares with the next tile, and a
+    triangle together with its own copy is still an open rim. Returns
+    (bool mask over faces, stats).
+    """
+    V = np.asarray(V)
+    F = np.asarray(F, np.int64)
+    G = np.asarray(G, bool)
+    stats = {"patches": 0, "sealed_patches": 0, "frontier_patches": 0,
+             "filled_faces": 0, "frontier_faces": 0}
+    drop = np.zeros(len(F), bool)
+    if not len(F) or not G.any():
+        return drop, stats
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    q = np.round(np.asarray(V, np.float64) / max(quantum, 1e-12)).astype(np.int64)
+    _, weld = np.unique(q, axis=0, return_inverse=True)
+    weld = weld.reshape(-1)
+    n_w = int(weld.max()) + 1
+    Fw = weld[F]
+    e = np.sort(np.concatenate([Fw[:, [0, 1]], Fw[:, [1, 2]], Fw[:, [2, 0]]]), axis=1)
+    _, inv, cnt = np.unique(e, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)
+    _, face_id = np.unique(np.sort(Fw, axis=1), axis=0, return_inverse=True)
+    pair = np.unique(np.stack([inv, np.tile(face_id.reshape(-1), 3)], 1), axis=0)
+    distinct = np.bincount(pair[:, 0], minlength=len(cnt))
+    open_per_face = (distinct == 1)[inv].reshape(3, -1).sum(0)
+
+    fmask = G[F].any(axis=1)
+    fi = np.nonzero(fmask)[0]
+    Ff = Fw[fi]
+    ee = np.concatenate([Ff[:, [0, 1]], Ff[:, [1, 2]], Ff[:, [2, 0]]])
+    g = coo_matrix((np.ones(len(ee), np.int8), (ee[:, 0], ee[:, 1])), shape=(n_w, n_w))
+    _, lab = connected_components(g, directed=False)
+    keys, pidx = np.unique(lab[Ff[:, 0]], return_inverse=True)
+    n_open = np.bincount(pidx, weights=open_per_face[fi], minlength=len(keys))
+    frontier = n_open > 0
+    drop[fi[frontier[pidx]]] = True
+    stats.update(patches=int(len(keys)), sealed_patches=int((~frontier).sum()),
+                 frontier_patches=int(frontier.sum()),
+                 filled_faces=int(fmask.sum()), frontier_faces=int(drop.sum()))
+    return drop, stats
+
+
+def keep_sealed_fill(V, F, C, G, quantum: float):
+    """Mesh-side fallback: cut frontier patches off the mesh.
+
+    Prefer `extract_sealed`, which reverts them in the field instead. This one
+    also removes measured triangles whose vertices round into a filled voxel,
+    so a rejected fill can leave a hole slightly larger than it was.
+    Returns (V, F, C, G, stats).
+    """
+    drop, stats = frontier_fill_faces(V, F, G, quantum)
+    V = np.asarray(V)
+    F = np.asarray(F, np.int64)
+    G = np.asarray(G, bool)
+    if not drop.any():
+        return V, F, C, G, stats
+    F2 = F[~drop]
+    used = np.unique(F2)
+    remap = np.full(len(V), -1, np.int64)
+    remap[used] = np.arange(len(used))
+    return (V[used], remap[F2], (None if C is None else np.asarray(C)[used]),
+            G[used], stats)
+
+
+def extract_sealed(vol: SurfaceVolume, min_weight: float, fill: EnclosedFill, *,
+                   max_rounds: int = 4, reach_voxels: int = 2,
+                   progress=None, **extract_kw):
+    """Extract; revert in the field every filled patch that did not seal; repeat.
+
+    Reverting part of a filled region can expose a new filled/unfilled
+    boundary, hence the rounds; they stop when every remaining filled patch is
+    sealed. If `max_rounds` runs out, what is left is cut off the mesh as a
+    last resort and the stats say how much.
+
+    Returns (V, F, C, G, stats).
+    """
+    quantum = min(vol.voxel * 1e-3, 1e-3)
+    stats = {"rounds": 0, "voxels_filled": fill.voxels, "voxels_reverted": 0,
+             "mesh_side_fallback_faces": 0}
+    st = {}
+    for rnd in range(max_rounds + 1):
+        V, F, C, G = vol.extract_mesh(min_weight, tag=fill.tag,
+                                      progress=progress, **extract_kw)
+        drop, st = frontier_fill_faces(V, F, G, quantum)
+        stats["rounds"] = rnd
+        if not drop.any():
+            break
+        if rnd == max_rounds:
+            V, F, C, G, _ = keep_sealed_fill(V, F, C, G, quantum)
+            stats["mesh_side_fallback_faces"] = int(drop.sum())
+            break
+        stats["voxels_reverted"] += revert_fill_near(
+            vol, fill, V[np.unique(F[drop])], reach_voxels)
+    G = np.asarray(G, bool)
+    stats.update({"voxels_kept": fill.voxels, "filled_vertices": int(G.sum()),
+                  "faces_touching_fill": int(G[F].any(axis=1).sum()) if len(F) else 0,
+                  "sealed_patches": st.get("sealed_patches", 0)})
+    return V, F, C, G, stats
 
 
 # ---------------------------------------------------------------------------

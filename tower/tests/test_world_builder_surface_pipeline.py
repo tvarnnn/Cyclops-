@@ -98,13 +98,16 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
         for i, (kid, d) in enumerate(zip(kids, depths)):
             # kind "depth" with a = 1, b = 0 stores metric-gauge depth as-is
             np.save(dense / "work" / "depth" / f"{i:05d}.npy", d.astype(np.float16))
+            np.save(dense / "work" / "depth" / f"{i:05d}_pred.npy", d.astype(np.float16))
+            np.save(dense / "work" / "depth" / f"{i:05d}_fill.npy",
+                    np.zeros(d.shape, bool))
             img = np.full((h, w, 3), 150 + 10 * (i % 3), np.uint8)
             cv2.imwrite(str(dense / "work" / "undist" / f"{i:05d}.jpg"), img)
             records.append({"ki": i, "kid": kid, "ok": True, "a": 1.0, "b": 0.0,
                             "held_out_rel": 0.01})
         (dense / "align.json").write_text(json.dumps({
             "kind": "depth", "camera": camera, "backend": DenseParams().backend,
-            "records": records}))
+            "input_digest": digest, "records": records}))
     return store
 
 
@@ -192,6 +195,14 @@ class TestACompletedBuildIsReusedAndRebuiltExactlyWhenItShouldBe:
 
         cur = SP.surface_currency(store, WORLD, SESSION, _manifest(store))
         assert cur["present"] and not cur["current"]
+
+        # The depth stage for the new solve. Without it the cache names
+        # digest-1 and is -- correctly, since the cache-identity fix --
+        # refused; this test used to pass only because it was not.
+        dense = store.world_dir(WORLD) / "dense" / SESSION
+        align = json.loads((dense / "align.json").read_text())
+        align["input_digest"] = "digest-2"
+        (dense / "align.json").write_text(json.dumps(align))
 
         SP.surfacify(store, WORLD, SESSION, params=_params())
         man = _manifest(store)
@@ -533,12 +544,6 @@ class TestTheLiveWorker:
         return BackgroundSurface(root=tmp_path, world_id=WORLD, session_id=SESSION,
                                  spawn=spawn)
 
-    def test_it_waits_for_the_solver_to_have_the_card(self, tmp_path):
-        spawned = []
-        s = self._surfacer(tmp_path, spawned)
-        assert not s.maybe_launch(None, solver_running=True)
-        assert spawned == []
-
     def test_it_runs_one_job_at_a_time_and_asks_for_the_live_preset(self, tmp_path):
         spawned = []
         s = self._surfacer(tmp_path, spawned)
@@ -743,3 +748,197 @@ def test_the_revision_route_answers_and_404s_like_the_page(tmp_path):
 
     missing = client.get("/worlds/nope/render/revision")
     assert missing.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# the depth cache belongs to one solve; its predictions belong to the keyframes
+# ---------------------------------------------------------------------------
+
+
+class _CountingBackend:
+    """A depth network that records whether it was asked anything."""
+
+    name = "counting-stub"
+    licence = "test"
+    windowed = False
+    window_size = 0
+    kind = "depth"
+    calls = 0
+
+    def predict(self, rgb):
+        type(self).calls += 1
+        return np.full(rgb.shape[:2], 2.0, np.float32)
+
+
+class TestTheDepthCacheBelongsToOneSolve:
+    """Measured on a real-time replay of the canonical walk: the one live
+    surface cached a depth stage fitted against the first 51 keyframes, and
+    the FINAL surface after Stop reused it, because the cache never named its
+    solve and "unnamed" counted as a match. The finished world was a
+    51-keyframe mesh at the live voxel, under the final solve's digest."""
+
+    def _stub(self, tmp_path, cached_digest):
+        from tower.world_builder.dense import DenseParams, register_backend
+
+        _CountingBackend.calls = 0
+        register_backend(_CountingBackend.name, _CountingBackend)
+        store = _synthetic_world(tmp_path, digest="final-solve")
+        dense = store.world_dir(WORLD) / "dense" / SESSION
+        align = json.loads((dense / "align.json").read_text())
+        align["backend"] = _CountingBackend.name
+        if cached_digest is None:
+            align.pop("input_digest", None)
+        else:
+            align["input_digest"] = cached_digest
+        (dense / "align.json").write_text(json.dumps(align))
+        return store, dense, DenseParams(backend=_CountingBackend.name)
+
+    def test_an_unnamed_cache_is_not_a_match(self, tmp_path):
+        from tower.world_builder.global_solve import load_solution
+
+        store, dense, dparams = self._stub(tmp_path, None)
+        align = json.loads((dense / "align.json").read_text())
+        assert not SP._depth_cache_usable(
+            align, dense, load_solution(store, WORLD, SESSION), dparams)
+
+    def test_a_cache_for_another_solve_is_not_a_match(self, tmp_path):
+        from tower.world_builder.global_solve import load_solution
+
+        store, dense, dparams = self._stub(tmp_path, "live-solve-51")
+        align = json.loads((dense / "align.json").read_text())
+        assert not SP._depth_cache_usable(
+            align, dense, load_solution(store, WORLD, SESSION), dparams)
+
+    def test_a_cache_for_this_solve_is_used_as_is(self, tmp_path):
+        from tower.world_builder.global_solve import load_solution
+
+        store, dense, dparams = self._stub(tmp_path, "final-solve")
+        align = json.loads((dense / "align.json").read_text())
+        assert SP._depth_cache_usable(
+            align, dense, load_solution(store, WORLD, SESSION), dparams)
+
+    def test_another_solves_predictions_are_refitted_not_repredicted(self, tmp_path):
+        """The fits are redone against this solve; the network is not rerun,
+        because its output depends only on the keyframe image."""
+        from tower.world_builder.global_solve import load_solution
+
+        store, dense, dparams = self._stub(tmp_path, "live-solve-51")
+        solution = load_solution(store, WORLD, SESSION)
+        session = store.read_session(WORLD, SESSION)
+        align, work = SP.ensure_depth_stage(
+            store, WORLD, SESSION, solution, session.intrinsics,
+            gate_rel=0.08, backend=_CountingBackend.name)
+
+        assert _CountingBackend.calls == 0, "every prediction was on disk"
+        assert align["input_digest"] == "final-solve"
+        assert align["cache_key"].startswith("final-solve|")
+        assert {r.get("kid") for r in align["records"]} == set(solution.keyframe_ids)
+        # This synthetic solve has no sparse observations, so every refit
+        # honestly refuses rather than keeping the old fit's a = 1, b = 0.
+        assert not any(r.get("ok") for r in align["records"])
+        on_disk = json.loads((dense / "align.json").read_text())
+        assert on_disk["input_digest"] == "final-solve"
+
+    def test_a_prediction_recorded_for_another_keyframe_is_not_offered(self, tmp_path):
+        from tower.world_builder.dense_pipeline import reusable_predictions
+
+        store, dense, dparams = self._stub(tmp_path, "live-solve-51")
+        align = json.loads((dense / "align.json").read_text())
+        align["records"][0]["kid"] = "someone-else:00000000"
+        (dense / "align.json").write_text(json.dumps(align))
+        mapping = reusable_predictions(dense / "align.json", _CountingBackend.name)
+        assert mapping[0] == "someone-else:00000000"
+        assert mapping[0] != f"{SESSION}:{0:08d}"
+
+    def test_another_backends_predictions_are_never_offered(self, tmp_path):
+        from tower.world_builder.dense_pipeline import reusable_predictions
+
+        store, dense, dparams = self._stub(tmp_path, "live-solve-51")
+        assert reusable_predictions(dense / "align.json", "some-other-network") == {}
+
+
+class TestTheLiveSurfaceIsNotStarved:
+    """On a real-time replay the live surface built ONCE in a 140 s walk: each
+    time a solve landed the next solve launched first, and the surface waited
+    for "no solve running", which never came."""
+
+    def _surfacer(self, tmp_path, spawned):
+        from scripts.world_build_session import BackgroundSurface
+
+        def spawn(argv, **kw):
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            spawned.append((argv, kw, proc))
+            return proc
+
+        return BackgroundSurface(root=tmp_path, world_id=WORLD, session_id=SESSION,
+                                 spawn=spawn)
+
+    def test_a_landed_solve_launches_a_build(self, tmp_path):
+        spawned = []
+        s = self._surfacer(tmp_path, spawned)
+        try:
+            assert s.solve_landed(None)
+            assert len(spawned) == 1
+        finally:
+            s.close()
+
+    def test_a_solve_that_lands_mid_build_is_built_next(self, tmp_path):
+        spawned = []
+        s = self._surfacer(tmp_path, spawned)
+        try:
+            assert s.solve_landed(None)
+            assert not s.solve_landed(None), "one build at a time"
+            assert not s.poll(None), "still building"
+            spawned[0][2].kill()
+            spawned[0][2].wait(timeout=10)
+            assert s.poll(None), "the solve that landed mid-build was dropped"
+            assert len(spawned) == 2
+            assert not s.poll(None), "and it is built only once"
+        finally:
+            s.close()
+
+    def test_nothing_is_launched_when_no_solve_is_owed(self, tmp_path):
+        spawned = []
+        s = self._surfacer(tmp_path, spawned)
+        assert not s.poll(None)
+        assert spawned == []
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows priority classes")
+    def test_it_yields_the_cpu_to_the_solve_and_to_ingestion(self, tmp_path):
+        spawned = []
+        s = self._surfacer(tmp_path, spawned)
+        try:
+            s.solve_landed(None)
+            flags = spawned[0][1].get("creationflags", 0)
+            assert flags & subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        finally:
+            s.close()
+
+
+def _settings(**kw):
+    from tower.config import Settings
+
+    return Settings(host="0.0.0.0", port=8000, dev_mode=True,
+                    cv_experiment="baseline", cv_device="cpu",
+                    world_root="C:/w", world_autobuild=True, **kw)
+
+
+def test_the_product_builds_a_surface_by_default():
+    from tower.config import Settings
+    from tower.main import _world_build_spec
+
+    spec = _world_build_spec(_settings())
+    assert "--surface" in spec.argv and "--solve" in spec.argv
+
+
+def test_the_surface_can_be_turned_off_and_needs_the_solve():
+    from tower.config import Settings
+    from tower.main import _world_build_spec
+
+    off = _world_build_spec(_settings(world_surface=False))
+    no_solve = _world_build_spec(_settings(world_solve=False))
+    assert "--surface" not in off.argv
+    assert "--surface" not in no_solve.argv

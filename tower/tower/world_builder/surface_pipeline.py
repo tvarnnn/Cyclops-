@@ -42,6 +42,7 @@ from tower.world_builder.surface import (
     STAGE_MESH,
     STAGE_PACK,
     SURFACE_FORMAT,
+    SURFACE_FORMAT_ENCLOSED_FILL,
     SURFACE_SCHEMA_VERSION,
     SurfaceParams,
     SurfaceResult,
@@ -50,6 +51,8 @@ from tower.world_builder.surface import (
     decimate,
     depth_validity,
     drop_small_components,
+    extract_sealed,
+    fill_enclosed,
     taubin_smooth,
     truncation_for,
     vertex_normals,
@@ -200,11 +203,26 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
             cached = None
         if cached and _depth_cache_usable(cached, root, solution, dparams):
             return cached, root / "work"
-        prior = cached
 
+    from tower.world_builder.dense_pipeline import (
+        _depth_cache_key,
+        reusable_predictions,
+    )
+
+    # Never `prior=cached`: `prior` resumes whole records, fits included, and
+    # a cache that was not usable above is by definition for another solve.
+    # Its PREDICTIONS are still good and are reused; the fits are redone.
     align = run_depth_stage(store, world_id, session_id, solution, intrinsics,
                             dparams, root, should_stop=should_stop,
-                            progress=progress, prior=prior)
+                            progress=progress, prior=None,
+                            reuse_predictions=reusable_predictions(
+                                align_path, dparams.backend))
+    if align.get("stopped_after") is None:
+        # Name the solve, in both spellings the two readers of this file use,
+        # so neither can mistake it for a cache of another solve.
+        align["input_digest"] = solution.input_digest
+        align["digest"] = solution.input_digest
+        align["cache_key"] = _depth_cache_key(solution.input_digest, dparams)
     write_json_atomic(align_path, align)
     return align, root / "work"
 
@@ -219,9 +237,19 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams) -> bool:
     behind it. Trusting the cache key alone would send the fuse stage looking
     for files pruning removed.
     """
-    if cached.get("input_digest") not in (None, solution.input_digest):
-        return False
+    # THE CACHE MUST NAME THIS SOLVE, AND "UNNAMED" IS NOT A MATCH.
+    #
+    # This read `cached.get("input_digest") not in (None, digest)`, and the
+    # depth stage never wrote the key, so every cache was "unnamed" and every
+    # cache matched. Measured on a real-time replay of the canonical walk:
+    # the one live surface cached a depth stage fitted against the first 51
+    # keyframes, and the FINAL surface after Stop reused it -- a 51-keyframe
+    # mesh at the live voxel, shipped as the finished world under the final
+    # solve's digest.
     if solution.input_digest is None:
+        return False
+    named = cached.get("input_digest") or cached.get("digest")
+    if named != solution.input_digest:
         return False
     if cached.get("backend") not in (None, dparams.backend):
         return False
@@ -515,7 +543,30 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     seconds[STAGE_FUSE] = round(time.time() - t, 2)
 
     t = time.time()
-    V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
+    fill_stats = None
+    radius = params.fill_radius_voxels()
+    if radius > 0:
+        # Opt-in only; see `SurfaceParams.fill_gap_frac`. The flag per vertex
+        # is used for the record below and then dropped: the format has no
+        # slot for it, and the manifest's format identifier is what tells a
+        # reader that some of these triangles were not measured.
+        fill = fill_enclosed(vol, params.min_weight, radius,
+                             params.fill_enclose_dirs, progress=progress)
+        if params.fill_sealed_only:
+            V, F, C, G, seal = extract_sealed(vol, params.min_weight, fill,
+                                              progress=progress)
+        else:
+            V, F, C, G = vol.extract_mesh(params.min_weight, progress=progress,
+                                          tag=fill.tag)
+            seal = {"voxels_filled": fill.voxels,
+                    "filled_vertices": int(np.asarray(G).sum())}
+        del fill
+        fill_stats = {"radius_voxels": radius,
+                      "gap_frac": params.fill_gap_frac,
+                      "enclose_dirs": params.fill_enclose_dirs,
+                      "sealed_only": params.fill_sealed_only, **seal}
+    else:
+        V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
     if not len(F):
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
@@ -544,14 +595,18 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         vertices=int(len(V)), faces=int(len(F)), blocks=vol.n_blocks,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
         detail=json.dumps({"components": comp_stats,
-                           "median_vertex_move_voxels": round(moved / voxel, 3)}),
+                           "median_vertex_move_voxels": round(moved / voxel, 3),
+                           **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
 
 
 def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
+    filled = params.fill_radius_voxels() > 0
     write_json_atomic(root / "manifest.json", {
         "schema_version": SURFACE_SCHEMA_VERSION,
-        "format": SURFACE_FORMAT,
+        # WORLD-BUILDER-SURFACE.md section 3: filling unobserved space breaks
+        # the format identifier rather than quietly relaxing its promise.
+        "format": SURFACE_FORMAT_ENCLOSED_FILL if filled else SURFACE_FORMAT,
         "record": ("header, then uint16[3] quantised position, uint8[3] rgb, "
                    "int8[3] normal per vertex, then uint16/uint32 indices"),
         "built_at": time.time(),
@@ -571,9 +626,18 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
         "mobile_level": params.mobile_level,
         "seconds": result.seconds,
         "scale": scale,
-        "closure": ("none: a cell emits surface only where accumulated "
-                    "evidence reached min_weight, so unobserved space is "
-                    "absent rather than closed over"),
+        "closure": (
+            ("enclosed-fill: unobserved voxels bracketed by observed field in "
+             f"at least {params.fill_enclose_dirs} of 26 directions within "
+             f"{params.fill_gap_frac} of median scene depth were interpolated "
+             "at min_weight; "
+             + ("filled patches left with an open rim were removed"
+                if params.fill_sealed_only else
+                "filled patches left with an open rim were KEPT"))
+            if filled else
+            ("none: a cell emits surface only where accumulated "
+             "evidence reached min_weight, so unobserved space is "
+             "absent rather than closed over")),
     })
 
 

@@ -403,6 +403,94 @@ class TestBlockKeysRefuseToAlias:
         assert torch.equal(S.block_coords(S.block_key(bc)), bc)
 
 
+class TestBlockAllocationIsTheSameSetMadeCheaply:
+    """`blocks_for_depth` expands every sampled pixel's block by a truncation
+    shell. It used to do that in coordinate space and deduplicate with
+    `unique(dim=0)` -- a lexicographic row sort over pixels x shell x 3 int64.
+    At a shell radius of 4 that is a 43.7M-row table per keyframe; it was 530 s
+    of an 873 s build, and on a tight room it died inside the sort with
+    `cudaErrorIllegalAddress`.
+
+    The replacement collapses pixels to blocks first and expands in KEY space,
+    because a key is affine in its coordinate. That is only a speed-up if it
+    is the same answer, so these tests hold it to the row form, key for key
+    and in order, including the range guard at the shell's extremes.
+    """
+
+    @staticmethod
+    def _row_form(vol, depth, valid, R, t, K):
+        """The previous implementation, kept verbatim as the reference."""
+        import torch
+
+        vy, vx = torch.nonzero(valid, as_tuple=True)
+        step = max(1, vy.numel() // 60000)
+        vy, vx = vy[::step], vx[::step]
+        z = depth[vy, vx]
+        x = (vx.to(torch.float32) - float(K[0, 2])) / float(K[0, 0]) * z
+        y = (vy.to(torch.float32) - float(K[1, 2])) / float(K[1, 1]) * z
+        Xw = (torch.stack([x, y, z], 1) - t) @ R
+        r = int(math.ceil(vol.trunc / (vol.voxel * S.BLOCK))) + 1
+        bc = torch.floor(Xw / (vol.voxel * S.BLOCK)).to(torch.int64)
+        offs = torch.arange(-r, r + 1)
+        oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
+        off = torch.stack([ox, oy, oz], -1).reshape(-1, 3)
+        cand = (bc.unsqueeze(1) + off.unsqueeze(0)).reshape(-1, 3)
+        return S.block_key(torch.unique(cand, dim=0))
+
+    @pytest.mark.parametrize("voxel,trunc", [(0.05, 0.15), (0.03, 0.40),
+                                             (0.06, 1.03), (0.12, 0.30)])
+    def test_the_block_set_is_identical_to_the_row_form(self, voxel, trunc):
+        import torch
+
+        K, w, h = _camera()
+        R, t = _look_from((0.4, -0.2, 0.3), (0.0, 0.0, ROOM))
+        depth = torch.as_tensor(_render_box_depth(
+            R, t, K, w, h, slab=((-1.0, -1.0, 1.0), (0.5, 0.2, 1.4))))
+        valid = torch.isfinite(depth)
+        R, t = torch.as_tensor(R).float(), torch.as_tensor(t).float()
+        vol = S.SurfaceVolume(voxel, trunc, device=torch.device("cpu"))
+        got = vol.blocks_for_depth(depth, valid, R, t, K)
+        want = self._row_form(vol, depth, valid, R, t, K)
+        assert got.numel() > 0
+        assert torch.equal(got, want)
+
+    def test_a_shell_that_leaves_the_keyable_range_still_raises(self):
+        """The CENTRE block is keyable here; only the shell's outer layer is
+        not. Checking only the centres would alias silently."""
+        import torch
+
+        K, w, h = _camera()
+        voxel, trunc = 0.05, 0.15
+        edge = ((1 << 20) - 1) * S.BLOCK * voxel      # the last keyable block, +z
+        depth = torch.full((h, w), float(edge))
+        valid = torch.zeros((h, w), dtype=torch.bool)
+        valid[h // 2, w // 2] = True                  # the principal ray only
+        vol = S.SurfaceVolume(voxel, trunc, device=torch.device("cpu"))
+        S.block_key(torch.tensor([[0, 0, (1 << 20) - 2]], dtype=torch.int64))
+        with pytest.raises(S.SurfaceUnavailable):
+            vol.blocks_for_depth(depth, valid, torch.eye(3), torch.zeros(3), K)
+
+    def test_the_returned_keys_do_not_pin_the_sort_buffer(self):
+        """The offline build holds every frame's keys until `reserve`. On CUDA
+        `torch.unique` returns a view of its full-length sort buffer, so a
+        result that is not copied keeps (centres x shell) int64 alive per
+        frame -- 823 MiB of peak allocation over a 346-frame build."""
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("the retained-buffer behaviour is a CUDA allocator property")
+        dev = torch.device("cuda")
+        K, w, h = _camera()
+        R, t = _look_from((0.4, -0.2, 0.3), (0.0, 0.0, ROOM))
+        depth = torch.as_tensor(_render_box_depth(R, t, K, w, h), device=dev)
+        vol = S.SurfaceVolume(0.03, 0.40, device=dev)
+        keys = vol.blocks_for_depth(depth, torch.isfinite(depth),
+                                    torch.as_tensor(R, device=dev).float(),
+                                    torch.as_tensor(t, device=dev).float(), K)
+        assert keys.numel() > 0
+        assert keys.untyped_storage().nbytes() == keys.numel() * keys.element_size()
+
+
 # ---------------------------------------------------------------------------
 # mesh cleanup
 # ---------------------------------------------------------------------------

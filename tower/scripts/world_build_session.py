@@ -582,9 +582,18 @@ class BackgroundSurface:
     leaves nothing behind, which is the lesson `BackgroundSolver` was written
     for after an orphaned solve ran on for 32 s past its parent.
 
-    One at a time, and never concurrently with the solve it depends on -- the
-    card is shared, and a surface job competing with the next solve delays the
-    thing that makes the NEXT surface better.
+    One at a time. NOT held back while a solve runs: an earlier version was,
+    on the theory that the two share the GPU, and on a real-time replay of the
+    canonical walk it built ONE surface in 140 s -- every time a solve landed
+    the next solve was already due and launched first, so the surface never
+    got its turn. The theory was also wrong on this machine: pycolmap has no
+    CUDA build on Windows, so the solve is CPU work and the surface is GPU
+    work. What they do share is CPU, so the surface child runs at below-normal
+    priority and the solve, and frame ingestion, win it.
+
+    A solve that lands while a surface is still building is not dropped: it
+    marks the surface stale, and the next `poll` launches a rebuild against the
+    newest solve as soon as the running one finishes.
     """
 
     def __init__(self, *, root: Path, world_id: str, session_id: str,
@@ -597,6 +606,7 @@ class BackgroundSurface:
         self._child = None
         self._launches = 0
         self._log = None
+        self._stale = False
 
     @property
     def running(self) -> bool:
@@ -605,6 +615,20 @@ class BackgroundSurface:
     @property
     def launches(self) -> int:
         return self._launches
+
+    def solve_landed(self, store: WorldStore) -> bool:
+        """A newer solve exists. Build against it now, or as soon as the
+        surface already building is done."""
+        self._stale = True
+        return self.poll(store)
+
+    def poll(self, store: WorldStore) -> bool:
+        """Launch the pending rebuild if one is owed and nothing is running."""
+        self._reap()
+        if not self._stale or self.running:
+            return False
+        self._stale = False
+        return self.maybe_launch(store)
 
     @property
     def child_pid(self) -> int | None:
@@ -617,9 +641,11 @@ class BackgroundSurface:
                 self._log.close()
                 self._log = None
 
-    def maybe_launch(self, store: WorldStore, *, solver_running: bool) -> bool:
+    def maybe_launch(self, store: WorldStore, *, solver_running: bool = False) -> bool:
+        # `solver_running` is accepted and ignored; see the class docstring for
+        # why the surface no longer waits for the solve.
         self._reap()
-        if self.running or solver_running:
+        if self.running:
             return False
         log_dir = self.root / "worlds" / self.world_id / "surface" / self.session_id
         try:
@@ -632,10 +658,14 @@ class BackgroundSurface:
             "--root", str(self.root), "--world", self.world_id,
             "--session", self.session_id, "--live", "--force",
         ]
+        extra = {}
+        if os.name == "nt":
+            # The solve and frame ingestion are CPU work and must win it.
+            extra["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
         self._child = self._spawn(
             argv, cwd=str(TOWER_ROOT), stdout=self._log or subprocess.DEVNULL,
             stderr=subprocess.STDOUT, env=child_environment(),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, **extra,
         )
         self._launches += 1
         logger.info(
@@ -1801,8 +1831,11 @@ def main(argv=None) -> int:
                 # rebuilt from geometry worth trusting, so the launch is here
                 # and not on a keyframe count. It is asked AFTER the solver,
                 # so a solve that is due wins the card.
-                if surfacer is not None and solve_landed:
-                    surfacer.maybe_launch(store, solver_running=solver.running)
+                if surfacer is not None:
+                    if solve_landed:
+                        surfacer.solve_landed(store)
+                    else:
+                        surfacer.poll(store)
         observe_seconds = time.perf_counter() - started
 
         # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?

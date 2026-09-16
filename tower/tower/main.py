@@ -153,6 +153,8 @@ def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
     # mistake, and passing it anyway would make the builder refuse per
     # session rather than here, once.
     densify = ("--densify",) if (settings.world_densify and settings.world_solve) else ()
+    # Same dependency on the solve, for the same reason.
+    surface = ("--surface",) if (settings.world_surface and settings.world_solve) else ()
 
     return WorkerSpec(
         argv=(
@@ -178,6 +180,9 @@ def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
             # world lock is released. Off unless TOWER_WORLD_DENSIFY says
             # otherwise; see Settings.world_densify for why the default is off.
             *densify,
+            # The surface: coarse during the walk, full after Stop. On unless
+            # TOWER_WORLD_SURFACE says otherwise; see Settings.world_surface.
+            *surface,
             # So a producer whose Tower died without closing the manifest
             # stops following instead of polling that directory forever.
             # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and
