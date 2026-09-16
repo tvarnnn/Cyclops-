@@ -258,6 +258,17 @@ is served its smallest level, over budget, until it is rebuilt.
 `mobile_page_bytes` is in the params digest, so such a surface is not "already
 built".
 
+**The vertical is an estimate, stated as one.** The solve declares no up
+(`up_axis: unknown`). The page's configuration carries `up`, seeded by the
+mean camera up and refined on the served level's own faces: the area-weighted
+normal of near-horizontal faces (within 30 degrees), iterated. The refinement is
+kept only when near-horizontal faces are at least 10% of the area, it moves the
+seed by at most 45 degrees, and the area-weighted mean wall tilt does not get
+worse. Otherwise `up` is the camera estimate. On the canonical world the camera
+estimate leaned 27 degrees toward the desk the wearer looked down at, and the
+page showed the room rolled; the refined vertical takes the median wall tilt
+from 13.1 to 4.6 degrees. Nothing claims the vertical is gravity.
+
 ## 9. Rebuilding
 
 Derived, and rebuildable from authoritative data alone:
