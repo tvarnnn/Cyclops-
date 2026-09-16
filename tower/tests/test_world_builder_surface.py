@@ -419,7 +419,9 @@ class TestBlockAllocationIsTheSameSetMadeCheaply:
 
     @staticmethod
     def _row_form(vol, depth, valid, R, t, K):
-        """The previous implementation, kept verbatim as the reference."""
+        """The previous implementation, kept as the reference. The shell radius
+        is now per pixel (the band can be depth-proportional) with
+        `SHELL_MARGIN_BLOCKS` of margin; the row-form expansion is verbatim."""
         import torch
 
         vy, vx = torch.nonzero(valid, as_tuple=True)
@@ -429,13 +431,16 @@ class TestBlockAllocationIsTheSameSetMadeCheaply:
         x = (vx.to(torch.float32) - float(K[0, 2])) / float(K[0, 0]) * z
         y = (vy.to(torch.float32) - float(K[1, 2])) / float(K[1, 1]) * z
         Xw = (torch.stack([x, y, z], 1) - t) @ R
-        r = int(math.ceil(vol.trunc / (vol.voxel * S.BLOCK))) + 1
         bc = torch.floor(Xw / (vol.voxel * S.BLOCK)).to(torch.int64)
-        offs = torch.arange(-r, r + 1)
-        oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
-        off = torch.stack([ox, oy, oz], -1).reshape(-1, 3)
-        cand = (bc.unsqueeze(1) + off.unsqueeze(0)).reshape(-1, 3)
-        return S.block_key(torch.unique(cand, dim=0))
+        rads = torch.tensor([int(math.ceil(vol.trunc_at(float(zz)) / (vol.voxel * S.BLOCK)))
+                             + S.SHELL_MARGIN_BLOCKS for zz in z])
+        cands = []
+        for r in sorted(set(rads.tolist())):
+            offs = torch.arange(-r, r + 1)
+            oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
+            off = torch.stack([ox, oy, oz], -1).reshape(-1, 3)
+            cands.append((bc[rads == r].unsqueeze(1) + off.unsqueeze(0)).reshape(-1, 3))
+        return S.block_key(torch.unique(torch.cat(cands), dim=0))
 
     @pytest.mark.parametrize("voxel,trunc", [(0.05, 0.15), (0.03, 0.40),
                                              (0.06, 1.03), (0.12, 0.30)])

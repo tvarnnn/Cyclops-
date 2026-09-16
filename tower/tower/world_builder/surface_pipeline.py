@@ -51,13 +51,17 @@ from tower.world_builder.surface import (
     SurfaceUnavailable,
     SurfaceVolume,
     decimate,
+    depth_bound,
     depth_validity,
     drop_small_components,
+    evidence_filter,
+    keep_faces,
     weld_mesh,
     extract_sealed,
     fill_enclosed,
     taubin_smooth,
     truncation_for,
+    truncation_rel,
     vertex_normals,
     write_mesh_bytes,
 )
@@ -314,6 +318,22 @@ def _depth_from_prediction(pred, a, b, kind):
     return depth_from_prediction(pred, a, b, kind)
 
 
+def _dilate_fill(fill, px: int):
+    """The redaction fill grown by `px` pixels on every side.
+
+    The depth stage marks the fill itself (dilated 1 px). The depth network,
+    though, predicts the pixels NEXT to a synthetic fill wedge from the wedge,
+    and ghost faces sat exactly on its boundary (keyframe 211, half filled,
+    passed the gate at 0.049)."""
+    import torch
+
+    if px <= 0 or not bool(fill.any()):
+        return fill
+    k = 2 * int(px) + 1
+    return torch.nn.functional.max_pool2d(
+        fill.to(torch.float32)[None, None], k, 1, int(px)).squeeze(0).squeeze(0) > 0.5
+
+
 class _Frames:
     """The gated, posed frames of one session, with their depth on disk."""
 
@@ -326,6 +346,7 @@ class _Frames:
                            [0, 0, 1.0]], float)
         poses = solution.poses or {}
         self.items = []
+        self.kids = {}
         held = []
         for r in align.get("records", []):
             if not r.get("ok"):
@@ -341,15 +362,22 @@ class _Frames:
             ki = int(r["ki"])
             if not (work / "depth" / f"{ki:05d}.npy").exists():
                 continue
+            self.kids[ki] = r["kid"]
             self.items.append((ki, float(r["a"]), float(r["b"]),
                                np.array(pose["rotation"], float).reshape(3, 3),
                                np.array(pose["translation"], float),
-                               1.0 if ho is None else float(ho)))
+                               1.0 if ho is None else float(ho),
+                               r.get("z_sparse_max")))
         self.median_held_out = float(np.median(held)) if held else None
         self.offered = len(align.get("records", []))
 
     def __len__(self):
         return len(self.items)
+
+    def poses(self):
+        """(keyframe id, R, t) of every gated frame."""
+        for ki, _a, _b, R, t, _ho, _zmax in self.items:
+            yield self.kids[ki], R, t
 
     def load(self, ki, *, image: bool = True):
         import cv2
@@ -373,15 +401,18 @@ class _Frames:
     def prepared(self, params: SurfaceParams, median_depth: float, device):
         import torch
 
-        for ki, a, b, R, t, ho in self.items:
+        for ki, a, b, R, t, ho, zmax in self.items:
             pred, img, fill = self.load(ki)
             if pred is None or img.shape[:2] != pred.shape:
                 continue
             z = _depth_from_prediction(pred, a, b, self.kind)
             zt = torch.as_tensor(np.asarray(z, np.float32), device=device)
-            ok, cosang = depth_validity(zt, self.K, params, median_depth)
+            ok, cosang = depth_validity(
+                zt, self.K, params, median_depth,
+                max_depth=depth_bound(params, median_depth, zmax))
             if fill is not None:
-                ok &= ~torch.as_tensor(fill, device=device)
+                ok &= ~_dilate_fill(torch.as_tensor(fill, device=device),
+                                    params.fill_margin_px)
             if not bool(ok.any()):
                 continue
             fw = float(np.clip((params.gate_rel - ho) / max(params.gate_rel, 1e-9),
@@ -466,7 +497,7 @@ def surfacify(store, world_id: str, session_id: str, *,
                 root, "no keyframe passed the alignment gate, so there is "
                       "nothing to fuse")
 
-        median_depth = _median_scene_depth(frames)
+        median_depth, scale_source = _scene_scale(frames, solution)
         if not (median_depth > 0):
             return _unavailable(root, "the solve has no usable scene depth")
         voxel = params.voxel_frac * median_depth
@@ -478,7 +509,8 @@ def surfacify(store, world_id: str, session_id: str, *,
             return result
 
         scale = _scale_note(store, world_id)
-        _write_manifest(root, result, params, digest, pdigest, median_depth, scale)
+        _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
+                        scale_source)
         _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
         _status(root, state=STATE_OK, input_digest=digest,
                 params_digest=pdigest, result=result.as_dict())
@@ -515,7 +547,73 @@ def _stop(root: Path, stage: str, seconds: dict) -> SurfaceResult:
     return SurfaceResult(state=STATE_STOPPED, stopped_after=stage, seconds=seconds)
 
 
-def _median_scene_depth(frames: "_Frames", sample_frames: int = 24) -> float:
+MIN_SCALE_OBSERVATIONS = 64
+
+
+def _scene_scale(frames: "_Frames", solution) -> tuple[float, str]:
+    """The one length every other length in the surface stage is a fraction of.
+
+    WHY THE SPARSE OBSERVATIONS AND NOT THE DEPTH MAPS. The scale used to be
+    the median of dense depth sampled from every 14th frame. That definition
+    moved with two things that have nothing to do with the room:
+
+      * which frames were sampled -- changing only the sampling offset moved
+        the canonical world's scale between 0.88x and 1.07x of itself;
+      * where the wearer happened to be looking so far -- a build over the
+        first 100 / 150 / 200 keyframes, as a live build during the walk is,
+        got 1.27x / 1.39x / 1.43x the final scale, because the walk looked at
+        the room first and the desk close up later.
+
+    Every live build therefore used a coarser voxel and, while the far clip
+    was tied to this number, a farther clip than the final one, so the room
+    visibly SHRANK when the final surface replaced the live one.
+
+    The median camera-frame depth of every sparse observation of the gated
+    frames is pooled over all of them (no sampling offset exists) and is
+    weighted by where features were tracked, not by which pixels a close-up
+    fills: over the same prefixes it is 1.09x / 1.14x / 1.16x the final
+    (`Glasses-scratch/wb-final-recon/surface-r2/gauge2.json`). It is not
+    perfectly stable -- content still moves it -- and nothing that decides
+    WHERE surface may exist depends on it any more (the far bound is per
+    frame, `SurfaceParams.anchor_depth_multiple`); it sets resolution.
+
+    Falls back to the dense-depth median over EVERY frame when the solve
+    carries too few observations (older solves, synthetic worlds).
+    """
+    z = _sparse_observation_depths(frames, solution)
+    if z is not None and z.size >= MIN_SCALE_OBSERVATIONS:
+        return float(np.median(z)), "sparse-observation-depth"
+    return _median_scene_depth(frames), "dense-depth-median"
+
+
+def _sparse_observation_depths(frames: "_Frames", solution):
+    """Camera-frame depth of every sparse observation made by a gated frame."""
+    obs = getattr(solution, "observations", None)
+    xyz = getattr(solution, "xyz", None)
+    kids = getattr(solution, "keyframe_ids", None)
+    if obs is None or xyz is None or not kids or len(obs) == 0 or len(xyz) == 0:
+        return None
+    obs = np.asarray(obs).reshape(-1, 3)
+    xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
+    index = {kid: i for i, kid in enumerate(kids)}
+    order = np.argsort(obs[:, 0], kind="stable")
+    kf_sorted = obs[order, 0]
+    out = []
+    for kid, R, t in frames.poses():
+        i = index.get(kid)
+        if i is None:
+            continue
+        lo, hi = np.searchsorted(kf_sorted, [i, i + 1])
+        pts = obs[order[lo:hi], 2]
+        pts = pts[(pts >= 0) & (pts < len(xyz))]
+        if not len(pts):
+            continue
+        zc = (xyz[pts] @ R.T + t)[:, 2]
+        out.append(zc[np.isfinite(zc) & (zc > 0)])
+    return np.concatenate(out) if out else None
+
+
+def _median_scene_depth(frames: "_Frames") -> float:
     """Median of the aligned depth the cameras actually measured.
 
     Every length in the surface stage is a fraction of this, because
@@ -532,16 +630,18 @@ def _median_scene_depth(frames: "_Frames", sample_frames: int = 24) -> float:
     """
     if not len(frames):
         return 0.0
-    step = max(1, len(frames) // sample_frames)
+    # Every frame, a fixed pixel stride: sampling every n-th FRAME made the
+    # answer depend on which frames the stride happened to land on.
+    stride = max(1, (len(frames) * 97) // 4096)
     chunks = []
-    for ki, a, b, _R, _t, _ho in frames.items[::step]:
+    for ki, a, b, _R, _t, _ho, _zmax in frames.items:
         pred, _img, _fill = frames.load(ki, image=False)
         if pred is None:
             continue
         z = _depth_from_prediction(pred, a, b, frames.kind)
-        z = z[np.isfinite(z)]
+        z = z[np.isfinite(z) & (z > 0)]
         if z.size:
-            chunks.append(z[::37])
+            chunks.append(z[::stride])
     if not chunks:
         return 0.0
     return float(np.median(np.concatenate(chunks)))
@@ -564,7 +664,16 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vol = SurfaceVolume(voxel, trunc, device=device)
+    trel = truncation_rel(params, frames.median_held_out)
+
+    def band_floor(vx):
+        # With a depth-proportional band the absolute part is only the floor.
+        if trel > 0:
+            return params.trunc_voxels * vx
+        return truncation_for(params, vx, median_depth, frames.median_held_out)
+
+    vol = SurfaceVolume(voxel, band_floor(voxel), device=device, trunc_rel=trel,
+                        trunc_max=params.trunc_max_voxels * voxel)
 
     t = time.time()
     _status(root, state=STATE_RUNNING, stage=STAGE_FUSE)
@@ -588,7 +697,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # Allocation is about a second since key-space expansion, so a second pass
     # is cheap, and it happens before a byte of field exists.
     coarsened = 1.0
-    attempts = 7
+    attempts = 12
     for attempt in range(attempts):
         keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt, frames.K)
                 for z, ok, _img, R, tt, _w in cached]
@@ -600,14 +709,18 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         if (params.max_blocks <= 0 or allk.numel() <= params.max_blocks
                 or attempt == attempts - 1):
             break
-        factor = math.sqrt(allk.numel() / params.max_blocks) * 1.05
+        # At least 10% a round: once the band's shell radius is a whole number of
+        # blocks, block count stops following voxel area smoothly and a pure
+        # square-root step can stall just above the budget.
+        factor = max(1.1, math.sqrt(allk.numel() / params.max_blocks) * 1.05)
         coarsened *= factor
         voxel *= factor
         trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
         logger.info("[Tower][WorldBuilder][surface] %d blocks exceeds the budget of "
                     "%d; voxel coarsened x%.2f to %.5f", allk.numel(),
                     params.max_blocks, coarsened, voxel)
-        vol = SurfaceVolume(voxel, trunc, device=device)
+        vol = SurfaceVolume(voxel, band_floor(voxel), device=device, trunc_rel=trel,
+                        trunc_max=params.trunc_max_voxels * voxel)
     vol.reserve(allk)
     del allk
 
@@ -621,6 +734,9 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             progress(STAGE_FUSE, i, len(frames))
         if _stopped(should_stop):
             return _stop(root, STAGE_FUSE, seconds)
+    # The depth and validity stay (host memory, ~0.7 MiB a frame) for the
+    # evidence filter after extraction; the images and weights do not.
+    views = [(z, ok, R, tt) for z, ok, _img, R, tt, _w in cached]
     del cached
     seconds[STAGE_FUSE] = round(time.time() - t, 2)
     _status(root, state=STATE_RUNNING, stage=STAGE_MESH)
@@ -651,6 +767,17 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     else:
         V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
     V, F, C, weld_stats = weld_mesh(V, F, C, quantum=voxel * 1e-3)
+    n_blocks, trunc_at = vol.n_blocks, vol.trunc_at
+    # The field is done with; the filter below needs the memory more.
+    vol.release_field()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    evidence_stats = None
+    if len(F) and (params.min_support_frames > 0 or params.contradiction_ratio > 0):
+        keep, evidence_stats = evidence_filter(V, F, views, frames.K, trunc_at, params,
+                                               device)
+        V, F, C = keep_faces(V, F, C, keep)
+    del views
     if not len(F):
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
@@ -698,17 +825,21 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
 
     return SurfaceResult(
         state=STATE_OK, frames_used=used, frames_offered=frames.offered,
-        vertices=int(len(V)), faces=int(len(F)), blocks=vol.n_blocks,
+        vertices=int(len(V)), faces=int(len(F)), blocks=n_blocks,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
         detail=json.dumps({"components": comp_stats,
                            "median_vertex_move_voxels": round(moved / voxel, 3),
                            "weld": weld_stats,
                            "voxel_coarsened_by": round(coarsened, 4),
+                           "truncation_floor": band_floor(voxel),
+                           "truncation_rel": trel,
+                           "evidence_filter": evidence_stats,
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
 
 
-def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
+def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
+                    scale_source=None):
     filled = params.fill_radius_voxels() > 0
     write_json_atomic(root / "manifest.json", {
         "schema_version": SURFACE_SCHEMA_VERSION,
@@ -723,6 +854,7 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
         "params": {k: (list(v) if isinstance(v, tuple) else v)
                    for k, v in params.__dict__.items()},
         "median_scene_depth": median_depth,
+        "scene_scale_source": scale_source,
         "voxel": result.voxel,
         "truncation": result.trunc,
         "frames_used": result.frames_used,
@@ -743,9 +875,12 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale):
                 if params.fill_sealed_only else
                 "filled patches left with an open rim were KEPT"))
             if filled else
-            ("none: a cell emits surface only where accumulated "
-             "evidence reached min_weight, so unobserved space is "
-             "absent rather than closed over")),
+            ("none: a cube emits surface only where all eight corners "
+             "reached min_weight, and a face is kept only where at least "
+             "min_support_frames distinct frames measured it and fewer than "
+             "contradiction_ratio times as many saw through it, so "
+             "unobserved space is absent rather than closed over; a hole "
+             "may also be space the frames disagreed about")),
     })
 
 

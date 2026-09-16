@@ -167,14 +167,19 @@ class TestField:
         centre = ((np.abs(c[:, 0] - 20.0) < 0.6) & (np.abs(c[:, 1] - 20.0) < 0.6))
         assert not centre.any()
 
-    def test_an_undersized_radius_leaves_slivers_the_raw_fill_would_ship(self):
-        """Why sealed-only exists: radius 3 on a 4-voxel gap fills the middle,
-        misses the corners, and marching cubes builds walls between them."""
+    def test_an_undersized_radius_leaves_no_sliver_walls_at_extraction(self):
+        """Radius 3 on a 4-voxel gap fills the middle and misses the corners.
+        Marching cubes used to build walls between filled and unfilled voxels,
+        because extraction checked evidence only at the voxel nearest each
+        vertex and an unfilled voxel reads +1. It now requires evidence at all
+        eight corners of a cube, so the sliver walls are not emitted; the
+        partial fill still leaves an open rim, which sealed extraction reverts
+        (next test)."""
         vol = _field()
         rec = S.fill_enclosed(vol, MINW, radius=3, need_dirs=22, tile_blocks=2)
         V, F, C, G = vol.extract_mesh(MINW, tile_blocks=2, tag=rec.tag)
         inside = _in_hole(V, F)
-        assert (np.abs(V[F[inside]][..., 2] - PLANE).max(axis=1) > 0.5).any()
+        assert not (np.abs(V[F[inside]][..., 2] - PLANE).max(axis=1) > 0.5).any()
 
     def test_sealed_extraction_reverts_a_bad_fill_to_exactly_the_baseline(self):
         Vb, Fb, _ = _field().extract_mesh(MINW, tile_blocks=2)

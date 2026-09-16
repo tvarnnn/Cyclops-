@@ -39,7 +39,12 @@ WORLD, SESSION = "w1", "s1"
 # ---------------------------------------------------------------------------
 
 
-def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True):
+def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True,
+                     views=None, anchors=False):
+    """`views`, if given, is a list of (eye, target, slab) replacing the ring.
+    `anchors` writes sparse points and observations the way a solve does --
+    ray-cast surface points each frame observed -- and each fit record's
+    `z_sparse_min` / `z_sparse_max`."""
     import cv2
 
     from tower.world_builder.dense import DenseParams
@@ -66,21 +71,44 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
     # 869d715 hardening, which is a different world from the one modelled.
     (derived / "points.json").write_text(json.dumps({"points": [{"segment_index": 0, "xyz": [0.1 * i, 0.2, 1.0], "rgb": [120, 120, 120]} for i in range(8)]}))
 
+    if views is None:
+        views = []
+        for i in range(n_frames):
+            a = 2 * np.pi * i / n_frames
+            eye = np.array([1.2 * np.cos(a), 0.0, 1.2 * np.sin(a)])
+            views.append((eye, eye * 3.0, None))
+    n_frames = len(views)
     kids, poses, depths = [], {}, []
-    for i in range(n_frames):
-        a = 2 * np.pi * i / n_frames
-        eye = np.array([1.2 * np.cos(a), 0.0, 1.2 * np.sin(a)])
-        R, t = _look_from(eye, eye * 3.0)
+    anchor_xyz, anchor_obs, zrange = [], [], []
+    for i, (eye, target, slab) in enumerate(views):
+        R, t = _look_from(eye, target)
         kid = f"{SESSION}:{i:08d}"
         kids.append(kid)
         poses[kid] = {"component": 0, "rotation": R.ravel().tolist(),
                       "translation": t.tolist(), "observations": 50}
-        depths.append(_render_box_depth(R, t, K, w, h))
+        d = _render_box_depth(R, t, K, w, h, slab=slab)
+        depths.append(d)
+        if anchors:
+            vv, uu = np.mgrid[4:h:16, 4:w:16]
+            z = d[vv, uu]
+            ok = np.isfinite(z)
+            z, uu, vv = z[ok], uu[ok], vv[ok]
+            Xc = np.stack([(uu + 0.5 - K[0, 2]) / K[0, 0] * z,
+                           (vv + 0.5 - K[1, 2]) / K[1, 1] * z, z], 1)
+            base = sum(len(x) for x in anchor_xyz)
+            anchor_xyz.append((Xc - t) @ R)
+            anchor_obs.append(np.stack([np.full(len(z), i), np.arange(len(z)),
+                                        base + np.arange(len(z))], 1))
+            zrange.append((float(z.min()), float(z.max())))
 
     camera = {"fx": float(K[0, 0]), "fy": float(K[1, 1]), "cx": float(K[0, 2]),
               "cy": float(K[1, 2]), "width": w, "height": h}
     rng = np.random.default_rng(0)
     xyz = rng.uniform(-2.9, 2.9, size=(64, 3)).astype(np.float32)
+    observations = np.zeros((0, 3), np.int32)
+    if anchors:
+        xyz = np.concatenate(anchor_xyz).astype(np.float32)
+        observations = np.concatenate(anchor_obs).astype(np.int32)
     write_solution(workspace_for(store, WORLD, SESSION), Solution(
         solver="glomap", solved_at=time.time(), input_digest=digest,
         keyframe_ids=kids, poses=poses,
@@ -90,7 +118,7 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
         first_keyframe=np.zeros(len(xyz), np.int32),
         track_length=np.full(len(xyz), 3, np.int32),
         error=np.full(len(xyz), 0.5, np.float32),
-        observations=np.zeros((0, 3), np.int32), camera=camera))
+        observations=observations, camera=camera))
 
     if with_dense:
         dense = store.world_dir(WORLD) / "dense" / SESSION
@@ -113,7 +141,9 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
             (images / f"{kid.rsplit(':', 1)[-1]}.jpg").write_bytes(enc.tobytes())
             records.append({"ki": i, "kid": kid, "ok": True, "a": 1.0, "b": 0.0,
                             "held_out_rel": 0.01,
-                            "image_sha1": hashlib.sha1(enc.tobytes()).hexdigest()})
+                            "image_sha1": hashlib.sha1(enc.tobytes()).hexdigest(),
+                            **({"z_sparse_min": zrange[i][0], "z_sparse_max": zrange[i][1]}
+                               if anchors else {})})
         (dense / "align.json").write_text(json.dumps({
             "kind": "depth", "camera": camera, "backend": DenseParams().backend,
             "input_digest": digest, "records": records}))
@@ -121,10 +151,15 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
 
 
 def _params(**kw):
-    """Coarse enough to be quick on a CPU-only runner, fine enough to mesh."""
+    """Coarse enough to be quick on a CPU-only runner, fine enough to mesh.
+
+    `min_support_frames=1` because this fixture's eight cameras look OUTWARD
+    from the centre with a 30-degree field, so every wall patch is measured by
+    exactly one frame by construction. The two-frame rule is tested on
+    fixtures built to have overlap (`TestEvidenceIsCountedByFrame`)."""
     base = dict(voxel_frac=0.02, lod_face_targets=(0, 1500), canonical_level=0,
                 mobile_level=1, smooth_iterations=2, min_weight=0.5,
-                min_component_frac=0.0)
+                min_component_frac=0.0, min_support_frames=1)
     base.update(kw)
     return S.SurfaceParams(**base)
 
@@ -287,6 +322,7 @@ class TestLiveThenFinal:
     def test_the_final_build_replaces_the_live_one(self, tmp_path):
         store = _synthetic_world(tmp_path)
         live = S.SurfaceParams.live(lod_face_targets=(0, 1500), min_component_frac=0.0,
+                                    min_support_frames=1,
                                     voxel_frac=0.04, min_weight=0.5)
         assert SP.surfacify(store, WORLD, SESSION, params=live).state == SP.STATE_OK
         man_live = _manifest(store)

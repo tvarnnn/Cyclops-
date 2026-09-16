@@ -22,13 +22,18 @@ answer. Three things follow:
 
 What this deliberately does NOT do is close holes. Space no camera measured
 keeps zero weight and emits no triangle; the surface stops at the edge of what
-was seen. That is the line between this and Poisson or Delaunay
+was seen. The converse does not hold: a hole is not proof that nobody looked.
+Where frames measured different things, the surface there is outvoted, below
+the evidence threshold, or removed by `evidence_filter`, and measured on the
+canonical capture that -- not missing coverage -- is most of what a hole is. That is the line between this and Poisson or Delaunay
 reconstruction, which are watertight by construction and would turn "never
 observed" into "surface here". `WORLD-BUILDER-SURFACE.md` states it as a rule
 of the format: any future change that closes unobserved space must break the
 format identifier rather than quietly relax it.
 
-Every length here is a FRACTION of the scene's own median depth. The SfM gauge
+Every length here is a FRACTION of the scene's own scale (the median depth
+of the solve's sparse observations, `surface_pipeline._scene_scale`), except
+the truncation band, which follows each sample's own depth. The SfM gauge
 is arbitrary -- `global_solve` never calls COLMAP's `normalize()` -- and the
 same room has solved to a ten-unit extent and to a three-hundred-unit one. A
 constant voxel size would shatter one world and collapse another.
@@ -41,6 +46,13 @@ import struct
 from dataclasses import dataclass, field
 
 import numpy as np
+
+
+def torch_full_like(t, value):
+    import torch
+
+    return torch.full_like(t, float(value))
+
 
 SURFACE_FORMAT = "wb-surface-mesh/1"
 SURFACE_FORMAT_ENCLOSED_FILL = "wb-surface-mesh/1+enclosed-fill"
@@ -62,6 +74,16 @@ STAGE_PACK = "pack"
 
 BLOCK = 8                       # voxels along a block edge
 BLOCK_VOXELS = BLOCK ** 3
+
+SHELL_MARGIN_BLOCKS = 0
+"""Blocks allocated beyond the truncation band. It was 1. A band of half-width
+`tr` around a point already lies within ceil(tr / block) blocks of the point's
+own block, so the margin held only voxels OUTSIDE the band -- which no sample
+writes a surface value into, and which, left at the +1 default beside the back
+of a band, were exactly what built phantom sheets (see `extract_mesh`). With
+extraction requiring evidence at every cube corner they add nothing, and with a
+depth-proportional band they cost 20% more blocks on the canonical world
+(392k against 472k), pushing it over the budget."""
 
 _KEY_OFFSET = 1 << 20
 _KEY_SPAN = 1 << 21
@@ -85,15 +107,37 @@ class SurfaceParams:
     """Everything the fusion needs, in units of the scene's own median depth."""
 
     # -- resolution ---------------------------------------------------------
-    voxel_frac: float = 0.006
-    """Voxel edge as a fraction of median scene depth. 0.006 of a 4.07-unit
-    scene is 0.024, which matches the spacing the dense stage's L1 ladder
-    shipped at, and is about the point where finer voxels store noise: the
-    imagery is 0.23 MP, so a pixel covers ~6 mm at 3 m and depth noise is
-    1-3 cm."""
+    voxel_frac: float = 0.0051
+    """Voxel edge as a fraction of the scene scale (`surface_pipeline.
+    _scene_scale`: the median depth of the solve's sparse observations).
+    0.0051 of the canonical world's 4.72 is 0.0241 -- the same voxel it was
+    built at when this was 0.006 of a 4.02 dense-depth median -- which matches
+    the spacing the dense stage's L1 ladder shipped at, and is about the point
+    where finer voxels store noise: the imagery is 0.23 MP, so a pixel covers
+    ~6 mm at 3 m and depth noise is 1-3 cm."""
 
     trunc_voxels: float = 3.0
     """Truncation floor, in voxels."""
+
+    trunc_depth_proportional: bool = True
+    """Size the band per sample: max(floor, multiple * held-out error * d).
+
+    The held-out error is RELATIVE, so the depth disagreement it measures
+    grows with range. One absolute band sized at the scene median was 4x the
+    error at desk range and 0.65x of it at the far wall (2.3% of 12 units is
+    0.28 against a 0.18 band) -- too wide close up, where a 1-4 voxel board
+    seen from both sides fused 9-12 voxels thick, and self-erasing far away.
+    `trunc_voxels` stays the floor, so a near band never falls under what
+    the voxel can represent."""
+
+    trunc_max_voxels: float = 12.0
+    """Ceiling on the depth-proportional band, in voxels.
+
+    Blocks follow band width: uncapped, the far wall's 0.55-unit band took the
+    canonical world from 290k to 392k blocks, past the 360k budget, and the
+    budget then coarsened every voxel by 1.2x -- the whole room paid for the
+    far wall. 12 voxels is about one held-out error (1 sigma) at the 12-unit
+    far mode rather than two; it is still 1.6x the old absolute band there."""
 
     trunc_error_multiple: float = 2.0
     """Truncation is raised to this multiple of the measured median held-out
@@ -108,8 +152,10 @@ class SurfaceParams:
     # -- evidence -----------------------------------------------------------
     min_weight: float = 2.0
     """Accumulated weight a cell needs before it may emit surface. Weight is
-    in units of one square-on, well-lit pixel, so 2.0 is roughly "two cameras
-    agreed", and a cell below it is left as unobserved rather than guessed."""
+    in units of one square-on pixel at its frame's median depth, and a nearer
+    pixel counts up to `max_near_boost` times, so ONE close frame can reach
+    2.0 by itself. Weight is therefore not a frame count; the requirement that
+    two distinct frames agree is `min_support_frames`, enforced per face."""
 
     carve: bool = True
     carve_weight: float = 0.35
@@ -132,8 +178,31 @@ class SurfaceParams:
     used as the integration weight rather than thrown away, so a surface seen
     at 70 degrees still contributes in proportion to how well it was seen."""
 
-    max_depth_frac: float = 2.6
-    """Depth beyond this multiple of the median is clipped."""
+    anchor_depth_multiple: float = 1.5
+    """A pixel deeper than this multiple of ITS OWN FRAME's farthest fitted
+    sparse anchor (`z_sparse_max` in the depth stage's fit) is not used.
+
+    The far bound is per frame and tied to what the solve supports, because
+    the scene is not one depth. This used to be a single clip at 2.6 x the
+    scene median, 10.44 units on the canonical world, and it deleted 9.0% of
+    all valid depth -- the far wall, the doorway and the ceiling corner that
+    45+ frames measured -- while the product told the wearer those gaps were
+    places nothing looked. Per-frame medians there run from 1.7 to 11.3; a
+    global relative clip cannot be right for both ends of that.
+
+    Depth beyond a frame's farthest anchor is extrapolation of the affine fit,
+    not measurement. Measured on the canonical world: 4.5% of valid depth lies
+    beyond 1.0 x the frame's farthest anchor, 1.53% beyond 1.2 x, 0.51% beyond
+    1.5 x. 1.5 keeps the far wall and refuses what the fit never saw."""
+
+    max_depth_frac: float = 6.0
+    """Fallback only, for a fit that records no anchor range: depth beyond this
+    multiple of the scene scale is not used. Deliberately generous -- it is a
+    guard against absurd depth, not a statement about where the room ends."""
+
+    fill_margin_px: int = 8
+    """Pixels around a redaction fill that are not used as depth. See
+    `surface_pipeline._dilate_fill`."""
 
     gate_rel: float = 0.08
     """A frame whose held-out alignment residual exceeds this is not used at
@@ -146,6 +215,35 @@ class SurfaceParams:
     depth_falloff: bool = True
     """Weight falls as 1/z^2: a far pixel's depth is less certain and covers
     more volume."""
+
+    max_near_boost: float = 4.0
+    """Ceiling on the falloff's weight for a pixel NEARER than its frame's
+    median depth. It was 4.0, and a pixel at half its frame's median depth --
+    a hand, a lap, the edge of the desk under the glasses -- then counted as
+    four pixels, so one close frame at a good angle reached `min_weight` on
+    its own. Near is where glasses see the wearer; it earns no extra vote."""
+
+    drop_back_facing: bool = True
+    """Remove a face whose normal points away from EVERY frame that supports
+    it (`evidence_filter`). A surface is seen from its front; a face that no
+    supporting camera sees from the front is a fold where frames that disagree
+    by a few voxels cross -- 18% of the shipped canonical area, the "crumpled
+    foil" at grazing views. A thin board seen from both sides keeps both
+    faces, because each side has cameras in front of it."""
+
+    min_support_frames: int = 2
+    """A face survives only if at least this many DISTINCT frames measured
+    depth within truncation of it (`evidence_filter`). Weight is a sum and can
+    be reached by one frame; this is a count and cannot."""
+
+    contradiction_ratio: float = 2.0
+    """A face is removed when the frames that saw THROUGH it -- measured depth
+    beyond it by more than the truncation, with nothing in between -- number at
+    least this multiple of the frames that support it. Carving blends free
+    space into the field only within `max_carve_voxels` of each frame's own
+    surface, so a hand half a metre from the camera was never carved by the
+    frames that looked past it at a wall three metres away; the count sees the
+    whole ray. 0 disables the test."""
 
     # -- surface cleanup ----------------------------------------------------
     min_component_frac: float = 0.0001
@@ -196,7 +294,7 @@ class SurfaceParams:
     it grew a frontier or left a sliver wall. Turning this off ships that."""
 
     # -- level of detail ----------------------------------------------------
-    lod_face_targets: tuple[int, ...] = (0, 600_000, 150_000)
+    lod_face_targets: tuple[int, ...] = (0, 600_000, 300_000)
     """Faces per level; 0 means "no decimation". Level 0 is the archive,
     level 2 is what a phone is sent. Each level is decimated from the one
     before it, not from level 0: decimation grows as faces^1.37, and on a
@@ -244,7 +342,7 @@ class SurfaceParams:
         weight, not because a live surface is allowed to be invented.
         """
         base = dict(
-            voxel_frac=0.012,
+            voxel_frac=0.0102,
             min_weight=1.5,
             smooth_iterations=3,
             lod_face_targets=(0, 120_000),
@@ -265,10 +363,13 @@ class SurfaceParams:
         """
         base = (
             self.voxel_frac, self.trunc_voxels, self.trunc_error_multiple,
+            self.trunc_depth_proportional, self.trunc_max_voxels, "all-corners",
             self.min_weight, self.carve, self.carve_weight,
             self.max_carve_voxels, self.edge_rel, self.max_grazing_deg,
-            self.max_depth_frac, self.gate_rel, self.frame_weight_floor,
-            self.depth_falloff, self.min_component_frac,
+            self.max_depth_frac, self.anchor_depth_multiple, self.fill_margin_px,
+            self.gate_rel, self.frame_weight_floor,
+            self.depth_falloff, self.max_near_boost, self.min_support_frames,
+            self.contradiction_ratio, self.drop_back_facing, self.min_component_frac,
             self.smooth_iterations, self.smooth_lambda, self.smooth_mu,
             self.lod_face_targets, self.component, self.quality,
             self.max_blocks, "lod-cascade",
@@ -417,13 +518,20 @@ class SurfaceVolume:
     advance.
     """
 
-    def __init__(self, voxel: float, trunc: float, device=None):
+    def __init__(self, voxel: float, trunc: float, device=None, *,
+                 trunc_rel: float = 0.0, trunc_max: float = 0.0):
+        """`trunc` is the truncation FLOOR, in scene units. `trunc_rel`, when
+        positive, makes the band depth-proportional: a sample measured at
+        depth d is truncated at max(trunc, trunc_rel * d). See
+        `SurfaceParams.trunc_depth_proportional` for why."""
         import torch
 
         if not (voxel > 0 and trunc > 0):
             raise SurfaceUnavailable("voxel and truncation must be positive")
         self.voxel = float(voxel)
         self.trunc = float(trunc)
+        self.trunc_rel = max(0.0, float(trunc_rel))
+        self.trunc_max = max(0.0, float(trunc_max))
         self.dev = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.keys = torch.zeros(0, dtype=torch.int64, device=self.dev)
@@ -439,6 +547,24 @@ class SurfaceVolume:
 
     def bytes_used(self) -> int:
         return self.n_blocks * BLOCK_VOXELS * (4 + 4 + 12)
+
+    def release_field(self) -> None:
+        """Drop the field's storage, keeping geometry parameters (voxel,
+        truncation) usable. For callers that are done extracting."""
+        import torch
+
+        self.tsdf = torch.zeros((0, BLOCK_VOXELS), dtype=torch.float32, device=self.dev)
+        self.w = torch.zeros((0, BLOCK_VOXELS), dtype=torch.float32, device=self.dev)
+        self.rgb = torch.zeros((0, BLOCK_VOXELS, 3), dtype=torch.float32, device=self.dev)
+
+    def trunc_at(self, depth):
+        """The truncation of a sample measured at `depth` (tensor or float)."""
+        cap = self.trunc_max if self.trunc_max > 0 else float("inf")
+        if hasattr(depth, "clamp"):
+            if self.trunc_rel <= 0:
+                return torch_full_like(depth, self.trunc)
+            return (depth * self.trunc_rel).clamp(min=self.trunc, max=max(cap, self.trunc))
+        return max(self.trunc, min(cap, float(depth) * self.trunc_rel))
 
     # -- allocation ---------------------------------------------------------
 
@@ -515,8 +641,11 @@ class SurfaceVolume:
         Xc = torch.stack([x, y, z], 1)
         Xw = (Xc - t) @ R                       # R^T (Xc - t)
 
-        r = int(math.ceil(self.trunc / (self.voxel * BLOCK))) + 1
         bc = torch.floor(Xw / (self.voxel * BLOCK)).to(torch.int64)
+        # The shell radius follows each pixel's own truncation, so a far pixel
+        # with a wide band does not widen the shell of every near one.
+        rads = (torch.ceil(self.trunc_at(z) / (self.voxel * BLOCK)).to(torch.int64)
+                + SHELL_MARGIN_BLOCKS)
         # The shell a pixel touches depends only on the block the pixel lands
         # in, so collapse pixels to blocks BEFORE expanding the shell, and
         # expand in key space rather than coordinate space. A key is affine in
@@ -536,17 +665,21 @@ class SurfaceVolume:
         #
         # The range guard stays exact: the shell's EXTREMES, not only its
         # centres, must be keyable, which is what the row form checked.
-        block_key(torch.stack([bc.min(0).values - r, bc.max(0).values + r]))
-        centre = torch.unique(block_key(bc))
-        offs = torch.arange(-r, r + 1, device=dev)
-        oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
-        koff = (ox.reshape(-1) * _KEY_SPAN + oy.reshape(-1)) * _KEY_SPAN + oz.reshape(-1)
+        out = []
+        for r in torch.unique(rads).tolist():
+            bcr = bc[rads == r]
+            block_key(torch.stack([bcr.min(0).values - r, bcr.max(0).values + r]))
+            centre = torch.unique(block_key(bcr))
+            offs = torch.arange(-r, r + 1, device=dev)
+            oz, oy, ox = torch.meshgrid(offs, offs, offs, indexing="ij")
+            koff = (ox.reshape(-1) * _KEY_SPAN + oy.reshape(-1)) * _KEY_SPAN + oz.reshape(-1)
+            out.append(torch.unique((centre.unsqueeze(1) + koff.unsqueeze(0)).reshape(-1)))
         # `.clone()` is load-bearing. On CUDA, `torch.unique` returns a view
         # narrowed out of its full-length sort buffer, so the returned keys
         # keep (centres x shell) int64 alive -- and the offline build holds
         # every frame's keys until `reserve`. Without it the peak allocation
         # of a 346-frame build rose by 823 MiB.
-        return torch.unique((centre.unsqueeze(1) + koff.unsqueeze(0)).reshape(-1)).clone()
+        return torch.unique(torch.cat(out)).clone()
 
     # -- integration --------------------------------------------------------
 
@@ -594,17 +727,18 @@ class SurfaceVolume:
 
         bc = block_coords(self.keys).to(torch.float32)
         ctr = (bc * BLOCK + BLOCK / 2) * self.voxel
-        rad = (BLOCK * self.voxel) * 0.8660254 + self.trunc
+        zmax = torch.nan_to_num(depth, nan=0.0).max()
+        tmax = self.trunc_at(float(zmax))
+        rad = (BLOCK * self.voxel) * 0.8660254 + tmax
         pc = ctr @ R.T + t
         z = pc[:, 2]
         zc = z.clamp(min=1e-4)
         u = pc[:, 0] / zc * fx + cx
         v = pc[:, 1] / zc * fy + cy
         mu, mv = rad / zc * fx, rad / zc * fy
-        zmax = torch.nan_to_num(depth, nan=0.0).max()
         return torch.nonzero(
             (z > -rad) & (u > -mu) & (u < W + mu) & (v > -mv) & (v < H + mv)
-            & (z < zmax + rad + self.trunc), as_tuple=False).squeeze(1)
+            & (z < zmax + rad + tmax), as_tuple=False).squeeze(1)
 
     def _integrate_blocks(self, sel, depth, valid, rgb_img, R, t,
                           fx, fy, cx, cy, H, W, params, weight_img, med):
@@ -626,20 +760,22 @@ class SurfaceVolume:
         ok &= valid.reshape(-1)[flat] & torch.isfinite(d) & (d > 1e-4)
 
         sdf = d - z
-        surface = ok & (sdf >= -self.trunc) & (sdf <= self.trunc)
+        tr = self.trunc_at(d)
+        surface = ok & (sdf >= -tr) & (sdf <= tr)
         if params.carve:
-            free = ok & (sdf > self.trunc) & (
-                sdf < self.trunc + params.max_carve_voxels * self.voxel)
+            free = ok & (sdf > tr) & (
+                sdf < tr + params.max_carve_voxels * self.voxel)
         else:
             free = torch.zeros_like(surface)
 
         wpix = (torch.ones_like(z) if weight_img is None
                 else weight_img.reshape(-1)[flat])
         if params.depth_falloff:
-            wpix = (wpix * (med * med) / (z * z).clamp(min=1e-6)).clamp(max=4.0)
+            wpix = wpix * ((med * med) / (z * z).clamp(min=1e-6)).clamp(
+                max=params.max_near_boost)
 
         col = rgb_img.reshape(-1, 3)[flat]
-        val = (sdf / self.trunc).clamp(-1.0, 1.0)
+        val = (sdf / tr).clamp(-1.0, 1.0)
 
         idx_b = torch.arange(n, device=self.dev).repeat_interleave(BLOCK_VOXELS)
         idx_v = torch.arange(BLOCK_VOXELS, device=self.dev).repeat(n)
@@ -670,10 +806,19 @@ class SurfaceVolume:
                      only_blocks=None, progress=None, tag=None):
         """Marching cubes over the observed part of the field only.
 
-        A cell emits a triangle only when every vertex it interpolates sits in
-        field with at least `min_weight` of evidence. Cells nobody measured
-        keep weight zero and read as empty, so the surface stops at the edge of
-        what was seen instead of closing over it.
+        A cube emits triangles only when ALL EIGHT of its corner voxels carry
+        at least `min_weight` of evidence, so both ends of every edge a vertex
+        is interpolated on were measured. Cells nobody measured keep weight
+        zero, and the surface stops at the edge of what was seen instead of
+        closing over it.
+
+        This used to test only the voxel NEAREST each vertex. An unobserved
+        voxel holds the allocation default +1, which reads as measured free
+        space, so a cube with one observed corner behind a surface and one
+        never-observed corner beyond the truncation band emitted a triangle
+        between them. On clean synthetic input that built a complete phantom
+        second wall 7 voxels behind a real one; on the canonical capture it
+        was 8,513 vertices whose far edge endpoint had weight exactly 0.
 
         `only_blocks` restricts extraction to a block set, which is how the
         live path re-meshes just what changed.
@@ -747,14 +892,23 @@ class SurfaceVolume:
             if not len(faces):
                 continue
 
-            # Weight and colour are only wanted AT the vertices, so they are
-            # sampled on the device and only the sampled values cross the bus.
+            # Colour is only wanted AT the vertices, so it is sampled on the
+            # device and only the sampled values cross the bus.
             vi = np.clip(np.round(verts).astype(np.int64), 0, n - 1)
             lin = torch.as_tensor(vi[:, 0] * n * n + vi[:, 1] * n + vi[:, 2],
                                   device=self.dev)
             dw = torch.zeros(n * n * n, dtype=torch.float32, device=self.dev)
             dw[dest] = self.w[bidx].reshape(-1)
-            keep = (dw[lin].cpu().numpy() >= min_weight)[faces].all(axis=1)
+            # The cube a face was generated in: every vertex lies on one of
+            # its edges, so the floor of the centroid names it.
+            observed = (dw >= min_weight).reshape(1, 1, n, n, n)
+            cube_ok = (-torch.nn.functional.max_pool3d(
+                -observed.to(torch.float32), 2, 1)).reshape(n - 1, n - 1, n - 1) > 0.5
+            ci = np.clip(np.floor(verts[faces].mean(axis=1)).astype(np.int64), 0, n - 2)
+            m = n - 1
+            clin = torch.as_tensor(ci[:, 0] * m * m + ci[:, 1] * m + ci[:, 2],
+                                   device=self.dev)
+            keep = cube_ok.reshape(-1)[clin].cpu().numpy()
             faces = faces[keep]
             if not len(faces):
                 continue
@@ -792,7 +946,18 @@ class SurfaceVolume:
 # ---------------------------------------------------------------------------
 
 
-def depth_validity(depth, K, params: SurfaceParams, median_depth: float):
+def depth_bound(params: SurfaceParams, scene_scale: float,
+                z_sparse_max: float | None) -> float:
+    """The far bound for one frame: its farthest fitted anchor times
+    `anchor_depth_multiple`, or the generous scene-relative fallback when the
+    fit records no anchor range."""
+    if z_sparse_max is not None and z_sparse_max > 0 and params.anchor_depth_multiple > 0:
+        return float(z_sparse_max) * params.anchor_depth_multiple
+    return float(scene_scale) * params.max_depth_frac
+
+
+def depth_validity(depth, K, params: SurfaceParams, median_depth: float,
+                   max_depth: float | None = None):
     """Per-pixel incidence cosine and validity mask, on whatever device the
     depth is on.
 
@@ -800,6 +965,9 @@ def depth_validity(depth, K, params: SurfaceParams, median_depth: float):
     grazing incidence, absurd depth -- but the incidence cosine is returned
     rather than discarded, so the caller can weight by it instead of treating
     a 70-degree surface the same as a head-on one right up to the cut.
+
+    `max_depth` is the frame's own far bound (`depth_bound`); without it the
+    scene-relative fallback applies.
     """
     import torch
 
@@ -832,7 +1000,8 @@ def depth_validity(depth, K, params: SurfaceParams, median_depth: float):
     cosang = ((nrm * ray).sum(-1) / nrm.norm(dim=-1).clamp(min=1e-12)).abs()
 
     ok = torch.isfinite(depth) & (depth > 1e-3)
-    ok &= depth < median_depth * params.max_depth_frac
+    ok &= depth < (max_depth if max_depth is not None
+                   else median_depth * params.max_depth_frac)
     ok &= torch.isfinite(edge) & (edge < params.edge_rel)
     ok &= torch.isfinite(cosang) & (cosang > math.cos(math.radians(params.max_grazing_deg)))
     # A depth edge's neighbour is not trustworthy either.
@@ -841,9 +1010,22 @@ def depth_validity(depth, K, params: SurfaceParams, median_depth: float):
     return ok, cosang.clamp(0, 1)
 
 
+def truncation_rel(params: SurfaceParams, median_held_out_rel: float | None) -> float:
+    """The depth-proportional part of the truncation: a sample at depth d is
+    truncated at max(floor, this * d). 0 when the error was not measured or
+    the band is configured absolute."""
+    if (not params.trunc_depth_proportional or not median_held_out_rel
+            or params.trunc_error_multiple <= 0):
+        return 0.0
+    return params.trunc_error_multiple * float(median_held_out_rel)
+
+
 def truncation_for(params: SurfaceParams, voxel: float, median_depth: float,
                    median_held_out_rel: float | None) -> float:
-    """Truncation from the voxel floor and the frames' measured disagreement."""
+    """Truncation from the voxel floor and the frames' measured disagreement,
+    evaluated AT `median_depth`. With `trunc_depth_proportional` a sample at
+    the scene scale gets exactly this and the absolute floor is
+    `trunc_voxels * voxel`; it stays in the manifest for comparison."""
     trunc = params.trunc_voxels * voxel
     if median_held_out_rel and params.trunc_error_multiple > 0:
         need = params.trunc_error_multiple * float(median_held_out_rel) * median_depth
@@ -1223,6 +1405,107 @@ def extract_sealed(vol: SurfaceVolume, min_weight: float, fill: EnclosedFill, *,
                   "faces_touching_fill": int(G[F].any(axis=1).sum()) if len(F) else 0,
                   "sealed_patches": st.get("sealed_patches", 0)})
     return V, F, C, G, stats
+
+
+# ---------------------------------------------------------------------------
+# evidence filter
+# ---------------------------------------------------------------------------
+
+
+def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None,
+                    *, chunk: int = 2_000_000):
+    """Which faces the frames, counted one by one, actually support.
+
+    `views` yields (depth, valid, R, t) per frame, exactly the depth and
+    validity the fusion used. For every face centroid and every frame whose
+    valid pixel it projects onto, the frame either SUPPORTS the face (measured
+    depth within `trunc_at(depth)` of it), saw THROUGH it (measured beyond
+    it), or saw something in front of it (no vote). A face is kept when
+
+      * at least `min_support_frames` distinct frames support it, and
+      * the see-through frames are fewer than `contradiction_ratio` times the
+        supporting ones.
+
+    The field cannot answer either question. Its weight is a sum, which one
+    close frame can fill alone, and its free-space carve is bounded to a band
+    in front of each frame's own surface, so a thing near the camera -- the
+    wearer's hand over the laptop, their lap -- is never carved by the frames
+    that look straight past it at the room. On the canonical capture every
+    face within 0.5 units of the walked path was contradicted 2:1 and all of
+    them survived fusion.
+
+    Returns (keep mask over faces, stats).
+    """
+    import torch
+
+    F = np.asarray(F, np.int64)
+    nF = len(F)
+    stats = {"faces_in": int(nF), "dropped_support": 0, "dropped_contradicted": 0,
+             "frames": 0}
+    if nF == 0:
+        return np.ones(0, bool), stats
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    Vt = torch.as_tensor(np.asarray(V, np.float32), device=dev)
+    sup = torch.zeros(nF, dtype=torch.int16, device=dev)
+    thru = torch.zeros(nF, dtype=torch.int16, device=dev)
+    front = torch.zeros(nF, dtype=torch.int16, device=dev)
+    cents, norms = [], []
+    for s0 in range(0, nF, chunk):
+        Fc = torch.as_tensor(F[s0:s0 + chunk], device=dev)
+        tri = Vt[Fc]
+        cents.append(tri.mean(1))
+        norms.append(torch.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=1))
+    P = torch.cat(cents)
+    N = torch.cat(norms)
+    del Vt, cents, norms, tri
+    for depth, valid, R, t in views:
+        depth = depth.to(dev).float()
+        valid = valid.to(dev)
+        R = R.to(dev).float()
+        t = t.to(dev).float()
+        H, W = depth.shape
+        centre = -(R.T @ t)
+        stats["frames"] += 1
+        for s0 in range(0, nF, chunk):
+            pc = P[s0:s0 + chunk] @ R.T + t
+            z = pc[:, 2]
+            zc = z.clamp(min=1e-6)
+            u = torch.round(pc[:, 0] / zc * fx + cx).long()
+            v = torch.round(pc[:, 1] / zc * fy + cy).long()
+            m = (z > 1e-4) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            flat = v.clamp(0, H - 1) * W + u.clamp(0, W - 1)
+            d = depth.reshape(-1)[flat]
+            m &= valid.reshape(-1)[flat] & torch.isfinite(d)
+            r = d - z
+            tr = trunc_at(d)
+            s_ = m & (r.abs() <= tr)
+            sup[s0:s0 + chunk] += s_.to(torch.int16)
+            facing = ((centre - P[s0:s0 + chunk]) * N[s0:s0 + chunk]).sum(1) > 0
+            front[s0:s0 + chunk] += (s_ & facing).to(torch.int16)
+            thru[s0:s0 + chunk] += (m & (r > tr)).to(torch.int16)
+    ok_support = sup >= int(params.min_support_frames)
+    keep = ok_support.clone()
+    if params.contradiction_ratio > 0:
+        contradicted = (thru.float() >= params.contradiction_ratio * sup.float()) & (thru > 0)
+        keep &= ~contradicted
+        stats["dropped_contradicted"] = int((ok_support & contradicted).sum())
+    if params.drop_back_facing:
+        back = (front == 0) & ok_support
+        stats["dropped_back_facing"] = int((keep & back).sum())
+        keep &= ~back
+    stats["dropped_support"] = int((~ok_support).sum())
+    stats["faces_kept"] = int(keep.sum())
+    return keep.cpu().numpy(), stats
+
+
+def keep_faces(V, F, C, keep):
+    """The mesh restricted to `keep`, with unused vertices removed."""
+    F = np.asarray(F, np.int64)[np.asarray(keep, bool)]
+    used = np.unique(F)
+    remap = np.full(len(V), -1, np.int64)
+    remap[used] = np.arange(len(used))
+    return (np.asarray(V)[used], remap[F], None if C is None else np.asarray(C)[used])
 
 
 # ---------------------------------------------------------------------------
