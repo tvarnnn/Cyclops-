@@ -793,7 +793,12 @@ def _world_with_geometry(tmp_path, *, dense: bool):
     derived = store.derived_dir("w1") / "s1"
     derived.mkdir(parents=True, exist_ok=True)
     (derived / "poses.json").write_text(json.dumps({"poses": []}))
-    (derived / "points.json").write_text(json.dumps({"points": []}))
+    # Real sparse points. This fixture was written against 9e939a3, when an
+    # empty points.json still counted as geometry; the live/history lane
+    # (869d715) made an empty tree mean "nothing to draw", which is right, and
+    # which left this fixture modelling a world that renders nothing at all
+    # rather than "a world built before the dense stage".
+    (derived / "points.json").write_text(json.dumps({"points": [{"segment_index": 0, "xyz": [0.1 * i, 0.2, 1.0], "rgb": [120, 120, 120]} for i in range(8)]}))
     if dense:
         rng = np.random.default_rng(31)
         X = rng.uniform(-1, 1, size=(500, 3)).astype(np.float32)

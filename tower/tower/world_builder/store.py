@@ -1157,6 +1157,106 @@ REQUIRED_MANIFEST_KEYS = (
 def session_has_drawable_geometry(store, world_id, session_id, manifest=None) -> bool:
     """Would opening this session SHOW the wearer anything?
 
+    Sparse geometry, OR a reconstruction the viewer ladder would actually
+    serve. The second half exists because the render route asked this
+    question BEFORE walking the ladder: a session with a complete surface
+    and an empty sparse tree was refused as "no geometry yet", and the
+    listing put `has_geometry: false` on it, so the picker showed a
+    reconstructed world as empty -- the one outcome the reconstruction
+    campaign was told never to produce.
+
+    Both halves apply the same standard the ladder does to the same files,
+    because two surfaces disagreeing about one session is the failure the
+    sparse half's own docstring describes.
+    """
+    if _sparse_drawable(store, world_id, session_id, manifest):
+        return True
+    return reconstruction_drawable(store, world_id, session_id)
+
+
+def reconstruction_drawable(store, world_id, session_id) -> bool:
+    """True when a surface or dense artifact would render for this session.
+
+    Cheap enough for a listing over a whole world root: the manifest is read
+    and each level file is checked by size, and a surface level by its
+    header, without decoding any geometry. A torn level fails the size check;
+    that is the case that matters, since every artifact write is atomic and
+    a torn file only arises from a copy or a disk fault.
+    """
+    world_dir = store.world_dir(world_id)
+    return (_surface_drawable(world_dir / "surface" / session_id)
+            or _dense_drawable(world_dir / "dense" / session_id))
+
+
+def _read_manifest_quietly(path):
+    try:
+        man = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return man if isinstance(man, dict) else None
+
+
+def _level_files_whole(root, levels, name) -> bool:
+    if not isinstance(levels, list) or not levels:
+        return False
+    for lv in levels:
+        if not isinstance(lv, dict):
+            return False
+        level, size = lv.get("level"), lv.get("bytes")
+        if not isinstance(level, int) or not isinstance(size, int):
+            return False
+        try:
+            if (root / name.format(level)).stat().st_size != size:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _surface_drawable(root) -> bool:
+    from tower.world_builder.surface import (  # noqa: PLC0415
+        _HEADER,
+        MESH_MAGIC,
+        SURFACE_FORMAT,
+        SURFACE_SCHEMA_VERSION,
+    )
+
+    man = _read_manifest_quietly(root / "manifest.json")
+    if (man is None or man.get("format") != SURFACE_FORMAT
+            or man.get("schema_version") != SURFACE_SCHEMA_VERSION):
+        return False
+    faces = man.get("faces")
+    if not isinstance(faces, int) or faces <= 0:
+        return False
+    levels = man.get("levels")
+    if not _level_files_whole(root, levels, "mesh_l{}.bin"):
+        return False
+    try:
+        with open(root / f"mesh_l{levels[-1]['level']}.bin", "rb") as handle:
+            head = handle.read(_HEADER.size)
+        magic, _nv, n_i, _flags, version, *_box = _HEADER.unpack(head)
+    except (OSError, Exception):  # noqa: BLE001 -- short or foreign header
+        return False
+    return magic == MESH_MAGIC and version == SURFACE_SCHEMA_VERSION and n_i > 0
+
+
+def _dense_drawable(root) -> bool:
+    from tower.world_builder.dense import DENSE_FORMAT  # noqa: PLC0415
+
+    man = _read_manifest_quietly(root / "manifest.json")
+    if man is None or man.get("format") != DENSE_FORMAT:
+        return False
+    levels = man.get("levels")
+    if not isinstance(levels, list) or not any(
+            isinstance(lv, dict) and isinstance(lv.get("points"), int)
+            and lv["points"] > 0 for lv in levels):
+        return False
+    return _level_files_whole(root, levels, "points_l{}.bin")
+
+
+def _sparse_drawable(store, world_id, session_id, manifest=None) -> bool:
+    """Would opening this session SHOW the wearer anything?
+
     **Not "do the files exist", which is what two separate copies of this
     used to ask.** `engine.build` calls `write_derived` unconditionally,
     so a walk that solved nothing still leaves `poses.json` and a
