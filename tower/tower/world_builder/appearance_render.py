@@ -65,15 +65,18 @@ PAGE_REVISION = "appearance:1"
 ASTC_LAYER_CAP = 192
 RGBA8_LAYER_CAP = 48
 
-# Display mapping of the dim captured frames: a gain, a hue-preserving
-# highlight roll-off above 0.6 that approaches 0.97 and never reaches white (not
-# a clamp), and a mild gamma. It is the same for every pixel; it adds no
-# lighting and moves no colour between surfaces.
-DISPLAY_EXPOSURE = 1.8
-DISPLAY_GAMMA = 1.15
-# Where the roll-off starts. Canonical world, 6 views: 0.6 put 12.3% of drawn
-# pixels at >= 240 (first page 18.1%, 0.75 18.9%); none reach 250 either way.
-TONE_KNEE = 0.6
+# Display mapping: the keyframes' own brightness, with a hue-preserving
+# highlight roll-off above the knee that approaches 0.97 and never reaches white
+# (not a clamp). It is the same for every pixel; it adds no lighting and moves
+# no colour between surfaces. Revised 2026-09-17 (fix-it blotch lane, after the
+# visual review): the first mapping lifted the frames by 1.8 with gamma 1.15,
+# and at the keyframes' own pose and field of view the render was 1.19-2.04x as
+# bright as the keyframe (median 1.66, NCC 0.85), whites blown to cream. At
+# 1.0 / 1.0 / knee 0.8 on the same 10 poses: median 1.01x, NCC 0.94, 3.6% of
+# pixels >= 235 against the keyframes' 4.0%.
+DISPLAY_EXPOSURE = 1.0
+DISPLAY_GAMMA = 1.0
+TONE_KNEE = 0.8
 
 # The blend (WORLD-BUILDER-WORLDS.md §4), measured on the canonical world by the
 # fix-it viewer-polish lane (Glasses-scratch/wb-final-recon/fixit/viewer-polish):
@@ -94,6 +97,18 @@ BORDER_FEATHER_PX = 80
 EDGE_FADE_PX = 8
 CONSENSUS = 1.0
 SOURCE_FADE_MS = 280
+# The fix-it blotch lane (Glasses-scratch/wb-final-recon/fixit/blotch):
+# - the display field of view is the keyframes' own, the viewport fitted inside
+#   their frustum with this margin on the tangent;
+# - thin cracks in the phone proxy (a third of its edges are open) are closed
+#   on the screen across CRACK_FILL_PX CSS px when both sides are one plane,
+#   and shaded from the sources like the proxy;
+# - a void is an unlit fog of the coarse grey luminance around it, and dims
+#   the room near it by up to VOID_WIDE_FADE.
+VIEW_MARGIN = 1.25
+CRACK_FILL_PX = 4
+VOID_FOG = 0.35
+VOID_WIDE_FADE = 0.2
 
 
 class AppearanceViewerUnavailable(Exception):
@@ -190,6 +205,10 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "edge_fade_px": EDGE_FADE_PX,
         "consensus": CONSENSUS,
         "source_fade_ms": SOURCE_FADE_MS,
+        "view_margin": VIEW_MARGIN,
+        "crack_fill_px": CRACK_FILL_PX,
+        "void_fog": VOID_FOG,
+        "void_wide_fade": VOID_WIDE_FADE,
     }
 
 
