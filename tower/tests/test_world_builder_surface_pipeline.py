@@ -1374,8 +1374,11 @@ def test_the_final_surface_runs_before_the_dense_stage_prunes_its_depth():
 
     import scripts.world_build_session as B
 
+    # The post-Stop surface chain lives in `final_surface_stages` (behaviour
+    # tested in test_world_builder_appearance.py::TestTheFinalChain).
     src = inspect.getsource(B.main)
-    assert src.index("surfacify(") < src.index("densify(")
+    assert src.index("final_surface_stages(") < src.index("densify(")
+    assert "surfacify(" in inspect.getsource(B.final_surface_stages)
 
 
 

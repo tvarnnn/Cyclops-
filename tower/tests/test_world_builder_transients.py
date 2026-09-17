@@ -597,12 +597,13 @@ def test_the_walk_uses_oneformer_and_the_finished_world_the_union():
     assert SurfaceParams.live().transient_detector == T.MODE_ONEFORMER
     assert A.AppearanceParams().transient_detector == T.MODE_UNION
     assert A.AppearanceParams.live().transient_detector == T.MODE_ONEFORMER
-    # the final surface and appearance after Stop take the defaults
-    src = inspect.getsource(B.main)
-    for name in ("surfacify(", "build_appearance("):
-        call = src[src.index(name):src.index("\n            )", src.index(name))]
-        code = "\n".join(line.split("#")[0] for line in call.splitlines())
-        assert "params=" not in code, code
+    # the final surface and appearance after Stop take the final presets, named
+    # without overrides (run for real in TestTheFinalChain)
+    src = inspect.getsource(B.final_surface_stages)
+    code = "\n".join(line.split("#")[0] for line in src.splitlines())
+    assert "params=SurfaceParams()," in code and "params=AppearanceParams()," in code
+    assert "SurfaceParams.live" not in code and "AppearanceParams.live" not in code
+    assert "final_surface_stages(" in inspect.getsource(B.main)
 
 
 def test_the_surface_cli_passes_the_detector_mode(tmp_path):
