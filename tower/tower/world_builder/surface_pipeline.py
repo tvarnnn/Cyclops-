@@ -901,6 +901,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
 
     t = time.time()
     fill_stats = None
+    strong = None
     radius = params.fill_radius_voxels()
     if radius > 0:
         # Opt-in only; see `SurfaceParams.fill_gap_frac`. The flag per vertex
@@ -922,19 +923,34 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                       "gap_frac": params.fill_gap_frac,
                       "enclose_dirs": params.fill_enclose_dirs,
                       "sealed_only": params.fill_sealed_only, **seal}
+    elif params.low_weight_evidence:
+        # Cubes observed at every corner but not to `min_weight` emit too, and
+        # only the frame tests below may admit them (SurfaceParams.
+        # low_weight_evidence). `strong` follows each face through the weld.
+        V, F, C, strong = vol.extract_mesh(params.min_weight, progress=progress,
+                                           weak_floor=0.0)
     else:
         V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
-    V, F, C, weld_stats = weld_mesh(V, F, C, quantum=voxel * 1e-3)
+    if strong is None:
+        V, F, C, weld_stats = weld_mesh(V, F, C, quantum=voxel * 1e-3)
+    else:
+        V, F, C, weld_stats, source = weld_mesh(V, F, C, quantum=voxel * 1e-3,
+                                                return_index=True)
+        strong = strong[source]
     n_blocks, trunc_at = vol.n_blocks, vol.trunc_at
     # The field is done with; the filter below needs the memory more.
     vol.release_field()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     evidence_stats = None
+    weak = None if strong is None else ~strong
     if len(F) and (params.min_support_frames > 0 or params.contradiction_ratio > 0):
         keep, evidence_stats = evidence_filter(V, F, views, frames.K, trunc_at, params,
-                                               device)
+                                               device, weak=weak)
         V, F, C = keep_faces(V, F, C, keep)
+    elif weak is not None and weak.any():
+        # A low-weight face is admitted by the frame tests or not at all.
+        V, F, C = keep_faces(V, F, C, ~weak)
     if not len(F):
         if evidence_stats and evidence_stats.get("faces_in"):
             s = evidence_stats
@@ -944,8 +960,10 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                       f"fewer than {params.min_support_frames} distinct frames, "
                       f"{s.get('dropped_contradicted', 0)} were seen past by at least "
                       f"{params.contradiction_ratio:g}x as many frames as measured "
-                      f"them, and {s.get('dropped_back_facing', 0)} were seen only "
-                      "from behind")
+                      f"them, {s.get('dropped_back_facing', 0)} were seen only "
+                      f"from behind, and {s.get('dropped_weak_seen_through', 0) + s.get('dropped_weak_parallax', 0)} "
+                      "low-weight faces were seen through or measured from too narrow "
+                      "a baseline")
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
                   "a surface")
@@ -989,12 +1007,14 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             return _stop(root, STAGE_PACK, seconds)
         # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
         parent = source
-        Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(*source, target)
+        Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(
+            *source, target, boundary_weight=params.lod_boundary_weight)
         N = vertex_normals(Vl, Fl)
         buf = write_mesh_bytes(Vl, Fl, Cl, N)
         if level == params.mobile_level and params.mobile_page_bytes > 0:
             Vl, Fl, Cl, buf, mobile_fit = _fit_mobile_page(
-                parent, (Vl, Fl, Cl), buf, target, params.mobile_page_bytes)
+                parent, (Vl, Fl, Cl), buf, target, params.mobile_page_bytes,
+                boundary_weight=params.lod_boundary_weight)
         source = (Vl, Fl, Cl)
         name = f"mesh_l{level}.{build_id}.bin"
         write_bytes_atomic(root / name, lambda handle, data=buf: handle.write(data))
@@ -1041,7 +1061,8 @@ def _snap_summary(stats):
     return keep
 
 
-def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4):
+def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4,
+                     boundary_weight: float = 1.0):
     """The phone level, decimated from its parent until its PAGE fits.
 
     The largest level that fits, not a fixed face count: each attempt scales
@@ -1061,7 +1082,7 @@ def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4):
     tries = 0
     while len(buf) > budget and len(Fl) > 1 and tries < attempts:
         fit = max(1, int(len(Fl) * budget / len(buf) * 0.98))
-        Vl, Fl, Cl = decimate(*parent, fit)
+        Vl, Fl, Cl = decimate(*parent, fit, boundary_weight=boundary_weight)
         buf = write_mesh_bytes(Vl, Fl, Cl, vertex_normals(Vl, Fl))
         tries += 1
     record = {"page_budget_bytes": int(page_bytes), "mesh_budget_bytes": int(budget),
@@ -1121,12 +1142,16 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
                 if params.fill_sealed_only else
                 "filled patches left with an open rim were KEPT"))
             if filled else
-            ("none: a cube emits surface only where all eight corners "
-             "reached min_weight, and a face is kept only where at least "
+            ("none: a cube emits surface only where all eight corners were "
+             "observed, and a face is kept only where at least "
              "min_support_frames distinct frames measured it and fewer than "
-             "contradiction_ratio times as many saw through it, so "
-             "unobserved space is absent rather than closed over; a hole "
-             "may also be space the frames disagreed about")),
+             "contradiction_ratio times as many saw through it"
+             + (("; where a corner fell short of min_weight, only if no frame "
+                 "saw through the face and its supporting cameras spanned "
+                 "low_weight_min_parallax") if params.low_weight_evidence else
+                "; and all eight reached min_weight")
+             + ", so unobserved space is absent rather than closed over; a hole "
+               "may also be space the frames disagreed about")),
     })
 
 
