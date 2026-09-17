@@ -66,7 +66,7 @@ def _params_from_args(args) -> SurfaceParams:
     if args.live:
         overrides = {}
         for name in ("voxel_frac", "min_weight", "smooth_iterations",
-                     "min_component_frac", "gate_rel"):
+                     "min_component_frac", "gate_rel", "transient_detector"):
             value = getattr(args, name, None)
             if value is not None:
                 overrides[name] = value
@@ -74,7 +74,8 @@ def _params_from_args(args) -> SurfaceParams:
     kw = {}
     for name in ("voxel_frac", "trunc_voxels", "trunc_error_multiple",
                  "min_weight", "carve_weight", "max_grazing_deg", "edge_rel",
-                 "gate_rel", "min_component_frac", "smooth_iterations"):
+                 "gate_rel", "min_component_frac", "smooth_iterations",
+                 "transient_detector"):
         value = getattr(args, name, None)
         if value is not None:
             kw[name] = value
@@ -87,7 +88,7 @@ def _print_progress(stage, done, total):
     print(f"    {stage}: {done}/{total}", flush=True)
 
 
-def _build_appearance(store, world_id, sid, *, live: bool) -> None:
+def _build_appearance(store, world_id, sid, *, live: bool, transients: str | None = None) -> None:
     """The appearance on the surface just built, in this process.
 
     In the SAME child as the live surface rather than a second one: it needs
@@ -99,7 +100,8 @@ def _build_appearance(store, world_id, sid, *, live: bool) -> None:
     from tower.world_builder.appearance_pipeline import build_appearance  # noqa: PLC0415
 
     t = time.time()
-    params = AppearanceParams.live() if live else AppearanceParams()
+    overrides = {"transient_detector": transients} if transients else {}
+    params = AppearanceParams.live(**overrides) if live else AppearanceParams(**overrides)
     result = build_appearance(store, world_id, sid, params=params)
     print(f"  appearance {result.state}: {result.keyframes} keyframes "
           f"({result.phone} phone), {result.chunks} chunks, {result.bytes / 1e6:.1f} MB, "
@@ -133,6 +135,11 @@ def main() -> int:
     ap.add_argument("--appearance", action="store_true",
                     help="after each surface builds, build the appearance artifact "
                          "on it (WORLD-BUILDER-APPEARANCE.md) in this same process")
+
+    ap.add_argument("--transients", dest="transient_detector",
+                    choices=("union", "oneformer", "off"),
+                    help="the transient detector that masks the wearer's hands out of "
+                         "fusion and appearance (default: union; oneformer with --live)")
 
     ap.add_argument("--voxel-frac", dest="voxel_frac", type=float)
     ap.add_argument("--trunc-voxels", dest="trunc_voxels", type=float)
@@ -235,8 +242,15 @@ def main() -> int:
             print(f"  L{lv['level']}: {lv['faces']:,} faces, "
                   f"{lv['bytes'] / 1e6:.1f} MB")
         print(f"  {time.time() - t:.1f}s total  {result.seconds}")
+        man = read_surface_manifest(store, world_id, sid) or {}
+        tr = man.get("transients") or {}
+        print(f"  transients {tr.get('state')} ({tr.get('mode')}): "
+              f"{tr.get('frames_masked', 0)} masked, {tr.get('computed', 0)} computed, "
+              f"{tr.get('cached', 0)} cached, {tr.get('seconds', {}).get('total')}s"
+              + (f" -- {tr['detail']}" if tr.get("detail") else ""), flush=True)
         if args.appearance:
-            _build_appearance(store, world_id, sid, live=args.live)
+            _build_appearance(store, world_id, sid, live=args.live,
+                              transients=args.transient_detector)
     if cannot_run_here:
         # Distinct from an ordinary failure, so the builder's live worker can
         # stop relaunching (SURFACE_EXIT_CANNOT_RUN_HERE in world_build_session).

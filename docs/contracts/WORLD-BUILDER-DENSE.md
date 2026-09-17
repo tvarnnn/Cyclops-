@@ -59,6 +59,24 @@ Three rules follow, and they are the whole compatibility story:
 Everything outside `manifest.json` and `points_l*.bin` is diagnostic or
 intermediate. A consumer reads only those.
 
+### 3a. Transient detector masks in `work/depth/`
+
+Added 2026-09-17. Beside each keyframe's `<ki:05d>_fill.npy` the surface and
+appearance stages may write `<ki:05d>_transient.<component>.npz`
+(`component` = `gdsam` or `oneformer`; `tower/world_builder/transients.py`):
+bit-packed `hand` and `phone` masks in the solve camera, their `shape`, and a
+`key` (JSON) naming the keyframe id, the stored-JPEG SHA-1, the effective
+redaction label, `fill_rule`, the unobserved rule, the pinned model revisions,
+the component's parameters, and the `image_sha1` the pixels came from. A file
+whose key does not match the reader's is not a mask; a missing file is never an
+empty one. They are computed only from the redacted keyframe through the
+appearance stage's provenance function (`WORLD-BUILDER-APPEARANCE.md` §6), never
+from `work/undist/`, the solve's `images/` or a capture. They live here
+because they are per keyframe, solve-independent, computed against `_fill.npy`,
+and read by both consumers of this directory; `prune_intermediates` removes
+them with the rest of `work/`, and a later build recomputes them (about 0.7 s a
+keyframe for `union`). The point stage (`points_l*.bin`) does not read them.
+
 ## 4. `points_lN.bin`
 
 A flat interleaved buffer with **no header**, so a browser can hand it straight

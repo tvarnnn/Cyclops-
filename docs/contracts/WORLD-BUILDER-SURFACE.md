@@ -90,7 +90,21 @@ geometry comes from.
    OpenCV axes with y down. It is NOT the frame `world.json`'s
    `pose_convention` block describes, which belongs to the derived tree's
    segment-local poses.
-6. **Scale is inherited, never invented.** `manifest.scale` is copied verbatim
+6. **The wearer's detected hands, arms and held phone have zero weight.**
+   When `transients.state` is `ok`, every pixel of a keyframe's transient
+   detector mask (`WORLD-BUILDER-APPEARANCE.md` §5.3a; `union` for a final
+   build, `oneformer` for a live one) is removed from that frame's valid depth
+   before fusion: it neither measures, carves, nor counts as support or
+   contradiction in claim 1. A hand lying on the desk is within depth noise of
+   the desk, so claim 3 cannot remove it; this can. Any other state means no
+   mask was applied — never read "unavailable" as "masked". The rule id is part
+   of `params_digest`. Measured on the canonical world: L0 went from 2,698,323 to
+   2,696,847 faces; rendered at the recorded poses ki 308/330/351/391, the vertex
+   colour changed by a mean 6.9–9.9 (of 255) inside those keyframes' masks and
+   1.1–2.3 outside, concentrated on the desk under the handled phone. The
+   ghost it removes is faint, because each vertex colour already averages many
+   keyframes; the phone itself stays (it rests there in other frames).
+7. **Scale is inherited, never invented.** `manifest.scale` is copied verbatim
    from the world's `ScaleState`. When the world's scale is `unknown` so is
    the artifact's, and no length in the viewer is labelled in metres.
 
@@ -230,7 +244,7 @@ distinguishable from corruption.
 | `format` | `wb-surface-mesh/1` |
 | `schema_version` | 1 |
 | `input_digest` | the solve this was built from; compare with the live solve to detect staleness |
-| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle), then `|set:<name>@<digest>` when the session reads a re-redacted keyframe set (`WORLD-BUILDER-APPEARANCE.md` §6.5). It includes the consistency solver's version and parameter digest and the plane snap's parameters and version, so every surface built before them is rebuilt. Recomputing it from `params` alone does not reproduce it |
+| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle), then `|set:<name>@<digest>` when the session reads a re-redacted keyframe set (`WORLD-BUILDER-APPEARANCE.md` §6.5), then `|transients:` and the transient detector's rule id. It includes the consistency solver's version and parameter digest and the plane snap's parameters and version, so every surface built before them is rebuilt. Recomputing it from `params` alone does not reproduce it |
 | `params` | the full parameter set, including `quality` |
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
 | `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |
@@ -244,7 +258,8 @@ distinguishable from corruption.
 | `vertices`, `faces` | of level 0 |
 | `levels` | per level: level, vertices, faces, bytes |
 | `canonical_level`, `mobile_level` | which rung is the archive and which the phone gets |
-| `seconds` | per stage: `depth`, `consistency`, `fuse`, `mesh`, `snap`, `pack` |
+| `seconds` | per stage: `depth`, `transients` (ensuring the detector masks), `consistency`, `fuse`, `mesh`, `snap`, `pack` |
+| `transients` | claim 6: the detector report (`state`, `detail`, `mode`, `rule`, `models`, `frames_masked`, `computed`, `cached`, `seconds`, `gpu_peak_mb`) plus `frames_fused_with_mask`. Absent from manifests written before 2026-09-17 |
 | `scale` | inherited verbatim, with a note saying so |
 | `closure` | the sentence stating that unobserved space is absent, and that a hole may also be space the frames disagreed about |
 

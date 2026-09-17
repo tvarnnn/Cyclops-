@@ -39,6 +39,7 @@ STATE_STOPPED = "stopped"
 STATE_UNAVAILABLE = "unavailable"
 
 STAGE_PROVENANCE = "provenance"
+STAGE_DETECTOR = "detector"
 STAGE_PROXY = "proxy"
 STAGE_OCCLUDERS = "occluders"
 STAGE_EXPOSURE = "exposure"
@@ -142,7 +143,8 @@ def named_files(manifest: dict | None) -> dict:
 def build_appearance(store, world_id: str, session_id: str, *,
                      params: A.AppearanceParams | None = None,
                      should_stop=None, progress=None, force: bool = False,
-                     redactor_factory=None, device=None) -> AppearanceResult:
+                     redactor_factory=None, device=None,
+                     transient_backend_factory=None) -> AppearanceResult:
     """Build the appearance artifact of one solved, surfaced session."""
     params = params or A.AppearanceParams()
     root = appearance_dir(store, world_id, session_id)
@@ -155,7 +157,7 @@ def build_appearance(store, world_id: str, session_id: str, *,
     try:
         _sweep_unnamed(root)
         return _build(store, world_id, session_id, root, params, should_stop, progress,
-                      force, redactor_factory, device)
+                      force, redactor_factory, device, transient_backend_factory)
     except A.AppearanceUnavailable as exc:
         logger.warning("[Tower][WorldBuilder][appearance] %s/%s not built: %s",
                        world_id, session_id, exc.reason)
@@ -170,7 +172,8 @@ def build_appearance(store, world_id: str, session_id: str, *,
 
 
 def _build(store, world_id, session_id, root, params, should_stop, progress, force,
-           redactor_factory, device) -> AppearanceResult:
+           redactor_factory, device, transient_backend_factory=None) -> AppearanceResult:
+    from tower.world_builder import transients as T  # noqa: PLC0415
     from tower.world_builder.dense import depth_from_prediction  # noqa: PLC0415
     from tower.world_builder.dense_pipeline import FILL_RULE, dense_dir  # noqa: PLC0415
     from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
@@ -241,6 +244,23 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
                                 undistorter=undistorter, hash_only=True)
         hashes.append((kid, src.source_sha1 or "missing"))
     frame_digest = A.per_frame_sha1_digest(hashes)
+
+    # -- transient detector masks (contract §5.3a) ----------------------------
+    # Before the digest: which masks exist is an input. Cached per keyframe
+    # beside the depth work, so this computes only keyframes no earlier build
+    # (usually the surface stage, just before) already masked. A machine that
+    # cannot run the detector gets `unavailable`, recorded, never "masked".
+    td = time.time()
+    _status(root, state=STATE_RUNNING, stage=STAGE_DETECTOR)
+    tparams = T.TransientParams(mode=params.transient_detector)
+    treport = T.ensure_transient_masks(
+        store, world_id, session_id, [(ki, kid) for ki, kid, _p, _r in candidates],
+        intrinsics=intrinsics, camera=cam, align_records=records, depth_dir=depth_dir,
+        params=tparams, policy=policy, backend_factory=transient_backend_factory,
+        should_stop=should_stop, progress=progress)
+    if treport.state == T.STATE_STOPPED:
+        return _stop(root, STAGE_DETECTOR, seconds)
+    seconds[STAGE_DETECTOR] = round(time.time() - td, 2)
     encoders = A.encoder_versions(params)
     digest_inputs = {
         "schema": A.APPEARANCE_SCHEMA_VERSION,
@@ -255,6 +275,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "unobserved_rule": A.UNOBSERVED_RULE,
         "alpha_ring_px": A.ALPHA_RING_PX,
         "per_frame_sha1_digest": frame_digest,
+        "transients": {"rule": tparams.rule_id(), "state": treport.state,
+                       "frames_digest": treport.frames_digest()},
         "params": params.as_dict(),
         "encoders": {k: [v["encoder"], v["version"], v["quality"], v["available"]]
                      for k, v in encoders.items()},
@@ -266,6 +288,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         _status(root, state=STATE_OK, params_digest=pdigest, result=done.as_dict())
         return done
 
+    tp = time.time()
     _status(root, state=STATE_RUNNING, stage=STAGE_PROVENANCE, params_digest=pdigest)
     frames: list[A.PreparedFrame] = []
     refused: dict = {}
@@ -283,9 +306,14 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             continue
         R = np.asarray(pose["rotation"], float).reshape(3, 3)
         t = np.asarray(pose["translation"], float)
+        det = treport.mask(ki)
+        if det is not None and det.shape != src.unobserved.shape:
+            det = None
         frames.append(A.PreparedFrame(source=src, R=R, t=t, zp=None, occluder=None,
-                                      occluder_record=None))
-    seconds[STAGE_PROVENANCE] = round(time.time() - t0, 2)
+                                      occluder_record=None, detector=det))
+    # From its own start: the detector stage now runs before it (the first
+    # canonical build reported 18.3 s here, 15.4 of them the detector).
+    seconds[STAGE_PROVENANCE] = round(time.time() - tp, 2)
 
     # -- proxy depth and occluders ------------------------------------------
     t1 = time.time()
@@ -470,6 +498,10 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "transparent_fraction": round(float((~opaque[i]).mean()), 4),
             "near_fraction": fr.extra.get("near_fraction"),
             "transient_fraction": fr.extra.get("transient_fraction"),
+            "detector_fraction": (None if fr.detector is None
+                                  else round(float(fr.detector.mean()), 4)),
+            "transient_mask": (None if fr.detector is None
+                               else {"mode": tparams.mode, "rule": tparams.rule_id()}),
             "occluder": fr.occluder_record,
             "transient": fr.extra.get("transient"),
             "source_sha1": src.source_sha1, "image_sha1": src.image_sha1,
@@ -479,6 +511,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     occ_px = [int(fr.occluder.sum()) for fr in frames]
     near_frac = [fr.extra.get("near_fraction") or 0.0 for fr in frames]
     tr_frac = [fr.extra.get("transient_fraction") or 0.0 for fr in frames]
+    det_frac = [float(fr.detector.mean()) if fr.detector is not None else 0.0 for fr in frames]
     inconsistent = [fr.source.ki for fr in frames
                     if fr.extra.get("transient") and not fr.extra["transient"].get("applied", True)]
     seconds["total"] = round(time.time() - t0, 2)
@@ -536,6 +569,10 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
                       "transient_mean_fraction": round(float(np.mean(tr_frac)), 5),
                       "frames_with_near": int(sum(1 for f in near_frac if f > 0)),
                       "frames_with_transient": int(sum(1 for f in tr_frac if f > 0)),
+                      "detector_mean_fraction": round(float(np.mean(det_frac)), 5),
+                      "frames_with_detector_mask": int(sum(1 for fr in frames
+                                                           if fr.detector is not None)),
+                      "frames_with_detector_pixels": int(sum(1 for f in det_frac if f > 0)),
                       "misregistered_frames_unmasked": inconsistent,
                       "rule": (f"near:src<clamp(1-{params.occluder_mad_multiple}mad,"
                                f"{params.occluder_ratio_min},{params.occluder_ratio_max})"
@@ -546,6 +583,10 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
                                f"views>={params.transient_min_views}|consensus{params.transient_consensus}|"
                                f"diff>max({params.transient_abs},{params.transient_rel}*luma)|"
                                f"shift{params.transient_shift_px}|framemax{params.transient_frame_max}")},
+        # THE MISSING-MASK POLICY (contract §5.3a): `state` is `ok` only when
+        # the detector ran or its cache answered; otherwise `unavailable`,
+        # `failed` or `off`, with the reason, and no keyframe says it is masked.
+        "transients": treport.record(),
         "seconds": seconds,
         "scale": _scale_note(world),
     }

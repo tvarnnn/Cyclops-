@@ -321,7 +321,24 @@ def _tree_bytes(path: Path | None) -> int:
     return total
 
 
-def load_hub_weights(name: str, model_id: str, load: Callable[[], object]):
+def _is_weights_missing(exc: BaseException, missing: tuple) -> bool:
+    """`exc`, or anything it was raised from, is the hub's "not cached and not
+    downloadable". `transformers` re-raises the hub's error as a bare `OSError`
+    `from` it, so the type of the outer exception alone does not say."""
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        if missing and isinstance(cur, missing):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def load_hub_weights(name: str, model_id: str, load: Callable[[], object], *,
+                     what: str = "depth model", error: type | None = None,
+                     hint: str = "about 1.3 GB for the default model",
+                     log_tag: str = "dense"):
     """Run `load` (a `from_pretrained`), turning "the weights are not here and
     cannot be fetched" into `DepthModelUnavailable` naming the model and the
     cache, and logging what a first-run download cost.
@@ -330,7 +347,13 @@ def load_hub_weights(name: str, model_id: str, load: Callable[[], object]):
     use. Before this, a machine that was offline on its first walk raised the
     hub's own `LocalEntryNotFoundError`, which the surface stage recorded as an
     ordinary failure, so the live worker relaunched a child on every solve.
+
+    Other hub-loaded models use the same rule with their own `what`, `error`
+    (the exception their stage treats as "this machine cannot run it") and
+    `hint` (the size a first run downloads): the transient detector
+    (`transients.py`) loads three checkpoints through here.
     """
+    error = error or DepthModelUnavailable
     cache = hub_model_cache(model_id)
     before = _tree_bytes(cache)
     t0 = time.time()
@@ -338,20 +361,20 @@ def load_hub_weights(name: str, model_id: str, load: Callable[[], object]):
     try:
         model = load()
     except Exception as exc:  # noqa: BLE001 -- re-raised unless it is the one case
-        if missing and isinstance(exc, missing):
-            raise DepthModelUnavailable(
-                f"depth model {model_id!r} (backend {name!r}) is not in the "
+        if _is_weights_missing(exc, missing):
+            raise error(
+                f"{what} {model_id!r} (backend {name!r}) is not in the "
                 f"Hugging Face cache ({cache}) and could not be downloaded: "
                 f"{type(exc).__name__}. Connect this machine to the internet "
-                "for its first build (about 1.3 GB for the default model), or "
-                "pre-seed the cache, then build again"
+                f"for its first build ({hint}), or pre-seed the cache, then "
+                "build again"
             ) from None
         raise
     grown = _tree_bytes(cache) - before
     if grown > 1_000_000:
-        logger.info("[Tower][WorldBuilder][dense] downloaded depth model %s: "
-                    "%.0f MB in %.0f s into %s", model_id, grown / 1e6,
-                    time.time() - t0, cache)
+        logger.info("[Tower][WorldBuilder][%s] downloaded %s %s: "
+                    "%.0f MB in %.0f s into %s", log_tag, what, model_id,
+                    grown / 1e6, time.time() - t0, cache)
     return model
 
 

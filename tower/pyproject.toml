@@ -67,6 +67,28 @@ appearance = [
     "astc-encoder-py==0.1.12",
     "open3d>=0.19",
 ]
+# The transient detector (tower/world_builder/transients.py,
+# WORLD-BUILDER-APPEARANCE.md §5.3a): the wearer's hands, arms and held phone,
+# masked out of appearance and surface fusion. Needs `dense` (torch) as well.
+# NOTHING NEW WAS INSTALLED for it: every package below was already in the
+# Tower venv (transformers 5.16.1, huggingface_hub 1.29.0, tokenizers 0.23.1,
+# safetensors 0.8.0, scipy 1.18.1, pillow 12.3.0). Declared so a fresh venv
+# gets them. Without them the stages record `transients: unavailable` and
+# build anyway.
+#   Weights (fetched on first use, pinned revisions, ~2.14 GB into the
+#   Hugging Face cache): Grounding DINO-base (Apache-2.0), SAM 2.1 hiera
+#   base-plus (Apache-2.0), OneFormer Swin-L COCO (MIT). Not used: EgoHOS
+#   (weights unobtainable), SAM 3 (gated, custom licence), YOLO11-seg (AGPL).
+#   transformers >= 5 for Sam2Model; scipy for OneFormer's panoptic
+#   post-processing.
+transients = [
+    "transformers>=5.0",
+    "huggingface_hub>=1.0",
+    "tokenizers>=0.22",
+    "safetensors>=0.4",
+    "scipy>=1.11",
+    "pillow>=10",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a

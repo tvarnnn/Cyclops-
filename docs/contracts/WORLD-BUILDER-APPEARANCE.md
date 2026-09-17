@@ -62,12 +62,11 @@ Tower does not render; it prepares.
 4. **The proxy is the surface artifact's geometry**, not a new reconstruction.
    `proxy.source` names the surface build it was copied from. A better surface
    plugs in by rebuilding this artifact; nothing in this stage changes geometry.
-5. **Occluder masks are a depth disagreement, not a detector.** A pixel is an
-   occluder in a keyframe when that keyframe's own aligned monocular depth is
-   much nearer than the proxy at that pixel (§5.3). It removes the wearer's
-   hands and phone where the proxy is behind them. It does not recognise hands,
-   and it also removes any real object the proxy lacks (which would otherwise
-   be pasted onto the surface behind it).
+5. **Three occluder masks, and the manifest says which ran.** A depth
+   disagreement and a photometric vote (§5.3), neither of which recognises a
+   hand; and, when `transients.state` is `ok`, a **detector** mask of the
+   wearer's hands, arms and held phone (§5.3a). A keyframe whose
+   `transient_mask` is `null` was NOT detector-masked, whatever else it says.
 
 ## 3. What this artifact PROMISES NOT to claim
 
@@ -251,6 +250,60 @@ The per-keyframe record keeps `near_fraction`, `transient_fraction`,
 `occluder: {median_ratio, mad, threshold}` and
 `transient: {tested, disagreeing_fraction, applied}`.
 
+### 5.3a The transient detector mask (`tower/world_builder/transients.py`)
+
+The tests above partly removed the hands on the desk (ki 308, 330, 351 kept
+most of them). This mask is the detector the fix-it hands lane measured on 62
+hand-labelled canonical frames: 97.7% hand/arm pixel recall, 99.7% held-phone
+recall, 3.1% of static pixels flagged (the geometry rules: 44–49%, 1–6%,
+13–15%).
+
+**Recipe** (`mode: union`, rule id recorded as `transients.rule`):
+
+- input: the undistorted **redacted** keyframe exactly as `keyframe_source`
+  returns it (§6), gamma-2 lifted for detection only;
+- `gdsam`: Grounding DINO-base boxes for `hand. arm. sleeve. mobile phone.`
+  (box/text 0.2; hand/arm/sleeve ≥ 0.30, phone ≥ 0.25; boxes ≥ 4 px) turned
+  into masks by SAM 2.1 hiera base-plus box prompts; a mask over 60% of the
+  image or more than 70% inside the unobserved (fill) mask is dropped;
+- `oneformer`: OneFormer Swin-L COCO panoptic at 0.5, `person` as hand,
+  `cell phone` as phone;
+- per component, a phone counts only when a connected component of it touches
+  the hand mask dilated 12 px (a resting phone is scene); union over
+  components; dilated by a 12-pixel ellipse at 359 px width, scaled with width.
+
+`mode: oneformer` is the cheaper mode (97.5% / 96.4% / 3.05% on the same
+labels); `mode: off` computes nothing. Checkpoints are pinned by revision
+(`transients.models`).
+
+**Use.** `transparent core = unobserved ∪ near ∪ vote ∪ detector`: RGB zeroed,
+alpha 0 over the core dilated 7 px (§5.6), and the exposure gains and the
+photometric vote sample only texels outside that dilated core, so a detected
+hand never constrains a gain or a reference colour. The detector mask is kept
+**separate** from the unobserved (privacy) mask: `unobserved_fraction` and
+`mask_origin` do not include it; `detector_fraction` does.
+
+**Cache.** Per keyframe per component, beside the depth work
+(`WORLD-BUILDER-DENSE.md` §3a), keyed by keyframe id, stored-JPEG SHA-1,
+effective redaction label, fill and unobserved rules, pinned model revisions
+and the component's parameters. Composition happens on read. A surface build
+usually computes them first; this stage computes only what is missing.
+
+**The missing-mask policy.** If the detector cannot run — packages absent,
+weights neither cached nor downloadable (named, with the cache path, logged
+once), `TOWER_WORLD_TRANSIENTS=off`, or the detector throws — the build
+**proceeds** with the depth and vote occluders only, and records
+`transients.state: unavailable` (or `failed`), `rule: null`,
+`frames_masked: 0`, and `transient_mask: null` on every keyframe. It never
+reports a keyframe masked that was not. Why proceed rather than refuse, when a
+missing *fill* mask refuses the frame (§6.2): the fill mask is a privacy
+guarantee — a pixel without it may be a face. The detector mask is a quality
+mask: a pixel without it may be a hand, which the wearer already saw and which
+the vote partly removes. Refusing would leave an offline Tower's first walk
+with no appearance at all, to prevent a defect that is visible, labelled, and
+fixed by the next build with the detector (the digest includes the mask state,
+so that build is not "already built").
+
 ### 5.4 Exposure gains
 
 Per keyframe, per channel, `g` such that the recorded 8-bit value is
@@ -386,8 +439,11 @@ Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 `input_digest`, the proxy's SHA-256 and its source surface build, the
 depth stage's `cache_key`, `session_redaction`, `keyframe_image_set`,
 `redactor_applied_here`,
-`fill_rule`, `unobserved_rule`, `per_frame_sha1_digest`, the occluder, exposure
-and selection parameters, and the encoder names and versions. Any change to any
+`fill_rule`, `unobserved_rule`, `per_frame_sha1_digest`, the transient
+detector's `{rule, state, frames_digest}` (SHA-1 over every keyframe's
+component cache keys: a rule change, a new model revision, or masks that
+appeared since, all rebuild), the occluder, exposure, detector-mode and
+selection parameters, and the encoder names and versions. Any change to any
 of them rebuilds; an equal digest with every named file whole is
 "already built" (`--force` rebuilds anyway).
 
@@ -509,7 +565,8 @@ step cannot run; a set already written is unaffected.
 | `selection` | `{phone_budget, phone, tower, coverage: {phone: {seen1, seen2}, all: {…}}, objective}` |
 | `exposure` | `{observations, points, abs_log_residual_before, abs_log_residual_after, gain_range}`; observations are a seeded sample of at most 6,000,000 |
 | `occluders` | `{frames_with_occluders, total_pixels, mean_fraction, near_mean_fraction, transient_mean_fraction, frames_with_near, frames_with_transient, misregistered_frames_unmasked, rule}` |
-| `seconds` | per stage |
+| `transients` | §5.3a: `{state (ok, unavailable, failed, off), detail, mode, rule (null unless ok), requested_rule, models, frames_masked, computed, cached, refused, frames_digest, seconds, gpu_peak_mb}` |
+| `seconds` | per stage (`detector` is the time to ensure the masks) |
 | `scale` | inherited, with a note |
 
 Per keyframe:
@@ -529,6 +586,8 @@ Per keyframe:
 | `sharpness` | variance of the Laplacian over opaque pixels |
 | `unobserved_fraction`, `occluder_fraction`, `near_fraction`, `transient_fraction` | of the frame, before the alpha ring |
 | `transparent_fraction` | alpha 0, ring included |
+| `detector_fraction` | the detector mask's fraction of the frame, or `null` when the keyframe has none |
+| `transient_mask` | `{mode, rule}` of the detector mask applied, or `null`: **not detector-masked** |
 | `occluder` | the near test's `{median_ratio, mad, threshold}`, or `null` when there was too little overlap to measure |
 | `transient` | `{tested, disagreeing_fraction, applied}`, or `null` |
 | `source_sha1`, `image_sha1`, `origin`, `mask_origin` | §6.3 |
@@ -600,6 +659,19 @@ answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
   until Stop): 27.5 ms a keyframe with the current redactor. Measured on the
   canonical world (374 keyframes, trusted label so no re-redaction): 45 s on a
   quiet card, 90 s with another lane holding it at 98%.
+- **Detector, live and final.** The live presets use `mode: oneformer`; the
+  final build after Stop uses `union`. Measured on the canonical world, RTX 5070
+  shared with another lane (73–88% utilisation), models already cached on disk:
+  a fresh 50-keyframe increment costs **15.2 s** in `oneformer` mode (0.9 s load,
+  0.28 s a keyframe) and **29.0 s** in `union` (Grounding DINO 11.6 s, SAM
+  1.6 s on the 18 keyframes with boxes, OneFormer 12.8 s, three loads 2.2 s);
+  a pass over already-masked keyframes costs 0.06–0.12 s per 50. Peak
+  allocation 2.67 GB (one model at a time). Union would double the detector's
+  share of a live build, so the walk uses OneFormer, and the final build adds
+  the Grounding DINO + SAM component to the OneFormer masks the walk already
+  cached (the cache is per component): 301 keyframes in 97.5 s at Stop. The
+  live child's own run: 251 new keyframes in 80.5 s. Each mask records its mode.
+  A first run downloads 2.14 GB (934 + 323 + 881 MB, logged).
 - **Final.** After Stop the builder runs the final surface, then the final
   appearance, then prunes the depth stage's work — in that order, because the
   appearance needs `_fill.npy` and `_pred.npy`.
