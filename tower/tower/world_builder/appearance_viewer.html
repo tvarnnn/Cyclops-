@@ -1,0 +1,1183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="wb-representation" content="appearance">
+<meta http-equiv="Content-Security-Policy" content="__WB_APPEARANCE_CSP__">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>World</title>
+<style>
+:root{
+  --bg:#0b0d10; --ink:#e8e9ec; --dim:#9aa0a8; --line:#23262c; --accent:#64d2ff;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  overscroll-behavior:none}
+body{overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none}
+canvas{display:block;width:100%;height:100%;touch-action:none;background:var(--bg)}
+#wrap{position:fixed;inset:0}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:10px 12px calc(10px + env(safe-area-inset-bottom));
+  background:linear-gradient(to top,rgba(11,13,16,.96),rgba(11,13,16,0));
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{appearance:none;-webkit-appearance:none;border:1px solid var(--line);background:#14171c;color:var(--ink);
+  border-radius:8px;padding:8px 11px;font:inherit;font-size:13px;min-height:38px;touch-action:manipulation}
+button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+button[disabled]{opacity:.4}
+#caption{position:fixed;left:0;right:0;top:0;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;
+  background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,0));
+  font-size:12px;color:var(--dim);pointer-events:none}
+#caption b{color:var(--ink);font-weight:600}
+#status{position:fixed;left:12px;bottom:calc(64px + env(safe-area-inset-bottom));font-size:12px;
+  color:var(--dim);pointer-events:none;font-variant-numeric:tabular-nums}
+#msg{position:fixed;inset:0;display:none;place-content:center;padding:28px;text-align:center;
+  color:var(--dim);background:var(--bg);z-index:5}
+#msg.on{display:grid}
+.spacer{flex:1}
+#pos{font-variant-numeric:tabular-nums;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="caption"></div>
+<div id="status"></div>
+<div id="bar">
+  <button id="bOrbit" aria-pressed="false">Orbit</button>
+  <button id="bWalk" aria-pressed="false">Walk</button>
+  <button id="bPrev">&#8592;</button>
+  <button id="bNext">&#8594;</button>
+  <span id="pos"></span>
+  <span class="spacer"></span>
+  <button id="bReset">Reset</button>
+</div>
+<div id="msg"></div>
+<script>
+"use strict";
+/* The appearance viewer: the wearer's own redacted keyframes, blended view-
+   dependently over the proxy surface they were prepared against.
+
+   Contract: docs/contracts/WORLD-BUILDER-APPEARANCE.md (the artifact) and
+   WORLD-BUILDER-WORLDS.md §4 (this page). The page is a small shell; the
+   imagery arrives through `fetch` from CONFIG.base, which is the app's private
+   scheme on the phone (every request passes a native whitelist) and the Tower's
+   own origin only in the explicit desktop debug mode. Nothing is written
+   anywhere: textures live in GPU memory for the life of the page. */
+const CONFIG = __WB_APPEARANCE_CONFIG__;
+const T0 = performance.now();
+const S = {                          // what the page reports about itself
+  phase: "starting", encoding: null, layers: 0, capacity: 0, keyframesInManifest: 0,
+  wireBytes: 0, requests: 0, gpu: {}, gpuBytes: 0, revision: null, buildId: null,
+  appends: 0, contextLosses: 0, errors: [], timing: {}, opening: null, choice: [],
+};
+window.__wbAppearance = S;
+
+const $ = id => document.getElementById(id);
+function fail(text){
+  S.phase = "failed"; S.errors.push(String(text));
+  const m = $("msg"); m.textContent = text; m.classList.add("on");
+  $("wrap").style.display = "none"; $("bar").style.display = "none";
+  $("caption").style.display = "none"; $("status").textContent = "";
+}
+function status(text){ $("status").textContent = text || ""; }
+
+const DEBUG = CONFIG.transport === "tower";
+const Q = DEBUG ? new URLSearchParams(location.search) : new URLSearchParams("");
+const OPT = {
+  // Candidate sources chosen per frame, and the ULR top-k blended per fragment.
+  candidates: 10,
+  k: Math.max(1, Math.min(6, +(Q.get("k") || CONFIG.k || 4))),
+  forceWebp: Q.get("enc") === "webp",
+  debugMode: +(Q.get("dbg") || 0),
+  preserve: Q.get("preserve") === "1",
+};
+
+/* ---------- transport ---------------------------------------------------- */
+function url(route){ return (CONFIG.base || "") + route; }
+async function fetchBytes(route, what){
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++){
+    try {
+      const r = await fetch(url(route), {cache: "no-store", credentials: "omit"});
+      S.requests++;
+      if (r.status === 404){
+        let detail = null;
+        try { detail = (await r.json()).detail; } catch (_) { /* not JSON */ }
+        const e = new Error(detail || (what + " is not served"));
+        e.absent = true; throw e;
+      }
+      if (!r.ok) throw new Error(what + ": HTTP " + r.status);
+      const b = await r.arrayBuffer();
+      S.wireBytes += b.byteLength;
+      return b;
+    } catch (e){
+      if (e.absent) throw e;
+      lastError = e;
+      await new Promise(res => setTimeout(res, 300 * (attempt + 1) * (attempt + 1)));
+    }
+  }
+  throw new Error("could not fetch " + what + ": " + (lastError && lastError.message || lastError));
+}
+async function fetchJSON(route, what){
+  const b = await fetchBytes(route, what);
+  return JSON.parse(new TextDecoder().decode(b));
+}
+
+/* ---------- formats ------------------------------------------------------- */
+function view(Type, buffer, offset, count){
+  if (offset % Type.BYTES_PER_ELEMENT === 0) return new Type(buffer, offset, count);
+  return new Type(buffer.slice(offset, offset + count * Type.BYTES_PER_ELEMENT));
+}
+/* wb-surface-mesh/1 (WORLD-BUILDER-SURFACE.md §5); only positions and indices
+   are used -- the proxy's own vertex colours are the rejected product and are
+   never drawn. */
+function decodeMesh(buf){
+  if (buf.byteLength < 48) throw new Error("proxy mesh is shorter than its header");
+  const dv = new DataView(buf);
+  let magic = ""; for (let i = 0; i < 8; i++) magic += String.fromCharCode(dv.getUint8(i));
+  if (magic !== "WBSURF01") throw new Error("the proxy is not a surface mesh");
+  const nV = dv.getUint32(8, true), nI = dv.getUint32(12, true);
+  const flags = dv.getUint32(16, true), version = dv.getUint32(20, true);
+  if (version !== 1) throw new Error("proxy mesh schema " + version + ", expected 1");
+  const lo = [dv.getFloat32(24,true), dv.getFloat32(28,true), dv.getFloat32(32,true)];
+  const hi = [dv.getFloat32(36,true), dv.getFloat32(40,true), dv.getFloat32(44,true)];
+  const hasN = (flags & 1) !== 0, u16 = (flags & 2) !== 0;
+  if (nI % 3 !== 0) throw new Error("proxy index count is not a multiple of 3");
+  let off = 48;
+  const need = off + nV * (6 + 3 + (hasN ? 3 : 0)) + nI * (u16 ? 2 : 4);
+  if (buf.byteLength !== need) throw new Error("proxy mesh length mismatch");
+  const pos = view(Uint16Array, buf, off, nV * 3); off += nV * 6 + nV * 3 + (hasN ? nV * 3 : 0);
+  const idx = u16 ? view(Uint16Array, buf, off, nI) : view(Uint32Array, buf, off, nI);
+  const span = [Math.max(hi[0]-lo[0],1e-9), Math.max(hi[1]-lo[1],1e-9), Math.max(hi[2]-lo[2],1e-9)];
+  return {pos, idx, lo, hi, span, nV, nI, u32: !u16};
+}
+/* WBAPCK01 (WORLD-BUILDER-APPEARANCE.md §4.1). */
+function decodeChunk(buf){
+  const dv = new DataView(buf);
+  let magic = ""; for (let i = 0; i < 8; i++) magic += String.fromCharCode(dv.getUint8(i));
+  if (magic !== "WBAPCK01") throw new Error("not an appearance chunk");
+  if (dv.getUint32(8, true) !== 1) throw new Error("appearance chunk schema is not 1");
+  const encoding = dv.getUint32(12, true), n = dv.getUint32(16, true);
+  const w = dv.getUint32(20, true), h = dv.getUint32(24, true);
+  const payload = 32 + 8 * n, slots = [];
+  for (let i = 0; i < n; i++){
+    const o = dv.getUint32(32 + 8 * i, true), len = dv.getUint32(36 + 8 * i, true);
+    if (payload + o + len > buf.byteLength) throw new Error("appearance chunk slot out of range");
+    slots.push(new Uint8Array(buf, payload + o, len));
+  }
+  return {encoding, w, h, slots};
+}
+
+/* ---------- small maths -------------------------------------------------- */
+const M = {
+  mul(a,b){const o=new Float32Array(16);
+    for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;},
+  persp(fy,asp,n,f){const t=1/Math.tan(fy/2),o=new Float32Array(16);
+    o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f);return o;},
+  look(eye,at,up){
+    let z=[eye[0]-at[0],eye[1]-at[1],eye[2]-at[2]];let l=Math.hypot(...z)||1;z=z.map(v=>v/l);
+    let x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]];
+    l=Math.hypot(...x);
+    if (l < 1e-6){ x=[1,0,0]; } else { x=x.map(v=>v/l); }
+    const y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]];
+    const o=new Float32Array(16);
+    o[0]=x[0];o[4]=x[1];o[8]=x[2];o[1]=y[0];o[5]=y[1];o[9]=y[2];o[2]=z[0];o[6]=z[1];o[10]=z[2];
+    o[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]);
+    o[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]);
+    o[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]);
+    o[15]=1;return o;}
+};
+const norm3 = v => { const l = Math.hypot(v[0],v[1],v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
+const cross3 = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const dot3 = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+
+/* ---------- shaders -------------------------------------------------------- */
+const MAXC = 10;
+/* One vertex shader for the depth prepass, the probe and the blend, with an
+   invariant position, so the blend's LEQUAL test matches the prepass exactly
+   and the expensive fragment shader runs once per visible pixel. */
+const VS_VIEW = `#version 300 es
+precision highp float;
+invariant gl_Position;
+in vec3 aQ;
+uniform mat4 uMVP; uniform vec3 uLo; uniform vec3 uSpan;
+out vec3 vX;
+void main(){ vec3 p = uLo + aQ * uSpan; vX = p; gl_Position = uMVP * vec4(p, 1.0); }`;
+
+const FS_NOTHING = `#version 300 es
+precision mediump float; out vec4 o; void main(){ o = vec4(0.0); }`;
+
+/* Distance from the eye, packed into RGBA8: the probe the CPU reads to learn
+   which surface points are on screen before choosing sources. */
+const FS_PROBE = `#version 300 es
+precision highp float;
+uniform vec3 uEye; uniform float uFar; in vec3 vX; out vec4 o;
+void main(){ float d = clamp(length(vX - uEye) / uFar, 0.0, 1.0) * 16777215.0;
+  o = vec4(floor(d / 65536.0), mod(floor(d / 256.0), 256.0), mod(d, 256.0), 255.0) / 255.0; }`;
+
+/* A keyframe's own view of the proxy: camera z, quantised to u16, rendered
+   through that keyframe's intrinsics so texel (i, j) is pixel (i, j) of the
+   image (the §4.2 convention: row 0 is the top). */
+const VS_SOURCE = `#version 300 es
+precision highp float;
+in vec3 aQ;
+uniform vec3 uLo; uniform vec3 uSpan; uniform mat3 uR; uniform vec3 uT;
+uniform vec4 uIntr; uniform vec2 uWH; uniform vec2 uNF;
+out float vZ;
+void main(){
+  vec3 p = uLo + aQ * uSpan; vec3 pc = uR * p + uT; vZ = pc.z;
+  float n = uNF.x, f = uNF.y;
+  gl_Position = vec4(2.0 * (uIntr.x * pc.x + uIntr.z * pc.z) / uWH.x - pc.z,
+                     2.0 * (uIntr.y * pc.y + uIntr.w * pc.z) / uWH.y - pc.z,
+                     (pc.z * (f + n) - 2.0 * f * n) / (f - n), pc.z);
+}`;
+const FS_SOURCE = `#version 300 es
+precision highp float; precision highp int;
+uniform float uZmax; in float vZ; out uvec4 o;
+void main(){ o = uvec4(uint(clamp(vZ / uZmax, 0.0, 1.0) * 65534.0 + 0.5), 0u, 0u, 0u); }`;
+
+/* 4x4 MIN pool: the nearest surface in a block wins, so a background point
+   beside a foreground edge is rejected rather than painted with the edge. */
+const VS_FULL = `#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+  gl_Position = vec4(p, 0.0, 1.0); }`;
+const FS_POOL = `#version 300 es
+precision highp float; precision highp int; precision highp usampler2D;
+uniform usampler2D uSrc; uniform ivec2 uSrcSize; out uvec4 o;
+void main(){
+  ivec2 b = ivec2(gl_FragCoord.xy) * 4; uint m = 65535u;
+  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++){
+    ivec2 q = min(b + ivec2(i, j), uSrcSize - 1);
+    m = min(m, texelFetch(uSrc, q, 0).r);
+  }
+  o = uvec4(m, 0u, 0u, 0u);
+}`;
+
+/* The blend. For every candidate source: project, in frame, visible from that
+   source (its depth), opaque in that source (alpha 0 = no weight: redaction,
+   hands, disagreement), within 60 degrees of the viewing ray. Then unstructured
+   lumigraph weights over the k best penalties, times the border feather and
+   the alpha feather, each sample divided by its keyframe's exposure gain.
+   UNSHADED: the images carry their own light; no lighting term is applied. */
+const FS_BLEND = `#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2DArray; precision highp usampler2DArray;
+#define MAXC ${MAXC}
+uniform sampler2DArray uCol; uniform usampler2DArray uDep;
+uniform int uN; uniform int uK;
+uniform float uLayer[MAXC]; uniform mat3 uR[MAXC]; uniform vec3 uT[MAXC];
+uniform vec3 uC[MAXC]; uniform vec3 uGain[MAXC]; uniform vec4 uIntr[MAXC]; uniform float uQ[MAXC];
+uniform vec2 uWH; uniform ivec2 uDWH; uniform float uZmax; uniform vec3 uEye;
+uniform float uExposure; uniform float uGamma; uniform vec3 uGhost; uniform int uMode; uniform float uFar;
+in vec3 vX; out vec4 o;
+vec3 shoulder(vec3 x){
+  // Linear to 0.7, then a smooth roll-off towards 1: a bright doorway keeps
+  // its shape instead of clipping flat.
+  vec3 over = max(x - 0.7, 0.0);
+  return min(x, vec3(0.7)) + 0.3 * (1.0 - exp(-over / 0.3));
+}
+void main(){
+  vec3 dv = uEye - vX; float distv = max(length(dv), 1e-6); dv /= distv;
+  float pen[MAXC]; float wgt[MAXC]; vec3 col[MAXC];
+  int n = 0; float pmax = 0.0;
+  for (int i = 0; i < uN; i++){
+    pen[i] = -1.0;
+    vec3 pc = uR[i] * vX + uT[i];
+    if (pc.z < 0.02) continue;
+    vec2 uv = vec2(uIntr[i].x * pc.x / pc.z + uIntr[i].z, uIntr[i].y * pc.y / pc.z + uIntr[i].w);
+    if (uv.x < 1.0 || uv.y < 1.0 || uv.x > uWH.x - 1.0 || uv.y > uWH.y - 1.0) continue;
+    ivec2 dt = min(ivec2(uv * 0.25), uDWH - 1);
+    uint dq = texelFetch(uDep, ivec3(dt, int(uLayer[i])), 0).r;
+    if (dq >= 65535u) continue;
+    float zs = float(dq) / 65534.0 * uZmax;
+    if (pc.z > zs * 1.03 + 0.015) continue;
+    vec4 c = texture(uCol, vec3(uv / uWH, uLayer[i]));
+    float a = smoothstep(0.5, 0.95, c.a);
+    if (a <= 0.0) continue;
+    vec3 ds = uC[i] - vX; float dists = length(ds); ds /= max(dists, 1e-6);
+    float ang = acos(clamp(dot(ds, dv), -1.0, 1.0));
+    if (ang > 1.0472) continue;
+    float e = min(min(uv.x, uWH.x - uv.x), min(uv.y, uWH.y - uv.y));
+    float bf = smoothstep(0.0, 16.0, e);
+    pen[i] = ang + 0.15 * max(dists / distv - 1.0, 0.0) + 0.15 * (1.0 - bf) + 0.10 * (1.0 - uQ[i]);
+    wgt[i] = bf * a;
+    col[i] = c.rgb / uGain[i];
+    pmax = max(pmax, pen[i]); n++;
+  }
+  // The (k+1)-th smallest penalty is the ULR threshold: only the k best blend.
+  float s[7];
+  for (int j = 0; j < 7; j++) s[j] = 1e9;
+  for (int i = 0; i < uN; i++){
+    if (pen[i] < 0.0) continue;
+    float p = pen[i];
+    for (int j = 0; j <= uK && j < 7; j++){
+      if (p < s[j]){ float t = s[j]; s[j] = p; p = t; }
+    }
+  }
+  float thr = (n > uK) ? s[uK] : pmax * 1.2 + 1e-3;
+  vec3 acc = vec3(0.0); float ws = 0.0; int used = 0;
+  for (int i = 0; i < uN; i++){
+    if (pen[i] < 0.0 || pen[i] >= thr) continue;
+    float w = (n == 1) ? 1.0 : (1.0 - pen[i] / thr) / max(pen[i], 0.02);
+    w *= max(wgt[i], 1e-4);
+    acc += w * col[i]; ws += w; used++;
+  }
+  bool observed = ws > 1e-5;
+  if (uMode == 1){ float t = float(used) / float(max(uK, 1));
+    o = vec4(observed ? vec3(t, t, 1.0 - t) : vec3(0.55, 0.0, 0.0), 1.0); return; }
+  if (uMode == 2){ o = vec4(observed ? vec3(1.0) : vec3(1.0, 0.0, 0.0), 1.0); return; }
+  if (uMode == 3){
+    float d = clamp(distv / uFar, 0.0, 1.0) * 65535.0;
+    o = vec4(observed ? 1.0 : 0.0, floor(d / 256.0) / 255.0, mod(d, 256.0) / 255.0, 1.0); return;
+  }
+  if (!observed){
+    // Unobserved: nothing is drawn but a faint, flat tint over the background,
+    // so the wearer can tell "geometry nobody's image covers" from "nothing".
+    o = vec4(uGhost, 1.0); return;
+  }
+  vec3 c = shoulder(max(acc / ws, 0.0) * uExposure);
+  o = vec4(pow(c, vec3(1.0 / uGamma)), 1.0);
+}`;
+
+/* ---------- main --------------------------------------------------------- */
+async function main(){
+  const canvas = $("c");
+  const attrs = {antialias: false, depth: true, alpha: false,
+                 preserveDrawingBuffer: DEBUG && OPT.preserve, powerPreference: "high-performance"};
+  let gl = canvas.getContext("webgl2", attrs);
+  if (!gl){
+    fail("This world is shown with the captured images and needs WebGL 2, which this viewer could not start.");
+    return;
+  }
+  const BG = [0.043, 0.051, 0.063];
+  const GHOST = [0.075, 0.085, 0.10];
+  const cams = CONFIG.cameras || [];
+  let UP = Array.isArray(CONFIG.up) && CONFIG.up.length === 3 ? norm3(CONFIG.up) : [0, -1, 0];
+
+  /* -------- GL state that a context loss takes away ---------------------- */
+  let G = null;                 // programs, buffers, textures
+  let ext = null;
+  let mesh = null;              // decoded proxy (kept: a restored context rebuilds from it)
+  let manifest = null;          // the manifest the layers were filled from
+  const layers = [];            // per texture layer: {id, digest, slot, ready, depthReady, kf}
+  let capacity = 0, encoding = null, KW = 0, KH = 0, DW = 0, DH = 0, zmax = 1;
+  let centre = [0,0,0], diag = 1;
+
+  function compile(type, src){
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  function program(vs, fs){
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, "aQ");
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {};
+    const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++){
+      const info = gl.getActiveUniform(p, i);
+      const name = info.name.replace(/\[0\]$/, "");
+      u[name] = gl.getUniformLocation(p, info.name);
+    }
+    return {p, u};
+  }
+
+  function buildGL(){
+    ext = gl.getExtension("WEBGL_compressed_texture_astc");
+    G = {
+      view: program(VS_VIEW, FS_NOTHING),
+      probe: program(VS_VIEW, FS_PROBE),
+      blend: program(VS_VIEW, FS_BLEND),
+      source: program(VS_SOURCE, FS_SOURCE),
+      pool: program(VS_FULL, FS_POOL),
+      vao: null, vbo: null, ibo: null, col: null, dep: null,
+      probeFB: null, probeTex: null, probeRB: null, pbo: null,
+    };
+    S.gl = {astc: !!ext, maxLayers: gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS),
+            maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE)};
+    // probe target
+    G.probeW = 32; G.probeH = 24;
+    G.probeTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, G.probeTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, G.probeW, G.probeH);
+    G.probeRB = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, G.probeRB);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, G.probeW, G.probeH);
+    G.probeFB = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, G.probeFB);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, G.probeTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, G.probeRB);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  }
+
+  function uploadMesh(){
+    if (G.vao){ gl.deleteVertexArray(G.vao); gl.deleteBuffer(G.vbo); gl.deleteBuffer(G.ibo); }
+    G.vao = gl.createVertexArray(); gl.bindVertexArray(G.vao);
+    G.vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, G.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.pos, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+    G.ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, G.ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
+    G.idxType = mesh.u32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    S.gpu.proxy = mesh.pos.byteLength + mesh.idx.byteLength;
+    centre = [mesh.lo[0]+mesh.span[0]/2, mesh.lo[1]+mesh.span[1]/2, mesh.lo[2]+mesh.span[2]/2];
+    diag = Math.hypot(mesh.span[0], mesh.span[1], mesh.span[2]) || 1;
+    zmax = diag * 2;
+  }
+  function meshUniforms(prog){
+    gl.uniform3f(prog.u.uLo, mesh.lo[0], mesh.lo[1], mesh.lo[2]);
+    gl.uniform3f(prog.u.uSpan, mesh.span[0], mesh.span[1], mesh.span[2]);
+  }
+  function drawMesh(){ gl.bindVertexArray(G.vao); gl.drawElements(gl.TRIANGLES, mesh.nI, G.idxType, 0); }
+
+  /* Texture arrays are allocated ONCE, at capacity: a WebGL2 array cannot
+     grow, and compressed layers cannot be copied on the GPU. Live builds
+     overwrite layers in place. */
+  function allocateLayers(){
+    if (G.col){ gl.deleteTexture(G.col); gl.deleteTexture(G.dep); }
+    const astcFormat = 0x93B4;   // COMPRESSED_RGBA_ASTC_6x6_KHR
+    G.col = gl.createTexture(); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, encoding === "astc-6x6-rgba" ? astcFormat : gl.RGBA8, KW, KH, capacity);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, k, v);
+    G.dep = gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.dep);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.R16UI, DW, DH, capacity);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, k, v);
+    const err = gl.getError();
+    if (err !== gl.NO_ERROR) throw new Error("the texture arrays could not be allocated (GL error " + err + ")");
+    S.gpu.colour = encoding === "astc-6x6-rgba"
+      ? Math.ceil(KW / 6) * Math.ceil(KH / 6) * 16 * capacity : KW * KH * 4 * capacity;
+    S.gpu.depth = DW * DH * 2 * capacity;
+  }
+  function gpuTotal(){
+    S.gpu.probe = G ? G.probeW * G.probeH * 7 : 0;
+    S.gpuBytes = (S.gpu.colour || 0) + (S.gpu.depth || 0) + (S.gpu.proxy || 0) + (S.gpu.probe || 0);
+    S.gpu.drawingBuffer = canvas.width * canvas.height * 7;   // RGBA8 + depth24, not counted above
+    return S.gpuBytes;
+  }
+
+  /* -------- source depth, generated on the device ----------------------- */
+  function renderSourceDepth(list){
+    if (!list.length) return;
+    const t = performance.now();
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R16UI, KW, KH);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, KW, KH);
+    const fbSrc = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbSrc);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    const fbDst = gl.createFramebuffer();
+    gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
+    gl.colorMask(true, true, true, true);
+    const R = new Float32Array(9), clear = new Uint32Array([65535, 0, 0, 0]);
+    for (const L of list){
+      const kf = L.kf;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbSrc); gl.viewport(0, 0, KW, KH);
+      gl.clearBufferuiv(gl.COLOR, 0, clear); gl.clear(gl.DEPTH_BUFFER_BIT);
+      gl.useProgram(G.source.p); meshUniforms(G.source);
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) R[c * 3 + r] = kf.rotation[r * 3 + c];
+      gl.uniformMatrix3fv(G.source.u.uR, false, R);
+      gl.uniform3f(G.source.u.uT, kf.translation[0], kf.translation[1], kf.translation[2]);
+      const I = kf.intrinsics;
+      gl.uniform4f(G.source.u.uIntr, I.fx, I.fy, I.cx, I.cy);
+      gl.uniform2f(G.source.u.uWH, KW, KH);
+      gl.uniform2f(G.source.u.uNF, 0.02, zmax);
+      gl.uniform1f(G.source.u.uZmax, zmax);
+      drawMesh();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbDst);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, G.dep, 0, L.index);
+      gl.viewport(0, 0, DW, DH);
+      gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(G.pool.p);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(G.pool.u.uSrc, 2); gl.uniform2i(G.pool.u.uSrcSize, KW, KH);
+      gl.bindVertexArray(null);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.enable(gl.DEPTH_TEST);
+      L.depthReady = true;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbSrc); gl.deleteFramebuffer(fbDst);
+    gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
+    S.timing.sourceDepthMs = (S.timing.sourceDepthMs || 0) + performance.now() - t;
+  }
+
+  /* -------- loading and live append ------------------------------------- */
+  const R = CONFIG.routes;
+  function chooseEncoding(man){
+    const encs = man.encodings || {};
+    const astcChunks = (man.chunks || []).some(c => c.encoding === "astc-6x6-rgba" && c.tier === "phone");
+    if (ext && !OPT.forceWebp && encs["astc-6x6-rgba"] && encs["astc-6x6-rgba"].available !== false && astcChunks)
+      return "astc-6x6-rgba";
+    return "webp-rgba";
+  }
+  function phoneKeyframes(man){
+    return (man.keyframes || []).filter(k => k.tier === "phone" && k.chunks && k.chunks[encoding])
+      .sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9));
+  }
+
+  async function uploadSlot(chunk, slot, L){
+    const bytes = chunk.slots[slot];
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
+    if (encoding === "astc-6x6-rgba"){
+      if (chunk.encoding !== 1) throw new Error("expected an ASTC chunk");
+      gl.compressedTexSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, L.index, KW, KH, 1, 0x93B4, bytes);
+    } else {
+      if (chunk.encoding !== 2) throw new Error("expected a WebP chunk");
+      const bmp = await createImageBitmap(new Blob([bytes], {type: "image/webp"}),
+                                          {premultiplyAlpha: "none", colorSpaceConversion: "none"});
+      if (!G) { bmp.close(); return; }
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, L.index, KW, KH, 1, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+      bmp.close();
+    }
+  }
+
+  function samePose(a, b){
+    if (!a || !b) return false;
+    for (let i = 0; i < 9; i++) if (a.rotation[i] !== b.rotation[i]) return false;
+    for (let i = 0; i < 3; i++) if (a.translation[i] !== b.translation[i]) return false;
+    return true;
+  }
+
+  /* Bring the layers in line with a manifest. The camera is never touched. */
+  async function applyManifest(man, generation){
+    if (!man || man.format !== "wb-appearance-keyframes/1") throw new Error("the appearance manifest is not in a format this page reads");
+    const first = !manifest;
+    let proxyChanged = !mesh || !manifest || manifest.proxy.digest !== man.proxy.digest;
+    if (first){
+      encoding = chooseEncoding(man);
+      KW = man.camera.width; KH = man.camera.height;
+      DW = Math.ceil(KW / 4); DH = Math.ceil(KH / 4);
+      const budget = (man.selection && man.selection.phone_budget) || 128;
+      const cap = encoding === "astc-6x6-rgba" ? (CONFIG.astc_layer_cap || 192) : (CONFIG.rgba8_layer_cap || 48);
+      capacity = Math.max(1, Math.min(budget, cap, S.gl.maxLayers));
+      S.encoding = encoding; S.capacity = capacity;
+    }
+    if (proxyChanged){
+      status("Loading the room's surface…");
+      const buf = await fetchBytes(R.proxy + man.proxy.digest, "the proxy surface");
+      if (generation !== loadGeneration) return;
+      mesh = decodeMesh(buf);
+      uploadMesh();
+      if (first) allocateLayers();
+      for (const L of layers) L.depthReady = false;
+    }
+    const wanted = phoneKeyframes(man).slice(0, capacity);
+    S.keyframesInManifest = (man.keyframes || []).length;
+    const wantedIds = new Set(wanted.map(k => k.id));
+    // Free layers whose keyframe left the phone tier.
+    for (const L of layers){ if (L.id && !wantedIds.has(L.id)){ L.id = null; L.ready = false; L.kf = null; } }
+    while (layers.length < capacity) layers.push({index: layers.length, id: null, ready: false, depthReady: false});
+    const byId = new Map(layers.filter(L => L.id).map(L => [L.id, L]));
+    const uploads = [];                 // [layer, keyframe, chunk ref]
+    for (const kf of wanted){
+      const ref = kf.chunks[encoding];
+      let L = byId.get(kf.id);
+      if (L && L.digest === ref.digest && L.slot === ref.slot){
+        // Same bytes. New pose or gain are uniforms; a moved pose needs depth.
+        if (!samePose(L.kf, kf)) L.depthReady = false;
+        L.kf = kf;
+        continue;
+      }
+      if (!L){ L = layers.find(x => !x.id); if (!L) break; L.id = kf.id; L.ready = false; L.depthReady = false; }
+      uploads.push([L, kf, ref]);
+    }
+    // Group by chunk, fetch a few at a time, draw as layers land.
+    const groups = new Map();
+    for (const u of uploads){ const d = u[2].digest; if (!groups.has(d)) groups.set(d, []); groups.get(d).push(u); }
+    const queue = [...groups.entries()];
+    let done = 0;
+    const total = uploads.length;
+    const worker = async () => {
+      while (queue.length){
+        const [digest, items] = queue.shift();
+        const buf = await fetchBytes(R.chunk + digest, "an image bundle");
+        if (generation !== loadGeneration || !G) return;
+        const chunk = decodeChunk(buf);
+        for (const [L, kf, ref] of items){
+          if (L.id !== kf.id) continue;
+          await uploadSlot(chunk, ref.slot, L);
+          if (generation !== loadGeneration || !G) return;
+          if (!samePose(L.kf, kf)) L.depthReady = false;
+          L.kf = kf; L.digest = ref.digest; L.slot = ref.slot; L.ready = true;
+          done++;
+        }
+        renderSourceDepth(layers.filter(x => x.ready && !x.depthReady));
+        S.layers = layers.filter(x => x.ready).length;
+        chosenFor = null;
+        status(total ? "Placing images " + done + " / " + total : "");
+        requestDraw();
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    if (generation !== loadGeneration || !G) return;
+    renderSourceDepth(layers.filter(x => x.ready && !x.depthReady));
+    const glErr = gl.getError();
+    if (glErr !== gl.NO_ERROR) S.errors.push("GL error " + glErr + " after upload");
+    manifest = man;
+    chosenFor = null;
+    S.buildId = man.build_id; S.layers = layers.filter(x => x.ready).length;
+    gpuTotal();
+    status("");
+    updateCaption();
+    requestDraw();
+  }
+
+  let loadGeneration = 0;
+  let chosen = [], chosenFor = null;
+  let busy = Promise.resolve();
+  function serial(fn){ const p = busy.then(fn, fn); busy = p.catch(() => {}); return p; }
+
+  async function loadRevision(revision){
+    const gen = loadGeneration;
+    const man = await fetchJSON(R.manifest, "the appearance manifest");
+    if (gen !== loadGeneration) return;
+    await applyManifest(man, gen);
+    if (gen !== loadGeneration) return;
+    S.revision = revision || S.revision;
+  }
+
+  /* The imagery was withdrawn (a changed redaction record, a purge): the
+     textures go, now, and the page says why rather than showing old images. */
+  function dropAppearance(reason){
+    loadGeneration++;
+    if (G && G.col){ gl.deleteTexture(G.col); gl.deleteTexture(G.dep); G.col = null; G.dep = null; }
+    for (const L of layers){ L.ready = false; L.id = null; L.kf = null; }
+    manifest = null; S.layers = 0; S.gpu.colour = 0; S.gpu.depth = 0; gpuTotal();
+    fail(reason);
+  }
+
+  /* -------- following new appearance builds (no reload, no camera reset) - */
+  let pollDelay = 10000;
+  async function pollOnce(){
+    let body;
+    try { body = await fetchJSON(R.revision, "the render revision"); }
+    catch (e){
+      if (e.absent) return {live: false};
+      return {live: null};
+    }
+    const a = body && body.appearance;
+    if (!a || a.revision === null || a.revision === undefined){
+      dropAppearance("These images are no longer served for this world (its redaction record changed, "
+                     + "or its imagery was removed). Close and reopen the world to see what remains.");
+      return {live: false, dropped: true};
+    }
+    CONFIG.current = !!a.current;
+    if (a.revision !== S.revision){
+      const before = S.revision;
+      await loadRevision(a.revision);
+      if (S.revision !== before) S.appends++;
+      return {live: body.live, changed: true};
+    }
+    updateCaption();
+    return {live: body.live, changed: false};
+  }
+  async function follow(){
+    for (;;){
+      await new Promise(res => setTimeout(res, pollDelay));
+      if (S.phase === "failed") return;
+      let r;
+      try { r = await serial(pollOnce); } catch (e){ S.errors.push(String(e && e.message || e)); r = {live: null}; }
+      if (r.dropped) return;
+      pollDelay = (r.changed || r.live === true) ? 10000 : Math.min(120000, pollDelay * 2);
+    }
+  }
+  S.refresh = () => serial(pollOnce);
+
+  /* -------- camera (the surface page's conventions) ---------------------- */
+  let mode = cams.length ? "walk" : "orbit";
+  let ci = 0, opening = -1;
+  const look = {yaw: 0, pitch: 0};
+  const orbit = {yaw: 0.6, pitch: -0.35, dist: 1, target: [0,0,0]};
+  let fovScale = 1, override = null;
+  let B = null;
+  function basis(){
+    const ref = Math.abs(UP[0]) < 0.9 ? [1,0,0] : [0,0,1];
+    const e1 = norm3(cross3(UP, ref)), e2 = cross3(e1, UP);
+    B = {e1, e2};
+  }
+  function dirFrom(yaw, pitch){
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    return norm3([cp*(Math.cos(yaw)*B.e1[0] + Math.sin(yaw)*B.e2[0]) + sp*UP[0],
+                  cp*(Math.cos(yaw)*B.e1[1] + Math.sin(yaw)*B.e2[1]) + sp*UP[1],
+                  cp*(Math.cos(yaw)*B.e1[2] + Math.sin(yaw)*B.e2[2]) + sp*UP[2]]);
+  }
+  function yawPitchOf(d){
+    d = norm3(d);
+    return {yaw: Math.atan2(dot3(d, B.e2), dot3(d, B.e1)),
+            pitch: Math.asin(Math.max(-1, Math.min(1, dot3(d, UP))))};
+  }
+  function resetOrbitToCamera(){
+    if (cams.length){
+      const c = cams[ci], f = norm3([c[3],c[4],c[5]]);
+      const d = CONFIG.median_scene_depth || diag * 0.2;
+      orbit.target = [c[0]+f[0]*d, c[1]+f[1]*d, c[2]+f[2]*d];
+      const yp = yawPitchOf(f); orbit.yaw = yp.yaw; orbit.pitch = yp.pitch; orbit.dist = d;
+    } else {
+      orbit.yaw = 0.6; orbit.pitch = -0.35; orbit.dist = diag * 0.9; orbit.target = centre.slice();
+    }
+  }
+  function walkEye(i, yaw, pitch){
+    const c = cams[Math.max(0, Math.min(cams.length-1, i))];
+    const yp = yawPitchOf([c[3],c[4],c[5]]);
+    const d = dirFrom(yp.yaw + yaw, Math.max(-1.45, Math.min(1.45, yp.pitch + pitch)));
+    const eye = [c[0], c[1], c[2]];
+    return [eye, [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]]];
+  }
+  function currentCamera(aspectOverride){
+    const aspect = aspectOverride || canvas.width / Math.max(1, canvas.height);
+    if (override){
+      return {eye: override.eye, at: override.target, up: override.up, fy: override.fovY, aspect,
+              near: 0.02, far: diag * 12};
+    }
+    let eye, at;
+    if (mode === "walk" && cams.length){ [eye, at] = walkEye(ci, look.yaw, look.pitch); }
+    else {
+      const d = dirFrom(orbit.yaw, orbit.pitch), t = orbit.target;
+      eye = [t[0]-d[0]*orbit.dist, t[1]-d[1]*orbit.dist, t[2]-d[2]*orbit.dist]; at = t.slice();
+    }
+    let fy = (mode === "walk" ? 1.25 : 0.95) * fovScale;
+    const fyForH = 2 * Math.atan(Math.tan(1.12 / 2) / aspect);
+    fy = Math.min(1.75, Math.max(fy, fyForH));
+    const near = mode === "walk" ? Math.max(0.02, diag * 0.0015) : Math.max(diag * 0.0015, orbit.dist * 0.01);
+    return {eye, at, fy, aspect, near, far: diag * 12};
+  }
+
+  /* -------- source choice (CPU, from a 32x24 probe of the proxy) --------- */
+  function probePoints(cam, px){
+    const f = 1 / Math.tan(cam.fy / 2);
+    const fwd = norm3([cam.at[0]-cam.eye[0], cam.at[1]-cam.eye[1], cam.at[2]-cam.eye[2]]);
+    const right = norm3(cross3(fwd, cam.up || UP)), up = cross3(right, fwd);
+    const pts = [];
+    const far = zmax * 3;
+    for (let y = 0; y < G.probeH; y++) for (let x = 0; x < G.probeW; x++){
+      const o = (y * G.probeW + x) * 4;
+      if (px[o] === 255 && px[o+1] === 255 && px[o+2] === 255) continue;
+      const d = (px[o] * 65536 + px[o+1] * 256 + px[o+2]) / 16777215 * far;
+      const nx = ((x + 0.5) / G.probeW * 2 - 1) * cam.aspect / f, ny = ((y + 0.5) / G.probeH * 2 - 1) / f;
+      const r = norm3([fwd[0] + right[0]*nx + up[0]*ny, fwd[1] + right[1]*nx + up[1]*ny, fwd[2] + right[2]*nx + up[2]*ny]);
+      pts.push([cam.eye[0] + r[0]*d, cam.eye[1] + r[1]*d, cam.eye[2] + r[2]*d]);
+    }
+    return pts;
+  }
+  function renderProbe(cam, MVP){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, G.probeFB); gl.viewport(0, 0, G.probeW, G.probeH);
+    gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true); gl.colorMask(true, true, true, true);
+    gl.useProgram(G.probe.p); meshUniforms(G.probe);
+    gl.uniformMatrix4fv(G.probe.u.uMVP, false, MVP);
+    gl.uniform3f(G.probe.u.uEye, cam.eye[0], cam.eye[1], cam.eye[2]);
+    gl.uniform1f(G.probe.u.uFar, zmax * 3);
+    drawMesh();
+  }
+  function choose(cam, pts){
+    const ready = layers.filter(L => L.ready && L.depthReady && L.kf);
+    const n = pts.length, Sn = ready.length, maxang = 1.0472;
+    if (!n || !Sn) return [];
+    const score = new Float32Array(Sn * n);
+    for (let s = 0; s < Sn; s++){
+      const kf = ready[s].kf, Rr = kf.rotation, t = kf.translation, I = kf.intrinsics;
+      const C = kf._C || (kf._C = [-(Rr[0]*t[0]+Rr[3]*t[1]+Rr[6]*t[2]), -(Rr[1]*t[0]+Rr[4]*t[1]+Rr[7]*t[2]), -(Rr[2]*t[0]+Rr[5]*t[1]+Rr[8]*t[2])]);
+      for (let p = 0; p < n; p++){
+        const X = pts[p];
+        const z = Rr[6]*X[0] + Rr[7]*X[1] + Rr[8]*X[2] + t[2]; if (z < 0.05) continue;
+        const u = I.fx * (Rr[0]*X[0] + Rr[1]*X[1] + Rr[2]*X[2] + t[0]) / z + I.cx;
+        const v = I.fy * (Rr[3]*X[0] + Rr[4]*X[1] + Rr[5]*X[2] + t[1]) / z + I.cy;
+        if (u < 8 || v < 8 || u > KW - 8 || v > KH - 8) continue;
+        const a = [C[0]-X[0], C[1]-X[1], C[2]-X[2]], b = [cam.eye[0]-X[0], cam.eye[1]-X[1], cam.eye[2]-X[2]];
+        const la = Math.hypot(a[0],a[1],a[2]), lb = Math.hypot(b[0],b[1],b[2]) || 1e-6;
+        const ang = Math.acos(Math.max(-1, Math.min(1, dot3(a, b) / (la * lb))));
+        const pen = ang + 0.15 * Math.max(la / lb - 1, 0);
+        score[s * n + p] = Math.max(0, 1 - pen / maxang) * (0.5 + 0.5 * (kf.quality ?? 1));
+      }
+    }
+    const b1 = new Float32Array(n), b2 = new Float32Array(n), chosen = [];
+    for (let it = 0; it < Math.min(OPT.candidates, Sn); it++){
+      let best = -1, bg = 0;
+      for (let s = 0; s < Sn; s++){
+        if (chosen.includes(s)) continue;
+        let g = 0;
+        for (let p = 0; p < n; p++){ const q = score[s*n+p];
+          if (q > b1[p]) g += (q - b1[p]) + 0.5 * (b1[p] - b2[p]); else if (q > b2[p]) g += 0.5 * (q - b2[p]); }
+        if (g > bg){ bg = g; best = s; }
+      }
+      if (best < 0) break;
+      chosen.push(best);
+      for (let p = 0; p < n; p++){ const q = score[best*n+p];
+        if (q > b1[p]){ b2[p] = b1[p]; b1[p] = q; } else if (q > b2[p]) b2[p] = q; }
+    }
+    return chosen.map(s => ready[s]);
+  }
+
+  /* -------- drawing -------------------------------------------------------- */
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+  }
+  function matrices(cam){
+    const V = M.look(cam.eye, cam.at, cam.up || UP);
+    const P = M.persp(cam.fy, cam.aspect, cam.near, cam.far);
+    return M.mul(P, V);
+  }
+  const U9 = new Float32Array(9 * MAXC), U3a = new Float32Array(3 * MAXC), U3b = new Float32Array(3 * MAXC),
+        U3c = new Float32Array(3 * MAXC), U4 = new Float32Array(4 * MAXC), U1 = new Float32Array(MAXC),
+        UQ = new Float32Array(MAXC);
+  function drawBlend(cam, MVP, chosen, modeOverride, target){
+    const fb = target ? target.fb : null;
+    const w = target ? target.w : canvas.width, h = target ? target.h : canvas.height;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, w, h);
+    gl.clearColor(BG[0], BG[1], BG[2], 1);
+    gl.depthMask(true); gl.colorMask(true, true, true, true);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (!mesh) return;
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+    gl.colorMask(false, false, false, false);
+    gl.useProgram(G.view.p); meshUniforms(G.view); gl.uniformMatrix4fv(G.view.u.uMVP, false, MVP);
+    drawMesh();
+    gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
+    const P = G.blend;
+    gl.useProgram(P.p); meshUniforms(P);
+    gl.uniformMatrix4fv(P.u.uMVP, false, MVP);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.dep);
+    gl.uniform1i(P.u.uCol, 0); gl.uniform1i(P.u.uDep, 1);
+    U9.fill(0); U3a.fill(0); U3b.fill(0); U3c.fill(1); U4.fill(0); U1.fill(0); UQ.fill(1);
+    chosen.forEach((L, i) => {
+      const kf = L.kf, Rr = kf.rotation, t = kf.translation, I = kf.intrinsics;
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) U9[i*9 + c*3 + r] = Rr[r*3 + c];
+      U3a.set(t, i * 3);
+      U3b.set(kf._C || [-(Rr[0]*t[0]+Rr[3]*t[1]+Rr[6]*t[2]), -(Rr[1]*t[0]+Rr[4]*t[1]+Rr[7]*t[2]), -(Rr[2]*t[0]+Rr[5]*t[1]+Rr[8]*t[2])], i * 3);
+      U3c.set(kf.gain || [1,1,1], i * 3);
+      U4.set([I.fx, I.fy, I.cx, I.cy], i * 4);
+      U1[i] = L.index; UQ[i] = kf.quality ?? 1;
+    });
+    gl.uniform1i(P.u.uN, chosen.length); gl.uniform1i(P.u.uK, OPT.k);
+    gl.uniform1fv(P.u.uLayer, U1); gl.uniformMatrix3fv(P.u.uR, false, U9);
+    gl.uniform3fv(P.u.uT, U3a); gl.uniform3fv(P.u.uC, U3b); gl.uniform3fv(P.u.uGain, U3c);
+    gl.uniform4fv(P.u.uIntr, U4); gl.uniform1fv(P.u.uQ, UQ);
+    gl.uniform2f(P.u.uWH, KW, KH); gl.uniform2i(P.u.uDWH, DW, DH);
+    gl.uniform1f(P.u.uZmax, zmax); gl.uniform3f(P.u.uEye, cam.eye[0], cam.eye[1], cam.eye[2]);
+    gl.uniform1f(P.u.uExposure, CONFIG.exposure || 1.8); gl.uniform1f(P.u.uGamma, CONFIG.gamma || 1.15);
+    gl.uniform3f(P.u.uGhost, GHOST[0], GHOST[1], GHOST[2]);
+    gl.uniform1i(P.u.uMode, modeOverride ?? OPT.debugMode);
+    gl.uniform1f(P.u.uFar, zmax * 3);
+    drawMesh();
+    gl.depthMask(true); gl.depthFunc(gl.LESS);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  let pending = false, asyncProbe = null;
+  function requestDraw(){
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; frame(); });
+  }
+  /* The probe is read back ASYNCHRONOUSLY on the phone: a synchronous
+     readPixels stalls the GPU every drag frame. The frame draws with the
+     previous choice and redraws once the new one is known. */
+  function startAsyncProbe(cam, MVP){
+    if (asyncProbe) return true;
+    if (G.noAsync || typeof gl.fenceSync !== "function") return false;
+    renderProbe(cam, MVP);
+    if (!G.pbo){ G.pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, G.pbo);
+                 gl.bufferData(gl.PIXEL_PACK_BUFFER, G.probeW * G.probeH * 4, gl.STREAM_READ); }
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, G.pbo);
+    gl.readPixels(0, 0, G.probeW, G.probeH, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_FENCE, 0);
+    if (!sync){
+      // Some implementations (SwiftShader here) refuse sync objects: read
+      // synchronously from now on.
+      gl.getError(); G.noAsync = true; return false;
+    }
+    asyncProbe = {sync, cam, key: camKey(cam)};
+    const poll = () => {
+      if (!G || !asyncProbe) return;
+      const st = gl.clientWaitSync(asyncProbe.sync, 0, 0);
+      if (st === gl.TIMEOUT_EXPIRED){ setTimeout(poll, 4); return; }
+      if (st === gl.WAIT_FAILED){ gl.deleteSync(asyncProbe.sync); asyncProbe = null; return; }
+      gl.deleteSync(asyncProbe.sync);
+      const px = new Uint8Array(G.probeW * G.probeH * 4);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, G.pbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, px);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      const probe = asyncProbe; asyncProbe = null;
+      const next = choose(probe.cam, probePoints(probe.cam, px));
+      const changed = next.length !== chosen.length || next.some((L, i) => L !== chosen[i]);
+      chosen = next; chosenFor = probe.key;
+      if (changed || camKey(currentCamera()) !== probe.key) requestDraw();
+    };
+    setTimeout(poll, 0);
+    return true;
+  }
+  function camKey(cam){ return [...cam.eye, ...cam.at, cam.fy, cam.aspect].map(v => v.toFixed(4)).join(","); }
+  function chooseSync(cam, MVP){
+    renderProbe(cam, MVP);
+    const px = new Uint8Array(G.probeW * G.probeH * 4);
+    gl.readPixels(0, 0, G.probeW, G.probeH, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return choose(cam, probePoints(cam, px));
+  }
+  function frame(sync){
+    if (!G || gl.isContextLost() || !mesh || !G.col) return;
+    resize();
+    const cam = currentCamera(), MVP = matrices(cam), key = camKey(cam);
+    if (sync || !chosen.length){ chosen = chooseSync(cam, MVP); chosenFor = key; }
+    else if (chosenFor !== key && !startAsyncProbe(cam, MVP)){ chosen = chooseSync(cam, MVP); chosenFor = key; }
+    drawBlend(cam, MVP, chosen);
+    S.choice = chosen.map(L => L.kf && L.kf.ki);
+    $("pos").textContent = !override && mode === "walk" && cams.length ? (ci + 1) + " / " + cams.length : "";
+    if (S.timing.firstFrameMs === undefined && S.layers > 0) S.timing.firstFrameMs = performance.now() - T0;
+  }
+
+  /* Observed surface, as world area: every observed pixel of a small render
+     weighted by its distance squared. */
+  function observedArea(cam, w, h){
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    const MVP = matrices(cam);
+    const picks = chooseSync(cam, MVP);
+    drawBlend(cam, MVP, picks, 3, {fb, w, h});
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
+    let area = 0, observed = 0;
+    const far = zmax * 3;
+    for (let i = 0; i < px.length; i += 4){
+      if (px[i] < 128) continue;
+      const d = (px[i+1] * 256 + px[i+2]) / 65535 * far;
+      area += d * d; observed++;
+    }
+    return {area, observed: observed / (w * h)};
+  }
+  function chooseOpening(){
+    if (!cams.length) return -1;
+    const t = performance.now();
+    const step = Math.max(1, Math.ceil(cams.length / 32));
+    let best = -1, bestArea = -1;
+    const saveMode = mode, saveOverride = override;
+    override = null; mode = "walk";
+    for (let i = 0; i < cams.length; i += step){
+      ci = i; look.yaw = 0; look.pitch = 0;
+      const cam = currentCamera(390 / 844);   // score the phone's portrait view
+      const r = observedArea(cam, 40, 64);
+      if (r.area > bestArea){ bestArea = r.area; best = i; }
+    }
+    mode = saveMode; override = saveOverride;
+    S.timing.openingMs = performance.now() - t;
+    S.opening = {index: best, step, score: bestArea};
+    return best;
+  }
+
+  /* -------- context loss ---------------------------------------------------- */
+  canvas.addEventListener("webglcontextlost", e => {
+    e.preventDefault();
+    S.contextLosses++;
+    loadGeneration++;
+    G = null; asyncProbe = null; chosen = [];
+    for (const L of layers){ L.ready = false; L.depthReady = false; L.digest = null; }
+    S.layers = 0;
+    const m = $("msg");
+    m.textContent = "The graphics context was taken away (usually memory pressure). Restoring…";
+    m.classList.add("on");
+  }, false);
+  canvas.addEventListener("webglcontextrestored", () => {
+    // Imagery is not kept in page memory: it is fetched again, through the same
+    // transport and the same redaction check, and the camera stays where it was.
+    const man = manifest; manifest = null;
+    serial(async () => {
+      try {
+        buildGL();
+        for (const L of layers){ L.id = null; L.kf = null; L.ready = false; L.depthReady = false; }
+        await applyManifest(man || await fetchJSON(R.manifest, "the appearance manifest"), loadGeneration);
+        $("msg").classList.remove("on");
+        requestDraw();
+      } catch (e){
+        fail("The graphics context came back but the images could not be placed again: " + e.message);
+      }
+    });
+  }, false);
+
+  /* -------- input ------------------------------------------------------------ */
+  const pts = new Map();
+  let gesture = null, walkSwipe = 0;
+  function two(){ const v = [...pts.values()];
+    return {d: Math.hypot(v[0].x-v[1].x, v[0].y-v[1].y), x:(v[0].x+v[1].x)/2, y:(v[0].y+v[1].y)/2}; }
+  canvas.addEventListener("pointerdown", e => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* synthetic */ }
+    pts.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    gesture = pts.size >= 2 ? two() : null; walkSwipe = 0;
+    e.preventDefault();
+  }, {passive: false});
+  canvas.addEventListener("pointermove", e => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    override = null;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size === 1){
+      if (mode === "walk"){
+        look.yaw -= dx * 0.005;
+        look.pitch = Math.max(-1.3, Math.min(1.3, look.pitch - dy * 0.005));
+      } else {
+        orbit.yaw -= dx * 0.008;
+        orbit.pitch = Math.max(-1.45, Math.min(1.45, orbit.pitch - dy * 0.008));
+      }
+    } else if (pts.size >= 2 && gesture){
+      const g = two();
+      if (mode === "orbit"){
+        orbit.dist = Math.max(diag*0.01, Math.min(diag*6, orbit.dist * (gesture.d / Math.max(1, g.d))));
+        const cam = currentCamera();
+        const f = norm3([cam.at[0]-cam.eye[0], cam.at[1]-cam.eye[1], cam.at[2]-cam.eye[2]]);
+        const r = norm3(cross3(f, UP)), u = cross3(r, f);
+        const k = orbit.dist * 0.0022, mx = g.x - gesture.x, my = g.y - gesture.y;
+        for (let i = 0; i < 3; i++) orbit.target[i] += (-r[i]*mx + u[i]*my) * k;
+      } else {
+        fovScale = Math.max(0.5, Math.min(1.4, fovScale * (gesture.d / Math.max(1, g.d))));
+        walkSwipe += g.x - gesture.x;
+        while (Math.abs(walkSwipe) >= 70){ step(walkSwipe < 0 ? 1 : -1); walkSwipe -= Math.sign(walkSwipe) * 70; }
+      }
+      gesture = g;
+    }
+    requestDraw(); e.preventDefault();
+  }, {passive: false});
+  function up(e){ pts.delete(e.pointerId); gesture = pts.size >= 2 ? two() : null; requestDraw(); }
+  canvas.addEventListener("pointerup", up);
+  canvas.addEventListener("pointercancel", up);
+  canvas.addEventListener("lostpointercapture", up);
+  canvas.addEventListener("touchmove", e => e.preventDefault(), {passive: false});
+  for (const n of ["gesturestart", "gesturechange", "gestureend"])
+    document.addEventListener(n, e => e.preventDefault(), {passive: false});
+  canvas.addEventListener("wheel", e => {
+    override = null;
+    if (mode === "orbit") orbit.dist = Math.max(diag*0.01, Math.min(diag*6, orbit.dist * Math.exp(e.deltaY * 0.0012)));
+    else fovScale = Math.max(0.5, Math.min(1.4, fovScale * Math.exp(e.deltaY * 0.001)));
+    requestDraw(); e.preventDefault();
+  }, {passive: false});
+  addEventListener("keydown", e => {
+    if (e.key === "ArrowRight") step(1); else if (e.key === "ArrowLeft") step(-1);
+  });
+
+  function step(d){
+    if (!cams.length) return;
+    override = null; ci = Math.max(0, Math.min(cams.length-1, ci + d));
+    look.yaw = 0; look.pitch = 0; requestDraw();
+  }
+  function setMode(m){
+    override = null; mode = m;
+    $("bOrbit").setAttribute("aria-pressed", String(m === "orbit"));
+    $("bWalk").setAttribute("aria-pressed", String(m === "walk"));
+    if (m === "orbit") resetOrbitToCamera();
+    look.yaw = 0; look.pitch = 0; fovScale = 1;
+    requestDraw();
+  }
+  function reset(){
+    override = null; ci = opening >= 0 ? opening : 0;
+    look.yaw = 0; look.pitch = 0; fovScale = 1;
+    resetOrbitToCamera(); setMode(cams.length ? "walk" : "orbit");
+  }
+  $("bOrbit").onclick = () => setMode("orbit");
+  $("bWalk").onclick = () => { if (cams.length) setMode("walk"); };
+  $("bPrev").onclick = () => { if (mode === "walk") step(-1); };
+  $("bNext").onclick = () => { if (mode === "walk") step(1); };
+  $("bReset").onclick = reset;
+  if (!cams.length){ $("bWalk").disabled = true; $("bPrev").disabled = true; $("bNext").disabled = true; }
+  addEventListener("resize", requestDraw);
+
+  /* -------- caption: exactly what this is ---------------------------------- */
+  function updateCaption(){
+    const cap = $("caption");
+    cap.textContent = "";
+    const head = document.createElement("b");
+    head.textContent = "Captured images on reconstructed geometry";
+    const bits = [];
+    if (manifest){
+      bits.push(S.layers + " of " + S.keyframesInManifest + " keyframes shown");
+      if (manifest.quality === "live") bits.push("still building as you walk");
+    }
+    if (CONFIG.current === false){
+      const reason = manifest && manifest.currency && manifest.currency.reason || CONFIG.currency_reason;
+      bits.push(reason ? String(reason) : "built from an earlier reconstruction");
+    }
+    if (encoding === "webp-rgba") bits.push("reduced set: this device has no compressed-texture support");
+    let note = "These are the camera's own frames, with faces redacted, placed on the reconstructed room. "
+      + "Dark areas are places no kept frame saw, or that were masked as unreliable (redaction, hands, "
+      + "views that disagreed); nothing there is filled in. Where the geometry underneath is wrong, "
+      + "images smear or double.";
+    if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
+    cap.append(head, bits.length ? " · " + bits.join(" · ") : "", document.createElement("br"), note);
+  }
+
+  /* -------- verification hooks (read-only, and harmless on the phone) ------- */
+  S.setView = (v) => { override = {eye: v.eye, target: v.target, up: v.up ? norm3(v.up) : null,
+    fovY: (v.fovYDeg || 70) * Math.PI / 180}; frame(true); return S.choice; };
+  S.walk = (i, yawDeg = 0, pitchDeg = 0) => { override = null; mode = "walk"; ci = i; look.yaw = yawDeg * Math.PI / 180;
+    look.pitch = pitchDeg * Math.PI / 180; fovScale = 1; frame(true); return {index: ci, of: cams.length}; };
+  S.orbitView = (yawDeg, pitchDeg, distScale = 1, around = null) => { override = null; mode = "orbit";
+    ci = around !== null ? around : (opening >= 0 ? opening : 0);
+    resetOrbitToCamera(); orbit.yaw += yawDeg * Math.PI / 180; orbit.pitch = Math.max(-1.45, Math.min(1.45, orbit.pitch + pitchDeg * Math.PI / 180));
+    orbit.dist *= distScale; frame(true); return true; };
+  S.reset = () => { reset(); frame(true); };
+  S.coverage = () => {
+    const cam = currentCamera(), MVP = matrices(cam);
+    drawBlend(cam, MVP, chosen, 2);
+    const w = canvas.width, h = canvas.height, px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let obs = 0, un = 0;
+    for (let i = 0; i < px.length; i += 4){
+      if (px[i] === 255 && px[i+1] === 255) obs++; else if (px[i] === 255 && px[i+1] === 0) un++;
+    }
+    frame(true);
+    return {observed: obs / (w*h), unobserved: un / (w*h), background: 1 - (obs + un) / (w*h)};
+  };
+  S.snapshot = () => { frame(true); return canvas.toDataURL("image/png"); };
+
+  /* -------- start ------------------------------------------------------------ */
+  try {
+    buildGL();
+    basis();
+    S.phase = "loading";
+    status("Loading the images…");
+    await serial(() => loadRevision(CONFIG.appearance_revision || null));
+    if (S.phase === "failed") return;
+    if (!S.layers){ fail("No image of this world could be placed."); return; }
+    resize();
+    opening = chooseOpening();
+    ci = opening >= 0 ? opening : 0;
+    resetOrbitToCamera();
+    updateCaption();
+    setMode(cams.length ? "walk" : "orbit");
+    frame(true);
+    S.phase = "ready";
+    S.timing.bootMs = performance.now() - T0;
+    gpuTotal();
+    follow();
+  } catch (e){
+    if (S.phase !== "failed") fail("The images could not be placed: " + (e && e.message ? e.message : e));
+  }
+}
+
+main().catch(e => fail("The world viewer failed to start: " + (e && e.message ? e.message : e)));
+</script>
+</body>
+</html>

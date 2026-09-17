@@ -9,7 +9,7 @@ Contract identifier: `wb-appearance-keyframes/1`.
 | Tower producer | `tower/tower/world_builder/appearance_pipeline.py` (build), `tower/tower/world_builder/appearance.py` (provenance, masks, gains, selection, encoding) |
 | Tower routes | `tower/tower/routes/geometry.py`, through the adapter `tower/tower/results/world_builder_appearance.py` |
 | CLI | `tower/scripts/world_appearance.py` |
-| Consumer | the phone's render page (WebGL2) and its iOS transport — a separate lane, built against this document |
+| Consumer | the appearance page, `tower/tower/world_builder/appearance_viewer.html` (`WORLD-BUILDER-WORLDS.md` §4, the top rung of the render ladder), reached on the phone through `ios/Glasses/Workspaces/WorldBuilder/WorldAssetTransport.swift` (`WORLD-BUILDER-IOS.md` §10) |
 
 This describes what `<world>/appearance/<session>/` contains, what it claims,
 and what it promises never to claim. It is additive in the way `surface/` is:
@@ -477,6 +477,13 @@ route would answer 200, else `null`. It is opaque and compared for equality. It
 is deliberately **not** folded into the page `revision`: the page follows
 appearance builds itself, and a page swap for every appearance build would
 reset the wearer's camera.
+
+**Who calls these.** Only the appearance page of `WORLD-BUILDER-WORLDS.md` §4,
+through the transport it names: on the phone the app's `glasses-world:` scheme
+handler, which proxies exactly these three routes and the revision route for the
+world and session on screen, through an ephemeral session with no URL cache, and
+drops its in-memory copy of bundles whenever a manifest or revision request stops
+answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
 
 ## 10. Live, final, rebuilding
 

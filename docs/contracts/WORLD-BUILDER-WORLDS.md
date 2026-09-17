@@ -80,14 +80,92 @@ Added 2026-09-06 on the Mac integration branch, so a saved world can be
 |---|---|---|
 | `session_id` | string, optional | The session to draw. Absent: the newest session of the world that has geometry (`has_geometry` in §2) |
 | `max_points` | int 1…200000, optional | Point budget, and only a point budget. **Sparse:** default 40,000 for a phone (`MOBILE_MAX_POINTS` in `tower/results/world_builder_render.py`, set from a measured canvas-fill cliff — 80,000 was the cliff, not a margin). Fractional-stride sampling over every segment, never a prefix. **Dense:** default 393,216 (a 6 MB binary buffer), met by a coarser voxel grid over the whole extent rather than by sampling; an explicit value is honoured as a cap. **Surface:** the mesh is not points, so this selects the level-of-detail rung rather than thinning vertices: it lowers the page budget to `max_points x 16` bytes, and the largest rung whose composed page (mesh base64-encoded, plus the viewer) fits it is served; when none fits, the smallest is served over budget, so it cannot go below the default phone page. The default page budget is 6 MiB (`WORLD-BUILDER-SURFACE.md` §8). The dense page's budget is on its binary buffer, not the page, which can therefore exceed 6 MiB (8.0 MB measured) |
-| `representation` | `auto` \| `sparse` \| `dense` \| `surface`, optional | Which reconstruction to serve, as a ladder: `surface` → `dense` → `sparse`. `auto` (default) serves the best rung the session actually has. A named value starts the walk at its own rung and falls through to worse ones, **except** that naming a rung the session does not have at all returns **404** rather than silently serving a different one — a caller that pinned a representation is comparing, and a silent substitution would corrupt the comparison. **422** outside this set. The rung actually served is stated in the page (`wb-representation`) and by `GET /worlds/{id}/render/revision` (§4a); the `GET /worlds` listing does not state it |
+| `representation` | `auto` \| `sparse` \| `dense` \| `surface` \| `appearance`, optional | Which reconstruction to serve, as a ladder: `appearance` → `surface` → `dense` → `sparse` (`appearance` added 2026-09-17). `auto` (default) serves the best rung the session actually has. A named value starts the walk at its own rung and falls through to worse ones, **except** that naming a rung the session does not have at all returns **404** rather than silently serving a different one — a caller that pinned a representation is comparing, and a silent substitution would corrupt the comparison. **422** outside this set. The rung actually served is stated in the page (`wb-representation`) and by `GET /worlds/{id}/render/revision` (§4a); the `GET /worlds` listing does not state it |
+| `transport` | `app` \| `tower`, optional | Where the **appearance** page fetches its imagery from; every other page fetches nothing and ignores it. `app` (default, and the only value the phone sends): `glasses-world://tower/…`, the app's private scheme, CSP `connect-src glasses-world:`. `tower`: a desktop debug mode, only when named, fetching from the Tower's own origin, CSP `connect-src 'self'`. **422** outside this set. See "The appearance page" below |
 | `view` | `product` \| `diagnostics`, optional | Which rendering the **sparse** page opens in: the product view (default) or the solver's segment-coloured diagnostics view. Honoured server-side, because a `loadHTMLString` client has no `location.search`. An unrecognised value opens the product view, never a 422. **`view=diagnostics` with `representation=auto` serves the sparse page**, whatever other rungs the session has — only the sparse page has the diagnostics rendering, so starting the ladder at the surface (or the dense rung) would answer "open the solver's view" with a surface or dense points. A pinned `representation` still wins |
 
-**200** `text/html`, `Cache-Control: no-store`. A self-contained page: no
-external script, stylesheet, image or fetch, so a web view that refuses
-every navigation but the initial one shows it whole. One finger orbits,
+**200** `text/html`, `Cache-Control: no-store`. Every page but the appearance
+page is self-contained: no external script, stylesheet, image or fetch, so a
+web view that refuses every navigation but the initial one shows it whole. The
+appearance page fetches its imagery through exactly one transport, below. One finger orbits,
 two fingers pinch to zoom and drag to pan; on a desktop, drag / wheel /
 shift-drag.
+
+**The appearance page** (2026-09-17, `tower/tower/world_builder/appearance_render.py`
++ `appearance_viewer.html`). The top rung, served whenever
+`GET /worlds/{id}/appearance/{session}/manifest` would answer 200 for the chosen
+session (label still matching, world not purged, manifest readable, proxy
+whole) — **not only when the artifact is `current`**. During a walk every new
+surface makes the appearance "built on an earlier surface" for the minute its
+rebuild takes; demoting the rung for that minute would swap the page down and
+back up on every solve, resetting the wearer's camera twice. The page says it is
+behind instead (`WORLD-BUILDER-APPEARANCE.md` §8: currency is reported, never
+enforced).
+
+- **A shell, not a data page.** About 70 KB on the canonical world: the WebGL2
+  renderer, the recorded camera path (`surface_render._camera_path`), the
+  vertical (`surface_render.surface_up` measured on the proxy, seeded by the
+  cameras), and the four addresses it fetches, relative to `CONFIG.base`:
+  `/worlds/{w}/appearance/{s}/manifest`, `…/chunk/{digest}`, `…/proxy/{digest}`
+  and `/worlds/{w}/render/revision?session_id={s}`. Every fetch goes through
+  one helper that prefixes `CONFIG.base`; nothing else is requested.
+- **The transport decision.** `transport=app` (default): `CONFIG.base` is
+  `glasses-world://tower` and the CSP (header and `<meta>`) is
+  `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src glasses-world:`.
+  The web content cannot reach the network or the Tower directly; the app's
+  scheme handler serves the page and proxies only this world's four routes
+  (`WORLD-BUILDER-IOS.md` §10). A desktop browser opening the route this way
+  fetches nothing and says so. `transport=tower` (named explicitly): `CONFIG.base`
+  is `""` and the policy is `… connect-src 'self'`, which reaches only routes any
+  client on the Tower's network can already call. No other value is accepted,
+  and no policy ever allows `*`, `http:`, `https:`, `img-src` or `script-src`
+  beyond inline.
+- **What it draws.** The proxy mesh, depth-prepassed; per fragment, up to ten
+  candidate keyframes chosen per frame on the CPU from a 32×24 probe of the
+  proxy, and the **k = 4** best by unstructured-lumigraph penalty (angle to the
+  viewing ray, distance ratio, 16 px border feather, keyframe quality) blended
+  with ULR weights. A source contributes only where the point is in its frame,
+  visible from it (its depth, rendered **on the device** from the proxy at full
+  resolution and min-pooled 4×4 into an R16UI array), within 60° of the viewing
+  ray, and opaque (**alpha < 0.5 is zero weight**, feathered to 0.95). Each
+  sample is divided by its keyframe's gain. **Unshaded**: no lighting term; one
+  display mapping for every pixel (exposure 1.8, a roll-off above 0.7, γ 1.15).
+  A proxy point no source covers is drawn as a faint flat tint over the dark
+  background (no hatching); where there is no proxy the background shows.
+- **Formats and memory.** ASTC 6×6 (`WEBGL_compressed_texture_astc`) into one
+  `TEXTURE_2D_ARRAY` allocated once at the phone budget (128 layers, capped at
+  192): 13.1 MB colour + 3.7 MB depth + 3.7 MB proxy buffers = 20.5 MB on the
+  canonical world, reported in `window.__wbAppearance.gpu` / `gpuBytes` (the
+  drawing buffer, about 7 bytes a pixel, is reported beside it, not in it).
+  Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
+  (42 MB colour) and the caption says the set is reduced.
+- **Navigation.** Walk (the recorded path, look-around, two-finger swipe to
+  step), Orbit (drag, pinch, pan), Reset, as the surface page. It opens in Walk
+  at the recorded pose whose view holds the **most observed surface**: every
+  ⌈n/32⌉-th recorded pose (29 of 198 on the canonical world) is rendered at
+  40×64 in the phone's portrait aspect through the real blend, and the
+  observed pixels are summed weighted by distance squared (surface area, not
+  pixel count). The horizon is levelled to `CONFIG.up`.
+- **Live.** The page polls the revision route every 10 s (backing off to 120 s
+  while `live` is false and nothing changed). A new `appearance.revision`
+  fetches the manifest and only the chunks whose digest it lacks, overwrites
+  layers in place (a keyframe that left the phone tier frees its layer), renders
+  source depth for moved or new layers, and keeps the camera: no navigation, no
+  reload. `appearance.revision: null` deletes every texture at once and says the
+  images are no longer served.
+- **Context loss.** Textures are not kept in page memory: on restore the page
+  fetches the manifest, proxy and chunks again through the same transport (so
+  the Tower's label check runs again) and keeps the camera.
+- **Caption.** *Captured images on reconstructed geometry · N of M keyframes
+  shown* (· *still building as you walk*, · the currency reason when behind),
+  then: *These are the camera's own frames, with faces redacted, placed on the
+  reconstructed room. Dark areas are places no kept frame saw, or that were
+  masked as unreliable (redaction, hands, views that disagreed); nothing there
+  is filled in. Where the geometry underneath is wrong, images smear or double.
+  Scale is unknown, so distances are relative.*
+- `window.__wbAppearance` also exposes `walk`, `orbitView`, `setView`,
+  `coverage` and `snapshot` for verification; they read the page and move its
+  camera, nothing else.
 
 **The route serves one of two pages and they differ, deliberately.** This
 section described only the sparse one until the dense viewer shipped; what
@@ -130,7 +208,7 @@ set.
 3. Composed on request, cached nowhere: a world under construction changes with every build, and the client bypasses its own cache for the same reason the geometry routes ask it to.
 4. `world_id` passes the same containment guard as the geometry routes (`contained_world_id`): an id that resolves outside the world root is "no world", and a non-canonical spelling is answered as the world it names.
 5. **One derived manifest per world, not per session.** `derived/manifest.json` records the digest of the *last* build, so in a world with two built sessions the older one's placements no longer bind to it: that session renders with every segment apart, labelled `unbound`, and the BEHIND caption — which is the truthful reading of a tree the current build did not produce, not a defect in the session. `GET /worlds` still answers `has_geometry: true` for it. A per-session manifest is the fix and belongs to the store, not to this route.
-6. The response carries `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'` — the promise above, enforced by the browser as well as kept by the producer — **and every page carries the same policy as a `<meta http-equiv="Content-Security-Policy">` right after `<meta charset>`**, which is the only form a `loadHTMLString` client enforces: iOS drops the response headers, and its navigation policy sees navigations, not an `<img>` or a `fetch`. All three pages (sparse, dense, surface) carry it, and it never pushes `wb-representation` out of the first 4096 characters.
+6. The response carries `Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'` — the promise above, enforced by the browser as well as kept by the producer — **and every page carries the same policy as a `<meta http-equiv="Content-Security-Policy">` right after `<meta charset>`**, which is the only form a `loadHTMLString` client enforces: iOS drops the response headers, and its navigation policy sees navigations, not an `<img>` or a `fetch`. All three pages (sparse, dense, surface) carry it, and it never pushes `wb-representation` out of the first 4096 characters. **The appearance page is the one exception to the policy's content, not to the rule:** its header and its `<meta>` both read `… connect-src glasses-world:` (or `connect-src 'self'` under `transport=tower`), and the two are always equal.
 
 ## 4a. `GET /worlds/{world_id}/render/revision` — has a better picture been built?
 
@@ -144,7 +222,7 @@ page to find out.
 | `session_id` | string, optional | as §4; resolved the same way |
 | `view` | string, optional | as §4. `view=diagnostics` reports the **sparse** rung, because that is the page §4 serves for it. A client showing the diagnostics rendering has nothing to follow and should not ask (the iOS app does not) |
 
-**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool}}`,
+**200** `{"session_id": str, "representation": "appearance"|"surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool}}`,
 `Cache-Control: no-store`. **404** exactly when §4 would 404.
 
 `appearance` (additive, 2026-09-17) follows the session's appearance artifact
@@ -182,7 +260,13 @@ Every page §4 serves carries the same two values in its head, within its first
 2. It changes when the page §4 would serve changes rung, or when the surface or
    dense artifact behind the served rung is rebuilt, or when the session §4
    would choose changes: every revision is prefixed with the chosen session id.
-3. The sparse rung's revision is the constant `<session_id>/sparse`. The derived
+3. The appearance rung's revision is the constant `<session_id>/appearance:1`,
+   the page PROGRAM's version (`appearance_render.PAGE_REVISION`), not the
+   appearance build: the page follows builds itself (`appearance.revision`), so a
+   new build never changes `revision` and never makes a client reload the page.
+   Stepping onto the rung, off it (a relabelled or purged session steps down to
+   the surface), or a Tower update that bumps the page version does change it.
+   The sparse rung's revision is the constant `<session_id>/sparse`. The derived
    tree is rewritten every few keyframes during a walk, and a picture that
    reloaded on each of those would be unusable to look at; the step the wearer
    is waiting for — up the ladder — still changes it.
@@ -239,6 +323,6 @@ short:
   no path, file name or capture sequence number.
 - `world_id` passes `contained_world_id`; `session_id` must be one of the
   world's sessions.
-- §4's page is unchanged by this: it still loads nothing from anywhere and its
-  CSP is still `default-src 'none'`. How a page reaches these routes is the
-  phone lane's design, not this route's.
+- The only page that reaches these routes is §4's appearance page, through the
+  transport §4 names (`glasses-world:` on the phone, the Tower's origin only
+  under `transport=tower`). Every other page still loads nothing from anywhere.

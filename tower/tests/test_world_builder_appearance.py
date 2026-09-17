@@ -868,8 +868,11 @@ class TestTheRoutes:
         assert client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{chunk}").status_code == 404
         rev2 = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION})
         assert rev2.json()["appearance"]["revision"] is None
-        # the page revision does not move for appearance
-        assert rev2.json()["revision"] == page_revision
+        # The appearance page is no longer served: the rung steps down to the
+        # surface, and that (not an appearance build) moves the page revision.
+        assert rev.json()["representation"] == "appearance"
+        assert rev2.json()["representation"] == "surface"
+        assert rev2.json()["revision"] != page_revision
 
     def test_a_rebuild_moves_only_the_appearance_revision(self, world):
         from fastapi.testclient import TestClient

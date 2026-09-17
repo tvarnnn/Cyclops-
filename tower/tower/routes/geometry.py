@@ -33,6 +33,7 @@ from tower.results.world_builder_render import (
     WorldRenderUnavailable,
     build_render_revision,
     build_world_render,
+    render_content_security_policy,
 )
 
 router = APIRouter()
@@ -205,7 +206,13 @@ def world_render(
     # the session does not have falls back rather than failing, because the
     # caller asking for a better picture should never get no picture.
     representation: str = Query(
-        default="auto", pattern="^(auto|sparse|dense|surface)$"),
+        default="auto", pattern="^(auto|sparse|dense|surface|appearance)$"),
+    # Where the APPEARANCE page fetches its imagery from (WORLD-BUILDER-WORLDS.md
+    # §4). `app`, the default and the phone's only mode: the app's private
+    # `glasses-world:` scheme, whose native handler whitelists this world's
+    # routes. `tower`: a desktop debug mode, only when named, fetching from this
+    # origin. Every other page fetches nothing and ignores it.
+    transport: str = Query(default="app", pattern="^(app|tower)$"),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -222,7 +229,7 @@ def world_render(
     try:
         html = build_world_render(
             _store(request), world_id, session_id, max_points=max_points,
-            view=view, representation=representation,
+            view=view, representation=representation, transport=transport,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None
@@ -233,9 +240,11 @@ def world_render(
     # The policy states what the contract promises -- a page that loads
     # nothing from anywhere -- so a browser enforces it too: its own inline
     # script and style, and no other resource of any kind.
+    #
+    # The appearance page is the one exception: it fetches its imagery, and its
+    # policy allows exactly that transport (`connect-src glasses-world:`, or
+    # `'self'` in the named desktop debug mode) and nothing else.
     return HTMLResponse(html, headers={
         "Cache-Control": "no-store",
-        "Content-Security-Policy": (
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
-        ),
+        "Content-Security-Policy": render_content_security_policy(html, transport),
     })

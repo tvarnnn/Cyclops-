@@ -188,6 +188,7 @@ class _ViewerModuleMissing(Exception):
 
 
 REPRESENTATION_AUTO = "auto"
+REPRESENTATION_APPEARANCE = "appearance"
 REPRESENTATION_SPARSE = "sparse"
 REPRESENTATION_DENSE = "dense"
 REPRESENTATION_SURFACE = "surface"
@@ -197,8 +198,23 @@ REPRESENTATION_SURFACE = "surface"
 # rung so "give me dense" never silently serves something better or worse
 # without saying so. The rung that is reached is reported in the page and in
 # the worlds listing, so "what am I looking at" is never a guess.
-REPRESENTATION_LADDER = (REPRESENTATION_SURFACE, REPRESENTATION_DENSE,
-                         REPRESENTATION_SPARSE)
+#
+# `appearance` (2026-09-17) sits above the surface: the wearer's own redacted
+# keyframes blended over the surface they were prepared against. It is served
+# whenever the appearance routes would serve (the label still matches, the
+# world is not purged, the manifest reads) -- NOT only when the artifact is
+# `current`. During a walk every new surface makes the appearance "built on an
+# earlier surface" for the minute its rebuild takes; demoting the rung for that
+# minute would swap the page down and back up on every solve, resetting the
+# wearer's camera twice. The page says it is behind instead
+# (WORLD-BUILDER-APPEARANCE.md §8: currency is reported, never enforced).
+REPRESENTATION_LADDER = (REPRESENTATION_APPEARANCE, REPRESENTATION_SURFACE,
+                         REPRESENTATION_DENSE, REPRESENTATION_SPARSE)
+
+# Transports of the appearance page (`appearance_render.TRANSPORTS`), named
+# here so the route has a default without importing the cartridge.
+TRANSPORT_APP = "app"
+TRANSPORT_TOWER = "tower"
 
 
 _REPRESENTATION_META = re.compile(
@@ -228,6 +244,16 @@ def render_revision(store: WorldStore, world_id: str, session_id: str,
     (review 2, iOS m5). The read now survives a replace; what still fails is
     reported as no surface revision, and the caller answers the next rung.
     """
+    if rung == REPRESENTATION_APPEARANCE:
+        # The page PROGRAM's revision. Appearance builds are followed by the
+        # page itself and are deliberately not in it (§4a `appearance`).
+        if _appearance_revision(store, world_id, session_id).get("revision") is None:
+            return None
+        try:
+            from tower.world_builder.appearance_render import PAGE_REVISION  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 -- no page module, no rung
+            return None
+        return PAGE_REVISION
     if rung == REPRESENTATION_SURFACE:
         from tower.world_builder.store import _read_json_past_a_replace  # noqa: PLC0415
 
@@ -297,8 +323,13 @@ def build_render_revision(store: WorldStore, world_id: str,
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
     revision = None
+    appearance = _appearance_revision(store, world_id, chosen)
     if view == VIEW_DIAGNOSTICS:
         rung = REPRESENTATION_SPARSE
+    elif (appearance.get("revision") is not None
+          and (revision := render_revision(
+              store, world_id, chosen, REPRESENTATION_APPEARANCE)) is not None):
+        rung = REPRESENTATION_APPEARANCE
     elif (surface_artifact_drawable(store, world_id, chosen)
           and (revision := render_revision(
               store, world_id, chosen, REPRESENTATION_SURFACE)) is not None):
@@ -309,7 +340,7 @@ def build_render_revision(store: WorldStore, world_id: str,
         rung = REPRESENTATION_DENSE
     else:
         rung = REPRESENTATION_SPARSE
-    if rung != REPRESENTATION_SURFACE:
+    if rung not in (REPRESENTATION_SURFACE, REPRESENTATION_APPEARANCE):
         revision = render_revision(store, world_id, chosen, rung)
     return {"session_id": chosen, "representation": rung,
             # The session is in the revision, so an open picture whose session
@@ -321,7 +352,76 @@ def build_render_revision(store: WorldStore, world_id: str,
             # them into the page revision would swap the page -- and reset the
             # wearer's camera -- on every one. `null` exactly when the
             # appearance route would 404, including a changed redaction label.
-            "appearance": _appearance_revision(store, world_id, chosen)}
+            "appearance": appearance}
+
+
+def _appearance_page(store: WorldStore, world_id: str, session_id: str, revisions: dict,
+                     transport: str, *, pinned: bool) -> str | None:
+    """The appearance page, or None to walk on down the ladder.
+
+    Served exactly when the appearance routes would serve -- the same probe
+    the revision route uses -- so the rung a page declares and the rung §4a
+    reports agree. A pinned `representation=appearance` that cannot be served
+    is a 404, like every other pinned rung.
+    """
+    appearance = _appearance_revision(store, world_id, session_id)
+    if appearance.get("revision") is None:
+        if pinned:
+            raise WorldRenderUnavailable("this session has no appearance that can be served")
+        return None
+    try:
+        from tower.world_builder.appearance_render import (  # noqa: PLC0415
+            AppearanceViewerUnavailable,
+            build_appearance_page,
+        )
+    except Exception:  # noqa: BLE001 -- an appearance module that will not import
+        logger.exception("[Tower][WorldBuilder] the appearance viewer module did not import "
+                         "for %s; falling back", world_id)
+        if pinned:
+            raise WorldRenderUnavailable("the appearance viewer is unavailable") from None
+        return None
+    try:
+        page = build_appearance_page(store, world_id, session_id, transport=transport,
+                                     appearance_revision=appearance["revision"])
+        return _stamp_revision(store, world_id, session_id, page, revisions)
+    except AppearanceViewerUnavailable as exc:
+        if pinned:
+            raise WorldRenderUnavailable(exc.reason) from None
+        logger.error(
+            "[Tower][WorldBuilder] appearance for %s/%s is served by its routes but the "
+            "page could not be composed (%s); serving a lower rung while the revision "
+            "route reports appearance", world_id, session_id, exc.reason)
+    except Exception:  # noqa: BLE001 -- never lose the world to an appearance bug
+        logger.exception("[Tower][WorldBuilder] appearance viewer failed for %s; falling back",
+                         world_id)
+        if pinned:
+            raise WorldRenderUnavailable("the appearance viewer failed") from None
+    return None
+
+
+STRICT_PAGE_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+
+
+def render_content_security_policy(html: str, transport: str = TRANSPORT_APP) -> str:
+    """The route's CSP header for a page this module composed.
+
+    Every rung but the appearance page loads nothing from anywhere. The
+    appearance page fetches its imagery -- from the app's private scheme, or in
+    the explicitly named desktop debug transport from the Tower's own origin --
+    and its header states the same policy as its `<meta>`
+    (WORLD-BUILDER-WORLDS.md §4 rule 6).
+    """
+    match = _REPRESENTATION_META.search(html, 0, 4096)
+    if match is not None and match.group(1) == REPRESENTATION_APPEARANCE:
+        try:
+            from tower.world_builder.appearance_render import (  # noqa: PLC0415
+                content_security_policy,
+            )
+
+            return content_security_policy(transport)
+        except Exception:  # noqa: BLE001 -- the strictest policy, then
+            logger.exception("[Tower][WorldBuilder] appearance CSP unavailable")
+    return STRICT_PAGE_POLICY
 
 
 def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> dict:
@@ -439,7 +539,8 @@ def session_build_running(store: WorldStore, world_id: str, session_id: str) -> 
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
                        max_points: int | None = None,
                        view: str | None = None,
-                       representation: str = REPRESENTATION_AUTO) -> str:
+                       representation: str = REPRESENTATION_AUTO,
+                       transport: str = TRANSPORT_APP) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -464,7 +565,7 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         if own is not None:
             revisions[rung] = f"{chosen}/{own}"
     wanted = (representation if representation in REPRESENTATION_LADDER
-              else REPRESENTATION_SURFACE)
+              else REPRESENTATION_APPEARANCE)
     # The solver's diagnostic view IS the sparse page -- only it has the
     # diagnostic rendering -- so asking for it with no representation pinned
     # starts the ladder at sparse. Starting at the surface served the surface
@@ -473,6 +574,12 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     if view == VIEW_DIAGNOSTICS and representation == REPRESENTATION_AUTO:
         wanted = REPRESENTATION_SPARSE
     start = REPRESENTATION_LADDER.index(wanted)
+
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_APPEARANCE):
+        page = _appearance_page(store, world_id, chosen, revisions, transport,
+                                pinned=representation == REPRESENTATION_APPEARANCE)
+        if page is not None:
+            return page
 
     if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE):
         # Same shape as the dense rung below, and for the same reason: the
