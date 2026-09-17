@@ -430,12 +430,21 @@ def test_appearance_modules_import_no_solve_workspace():
                     and id(node) not in docstrings]
         assert not [s for s in literals if "sources" in s or "undist" in s
                     or "captures" in s or s == "images"]
-    # `images_dir` is used in exactly one function: the provenance function.
+    # Keyframe pixels are located only through the store's one accessor
+    # (`keyframe_image_set`, which honours a re-redaction switch), never the
+    # capture's `images_dir` directly, and the directory is opened in exactly
+    # one function: the provenance function.
     tree = ast.parse(pathlib.Path(A.__file__).read_text(encoding="utf-8"))
-    users = {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
-             for node in ast.walk(fn) if isinstance(node, ast.Attribute)
-             and node.attr == "images_dir"}
-    assert users == {"keyframe_source"}
+
+    def users_of(attr):
+        return {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+                for node in ast.walk(fn) if isinstance(node, ast.Attribute)
+                and node.attr == attr}
+
+    assert users_of("images_dir") == set()
+    assert users_of("directory") == {"keyframe_source"}
+    assert users_of("keyframe_image_set") <= {"keyframe_source", "resolve_label_policy",
+                                              "keyframe_set_identity"}
     assert "images_dir" not in pathlib.Path(AP.__file__).read_text(encoding="utf-8")
 
 

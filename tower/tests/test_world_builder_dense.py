@@ -356,6 +356,14 @@ class _StubStore:
     def images_dir(self, world_id, session_id):
         return self._images
 
+    def keyframe_image_set(self, world_id, session_id):
+        # The store's one accessor for which keyframes a build reads; a stub
+        # store has no re-redacted set, so it is always `images/`.
+        from tower.world_builder.store import KeyframeImageSet
+
+        return KeyframeImageSet(directory=self._images, name="images", redaction=None,
+                                stored_redaction=None, digest=None)
+
 
 class _StubRedactor:
     """Stands in for FaceRedactor, INCLUDING its failure shape.
@@ -1294,7 +1302,14 @@ def test_the_depth_stage_reads_the_sessions_redaction_record():
     # against a later solve; the claim is about the depth stage as a whole.
     body = (inspect.getsource(dense_pipeline.run_depth_stage)
             + inspect.getsource(dense_pipeline._fit_record))
-    assert "read_session" in body
+    # Read through the store's one accessor, which reads `session.redaction`
+    # (or the label of a re-redacted set the session was switched to).
+    import inspect as _inspect
+
+    from tower.world_builder.store import WorldStore
+
+    assert "keyframe_image_set" in body
+    assert "read_session" in _inspect.getsource(WorldStore.keyframe_image_set)
     assert "REDACTION_NONE" in body
     assert "keyframes_are_redacted=keyframes_are_redacted" in body
 

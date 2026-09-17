@@ -71,6 +71,31 @@ LOCK_FILENAME = "LOCK"
 DERIVED_DIRNAME = "derived"
 DERIVED_MANIFEST = "manifest.json"
 IMAGES_DIRNAME = "images"
+# A re-redacted keyframe set sits beside `images/` and never replaces it
+# (`world_builder/reredaction.py`); the pointer names which one builds read.
+REREDACTED_IMAGES_PREFIX = "images.redacted-"
+REDACTION_SET_FILENAME = "redaction_set.json"
+
+
+@dataclass(frozen=True)
+class KeyframeImageSet:
+    """Which keyframe images a build reads, and the label describing them."""
+
+    directory: Path
+    name: str
+    redaction: str | None          # the label a reader applies its trust rule to
+    stored_redaction: str | None   # what `session.json` records for `images/`
+    digest: str | None             # the set's per-frame digest; None for `images/`
+
+    @property
+    def reredacted(self) -> bool:
+        return self.name != IMAGES_DIRNAME
+
+    @property
+    def cache_token(self) -> str | None:
+        """None for the stored set, so every cache key written before
+        re-redaction existed stays valid; otherwise names the set exactly."""
+        return f"{self.name}@{self.digest}" if self.reredacted else None
 
 
 # How many times `acquire_writer_lock` will lose the exclusive create
@@ -278,7 +303,88 @@ class WorldStore:
         return self.session_dir(world_id, session_id) / EVENTS_FILENAME
 
     def images_dir(self, world_id: str, session_id: str) -> Path:
+        """The keyframes the capture wrote: AUTHORITATIVE, never rewritten.
+
+        Writers (the engine) and the re-redaction step's source read this.
+        A reader that wants the pixels a build may use asks
+        `keyframe_image_set` instead, which honours a re-redaction switch.
+        """
         return self.session_dir(world_id, session_id) / IMAGES_DIRNAME
+
+    def redaction_set_path(self, world_id: str, session_id: str) -> Path:
+        return self.session_dir(world_id, session_id) / REDACTION_SET_FILENAME
+
+    def keyframe_image_set(self, world_id: str, session_id: str) -> KeyframeImageSet:
+        """THE ONE ACCESSOR for which keyframe images a build reads, and the
+        redaction label that describes them.
+
+        Normally that is `images/` under the label `session.json` records. After
+        `scripts/world_reredact.py --apply` it is the re-redacted set beside it
+        (`images.redacted-<slug>/`), named by `redaction_set.json`, under the
+        label that set was written with. The pointer is honoured only while it
+        is whole: it names a directory of that exact shape that exists, and the
+        stored label it was made from is still the one `session.json` records.
+        Anything else reads as "no switch": the authoritative keyframes, whose
+        fill on every label the step accepts contains the set's.
+
+        Contract: WORLD-BUILDER-APPEARANCE.md section 6.5.
+        """
+        try:
+            stored = self.read_session(world_id, session_id).redaction
+        except Exception:  # noqa: BLE001 -- unreadable is untrusted, never an error
+            stored = None
+        stored = stored if isinstance(stored, str) and stored else None
+        default = KeyframeImageSet(
+            directory=self.images_dir(world_id, session_id), name=IMAGES_DIRNAME,
+            redaction=stored, stored_redaction=stored, digest=None)
+        path = self.redaction_set_path(world_id, session_id)
+        if not path.exists():
+            return default
+        try:
+            pointer = _read_json_past_a_replace(path)
+        except ValueError:
+            pointer = None
+        if not isinstance(pointer, dict):
+            logger.warning("world builder: redaction set pointer unreadable at %s; "
+                           "reading the stored keyframes", path)
+            return default
+        active = pointer.get("active")
+        if active is None:
+            return default
+        label = pointer.get("redaction")
+        digest = pointer.get("set_digest")
+        whole = (isinstance(active, str)
+                 and active.startswith(REREDACTED_IMAGES_PREFIX)
+                 and len(active) > len(REREDACTED_IMAGES_PREFIX)
+                 and "/" not in active and "\\" not in active and ".." not in active
+                 and isinstance(label, str) and bool(label)
+                 and isinstance(digest, str) and bool(digest)
+                 and pointer.get("stored_redaction") == stored)
+        directory = self.session_dir(world_id, session_id) / str(active)
+        if not whole or not directory.is_dir():
+            logger.warning(
+                "world builder: redaction set pointer at %s is not usable (active=%r, "
+                "stored label now %r, recorded %r); reading the stored keyframes",
+                path, active, stored, pointer.get("stored_redaction"))
+            return default
+        return KeyframeImageSet(directory=directory, name=active, redaction=label,
+                                stored_redaction=stored, digest=digest)
+
+    def read_redaction_set_pointer(self, world_id: str, session_id: str) -> dict | None:
+        path = self.redaction_set_path(world_id, session_id)
+        if not path.exists():
+            return None
+        try:
+            data = _read_json_past_a_replace(path)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_redaction_set_pointer(self, world_id: str, session_id: str,
+                                    pointer: dict) -> None:
+        """Switch, or switch back, a session's keyframe set: one atomic replace."""
+        with self._lock:
+            write_json_atomic(self.redaction_set_path(world_id, session_id), pointer)
 
     def derived_dir(self, world_id: str) -> Path:
         return self.world_dir(world_id) / DERIVED_DIRNAME

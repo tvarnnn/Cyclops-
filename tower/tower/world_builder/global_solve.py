@@ -339,7 +339,40 @@ def write_sources_records(workspace: SolveWorkspace, sources: dict) -> None:
     )
 
 
+# WHAT A RELATIVE `sources.json` PATH IS RELATIVE TO.
+#
+# The builder records paths as it was given them, and the Tower runs from
+# `tower/`, so the canonical capture's 398 entries read `data\captures\...`.
+# Every reader then asked `Path(recorded).exists()`, resolved against the
+# PROCESS cwd. Measured by the fix-it privacy lane from a scratch directory:
+# 95 of 398 raw frames were found, and the dense stage's fill masks fell back
+# to the shape guess, which misses solid boxes touching dark scene (PRIVACY.md
+# L3). Resolved against `tower/`, 398 of 398 exist (REREDACT.md section 1).
+# Same bug class, and the same anchor, as the model path in `redaction.py`.
+#
+# `TOWER_SOURCES_ROOT` overrides the anchor for a world root read by code that
+# is not the Tower that captured it (a worktree, a copy). Never the cwd.
+TOWER_ROOT = Path(__file__).resolve().parents[2]
+SOURCES_ROOT_ENV = "TOWER_SOURCES_ROOT"
+
+
+def sources_root() -> Path:
+    override = os.environ.get(SOURCES_ROOT_ENV, "").strip()
+    return Path(override) if override else TOWER_ROOT
+
+
+def resolve_source_path(recorded, tower_root=None) -> Path | None:
+    """A `sources.json` entry as an absolute path, whatever the cwd."""
+    if not recorded:
+        return None
+    path = Path(str(recorded))
+    if path.is_absolute():
+        return path
+    return (Path(tower_root) if tower_root is not None else sources_root()) / path
+
+
 def read_sources(workspace: SolveWorkspace) -> dict:
+    """keyframe_id -> the path AS RECORDED. Resolve with `resolve_source_path`."""
     path = workspace.root / SOURCES_FILENAME
     if not path.exists():
         return {}
@@ -359,9 +392,9 @@ def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=N
     this machine and nothing derived from it but points and poses is
     published, exactly as before.
     """
-    recorded = (sources or {}).get(keyframe.keyframe_id)
-    if recorded and Path(recorded).is_file():
-        return Path(recorded)
+    recorded = resolve_source_path((sources or {}).get(keyframe.keyframe_id))
+    if recorded is not None and recorded.is_file():
+        return recorded
     name = keyframe_image_name(keyframe)
     for capture_dir in capture_dirs:
         for candidate in (Path(capture_dir) / "frames" / name, Path(capture_dir) / name):

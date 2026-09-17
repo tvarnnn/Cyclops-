@@ -181,6 +181,9 @@ class LabelPolicy:
     trusted: bool
     redactor: object | None = None
     redactor_label: str | None = None
+    # `store.keyframe_image_set(...)`, read once with the label: which keyframes
+    # this build reads. None (a policy built by hand) reads it at the frame.
+    image_set: object | None = None
 
     @property
     def effective(self) -> str:
@@ -190,13 +193,24 @@ class LabelPolicy:
 
 
 def read_session_redaction(store, world_id: str, session_id: str) -> str | None:
-    """The session's `redaction`, or None when the record is absent or
-    unreadable -- which is treated exactly like `none`."""
+    """The label of the keyframes a build reads, or None when the record is
+    absent or unreadable -- which is treated exactly like `none`.
+
+    Through the store's one accessor: `session.json`'s `redaction` for the
+    capture's own keyframes, the re-redacted set's label after a
+    `world_reredact.py --apply` switch (contract section 6.5)."""
+    return keyframe_set_identity(store, world_id, session_id)[0]
+
+
+def keyframe_set_identity(store, world_id: str, session_id: str) -> tuple[str | None, str | None]:
+    """(label, set token) of the keyframe set a build reads now. The token is
+    None for the capture's own keyframes."""
     try:
-        label = store.read_session(world_id, session_id).redaction
+        image_set = store.keyframe_image_set(world_id, session_id)
     except Exception:  # noqa: BLE001 -- unreadable is untrusted, never an error
-        return None
-    return label if isinstance(label, str) and label else None
+        return None, None
+    label = image_set.redaction
+    return (label if isinstance(label, str) and label else None), image_set.cache_token
 
 
 def label_is_trusted(label: str | None) -> bool:
@@ -208,9 +222,10 @@ def resolve_label_policy(store, world_id: str, session_id: str,
     """Read the label ONCE and decide. Refuses the whole build when the label
     needs a re-redaction and no redactor can run: a layer silently missing
     most of the room is worse than a clear refusal."""
-    label = read_session_redaction(store, world_id, session_id)
+    image_set = store.keyframe_image_set(world_id, session_id)
+    label = image_set.redaction if isinstance(image_set.redaction, str) and image_set.redaction else None
     if label_is_trusted(label):
-        return LabelPolicy(session_redaction=label, trusted=True)
+        return LabelPolicy(session_redaction=label, trusted=True, image_set=image_set)
     if redactor_factory is None:
         from tower.world_builder.redaction import FaceRedactor  # noqa: PLC0415
 
@@ -222,7 +237,8 @@ def resolve_label_policy(store, world_id: str, session_id: str,
             "keyframe must be redacted again before it can become appearance, and "
             f"no face redactor is available ({getattr(redactor, 'unavailable_reason', None)})")
     return LabelPolicy(session_redaction=label, trusted=False, redactor=redactor,
-                       redactor_label=str(getattr(redactor, "label", None)))
+                       redactor_label=str(getattr(redactor, "label", None)),
+                       image_set=image_set)
 
 
 @dataclass
@@ -309,7 +325,8 @@ def keyframe_source(store, world_id: str, session_id: str, keyframe_id: str, ki:
 
     out = FrameSource(ki=int(ki), keyframe_id=keyframe_id)
     seq = keyframe_id.rsplit(":", 1)[-1]
-    path = store.images_dir(world_id, session_id) / f"{seq}.jpg"
+    image_set = policy.image_set or store.keyframe_image_set(world_id, session_id)
+    path = image_set.directory / f"{seq}.jpg"
     try:
         stored = path.read_bytes()
     except OSError:

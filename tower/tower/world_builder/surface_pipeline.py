@@ -235,12 +235,14 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
 
     align_path = root / "align.json"
     prior = None
+    set_token = store.keyframe_image_set(world_id, session_id).cache_token
     if align_path.exists():
         try:
             cached = json.loads(align_path.read_text())
         except (OSError, ValueError):
             cached = None
-        if cached and _depth_cache_usable(cached, root, solution, dparams):
+        if cached and _depth_cache_usable(cached, root, solution, dparams,
+                                          image_set=set_token):
             return cached, root / "work"
 
     from tower.world_builder.dense_pipeline import (
@@ -261,12 +263,14 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
         # so neither can mistake it for a cache of another solve.
         align["input_digest"] = solution.input_digest
         align["digest"] = solution.input_digest
-        align["cache_key"] = _depth_cache_key(solution.input_digest, dparams)
+        align["cache_key"] = _depth_cache_key(solution.input_digest, dparams,
+                                              align.get("keyframe_image_set"))
     write_json_atomic(align_path, align)
     return align, root / "work"
 
 
-def _depth_cache_usable(cached: dict, root: Path, solution, dparams) -> bool:
+def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
+                        image_set: str | None = None) -> bool:
     """A cached depth stage is reusable only if it came from this solve, this
     network, and still has its per-frame maps on disk.
 
@@ -304,6 +308,13 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams) -> bool:
     from tower.world_builder.dense_pipeline import FILL_RULE  # noqa: PLC0415
 
     if cached.get("fill_rule") != FILL_RULE:
+        return False
+    # THE KEYFRAME SET IT READ. A re-redaction switch (or a switch back) changes
+    # the pixels without changing the solve; `image_set` is the store's
+    # `keyframe_image_set(...).cache_token` now, None for the capture's
+    # `images/`, which is also what every align.json written before the switch
+    # existed reads as.
+    if cached.get("keyframe_image_set") != image_set:
         return False
     records = [r for r in cached.get("records", []) if r.get("ok")]
     if not records:
@@ -481,6 +492,12 @@ def surfacify(store, world_id: str, session_id: str, *,
         # The depth backend changes every triangle; a request for a different
         # network must not be answered "already built".
         pdigest = _params_digest(params, digest) + "|" + (backend or DenseParams().backend)
+        # A re-redaction switch rebuilds the surface too (its colours and fill
+        # exclusion come from the depth stage's frames). Appended only when a
+        # re-redacted set is active, so every digest written before is unchanged.
+        set_token = store.keyframe_image_set(world_id, session_id).cache_token
+        if set_token:
+            pdigest += "|set:" + set_token
 
         done = _already_built(root, digest, pdigest, force)
         if done is not None:

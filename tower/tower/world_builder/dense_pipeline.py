@@ -114,27 +114,38 @@ def _params_match(stored: dict, wanted: dict) -> bool:
     return all(stored[k] == wanted[k] for k in shared)
 
 
-def _depth_cache_key(digest, params: DenseParams) -> str:
+def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None) -> str:
     """Everything the DEPTH stage reads.
 
     `component` belongs here: re-running with a different one used to reuse the
     other component's predictions and then write a manifest claiming the new
     one. A `digest` of None must not match every solve either.
+
+    `image_set` is `store.keyframe_image_set(...).cache_token`: None for the
+    capture's own `images/` -- so every key written before re-redaction existed
+    is unchanged -- and the re-redacted set's name and digest after a switch,
+    so a switch (or a switch back) refits rather than reusing the other set's
+    depth and fill masks. The solve digest cannot see a switch: the solve reads
+    the raw frames, not either set.
     """
-    return "|".join(str(x) for x in (
-        digest, params.backend, params.component, params.min_sparse_points,
-        f"fill{FILL_RULE}",
-    ))
+    fields = [digest, params.backend, params.component, params.min_sparse_points,
+              f"fill{FILL_RULE}"]
+    if image_set:
+        fields.append(f"set:{image_set}")
+    return "|".join(str(x) for x in fields)
 
 
-def _fuse_cache_key(digest, params: DenseParams) -> str:
-    """Everything the FUSE stage reads."""
-    return "|".join(str(x) for x in (
+def _fuse_cache_key(digest, params: DenseParams, image_set: str | None = None) -> str:
+    """Everything the FUSE stage reads, the depth stage's keyframe set included."""
+    fields = [
         digest, params.backend, params.component, params.gate_rel, params.tau,
         params.min_views, params.neighbours, params.stride, params.edge_rel,
         params.max_grazing_deg, params.erode_px, params.average_views,
         params.max_depth_pct, params.max_extrapolation,
-    ))
+    ]
+    if image_set:
+        fields.append(f"set:{image_set}")
+    return "|".join(str(x) for x in fields)
 
 
 def dense_dir(store, world_id: str, session_id: str) -> Path:
@@ -365,6 +376,7 @@ def _fill_mask_for(redacted: bytes, raw: bytes | None, stored: bytes | None = No
 def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str,
                          source_path: str | None, redactor, *,
                          keyframes_are_redacted: bool,
+                         image_set=None,
                          ) -> tuple[bytes | None, str, "np.ndarray | None"]:
     """The pixels the dense stage is allowed to read, and where they came from.
 
@@ -399,15 +411,29 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
     function, from the difference against the raw frame, and the raw bytes are
     dropped here -- so raw pixels never leave the boundary, not even as an
     argument to the caller.
+
+    WHICH `images/`: `store.keyframe_image_set` decides -- the capture's own
+    keyframes, or the re-redacted set `world_reredact.py --apply` switched the
+    session to -- and `keyframes_are_redacted` must come from that SAME set's
+    label. `image_set` is the set, resolved once per stage by the caller so a
+    switch mid-stage cannot mix two sets; None resolves it here.
+
+    `source_path` is a `sources.json` entry, resolved against the Tower root
+    (`global_solve.resolve_source_path`), never against the process cwd.
     """
+    from tower.world_builder.global_solve import resolve_source_path
+
     seq = keyframe_id.rsplit(":", 1)[-1]
     raw_bytes = None
-    if source_path and Path(source_path).exists():
+    resolved = resolve_source_path(source_path)
+    if resolved is not None and resolved.exists():
         try:
-            raw_bytes = Path(source_path).read_bytes()
+            raw_bytes = resolved.read_bytes()
         except OSError:
             raw_bytes = None
-    p = store.images_dir(world_id, session_id) / f"{seq}.jpg"
+    if image_set is None:
+        image_set = store.keyframe_image_set(world_id, session_id)
+    p = image_set.directory / f"{seq}.jpg"
     if p.exists():
         try:
             # The fill mask is computed HERE, from the difference, and the raw
@@ -545,10 +571,11 @@ def run_depth_stage(
     # `redact` returns, including the original bytes when redaction was
     # unavailable at capture time, so `images/` is only trustworthy when this
     # says so. Anything unrecognised is treated as unredacted.
-    try:
-        session_redaction = store.read_session(world_id, session_id).redaction
-    except Exception:
-        session_redaction = None
+    #
+    # Read through the store's one accessor, ONCE: after a re-redaction switch
+    # the images, and the label that describes them, are the re-redacted set's.
+    image_set = store.keyframe_image_set(world_id, session_id)
+    session_redaction = image_set.redaction
     keyframes_are_redacted = bool(session_redaction) and session_redaction != REDACTION_NONE
 
     redactor = FaceRedactor()
@@ -625,7 +652,8 @@ def run_depth_stage(
         if _stopped(should_stop):
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
                     "camera": cam, "targets": len(targets), "image_origins": origins,
-                    "kind": backend.kind, "fill_rule": FILL_RULE}
+                    "kind": backend.kind, "fill_rule": FILL_RULE,
+                    "keyframe_image_set": image_set.cache_token}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
@@ -635,7 +663,7 @@ def run_depth_stage(
 
         data, origin, exact_fill = keyframe_image_bytes(
             store, world_id, session_id, kid, sources.get(kid), redactor,
-            keyframes_are_redacted=keyframes_are_redacted,
+            keyframes_are_redacted=keyframes_are_redacted, image_set=image_set,
         )
         image_sha1 = hashlib.sha1(data).hexdigest() if data is not None else None
         # A prediction is reused only for the SAME IMAGE, not merely the same
@@ -728,6 +756,7 @@ def run_depth_stage(
                "backend_licence": backend.licence, "kind": backend.kind,
                "stopped_after": None,
                "fill_rule": FILL_RULE,
+               "keyframe_image_set": image_set.cache_token,
                "image_origins": origins,
                "redaction": session_redaction,
                "keyframes_were_redacted_at_capture": keyframes_are_redacted,
@@ -993,7 +1022,8 @@ def run_fuse_stage(
 
 
 def run_pack_stage(params: DenseParams, root: Path, scale: dict,
-                   input_digest: str | None = None) -> dict:
+                   input_digest: str | None = None,
+                   keyframe_image_set: str | None = None) -> dict:
     """The LOD ladder plus the manifest a viewer reads."""
     with np.load(root / "fused.npz") as z:
         X = z["xyz"].astype(np.float32)
@@ -1052,6 +1082,8 @@ def run_pack_stage(params: DenseParams, root: Path, scale: dict,
         # way to say so. `status.json` carries the same value for artifacts
         # written before this key existed.
         "input_digest": input_digest,
+        # The re-redacted keyframe set it was built from; null for `images/`.
+        "keyframe_image_set": keyframe_image_set,
     }
     _write_json(root / "manifest.json", manifest)
     return {"levels": levels, "points": levels[0]["points"]}
@@ -1285,6 +1317,9 @@ def densify(
                          "makes no new scale claim")
 
         digest = solution.input_digest
+        # Which keyframe set this build reads: a re-redaction switch changes it
+        # without changing the solve, so every cache below keys on it too.
+        set_token = store.keyframe_image_set(world_id, session_id).cache_token
 
         # A COMPLETED ARTIFACT IS COMPLETE, and this is decided before the
         # first status write as well as before any stage runs -- an early
@@ -1325,7 +1360,8 @@ def densify(
             # nothing has established is unnecessary -- the same
             # "None matches everything" bug the depth cache key had.
             if (existing and digest is not None
-                    and existing_digest == digest and same_params):
+                    and existing_digest == digest and same_params
+                    and existing.get("keyframe_image_set") == set_token):
                 levels = existing.get("levels") or []
                 if levels and all((root / f"points_l{i}.bin").exists()
                                   for i in range(len(levels))):
@@ -1360,7 +1396,7 @@ def densify(
                 # would make the artifact unreproducible from its own params --
                 # the most expensive kind of wrong, because everything still
                 # runs and the numbers still look reasonable.
-                want = _depth_cache_key(digest, params)
+                want = _depth_cache_key(digest, params, set_token)
                 if cached.get("cache_key") == want:
                     if cached.get("stopped_after") is None:
                         align = cached
@@ -1388,7 +1424,8 @@ def densify(
                 # under the digest was trusted as a finished cache.
                 align["digest"] = digest
                 align["input_digest"] = digest
-                align["cache_key"] = _depth_cache_key(digest, params)
+                align["cache_key"] = _depth_cache_key(
+                    digest, params, align.get("keyframe_image_set"))
             _write_json(align_path, align)
             seconds[STAGE_DEPTH] = time.time() - t
             if align.get("stopped_after") is not None:
@@ -1406,7 +1443,8 @@ def densify(
         if (root / "fused.npz").exists() and fuse_path.exists() and not force:
             try:
                 cached_fuse = json.loads(fuse_path.read_text())
-                if (cached_fuse.get("cache_key") == _fuse_cache_key(digest, params)
+                if (cached_fuse.get("cache_key") == _fuse_cache_key(
+                        digest, params, align.get("keyframe_image_set"))
                         and cached_fuse.get("stopped_after") is None):
                     fuse = cached_fuse
                     logger.info("[Tower][WorldBuilder][dense] reusing fusion")
@@ -1415,7 +1453,8 @@ def densify(
         if fuse is None:
             fuse = run_fuse_stage(solution, align, params, root,
                                   should_stop=should_stop, progress=progress)
-            fuse["cache_key"] = _fuse_cache_key(digest, params)
+            fuse["cache_key"] = _fuse_cache_key(digest, params,
+                                                align.get("keyframe_image_set"))
             if fuse.get("stopped_after") is None:
                 _write_json(fuse_path, fuse)
         seconds[STAGE_FUSE] = time.time() - t
@@ -1426,7 +1465,8 @@ def densify(
 
         _status(root, state=STATE_RUNNING, stage=STAGE_PACK, input_digest=digest)
         t = time.time()
-        pack = run_pack_stage(params, root, scale, input_digest=digest)
+        pack = run_pack_stage(params, root, scale, input_digest=digest,
+                              keyframe_image_set=align.get("keyframe_image_set"))
         seconds[STAGE_PACK] = time.time() - t
 
         result = DenseResult(
