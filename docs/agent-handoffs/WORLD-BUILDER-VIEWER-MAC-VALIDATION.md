@@ -18,6 +18,35 @@ What changed, and what each check proves:
 | Non-persistent `WKWebsiteDataStore`; navigation policy allows exactly the page URL; `WorldRenderClient` moved off `URLSession.shared` to an ephemeral session with no URL cache | `WorldRenderViewer.swift` | A1, A2, A7 |
 | `WorldRenderRepresentation.appearance` (rank above surface) and its caption; `WorldRenderRevision.appearance` decoded but never acted on | `WorldRenderViewer.swift` | A2, A6 |
 
+### Review-1 fixes (branch `world-builder/reconstruction-fixit-review1`)
+
+An adversarial code review of the fix-it branch
+(`Glasses-scratch\wb-final-recon\fixit\review-code\REVIEW.md`) changed the
+appearance lifecycle on all three sides. Validate the review-1 SHA named in its
+handoff; where the checks below and this list disagree, this list wins.
+
+| Change | Files | Check |
+|---|---|---|
+| **Stop no longer kills the open page.** The revision's `appearance` gains `state` (`served`/`rebuilding`/`withdrawn`/`absent`) and `epoch`; the page's `FOLLOW` unit keeps textures through `rebuilding`, drops on `withdrawn` but keeps polling, and draws a rebuild without a reload. The page revision is `S/appearance:1@<epoch>` | `appearance_viewer.html`, `appearance_pipeline.py`, `results/world_builder_appearance.py`, `results/world_builder_render.py` | A3, A6, A7 |
+| The handler answers a memory copy only within 20 s of a manifest 200 from the Tower, else revalidates the manifest first (`WorldAssetMemory`, `answer(_:sessionID:)`) | `WorldAssetTransport.swift` | A1, A2, A7 |
+| The follower replaces an appearance page whose imagery was withdrawn once it is served again, even under an unchanged page revision; `appearanceState` decoded | `WorldRenderViewer.swift` | A2, A7 |
+| The page may reload itself (main-frame `.reload` of exactly the page URL) when WebKit never restores a lost context: asks after 3 s, reloads after 10 s | `WorldRenderViewer.swift` (`WorldRenderNavigationPolicy.allows(…isReload:)`), `appearance_viewer.html` | A2, A5.8 |
+| A restored context refetches the manifest; a chunk 404 refetches the manifest and retries once; the Tower serves the previous manifest's files for 120 s | `appearance_viewer.html`, `appearance_pipeline.py` | A5.8, A6 |
+
+Swift compile risks added by these, most likely first:
+- `WorldAssetSchemeHandler.webView(_:start:)`: the `Task { [weak self] in guard let self … await self.answer(…) }` now holds `self` across the await and still captures `urlSchemeTask`.
+- `WorldAssetMemory` (`nonisolated struct … : Sendable`) calls `WorldAssetSchemeHandler.revisionServesAppearance`, a `nonisolated static` on a main-actor class; its nested `enum Decision: Equatable, Sendable` carries a `WorldAssetResponse`.
+- `var clock: () -> Date = { Date() }` on the handler, and the tests' `handler(clock:)` helper, whose two closures share a captured `var now`.
+- `WorldRenderViewerModel.appearanceReturned(after:latest:)` is `nonisolated static` returning `Bool?`; `refresh(to:evenIfUnchanged:)` gained a defaulted parameter.
+
+Test counts after review 1: `WorldAssetTransportTests` **13** (8 + two `WorldAssetMemory` rule tests + three handler tests against the stubbed Tower), `WorldRenderRevisionTests` **34** (31 + `testTheStopGapNeverReloadsThePage`, `testAWithdrawnAppearanceThatComesBackReplacesThePage`, `testWhichRevisionsBringAWithdrawnAppearanceBack`), `WorldRenderViewerTests` **21** (+ `testThePageMayReloadItselfAndGoNowhereElse`). The two follower tests are timing-sensitive like `testAnAppearanceOnlyChangeNeverReloadsThePage`; name them if they flake.
+
+Changed expectations below:
+- **A3.** The revision JSON is `{"…", "revision": "S/appearance:1@<epoch>", …, "appearance": {"revision": "S/appearance:<build id>", "current": true, "state": "served", "epoch": "<epoch>"}}`, and `wb-revision` in the page equals it.
+- **A5.8 (context loss).** Also record whether `webglcontextrestored` fired or the page reloaded itself (`__wbAppearance.reloadRequested` is set just before a reload; after one, `contextLosses` is back to 0 and the camera is at the opening pose). Either must end on the picture, never on *Restoring…* for more than ~10 s.
+- **A6 (Stop).** After Stop, before the final appearance publishes: the page keeps its picture and its caption adds *finishing the world: these are the walk's images until the final ones arrive*; `curl …/render/revision` shows `"state": "rebuilding"`. When the final build publishes, `__wbAppearance.appends` increments, there is **no** document reload, and the camera stays. Record the time from the final `[appearance] … built` log line to the append.
+- **A7 (relabel).** The page shows *These images are no longer served for this world… This view will show them again if they are rebuilt.* (not "Close and reopen"). Then, **before restoring the label**, background the app for 2 minutes and return: the picture must NOT come back (the handler's memory copy is not answered without a manifest 200; the Tower log shows the manifest request answered 404). Restore the label and run `world_appearance.py --force` on the copy: within one poll (up to 120 s after the drop) the picture returns — in place, or by the app replacing the page — without closing the viewer.
+
 ### A1. Build
 
 As §1 below, then:

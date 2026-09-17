@@ -2747,6 +2747,25 @@ final class WorldRenderViewerTests: XCTestCase {
         XCTAssertFalse(WorldRenderNavigationPolicy.allows(page, isInitialLoad: true, pageURL: nil))
     }
 
+    /// The appearance page reloads itself when WebKit never restores a lost
+    /// WebGL context (review 1, m8). A reload of exactly the page URL is
+    /// allowed after the initial load; a reload anywhere else is not.
+    func testThePageMayReloadItselfAndGoNowhereElse() {
+        let page = WorldAssetScheme.pageURL(worldID: "w1")
+        func reload(_ string: String?) -> Bool {
+            WorldRenderNavigationPolicy.allows(
+                string.flatMap { URL(string: $0) }, isInitialLoad: false, pageURL: page, isReload: true)
+        }
+        XCTAssertTrue(reload("glasses-world://tower/worlds/w1/render"))
+        XCTAssertFalse(reload("glasses-world://tower/worlds/w2/render"))
+        XCTAssertFalse(reload("glasses-world://tower/worlds/w1/render?transport=tower"))
+        XCTAssertFalse(reload("about:blank"))
+        XCTAssertFalse(reload(nil))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(
+            page, isInitialLoad: false, pageURL: page, isReload: false),
+            "a navigation that is not a reload is still refused")
+    }
+
     // MARK: Where the picture button gets its target
 
     /// Opening a stored world names it for the viewer at once — the person
@@ -4617,6 +4636,11 @@ final class WorldRenderRevisionTests: XCTestCase {
         let withdrawn = try WorldRenderClient.decodeRevision(
             Data(#"{"revision": "s1/surface:2", "appearance": {"revision": null, "current": false}}"#.utf8))
         XCTAssertNil(withdrawn.appearance, "a withdrawn appearance is absent, not an empty string")
+        XCTAssertNil(withdrawn.appearanceState)
+        let gap = try WorldRenderClient.decodeRevision(
+            Data(#"{"revision": "s1/surface:2", "appearance": {"revision": null, "current": false, "state": "rebuilding", "epoch": null}}"#.utf8))
+        XCTAssertNil(gap.appearance)
+        XCTAssertEqual(gap.appearanceState, "rebuilding")
     }
 
     func testOnlyABetterRungIsAnUpgrade() {
@@ -4760,6 +4784,83 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
                        "an appearance build fetched a page; the page follows those itself")
         XCTAssertFalse(model.newerPictureAvailable, "an appearance build is not offered as a newer picture")
+    }
+
+    private func appearanceBody(rung: String, page: String, build: String?, state: String,
+                                live: Bool = true) -> String {
+        let revision = build.map { "\"s1/appearance:\($0)\"" } ?? "null"
+        return "{\"session_id\": \"s1\", \"representation\": \"\(rung)\", \"revision\": \"\(page)\", "
+            + "\"live\": \(live), \"appearance\": {\"revision\": \(revision), \"current\": true, "
+            + "\"state\": \"\(state)\"}}"
+    }
+
+    /// Review 1, B1: the ordinary Stop. The label turns from `none` to the real
+    /// one, the Tower answers `rebuilding` (worse rung, no appearance served)
+    /// until the final build lands, then the appearance again under the SAME
+    /// page revision. The page keeps its textures and picks the final build up
+    /// itself; the app must not reload it.
+    func testTheStopGapNeverReloadsThePage() async {
+        let shown = page("appearance", "s1/appearance:1@e1")
+        let model = await readyModel(page: shown, revision: appearanceBody(
+            rung: "appearance", page: "s1/appearance:1@e1", build: "b1", state: "served"))
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "surface", page: "s1/surface:9", build: nil, state: "rebuilding", live: false)))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 5 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "appearance", page: "s1/appearance:1@e1", build: "b2", state: "served", live: false)))
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 8 }
+        await stop(follow)
+        XCTAssertTrue(polled)
+        XCTAssertEqual(model.state, .ready(html: shown))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
+                       "the final build is picked up by the page, not by a reload")
+    }
+
+    /// Review 1, B1: a withdrawal (relabel, purge) makes the page drop its
+    /// textures. When a served appearance comes back the app replaces the page
+    /// by itself -- even when the page revision did not change, which is what a
+    /// Tower without epochs answers and why the dead page used to stay dead.
+    func testAWithdrawnAppearanceThatComesBackReplacesThePage() async {
+        let shown = page("appearance", "s1/appearance:1")
+        let model = await readyModel(page: shown, revision: appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b1", state: "served"))
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "surface", page: "s1/surface:9", build: nil, state: "withdrawn")))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 4 }
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
+                       "a withdrawal alone is not a worse page to swap in")
+        let rebuilt = page("appearance", "s1/appearance:1", body: "rebuilt")
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, rebuilt))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b2", state: "served")))
+        let replaced = await waitUntil { model.state == .rendering(html: rebuilt) }
+        await stop(follow)
+        XCTAssertTrue(replaced, "the page that dropped its textures was replaced")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2)
+    }
+
+    func testWhichRevisionsBringAWithdrawnAppearanceBack() {
+        func latest(_ appearance: String?, _ state: String?, _ rung: WorldRenderRepresentation?)
+            -> WorldRenderRevision
+        {
+            WorldRenderRevision(revision: "s1/x", representation: rung, live: true,
+                                appearance: appearance, appearanceState: state)
+        }
+        typealias M = WorldRenderViewerModel
+        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest("b", "served", .appearance)), false)
+        XCTAssertNil(M.appearanceReturned(after: true, latest: latest("b", "served", .appearance)))
+        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, "rebuilding", .surface)), false,
+                       "the Stop gap is not a withdrawal")
+        XCTAssertEqual(M.appearanceReturned(after: true, latest: latest(nil, "rebuilding", .surface)), true)
+        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, "withdrawn", .surface)), true)
+        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, nil, .surface)), true,
+                       "a Tower that does not say is a withdrawal")
+        XCTAssertEqual(M.appearanceReturned(after: true, latest: latest("b", "served", .surface)), false,
+                       "served but not the rung this app is given: nothing to reload into")
     }
 
     func testAnUnchangedRevisionFetchesNoPage() async {
@@ -5276,6 +5377,140 @@ final class WorldAssetTransportTests: XCTestCase {
             "the Tower's choice, read from the page it served")
         XCTAssertNil(WorldAssetSchemeHandler.session(
             for: WorldRenderTarget(worldID: "w1", sessionID: nil), page: "<html></html>"))
+    }
+
+    // MARK: The memory copy (review 1, M5)
+
+    private static let chunkPath = "/tower/worlds/w1/appearance/s1/chunk/0123456789abcdef0123456789abcdef"
+    private static let manifestPath = "/tower/worlds/w1/appearance/s1/manifest"
+    private static let revisionPath = "/tower/worlds/w1/render/revision"
+
+    private func response(_ status: Int, _ body: String = "x") -> WorldAssetResponse {
+        WorldAssetResponse(status: status, mimeType: "application/octet-stream", data: Data(body.utf8))
+    }
+
+    func testAMemoryCopyIsAnsweredOnlyUnderAFreshManifestAuthorisation() {
+        let chunk = WorldAssetRequest.appearanceChunk(digest: Self.digest)
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        var memory = WorldAssetMemory()
+        XCTAssertEqual(memory.decision(for: chunk, now: t0), .fetch, "nothing kept yet")
+        memory.record(chunk, response(200, "bundle"), now: t0)
+        XCTAssertEqual(memory.decision(for: chunk, now: t0), .revalidate,
+                       "a copy with no manifest behind it is not answered from memory")
+        memory.record(.appearanceManifest, response(200, "{}"), now: t0)
+        XCTAssertEqual(memory.decision(for: chunk, now: t0.addingTimeInterval(1)), .serve(response(200, "bundle")))
+        XCTAssertEqual(memory.decision(
+            for: chunk, now: t0.addingTimeInterval(WorldAssetMemory.authorizationWindow + 1)), .revalidate,
+            "a later load asks the Tower again")
+        XCTAssertEqual(memory.decision(for: .appearanceManifest, now: t0), .fetch)
+        XCTAssertEqual(memory.decision(for: .renderRevision, now: t0), .fetch)
+        memory.record(.appearanceChunk(digest: "ffffffffffffffffffffffffffffffff"), response(404), now: t0)
+        XCTAssertEqual(memory.entries.count, 1, "only a 200 is kept")
+    }
+
+    func testAnyAnswerThatWithdrawsTheAppearanceDropsTheCopyAndItsAuthorisation() {
+        let chunk = WorldAssetRequest.appearanceChunk(digest: Self.digest)
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        func primed() -> WorldAssetMemory {
+            var memory = WorldAssetMemory()
+            memory.record(.appearanceManifest, response(200, "{}"), now: t0)
+            memory.record(chunk, response(200, "bundle"), now: t0)
+            return memory
+        }
+        var byManifest = primed()
+        byManifest.record(.appearanceManifest, response(404, #"{"detail": "stale"}"#), now: t0)
+        var byRevision = primed()
+        byRevision.record(.renderRevision, response(200,
+            #"{"revision": "s1/surface:1", "appearance": {"revision": null, "state": "rebuilding"}}"#), now: t0)
+        var byRevisionError = primed()
+        byRevisionError.record(.renderRevision, response(404), now: t0)
+        for memory in [byManifest, byRevision, byRevisionError] {
+            XCTAssertTrue(memory.entries.isEmpty)
+            XCTAssertEqual(memory.bytes, 0)
+            XCTAssertNil(memory.authorizedAt)
+            XCTAssertEqual(memory.decision(for: chunk, now: t0), .fetch)
+        }
+        var stillServed = primed()
+        stillServed.record(.renderRevision, response(200,
+            #"{"revision": "s1/appearance:1", "appearance": {"revision": "s1/appearance:b", "state": "served"}}"#),
+            now: t0)
+        XCTAssertEqual(stillServed.entries.count, 1)
+    }
+
+    private func handler(clock: Date) -> (WorldAssetSchemeHandler, () -> Void) {
+        let assets = WorldAssetSchemeHandler(
+            worldID: "w1",
+            client: WorldAssetClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()))
+        assets.sessionID = "s1"
+        var now = clock
+        assets.clock = { now }
+        return (assets, { now = now.addingTimeInterval(WorldAssetMemory.authorizationWindow + 5) })
+    }
+
+    /// The handler itself, not the predicate: a cache hit outside the window
+    /// asks the Tower for the manifest before it answers from memory.
+    func testTheHandlerRevalidatesAStaleCopyWithTheTowerBeforeAnsweringFromIt() async throws {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, "{}"),
+            Self.chunkPath: (200, "bundle"),
+        ])
+        let (assets, later) = handler(clock: Date(timeIntervalSince1970: 1_000))
+        let chunk = WorldAssetRequest.appearanceChunk(digest: Self.digest)
+        _ = try await assets.answer(.appearanceManifest, sessionID: "s1")
+        let first = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertEqual(first.data, Data("bundle".utf8))
+        _ = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.chunkPath), 1,
+                       "inside the window the copy is answered from memory")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 1)
+
+        later()
+        let again = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertEqual(again.data, Data("bundle".utf8))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 2,
+                       "outside it the Tower's label check ran again first")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.chunkPath), 1)
+    }
+
+    /// A relabel or purge between two loads: the revalidation 404s, the copy is
+    /// dropped, and the bundle request goes to the Tower, which refuses it.
+    func testTheHandlerNeverAnswersWithdrawnImageryFromMemory() async throws {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, "{}"),
+            Self.chunkPath: (200, "bundle"),
+        ])
+        let (assets, later) = handler(clock: Date(timeIntervalSince1970: 1_000))
+        let chunk = WorldAssetRequest.appearanceChunk(digest: Self.digest)
+        _ = try await assets.answer(.appearanceManifest, sessionID: "s1")
+        _ = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertGreaterThan(assets.cacheBytes, 0)
+
+        let stale = #"{"detail": "appearance is stale against the session's redaction record"}"#
+        StubbedGeometryProtocol.set(route: Self.manifestPath, to: (404, stale))
+        StubbedGeometryProtocol.set(route: Self.chunkPath, to: (404, stale))
+        later()
+        let refused = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertEqual(refused.status, 404, "the withdrawn bundle was not answered from memory")
+        XCTAssertEqual(assets.cacheBytes, 0)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.chunkPath), 2)
+    }
+
+    /// Inside the window too: a revision poll that no longer serves the
+    /// appearance drops the copy at once.
+    func testAWithdrawingRevisionPollEndsTheCopyInsideTheWindow() async throws {
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, "{}"),
+            Self.chunkPath: (200, "bundle"),
+            Self.revisionPath: (200, #"{"revision": "s1/surface:1", "appearance": {"revision": null, "state": "withdrawn"}}"#),
+        ])
+        let (assets, _) = handler(clock: Date(timeIntervalSince1970: 1_000))
+        let chunk = WorldAssetRequest.appearanceChunk(digest: Self.digest)
+        _ = try await assets.answer(.appearanceManifest, sessionID: "s1")
+        _ = try await assets.answer(chunk, sessionID: "s1")
+        _ = try await assets.answer(.renderRevision, sessionID: "s1")
+        XCTAssertEqual(assets.cacheBytes, 0)
+        _ = try await assets.answer(chunk, sessionID: "s1")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.chunkPath), 2)
     }
 
     func testAWithdrawnAppearanceIsRecognisedSoTheMemoryCopyIsDropped() {

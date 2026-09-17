@@ -145,8 +145,13 @@ class World:
     def write_align(self):
         from tower.world_builder.dense_pipeline import FILL_RULE
 
+        # The trust decision the depth stage records (review 1, M3): the stored
+        # bytes under a trusted label, a re-redaction by the current rule else.
+        label = self.store.keyframe_image_set(WORLD, SESSION).redaction
+        trust = A.pixel_trust_token(label, None if A.label_is_trusted(label) else TRUSTED)
         (self.dense / "align.json").write_text(json.dumps({
             "kind": "depth", "backend": "moge2-vitl", "fill_rule": FILL_RULE,
+            "redaction": label, "redaction_trust": trust,
             "input_digest": "digest-1", "cache_key": "digest-1|moge2-vitl|fill2",
             "camera": {"fx": FX, "fy": FX, "cx": SW / 2, "cy": SH / 2, "width": W, "height": H},
             "records": self.records}))
@@ -290,12 +295,22 @@ class TestABuild:
             assert A.ENC_WEBP in k["chunks"]
             if k["tier"] == A.TIER_PHONE:
                 assert A.ENC_ASTC in k["chunks"] and isinstance(k["rank"], int)
-        # the proxy is the surface's phone level, byte for byte
+        # the proxy is the surface's phone level, byte for byte -- except its
+        # vertex colours, which are zero: they are the depth stage's pixels,
+        # the page never draws them, and the route must not carry them
+        # (review 1, M2)
+        from tower.world_builder.surface import read_mesh_bytes
         from tower.world_builder.surface_pipeline import read_surface_level
 
         proxy = AP.read_appearance_file(world.store, WORLD, SESSION, "proxy",
                                         man["proxy"]["digest"], man)
-        assert proxy == read_surface_level(world.store, WORLD, SESSION, 0)
+        surface = read_surface_level(world.store, WORLD, SESSION, 0)
+        assert len(proxy) == len(surface)
+        pV, pF, pC, _pN = read_mesh_bytes(proxy)
+        sV, sF, sC, _sN = read_mesh_bytes(surface)
+        assert np.array_equal(pV, sV) and np.array_equal(pF, sF)
+        assert sC.any() and not pC.any()
+        assert proxy == AP.proxy_without_colours(surface)
         assert man["proxy"]["source"]["surface_built_at"] == world.surface_built_at
         # every chunk reads, holds whole slots, and its name is its content
         for c in man["chunks"]:
@@ -547,14 +562,149 @@ def test_a_purged_world_is_neither_built_nor_served(world):
     assert world.build(force=True, redactor_factory=_never_redact).state == AP.STATE_UNAVAILABLE
 
 
-def test_the_dense_stage_label_rule_is_the_gap_this_stage_closes():
-    """14, as far as this lane goes: the appearance allowlist refuses what the
-    dense stage's `label != "none"` would trust. (The dense stage itself is
-    another lane's to change; this pins the difference.)"""
-    for label in ("redacted", "faces-detected-and-filled/yunet-2023mar@0.30+plausibility2",
-                  "faces-detected-and-filled/yunet-2023mar@0.30+plausibility9"):
-        assert bool(label) and label != "none"
-        assert not A.label_is_trusted(label)
+class _StubDepth:
+    """A depth network that answers without a model."""
+
+    name = "appearance-test-stub"
+    licence = "test"
+    windowed = False
+    window_size = 0
+    kind = "depth"
+
+    def predict(self, rgb):
+        return np.full(rgb.shape[:2], 2.0, np.float32)
+
+
+@pytest.fixture
+def depth_stub(monkeypatch):
+    """The depth stage runnable on the synthetic world: a stub network, and the
+    fake redactor wherever the stage constructs `FaceRedactor`."""
+    from tower.world_builder import redaction as R
+    from tower.world_builder.dense import register_backend
+
+    register_backend(_StubDepth.name, _StubDepth)
+    monkeypatch.setattr(R, "FaceRedactor", _FakeRedactor)
+    _FakeRedactor.calls = 0
+    return _StubDepth.name
+
+
+UNGATED = "faces-detected-and-filled/yunet-2023mar@0.30"
+UNTRUSTED_LABELS = ("faces-detected-and-filled/yunet-2023mar@0.30+plausibility2",
+                    "faces-detected-and-filled/yunet-2023mar@0.50", "redacted", "none")
+
+
+@pytest.mark.parametrize("label", UNTRUSTED_LABELS + (UNGATED, TRUSTED))
+def test_the_depth_stage_trusts_exactly_the_labels_the_appearance_stage_trusts(
+        tmp_path, depth_stub, label):
+    """14 (review 1, M2): the depth stage ran `label != "none"` and read the
+    stored bytes of `+plausibility2`, `@0.50` or any string with no redactor
+    call, while the appearance stage re-redacted the same session. Now both go
+    through `appearance.label_is_trusted`, and the stage records the decision."""
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import run_depth_stage
+
+    w = World(tmp_path, label=label)
+    trusted = A.label_is_trusted(label)
+    payload = run_depth_stage(w.store, WORLD, SESSION, w.solution, w.intrinsics,
+                              DenseParams(backend=depth_stub), w.dense)
+    origins = {k: v for k, v in payload["image_origins"].items()}
+    if trusted:
+        assert origins == {"world-keyframe": N_FRAMES}
+        assert _FakeRedactor.calls == 0
+    else:
+        assert origins == {"world-keyframe-redacted-here": N_FRAMES}
+        assert _FakeRedactor.calls >= N_FRAMES
+    assert payload["redaction_trust"] == A.pixel_trust_token(label, None if trusted else TRUSTED)
+    stored = {kid: hashlib.sha1((w.images / f"{kid.rsplit(':', 1)[-1]}.jpg").read_bytes()).hexdigest()
+              for kid in w.kids}
+    for record in payload["records"]:
+        assert (record["image_sha1"] == stored[w.kids[record["ki"]]]) is trusted
+
+
+@pytest.mark.parametrize("label", UNTRUSTED_LABELS[:3])
+def test_the_dense_read_refuses_a_callers_trust_the_allowlist_does_not_give(tmp_path, label):
+    """The same rule inside `keyframe_image_bytes` itself (review 1, repro r4):
+    a caller that still says "redacted" for a label off the allowlist gets the
+    bytes redacted again, never the stored bytes as `world-keyframe`."""
+    from tower.world_builder.dense_pipeline import keyframe_image_bytes
+
+    w = World(tmp_path, label=label)
+    image_set = w.store.keyframe_image_set(WORLD, SESSION)
+    stored = (w.images / f"{w.kids[0].rsplit(':', 1)[-1]}.jpg").read_bytes()
+    _FakeRedactor.calls = 0
+    data, origin, _fill = keyframe_image_bytes(
+        w.store, WORLD, SESSION, w.kids[0], None, _FakeRedactor(),
+        keyframes_are_redacted=True, image_set=image_set)
+    assert origin == "world-keyframe-redacted-here" and _FakeRedactor.calls == 1
+    assert data != stored
+    trusted = World(tmp_path / "t", label=TRUSTED)
+    data, origin, _fill = keyframe_image_bytes(
+        trusted.store, WORLD, SESSION, trusted.kids[0], None, _UnavailableRedactor(),
+        keyframes_are_redacted=True, image_set=trusted.store.keyframe_image_set(WORLD, SESSION))
+    assert origin == "world-keyframe"
+
+
+def test_a_walk_time_depth_stage_is_not_reused_after_stop(tmp_path, depth_stub):
+    """Review 1, M3 (repro r2, first half). During a walk the label is `none`,
+    the depth stage re-redacts, and `align.json` records the RE-REDACTED bytes'
+    SHA-1. After Stop the label is trusted and the solve digest is often the
+    same; the depth cache used to be reused, so the trusted final appearance
+    found no record matching the stored bytes and refused every frame the
+    re-redaction had changed. The trust decision is now part of the cache."""
+    from tower.world_builder import surface_pipeline as SP
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import depth_trust_now
+
+    w = World(tmp_path, label="none")
+    (w.dense / "align.json").unlink()
+    dparams = DenseParams(backend=depth_stub)
+    walk, work = SP.ensure_depth_stage(w.store, WORLD, SESSION, w.solution, w.intrinsics,
+                                       gate_rel=dparams.gate_rel, backend=depth_stub)
+    assert walk["redaction_trust"] == f"rerun:none&{TRUSTED}"
+    # This synthetic solve has no sparse points, so no fit succeeds; mark them
+    # good and put their maps on disk, so the trust decision is the only thing
+    # between this cache and reuse.
+    for r in walk["records"]:
+        r["ok"] = True
+        np.save(work / "depth" / f"{r['ki']:05d}.npy", np.ones((H, W), np.float32))
+    (w.dense / "align.json").write_text(json.dumps(walk))
+    walk_trust = depth_trust_now(w.store, WORLD, SESSION)
+    assert SP._depth_cache_usable(walk, w.dense, w.solution, dparams, trust=walk_trust)
+
+    w.set_label(TRUSTED)                                   # Stop writes the real label
+    final_trust = depth_trust_now(w.store, WORLD, SESSION)
+    assert final_trust == f"trusted:{TRUSTED}"
+    assert not SP._depth_cache_usable(walk, w.dense, w.solution, dparams, trust=final_trust)
+    final, _work = SP.ensure_depth_stage(w.store, WORLD, SESSION, w.solution, w.intrinsics,
+                                         gate_rel=dparams.gate_rel, backend=depth_stub)
+    assert final["redaction_trust"] == final_trust
+    assert final["cache_key"].endswith(f"|trust:{final_trust}")
+    stored = {i: hashlib.sha1((w.images / f"{kid.rsplit(':', 1)[-1]}.jpg").read_bytes()).hexdigest()
+              for i, kid in enumerate(w.kids)}
+    assert {r["ki"]: r["image_sha1"] for r in final["records"]} == stored
+    # And the reverse (a relabel to an untrusted label) is not reused either.
+    w.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility2")
+    assert not SP._depth_cache_usable(final, w.dense, w.solution, dparams,
+                                      trust=depth_trust_now(w.store, WORLD, SESSION))
+
+
+def test_a_depth_cache_from_before_the_trust_token_is_kept_only_if_still_trusted():
+    """No canonical world refits for the new key alone: a record that used the
+    stored bytes of a label still on the allowlist reads as that trust; one
+    that trusted `+plausibility2` (the old rule) does not."""
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.dense_pipeline import _depth_cache_key, depth_cache_matches, recorded_trust
+
+    p = DenseParams()
+    old = {"cache_key": _depth_cache_key("d", p), "redaction": UNGATED,
+           "keyframes_were_redacted_at_capture": True}
+    assert recorded_trust(old) == f"trusted:{UNGATED}"
+    assert depth_cache_matches(old, "d", p, None, f"trusted:{UNGATED}")
+    weak = {**old, "redaction": UNTRUSTED_LABELS[0]}
+    assert recorded_trust(weak) is None
+    assert not depth_cache_matches(weak, "d", p, None, f"trusted:{UNGATED}")
+    rerun = {**old, "redaction": "none", "keyframes_were_redacted_at_capture": False}
+    assert recorded_trust(rerun) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1249,237 @@ class TestTheRoutes:
 
 
 # ---------------------------------------------------------------------------
+# review 1, B1: the label transition at Stop, epochs, and what a page is told
+# ---------------------------------------------------------------------------
+
+
+def _revision(client):
+    return client.get(f"/worlds/{WORLD}/render/revision",
+                      params={"session_id": SESSION, "viewer": "appearance-1"}).json()
+
+
+def _records_carry(world, redactor=None):
+    """What the depth stage records: the SHA-1 of the bytes it read -- the
+    re-redacted ones under an untrusted label, the stored ones under a trusted."""
+    for i, kid in enumerate(world.kids):
+        data = (world.images / f"{kid.rsplit(':', 1)[-1]}.jpg").read_bytes()
+        if redactor is not None:
+            data = redactor.redact(data).image_bytes
+        world.records[i]["image_sha1"] = hashlib.sha1(data).hexdigest()
+    world.write_align()
+
+
+class TestTheStopTransition:
+    """Every ordinary Stop turned the label from `none` to the real one; the
+    revision answered `appearance: null` with nothing else, the open page dropped
+    its textures for good, and the final build came back under the constant page
+    revision the dead page was stamped with, so nothing ever replaced it."""
+
+    def _walk(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        w = World(tmp_path, label="none")
+        _records_carry(w, _FakeRedactor())
+        live = w.build(params=A.AppearanceParams.live(selection_samples=3000,
+                                                       transient_detector="off"),
+                       redactor_factory=_FakeRedactor)
+        assert live.state == AP.STATE_OK, live.detail
+        return w, TestClient(_app(w.root))
+
+    def test_stop_reports_rebuilding_and_the_final_build_keeps_the_epoch(self, tmp_path):
+        w, client = self._walk(tmp_path)
+        walking = _revision(client)
+        assert walking["representation"] == "appearance"
+        assert walking["appearance"]["state"] == AP.SERVED
+        epoch = walking["appearance"]["epoch"]
+        assert epoch == w.manifest()["epoch"] == w.manifest()["build_id"]
+
+        w.set_label(TRUSTED)                                   # Stop
+        gap = _revision(client)
+        assert gap["appearance"]["revision"] is None
+        assert gap["appearance"]["state"] == AP.REBUILDING, "not a withdrawal: keep drawing"
+        assert gap["representation"] == "surface"
+        # still not SERVED to anyone during the gap: the label check stands
+        r = client.get(f"/worlds/{WORLD}/appearance/{SESSION}/manifest")
+        assert r.status_code == 404 and r.json()["detail"] == AP.STALE_LABEL_DETAIL
+
+        _records_carry(w)                                      # the final depth stage
+        final = w.build(params=A.AppearanceParams(selection_samples=4000,
+                                                  transient_detector="off"),
+                        redactor_factory=_never_redact)
+        assert final.state == AP.STATE_OK, final.detail
+        done = _revision(client)
+        assert done["appearance"]["state"] == AP.SERVED
+        assert done["appearance"]["revision"] != walking["appearance"]["revision"]
+        assert done["appearance"]["epoch"] == epoch, "the final build replaces the walk's in place"
+        assert done["revision"] == walking["revision"], "so the page is not reloaded"
+        assert w.manifest()["appearance_provenance"]["label_trusted"] is True
+
+    def test_a_relabel_withdraws_and_its_rebuild_moves_the_page_revision(self, world):
+        from fastapi.testclient import TestClient
+
+        world.build(redactor_factory=_never_redact)
+        client = TestClient(_app(world.root))
+        before = _revision(client)
+        assert before["appearance"]["state"] == AP.SERVED
+        world.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility1")
+        gap = _revision(client)
+        assert gap["appearance"] == {"revision": None, "current": False,
+                                     "state": AP.WITHDRAWN, "epoch": None}
+        world.build(redactor_factory=_never_redact)
+        after = _revision(client)
+        assert after["representation"] == "appearance"
+        assert after["appearance"]["epoch"] != before["appearance"]["epoch"]
+        assert after["revision"] != before["revision"], (
+            "a page that dropped its textures must see a new page revision when they return")
+
+    def test_a_label_change_and_rebuild_inside_one_poll_still_changes_the_epoch(self, world):
+        """m7: the page never sees the gap, so the epoch is what tells it to drop
+        the old textures before drawing the new build."""
+        world.build(redactor_factory=_never_redact)
+        first = world.manifest()["epoch"]
+        world.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility2")
+        assert world.build(redactor_factory=_FakeRedactor).state == AP.STATE_OK
+        assert world.manifest()["epoch"] != first
+
+    def test_purged_and_absent_are_told_apart(self, world, tmp_path):
+        from fastapi.testclient import TestClient
+
+        empty = World(tmp_path / "empty")
+        assert _revision(TestClient(_app(empty.root)))["appearance"]["state"] == AP.ABSENT
+        world.build(redactor_factory=_never_redact)
+        record = world.store.read_world(WORLD)
+        world.store.write_world(type(record)(**{**record.__dict__, "images_purged": True}))
+        assert _revision(TestClient(_app(world.root)))["appearance"]["state"] == AP.WITHDRAWN
+
+    @pytest.mark.parametrize("previous,current,carries", [
+        # the walk's re-redacted build -> the final build under the real label
+        ({"label_trusted": False, "session_redaction": None, "redactor_applied_here": TRUSTED,
+          "keyframe_image_set": None},
+         {"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None}, True),
+        # a re-redaction by a redactor that is not itself trusted
+        ({"label_trusted": False, "session_redaction": None, "redactor_applied_here": "x",
+          "keyframe_image_set": None},
+         {"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None}, False),
+        # stored bytes under one trusted label -> another label
+        ({"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None},
+         {"label_trusted": True, "session_redaction": UNGATED, "keyframe_image_set": None}, False),
+        ({"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None},
+         {"label_trusted": False, "session_redaction": "none", "keyframe_image_set": None}, False),
+        # the same label and set
+        ({"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None},
+         {"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None}, True),
+        # a re-redaction switch or revert changes the pixels
+        ({"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": "images.redacted-p3@1"},
+         {"label_trusted": True, "session_redaction": TRUSTED, "keyframe_image_set": None}, False),
+        (None, {"label_trusted": True, "session_redaction": TRUSTED}, False),
+    ])
+    def test_which_label_changes_carry_textures_over(self, previous, current, carries):
+        assert AP.textures_carry_over(previous, current) is carries
+
+
+class TestAPageLoadingTheLastBuild:
+    """Review 1, M4 (repro r5): the chunks a page is loading 404ed the moment the
+    next build published, because the route served only the current manifest's
+    digests although the files were kept for the prune grace."""
+
+    def _two_builds(self, world):
+        from fastapi.testclient import TestClient
+
+        p = A.AppearanceParams(selection_samples=4000, transient_detector="off")
+        assert world.build(params=p, redactor_factory=_never_redact).state == AP.STATE_OK
+        old = world.manifest()
+        img = world.render(3)
+        img[10:30, 10:30] = (200, 40, 40)
+        world.set_image(3, img)
+        world.write_align()
+        assert world.build(params=p, redactor_factory=_never_redact).state == AP.STATE_OK
+        new = world.manifest()
+        gone = [c["digest"] for c in old["chunks"]
+                if c["digest"] not in {n["digest"] for n in new["chunks"]}]
+        assert gone, "the rebuild replaced some chunks"
+        return TestClient(_app(world.root)), gone
+
+    def test_a_superseded_chunk_is_served_through_the_grace(self, world):
+        client, gone = self._two_builds(world)
+        for digest in gone:
+            r = client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{digest}")
+            assert r.status_code == 200, r.text
+            _assert_private(r)
+            assert AP.content_digest(r.content) == digest
+
+    def test_not_after_the_grace(self, world):
+        client, gone = self._two_builds(world)
+        root = AP.appearance_dir(world.store, WORLD, SESSION)
+        doc = json.loads((root / AP.SUPERSEDED_NAME).read_text())
+        for entry in doc["entries"]:
+            entry["at"] -= AP.PRUNE_GRACE_S + 1
+        (root / AP.SUPERSEDED_NAME).write_text(json.dumps(doc))
+        for digest in gone:
+            r = client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{digest}")
+            assert r.status_code == 404 and r.json()["detail"] == "no such appearance file"
+
+    def test_not_under_another_label_and_not_when_the_label_is_stale(self, world):
+        client, gone = self._two_builds(world)
+        root = AP.appearance_dir(world.store, WORLD, SESSION)
+        doc = json.loads((root / AP.SUPERSEDED_NAME).read_text())
+        for entry in doc["entries"]:
+            entry["session_redaction"] = None               # built under `none`
+        (root / AP.SUPERSEDED_NAME).write_text(json.dumps(doc))
+        assert all(client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{d}").status_code == 404
+                   for d in gone)
+        world.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility1")
+        doc2 = json.loads((root / AP.SUPERSEDED_NAME).read_text())
+        assert doc2  # still on disk; the label check comes first
+        current = world.manifest()["chunks"][0]["digest"]
+        assert client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{current}").status_code == 404
+
+
+def test_the_world_listing_reports_the_appearance_as_imagery(world):
+    """29 (review 1, m6): `GET /worlds` names the appearance artifact, its label,
+    privacy tags and retention, whether it is served, and never a path, a URL,
+    or a claim that it is anonymised or privacy-safe."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(_app(world.root))
+
+    def summary():
+        body = client.get("/worlds").json()
+        (w,) = [x for x in body["worlds"] if x["world_id"] == WORLD]
+        (s,) = w["sessions"]
+        return s["appearance"]
+
+    assert summary() is None
+    world.build(redactor_factory=_never_redact)
+    a = summary()
+    assert a["state"] == AP.SERVED and a["redaction"] == TRUSTED
+    assert a["redaction_effective"] == TRUSTED and a["label_trusted"] is True
+    assert a["keyframes"] == N_FRAMES and a["bytes"] > 0
+    assert "retention" in a and "purged" in a["retention"]
+    text = json.dumps(a).lower()
+    assert "not anonymised" in text
+    assert "anonymised" not in text.replace("not anonymised", "")
+    assert "privacy-safe" not in text and "privacy safe" not in text
+    assert "\\\\" not in text and "/appearance/" not in text.replace("appearance/<session>/", "")
+    world.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility2")
+    assert summary()["state"] == AP.WITHDRAWN
+
+
+def test_a_same_size_corrupt_file_is_rewritten_and_is_not_already_built(world):
+    """m10: `_write_once` and `_already_built` trusted the name and size."""
+    assert world.build(redactor_factory=_never_redact).state == AP.STATE_OK
+    man = world.manifest()
+    root = AP.appearance_dir(world.store, WORLD, SESSION)
+    name = next(iter(AP.named_files(man)))
+    good = (root / name).read_bytes()
+    (root / name).write_bytes(bytes(len(good)))                # same size, wrong content
+    assert AP._already_built(root, man["params_digest"], False) is None
+    AP._write_once(root / name, good)
+    assert (root / name).read_bytes() == good
+    assert AP._already_built(root, man["params_digest"], False) is not None
+
+
+# ---------------------------------------------------------------------------
 # wiring
 # ---------------------------------------------------------------------------
 
@@ -1253,10 +1634,14 @@ class TestTheFinalChain:
         report = self._run(tmp_path, calls)
         assert calls["order"] == ["surface"] and "appearance" not in report
 
-    def test_a_failed_appearance_still_prunes(self, tmp_path, calls):
-        calls["appearance_state"] = "unavailable"
-        self._run(tmp_path, calls)
-        assert calls["order"] == ["surface", "appearance", "prune"]
+    @pytest.mark.parametrize("state", ["unavailable", "failed"])
+    def test_an_appearance_that_did_not_build_keeps_the_depth_work(self, tmp_path, calls, state):
+        """Review 1, m2: an `unavailable` appearance (a live child's lock not yet
+        released, no redactor) is rebuilt later and needs the per-frame work."""
+        calls["appearance_state"] = state
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface", "appearance"]
+        assert "depth_work_pruned_bytes" not in report["surface"]
 
     def test_no_solve_no_surface(self, tmp_path, calls):
         report = self._run(tmp_path, calls, solved=False)

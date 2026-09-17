@@ -114,7 +114,8 @@ def _params_match(stored: dict, wanted: dict) -> bool:
     return all(stored[k] == wanted[k] for k in shared)
 
 
-def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None) -> str:
+def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None,
+                     trust: str | None = None) -> str:
     """Everything the DEPTH stage reads.
 
     `component` belongs here: re-running with a different one used to reuse the
@@ -132,7 +133,64 @@ def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None) 
               f"fill{FILL_RULE}"]
     if image_set:
         fields.append(f"set:{image_set}")
+    # `trust` is `appearance.pixel_trust_token`: whether the stage used the
+    # stored bytes or redacted them again, and under which labels. A walk's
+    # depth stage runs under `none` (re-redacted bytes, their SHA-1 in every
+    # record); the final one after Stop runs under the real label (the stored
+    # bytes). The solve digest cannot see that change, and reusing the walk's
+    # records made the trusted final appearance refuse every frame whose bytes
+    # the re-redaction had changed (review 1, M3).
+    if trust:
+        fields.append(f"trust:{trust}")
     return "|".join(str(x) for x in fields)
+
+
+def recorded_trust(align: dict | None) -> str | None:
+    """The `pixel_trust_token` an `align.json` was produced under, or None
+    when it cannot be established. A record from before the token existed is
+    read from what it did record: it used the stored bytes exactly when it
+    said so, and that is still the trusted token only if its label is on
+    today's allowlist (an old `+plausibility2` stage trusted a label that is
+    no longer trusted, so it is not reused)."""
+    from tower.world_builder.appearance import label_is_trusted, pixel_trust_token  # noqa: PLC0415
+
+    if not isinstance(align, dict):
+        return None
+    token = align.get("redaction_trust")
+    if isinstance(token, str) and token:
+        return token
+    label = align.get("redaction")
+    if align.get("keyframes_were_redacted_at_capture") is True and label_is_trusted(label):
+        return pixel_trust_token(label)
+    return None
+
+
+def depth_trust_now(store, world_id: str, session_id: str, redactor=None) -> str:
+    """The token a depth stage run NOW would record: the keyframe set's label
+    through the one allowlist, and the current redactor's label when that
+    label is not trusted. `FaceRedactor()` is cheap (its model loads lazily)."""
+    from tower.world_builder.appearance import label_is_trusted, pixel_trust_token  # noqa: PLC0415
+
+    label = store.keyframe_image_set(world_id, session_id).redaction
+    if label_is_trusted(label):
+        return pixel_trust_token(label)
+    if redactor is None:
+        from tower.world_builder.redaction import FaceRedactor  # noqa: PLC0415
+
+        redactor = FaceRedactor()
+    return pixel_trust_token(label, getattr(redactor, "label", None)
+                             if getattr(redactor, "available", False) else None)
+
+
+def depth_cache_matches(cached: dict | None, digest, params: DenseParams,
+                        image_set: str | None, trust: str) -> bool:
+    """Whether a cached `align.json` is the depth stage of this solve, these
+    parameters, this keyframe set AND this trust decision. A key written before
+    the trust token existed matches when its recorded trust equals `trust`."""
+    if not isinstance(cached, dict) or recorded_trust(cached) != trust:
+        return False
+    return cached.get("cache_key") in (_depth_cache_key(digest, params, image_set, trust),
+                                       _depth_cache_key(digest, params, image_set))
 
 
 def _fuse_cache_key(digest, params: DenseParams, image_set: str | None = None) -> str:
@@ -420,7 +478,15 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
 
     `source_path` is a `sources.json` entry, resolved against the Tower root
     (`global_solve.resolve_source_path`), never against the process cwd.
+
+    THE LABEL IS CHECKED HERE TOO, through the appearance stage's allowlist
+    (`appearance.label_is_trusted`): stored bytes are returned as
+    `world-keyframe` only when the caller says the set is redacted AND the
+    set's own label is on the allowlist. `label != "none"` trusted any string,
+    the weak `+plausibility2` gate included, and served one session under two
+    trust decisions (review 1, M2; privacy lane L2).
     """
+    from tower.world_builder.appearance import label_is_trusted
     from tower.world_builder.global_solve import resolve_source_path
 
     seq = keyframe_id.rsplit(":", 1)[-1]
@@ -433,6 +499,7 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
             raw_bytes = None
     if image_set is None:
         image_set = store.keyframe_image_set(world_id, session_id)
+    keyframes_are_redacted = bool(keyframes_are_redacted) and label_is_trusted(image_set.redaction)
     p = image_set.directory / f"{seq}.jpg"
     if p.exists():
         try:
@@ -576,9 +643,19 @@ def run_depth_stage(
     # the images, and the label that describes them, are the re-redacted set's.
     image_set = store.keyframe_image_set(world_id, session_id)
     session_redaction = image_set.redaction
-    keyframes_are_redacted = bool(session_redaction) and session_redaction != REDACTION_NONE
+    # The one allowlist (`appearance.label_is_trusted`), not `!= "none"`: the
+    # depth stage's pixels become `undist/`, the surface's vertex colours, the
+    # dense points and the appearance proxy, and must be trusted exactly when
+    # the appearance stage trusts the same set (review 1, M2).
+    from tower.world_builder.appearance import label_is_trusted, pixel_trust_token
+
+    keyframes_are_redacted = label_is_trusted(session_redaction)
 
     redactor = FaceRedactor()
+    trust = pixel_trust_token(
+        session_redaction,
+        None if keyframes_are_redacted
+        else (getattr(redactor, "label", None) if redactor.available else None))
     if not keyframes_are_redacted:
         logger.warning(
             "[Tower][WorldBuilder][dense] session %s records redaction=%r; its "
@@ -653,7 +730,8 @@ def run_depth_stage(
             return {"stopped_after": n, "records": records, "seconds": time.time() - t0,
                     "camera": cam, "targets": len(targets), "image_origins": origins,
                     "kind": backend.kind, "fill_rule": FILL_RULE,
-                    "keyframe_image_set": image_set.cache_token}
+                    "keyframe_image_set": image_set.cache_token,
+                    "redaction_trust": trust}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
@@ -757,6 +835,7 @@ def run_depth_stage(
                "stopped_after": None,
                "fill_rule": FILL_RULE,
                "keyframe_image_set": image_set.cache_token,
+               "redaction_trust": trust,
                "image_origins": origins,
                "redaction": session_redaction,
                "keyframes_were_redacted_at_capture": keyframes_are_redacted,
@@ -1387,6 +1466,7 @@ def densify(
         align_path = root / "align.json"
         align = None
         prior = None
+        trust_now = depth_trust_now(store, world_id, session_id)
         if align_path.exists() and not force:
             try:
                 cached = json.loads(align_path.read_text())
@@ -1396,8 +1476,8 @@ def densify(
                 # would make the artifact unreproducible from its own params --
                 # the most expensive kind of wrong, because everything still
                 # runs and the numbers still look reasonable.
-                want = _depth_cache_key(digest, params, set_token)
-                if cached.get("cache_key") == want:
+                want = _depth_cache_key(digest, params, set_token, trust_now)
+                if depth_cache_matches(cached, digest, params, set_token, trust_now):
                     if cached.get("stopped_after") is None:
                         align = cached
                         logger.info("[Tower][WorldBuilder][dense] reusing depth stage")
@@ -1425,7 +1505,8 @@ def densify(
                 align["digest"] = digest
                 align["input_digest"] = digest
                 align["cache_key"] = _depth_cache_key(
-                    digest, params, align.get("keyframe_image_set"))
+                    digest, params, align.get("keyframe_image_set"),
+                    align.get("redaction_trust"))
             _write_json(align_path, align)
             seconds[STAGE_DEPTH] = time.time() - t
             if align.get("stopped_after") is not None:

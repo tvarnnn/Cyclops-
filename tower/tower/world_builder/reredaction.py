@@ -47,12 +47,15 @@ frame's fill contains what the current rule fills on that frame's raw image:
 
 - a re-redacted frame is the current rule's output by construction;
 - a frame kept because nothing was recoverable has the same fill;
-- a frame kept for any other reason (raw missing or unverified, the redactor
-  returned `none`, the invariant failed) holds the STORED rule's fill, which
-  contains the current rule's only when the stored rule is a superset of it.
-  The ungated rule is: every gate only removes boxes from the same detection
-  pass. `plausibility1` and `plausibility2` are not (each fills some large box
-  the other does not).
+- a frame kept because its raw frame is missing or unverified, or the redactor
+  returned `none`, holds the STORED rule's fill, which contains the current
+  rule's only when the stored rule is a superset of it. The ungated rule is:
+  every gate only removes boxes from the same detection pass. `plausibility1`
+  and `plausibility2` are not (each fills some large box the other does not);
+- a frame kept because a MEASUREMENT says the current rule is not contained in
+  the stored fill (`fill-outside-stored`) or the redactor's output is not the
+  raw frame plus boxes (`output-not-raw-plus-fill`) is not covered by any
+  argument, the superset one included: that measurement is the argument failing.
 
 So an apply whose kept frames are not all covered is REFUSED, whole.
 """
@@ -127,6 +130,14 @@ KEPT_FILL_OUTSIDE_STORED = "stored:fill-outside-stored"
 KEPT_OUTPUT_NOT_RAW = "stored:output-not-raw-plus-fill"
 # Kept frames whose stored fill equals the target's by measurement.
 _KEPT_AT_TARGET = {KEPT_NOTHING_RECOVERED}
+# Kept frames where a measurement CONTRADICTS the stored rule containing the
+# target's fill: the current rule filled pixels the stored keyframe leaves raw,
+# or produced an output that is not the raw frame plus boxes, so nothing can be
+# said about its fill. Keeping the stored bytes of such a frame under the
+# target's label would publish a frame the label is false for, whatever the
+# stored rule (review 1, M1): the ungated superset argument is exactly what the
+# measurement failed on. An apply with any such frame is refused whole.
+_KEPT_CONTRADICTS_TARGET = {KEPT_FILL_OUTSIDE_STORED, KEPT_OUTPUT_NOT_RAW}
 
 
 class ReredactionRefused(RuntimeError):
@@ -467,7 +478,17 @@ def plan_session(store, world_id: str, session_id: str, *, redactor=None,
 
     uncovered = [f for f in plan.frames
                  if not f.reredacted and f.origin not in _KEPT_AT_TARGET]
-    if uncovered and not REREDACTABLE_LABELS[stored]:
+    contradicted = [f for f in uncovered if f.origin in _KEPT_CONTRADICTS_TARGET]
+    if contradicted and plan.recovered_frames:
+        # THE SET'S LABEL MUST BE TRUE FOR EVERY FRAME IN IT. These frames were
+        # measured NOT to meet the target rule, so no label this step can write
+        # is honest for a set that holds them; refused, whatever `stored` is.
+        plan.refusal = (
+            f"{len(contradicted)} frame(s) would keep stored keyframes that the current rule "
+            f"was measured not to be contained in ({contradicted[0].keyframe_id} "
+            f"{contradicted[0].origin}: {contradicted[0].detail}), so a set labelled "
+            f"{TARGET_LABEL!r} could not honestly hold them")
+    elif uncovered and not REREDACTABLE_LABELS[stored]:
         plan.refusal = (
             f"{len(uncovered)} frame(s) would keep keyframes redacted under {stored!r}, "
             f"which does not fill everything {TARGET_LABEL!r} fills, so the set could not "

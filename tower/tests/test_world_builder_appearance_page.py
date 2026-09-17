@@ -68,7 +68,9 @@ class TestTheLadder:
 
         rev = build_render_revision(built.store, WORLD, SESSION, viewer=V)
         assert rev["representation"] == "appearance"
-        assert rev["revision"] == f"{SESSION}/appearance:1"
+        epoch = built.manifest()["epoch"]
+        assert rev["revision"] == f"{SESSION}/appearance:1@{epoch}"
+        assert rev["appearance"]["epoch"] == epoch and rev["appearance"]["state"] == "served"
         html = build_world_render(built.store, WORLD, SESSION, viewer=V)
         assert _meta(html, "wb-revision") == rev["revision"]
         assert _config(html)["appearance_revision"] == rev["appearance"]["revision"]
@@ -450,3 +452,164 @@ class TestTheRoute:
         rev = client.get(f"/worlds/{WORLD}/render/revision", params={"viewer": V}).json()
         assert rev["representation"] == "appearance"
         assert len(json.dumps(rev)) < 512
+
+
+# ---------------------------------------------------------------------------
+# review 1, B1 / M4 / M5 / m3 / m7 / m8: the page's follower, run under node
+# ---------------------------------------------------------------------------
+
+
+def _node():
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("no node on this host to run the page's follower")
+    return node
+
+
+def _follower_source():
+    text = _template()
+    start = text.index("/* ---------- follower: what a revision poll means")
+    return text[start:text.index("/* ---------- end follower */", start)]
+
+
+def _run_follower(script):
+    """The page's own FOLLOW unit, verbatim, then `script` (with `assert`)."""
+    import subprocess
+
+    program = ("const assert = require('assert');\n" + _follower_source()
+               + "\n" + script + "\nconsole.log('follower ok');\n")
+    r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "follower ok" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
+
+class TestTheFollower:
+
+    def test_the_stop_transition_as_the_tower_answers_it(self, tmp_path):
+        """The whole B1 sequence against the real routes: the walk's build,
+        Stop (label none -> real), the final build. The page must load, keep
+        its textures through the gap, keep polling, and pick the final build
+        up in place (same epoch) -- never drop."""
+        from fastapi.testclient import TestClient
+
+        from tests.test_world_builder_appearance import (
+            TRUSTED,
+            _FakeRedactor,
+            _records_carry,
+        )
+        from tower.world_builder import appearance as A
+
+        w = World(tmp_path, label="none")
+        _records_carry(w, _FakeRedactor())
+        assert w.build(params=A.AppearanceParams.live(selection_samples=3000,
+                                                       transient_detector="off"),
+                       redactor_factory=_FakeRedactor).state == "ok"
+        client = TestClient(_app(w.root))
+        url = f"/worlds/{WORLD}/render/revision"
+        q = {"session_id": SESSION, "viewer": V}
+        walking = client.get(url, params=q).json()
+        live_manifest = client.get(f"/worlds/{WORLD}/appearance/{SESSION}/manifest").json()
+        w.set_label(TRUSTED)
+        gap = client.get(url, params=q).json()
+        _records_carry(w)
+        assert w.build(params=A.AppearanceParams(selection_samples=4000, transient_detector="off"),
+                       redactor_factory=_never_redact).state == "ok"
+        done = client.get(url, params=q).json()
+        final_manifest = client.get(f"/worlds/{WORLD}/appearance/{SESSION}/manifest").json()
+        bodies = json.dumps({"walking": walking, "gap": gap, "done": done,
+                             "liveMan": {"epoch": live_manifest["epoch"]},
+                             "finalMan": {"epoch": final_manifest["epoch"]}})
+        _run_follower("const T = " + bodies + ";\n" + STOP_SCRIPT)
+
+    def test_withdrawn_drops_but_keeps_polling_and_a_new_epoch_replaces(self):
+        _run_follower(WITHDRAWN_SCRIPT)
+
+    def test_a_hold_is_bounded(self):
+        _run_follower(HOLD_SCRIPT)
+
+    def test_what_a_failed_poll_means(self):
+        """m3: a 404 naming a world or session that is gone drops the textures;
+        a transient 404 or a dropped request changes nothing."""
+        _run_follower(FAILED_POLL_SCRIPT)
+
+    def test_the_page_carries_the_actions_out(self):
+        """Wiring, on the page's source: the follower decides every poll, a drop
+        is not terminal, a chunk 404 refetches the manifest, a restored context
+        refetches the manifest (the Tower's label check runs again), and a
+        restore that never comes reloads the page."""
+        text = _template()
+        poll = _section(text, "async function pollOnce(", "async function follow(")
+        assert "FOLLOW.decide(" in poll and "dropAppearance(" in poll and "loadRevision(" in poll
+        follow = _section(text, "async function follow(", "S.refresh =")
+        assert "FOLLOW.nextDelay(" in follow and "dropped" not in follow
+        drop = _section(text, "function dropAppearance(", "/* -------- following")
+        assert "fail(" not in drop, "a withdrawal is not a dead end"
+        load = _section(text, "async function loadRevision(", "function clearTextures(")
+        assert "FOLLOW.mustReplace(manifest, man)" in load and "clearTextures()" in load
+        assert "e.absent && attempt === 0" in load and "continue;" in load
+        assert "fetchJSON(R.manifest" in load
+        restored = _section(text, 'canvas.addEventListener("webglcontextrestored"',
+                            "/* -------- input")
+        assert "loadRevision(" in restored
+        assert "applyManifest(man" not in restored, "the old in-page manifest is never reapplied"
+        lost = _section(text, 'canvas.addEventListener("webglcontextlost"',
+                        'canvas.addEventListener("webglcontextrestored"')
+        assert "restoreContext()" in lost and "location.reload()" in lost
+
+
+STOP_SCRIPT = r"""
+const page = {revision: null, holdingSince: null, now: 0};
+let r = FOLLOW.decide({ok: T.walking}, page);
+assert.strictEqual(r.action, "load");
+page.revision = r.revision;
+assert.strictEqual(FOLLOW.decide({ok: T.walking}, page).action, "none");
+r = FOLLOW.decide({ok: T.gap}, page);
+assert.strictEqual(r.action, "hold", "Stop must not drop the page: " + JSON.stringify(T.gap));
+assert.strictEqual(FOLLOW.nextDelay(r, 80000), FOLLOW.BASE_MS, "and it keeps asking at the base rate");
+page.holdingSince = 0; page.now = 60000;
+assert.strictEqual(FOLLOW.decide({ok: T.gap}, page).action, "hold");
+r = FOLLOW.decide({ok: T.done}, page);
+assert.strictEqual(r.action, "load");
+assert.notStrictEqual(r.revision, page.revision);
+assert.strictEqual(FOLLOW.mustReplace(T.liveMan, T.finalMan), false, "picked up in place, no blank");
+"""
+
+WITHDRAWN_SCRIPT = r"""
+const page = {revision: "s1/appearance:b1", holdingSince: null, now: 0};
+const withdrawn = {live: false, appearance: {revision: null, current: false, state: "withdrawn", epoch: null}};
+let r = FOLLOW.decide({ok: withdrawn}, page);
+assert.strictEqual(r.action, "drop");
+assert.ok(!/Close and reopen/.test(r.reason), "not a dead end");
+let delay = FOLLOW.BASE_MS;
+for (let i = 0; i < 10; i++){ delay = FOLLOW.nextDelay(r, delay); }
+assert.strictEqual(delay, FOLLOW.CEILING_MS, "slower, never silent");
+// an old Tower that says nothing but null is treated as a withdrawal
+assert.strictEqual(FOLLOW.decide({ok: {appearance: {revision: null}}}, page).action, "drop");
+assert.strictEqual(FOLLOW.decide({ok: {revision: "s1/surface:1"}}, page).action, "drop");
+// the rebuild comes back: load it, and a different epoch replaces what is shown
+const back = {live: false, appearance: {revision: "s1/appearance:b9", current: true, state: "served", epoch: "b9"}};
+assert.strictEqual(FOLLOW.decide({ok: back}, {revision: null}).action, "load");
+assert.strictEqual(FOLLOW.mustReplace({epoch: "b1"}, {epoch: "b9"}), true);
+assert.strictEqual(FOLLOW.mustReplace({epoch: "b1"}, {epoch: "b1"}), false);
+assert.strictEqual(FOLLOW.mustReplace({}, {epoch: "b1"}), true, "an unknown epoch is never the same");
+assert.strictEqual(FOLLOW.mustReplace(null, {epoch: "b1"}), false, "nothing on screen");
+"""
+
+HOLD_SCRIPT = r"""
+const gap = {appearance: {revision: null, state: "rebuilding"}};
+assert.strictEqual(FOLLOW.decide({ok: gap}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS}).action, "hold");
+const r = FOLLOW.decide({ok: gap}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS + 1});
+assert.strictEqual(r.action, "drop");
+"""
+
+FAILED_POLL_SCRIPT = r"""
+const page = {revision: "s1/appearance:b1"};
+assert.strictEqual(FOLLOW.decide({absent: "no world 'w1'"}, page).action, "drop");
+assert.strictEqual(FOLLOW.decide({absent: "world 'w1' has no session 's1'"}, page).action, "drop");
+assert.strictEqual(FOLLOW.decide({absent: "session 's1' of world 'w1' has no geometry yet"}, page).action, "none");
+assert.strictEqual(FOLLOW.decide({absent: "the render revision is not served"}, page).action, "none");
+assert.strictEqual(FOLLOW.decide({error: "timeout"}, page).action, "none");
+assert.strictEqual(FOLLOW.nextDelay({action: "none", live: true}, 80000), FOLLOW.BASE_MS);
+assert.strictEqual(FOLLOW.nextDelay({action: "none", live: null}, 10000), 20000);
+"""

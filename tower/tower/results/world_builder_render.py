@@ -36,6 +36,7 @@ from tower.results.world_builder_library import _sortable
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
+    built_from_an_inactive_keyframe_set,
     dense_artifact_drawable,
     session_has_drawable_geometry,
     surface_artifact_drawable,
@@ -277,15 +278,23 @@ def render_revision(store: WorldStore, world_id: str, session_id: str,
     reported as no surface revision, and the caller answers the next rung.
     """
     if rung == REPRESENTATION_APPEARANCE:
-        # The page PROGRAM's revision. Appearance builds are followed by the
-        # page itself and are deliberately not in it (§4a `appearance`).
-        if _appearance_revision(store, world_id, session_id).get("revision") is None:
+        # The page PROGRAM's revision, and the appearance EPOCH. Appearance
+        # builds are followed by the page itself and are deliberately not in
+        # it (§4a `appearance`) -- but a build that an open page must not
+        # overwrite in place (a relabel, a purge and rebuild, a re-redaction
+        # switch) starts a new epoch, and that does move the page revision. The
+        # page revision used to be a constant, so a page that had dropped its
+        # textures was stamped exactly like the rebuilt one and the app never
+        # replaced it (review 1, B1).
+        appearance = _appearance_revision(store, world_id, session_id)
+        if appearance.get("revision") is None:
             return None
         try:
             from tower.world_builder.appearance_render import PAGE_REVISION  # noqa: PLC0415
         except Exception:  # noqa: BLE001 -- no page module, no rung
             return None
-        return PAGE_REVISION
+        epoch = appearance.get("epoch")
+        return f"{PAGE_REVISION}@{epoch}" if epoch else PAGE_REVISION
     if rung == REPRESENTATION_SURFACE:
         from tower.world_builder.store import _read_json_past_a_replace  # noqa: PLC0415
 
@@ -472,7 +481,7 @@ def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> d
         return appearance_revision(store, world_id, session_id)
     except Exception:  # noqa: BLE001 -- the page revision must survive an appearance bug
         logger.debug("[Tower][WorldBuilder] appearance revision failed", exc_info=True)
-        return {"revision": None, "current": False}
+        return {"revision": None, "current": False, "state": "withdrawn", "epoch": None}
 
 
 def _stage_running(status_path, is_stale) -> bool:
@@ -627,7 +636,18 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         if page is not None:
             return page
 
-    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE):
+    # A surface or dense artifact whose colours came from a re-redacted keyframe
+    # set the session no longer reads (a `--revert`) is not served until it is
+    # rebuilt; the ladder steps past it, as the revision route does
+    # (`store.built_from_an_inactive_keyframe_set`, review 1 m4).
+    stale = {rung: built_from_an_inactive_keyframe_set(store, world_id, chosen, rung)
+             for rung in (REPRESENTATION_SURFACE, REPRESENTATION_DENSE)}
+    if representation in stale and stale[representation]:
+        raise WorldRenderUnavailable(
+            f"this session's {representation} was built from a re-redacted keyframe set it "
+            "no longer reads; it is served again once rebuilt")
+
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE) and not stale[REPRESENTATION_SURFACE]:
         # Same shape as the dense rung below, and for the same reason: the
         # import sits OUTSIDE the try that catches its exception, so a
         # surface module that will not import degrades to the next rung
@@ -675,7 +695,7 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     # `view=diagnostics` arrives as `auto` and starts at sparse, and gating on
     # `representation != sparse` served it the dense page whenever a dense
     # artifact existed -- while the revision route said sparse (review 3, R3).
-    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_DENSE):
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_DENSE) and not stale[REPRESENTATION_DENSE]:
         # THE IMPORT IS OUTSIDE THE try THAT CATCHES ITS EXCEPTION.
         #
         # `DenseViewerUnavailable` used to be bound by an import inside the

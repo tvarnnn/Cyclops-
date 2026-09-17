@@ -148,7 +148,10 @@ def _synthetic_world(tmp_path, *, n_frames=8, digest="digest-1", with_dense=True
                                if anchors else {})})
         (dense / "align.json").write_text(json.dumps({
             "kind": "depth", "camera": camera, "backend": DenseParams().backend,
-            "input_digest": digest, "fill_rule": FILL_RULE, "records": records}))
+            "input_digest": digest, "fill_rule": FILL_RULE, "records": records,
+            # What the depth stage records about the label it read under
+            # (review 1, M3): the stored bytes of this session's trusted label.
+            "redaction": "faces-detected-and-filled/yunet-2023mar@0.30+plausibility1", "keyframes_were_redacted_at_capture": True}))
     return store
 
 

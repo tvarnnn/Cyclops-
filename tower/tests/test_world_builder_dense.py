@@ -361,8 +361,12 @@ class _StubStore:
         # store has no re-redacted set, so it is always `images/`.
         from tower.world_builder.store import KeyframeImageSet
 
-        return KeyframeImageSet(directory=self._images, name="images", redaction=None,
-                                stored_redaction=None, digest=None)
+        # Labelled with an allowlisted rule: `keyframe_image_bytes` trusts a
+        # caller's "redacted" only for a label the appearance allowlist trusts
+        # (review 1, M2), and these tests are about a redacted set.
+        label = "faces-detected-and-filled/yunet-2023mar@0.30+plausibility3"
+        return KeyframeImageSet(directory=self._images, name="images", redaction=label,
+                                stored_redaction=label, digest=None)
 
 
 class _StubRedactor:

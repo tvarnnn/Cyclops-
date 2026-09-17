@@ -28,6 +28,7 @@ that produced it, so a stale derived tree is detected rather than trusted.
 import hashlib
 import json
 import os
+import re
 import time
 import logging
 import shutil
@@ -1296,13 +1297,52 @@ def reconstruction_drawable(store, world_id, session_id) -> bool:
 
 def surface_artifact_drawable(store, world_id, session_id) -> bool:
     """Whether this session's surface artifact would render. See
-    `reconstruction_drawable`."""
-    return _surface_drawable(store.world_dir(world_id) / "surface" / session_id)
+    `reconstruction_drawable`. Not one built from a re-redacted keyframe set
+    the session no longer reads (`built_from_an_inactive_keyframe_set`)."""
+    return (_surface_drawable(store.world_dir(world_id) / "surface" / session_id)
+            and not built_from_an_inactive_keyframe_set(store, world_id, session_id, "surface"))
 
 
 def dense_artifact_drawable(store, world_id, session_id) -> bool:
-    """Whether this session's dense point artifact would render."""
-    return _dense_drawable(store.world_dir(world_id) / "dense" / session_id)
+    """Whether this session's dense point artifact would render (and was not
+    built from a keyframe set the session no longer reads)."""
+    return (_dense_drawable(store.world_dir(world_id) / "dense" / session_id)
+            and not built_from_an_inactive_keyframe_set(store, world_id, session_id, "dense"))
+
+
+_SET_IN_PARAMS_DIGEST = re.compile(r"\|set:([^|]+)")
+
+
+def built_from_an_inactive_keyframe_set(store, world_id, session_id, kind: str) -> bool:
+    """Whether the `kind` (`surface` or `dense`) artifact's colours came from a
+    re-redacted keyframe set that is not the one the session reads now.
+
+    After `world_reredact.py --revert` the appearance route stops serving the
+    set's imagery at once (its label check names the set), but the surface and
+    dense pages -- vertex colours and point colours from the same pixels -- were
+    still served until someone rebuilt them (review 1, m4). Such an artifact is
+    reported as not drawable, so the ladder, the revision and the listing all
+    step past it until it is rebuilt from the active set.
+
+    Only that direction: an artifact built from the capture's own `images/`
+    (no set recorded) is never stale by this test, because every label a switch
+    accepts fills at least what the set does. An unreadable pointer is treated
+    as "not the same set", the safe answer.
+    """
+    man = _read_manifest_quietly(store.world_dir(world_id) / kind / session_id / "manifest.json")
+    if man is None:
+        return False
+    built = man.get("keyframe_image_set")
+    if not built and kind == "surface":
+        match = _SET_IN_PARAMS_DIGEST.search(str(man.get("params_digest") or ""))
+        built = match.group(1) if match else None
+    if not built:
+        return False
+    try:
+        active = store.keyframe_image_set(world_id, session_id).cache_token
+    except Exception:  # noqa: BLE001 -- unreadable is "not this set"
+        return True
+    return built != active
 
 
 def _read_manifest_quietly(path):

@@ -257,6 +257,26 @@ its set identity is appended to the depth and fuse cache keys, recorded as
 surface's depth-cache test. It is absent (and every older key unchanged) while
 builds read `images/`.
 
+**The label rule is the appearance stage's allowlist** (2026-09-17, review 1 M2).
+`run_depth_stage` trusts the stored keyframes only when
+`appearance.label_is_trusted(label)` — the exact allowlist of
+`WORLD-BUILDER-APPEARANCE.md` §6.2 — and `keyframe_image_bytes` applies the
+same check to its caller's flag. It was `bool(label) and label != "none"`, which
+read `+plausibility2`, `…@0.50`, `redacted` or any string as redacted, with no
+redactor call. `align.json` records the decision as `redaction_trust`
+(`trusted:<label>` or `rerun:<label>&<redactor label>`), and the depth cache key
+carries it (`|trust:<token>`), so a walk-time stage (under `none`) is never
+reused for the trusted final one. An `align.json` from before the token is kept
+only when it used the stored bytes of a label still on the allowlist.
+
+**Sparse point colour is not persisted** (2026-09-17, review 1 m5; privacy lane
+L1). pycolmap's point colour averages the RAW solve images. `solution.npz` `rgb`
+and `derived/*/points.json` `rgb` keep their shapes and now hold the neutral grey
+`(138, 138, 138)` (`global_solve.WITHHELD_POINT_RGB`) from every writer; the
+page already drew no solver colour. Solutions written before this still hold
+the old colours on disk until they are re-solved; nothing reads them for
+display.
+
 ## 8. `GET /worlds` — the `dense` object
 
 Additive, per session, `null` on every world built before the dense stage.

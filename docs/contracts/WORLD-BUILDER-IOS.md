@@ -516,16 +516,30 @@ WORLDS §4, which fetches its imagery:
   fetch cancelled; a completion for a stopped task says nothing (answering one
   raises an Objective-C exception).
 - **Memory only.** Chunks and the proxy (content-addressed, immutable) are kept
-  in the handler's memory, capped at 64 MB, so a WebContent kill does not
-  download 14 MB again. The copy is **dropped** whenever a manifest request
-  answers anything but 200 or a revision request stops naming a served
-  appearance, and dies with the viewer. Nothing is written to disk.
+  in the handler's memory (`WorldAssetMemory`), capped at 64 MB, so a WebContent
+  kill does not download 14 MB again. **A copy is answered only under a fresh
+  authorisation** (2026-09-17, review 1 M5): the Tower answered this session's
+  manifest with 200 within the last 20 s (`authorizationWindow`). The page fetches
+  the manifest before any bundle — at boot, for a new build, on a restored
+  context — so a page load is authorised by its own manifest request. A hit
+  outside the window is revalidated: the handler fetches the manifest first and
+  answers from memory only if that is 200; otherwise the copy is dropped and the
+  bundle request goes to the Tower, which applies the label check. The copy and
+  its authorisation are **dropped** whenever a manifest request answers anything
+  but 200 or a revision request stops naming a served appearance, and die with
+  the viewer. Before this a hit was answered with no Tower check at all, so a
+  restore or reload after a relabel or purge redrew withdrawn imagery for up to
+  a poll interval. Tested on the handler (`answer(_:sessionID:)`) against a
+  stubbed Tower, not only on a JSON predicate. Nothing is written to disk.
 - **The web view.** `WKWebsiteDataStore.nonPersistent()`, the scheme handler
   registered before the view exists (`WorldRenderWebView.makeConfiguration`),
   no data detectors, no inline media.
-- **Navigation.** `WorldRenderNavigationPolicy.allows(_:isInitialLoad:pageURL:)`:
+- **Navigation.** `WorldRenderNavigationPolicy.allows(_:isInitialLoad:pageURL:isReload:)`:
   the initial load of exactly the page URL, nothing else — not `about:blank`,
-  not the page with a query, not a second load of it.
+  not the page with a query, not a second load of it — **except a main-frame
+  reload of exactly the page URL** (2026-09-17, review 1 m8), which the
+  appearance page asks for when WebKit never restores a lost WebGL context. The
+  reload is served the same string from memory and costs the camera.
 - **CSP.** The appearance page's `<meta>` allows `connect-src glasses-world:`
   and nothing else; every other page keeps `default-src 'none'`.
 
@@ -555,6 +569,8 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 |---|---|
 | same revision | nothing; no page is fetched |
 | same revision, **new `appearance.revision`** (decoded as `WorldRenderRevision.appearance`) | nothing. The appearance page polls the same route through the scheme and overwrites its texture layers in place, keeping the camera. The follower never reloads the page for an appearance build |
+| while an **appearance** page is on screen: `appearance.state` `rebuilding` (decoded as `appearanceState`; the ordinary Stop), then the appearance served again | nothing. The page kept its textures and loads the final build in place; the page revision (`…@<epoch>`) did not move |
+| while an **appearance** page is on screen: the appearance **withdrawn** (`state` `withdrawn`/`absent`, or no `state` from an older Tower), then served again on the appearance rung, of the same walk | fetches the page and swaps it in **by itself, even when the page revision is unchanged** (review 1, B1): the page dropped its textures, and a page whose script died, or a Tower without epochs, would otherwise stay on "no longer served" for good (`WorldRenderViewerModel.appearanceReturned`) |
 | a new revision of a **better rung** (sparse → dense → surface → appearance, read from `representation`, never from the opaque revision), of the **same walk** | fetches the page and swaps it in |
 | a new revision of the **same rung** with `live: false`, of the **same walk** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
 | a new revision of the **same rung** otherwise (live, or the Tower did not say), or **any** new revision of a better or same rung from **another walk** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |

@@ -285,6 +285,91 @@ nonisolated struct WorldAssetClient: Sendable {
     }
 }
 
+// MARK: - What may be answered from memory
+
+/// The viewer's in-memory copy of content-addressed bundles and the proxy, and
+/// the rule for when a copy may be answered WITHOUT asking the Tower.
+///
+/// Pure and a value, so the rule is tested without a web view or a network.
+///
+/// ## Why a copy needs a fresh authorisation (review 1, M5)
+///
+/// The Tower re-checks the session's redaction label on every appearance
+/// request (`WORLD-BUILDER-APPEARANCE.md` §9). A memory copy answered on a hit
+/// skipped that check entirely: after a relabel or a purge, a restored WebGL
+/// context or a reloaded page redrew withdrawn imagery from this copy until the
+/// next revision poll happened to drop it, up to two minutes later. So a hit is
+/// served only while the Tower has answered this session's MANIFEST with 200
+/// within `authorizationWindow` -- the page fetches the manifest before it asks
+/// for any bundle, at boot, on a new build and on a restored context, so in
+/// practice every page load is authorised by its own manifest request. A hit
+/// outside the window is `revalidate`: the handler asks for the manifest first
+/// (a few hundred kilobytes, `no-store`) and answers from memory only if that
+/// comes back 200. Any manifest or revision answer that does not serve the
+/// appearance drops the copy and the authorisation with it.
+nonisolated struct WorldAssetMemory: Sendable {
+    static let limit = 64 << 20
+    /// Long enough for a page to fetch its manifest and then its bundles;
+    /// short enough that a later load must ask the Tower again.
+    static let authorizationWindow: TimeInterval = 20
+
+    private(set) var entries: [String: WorldAssetResponse] = [:]
+    private(set) var bytes = 0
+    /// When the Tower last served this session's manifest.
+    private(set) var authorizedAt: Date?
+
+    enum Decision: Equatable, Sendable {
+        /// Answer from memory, now.
+        case serve(WorldAssetResponse)
+        /// A copy exists but its authorisation is stale: fetch the manifest
+        /// first, then decide again.
+        case revalidate
+        /// Proxy the request to the Tower.
+        case fetch
+    }
+
+    func isAuthorized(at now: Date) -> Bool {
+        guard let authorizedAt else { return false }
+        let age = now.timeIntervalSince(authorizedAt)
+        return age >= 0 && age < Self.authorizationWindow
+    }
+
+    func decision(for asset: WorldAssetRequest, now: Date) -> Decision {
+        guard let digest = asset.digest, let hit = entries[digest] else { return .fetch }
+        return isAuthorized(at: now) ? .serve(hit) : .revalidate
+    }
+
+    /// Learn from what the Tower answered.
+    mutating func record(_ asset: WorldAssetRequest, _ response: WorldAssetResponse, now: Date) {
+        switch asset {
+        case .appearanceManifest:
+            if response.status == 200 {
+                authorizedAt = now
+            } else {
+                drop()
+            }
+        case .renderRevision:
+            if response.status != 200 || !WorldAssetSchemeHandler.revisionServesAppearance(response.data) {
+                drop()
+            }
+        case .appearanceChunk(let digest), .appearanceProxy(let digest):
+            guard response.status == 200, entries[digest] == nil,
+                  bytes + response.data.count <= Self.limit
+            else { return }
+            entries[digest] = response
+            bytes += response.data.count
+        case .page:
+            break
+        }
+    }
+
+    mutating func drop() {
+        entries = [:]
+        bytes = 0
+        authorizedAt = nil
+    }
+}
+
 // MARK: - The handler
 
 /// Answers the viewer page's `glasses-world:` requests.
@@ -296,12 +381,12 @@ nonisolated struct WorldAssetClient: Sendable {
 /// cancelled.
 ///
 /// **Memory only.** Content-addressed bundles and the proxy are kept in memory
-/// for the life of this viewer, capped at `cacheLimit`, so a content-process
-/// kill does not download 14 MB again. That copy is dropped whenever the Tower
-/// stops serving this session's appearance (a manifest or revision request
-/// that does not answer with a served appearance), because the Tower re-checks
-/// the redaction label on every request and a copy must not outlive that check.
-/// Nothing is written to disk.
+/// for the life of this viewer, capped at `WorldAssetMemory.limit`, so a
+/// content-process kill does not download 14 MB again. A copy is answered only
+/// under a fresh authorisation from the Tower (`WorldAssetMemory`), and dropped
+/// whenever the Tower stops serving this session's appearance, because the
+/// Tower re-checks the redaction label on every request and a copy must not
+/// outlive that check. Nothing is written to disk.
 final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     let worldID: String
     private let client: WorldAssetClient
@@ -311,9 +396,11 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     /// The session the page on screen draws. Only its routes are proxied.
     var sessionID: String?
 
-    static let cacheLimit = 64 << 20
-    private var cache: [String: WorldAssetResponse] = [:]
-    private(set) var cacheBytes = 0
+    static let cacheLimit = WorldAssetMemory.limit
+    private(set) var memory = WorldAssetMemory()
+    var cacheBytes: Int { memory.bytes }
+    /// Injectable so a test can move past the authorisation window.
+    var clock: () -> Date = { Date() }
 
     private var liveTasks: Set<ObjectIdentifier> = []
     private var inflight: [ObjectIdentifier: Task<Void, Never>] = [:]
@@ -332,8 +419,30 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     func dropCache() {
-        cache = [:]
-        cacheBytes = 0
+        memory.drop()
+    }
+
+    /// What the page gets for `asset` (anything but `.page`): from memory under
+    /// a fresh authorisation, after revalidating the manifest when the
+    /// authorisation is stale, or from the Tower. Every Tower answer is
+    /// recorded, so a manifest or revision that withdraws the appearance drops
+    /// the copy before anything else is answered from it.
+    func answer(_ asset: WorldAssetRequest, sessionID: String?) async throws -> WorldAssetResponse {
+        switch memory.decision(for: asset, now: clock()) {
+        case .serve(let hit):
+            return hit
+        case .revalidate:
+            let manifest = try await client.fetch(.appearanceManifest, worldID: worldID, sessionID: sessionID)
+            memory.record(.appearanceManifest, manifest, now: clock())
+            if case .serve(let hit) = memory.decision(for: asset, now: clock()) {
+                return hit
+            }
+        case .fetch:
+            break
+        }
+        let response = try await client.fetch(asset, worldID: worldID, sessionID: sessionID)
+        memory.record(asset, response, now: clock())
+        return response
     }
 
     func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
@@ -349,28 +458,26 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
                     data: Data((pageHTML ?? "").utf8))
             return
         }
-        if let digest = asset.digest, let hit = cache[digest] {
+        if case .serve(let hit) = memory.decision(for: asset, now: clock()) {
             respond(urlSchemeTask, status: hit.status, mimeType: hit.mimeType, data: hit.data)
             return
         }
         let id = ObjectIdentifier(urlSchemeTask as AnyObject)
         liveTasks.insert(id)
-        let client = client
-        let worldID = worldID
         let sessionID = sessionID
         inflight[id] = Task { [weak self] in
+            guard let self else { return }
             let result: Result<WorldAssetResponse, Error>
             do {
-                result = .success(try await client.fetch(asset, worldID: worldID, sessionID: sessionID))
+                result = .success(try await self.answer(asset, sessionID: sessionID))
             } catch {
                 result = .failure(error)
             }
             // Back on the main actor: the task inherited it.
-            guard let self, self.liveTasks.remove(id) != nil else { return }
+            guard self.liveTasks.remove(id) != nil else { return }
             self.inflight[id] = nil
             switch result {
             case .success(let response):
-                self.remember(asset, response)
                 self.respond(urlSchemeTask, status: response.status, mimeType: response.mimeType,
                              data: response.data)
             case .failure(let error):
@@ -383,26 +490,6 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         let id = ObjectIdentifier(urlSchemeTask as AnyObject)
         liveTasks.remove(id)
         inflight.removeValue(forKey: id)?.cancel()
-    }
-
-    /// Keep an immutable 200 in memory; forget everything when the Tower stops
-    /// serving this session's appearance.
-    private func remember(_ asset: WorldAssetRequest, _ response: WorldAssetResponse) {
-        switch asset {
-        case .appearanceManifest where response.status != 200:
-            dropCache()
-        case .renderRevision:
-            if response.status != 200 || !Self.revisionServesAppearance(response.data) {
-                dropCache()
-            }
-        case .appearanceChunk(let digest), .appearanceProxy(let digest):
-            guard response.status == 200, cacheBytes + response.data.count <= Self.cacheLimit
-            else { return }
-            cache[digest] = response
-            cacheBytes += response.data.count
-        default:
-            break
-        }
     }
 
     /// Whether a revision body still names a served appearance

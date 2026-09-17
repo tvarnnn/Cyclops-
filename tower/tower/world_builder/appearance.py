@@ -234,7 +234,24 @@ def keyframe_set_identity(store, world_id: str, session_id: str) -> tuple[str | 
 
 
 def label_is_trusted(label: str | None) -> bool:
+    """THE trust decision for stored keyframe pixels, for every stage that
+    reads them: this stage, the depth stage (`dense_pipeline.run_depth_stage`
+    and `keyframe_image_bytes`) and, through their records, everything built on
+    the depth stage. An exact allowlist; unknown never means trusted."""
     return isinstance(label, str) and label in TRUSTED_REDACTION_LABELS
+
+
+def pixel_trust_token(label: str | None, redactor_label: str | None = None) -> str:
+    """What a stage that read keyframe pixels did about the label, as one
+    string for its cache keys and records: `trusted:<label>` when the stored
+    bytes were used, `rerun:<label or none>&<redactor label>` when they were
+    redacted again first. Two stages with equal tokens read equal pixels from
+    equal stored bytes; a label change at Stop (`none` -> the real label)
+    changes the token, so nothing cached under one is reused under the other
+    (review 1, M3)."""
+    if label_is_trusted(label):
+        return f"trusted:{label}"
+    return f"rerun:{label if isinstance(label, str) and label else 'none'}&{redactor_label}"
 
 
 def resolve_label_policy(store, world_id: str, session_id: str,

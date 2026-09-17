@@ -109,6 +109,11 @@ nonisolated struct WorldRenderRevision: Equatable, Sendable {
     /// layers in place, so the follower never reloads the page for one -- that
     /// would reset the wearer's camera on every solve.
     var appearance: String? = nil
+    /// `appearance.state` (`WORLD-BUILDER-APPEARANCE.md` §9): `served`,
+    /// `rebuilding` (the label changed at Stop and the final build is coming;
+    /// the page keeps what it drew), `withdrawn` or `absent`. `nil` from a
+    /// Tower that does not say.
+    var appearanceState: String? = nil
 }
 
 /// Fetches the viewer page over HTTP, as a string.
@@ -222,12 +227,15 @@ nonisolated struct WorldRenderClient {
         else { throw WorldRenderFetchError.undecodable }
         let representation = (json["representation"] as? String)
             .flatMap(WorldRenderRepresentation.init(rawValue:))
-        let appearance = (json["appearance"] as? [String: Any])?["revision"] as? String
+        let appearanceObject = json["appearance"] as? [String: Any]
+        let appearance = appearanceObject?["revision"] as? String
+        let appearanceState = appearanceObject?["state"] as? String
         return WorldRenderRevision(
             revision: revision,
             representation: representation,
             live: json["live"] as? Bool,
-            appearance: (appearance?.isEmpty ?? true) ? nil : appearance
+            appearance: (appearance?.isEmpty ?? true) ? nil : appearance,
+            appearanceState: (appearanceState?.isEmpty ?? true) ? nil : appearanceState
         )
     }
 
@@ -678,6 +686,17 @@ final class WorldRenderViewerModel: ObservableObject {
     @Published private(set) var newerPictureAvailable = false
     private var pendingRevision: String?
 
+    /// The appearance page on screen was told its imagery is withdrawn (a
+    /// relabel, a purge: `appearance.state` neither `served` nor `rebuilding`)
+    /// and dropped its textures. When a served appearance comes back the page is
+    /// replaced by itself, whatever its page revision says (review 1, B1): the
+    /// page recovers on its own, but one from a Tower that predates epochs (or
+    /// one whose script died) would otherwise show "no longer served" for good,
+    /// because an unchanged page revision is never fetched again. Not set by
+    /// `rebuilding`, the ordinary Stop, where the page keeps its textures and
+    /// picks the final build up in place without a reload.
+    private var appearanceWithdrawnWhileShown = false
+
     init(target: WorldRenderTarget, client: WorldRenderClient = WorldRenderClient()) {
         self.target = target
         self.client = client
@@ -720,6 +739,23 @@ final class WorldRenderViewerModel: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let latest else { return }
+            if state.representation == .appearance {
+                if let withdrawn = Self.appearanceReturned(
+                    after: appearanceWithdrawnWhileShown, latest: latest)
+                {
+                    appearanceWithdrawnWhileShown = withdrawn
+                } else {
+                    appearanceWithdrawnWhileShown = false
+                    let sameWalk = target.sessionID != nil
+                        || WorldRenderRepresentation.session(of: latest.revision)
+                            == WorldRenderRepresentation.session(of: shownRevision)
+                    if sameWalk {
+                        interval = revisionPollInterval
+                        await refresh(to: latest.revision, evenIfUnchanged: true)
+                        continue
+                    }
+                }
+            }
             if latest.revision == shownRevision, newerPictureAvailable {
                 // The build that was offered is no longer what the Tower would
                 // serve; the button must not outlive its reason.
@@ -800,6 +836,22 @@ final class WorldRenderViewerModel: ObservableObject {
         return !downgrade && latest.live == false
     }
 
+    /// The appearance-withdrawal flag after `latest`, or `nil` when the page on
+    /// screen (an appearance page) must be replaced now because a withdrawn
+    /// appearance is served again. Pure, so the rule is tested without a page.
+    ///
+    /// - served again after a withdrawal: `nil` (replace);
+    /// - `rebuilding` (the ordinary Stop): unchanged -- never a withdrawal;
+    /// - anything else without a served appearance: `true`;
+    /// - served, and nothing was withdrawn: `false`.
+    nonisolated static func appearanceReturned(after withdrawn: Bool, latest: WorldRenderRevision) -> Bool? {
+        if latest.appearance != nil {
+            return (withdrawn && latest.representation == .appearance) ? nil : false
+        }
+        if latest.appearanceState == "rebuilding" { return withdrawn }
+        return true
+    }
+
     /// How long to wait before the next ask.
     ///
     /// Back to `base` whenever the revision changed or the Tower is building;
@@ -829,7 +881,7 @@ final class WorldRenderViewerModel: ObservableObject {
     /// refresh. The page's own stamped revision is recorded, not the polled one,
     /// so a build that lands between the poll and the fetch costs no second
     /// download.
-    private func refresh(to revision: String) async {
+    private func refresh(to revision: String, evenIfUnchanged: Bool = false) async {
         let html: String
         do {
             html = try await client.page(for: target)
@@ -839,9 +891,21 @@ final class WorldRenderViewerModel: ObservableObject {
         guard !Task.isCancelled, case .ready(let current) = state else { return }
         handledRevision = revision
         let stamped = WorldRenderViewerState.ready(html: html).revision ?? revision
-        guard html != current,
-              WorldRenderRepresentation.withoutRevisionStamp(html)
-                != WorldRenderRepresentation.withoutRevisionStamp(current)
+        // `evenIfUnchanged`: the page on screen dropped its textures, so the
+        // same page must be loaded again (a new attempt reloads an identical
+        // string; see `renderAttempt`).
+        if evenIfUnchanged, html == current {
+            renderWatchdog?.cancel()
+            fallback = nil
+            shownRevision = stamped
+            renderAttempt += 1
+            state = .rendering(html: html)
+            startRenderWatchdog()
+            return
+        }
+        guard evenIfUnchanged || (html != current
+              && WorldRenderRepresentation.withoutRevisionStamp(html)
+                != WorldRenderRepresentation.withoutRevisionStamp(current))
         else {
             // The same picture, possibly now carrying the stamp it lacked.
             shownRevision = stamped
@@ -1014,9 +1078,16 @@ final class WorldRenderViewerModel: ObservableObject {
 /// here. They are governed twice: the page's CSP allows `connect-src
 /// glasses-world:` and nothing else, and the scheme handler serves only the
 /// whitelist in `WorldAssetRequest`.
+///
+/// **One exception: the page reloading itself** (`isReload`, a main-frame
+/// `.reload` of exactly the page URL). The appearance page asks for that when
+/// WebKit never gives back a lost WebGL context -- it often does not -- rather
+/// than sit on "Restoring…" for good (review 1, m8). The reload is served the
+/// same string from memory by the scheme handler, costs the wearer's camera,
+/// and goes nowhere else.
 nonisolated enum WorldRenderNavigationPolicy {
-    static func allows(_ url: URL?, isInitialLoad: Bool, pageURL: URL?) -> Bool {
-        guard isInitialLoad, let url, let pageURL else { return false }
+    static func allows(_ url: URL?, isInitialLoad: Bool, pageURL: URL?, isReload: Bool = false) -> Bool {
+        guard isInitialLoad || isReload, let url, let pageURL else { return false }
         return url.absoluteString == pageURL.absoluteString
     }
 }
@@ -1189,11 +1260,16 @@ struct WorldRenderWebView: UIViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
         ) {
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame == true
             let isInitialLoad = !hasDecidedInitialLoad
                 && navigationAction.navigationType == .other
-                && navigationAction.targetFrame?.isMainFrame == true
+                && isMainFrame
+            let isReload = hasDecidedInitialLoad
+                && navigationAction.navigationType == .reload
+                && isMainFrame
             let allowed = WorldRenderNavigationPolicy.allows(
-                navigationAction.request.url, isInitialLoad: isInitialLoad, pageURL: pageURL
+                navigationAction.request.url, isInitialLoad: isInitialLoad, pageURL: pageURL,
+                isReload: isReload
             )
             if allowed { hasDecidedInitialLoad = true }
             decisionHandler(allowed ? .allow : .cancel)
