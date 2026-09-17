@@ -1,5 +1,122 @@
 # Mac validation: the saved-world viewer after the iOS review fixes
 
+## Fix-it addendum (2026-09-17): the appearance rung and the `glasses-world:` transport
+
+Branch `world-builder/reconstruction-fixit-v1`. **Run this addendum first, on the
+fix-it SHA named in the fix-it handoff; the checklist below it still applies
+unchanged except where this addendum says otherwise.** Nothing Swift in this
+change has been compiled; the page and the Tower routes were verified on Windows
+in headless Chrome (SwiftShader), which says nothing about WebKit, Metal ASTC or
+phone frame times.
+
+What changed, and what each check proves:
+
+| Change | Files | Check |
+|---|---|---|
+| New top rung `appearance`: a ~70 KB page shell that fetches the manifest, the proxy and ASTC bundles, blends the redacted keyframes on the proxy (k = 4 ULR, on-device source depth, alpha 0 = no weight, unshaded), and follows new appearance builds in place | `tower/tower/world_builder/appearance_render.py`, `appearance_viewer.html`, `tower/tower/results/world_builder_render.py`, `tower/tower/routes/geometry.py` | A3, A5, A6 |
+| The page is served from `glasses-world://tower/worlds/<w>/render` by a `WKURLSchemeHandler` that proxies only this world's appearance and revision routes | `ios/Glasses/Workspaces/WorldBuilder/WorldAssetTransport.swift` (new; the app target uses a synchronized group, so no project edit) | A1, A2, A4 |
+| Non-persistent `WKWebsiteDataStore`; navigation policy allows exactly the page URL; `WorldRenderClient` moved off `URLSession.shared` to an ephemeral session with no URL cache | `WorldRenderViewer.swift` | A1, A2, A7 |
+| `WorldRenderRepresentation.appearance` (rank above surface) and its caption; `WorldRenderRevision.appearance` decoded but never acted on | `WorldRenderViewer.swift` | A2, A6 |
+
+### A1. Build
+
+As §1 below, then:
+
+```sh
+grep -E "WorldAssetTransport.swift|WorldRenderViewer.swift" ~/Projects/Glasses-scratch/wb-final-recon-mac/build.log | grep -E "error:|warning:"
+```
+
+Record every error and warning in either file. Most likely spots, most likely first:
+
+- `WorldAssetSchemeHandler.webView(_:start:)`: the `Task { [weak self] in … }` captures `urlSchemeTask` (`any WKURLSchemeTask`, not `Sendable`) and `asset` in a main-actor closure; `ObjectIdentifier(urlSchemeTask as AnyObject)`.
+- The `WKURLSchemeHandler` conformance on a main-actor class (default isolation) — if the 26.5 SDK's protocol is not `@MainActor`, mark the class `@MainActor` explicitly or the two requirements `nonisolated` + `MainActor.assumeIsolated`.
+- `nonisolated struct WorldAssetClient: Sendable` with `static let sharedUncachedSession = uncachedSession()`.
+- `url.host` on a custom scheme (deprecated spelling; a warning, not an error) — replace with `url.host(percentEncoded: false)` if it warns.
+- `WorldRenderWebView.makeConfiguration(assets:)`, a `static func` on the representable; `Coordinator.init(target:)` calling `super.init()` after `let` properties.
+- Tests: `import WebKit` added to `WorldBuilderIntegrationTests.swift`; `configuration.urlSchemeHandler(forURLScheme:) === assets` (existential identity comparison).
+
+### A2. Unit tests (no Tower)
+
+```sh
+xcodebuild -project Glasses.xcodeproj -scheme Glasses \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -derivedDataPath ~/Projects/Glasses-scratch/wb-final-recon-mac/dd \
+  -only-testing:GlassesTests/WorldAssetTransportTests \
+  -only-testing:GlassesTests/WorldRenderRevisionTests \
+  -only-testing:GlassesTests/WorldRenderViewerTests \
+  test-without-building
+```
+
+Expect:
+- **8** in `WorldAssetTransportTests`: the whitelisted routes are recognised; 23 other URLs, a POST, a session-less manifest and an empty world are refused; each whitelisted request maps to the Tower path of the same name; no URL cache anywhere (`urlCache == nil`, both cache policies, no cookies, and `WorldRenderClient().session` too); the web view configuration's `websiteDataStore.isPersistent == false` and the scheme handler is registered; the handler's session is the pinned one or the page's own; a withdrawn appearance in a revision body is recognised; the appearance caption.
+- `WorldRenderRevisionTests` **31** (29 + the appearance decode test + `testAnAppearanceOnlyChangeNeverReloadsThePage`), `WorldRenderViewerTests` **20** (the navigation test is now `testOnlyTheInitialLoadOfTheSchemePageIsAllowed`).
+
+Record pass/fail per class. `testAnAppearanceOnlyChangeNeverReloadsThePage` is timing-sensitive (7 polls at 20 ms, with a back-off after the last change); if it flakes, name it.
+
+### A3. Tower routes on the Mac
+
+Use the Tower of §3, but copy the world from the Windows lane copy that HAS an
+appearance artifact: `Glasses-scratch\wb-final-recon\fixit\phone-viewer\dataset\worlds\b2a75ab40d2d415d8d6ef5e4d5f0fb3d\`
+(whole directory; it is imagery — keep it private, do not commit it). The Mac
+Tower does not need the ASTC encoder to SERVE it.
+
+```sh
+W=b2a75ab40d2d415d8d6ef5e4d5f0fb3d; S=a8c6817e14a74e3c977fccfcdacad595; T=http://127.0.0.1:8010
+curl -s "$T/worlds/$W/render/revision?session_id=$S"
+#   {"session_id": S, "representation": "appearance", "revision": "S/appearance:1", "live": false,
+#    "appearance": {"revision": "S/appearance:18d60c554d5e8e7089d4", "current": true}}
+curl -s -D /tmp/h.txt "$T/worlds/$W/render?session_id=$S" -o /tmp/a.html; wc -c < /tmp/a.html      # about 70 KB
+grep -i content-security-policy /tmp/h.txt        # ... connect-src glasses-world:
+head -c 4096 /tmp/a.html | grep -o '<meta [^>]*>'  # wb-representation appearance, wb-revision S/appearance:1, the same CSP
+curl -s -D - "$T/worlds/$W/render?session_id=$S&transport=tower" -o /dev/null | grep -i content-security   # connect-src 'self'
+curl -s -o /dev/null -w "%{http_code}\n" "$T/worlds/$W/render?transport=https://x"                        # 422
+curl -s "$T/worlds/$W/render?session_id=$S&representation=surface" | head -c 800 | grep -o 'wb-representation" content="[a-z]*"'   # surface
+curl -s "$T/worlds/$W/render?session_id=$S&view=diagnostics" | head -c 800 | grep -o 'wb-representation" content="[a-z]*"'          # sparse
+```
+
+Record: the revision JSON; page bytes; the header CSP equals the `<meta>` CSP;
+`wb-revision` equals the revision JSON's `revision`; the 422; surface and sparse
+still served on request.
+
+### A4. The transport, in the Simulator (Safari Web Inspector attached to the app's web view)
+
+Open b2a75ab4 from Saved Worlds. In Web Inspector → Network:
+
+- [ ] The document is `glasses-world://tower/worlds/<W>/render`; every other request is `glasses-world://tower/…` — the manifest once, the proxy once, **8** chunk requests — and **no** `http://` request from the page.
+- [ ] Console: `fetch("https://example.com")` and `fetch("http://127.0.0.1:8010/worlds")` are refused by CSP; `fetch("glasses-world://tower/worlds")` and `fetch("glasses-world://tower/worlds/<W>/appearance/<S>/chunk/" + "0".repeat(32))` answer **404 from the handler** and the Tower log shows **no** request for either.
+- [ ] Tower log during load: only `GET /worlds/<W>/render`, `/render/revision`, `/appearance/<S>/manifest`, `/proxy/…`, `/chunk/…`.
+- [ ] `window.__wbAppearance` in the console: `phase: "ready"`, `encoding: "astc-6x6-rgba"`, `layers: 128`, `gpuBytes` about 20.5 MB, `errors: []`.
+- [ ] After closing the viewer: `~/Library/Developer/CoreSimulator/Devices/<udid>/data/Containers/Data/Application/<app>/` contains no file with a chunk's bytes (search for the 8-byte magic `WBAPCK01`: `grep -rl WBAPCK01 .` prints nothing) and no WebKit website-data directory created at the time of the test.
+
+### A5. What the page shows (physical iPhone, Windows Tower on port 8000)
+
+Record a screenshot for each.
+
+1. **Opening.** It opens in Walk at pose 99 / 198 (the desk hutch, monitor, door at right). Compare with `fixit\phone-viewer\fig\after_open_phone390.png`. The caption reads *Captured images on reconstructed geometry · 128 of 374 keyframes shown* and the native caption *The camera's own images, faces redacted, placed on the reconstructed room…*.
+2. **The extension.** `__wbAppearance.gl.astc` must be `true` on the phone. If it is `false`, record it: the page falls back to 48 WebP layers (about 42 MB colour) and says so in its caption.
+3. **Walk.** Step ← → through at least 10 poses and look around with one finger (left, right, up, down). Record whether it looks like the room or like triangles, and name seams, ghosting (a hand on the desk is expected around poses 120–180), swimming while turning, black cracks (proxy holes), smears.
+4. **Orbit, pinch, pan.** As §5.2.
+5. **Frame time.** Web Inspector → Timelines → Rendering Frames while dragging in Walk for 10 s: median and worst frame. Repeat in Orbit. Record both, and whether a frame over 100 ms happens when the camera stops (the async probe readback).
+6. **Memory.** Xcode's WebContent memory gauge (or Instruments → VM Tracker) at the opening view and after a minute of dragging. Record peak MB. Expected order: 20.5 MB of GL textures and buffers plus the drawing buffer (about 7 bytes a pixel at DPR 2) plus WebKit's own baseline.
+7. **Boot time.** Tap → first picture, three times: `__wbAppearance.timing.bootMs`, `openingMs`, `firstFrameMs`.
+8. **Context loss.** Background the app for 2 min, return: either the picture is still there, or *The graphics context was taken away… Restoring…* then the picture at the **same camera**. Record which, and `__wbAppearance.contextLosses`.
+
+### A6. Live append during a walk (phone + glasses + Windows Tower, `TOWER_WORLD_AUTOBUILD=true`)
+
+Open the picture early. Once the rung reaches appearance:
+
+- [ ] Each new appearance build (Tower log: `[appearance]` publish; revision JSON `appearance.revision` changes) is taken **without a page reload**: Web Inspector shows no new document request, `__wbAppearance.appends` increments, the camera stays where you left it, and the native *"A newer reconstruction is ready"* button does **not** appear for it.
+- [ ] Count full `GET …/render` in the Tower log during the walk: 1 + rung improvements (sparse → surface → appearance) + taps on the button + at most 1 after Stop. Appearance builds add **zero**.
+- [ ] After Stop, the final appearance arrives the same way (appends +1), within one poll interval (10–120 s) of its publish.
+
+### A7. Privacy spot checks
+
+- [ ] Relabel test (Mac Tower, copy only): edit the copied `session.json` `redaction` to `…@0.30+plausibility2` while the page is open. Within one poll the page replaces the picture with *These images are no longer served for this world…*; Web Inspector shows the handler answered the next manifest request 404; `curl …/render/revision` reports `representation: "surface"`. Restore the label afterwards.
+- [ ] No texture, page HTML or manifest in the app container, `Caches/` or `tmp/` after a session (A4's grep, on the device via Xcode → Devices → Download Container).
+
+---
+
+
 Branch `world-builder/reconstruction-final-v1`, at **the final SHA named in
 `docs/agent-handoffs/WORLD-BUILDER-RECONSTRUCTION-FINAL.md`**. Validate that
 commit and no other: the review branches (`…-review1` to `…-review4`) are
