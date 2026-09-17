@@ -482,9 +482,12 @@ reset the wearer's camera.
 
 - **Live.** During a walk the live surface child (`world_surface.py --live
   --appearance`) builds the appearance right after each live surface, against
-  that surface's phone level, with `quality: live` (fewer selection samples,
-  a coarser exposure grid). A live appearance is re-redacted (the label is
-  `none` until Stop).
+  that surface's phone level, with `quality: live` (30,000 selection samples,
+  a 24-pixel exposure grid, a 12-pixel transient grid; the privacy and occluder
+  rules do not move). A live appearance is re-redacted (the label is `none`
+  until Stop): 27.5 ms a keyframe with the current redactor. Measured on the
+  canonical world (374 keyframes, trusted label so no re-redaction): 45 s on a
+  quiet card, 90 s with another lane holding it at 98%.
 - **Final.** After Stop the builder runs the final surface, then the final
   appearance, then prunes the depth stage's work — in that order, because the
   appearance needs `_fill.npy` and `_pred.npy`.
