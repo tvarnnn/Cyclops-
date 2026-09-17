@@ -842,6 +842,71 @@ class TestTheRoutes:
         assert p.status_code == 200 and p.content[:8] == b"WBSURF01"
         _assert_private(p)
 
+    def test_bodies_are_compressed_only_when_accepted_and_stay_private(self, world):
+        """gzip/deflate when the client accepts it (18.2 MB -> ~14.1 MB on the
+        canonical world); the privacy headers do not change with the encoding."""
+        import gzip
+        import zlib
+
+        from fastapi.testclient import TestClient
+
+        world.build(redactor_factory=_never_redact)
+        client = TestClient(_app(world.root))
+        man = world.manifest()
+        base = f"/worlds/{WORLD}/appearance/{SESSION}"
+        urls = (f"{base}/manifest", f"{base}/chunk/{man['chunks'][0]['digest']}",
+                f"{base}/proxy/{man['proxy']['digest']}")
+        for url in urls:
+            plain = client.get(url, headers={"Accept-Encoding": "identity"})
+            assert plain.status_code == 200, url
+            assert "content-encoding" not in plain.headers, url
+            assert plain.headers["vary"] == "Accept-Encoding"
+            _assert_private(plain)
+            raw = plain.content
+            for accept, coding, decode in (("gzip", "gzip", gzip.decompress),
+                                           ("br, gzip;q=0.5, deflate", "gzip", gzip.decompress),
+                                           ("deflate", "deflate", zlib.decompress),
+                                           ("gzip;q=0, deflate;q=0.1", "deflate", zlib.decompress),
+                                           ("*", "gzip", gzip.decompress)):
+                # stream=True-free: read the wire bytes undecoded.
+                with client.stream("GET", url, headers={"Accept-Encoding": accept}) as r:
+                    wire = b"".join(r.iter_raw())
+                    assert r.status_code == 200, (url, accept)
+                    assert r.headers["content-encoding"] == coding, (url, accept)
+                    assert r.headers["vary"] == "Accept-Encoding"
+                    assert int(r.headers["content-length"]) == len(wire)
+                    _assert_private(r)
+                    assert r.headers["x-world-redaction"] == TRUSTED
+                assert decode(wire) == raw, (url, accept)
+            for refused in ("gzip;q=0", "br", "identity, *;q=0"):
+                r = client.get(url, headers={"Accept-Encoding": refused})
+                assert "content-encoding" not in r.headers, (url, refused)
+                assert r.content == raw
+        # A 404 is a sentence, never compressed, and still private.
+        with client.stream("GET", f"{base}/chunk/{'0' * 32}",
+                           headers={"Accept-Encoding": "gzip"}) as r:
+            assert r.status_code == 404 and "content-encoding" not in r.headers
+            _assert_private(r)
+
+    def test_the_encoding_negotiation(self):
+        from tower.results.world_builder_appearance import encode_body, negotiate_encoding
+
+        assert negotiate_encoding(None) is None and negotiate_encoding("") is None
+        assert negotiate_encoding("gzip, deflate, br") == "gzip"  # URLSession's default
+        assert negotiate_encoding("deflate, gzip") == "gzip"
+        assert negotiate_encoding("GZIP;Q=1.0") == "gzip"
+        assert negotiate_encoding("gzip;q=0, deflate") == "deflate"
+        assert negotiate_encoding("gzip;q=bogus") is None
+        assert negotiate_encoding("*;q=0.2") == "gzip"
+        assert negotiate_encoding("*, gzip;q=0") == "deflate"
+        assert negotiate_encoding("identity") is None
+        small, headers = encode_body(b"x" * 100, "gzip")
+        assert small == b"x" * 100 and "Content-Encoding" not in headers
+        data = bytes(range(256)) * 64
+        body, headers = encode_body(data, "gzip")
+        again, _ = encode_body(data, "gzip")
+        assert headers["Content-Encoding"] == "gzip" and body == again, "deterministic"
+
     def test_anything_not_named_is_404_and_still_private(self, world):
         from fastapi.testclient import TestClient
 

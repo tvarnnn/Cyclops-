@@ -21,6 +21,7 @@ from tower.results.world_builder_appearance import (
     AppearanceNotServed,
     appearance_file,
     appearance_manifest,
+    encode_body,
 )
 from tower.results.world_builder_geometry import (
     build_manifest,
@@ -110,8 +111,20 @@ def _appearance_headers(label: str) -> dict:
     return {**NO_STORE_HEADERS, "X-World-Redaction": label}
 
 
+def _appearance_response(request: Request, data: bytes, media_type: str, label: str) -> Response:
+    """A 200 of appearance bytes, gzip/deflate when the client accepts it.
+
+    The privacy headers are the same either way (`no-store`, `nosniff`, no
+    validators); only `Content-Encoding` and `Vary` are added. 404s are not
+    compressed: they are a sentence.
+    """
+    body, encoding = encode_body(data, request.headers.get("accept-encoding"))
+    return Response(content=body, media_type=media_type,
+                    headers={**_appearance_headers(label), **encoding})
+
+
 @router.get("/worlds/{world_id}/appearance/{session_id}/manifest")
-def appearance_manifest_route(world_id: str, session_id: str, request: Request) -> JSONResponse:
+def appearance_manifest_route(world_id: str, session_id: str, request: Request) -> Response:
     """The appearance artifact's manifest (`WORLD-BUILDER-APPEARANCE.md` §9).
 
     Imagery metadata of a private space: `no-store`, no validators, and the
@@ -123,7 +136,10 @@ def appearance_manifest_route(world_id: str, session_id: str, request: Request) 
     except AppearanceNotServed as exc:
         raise HTTPException(status_code=404, detail=exc.reason,
                             headers=NO_STORE_HEADERS) from None
-    return JSONResponse(json_safe(payload), headers=_appearance_headers(label))
+    # Rendered exactly as JSONResponse would, then encoded like the bytes routes:
+    # the manifest is ~0.4 MB of JSON for a 374-keyframe walk.
+    data = JSONResponse(json_safe(payload)).body
+    return _appearance_response(request, data, "application/json", label)
 
 
 def _appearance_bytes(request: Request, world_id: str, session_id: str, kind: str,
@@ -134,8 +150,7 @@ def _appearance_bytes(request: Request, world_id: str, session_id: str, kind: st
     except AppearanceNotServed as exc:
         raise HTTPException(status_code=404, detail=exc.reason,
                             headers=NO_STORE_HEADERS) from None
-    return Response(content=data, media_type="application/octet-stream",
-                    headers=_appearance_headers(label))
+    return _appearance_response(request, data, "application/octet-stream", label)
 
 
 @router.get("/worlds/{world_id}/appearance/{session_id}/chunk/{digest}")

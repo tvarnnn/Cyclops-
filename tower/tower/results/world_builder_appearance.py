@@ -14,6 +14,7 @@ Nothing here is cached and nothing is written.
 from __future__ import annotations
 
 import logging
+import zlib
 
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder import appearance_pipeline as AP
@@ -28,6 +29,73 @@ NO_STORE_HEADERS = {
     "Pragma": "no-cache",
     "X-Content-Type-Options": "nosniff",
 }
+
+
+# Content-Encoding for the appearance bodies (WORLD-BUILDER-APPEARANCE.md §9).
+#
+# The canonical world's phone load was 18.2 MB on the wire uncompressed; gzip
+# brings it to about 14.1 MB (ASTC blocks compress to ~0.8, the WBSURF01 proxy to
+# ~0.6, the manifest JSON to ~0.25). Measured on the canonical chunks: level 6
+# is 0.794 at ~35 ms per MB, level 1 0.803 at ~22 ms per MB; 6 is chosen because
+# the bytes cross a phone's radio and the CPU is the Tower's.
+#
+# Only what the client says it accepts, only on a 200, and nothing about the
+# privacy headers changes: `no-store`, `nosniff`, no validators. `Vary:
+# Accept-Encoding` is added so no intermediary could hand a compressed body to
+# a client that did not ask for one (and nothing may store it anyway).
+# Compressed per request and not kept: nothing here is cached.
+COMPRESS_LEVEL = 6
+COMPRESS_MIN_BYTES = 1024
+ENCODINGS = ("gzip", "deflate")
+
+
+def negotiate_encoding(accept_encoding: str | None) -> str | None:
+    """`gzip`, `deflate` or `None` from an `Accept-Encoding` header value.
+
+    gzip is preferred when both are acceptable. A coding with `q=0` is refused,
+    and `*` stands for any coding not named. `identity` is always acceptable,
+    so a header that allows neither gets the plain body, never a 406.
+    """
+    if not accept_encoding:
+        return None
+    quality: dict[str, float] = {}
+    for part in str(accept_encoding).split(","):
+        fields = [f.strip() for f in part.split(";")]
+        coding = fields[0].lower()
+        if not coding:
+            continue
+        q = 1.0
+        for param in fields[1:]:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    q = float(value.strip())
+                except ValueError:
+                    q = 0.0
+        quality[coding] = q
+    for coding in ENCODINGS:
+        q = quality.get(coding, quality.get("*", 0.0))
+        if q > 0.0:
+            return coding
+    return None
+
+
+def encode_body(data: bytes, accept_encoding: str | None) -> tuple[bytes, dict]:
+    """The body to send and the headers that describe its encoding.
+
+    `deflate` is the zlib format (RFC 9110 §8.4.1.2), which is what browsers
+    and `URLSession` decode under that name.
+    """
+    coding = negotiate_encoding(accept_encoding) if len(data) >= COMPRESS_MIN_BYTES else None
+    if coding == "gzip":
+        # A fixed header timestamp, so the same bytes always encode identically.
+        compressor = zlib.compressobj(COMPRESS_LEVEL, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        body = compressor.compress(data) + compressor.flush()
+    elif coding == "deflate":
+        body = zlib.compress(data, COMPRESS_LEVEL)
+    else:
+        return data, {"Vary": "Accept-Encoding"}
+    return body, {"Content-Encoding": coding, "Vary": "Accept-Encoding"}
 
 
 class AppearanceNotServed(Exception):

@@ -209,6 +209,15 @@ nonisolated struct WorldAssetResponse: Sendable, Equatable {
 
 /// Proxies whitelisted requests to the Tower.
 ///
+/// **Compression is URLSession's.** The Tower gzips the appearance bodies when
+/// the request accepts it (`WORLD-BUILDER-APPEARANCE.md` §9); `URLSession` sends
+/// `Accept-Encoding: gzip, deflate, br` by itself and hands back DECODED bytes.
+/// So `data` below is already the plain chunk, and this type must never set
+/// `Accept-Encoding` itself (a hand-set value is passed through verbatim and the
+/// body is no longer guaranteed to be decoded). The handler then describes the
+/// decoded bytes to WebKit (`WorldAssetSchemeHandler.responseHeaders`): no
+/// `Content-Encoding`, `Content-Length` of what it actually sends.
+///
 /// **An ephemeral session with no URL cache**, and every request asks for
 /// `.reloadIgnoringLocalAndRemoteCacheData`, for the reason
 /// `ObjectMemoryImageryHTTPClient` gives: these are first-person images of a
@@ -407,14 +416,22 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         return !revision.isEmpty
     }
 
-    private func respond(_ task: any WKURLSchemeTask, status: Int, mimeType: String, data: Data) {
-        guard let url = task.request.url else { return }
-        let headers = [
+    /// The headers WebKit is given for a body of `byteCount` bytes. Only these:
+    /// in particular never the Tower's `Content-Encoding`, because `URLSession`
+    /// already decoded the body -- forwarding `gzip` would make WebKit decode
+    /// plain bytes -- and `Content-Length` is the decoded length, not the wire's.
+    nonisolated static func responseHeaders(mimeType: String, byteCount: Int) -> [String: String] {
+        [
             "Content-Type": mimeType,
-            "Content-Length": String(data.count),
+            "Content-Length": String(byteCount),
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
         ]
+    }
+
+    private func respond(_ task: any WKURLSchemeTask, status: Int, mimeType: String, data: Data) {
+        guard let url = task.request.url else { return }
+        let headers = Self.responseHeaders(mimeType: mimeType, byteCount: data.count)
         guard let response = HTTPURLResponse(
             url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers
         ) else { return }

@@ -618,7 +618,19 @@ anything else is 404. URLs carry no path, file name or sequence number.
 
 **Headers on every response, 200 or 404:** `Cache-Control: no-store`,
 `Pragma: no-cache`, `X-Content-Type-Options: nosniff`, and no `ETag` or
-`Last-Modified`. A 200 also carries `X-World-Redaction: <redaction_effective>`.
+`Last-Modified`. A 200 also carries `X-World-Redaction: <redaction_effective>`
+and `Vary: Accept-Encoding`.
+
+**Compression** (2026-09-17). A 200 of at least 1 KiB is sent
+`Content-Encoding: gzip` when the request's `Accept-Encoding` accepts gzip
+(preferred), else `deflate` (zlib format) when that is accepted, else plain;
+`q=0` refuses a coding and `*` stands for any not named. Level 6, per request,
+never stored. Canonical world, full phone load: 18.2 MB raw → about 14.1 MB
+(ASTC chunks ≈ 0.80, proxy ≈ 0.6, manifest ≈ 0.25). A 404 is never compressed.
+The privacy headers above are identical with and without it. The iOS proxy
+leaves negotiation to `URLSession`, which decodes transparently; its scheme
+handler gives WebKit the decoded bytes with no `Content-Encoding`
+(`WORLD-BUILDER-IOS.md` §10).
 
 **Served only while all of these hold, else 404** with a `detail`:
 

@@ -62,10 +62,18 @@ Tower does not need the ASTC encoder to SERVE it.
 
 ```sh
 W=b2a75ab40d2d415d8d6ef5e4d5f0fb3d; S=a8c6817e14a74e3c977fccfcdacad595; T=http://127.0.0.1:8010
-curl -s "$T/worlds/$W/render/revision?session_id=$S"
+# `viewer=appearance-1` is what the app declares; without it `auto` serves the
+# surface, which is what an app built before the appearance page gets (WORLDS §4).
+curl -s "$T/worlds/$W/render/revision?session_id=$S&viewer=appearance-1"
 #   {"session_id": S, "representation": "appearance", "revision": "S/appearance:1", "live": false,
-#    "appearance": {"revision": "S/appearance:18d60c554d5e8e7089d4", "current": true}}
-curl -s -D /tmp/h.txt "$T/worlds/$W/render?session_id=$S" -o /tmp/a.html; wc -c < /tmp/a.html      # about 70 KB
+#    "appearance": {"revision": "S/appearance:<build id>", "current": true}}
+curl -s "$T/worlds/$W/render/revision?session_id=$S" | grep -o '"representation": *"[a-z]*"'   # surface (old app)
+curl -s "$T/worlds/$W/render?session_id=$S" | head -c 800 | grep -o 'wb-representation" content="[a-z]*"'   # surface (old app)
+curl -s -D /tmp/h.txt "$T/worlds/$W/render?session_id=$S&viewer=appearance-1" -o /tmp/a.html; wc -c < /tmp/a.html      # about 70 KB
+# Compression: wire bytes gzip vs identity for one chunk (digest from the manifest)
+curl -s "$T/worlds/$W/appearance/$S/manifest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["chunks"][0]["digest"])' > /tmp/d.txt
+curl -s -D - -H 'Accept-Encoding: gzip' "$T/worlds/$W/appearance/$S/chunk/$(cat /tmp/d.txt)" -o /tmp/c.gz | grep -i 'content-encoding\|vary\|cache-control\|etag'   # gzip, Accept-Encoding, no-store, no etag
+wc -c < /tmp/c.gz; curl -s "$T/worlds/$W/appearance/$S/chunk/$(cat /tmp/d.txt)" | wc -c    # about 0.8x of the plain body
 grep -i content-security-policy /tmp/h.txt        # ... connect-src glasses-world:
 head -c 4096 /tmp/a.html | grep -o '<meta [^>]*>'  # wb-representation appearance, wb-revision S/appearance:1, the same CSP
 curl -s -D - "$T/worlds/$W/render?session_id=$S&transport=tower" -o /dev/null | grep -i content-security   # connect-src 'self'
@@ -86,6 +94,8 @@ Open b2a75ab4 from Saved Worlds. In Web Inspector → Network:
 - [ ] Console: `fetch("https://example.com")` and `fetch("http://127.0.0.1:8010/worlds")` are refused by CSP; `fetch("glasses-world://tower/worlds")` and `fetch("glasses-world://tower/worlds/<W>/appearance/<S>/chunk/" + "0".repeat(32))` answer **404 from the handler** and the Tower log shows **no** request for either.
 - [ ] Tower log during load: only `GET /worlds/<W>/render`, `/render/revision`, `/appearance/<S>/manifest`, `/proxy/…`, `/chunk/…`.
 - [ ] `window.__wbAppearance` in the console: `phase: "ready"`, `encoding: "astc-6x6-rgba"`, `layers: 128`, `gpuBytes` about 20.5 MB, `errors: []`.
+- [ ] **Compression through the scheme handler.** Tower log (or a proxy such as Proxyman on the Mac) shows the chunk/proxy/manifest requests from the app arriving with `Accept-Encoding` containing `gzip` and answered `Content-Encoding: gzip`; the page still reaches `phase: "ready"` with 128 layers (so WebKit received decoded bytes). Record the total wire bytes for a full load (expect about 14 MB rather than 18.2 MB).
+- [ ] **Old-app safety.** The Tower log shows `viewer=appearance-1` on `GET /worlds/<W>/render` and on BOTH `render/revision` polls (the app's and the page's proxied one). If an app build from before this branch is available, open the same world with it: it must show the **surface** page, not a broken appearance page.
 - [ ] After closing the viewer: `~/Library/Developer/CoreSimulator/Devices/<udid>/data/Containers/Data/Application/<app>/` contains no file with a chunk's bytes (search for the 8-byte magic `WBAPCK01`: `grep -rl WBAPCK01 .` prints nothing) and no WebKit website-data directory created at the time of the test.
 
 ### A5. What the page shows (physical iPhone, Windows Tower on port 8000)

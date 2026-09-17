@@ -507,7 +507,11 @@ WORLDS §4, which fetches its imagery:
   `TowerConfiguration.httpBaseURL` through `WorldAssetClient`: an ephemeral
   session, `urlCache = nil`, no cookies, `.reloadIgnoringLocalAndRemoteCacheData`.
   Status and MIME type pass through; the handler adds `Cache-Control: no-store`
-  and `nosniff`. Bodies go to WebKit in 1 MB pieces.
+  and `nosniff`. Bodies go to WebKit in 1 MB pieces. The Tower gzips appearance
+  bodies (APPEARANCE §9); `URLSession` negotiates that itself (the client never
+  sets `Accept-Encoding`) and returns decoded bytes, so WebKit is given the
+  decoded body, its decoded `Content-Length`, and **no** `Content-Encoding`
+  (`WorldAssetSchemeHandler.responseHeaders`).
 - **Stop and cancel.** A task WebKit stops is removed from the live set and its
   fetch cancelled; a completion for a stopped task says nothing (answering one
   raises an Objective-C exception).

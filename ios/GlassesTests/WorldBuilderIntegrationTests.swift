@@ -5211,6 +5211,30 @@ final class WorldAssetTransportTests: XCTestCase {
         XCTAssertNil(WorldAssetRequest.appearanceManifest.towerURL(baseURL: Self.host, worldID: "w1", sessionID: nil))
     }
 
+    /// The Tower gzips appearance bodies and `URLSession` decodes them, so the
+    /// handler describes DECODED bytes: no `Content-Encoding` (WebKit would try
+    /// to decode plain bytes) and the decoded length.
+    func testTheHandlerDescribesDecodedBytesAndNeverForwardsAnEncoding() {
+        let headers = WorldAssetSchemeHandler.responseHeaders(
+            mimeType: "application/octet-stream", byteCount: 1_643_680)
+        XCTAssertEqual(Set(headers.keys),
+                       ["Content-Type", "Content-Length", "Cache-Control", "X-Content-Type-Options"])
+        XCTAssertNil(headers["Content-Encoding"])
+        XCTAssertEqual(headers["Content-Length"], "1643680")
+        XCTAssertEqual(headers["Cache-Control"], "no-store")
+        XCTAssertEqual(headers["X-Content-Type-Options"], "nosniff")
+    }
+
+    /// `URLSession` only decodes what it negotiated itself; a hand-set
+    /// `Accept-Encoding` would be sent verbatim with no decoding promise.
+    func testTheProxyLeavesContentNegotiationToURLSession() throws {
+        let client = WorldAssetClient(baseURL: Self.host, session: WorldAssetClient.uncachedSession())
+        let request = try XCTUnwrap(client.request(for: .appearanceChunk(digest: Self.digest),
+                                                   worldID: "w1", sessionID: "s1"))
+        XCTAssertNil(request.value(forHTTPHeaderField: "Accept-Encoding"))
+        XCTAssertNil(WorldAssetClient.uncachedConfiguration().httpAdditionalHeaders?["Accept-Encoding"])
+    }
+
     func testImageryIsFetchedWithNoCacheAnywhere() throws {
         let configuration = WorldAssetClient.uncachedConfiguration()
         XCTAssertNil(configuration.urlCache, "no URL cache, in memory or on disk")
