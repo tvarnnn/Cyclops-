@@ -9,6 +9,7 @@
 //
 
 import Combine
+import WebKit
 import XCTest
 
 @testable import Glasses
@@ -2721,17 +2722,27 @@ final class WorldRenderViewerTests: XCTestCase {
 
     // MARK: Navigation policy
 
-    /// The page is loaded as a string with no base URL, so its one legitimate
-    /// navigation is the initial `about:blank`. Everything else is refused.
-    func testOnlyTheInitialBlankNavigationIsAllowed() {
-        XCTAssertTrue(WorldRenderNavigationPolicy.allows(URL(string: "about:blank"), isInitialLoad: true))
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "about:blank"), isInitialLoad: false),
-                       "a link click to about:blank is still a link click")
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "http://stub.invalid/"), isInitialLoad: true))
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "https://example.com/"), isInitialLoad: true))
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "file:///etc/passwd"), isInitialLoad: true))
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(URL(string: "about:srcdoc"), isInitialLoad: true))
-        XCTAssertFalse(WorldRenderNavigationPolicy.allows(nil, isInitialLoad: true))
+    /// The page is loaded from the private scheme, so its one legitimate
+    /// navigation is the initial load of exactly that URL. Everything else is
+    /// refused, `about:blank` included.
+    func testOnlyTheInitialLoadOfTheSchemePageIsAllowed() {
+        let page = WorldAssetScheme.pageURL(worldID: "w1")
+        XCTAssertEqual(page?.absoluteString, "glasses-world://tower/worlds/w1/render")
+        func allows(_ string: String?, initial: Bool = true) -> Bool {
+            WorldRenderNavigationPolicy.allows(
+                string.flatMap { URL(string: $0) }, isInitialLoad: initial, pageURL: page)
+        }
+        XCTAssertTrue(allows("glasses-world://tower/worlds/w1/render"))
+        XCTAssertFalse(allows("glasses-world://tower/worlds/w1/render", initial: false),
+                       "a second navigation to the page reloads it and resets the camera")
+        XCTAssertFalse(allows("glasses-world://tower/worlds/w2/render"), "another world's page")
+        XCTAssertFalse(allows("glasses-world://tower/worlds/w1/render?transport=tower"))
+        XCTAssertFalse(allows("about:blank"))
+        XCTAssertFalse(allows("http://stub.invalid/worlds/w1/render"))
+        XCTAssertFalse(allows("https://example.com/"))
+        XCTAssertFalse(allows("file:///etc/passwd"))
+        XCTAssertFalse(allows(nil))
+        XCTAssertFalse(WorldRenderNavigationPolicy.allows(page, isInitialLoad: true, pageURL: nil))
     }
 
     // MARK: Where the picture button gets its target
@@ -4580,7 +4591,21 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertThrowsError(try WorldRenderClient.decodeRevision(Data(#"{"representation": "surface"}"#.utf8)))
     }
 
+    func testTheRevisionBodyCarriesTheAppearanceBuildApartFromThePageRevision() throws {
+        let body = #"{"session_id": "s1", "representation": "appearance", "revision": "s1/appearance:1", "live": true, "appearance": {"revision": "s1/appearance:b7", "current": false}}"#
+        let decoded = try WorldRenderClient.decodeRevision(Data(body.utf8))
+        XCTAssertEqual(decoded, WorldRenderRevision(
+            revision: "s1/appearance:1", representation: .appearance, live: true, appearance: "s1/appearance:b7"))
+        let withdrawn = try WorldRenderClient.decodeRevision(
+            Data(#"{"revision": "s1/surface:2", "appearance": {"revision": null, "current": false}}"#.utf8))
+        XCTAssertNil(withdrawn.appearance, "a withdrawn appearance is absent, not an empty string")
+    }
+
     func testOnlyABetterRungIsAnUpgrade() {
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .surface, to: .appearance))
+        XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .appearance))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .appearance, to: .surface))
+        XCTAssertFalse(WorldRenderRepresentation.isUpgrade(from: .appearance, to: .appearance))
         XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .surface))
         XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .sparse, to: .dense))
         XCTAssertTrue(WorldRenderRepresentation.isUpgrade(from: .dense, to: .surface))
@@ -4693,6 +4718,30 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertEqual(model.state, .rendering(html: page("surface", "surface:2")))
         XCTAssertFalse(model.newerPictureAvailable)
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2)
+    }
+
+    /// The appearance page follows new appearance builds itself, overwriting
+    /// its texture layers in place. The native follower must never reload the
+    /// page for one: that would reset the wearer's camera on every solve.
+    func testAnAppearanceOnlyChangeNeverReloadsThePage() async {
+        let shown = page("appearance", "s1/appearance:1")
+        func body(_ build: String, live: Bool) -> String {
+            "{\"session_id\": \"s1\", \"representation\": \"appearance\", \"revision\": \"s1/appearance:1\", "
+                + "\"live\": \(live), \"appearance\": {\"revision\": \"s1/appearance:\(build)\", \"current\": true}}"
+        }
+        let model = await readyModel(page: shown, revision: body("b1", live: true))
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, body("b2", live: true)))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 5 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, body("b3", live: false)))
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 7 }
+        await stop(follow)
+        XCTAssertTrue(polled, "it did poll")
+        XCTAssertEqual(model.state, .ready(html: shown), "the page on screen was replaced")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
+                       "an appearance build fetched a page; the page follows those itself")
+        XCTAssertFalse(model.newerPictureAvailable, "an appearance build is not offered as a newer picture")
     }
 
     func testAnUnchangedRevisionFetchesNoPage() async {
@@ -5059,5 +5108,147 @@ final class WorldRenderRevisionTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.revisionPath), asked,
                        "no request after the follower ended")
+    }
+}
+
+
+// MARK: - The private scheme the viewer page loads and fetches through
+
+/// `WORLD-BUILDER-IOS.md` §10: the page is served from `glasses-world:`, and
+/// the handler proxies only this world's appearance and revision routes,
+/// through an ephemeral session with no cache, into a web view whose data store
+/// is not persistent. None of it needs a `WKWebView` to test; the configuration
+/// needs no view either.
+@MainActor
+final class WorldAssetTransportTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid/tower")!
+    private static let digest = "0123456789abcdef0123456789abcdef"
+
+    private func parse(_ string: String, method: String? = "GET", world: String = "w1",
+                       session: String? = "s1") -> WorldAssetRequest? {
+        WorldAssetRequest.parse(URL(string: string), method: method, worldID: world, sessionID: session)
+    }
+
+    func testThePageAndTheWhitelistedRoutesAreRecognised() {
+        let base = "glasses-world://tower/worlds/w1"
+        XCTAssertEqual(parse("\(base)/render"), .page)
+        XCTAssertEqual(parse("\(base)/render", session: nil), .page, "the page needs no session")
+        XCTAssertEqual(parse("\(base)/render/revision?session_id=s1"), .renderRevision)
+        XCTAssertEqual(parse("\(base)/appearance/s1/manifest"), .appearanceManifest)
+        XCTAssertEqual(parse("\(base)/appearance/s1/chunk/\(Self.digest)"), .appearanceChunk(digest: Self.digest))
+        XCTAssertEqual(parse("\(base)/appearance/s1/proxy/\(Self.digest)"), .appearanceProxy(digest: Self.digest))
+    }
+
+    func testEverythingElseIsRefusedAndNeverReachesTheTower() {
+        let base = "glasses-world://tower/worlds/w1"
+        let refused: [String] = [
+            "glasses-world://tower/worlds/w2/render",
+            "glasses-world://tower/worlds/w2/appearance/s1/manifest",
+            "\(base)/appearance/s2/manifest",
+            "\(base)/render/revision?session_id=s2",
+            "\(base)/render/revision",
+            "\(base)/render/revision?session_id=s1&view=diagnostics",
+            "\(base)/render?transport=tower",
+            "\(base)/appearance/s1/manifest?x=1",
+            "\(base)/appearance/s1/chunk/\(Self.digest.uppercased())",
+            "\(base)/appearance/s1/chunk/\(String(Self.digest.dropLast()))",
+            "\(base)/appearance/s1/chunk/..%2Fmanifest",
+            "\(base)/appearance/s1/image/\(Self.digest)",
+            "\(base)/appearance/s1/chunk/\(Self.digest)/x",
+            "\(base)/appearance/s1/../s2/manifest",
+            "glasses-world://tower/worlds//w1/render",
+            "\(base)/geometry/manifest?session_id=s1",
+            "glasses-world://tower/worlds",
+            "glasses-world://tower/worlds/w1/render#frag",
+            "glasses-world://other/worlds/w1/render",
+            "glasses-world://user@tower/worlds/w1/render",
+            "glasses-world://tower:8000/worlds/w1/render",
+            "http://stub.invalid/worlds/w1/render",
+            "https://example.com/worlds/w1/appearance/s1/manifest",
+        ]
+        for string in refused {
+            XCTAssertNil(parse(string), string)
+        }
+        XCTAssertNil(parse("\(base)/appearance/s1/manifest", method: "POST"))
+        XCTAssertNil(parse("\(base)/appearance/s1/manifest", session: nil),
+                     "with no session known, only the page is served")
+        XCTAssertNil(parse("\(base)/render", world: ""))
+        XCTAssertNil(WorldAssetRequest.parse(nil, method: "GET", worldID: "w1", sessionID: "s1"))
+    }
+
+    func testAWhitelistedRequestIsProxiedToTheTowerRouteOfTheSameName() {
+        func tower(_ request: WorldAssetRequest) -> String? {
+            request.towerURL(baseURL: Self.host, worldID: "w1", sessionID: "s1")?.absoluteString
+        }
+        XCTAssertNil(tower(.page), "the page is served from memory, never fetched by the handler")
+        XCTAssertEqual(tower(.appearanceManifest), "http://stub.invalid/tower/worlds/w1/appearance/s1/manifest")
+        XCTAssertEqual(tower(.appearanceChunk(digest: Self.digest)),
+                       "http://stub.invalid/tower/worlds/w1/appearance/s1/chunk/\(Self.digest)")
+        XCTAssertEqual(tower(.appearanceProxy(digest: Self.digest)),
+                       "http://stub.invalid/tower/worlds/w1/appearance/s1/proxy/\(Self.digest)")
+        XCTAssertEqual(tower(.renderRevision), "http://stub.invalid/tower/worlds/w1/render/revision?session_id=s1")
+        XCTAssertNil(WorldAssetRequest.appearanceManifest.towerURL(baseURL: Self.host, worldID: "w1", sessionID: nil))
+    }
+
+    func testImageryIsFetchedWithNoCacheAnywhere() throws {
+        let configuration = WorldAssetClient.uncachedConfiguration()
+        XCTAssertNil(configuration.urlCache, "no URL cache, in memory or on disk")
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertNil(WorldAssetClient.sharedUncachedSession.configuration.urlCache)
+
+        let client = WorldAssetClient(baseURL: Self.host)
+        let request = try XCTUnwrap(
+            client.request(for: .appearanceChunk(digest: Self.digest), worldID: "w1", sessionID: "s1"))
+        XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertFalse(request.httpShouldHandleCookies)
+        XCTAssertNil(client.request(for: .page, worldID: "w1", sessionID: "s1"))
+
+        XCTAssertNil(WorldRenderClient().session.configuration.urlCache,
+                     "the page fetch is no longer URLSession.shared, which writes a disk cache")
+        let page = WorldRenderClient.request(try XCTUnwrap(URL(string: "http://stub.invalid/worlds/w1/render")),
+                                             timeout: 30)
+        XCTAssertEqual(page.cachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
+    }
+
+    func testTheViewerWebViewKeepsNothingAndRegistersTheScheme() {
+        let assets = WorldAssetSchemeHandler(worldID: "w1")
+        let configuration = WorldRenderWebView.makeConfiguration(assets: assets)
+        XCTAssertFalse(configuration.websiteDataStore.isPersistent)
+        XCTAssertTrue(configuration.urlSchemeHandler(forURLScheme: WorldAssetScheme.name) === assets)
+    }
+
+    func testTheHandlerReachesOnlyTheSessionThePageDraws() {
+        let stamped = "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<meta name=\"wb-representation\" content=\"appearance\">"
+            + "<meta name=\"wb-revision\" content=\"s9/appearance:1\"></head></html>"
+        XCTAssertEqual(WorldAssetSchemeHandler.session(
+            for: WorldRenderTarget(worldID: "w1", sessionID: "s1"), page: stamped), "s1",
+            "a session the viewer was opened for wins")
+        XCTAssertEqual(WorldAssetSchemeHandler.session(
+            for: WorldRenderTarget(worldID: "w1", sessionID: nil), page: stamped), "s9",
+            "the Tower's choice, read from the page it served")
+        XCTAssertNil(WorldAssetSchemeHandler.session(
+            for: WorldRenderTarget(worldID: "w1", sessionID: nil), page: "<html></html>"))
+    }
+
+    func testAWithdrawnAppearanceIsRecognisedSoTheMemoryCopyIsDropped() {
+        XCTAssertTrue(WorldAssetSchemeHandler.revisionServesAppearance(
+            Data(#"{"revision": "s1/appearance:1", "appearance": {"revision": "s1/appearance:b", "current": true}}"#.utf8)))
+        XCTAssertFalse(WorldAssetSchemeHandler.revisionServesAppearance(
+            Data(#"{"revision": "s1/surface:1", "appearance": {"revision": null, "current": false}}"#.utf8)))
+        XCTAssertFalse(WorldAssetSchemeHandler.revisionServesAppearance(Data("not json".utf8)))
+    }
+
+    func testTheAppearanceRungIsCaptionedForWhatItIs() {
+        let caption = WorldRenderRepresentation.caption(for: .appearance)
+        XCTAssertTrue(caption.contains("faces redacted"))
+        XCTAssertTrue(caption.contains("nothing is filled in"))
+        XCTAssertTrue(caption.contains("Not to scale"))
+        XCTAssertNotEqual(caption, WorldRenderRepresentation.caption(for: .surface))
+        XCTAssertEqual(WorldRenderRepresentation.declared(
+            in: "<head><meta name=\"wb-representation\" content=\"appearance\"></head>"), .appearance)
     }
 }

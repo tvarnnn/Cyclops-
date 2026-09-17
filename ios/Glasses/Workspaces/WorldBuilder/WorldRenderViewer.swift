@@ -103,6 +103,12 @@ nonisolated struct WorldRenderRevision: Equatable, Sendable {
     /// Whether the Tower is building this session right now. `nil` when the
     /// Tower did not say. `false` means "slow down", not "stop" (§4a rule 6).
     let live: Bool?
+    /// The session's appearance build (`appearance.revision`), or `nil` when
+    /// none is served. Opaque, and deliberately NOT part of `revision`: the
+    /// appearance page follows these builds itself, overwriting its texture
+    /// layers in place, so the follower never reloads the page for one -- that
+    /// would reset the wearer's camera on every solve.
+    var appearance: String? = nil
 }
 
 /// Fetches the viewer page over HTTP, as a string.
@@ -116,15 +122,20 @@ nonisolated struct WorldRenderRevision: Equatable, Sendable {
 /// page. Fetching here means the failure arrives as a typed error with the
 /// Tower's own words in it, the request carries the app's timeout and cache
 /// policy like every other HTTP client in this app, and the web view is handed
-/// a string with no origin and nothing to navigate to — which is also what
-/// makes refusing every other navigation a one-line policy rather than an
-/// allow-list.
+/// that string through the app's own `glasses-world:` scheme
+/// (`WorldAssetSchemeHandler`), which serves it and a short whitelist of this
+/// world's routes and nothing else — so refusing every other navigation is
+/// still a one-line policy rather than an allow-list.
 ///
-/// Modelled on `WorldListClient`: a struct holding a `URL` and the shared
-/// session, defaulted so a test can substitute a stubbed one.
+/// Modelled on `WorldListClient`: a struct holding a `URL` and a session,
+/// defaulted so a test can substitute a stubbed one.
 nonisolated struct WorldRenderClient {
     var baseURL: URL = TowerConfiguration.httpBaseURL
-    var session: URLSession = .shared
+    /// Ephemeral and cache-less (`WorldAssetClient.uncachedSession()`), not
+    /// `.shared`: the appearance page's configuration names the imagery it
+    /// fetches, and `URLSession.shared` writes responses to a disk cache unless
+    /// told otherwise. Privacy review §3.6.
+    var session: URLSession = WorldAssetClient.sharedUncachedSession
     /// Longer than the list's ten seconds: a page for a full walk is a few
     /// megabytes of point coordinates, and a slow link is not a stalled one
     /// at that size. Still bounded (Rule 15).
@@ -134,12 +145,10 @@ nonisolated struct WorldRenderClient {
         guard let url = Self.url(for: target, baseURL: baseURL) else {
             throw WorldRenderFetchError.badAddress
         }
-        // `.reloadIgnoringLocalCacheData` for the reason `WorldGeometryClient`
-        // gives; the Tower also answers `Cache-Control: no-store`, and a world
-        // under construction changes with every build.
-        let request = URLRequest(
-            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout
-        )
+        // Local AND remote caches ignored, for the reason `WorldGeometryClient`
+        // gives and for privacy §3.6; the Tower also answers `Cache-Control:
+        // no-store`, and a world under construction changes with every build.
+        let request = Self.request(url, timeout: timeout)
         let data: Data
         let response: URLResponse
         do {
@@ -176,9 +185,7 @@ nonisolated struct WorldRenderClient {
         guard let url = Self.revisionURL(for: target, baseURL: baseURL) else {
             throw WorldRenderFetchError.badAddress
         }
-        let request = URLRequest(
-            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10
-        )
+        let request = Self.request(url, timeout: 10)
         let data: Data
         let response: URLResponse
         do {
@@ -199,6 +206,13 @@ nonisolated struct WorldRenderClient {
         return try Self.decodeRevision(data)
     }
 
+    /// Every request this client makes. Split out so the cache policy is
+    /// tested without a stubbed session.
+    static func request(_ url: URL, timeout: TimeInterval) -> URLRequest {
+        URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                   timeoutInterval: timeout)
+    }
+
     /// The revision route's body. Split out so the decoding is tested without
     /// a stubbed session.
     static func decodeRevision(_ data: Data) throws -> WorldRenderRevision {
@@ -208,10 +222,12 @@ nonisolated struct WorldRenderClient {
         else { throw WorldRenderFetchError.undecodable }
         let representation = (json["representation"] as? String)
             .flatMap(WorldRenderRepresentation.init(rawValue:))
+        let appearance = (json["appearance"] as? [String: Any])?["revision"] as? String
         return WorldRenderRevision(
             revision: revision,
             representation: representation,
-            live: json["live"] as? Bool
+            live: json["live"] as? Bool,
+            appearance: (appearance?.isEmpty ?? true) ? nil : appearance
         )
     }
 
@@ -363,6 +379,9 @@ enum WorldRenderViewerState: Equatable {
 /// Tower could serve until it could serve a surface. A caption that denies what
 /// is on screen is the same failure as one that overclaims.
 nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
+    /// The wearer's own redacted keyframes blended over the surface
+    /// (`WORLD-BUILDER-APPEARANCE.md`). The top rung.
+    case appearance
     case surface
     case dense
     case sparse
@@ -380,6 +399,7 @@ nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
 
     private static func rank(_ representation: WorldRenderRepresentation?) -> Int {
         switch representation {
+        case .appearance: return 3
         case .surface: return 2
         case .dense: return 1
         case .sparse, nil: return 0
@@ -438,6 +458,12 @@ nonisolated enum WorldRenderRepresentation: String, Equatable, Sendable {
     /// can make yet is a real-world size: scale is unknown on every world.
     static func caption(for representation: WorldRenderRepresentation?) -> String {
         switch representation {
+        case .appearance:
+            // Agrees with the page's own caption and WORLD-BUILDER-APPEARANCE.md
+            // sections 2 and 3: the pixels are camera frames with faces
+            // redacted, nothing unseen is filled in, and the geometry under
+            // them can be wrong.
+            return "The camera's own images, faces redacted, placed on the reconstructed room. Dark gaps were not seen or were masked as unreliable; nothing is filled in. Not to scale."
         case .surface:
             // Agrees with the page's own caption and WORLD-BUILDER-SURFACE.md
             // section 2 claim 2: a gap is NOT proof that nobody looked. On the
@@ -658,6 +684,13 @@ final class WorldRenderViewerModel: ObservableObject {
     ///
     /// A better RUNG replaces the page by itself; a rebuild of the same rung
     /// sets `newerPictureAvailable` and waits for `showNewerPicture()`.
+    ///
+    /// **An appearance build is never acted on here.** It arrives as
+    /// `WorldRenderRevision.appearance`, which is deliberately not part of
+    /// `revision`: the appearance page polls the same route through the scheme
+    /// handler and overwrites its texture layers in place, keeping the camera.
+    /// Only the PAGE revision -- a rung change, a session change, a page
+    /// program change -- reloads, exactly as before.
     func followRevisions() async {
         guard target.view == .product else { return }
         var interval = revisionPollInterval
@@ -958,26 +991,35 @@ final class WorldRenderViewerModel: ObservableObject {
 /// Decides what the web view may navigate to: the page it was handed, and
 /// nothing else. Pure, so it is tested without a `WKWebView`.
 ///
-/// The page is loaded with `loadHTMLString(_:baseURL:nil)`, so its only
-/// navigation is the initial one, to `about:blank`. Anything else — a link
-/// the page does not contain today, a `window.location` a future page might
-/// set, a target the Tower's HTML could carry — is refused, and so is a
-/// *second* navigation to `about:blank`, which would blank the page. The
-/// page is self-contained by contract (§4), so refusing costs it nothing.
+/// The page is loaded from the app's private scheme
+/// (`WorldAssetScheme.pageURL`), whose handler serves the string
+/// `WorldRenderClient` fetched, so its only navigation is the initial one, to
+/// exactly that URL. Anything else — a link the page does not contain today, a
+/// `window.location` a future page might set, `about:blank`, another world's
+/// page, the same page with a query — is refused, and so is a *second*
+/// navigation to the page URL, which would reload it and reset the camera.
 ///
 /// This governs navigations. Subresource loads — a `fetch`, an `<img src>`,
 /// a `<script src>`, a WebSocket — are not navigations and are not seen
-/// here; the contract's "no external script, stylesheet, image or fetch"
-/// is what keeps them absent, and the page is the Tower's own.
+/// here. They are governed twice: the page's CSP allows `connect-src
+/// glasses-world:` and nothing else, and the scheme handler serves only the
+/// whitelist in `WorldAssetRequest`.
 nonisolated enum WorldRenderNavigationPolicy {
-    static func allows(_ url: URL?, isInitialLoad: Bool) -> Bool {
-        guard isInitialLoad, let url else { return false }
-        return url.scheme == "about" && (url.absoluteString == "about:blank")
+    static func allows(_ url: URL?, isInitialLoad: Bool, pageURL: URL?) -> Bool {
+        guard isInitialLoad, let url, let pageURL else { return false }
+        return url.absoluteString == pageURL.absoluteString
     }
 }
 
-/// A `WKWebView` that shows one string and goes nowhere.
+/// A `WKWebView` that shows one page and goes nowhere.
+///
+/// The page is the string the model fetched, served by a
+/// `WorldAssetSchemeHandler` at `glasses-world://tower/worlds/<world>/render`,
+/// in a web view with a NON-PERSISTENT website data store: nothing the page
+/// does -- its fetched imagery, storage, caches -- outlives the viewer.
 struct WorldRenderWebView: UIViewRepresentable {
+    /// Which world's routes the page may reach through the scheme.
+    let target: WorldRenderTarget
     let html: String
     /// Which `load()` this page belongs to. A retry of the **same** page after
     /// a render failure carries a new number, which is what makes the reload
@@ -991,14 +1033,25 @@ struct WorldRenderWebView: UIViewRepresentable {
     /// the main thread, and the model it calls is `@MainActor`.
     var onEvent: (@MainActor (WorldRenderPageEvent) -> Void)? = nil
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(target: target) }
 
-    func makeUIView(context: Context) -> WKWebView {
+    /// The configuration every viewer web view is built with. Split out so
+    /// the data store and the scheme registration are tested without a view.
+    static func makeConfiguration(assets: WorldAssetSchemeHandler) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
+        // Privacy §3.6: the default store is persistent; this one is memory only.
+        configuration.websiteDataStore = .nonPersistent()
+        // Must be registered before the web view exists.
+        configuration.setURLSchemeHandler(assets, forURLScheme: WorldAssetScheme.name)
         // The page needs its script and nothing else: no media, no data
         // detectors turning a coordinate into a phone number.
         configuration.dataDetectorTypes = []
         configuration.allowsInlineMediaPlayback = false
+        return configuration
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = Self.makeConfiguration(assets: context.coordinator.assets)
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
@@ -1027,6 +1080,20 @@ struct WorldRenderWebView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
+        let target: WorldRenderTarget
+        /// Serves the page and proxies this world's whitelisted routes. Owned
+        /// here for the life of the web view; the configuration retains it too.
+        let assets: WorldAssetSchemeHandler
+        /// The one URL this web view may navigate to.
+        let pageURL: URL?
+
+        init(target: WorldRenderTarget) {
+            self.target = target
+            self.assets = WorldAssetSchemeHandler(worldID: target.worldID)
+            self.pageURL = WorldAssetScheme.pageURL(worldID: target.worldID)
+            super.init()
+        }
+
         /// The string on screen, so `updateUIView` — called on every parent
         /// re-render — reloads only when the page actually changed.
         private var loaded: String?
@@ -1094,10 +1161,17 @@ struct WorldRenderWebView: UIViewRepresentable {
 
         private func reload(into webView: WKWebView) {
             guard let html = loaded else { return }
+            guard let pageURL else {
+                onEvent?(.failed("this world's identifier could not be made into a page address"))
+                return
+            }
             hasDecidedInitialLoad = false
-            // No base URL: the page has no origin, can name no relative
-            // resource, and its one navigation is to `about:blank`.
-            webView.loadHTMLString(html, baseURL: nil)
+            // The handler serves THIS string for the page URL, and the session
+            // the page draws bounds which appearance routes it may reach. The
+            // page's own fetches follow new appearance builds without a reload.
+            assets.pageHTML = html
+            assets.sessionID = WorldAssetSchemeHandler.session(for: target, page: html)
+            webView.load(URLRequest(url: pageURL))
         }
 
         func webView(
@@ -1109,7 +1183,7 @@ struct WorldRenderWebView: UIViewRepresentable {
                 && navigationAction.navigationType == .other
                 && navigationAction.targetFrame?.isMainFrame == true
             let allowed = WorldRenderNavigationPolicy.allows(
-                navigationAction.request.url, isInitialLoad: isInitialLoad
+                navigationAction.request.url, isInitialLoad: isInitialLoad, pageURL: pageURL
             )
             if allowed { hasDecidedInitialLoad = true }
             decisionHandler(allowed ? .allow : .cancel)
@@ -1370,7 +1444,8 @@ struct WorldRenderScene: View {
     @ViewBuilder
     private var content: some View {
         if let html = model.state.html {
-            WorldRenderWebView(html: html, attempt: model.renderAttempt, onEvent: model.pageEvent)
+            WorldRenderWebView(target: model.target, html: html, attempt: model.renderAttempt,
+                               onEvent: model.pageEvent)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay { renderingOverlay }
         } else if model.state.failureMessage != nil {

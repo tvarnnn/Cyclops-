@@ -465,11 +465,53 @@ Consumes `WORLD-BUILDER-WORLDS.md` §4 (the page) and §4a (its revision). Added
 2026-09-16 after an adversarial review of the viewer. Nothing below has been
 compiled or run on a device yet; `docs/agent-handoffs/` names the Mac checks.
 
-**The page.** `WorldRenderClient.page(for:)` fetches the HTML with `URLSession`
-and hands the string to a `WKWebView` with `loadHTMLString(_:baseURL: nil)`: no
-origin, one navigation, every other navigation refused. The response headers
-never reach WebKit, so the Tower's CSP reaches the phone only as the
+**The page.** `WorldRenderClient.page(for:)` fetches the HTML with an
+**ephemeral `URLSession` with no URL cache** (`WorldAssetClient.sharedUncachedSession`;
+requests `.reloadIgnoringLocalAndRemoteCacheData`) and hands the string to a
+`WKWebView`. Changed 2026-09-17: the web view no longer uses
+`loadHTMLString(_:baseURL: nil)`. It loads `glasses-world://tower/worlds/<world>/render`,
+and the app's scheme handler answers that URL with the string it fetched, so
+the typed fetch errors, the 30 s bound, the render watchdog and the
+`wb-representation` / `wb-revision` scan are all unchanged. The response headers
+still never reach WebKit, so the Tower's CSP reaches the phone only as the
 `<meta http-equiv>` tag every page carries (§4 rule 6).
+
+**The transport** (`WorldAssetTransport.swift`), for the appearance page of
+WORLDS §4, which fetches its imagery:
+
+- **One scheme, one host.** `glasses-world://tower/…`, whose paths mirror the
+  Tower's. The handler (`WorldAssetSchemeHandler`, a `WKURLSchemeHandler`)
+  answers exactly: the page (`/worlds/<w>/render`, no query, from memory);
+  `/worlds/<w>/appearance/<s>/manifest`; `…/chunk/<digest>` and
+  `…/proxy/<digest>` with a 32 lower-hex digest; and
+  `/worlds/<w>/render/revision?session_id=<s>` (that query and no other).
+  `<w>` is the world the viewer was opened for; `<s>` is the session the page
+  draws — the target's session, or the one the page's own `wb-revision` names.
+  **Everything else is a 404 from the handler and never reaches the Tower**:
+  another world or session, any other route, any method but GET, a query
+  elsewhere, a user, port or fragment, an empty, `.` or `..` segment. The
+  whitelist is the pure `WorldAssetRequest.parse`.
+- **Proxying.** Whitelisted requests go to the same path on
+  `TowerConfiguration.httpBaseURL` through `WorldAssetClient`: an ephemeral
+  session, `urlCache = nil`, no cookies, `.reloadIgnoringLocalAndRemoteCacheData`.
+  Status and MIME type pass through; the handler adds `Cache-Control: no-store`
+  and `nosniff`. Bodies go to WebKit in 1 MB pieces.
+- **Stop and cancel.** A task WebKit stops is removed from the live set and its
+  fetch cancelled; a completion for a stopped task says nothing (answering one
+  raises an Objective-C exception).
+- **Memory only.** Chunks and the proxy (content-addressed, immutable) are kept
+  in the handler's memory, capped at 64 MB, so a WebContent kill does not
+  download 14 MB again. The copy is **dropped** whenever a manifest request
+  answers anything but 200 or a revision request stops naming a served
+  appearance, and dies with the viewer. Nothing is written to disk.
+- **The web view.** `WKWebsiteDataStore.nonPersistent()`, the scheme handler
+  registered before the view exists (`WorldRenderWebView.makeConfiguration`),
+  no data detectors, no inline media.
+- **Navigation.** `WorldRenderNavigationPolicy.allows(_:isInitialLoad:pageURL:)`:
+  the initial load of exactly the page URL, nothing else — not `about:blank`,
+  not the page with a query, not a second load of it.
+- **CSP.** The appearance page's `<meta>` allows `connect-src glasses-world:`
+  and nothing else; every other page keeps `default-src 'none'`.
 
 **The caption follows the page.** The native caption above the web view reads
 the page's `<meta name="wb-representation">` from its first 4096 characters:
@@ -481,6 +523,9 @@ views": the app cannot see the manifest, and a surface built before the
 per-face filter made no such test. The page's own caption says "at least two
 camera views" only when the manifest shows the filter ran), *Points the Tower measured
 densely…* (dense), *Points the Tower measured from the walk…* (sparse), and a
+*The camera's own images, faces redacted, placed on the reconstructed room.
+Dark gaps were not seen or were masked as unreliable; nothing is filled in. Not
+to scale.* (appearance, 2026-09-17), and a
 rung-neutral *What the Tower reconstructed from the walk. Not to scale.* before
 the page arrives or for a page that declares nothing. Details says the page's
 own Diagnostics button switches views **only** on a sparse (or undeclared) page;
@@ -493,7 +538,8 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 | The Tower says | The app does |
 |---|---|
 | same revision | nothing; no page is fetched |
-| a new revision of a **better rung** (sparse → dense → surface, read from `representation`, never from the opaque revision), of the **same walk** | fetches the page and swaps it in |
+| same revision, **new `appearance.revision`** (decoded as `WorldRenderRevision.appearance`) | nothing. The appearance page polls the same route through the scheme and overwrites its texture layers in place, keeping the camera. The follower never reloads the page for an appearance build |
+| a new revision of a **better rung** (sparse → dense → surface → appearance, read from `representation`, never from the opaque revision), of the **same walk** | fetches the page and swaps it in |
 | a new revision of the **same rung** with `live: false`, of the **same walk** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
 | a new revision of the **same rung** otherwise (live, or the Tower did not say), or **any** new revision of a better or same rung from **another walk** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |
 | a new revision of a **worse rung** | nothing: not swapped, and not offered as "newer" |
