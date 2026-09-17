@@ -908,3 +908,67 @@ class TestTheRoutes:
             assert f"{SESSION}:" not in text
             assert not any(seq in text for seq in seqs), text
             assert "\\" not in text and ".jpg" not in text and "/images" not in text, text
+
+
+# ---------------------------------------------------------------------------
+# wiring
+# ---------------------------------------------------------------------------
+
+
+def test_the_product_builds_appearance_with_the_surface():
+    from tower.config import Settings
+    from tower.main import _world_build_spec
+
+    def settings(**kw):
+        return Settings(host="0.0.0.0", port=8000, dev_mode=True, cv_experiment="baseline",
+                        cv_device="cpu", world_root="C:/w", world_autobuild=True, **kw)
+
+    assert "--appearance" in _world_build_spec(settings()).argv
+    assert "--appearance" not in _world_build_spec(settings(world_appearance=False)).argv
+    assert "--appearance" not in _world_build_spec(settings(world_surface=False)).argv
+
+
+def test_the_live_surface_child_builds_the_appearance_when_asked(tmp_path):
+    from scripts.world_build_session import BackgroundSurface
+
+    spawned = []
+
+    class Proc:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    def spawn(argv, **kw):
+        spawned.append(argv)
+        return Proc()
+
+    s = BackgroundSurface(root=tmp_path, world_id=WORLD, session_id=SESSION, spawn=spawn,
+                          appearance=True)
+    assert s.maybe_launch(None)
+    assert "--appearance" in spawned[0] and "--live" in spawned[0]
+    s._child = None
+    plain = BackgroundSurface(root=tmp_path, world_id=WORLD, session_id=SESSION, spawn=spawn)
+    assert plain.maybe_launch(None)
+    assert "--appearance" not in spawned[1]
+    plain._child = None
+
+
+def test_the_final_appearance_runs_after_the_final_surface_and_before_the_depth_work_is_pruned():
+    import inspect
+
+    import scripts.world_build_session as B
+
+    src = inspect.getsource(B.main)
+    assert src.index("surfacify(") < src.index("build_appearance(") < src.index(
+        "prune_intermediates(")
+
+
+def test_the_cli_inspects_what_it_built(world, capsys):
+    import scripts.world_appearance as CLI
+
+    world.build(redactor_factory=_never_redact)
+    assert CLI.main(["--root", str(world.root), "--world", WORLD, "--session", SESSION,
+                     "--inspect"]) == 0
+    out = capsys.readouterr().out
+    assert '"present": true' in out and '"current": true' in out

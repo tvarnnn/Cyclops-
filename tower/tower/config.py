@@ -546,6 +546,14 @@ class Settings:
     # installed.
     world_surface: bool = True
 
+    # The appearance stage (docs/contracts/WORLD-BUILDER-APPEARANCE.md): the
+    # wearer's redacted keyframes prepared for view-dependent blending over the
+    # surface on the phone. ON with the surface, because the surface alone is
+    # geometry and the saved world's appearance comes from what the glasses
+    # saw. It runs after each surface build in the same child, needs the
+    # surface, and costs about 40 s of mostly-CPU work on a 400-keyframe walk.
+    world_appearance: bool = True
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -594,6 +602,7 @@ def get_settings() -> Settings:
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
         world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
         world_surface=_flag("TOWER_WORLD_SURFACE", default=True),
+        world_appearance=_flag("TOWER_WORLD_APPEARANCE", default=True),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),

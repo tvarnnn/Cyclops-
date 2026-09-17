@@ -602,8 +602,10 @@ class BackgroundSurface:
     """
 
     def __init__(self, *, root: Path, world_id: str, session_id: str,
-                 script: Path | None = None, spawn=None):
+                 script: Path | None = None, spawn=None, appearance: bool = False):
         self.root = root
+        # Build the appearance on each live surface, in the same child.
+        self.appearance = appearance
         self.world_id = world_id
         self.session_id = session_id
         self.script = Path(script) if script is not None             else TOWER_ROOT / "scripts" / "world_surface.py"
@@ -695,6 +697,7 @@ class BackgroundSurface:
             python_executable(), str(self.script),
             "--root", str(self.root), "--world", self.world_id,
             "--session", self.session_id, "--live", "--force",
+            *(["--appearance"] if self.appearance else []),
         ]
         extra = {}
         if os.name == "nt":
@@ -1480,6 +1483,13 @@ def main(argv=None) -> int:
              "Needs --solve.",
     )
     parser.add_argument(
+        "--appearance",
+        action="store_true",
+        help="build the appearance artifact (redacted keyframes prepared for "
+             "view-dependent blending on the phone) after each live surface and "
+             "after the final surface. Needs --surface.",
+    )
+    parser.add_argument(
         "--surface-script",
         type=Path,
         default=None,
@@ -1761,7 +1771,7 @@ def main(argv=None) -> int:
     if args.surface and background_solves:
         surfacer = BackgroundSurface(
             root=args.root.resolve(), world_id=world_id, session_id=session_id,
-            script=args.surface_script,
+            script=args.surface_script, appearance=args.appearance,
         )
 
     # THE LIFECYCLE, IN ONE PLACE, AND IT UNWINDS.
@@ -2187,6 +2197,26 @@ def main(argv=None) -> int:
                 should_stop=stop_request.hard_asked_for,
             )
             report["surface"] = {"attempted": True, **surface_result.as_dict()}
+            # The final appearance, on the final surface, BEFORE the depth work
+            # is pruned below: it reads each frame's fill mask and raw depth
+            # prediction from that work. Skipped on a hard stop like the rest.
+            if args.appearance and surface_result.state == "ok":
+                if stop_request.hard_asked_for():
+                    report["appearance"] = {
+                        "attempted": False,
+                        "reason": f"hard stop ({stop_request.source}) during finalization",
+                    }
+                else:
+                    from tower.world_builder.appearance_pipeline import (  # noqa: PLC0415
+                        build_appearance,
+                    )
+
+                    appearance_result = build_appearance(
+                        store, world_id, session_id,
+                        should_stop=stop_request.hard_asked_for,
+                    )
+                    report["appearance"] = {"attempted": True,
+                                            **appearance_result.as_dict()}
             if not args.densify and surface_result.state == "ok":
                 # The per-frame depth work is ~0.5 GB for a walk and nothing in
                 # the product reads it once the final surface exists; a later

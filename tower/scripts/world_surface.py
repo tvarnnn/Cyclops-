@@ -87,6 +87,26 @@ def _print_progress(stage, done, total):
     print(f"    {stage}: {done}/{total}", flush=True)
 
 
+def _build_appearance(store, world_id, sid, *, live: bool) -> None:
+    """The appearance on the surface just built, in this process.
+
+    In the SAME child as the live surface rather than a second one: it needs
+    that surface, it must not race the next live surface for the depth work,
+    and one child is one thing for the builder to kill at Stop. Its latency is
+    printed so the builder's `surface.log` records what it added to the walk.
+    """
+    from tower.world_builder.appearance import AppearanceParams  # noqa: PLC0415
+    from tower.world_builder.appearance_pipeline import build_appearance  # noqa: PLC0415
+
+    t = time.time()
+    params = AppearanceParams.live() if live else AppearanceParams()
+    result = build_appearance(store, world_id, sid, params=params)
+    print(f"  appearance {result.state}: {result.keyframes} keyframes "
+          f"({result.phone} phone), {result.chunks} chunks, {result.bytes / 1e6:.1f} MB, "
+          f"{time.time() - t:.1f}s {result.seconds}"
+          + (f" -- {result.detail}" if result.detail else ""), flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -109,6 +129,10 @@ def main() -> int:
                          "twice the voxel, one level of detail, a lighter "
                          "smooth. Being late is worse than being coarse; the "
                          "evidence rule is not relaxed")
+
+    ap.add_argument("--appearance", action="store_true",
+                    help="after each surface builds, build the appearance artifact "
+                         "on it (WORLD-BUILDER-APPEARANCE.md) in this same process")
 
     ap.add_argument("--voxel-frac", dest="voxel_frac", type=float)
     ap.add_argument("--trunc-voxels", dest="trunc_voxels", type=float)
@@ -211,6 +235,8 @@ def main() -> int:
             print(f"  L{lv['level']}: {lv['faces']:,} faces, "
                   f"{lv['bytes'] / 1e6:.1f} MB")
         print(f"  {time.time() - t:.1f}s total  {result.seconds}")
+        if args.appearance:
+            _build_appearance(store, world_id, sid, live=args.live)
     if cannot_run_here:
         # Distinct from an ordinary failure, so the builder's live worker can
         # stop relaunching (SURFACE_EXIT_CANNOT_RUN_HERE in world_build_session).
