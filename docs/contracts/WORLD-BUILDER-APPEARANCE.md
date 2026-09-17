@@ -625,8 +625,9 @@ and `Vary: Accept-Encoding`.
 `Content-Encoding: gzip` when the request's `Accept-Encoding` accepts gzip
 (preferred), else `deflate` (zlib format) when that is accepted, else plain;
 `q=0` refuses a coding and `*` stands for any not named. Level 6, per request,
-never stored. Canonical world, full phone load: 18.2 MB raw → about 14.1 MB
-(ASTC chunks ≈ 0.80, proxy ≈ 0.6, manifest ≈ 0.25). A 404 is never compressed.
+never stored. Canonical world, full phone load measured over the routes:
+18,229,238 B raw → 14,103,933 B in 10 requests (ASTC chunks 0.87, proxy 0.57,
+manifest 0.20); about 0.1 s of Tower CPU per chunk. A 404 is never compressed.
 The privacy headers above are identical with and without it. The iOS proxy
 leaves negotiation to `URLSession`, which decodes transparently; its scheme
 handler gives WebKit the decoded bytes with no `Content-Encoding`

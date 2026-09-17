@@ -33,11 +33,11 @@ NO_STORE_HEADERS = {
 
 # Content-Encoding for the appearance bodies (WORLD-BUILDER-APPEARANCE.md §9).
 #
-# The canonical world's phone load was 18.2 MB on the wire uncompressed; gzip
-# brings it to about 14.1 MB (ASTC blocks compress to ~0.8, the WBSURF01 proxy to
-# ~0.6, the manifest JSON to ~0.25). Measured on the canonical chunks: level 6
-# is 0.794 at ~35 ms per MB, level 1 0.803 at ~22 ms per MB; 6 is chosen because
-# the bytes cross a phone's radio and the CPU is the Tower's.
+# The canonical world's phone load, measured over these routes: 18,229,238 B
+# in 10 requests uncompressed, 14,103,933 B gzipped (0.774): ASTC chunks 0.87,
+# the WBSURF01 proxy 0.57, the manifest JSON 0.20. On the largest canonical files
+# level 6 is 0.794 at ~35 ms per MB, level 1 0.803 at ~22 ms per MB; 6 is chosen
+# because the bytes cross a phone's radio and the CPU is the Tower's.
 #
 # Only what the client says it accepts, only on a 200, and nothing about the
 # privacy headers changes: `no-store`, `nosniff`, no validators. `Vary:
