@@ -143,6 +143,16 @@ class AppearanceParams:
     # A cap, seeded, on the observations the IRLS runs over. The full set on the
     # canonical world is ~25M and peaked at 5.2 GB of a shared 12 GB card.
     exposure_max_observations: int = 6_000_000
+    # The photometric model (§5.4): `gain` (per keyframe, per channel) or
+    # `gain+slope+vignette` (also a per-keyframe log-linear tilt across the
+    # image -- auto-exposure and lens falloff that is not radially symmetric --
+    # and one radial falloff shared by every keyframe of the lens). The ridges
+    # hold a keyframe that saw too little of the room to a flat field.
+    exposure_model: str = "gain+slope+vignette"
+    exposure_slope_ridge: float = 0.005
+    exposure_vignette_ridge: float = 0.0
+    exposure_cg_outer: int = 4
+    exposure_cg_iterations: int = 40
     # selection (§5.5)
     selection_samples: int = 60_000
     selection_vis_tol: float = 0.03
@@ -155,6 +165,10 @@ class AppearanceParams:
     chunk_slots: int = CHUNK_SLOTS
     astc_quality: float = ASTC_QUALITY
     webp_quality: int = WEBP_QUALITY
+    # Alpha rises from 0 to 255 over this many pixels beyond the alpha ring
+    # (§5.6): a mask edge fades INTO the evidence instead of cutting it, and
+    # never reaches outward past the ring. 0 = the hard edge of the first build.
+    alpha_feather_px: int = 8
 
     @classmethod
     def live(cls, **overrides) -> "AppearanceParams":
@@ -506,7 +520,7 @@ def occluder_mask(zs: np.ndarray, zp: np.ndarray, unobserved: np.ndarray,
 
 
 def transient_votes(rgbs, opaque, zps, gains, Rs, ts, K, params: AppearanceParams, device=None,
-                    should_stop=None):
+                    should_stop=None, slopes=None, vignette=None):
     """Where a keyframe shows something most OTHER keyframes did not see there.
 
     The depth test above removes what is nearer than the proxy. It cannot
@@ -517,7 +531,8 @@ def transient_votes(rgbs, opaque, zps, gains, Rs, ts, K, params: AppearanceParam
     146 keyframes saw desk there.
 
     For a grid of each keyframe's proxy points, the colour (7x7 box, divided by
-    the keyframe's exposure gain) is sampled in every keyframe where the point
+    the keyframe's exposure model: its gain, and with `slopes` / `vignette` the
+    spatial field of §5.4) is sampled in every keyframe where the point
     is the nearest proxy surface, on an opaque texel, and away from the border.
     The reference is the per-channel median over the OTHER keyframes. A point
     is transient in this keyframe when at least `transient_min_views` others
@@ -556,7 +571,11 @@ def transient_votes(rgbs, opaque, zps, gains, Rs, ts, K, params: AppearanceParam
         # Clipped or near-black samples say nothing about what was there.
         raw_ok[i, 0] = ((blur.amax(0) < params.transient_saturated)
                         & (blur.amax(0) > params.transient_dark)).to(half)
-        rgb[i] = (blur / g[i][:, None, None].clamp(min=1e-3)).to(half)
+        div = g[i][:, None, None]
+        if slopes is not None or vignette is not None:
+            field = exposure_field(None if slopes is None else slopes[i], vignette, W, H)
+            div = div * torch.as_tensor(field, device=dev)[None]
+        rgb[i] = (blur / div.clamp(min=1e-3)).to(half)
     zp = torch.stack([torch.as_tensor(np.asarray(z, np.float32)) for z in zps]).to(dev, half)[:, None]
     op = torch.stack([torch.as_tensor(np.asarray(o, bool)) for o in opaque]).to(dev, half)[:, None]
     op = op * raw_ok
@@ -716,20 +735,146 @@ def _torch_device(device=None):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+EXPOSURE_MODEL_GAIN = "gain"
+EXPOSURE_MODEL_SPATIAL = "gain+slope+vignette"
+EXPOSURE_MODELS = (EXPOSURE_MODEL_GAIN, EXPOSURE_MODEL_SPATIAL)
+# The image coordinates the spatial terms are written in (contract §5.4).
+EXPOSURE_COORDINATES = ("xn=(u-W/2)/(W/2), yn=(v-H/2)/(H/2), "
+                        "r2=((u-W/2)^2+(v-H/2)^2)/((W/2)^2+(H/2)^2); u,v pixel centres")
+
+
+def exposure_coordinates(u, v, width: int, height: int):
+    """(xn, yn, r2) of pixel positions `u`, `v` (numpy or torch, any shape)."""
+    hw, hh = width / 2.0, height / 2.0
+    du, dv = u - hw, v - hh
+    return du / hw, dv / hh, (du * du + dv * dv) / (hw * hw + hh * hh)
+
+
+def exposure_field(slope, vignette, width: int, height: int) -> np.ndarray:
+    """The spatial factor of §5.4 over a whole image, (H, W) float32:
+    `exp(slope_x * xn + slope_y * yn + k1 * r2 + k2 * r2^2)`. The recorded value
+    at a pixel is `gain * field * radiance`."""
+    vv, uu = np.mgrid[0:height, 0:width].astype(np.float32)
+    xn, yn, r2 = exposure_coordinates(uu + 0.5, vv + 0.5, width, height)
+    sx, sy = (float(slope[0]), float(slope[1])) if slope is not None else (0.0, 0.0)
+    k1, k2 = (float(vignette[0]), float(vignette[1])) if vignette is not None else (0.0, 0.0)
+    return np.exp(sx * xn + sy * yn + k1 * r2 + k2 * r2 * r2).astype(np.float32)
+
+
+def _solve_spatial_exposure(L, P, S, XN, YN, R2, la, lg, npts, N, params, huber, dev):
+    """Huber-IRLS over the joint weighted least squares of §5.4 -- albedos,
+    per-keyframe (gain, tilt) and the shared falloff together -- each
+    reweighting solved by Jacobi-preconditioned CGLS, warm-started from the
+    gain model. Ridges: `exposure_slope_ridge` x a keyframe's weight on its tilt,
+    `exposure_vignette_ridge` x the total weight on the falloff. Gauge: mean log
+    gain 0 over keyframes with observations."""
+    import torch  # noqa: PLC0415
+
+    R4 = R2 * R2
+    sl = torch.zeros((N, 2), device=dev)
+    vg = torch.zeros(2, device=dev)
+    outer = max(1, int(params.exposure_cg_outer))
+    inner = max(1, int(params.exposure_cg_iterations))
+    for _ in range(outer):
+        pred = la[P] + lg[S] + (sl[S, 0] * XN + sl[S, 1] * YN + vg[0] * R2 + vg[1] * R4)[:, None]
+        w = huber(L - pred)
+        sw = w.sqrt()
+        wsum = w.sum(1)
+        fw = torch.zeros(N, device=dev).index_add_(0, S, wsum)
+        lam_s = params.exposure_slope_ridge * fw                      # (N,)
+        lam_v = params.exposure_vignette_ridge * wsum.sum()
+        # column norms (diag of AtA) -> Jacobi scaling
+        d_la = torch.zeros((npts, 3), device=dev).index_add_(0, P, w)
+        d_lg = torch.zeros((N, 3), device=dev).index_add_(0, S, w)
+        d_sl = torch.stack([torch.zeros(N, device=dev).index_add_(0, S, wsum * XN * XN),
+                            torch.zeros(N, device=dev).index_add_(0, S, wsum * YN * YN)], 1) + lam_s[:, None]
+        d_vg = torch.stack([(wsum * R2 * R2).sum(), (wsum * R4 * R4).sum()]) + lam_v
+        D = [1 / d.clamp(min=1e-9).sqrt() for d in (d_la, d_lg, d_sl, d_vg)]
+        sq_s, sq_v = lam_s.sqrt(), lam_v.sqrt()
+
+        def A(x):                       # scaled unknowns -> weighted residual rows
+            xa, xg, xs, xv = (x[0] * D[0], x[1] * D[1], x[2] * D[2], x[3] * D[3])
+            obs = sw * (xa[P] + xg[S] + (xs[S, 0] * XN + xs[S, 1] * YN + xv[0] * R2 + xv[1] * R4)[:, None])
+            return [obs, sq_s[:, None] * xs, sq_v * xv]
+
+        def At(y):
+            u = sw * y[0]
+            us = u.sum(1)
+            ga = torch.zeros((npts, 3), device=dev).index_add_(0, P, u)
+            gg = torch.zeros((N, 3), device=dev).index_add_(0, S, u)
+            gs = torch.stack([torch.zeros(N, device=dev).index_add_(0, S, us * XN),
+                              torch.zeros(N, device=dev).index_add_(0, S, us * YN)], 1) + sq_s[:, None] * y[1]
+            gv = torch.stack([(us * R2).sum(), (us * R4).sum()]) + sq_v * y[2]
+            return [ga * D[0], gg * D[1], gs * D[2], gv * D[3]]
+
+        def dot(a, b):
+            return sum((x * y).sum() for x, y in zip(a, b))
+
+        # residual of the current solution; CGLS on the correction
+        r = [sw * (L - pred), -sq_s[:, None] * sl, -sq_v * vg]
+        x = [torch.zeros_like(la), torch.zeros_like(lg), torch.zeros_like(sl), torch.zeros_like(vg)]
+        sv = At(r)
+        p = [t.clone() for t in sv]
+        gamma = dot(sv, sv)
+        for _it in range(inner):
+            q = A(p)
+            qq = dot(q, q)
+            if float(qq) <= 1e-20:
+                break
+            alpha = gamma / qq
+            x = [xi + alpha * pi for xi, pi in zip(x, p)]
+            r = [ri - alpha * qi for ri, qi in zip(r, q)]
+            sv = At(r)
+            gnew = dot(sv, sv)
+            if float(gnew) <= 1e-12 * float(gamma) + 1e-30:
+                gamma = gnew
+                break
+            p = [si + (gnew / gamma) * pi for si, pi in zip(sv, p)]
+            gamma = gnew
+        la = la + x[0] * D[0]
+        lg = lg + x[1] * D[1]
+        sl = sl + x[2] * D[2]
+        vg = vg + x[3] * D[3]
+        seen = d_lg[:, 0] > 0
+        if bool(seen.any()):
+            shift = lg[seen].mean(0, keepdim=True)
+            lg[seen] = lg[seen] - shift
+            la = la + shift
+    return la, lg, sl, vg
+
+
 def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=None,
                 should_stop=None):
-    """Per-keyframe, per-channel exposure gain (contract §5.4).
+    """The per-keyframe photometric model (contract §5.4).
 
     `rgbs` (N,H,W,3) uint8, `opaque` (N,H,W) bool, `zps` (N,H,W) float proxy
     depth. Returns (gains (N,3) float32, observations per frame (N,), record).
+
+    With `params.exposure_model == "gain+slope+vignette"` the recorded log
+    colour of a surface point p seen by keyframe s at image position (xn, yn,
+    r2) is modelled as
+
+        log I = log g[s,c] + a[s]*xn + b[s]*yn + k1*r2 + k2*r2^2 + log A[p,c]
+
+    -- a per-channel gain, a per-keyframe log-linear tilt (auto-exposure and
+    off-axis falloff), and one radial falloff for the lens -- solved by
+    alternating Huber-IRLS: point albedos as weighted means, then each
+    keyframe's (g, a, b) as a ridge-regularised 5x5 weighted least squares,
+    then (k1, k2). The record then also carries `slopes` (N,2), which the
+    pipeline moves onto the keyframes, and `vignette`. With `gain` the model
+    and the solve are the first build's, exactly.
     """
     import torch  # noqa: PLC0415
     import torch.nn.functional as TF  # noqa: PLC0415
 
+    model = params.exposure_model
+    if model not in EXPOSURE_MODELS:
+        raise ValueError(f"unknown exposure model {model!r}")
+    spatial = model == EXPOSURE_MODEL_SPATIAL
     dev = _torch_device(device)
     N = len(rgbs)
     if N == 0:
-        return np.ones((0, 3), np.float32), np.zeros(0, int), {"observations": 0}
+        return np.ones((0, 3), np.float32), np.zeros(0, int), {"observations": 0, "model": model}
     H, W = rgbs[0].shape[:2]
     Kt = torch.as_tensor(K, dtype=torch.float32, device=dev)
     R = torch.as_tensor(np.asarray(Rs), dtype=torch.float32, device=dev)
@@ -747,7 +892,7 @@ def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=N
     ys, xs = torch.meshgrid(torch.arange(step // 2, H, step, device=dev),
                             torch.arange(step // 2, W, step, device=dev), indexing="ij")
     ys, xs = ys.reshape(-1), xs.reshape(-1)
-    obs_p, obs_s, obs_c = [], [], []
+    obs_p, obs_s, obs_c, obs_uv = [], [], [], []
     npts = 0
     group = 32
     bd = params.exposure_border_px
@@ -762,7 +907,7 @@ def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=N
         xc = torch.stack([(x - Kt[0, 2]) / Kt[0, 0] * z, (y - Kt[1, 2]) / Kt[1, 1] * z, z], 1)
         X = (xc - t[a]) @ R[a]
         n = X.shape[0]
-        fp, fs, fc = [], [], []
+        fp, fs, fc, fuv = [], [], [], []
         for c0 in range(0, N, group):
             cs = torch.arange(c0, min(N, c0 + group), device=dev)
             pc = torch.einsum("sij,pj->spi", R[cs], X) + t[cs][:, None]
@@ -781,32 +926,41 @@ def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=N
             fp.append((pi + npts).to(torch.int32))
             fs.append(cs[si].to(torch.int32))
             fc.append(col[si, pi].to(torch.float16))
+            if spatial:
+                fuv.append(torch.stack([u[si, pi], v[si, pi]], 1).to(torch.float16))
         # To the host once per source keyframe: 25M observations held on the
         # card while the stream grows peaked at 3.3 GB of a shared 12 GB GPU,
         # and a transfer per group cost more than the projection itself.
         obs_p.append(torch.cat(fp).cpu())
         obs_s.append(torch.cat(fs).cpu())
         obs_c.append(torch.cat(fc).cpu())
+        if spatial:
+            obs_uv.append(torch.cat(fuv).cpu())
         npts += n
-    empty = {"observations": 0, "points": 0}
+    empty = {"observations": 0, "points": 0, "model": model}
     if not obs_p:
         return np.ones((N, 3), np.float32), np.zeros(N, int), empty
     P = torch.cat(obs_p)
     S = torch.cat(obs_s)
     C = torch.cat(obs_c)
+    UV = torch.cat(obs_uv) if spatial else None
     if P.numel() == 0:
         return np.ones((N, 3), np.float32), np.zeros(N, int), empty
     cnt = torch.bincount(P.to(torch.int64), minlength=npts)
     keep = cnt[P] >= params.exposure_min_views
     P, S, C = P[keep], S[keep], C[keep]
+    if spatial:
+        UV = UV[keep]
     if P.numel() == 0:
         return np.ones((N, 3), np.float32), np.zeros(N, int), empty
-    del rgb, op, zp, obs_p, obs_s, obs_c
+    del rgb, op, zp, obs_p, obs_s, obs_c, obs_uv
     if P.numel() > params.exposure_max_observations:
         gen = torch.Generator(device="cpu").manual_seed(params.seed)
         pick = torch.randperm(P.numel(), generator=gen)[:params.exposure_max_observations]
         pick = pick.sort().values
         P, S, C = P[pick], S[pick], C[pick]
+        if spatial:
+            UV = UV[pick]
     P = P.to(dev, torch.int64)
     S = S.to(dev, torch.int64)
     C = C.to(dev, torch.float32)
@@ -817,8 +971,24 @@ def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=N
         return torch.where(res.abs() <= delta, torch.ones_like(res), delta / res.abs())
 
     lg = torch.zeros((N, 3), device=dev)
+    sl = torch.zeros((N, 2), device=dev)
+    vg = torch.zeros(2, device=dev)
+    if spatial:
+        UV = UV.to(dev, torch.float32)
+        XN, YN, R2 = exposure_coordinates(UV[:, 0], UV[:, 1], W, H)
+        del UV
+    else:
+        XN = YN = R2 = None
+
+    def spatial_term():
+        return sl[S, 0] * XN + sl[S, 1] * YN + vg[0] * R2 + vg[1] * R2 * R2
+
     la = None
-    for it in range(params.exposure_iterations):
+    # The gain model's alternation. For the spatial model it is only the warm
+    # start: alternating albedos against a lens falloff converges far too
+    # slowly (measured on a synthetic falloff of -0.35: -0.12 after 30 rounds,
+    # -0.33 after 300), so the joint problem is then solved outright below.
+    for it in range(params.exposure_iterations if not spatial else 10):
         r0 = L - lg[S]
         w = torch.ones_like(L) if la is None else huber(r0 - la[P])
         acc = torch.zeros((npts, 3), device=dev).index_add_(0, P, w * r0)
@@ -832,26 +1002,45 @@ def solve_gains(rgbs, opaque, zps, Rs, ts, K, params: AppearanceParams, device=N
         seen = gw[:, 0] > 0
         if bool(seen.any()):
             lg[seen] = lg[seen] - lg[seen].mean(0, keepdim=True)
+    if spatial:
+        la, lg, sl, vg = _solve_spatial_exposure(L, P, S, XN, YN, R2, la, lg, npts, N, params, huber, dev)
 
     la0 = torch.zeros((npts, 3), device=dev).index_add_(0, P, L)
     c0 = torch.zeros((npts, 3), device=dev).index_add_(0, P, torch.ones_like(L))
-    before = (L - la0[P] / c0[P].clamp(min=1)).abs().reshape(-1)
-    after = (L - lg[S] - la[P]).abs().reshape(-1)
+    before = (L - la0[P] / c0[P].clamp(min=1)).abs()
+    after = (L - lg[S] - la[P] - (spatial_term()[:, None] if spatial else 0.0)).abs()
     per_frame = torch.bincount(S, minlength=N).cpu().numpy()
     gains = torch.exp(lg).cpu().numpy().astype(np.float32)
     gains[per_frame == 0] = 1.0
-    if dev.type == "cuda":
-        torch.cuda.empty_cache()
+    slopes = sl.cpu().numpy().astype(np.float32)
+    slopes[per_frame == 0] = 0.0
     sub = slice(None, None, max(1, before.numel() // 2_000_000))
     record = {
+        "model": model,
         "observations": int(P.numel()),
         "points": int(torch.unique(P).numel()),
-        "abs_log_residual_before": round(float(before[sub].median()), 4),
-        "abs_log_residual_after": round(float(after[sub].median()), 4),
+        "abs_log_residual_before": round(float(before.reshape(-1)[sub].median()), 4),
+        "abs_log_residual_after": round(float(after.reshape(-1)[sub].median()), 4),
         "gain_range": [round(float(gains[per_frame > 0].mean(1).min()), 4),
                        round(float(gains[per_frame > 0].mean(1).max()), 4)]
         if (per_frame > 0).any() else None,
     }
+    if spatial:
+        centre, edge = R2 < 0.15, R2 > 0.45
+        am = after.mean(1)
+        record.update({
+            "coordinates": EXPOSURE_COORDINATES,
+            "vignette": [round(float(v), 5) for v in vg.cpu().numpy()],
+            "slope_abs_median": round(float(np.median(np.abs(slopes[per_frame > 0])))
+                                      if (per_frame > 0).any() else 0.0, 5),
+            "abs_log_residual_after_centre": round(float(am[centre].median()), 4)
+            if bool(centre.any()) else None,
+            "abs_log_residual_after_edge": round(float(am[edge].median()), 4)
+            if bool(edge.any()) else None,
+            "slopes": slopes,
+        })
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
     return gains, per_frame.astype(int), record
 
 
@@ -966,13 +1155,29 @@ def coverage(scores: np.ndarray, rows) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def rgba_for(rgb: np.ndarray, transparent_core: np.ndarray) -> np.ndarray:
+def rgba_for(rgb: np.ndarray, transparent_core: np.ndarray, feather_px: int = 0) -> np.ndarray:
     """RGB zeroed inside the transparent core; alpha 0 over the core dilated by
-    ALPHA_RING_PX (contract §5.6)."""
+    ALPHA_RING_PX (contract §5.6); beyond the ring, alpha rises smoothly to 255
+    over `feather_px` pixels (Euclidean distance from the ring), so a masked
+    patch's edge fades inward. The ring is untouched: no texel that is alpha 0
+    without the feather gains alpha, and no texel gains alpha that the ring
+    rule did not already give. The image border is not feathered here (the
+    renderer feathers borders by its own rule)."""
+    import cv2  # noqa: PLC0415
+
     rgba = np.empty(rgb.shape[:2] + (4,), np.uint8)
     rgba[..., :3] = rgb
     rgba[transparent_core, :3] = 0
-    rgba[..., 3] = np.where(dilate(transparent_core, ALPHA_RING_PX), 0, 255)
+    ring = dilate(transparent_core, ALPHA_RING_PX)
+    if feather_px <= 0 or not ring.any():
+        rgba[..., 3] = np.where(ring, 0, 255)
+        return rgba
+    # distance (px) of every texel outside the ring to the nearest ring texel
+    d = cv2.distanceTransform((~ring).astype(np.uint8), cv2.DIST_L2, 5)
+    x = np.clip((d - 1.0) / float(feather_px), 0.0, 1.0)
+    alpha = np.rint(255.0 * x * x * (3.0 - 2.0 * x))
+    alpha[ring] = 0
+    rgba[..., 3] = alpha.astype(np.uint8)
     return rgba
 
 
@@ -1055,6 +1260,14 @@ def astc_bytes(width: int, height: int) -> int:
 def encode_webp(rgba: np.ndarray, quality: int = WEBP_QUALITY) -> bytes:
     import cv2  # noqa: PLC0415
 
+    # Every alpha-0 texel's RGB is zeroed before a LOSSY WebP encode. libwebp
+    # (without `exact`, which OpenCV cannot set) rewrites the colour of
+    # transparent blocks from their surroundings, and with a feathered alpha
+    # (§5.6) it wrote scene colour (up to 159 of 255) into a zeroed redaction
+    # fill of the synthetic world. Zero in, zero out; the page gives alpha 0 no
+    # weight whatever its colour.
+    rgba = rgba.copy()
+    rgba[rgba[..., 3] == 0, :3] = 0
     ok, enc = cv2.imencode(".webp", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA),
                            [cv2.IMWRITE_WEBP_QUALITY, int(quality)])
     if not ok:

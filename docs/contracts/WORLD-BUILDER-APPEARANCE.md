@@ -39,8 +39,8 @@ visibility was computed against travels with the images.
 
 A renderer draws the proxy and, per fragment, blends the keyframes that saw
 that point (view-dependent, unstructured-lumigraph style), dividing each
-sample by its keyframe's gain and giving alpha-0 samples zero weight. The
-Tower does not render; it prepares.
+sample by its keyframe's photometric model (§5.4) and weighting it by its
+alpha (0 = no weight). The Tower does not render; it prepares.
 
 ## 2. What this artifact CLAIMS
 
@@ -304,19 +304,52 @@ with no appearance at all, to prevent a defect that is visible, labelled, and
 fixed by the next build with the detector (the digest includes the mask state,
 so that build is not "already built").
 
-### 5.4 Exposure gains
+### 5.4 Exposure: the photometric model
 
-Per keyframe, per channel, `g` such that the recorded 8-bit value is
-`g × radiance`, gauge `mean(log g) = 0` over usable keyframes. Solved by
-alternating Huber-IRLS means (δ = 0.15 in log, 30 iterations) over co-visible
-samples: a 16-pixel grid of each keyframe's proxy depth, back-projected and
+`params.exposure_model` is `gain+slope+vignette` (default since 2026-09-17) or
+`gain` (the first builds). The recorded 8-bit value of a surface point seen by
+keyframe `s` at pixel `(u, v)` of a `W × H` image is modelled as
+
+    I = g[s] × exp(a[s]·xn + b[s]·yn + k1·r2 + k2·r2²) × radiance
+    xn = (u − W/2)/(W/2),  yn = (v − H/2)/(H/2),
+    r2 = ((u − W/2)² + (v − H/2)²) / ((W/2)² + (H/2)²)       (u, v at pixel centres)
+
+— a per-channel gain `g` (**`gain`**), a per-keyframe log-linear tilt `(a, b)`
+(**`gain_slope`**: auto-exposure and off-axis falloff that is not radially
+symmetric) and one radial lens falloff `(k1, k2)` shared by every keyframe
+(**`exposure.vignette`**). With `gain` the tilt and falloff are 0. Gauge
+`mean(log g) = 0` over keyframes with observations.
+
+Samples: a 16-pixel grid of each keyframe's proxy depth, back-projected and
 re-projected into every keyframe; a sample is kept when it is inside that frame
 8 px from the border, within 3% of that frame's proxy depth, on an opaque texel
 there, and neither dark (< 0.02) nor saturated (> 0.97) in a 7×7 box blur;
-points seen by fewer than three keyframes are dropped. A keyframe with no
-kept observation has gain `[1, 1, 1]` and `gain_observations: 0`.
+points seen by fewer than three keyframes are dropped; at most 6,000,000,
+seeded. A keyframe with no kept observation has gain `[1, 1, 1]`, `gain_slope`
+`[0, 0]` and `gain_observations: 0`.
 
-**A renderer divides the decoded channel (0…1) by `gain`.**
+Solve (`gain`): alternating Huber-IRLS means (δ = 0.15 in log, 30 iterations).
+Solve (`gain+slope+vignette`): 10 of those rounds as a warm start, then
+Huber-IRLS (4 reweightings) over the joint weighted least squares of albedos,
+gains, tilts and falloff, each by Jacobi-preconditioned CGLS (40 iterations).
+Ridges: `exposure_slope_ridge` (0.005) × a keyframe's total weight on its tilt;
+`exposure_vignette_ridge` (0) on the falloff. Alternating the falloff against
+the albedos instead converges far too slowly (a synthetic falloff of −0.35 read
+−0.12 after 30 rounds, −0.33 after 300); the joint solve recovers it exactly
+unregularised (`test_the_spatial_exposure_model_recovers_a_lens_falloff_and_a_tilt`).
+
+Measured on the canonical world (382 keyframes, 6 M observations): median
+|log residual| 0.251 raw → 0.142 with `gain` → 0.135 with the spatial model
+(centre 0.144, edge 0.149); falloff `k1 = −0.39, k2 = +0.21` (corner ×0.83); tilt
+|a|, |b| median 0.076, 90th percentile 0.24 / 0.28; solve 8.7 s on the RTX 5070.
+**On the page it did not measurably reduce seams** (seam excess 5.28 against 5.23
+for an otherwise identical `gain` build over 34 views; fix-it viewer-polish lane);
+the rectangles the first page showed were removed by the blend (WORLDS §4).
+
+**A renderer divides the decoded channel (0…1) by
+`gain × exp(gain_slope · (xn, yn) + k1·r2 + k2·r2²)`**; one that knows only `gain`
+still gets the right brightness at the image centre. The transient vote (§5.3)
+divides by the same model.
 
 ### 5.5 Selection
 
@@ -343,11 +376,21 @@ Greedy set cover over proxy visibility, with a quality weight.
   ARM's `astcenc`; MIT wrapper, Apache-2.0 encoder) at quality 60 ("medium").
   iOS exposes `WEBGL_compressed_texture_astc` on essentially every device.
 - **Everywhere: WebP RGBA**, lossy RGB quality 90, lossless alpha (OpenCV).
+  Every alpha-0 texel's RGB is zeroed before the WebP encode: libwebp rewrites
+  the colour of transparent blocks from their surroundings, and with the
+  feathered alpha below it wrote scene colour (up to 159) into a zeroed fill of
+  the synthetic test world.
 - **Transparent texels.** RGB is zeroed inside `unobserved ∪ occluder`; alpha is
   0 over that set dilated by 7 px (one 6×6 block plus a bilinear tap), so no
-  block that holds a zeroed texel also holds an opaque one, and no bilinear
-  fetch of an opaque texel reaches a zeroed one. A renderer treats
-  `alpha < 0.5` as zero weight.
+  block that holds a zeroed texel also holds a texel with alpha, and no bilinear
+  fetch of a texel with alpha reaches a zeroed one.
+- **Feathered alpha** (`params.alpha_feather_px`, 8; 0 = the first builds' hard
+  edge). Beyond the ring, alpha rises smoothly (smoothstep of the Euclidean
+  distance to the ring, from 1 px) to 255 at 8 px, so a masked patch's edge fades
+  INTO the evidence instead of cutting it with the 8 px transient cells' stair
+  steps. No texel the ring rule makes transparent gains alpha. **A renderer
+  uses alpha as a weight** (0 = none); one that treats `alpha < 0.5` as zero
+  weight, as the first page did, still draws correctly, with a narrower fade.
 - **Chunks.** Phone keyframes in rank order, 16 per chunk, in both encodings;
   Tower-tier keyframes in keyframe order, 16 per chunk, WebP only.
 
@@ -563,7 +606,7 @@ step cannot run; a set already written is unaffected.
 | `keyframes` | per usable keyframe, below |
 | `excluded` | `[{ki, reason}]` |
 | `selection` | `{phone_budget, phone, tower, coverage: {phone: {seen1, seen2}, all: {…}}, objective}` |
-| `exposure` | `{observations, points, abs_log_residual_before, abs_log_residual_after, gain_range}`; observations are a seeded sample of at most 6,000,000 |
+| `exposure` | `{model, observations, points, abs_log_residual_before, abs_log_residual_after, gain_range}`, and for `gain+slope+vignette` also `{coordinates, vignette: [k1, k2], slope_abs_median, abs_log_residual_after_centre, abs_log_residual_after_edge}` (§5.4); observations are a seeded sample of at most 6,000,000 |
 | `occluders` | `{frames_with_occluders, total_pixels, mean_fraction, near_mean_fraction, transient_mean_fraction, frames_with_near, frames_with_transient, misregistered_frames_unmasked, rule}` |
 | `transients` | §5.3a: `{state (ok, unavailable, failed, off), detail, mode, rule (null unless ok), requested_rule, models, frames_masked, computed, cached, refused, frames_digest, seconds, gpu_peak_mb}` |
 | `seconds` | per stage (`detector` is the time to ensure the masks) |
@@ -581,6 +624,7 @@ Per keyframe:
 | `rotation` | 9 floats, row-major, world-to-camera |
 | `translation` | 3 floats |
 | `gain` | 3 floats, divide by it |
+| `gain_slope` | 2 floats `(a, b)`, the tilt of §5.4; `[0, 0]` under the `gain` model |
 | `gain_observations` | samples that constrained it |
 | `quality` | the selection weight `q` |
 | `sharpness` | variance of the Laplacian over opaque pixels |

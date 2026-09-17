@@ -652,6 +652,115 @@ def test_exposure_gains_recover_a_frame_shot_darker(tmp_path):
     assert man["exposure"]["observations"] > 0
 
 
+def _exposure_inputs(gains, slopes, vignette, n=12):
+    """Keyframes of the box room in the SOLVE camera, recorded through a known
+    photometric model: albedo x gain x exp(slope . (xn, yn) + vignette(r2))."""
+    K = np.array([[FX, 0, SW / 2], [0, FX, SH / 2], [0, 0, 1.0]])
+    rgbs, zps, Rs, ts = [], [], [], []
+    for i in range(n):
+        x = -0.9 + 1.8 * i / (n - 1)
+        eye = np.array([x, 0.3 * ((i % 3) - 1), 0.4 * ((i % 2) - 0.5)])
+        target = np.array([0.2 * x, 0.25 * ((i % 4) - 1.5), 3.0])
+        R, t = _look_from(eye, target)
+        z = _render_box_depth(R, t, K, W, H)
+        vv, uu = np.mgrid[0:H, 0:W].astype(float)
+        xc = np.stack([(uu + 0.5 - K[0, 2]) / FX * z, (vv + 0.5 - K[1, 2]) / FX * z, z], -1)
+        X = (xc - t) @ R
+        field = A.exposure_field(slopes[i], vignette, W, H)
+        img = _pattern(X) * np.asarray(gains[i], float)[None, None] * field[..., None]
+        rgbs.append(np.clip(img, 0, 255).astype(np.uint8))
+        zps.append(z.astype(np.float32))
+        Rs.append(R)
+        ts.append(t)
+    return rgbs, [np.ones((H, W), bool)] * n, zps, Rs, ts, K
+
+
+def test_the_exposure_field_is_written_in_the_contracts_coordinates():
+    """§5.4: xn, yn in [-1, 1] from the image centre, r2 = 1 at the corners."""
+    f = A.exposure_field((0.2, -0.1), (-0.3, -0.05), 200, 100)
+    assert f.shape == (100, 200) and f.dtype == np.float32
+    xn, yn, r2 = A.exposure_coordinates(199.5, 0.5, 200, 100)
+    assert f[0, 199] == pytest.approx(np.exp(0.2 * xn - 0.1 * yn - 0.3 * r2 - 0.05 * r2 * r2), rel=1e-5)
+    assert A.exposure_coordinates(100.0, 50.0, 200, 100) == (0.0, 0.0, 0.0)
+    assert A.exposure_coordinates(200.0, 100.0, 200, 100) == (1.0, 1.0, 1.0)
+    # a positive x slope records the right of the image brighter
+    assert f[50, 190] > f[50, 10]
+    assert A.exposure_field(None, None, 8, 4) == pytest.approx(np.ones((4, 8)))
+
+
+def test_the_spatial_exposure_model_recovers_a_lens_falloff_and_a_tilt():
+    n = 12
+    gains = [[1.0, 1.0, 1.0]] * n
+    gains[5] = [0.7, 0.7, 0.7]
+    slopes = [(0.0, 0.0)] * n
+    slopes[3] = (0.3, 0.0)
+    inputs = _exposure_inputs(gains, slopes, (-0.35, 0.0), n)
+    # Unregularised, the joint solve recovers the model the frames were recorded through.
+    params = A.AppearanceParams(exposure_grid_px=6, exposure_border_px=4, exposure_slope_ridge=0.0,
+                                exposure_vignette_ridge=0.0)
+    g, obs, rec = A.solve_gains(*inputs, params, device="cpu")
+    assert rec["model"] == A.EXPOSURE_MODEL_SPATIAL and (obs > 0).all()
+    k1, k2 = rec["vignette"]
+    assert k1 + k2 == pytest.approx(-0.35, abs=0.03)         # the corner falloff
+    assert k1 == pytest.approx(-0.35, abs=0.05)
+    sl = rec["slopes"]
+    assert sl[3, 0] == pytest.approx(0.3, abs=0.03) and sl[3, 1] == pytest.approx(0.0, abs=0.03)
+    assert np.abs(np.delete(sl, 3, axis=0)).max() < 0.03
+    ratio = g[5].mean() / np.median(np.delete(g.mean(1), 5))
+    assert ratio == pytest.approx(0.7, abs=0.02)
+    # With the default ridges (a keyframe that saw little is held flat), the
+    # same answers, shrunk: this synthetic walk faces one wall, so a tilt and
+    # the falloff are only weakly told apart.
+    g1, _obs1, rec1 = A.solve_gains(*inputs, A.AppearanceParams(exposure_grid_px=6, exposure_border_px=4),
+                                    device="cpu")
+    assert -0.35 - 0.05 < sum(rec1["vignette"]) < -0.15
+    assert rec1["slopes"][3, 0] - np.median(np.delete(rec1["slopes"][:, 0], 3)) == pytest.approx(0.3, abs=0.08)
+
+    g0, _obs0, rec0 = A.solve_gains(*inputs, A.AppearanceParams(
+        exposure_grid_px=6, exposure_border_px=4, exposure_model=A.EXPOSURE_MODEL_GAIN), device="cpu")
+    assert "slopes" not in rec0 and "vignette" not in rec0
+    assert rec["abs_log_residual_after"] < 0.5 * rec0["abs_log_residual_after"]
+
+
+def test_an_unknown_exposure_model_is_refused():
+    with pytest.raises(ValueError):
+        A.solve_gains([np.zeros((4, 4, 3), np.uint8)], [np.ones((4, 4), bool)], [np.ones((4, 4))],
+                      [np.eye(3)], [np.zeros(3)], np.eye(3),
+                      A.AppearanceParams(exposure_model="gain+magic"), device="cpu")
+
+
+def test_the_manifest_carries_the_photometric_model(world):
+    world.build(redactor_factory=_never_redact)
+    man = world.manifest()
+    ex = man["exposure"]
+    assert ex["model"] == A.EXPOSURE_MODEL_SPATIAL
+    assert len(ex["vignette"]) == 2 and ex["coordinates"] == A.EXPOSURE_COORDINATES
+    assert "slopes" not in ex                                  # they travel on the keyframes
+    for k in man["keyframes"]:
+        assert len(k["gain_slope"]) == 2 and all(np.isfinite(k["gain_slope"]))
+    assert man["params"]["exposure_model"] == A.EXPOSURE_MODEL_SPATIAL
+
+
+def test_mask_edges_fade_inward_and_the_ring_is_untouched():
+    """§5.6: alpha 0 over the core dilated by the ring, then a smooth rise over
+    the feather; nothing that the hard rule made transparent gains alpha."""
+    rgb = np.full((60, 80, 3), 120, np.uint8)
+    core = np.zeros((60, 80), bool)
+    core[20:30, 30:40] = True
+    hard = A.rgba_for(rgb, core)
+    soft = A.rgba_for(rgb, core, feather_px=8)
+    ring = A.dilate(core, A.ALPHA_RING_PX)
+    assert (hard[..., 3][ring] == 0).all() and (hard[..., 3][~ring] == 255).all()
+    assert (soft[..., 3][ring] == 0).all()
+    assert (soft[..., :3][core] == 0).all() and (soft[..., :3][~core] == 120).all()
+    assert (soft[..., 3] <= hard[..., 3]).all()
+    far = ~A.dilate(core, A.ALPHA_RING_PX + 10)
+    assert (soft[..., 3][far] == 255).all()
+    row = soft[25, 40 + A.ALPHA_RING_PX:, 3].astype(int)       # walking away from the patch
+    assert (np.diff(row) >= 0).all() and 0 < row[3] < 255
+    assert A.rgba_for(rgb, np.zeros((60, 80), bool), feather_px=8)[..., 3].min() == 255
+
+
 def test_the_phone_tier_is_capped_and_the_rest_is_kept_for_the_tower(world):
     params = A.AppearanceParams(selection_samples=4000, phone_budget=3)
     world.build(params=params, redactor_factory=_never_redact)
