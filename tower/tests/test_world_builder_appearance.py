@@ -1033,14 +1033,132 @@ def test_the_live_surface_child_builds_the_appearance_when_asked(tmp_path):
     plain._child = None
 
 
-def test_the_final_appearance_runs_after_the_final_surface_and_before_the_depth_work_is_pruned():
-    import inspect
+class TestTheFinalChain:
+    """`world_build_session.final_surface_stages`: what runs after Stop, run with
+    the three stages replaced by recorders (the stages themselves are tested in
+    their own files)."""
 
-    import scripts.world_build_session as B
+    @pytest.fixture
+    def calls(self, monkeypatch):
+        from tower.world_builder import appearance_pipeline, dense_pipeline, surface_pipeline
+        from tower.world_builder.appearance_pipeline import AppearanceResult
+        from tower.world_builder.surface import SurfaceResult
 
-    src = inspect.getsource(B.main)
-    assert src.index("surfacify(") < src.index("build_appearance(") < src.index(
-        "prune_intermediates(")
+        log = {"order": [], "surface_state": "ok", "appearance_state": "ok", "stop_in": None,
+               "stop": False}
+
+        def trip(stage):
+            if log["stop_in"] == stage:
+                log["stop"] = True
+
+        def surfacify(store, world_id, session_id, *, params=None, force=False,
+                      should_stop=None, **kw):
+            log["order"].append("surface")
+            log["surface_params"], log["surface_force"] = params, force
+            log["surface_stop"] = should_stop
+            trip("surface")
+            state = "stopped" if should_stop() else log["surface_state"]
+            return SurfaceResult(state=state)
+
+        def build_appearance(store, world_id, session_id, *, params=None, should_stop=None, **kw):
+            log["order"].append("appearance")
+            log["appearance_params"], log["appearance_stop"] = params, should_stop
+            trip("appearance")
+            return AppearanceResult(state="stopped" if should_stop() else log["appearance_state"])
+
+        def prune(directory):
+            log["order"].append("prune")
+            return 123
+
+        monkeypatch.setattr(surface_pipeline, "surfacify", surfacify)
+        monkeypatch.setattr(appearance_pipeline, "build_appearance", build_appearance)
+        monkeypatch.setattr(dense_pipeline, "prune_intermediates", prune)
+        return log
+
+    def _run(self, tmp_path, log, **kw):
+        from scripts.world_build_session import final_surface_stages
+        from tower.world_builder.store import WorldStore
+
+        args = dict(solved=True, appearance=True, prune_depth_work=True,
+                    should_stop=lambda: log["stop"], stop_source=lambda: "stdin")
+        args.update(kw)
+        return final_surface_stages(WorldStore(tmp_path), WORLD, SESSION, **args)
+
+    def test_surface_then_appearance_then_prune_with_the_final_presets(self, tmp_path, calls):
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface", "appearance", "prune"]
+        sp, ap = calls["surface_params"], calls["appearance_params"]
+        # Union masks at Stop (OneFormer alone during the walk), final consistency.
+        assert sp.transient_detector == "union" and ap.transient_detector == "union"
+        assert sp.quality != "live" and sp.depth_consistency
+        assert (sp.consistency_outer, sp.consistency_warm_outer) == (5, 2)
+        assert calls["surface_force"] is True
+        assert calls["surface_stop"]() is False and calls["appearance_stop"]() is False
+        assert report["surface"]["attempted"] and report["surface"]["depth_work_pruned_bytes"] == 123
+        assert report["appearance"]["attempted"] and report["appearance"]["state"] == "ok"
+
+    def test_the_live_child_uses_oneformer_and_the_warm_live_iterations(self):
+        from tower.world_builder.appearance import AppearanceParams
+        from tower.world_builder.surface import SurfaceParams
+
+        live = SurfaceParams.live()
+        assert live.transient_detector == "oneformer" and live.depth_consistency
+        assert (live.consistency_outer, live.consistency_warm_outer) == (3, 1)
+        assert AppearanceParams.live().transient_detector == "oneformer"
+
+    def test_a_hard_stop_before_it_attempts_nothing(self, tmp_path, calls):
+        calls["stop"] = True
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == []
+        assert report == {"surface": {"attempted": False,
+                                      "reason": "hard stop (stdin) during finalization"}}
+
+    def test_a_hard_stop_during_the_surface_skips_the_rest(self, tmp_path, calls):
+        calls["stop_in"] = "surface"
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface"]
+        assert report["surface"]["state"] == "stopped" and "appearance" not in report
+
+    def test_a_hard_stop_during_the_appearance_keeps_the_depth_work(self, tmp_path, calls):
+        """The stopped appearance is rebuilt by the next run, which needs the
+        per-frame depth work; pruning it after a hard stop made that rebuild
+        refuse every frame."""
+        calls["stop_in"] = "appearance"
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface", "appearance"]
+        assert report["appearance"]["state"] == "stopped"
+        assert "depth_work_pruned_bytes" not in report["surface"]
+
+    def test_a_surface_that_did_not_build_gets_no_appearance_and_no_prune(self, tmp_path, calls):
+        calls["surface_state"] = "failed"
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface"] and "appearance" not in report
+
+    def test_a_failed_appearance_still_prunes(self, tmp_path, calls):
+        calls["appearance_state"] = "unavailable"
+        self._run(tmp_path, calls)
+        assert calls["order"] == ["surface", "appearance", "prune"]
+
+    def test_no_solve_no_surface(self, tmp_path, calls):
+        report = self._run(tmp_path, calls, solved=False)
+        assert calls["order"] == [] and report["surface"]["attempted"] is False
+
+    def test_without_appearance_or_with_densify(self, tmp_path, calls):
+        self._run(tmp_path, calls, appearance=False)
+        assert calls["order"] == ["surface", "prune"]
+        calls["order"].clear()
+        self._run(tmp_path, calls, prune_depth_work=False)
+        assert calls["order"] == ["surface", "appearance"]
+
+    def test_main_runs_it_after_the_final_solve_and_before_the_dense_stage(self):
+        import inspect
+
+        import scripts.world_build_session as B
+
+        src = inspect.getsource(B.main)
+        assert src.index("solver.run_final(") < src.index("final_surface_stages(") < src.index(
+            "densify(")
+        assert "should_stop=stop_request.hard_asked_for" in src[src.index("final_surface_stages("):]
 
 
 def test_the_cli_inspects_what_it_built(world, capsys):

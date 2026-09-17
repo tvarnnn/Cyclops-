@@ -1368,6 +1368,101 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     }
 
 
+def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
+                         solved: bool, appearance: bool, prune_depth_work: bool,
+                         should_stop, stop_source=lambda: None) -> dict:
+    """The finished world's surface stages, after Stop, in THIS process.
+
+    Returns the report entries (`surface`, and `appearance` when asked). In order,
+    each stage skipped rather than truncated on a hard stop (`should_stop`):
+
+    1. `surfacify(force=True)` with the FINAL parameters (`SurfaceParams()`):
+       depth, then the transient detector masks under **union** (Grounding DINO +
+       SAM 2 on top of the OneFormer masks the live child already cached --
+       the cache is per component, so OneFormer is not run twice), then the depth
+       consistency field **warm-started** from the live child's field (the key
+       differs: final outer iterations and a later solve), then fusion, the plane
+       snap and the levels;
+    2. the final appearance on that surface, with the final parameters (union
+       masks, read from the same cache), only if the surface is `ok`;
+    3. pruning the per-frame depth work, only after both, because the appearance
+       reads each frame's fill mask and raw prediction from it.
+
+    The live child (`BackgroundSurface`, `scripts/world_surface.py --live`) runs
+    the same order with the live presets (OneFormer only, fewer outer iterations)
+    and is terminated before this starts. Extracted from `main` so the order,
+    the parameters and the stop behaviour are tested by running it.
+    """
+    report: dict = {}
+    if should_stop():
+        report["surface"] = {
+            "attempted": False,
+            "reason": f"hard stop ({stop_source()}) during finalization",
+        }
+        return report
+    if not solved:
+        report["surface"] = {
+            "attempted": False,
+            "reason": "a surface needs a global solve; there is none",
+        }
+        return report
+    from tower.world_builder.surface import SurfaceParams  # noqa: PLC0415
+    from tower.world_builder.surface_pipeline import surfacify  # noqa: PLC0415
+
+    surface_result = surfacify(
+        store, world_id, session_id,
+        # The final preset, named rather than defaulted, so the union detector
+        # and the final consistency iterations are what this line says.
+        params=SurfaceParams(),
+        # `force`, because the live stage has almost certainly left a
+        # COARSE artifact for this same solve behind. Without it the
+        # "already built from this solve" short-circuit would see a
+        # matching digest and keep the walk-time reconstruction as the
+        # finished world -- the exact failure the final stage exists
+        # to prevent. The parameters differ, so the params digest
+        # differs too and the short-circuit would not in fact fire;
+        # this is belt and braces on the thing that would be worst to
+        # get wrong.
+        force=True,
+        should_stop=should_stop,
+    )
+    report["surface"] = {"attempted": True, **surface_result.as_dict()}
+    # The final appearance, on the final surface, BEFORE the depth work
+    # is pruned below: it reads each frame's fill mask and raw depth
+    # prediction from that work. Skipped on a hard stop like the rest.
+    if appearance and surface_result.state == "ok":
+        if should_stop():
+            report["appearance"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_source()}) during finalization",
+            }
+        else:
+            from tower.world_builder.appearance import AppearanceParams  # noqa: PLC0415
+            from tower.world_builder.appearance_pipeline import (  # noqa: PLC0415
+                build_appearance,
+            )
+
+            appearance_result = build_appearance(
+                store, world_id, session_id, params=AppearanceParams(),
+                should_stop=should_stop,
+            )
+            report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
+    if prune_depth_work and surface_result.state == "ok" and not should_stop():
+        # The per-frame depth work is ~0.5 GB for a walk and nothing in
+        # the product reads it once the final surface exists; a later
+        # rebuild recomputes it. The dense stage prunes its own when on.
+        # Not after a hard stop: an appearance stopped half-way would be
+        # rebuilt by the next run, and it needs this work to be rebuilt.
+        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+            dense_dir,
+            prune_intermediates,
+        )
+
+        report["surface"]["depth_work_pruned_bytes"] = prune_intermediates(
+            dense_dir(store, world_id, session_id))
+    return report
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
@@ -2169,65 +2264,14 @@ def main(argv=None) -> int:
     # none, which is why the artifact is published atomically and why the
     # format checks its own length on read.
     if args.surface:
-        if stop_request.hard_asked_for():
-            report["surface"] = {
-                "attempted": False,
-                "reason": f"hard stop ({stop_request.source}) during finalization",
-            }
-        elif not (solve_report or {}).get("solved"):
-            report["surface"] = {
-                "attempted": False,
-                "reason": "a surface needs a global solve; there is none",
-            }
-        else:
-            from tower.world_builder.surface_pipeline import surfacify  # noqa: PLC0415
-
-            surface_result = surfacify(
-                store, world_id, session_id,
-                # `force`, because the live stage has almost certainly left a
-                # COARSE artifact for this same solve behind. Without it the
-                # "already built from this solve" short-circuit would see a
-                # matching digest and keep the walk-time reconstruction as the
-                # finished world -- the exact failure the final stage exists
-                # to prevent. The parameters differ, so the params digest
-                # differs too and the short-circuit would not in fact fire;
-                # this is belt and braces on the thing that would be worst to
-                # get wrong.
-                force=True,
-                should_stop=stop_request.hard_asked_for,
-            )
-            report["surface"] = {"attempted": True, **surface_result.as_dict()}
-            # The final appearance, on the final surface, BEFORE the depth work
-            # is pruned below: it reads each frame's fill mask and raw depth
-            # prediction from that work. Skipped on a hard stop like the rest.
-            if args.appearance and surface_result.state == "ok":
-                if stop_request.hard_asked_for():
-                    report["appearance"] = {
-                        "attempted": False,
-                        "reason": f"hard stop ({stop_request.source}) during finalization",
-                    }
-                else:
-                    from tower.world_builder.appearance_pipeline import (  # noqa: PLC0415
-                        build_appearance,
-                    )
-
-                    appearance_result = build_appearance(
-                        store, world_id, session_id,
-                        should_stop=stop_request.hard_asked_for,
-                    )
-                    report["appearance"] = {"attempted": True,
-                                            **appearance_result.as_dict()}
-            if not args.densify and surface_result.state == "ok":
-                # The per-frame depth work is ~0.5 GB for a walk and nothing in
-                # the product reads it once the final surface exists; a later
-                # rebuild recomputes it. The dense stage prunes its own when on.
-                from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
-                    dense_dir,
-                    prune_intermediates,
-                )
-
-                report["surface"]["depth_work_pruned_bytes"] = prune_intermediates(
-                    dense_dir(store, world_id, session_id))
+        report.update(final_surface_stages(
+            store, world_id, session_id,
+            solved=bool((solve_report or {}).get("solved")),
+            appearance=args.appearance,
+            prune_depth_work=not args.densify,
+            should_stop=stop_request.hard_asked_for,
+            stop_source=lambda: stop_request.source,
+        ))
 
     # Dense reconstruction last (after the surface, which shares its depth
     # stage), because it is the most expensive thing here

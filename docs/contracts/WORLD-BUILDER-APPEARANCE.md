@@ -686,7 +686,14 @@ answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
   A first run downloads 2.14 GB (934 + 323 + 881 MB, logged).
 - **Final.** After Stop the builder runs the final surface, then the final
   appearance, then prunes the depth stage's work — in that order, because the
-  appearance needs `_fill.npy` and `_pred.npy`.
+  appearance needs `_fill.npy` and `_pred.npy`
+  (`scripts/world_build_session.py::final_surface_stages`). Both stages get the
+  final presets by name (`SurfaceParams()`, `AppearanceParams()`: `union` masks,
+  5 cold / 2 warm consistency iterations, warm-started from the live child's
+  field); the live child is terminated first. A hard stop skips whatever has
+  not started, and **after a hard stop the depth work is not pruned**, so the
+  stopped appearance can be rebuilt without recomputing it (2026-09-17; before,
+  it was pruned and `world_appearance.py` then refused every frame).
 - **Rebuild** from authoritative data alone:
 
   ```
