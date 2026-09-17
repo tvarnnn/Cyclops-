@@ -365,6 +365,9 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         should_stop=should_stop)
     if gains is None:
         return _stop(root, STAGE_EXPOSURE, seconds)
+    # the per-keyframe tilt travels on the keyframes, not in the record
+    slopes = exposure.pop("slopes", None)
+    vignette = exposure.get("vignette")
     seconds[STAGE_EXPOSURE] = round(time.time() - t2, 2)
 
     # -- transients: what most other keyframes did not see there ------------
@@ -373,7 +376,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     votes = A.transient_votes([fr.source.rgb for fr in frames], opaque,
                               [fr.zp for fr in frames], gains,
                               [fr.R for fr in frames], [fr.t for fr in frames], K, params,
-                              device=device, should_stop=should_stop)
+                              device=device, should_stop=should_stop,
+                              slopes=slopes, vignette=vignette)
     if votes is None:
         return _stop(root, STAGE_TRANSIENTS, seconds)
     for i, (fr, (grid, vrec)) in enumerate(zip(frames, votes)):
@@ -434,7 +438,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     def emit(group, encoding, tier):
         blobs = []
         for fr in group:
-            rgba = A.rgba_for(fr.source.rgb, fr.transparent_core)
+            rgba = A.rgba_for(fr.source.rgb, fr.transparent_core, params.alpha_feather_px)
             blobs.append(A.encode_astc(rgba, params.astc_quality, threads)
                          if encoding == A.ENC_ASTC else A.encode_webp(rgba, params.webp_quality))
         buf = A.pack_chunk(encoding, W, H, blobs)
@@ -491,6 +495,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "translation": [float(x) for x in fr.t.reshape(-1)],
             "gain": [round(float(g), 5) for g in gains[i]],
             "gain_observations": int(gain_obs[i]),
+            "gain_slope": ([0.0, 0.0] if slopes is None
+                           else [round(float(v), 5) for v in slopes[i]]),
             "quality": round(fr.quality, 4),
             "sharpness": round(fr.sharpness, 2),
             "unobserved_fraction": round(float(src.unobserved.mean()), 4),

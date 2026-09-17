@@ -310,6 +310,114 @@ class TestThePage:
         assert text.index('name="wb-representation" content="appearance"') < 400
 
 
+def _template():
+    from tower.world_builder.appearance_render import viewer_template_path
+
+    return viewer_template_path().read_text(encoding="utf-8")
+
+
+def _section(text, start, end):
+    return text[text.index(start):text.index(end, text.index(start))]
+
+
+class TestTheBlend:
+    """What the page draws (WORLD-BUILDER-WORLDS.md §4), checked on its source:
+    the renderer runs only in a browser, and the behaviour is measured there by
+    the viewer-polish lane (Glasses-scratch/wb-final-recon/fixit/viewer-polish)."""
+
+    def test_the_script_parses(self, built):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("no node on this host to parse the page's script")
+        from tower.world_builder.appearance_render import build_appearance_page
+
+        html = build_appearance_page(built.store, WORLD, SESSION, transport="tower")
+        script = html[html.index("<script>") + len("<script>"):html.rindex("</script>")]
+        r = subprocess.run([node, "--check", "-"], input=script, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr[-2000:]
+
+    def test_the_config_carries_the_measured_blend_constants(self, built):
+        from tower.world_builder import appearance_render as R
+
+        config = R.build_appearance_config(built.store, WORLD, SESSION)
+        assert config["border_feather_px"] == R.BORDER_FEATHER_PX == 80
+        assert config["edge_fade_px"] == R.EDGE_FADE_PX
+        assert config["blend_temperature"] == R.BLEND_TEMPERATURE
+        assert config["source_fade_ms"] == R.SOURCE_FADE_MS > 0
+        assert config["consensus"] == R.CONSENSUS
+
+    def test_no_test_switches_a_source_on_or_off_between_neighbouring_pixels(self):
+        blend = _section(_template(), "const FS_BLEND", "/* ---------- main")
+        # the first page's hard cuts
+        assert "pc.z > zs * 1.03" not in blend
+        assert "if (ang > 1.0472) continue;" not in blend
+        assert "smoothstep(0.5, 0.95, c.a)" not in blend
+        # their soft replacements
+        assert "float visibility(" in blend and "smoothstep(0.015, 0.045" in blend
+        assert "smoothstep(0.80, 1.0472, ang)" in blend
+        assert "smoothstep(0.5, uBorder, e)" in blend
+        assert "exp(-(pen[i] - pmin) / uTemp)" in blend
+
+    def test_a_minority_colour_is_voted_down(self):
+        blend = _section(_template(), "const FS_BLEND", "/* ---------- main")
+        assert "uConsensus" in blend and "float cdist(" in blend
+        # the voters are the k + 2 best, never every candidate
+        assert "vthr = (n > k + 2) ? s[k + 2]" in blend
+
+    def test_the_photometric_model_is_applied(self):
+        text = _template()
+        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        assert "uGain[i] * exp(dot(uSlope[i], q) + uVig.x * r2 + uVig.y * r2 * r2)" in blend
+        assert "kf.gain_slope" in text and "man.exposure.vignette" in text
+
+    def test_highlights_roll_off_below_white(self, built):
+        from tower.world_builder.appearance_render import build_appearance_config
+
+        text = _template()
+        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        ceiling = float(re.search(r"#define TONE_CEILING ([0-9.]+)", blend).group(1))
+        assert ceiling < 0.99                                   # the brightest output is not white
+        assert "float y = uKnee + span * (1.0 - exp(-(m - uKnee) / span));" in blend
+        assert "if (m <= uKnee) return x;" in blend
+        knee = build_appearance_config(built.store, WORLD, SESSION)["tone_knee"]
+        assert 0.3 <= knee < ceiling
+
+    def test_a_changed_choice_of_sources_crossfades(self):
+        text = _template()
+        assert "function setChosen(" in text and "function updatePresence(" in text
+        assert "uPres[i]" in _section(text, "const FS_BLEND", "/* ---------- main")
+        maxc = int(re.search(r"const MAXC = (\d+);", text).group(1))
+        cands = int(re.search(r"candidates: (\d+),", text).group(1))
+        assert maxc > cands                                     # room for sources fading out
+
+    def test_the_border_with_nothing_fades_inward_on_a_plain_background(self):
+        text = _template()
+        background = _section(text, "const GLSL_BACKGROUND", "`;")
+        assert "texture(" not in background and "texelFetch(" not in background
+        composite = _section(text, "const FS_COMPOSITE", "}`;")
+        # alpha only ever shrinks from the layer's own evidence
+        assert "alpha *= smoothstep(" in composite and "float alpha = layer.a;" in composite
+
+    def test_proxy_nobody_saw_is_drawn_as_nothing_but_still_occludes(self):
+        text = _template()
+        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        assert "if (!observed){ o = vec4(0.0); return; }" in blend      # no tint, no fog
+        assert "uFogLift" not in text and "uGhost" not in text
+        # the depth prepass still draws the whole proxy before the blend
+        pass_ = _section(text, "function blendPass(", "const P = G.blend;")
+        assert "gl.colorMask(false, false, false, false);" in pass_ and "drawMesh();" in pass_
+
+    def test_the_opening_is_the_most_drawn_frame_at_the_canvas_aspect(self):
+        text = _template()
+        opening = _section(text, "function openingScore(", "/* -------- context loss")
+        assert "canvas.width / Math.max(1, canvas.height)" in opening
+        assert "r.drawn * (0.85 + 0.15 * wide)" in opening
+        assert "d * d" not in opening                           # not the old distance-squared area
+
+
 class TestTheRoute:
 
     def test_the_header_policy_matches_the_page(self, built):

@@ -121,32 +121,68 @@ enforced).
   client on the Tower's network can already call. No other value is accepted,
   and no policy ever allows `*`, `http:`, `https:`, `img-src` or `script-src`
   beyond inline.
-- **What it draws.** The proxy mesh, depth-prepassed; per fragment, up to ten
-  candidate keyframes chosen per frame on the CPU from a 32×24 probe of the
-  proxy, and the **k = 4** best by unstructured-lumigraph penalty (angle to the
-  viewing ray, distance ratio, 16 px border feather, keyframe quality) blended
-  with ULR weights. A source contributes only where the point is in its frame,
-  visible from it (its depth, rendered **on the device** from the proxy at full
-  resolution and min-pooled 4×4 into an R16UI array), within 60° of the viewing
-  ray, and opaque (**alpha < 0.5 is zero weight**, feathered to 0.95). Each
-  sample is divided by its keyframe's gain. **Unshaded**: no lighting term; one
-  display mapping for every pixel (exposure 1.8, a roll-off above 0.7, γ 1.15).
-  A proxy point no source covers is drawn as a faint flat tint over the dark
-  background (no hatching); where there is no proxy the background shows.
+- **What it draws** (revised 2026-09-17, fix-it viewer-polish lane). The proxy
+  mesh, depth-prepassed; eight candidate keyframes chosen per frame on the CPU
+  from a 32×24 probe of the proxy (a keyframe already on screen scores ×1.12, so
+  the choice changes less while the camera moves), plus up to four still fading
+  out of the previous choice (12 bound at most). **A changed choice crossfades**:
+  every bound source carries a presence that moves 0 ↔ 1 over 280 ms.
+  Per fragment, each source gets a **confidence**, the product of soft tests —
+  in its frame (weight rises over 80 source px from its image border), visible
+  from it (its depth, rendered **on the device** from the proxy at full
+  resolution and min-pooled 4×4 into an R16UI array; the test fades from 1.5% to
+  4.5% beyond it, and where the nearest depth block is in doubt it is evaluated
+  on the 2×2 neighbouring blocks and interpolated), within 60° of the viewing ray
+  (fading from 46°), its **alpha as a weight** (APPEARANCE §5.6), and its
+  presence — so no test switches a source on or off between neighbouring pixels.
+  Penalty = angle + 0.15·distance ratio (capped) + 0.10·(1 − quality) +
+  2·(1 − confidence)³. The **k = 4** best blend with weight
+  confidence × exp(−(penalty − best)/0.07) × a smooth cut below the 5th
+  penalty (×0.3 for a sample clipped in its source). Then a **consensus** over the
+  k + 2 best: a soft medoid of their colours, and every weight × 1/(1 + (d/0.35)²)
+  for its brightness-relative distance d to it, so a colour a minority of good
+  sources saw (a door standing open in a few frames) is voted down. Each sample
+  is divided by its keyframe's photometric model (APPEARANCE §5.4: gain, tilt,
+  falloff). **Unshaded**: no lighting term; one display mapping for every pixel
+  (exposure 1.8, a hue-preserving roll-off above 0.6 that approaches 0.97 and
+  never reaches white, γ 1.15).
+  The layer's alpha is the **evidence** 1 − Π(1 − confidence′), where
+  confidence′ uses a 20 px border feather and only the last 3° before 60° (the
+  angle lowers a source's weight, not the evidence that it saw the point), so a
+  place every source masked fades out instead of cutting. The frame is that
+  layer composited over the **background, a dark smooth vignette, never a
+  texture**, with a soft edge wherever nothing is drawn: where the evidence
+  exceeds 0.02 is blurred over 8 CSS px (two separable passes) and alpha rises
+  from 0 at that border to 1 inside it. **Proxy that no kept image covers is
+  drawn exactly as "nothing"** — the same background, the same soft edge — not
+  as a tint (revised 2026-09-17: on wide views the tint read as dark angular
+  shards floating in the room); it still writes depth in the prepass, so it
+  still hides what is behind it. Fading is only ever inward; a pixel with no
+  evidence never gains colour. (A fade by distance over the mesh to its
+  open edges was built and rejected: 17% of the canonical proxy's edges are open,
+  and its sliver triangles with three rim vertices went fully transparent,
+  shredding walls into dark triangles.)
 - **Formats and memory.** ASTC 6×6 (`WEBGL_compressed_texture_astc`) into one
   `TEXTURE_2D_ARRAY` allocated once at the phone budget (128 layers, capped at
   192): 13.1 MB colour + 3.7 MB depth + 3.7 MB proxy buffers = 20.5 MB on the
-  canonical world, reported in `window.__wbAppearance.gpu` / `gpuBytes` (the
-  drawing buffer, about 7 bytes a pixel, is reported beside it, not in it).
+  canonical world, reported in `window.__wbAppearance.gpu` / `gpuBytes`. Beside
+  it, not in it, both scaling with the canvas: the drawing buffer (about 7 bytes
+  a pixel) and the surface layer + blurred coverage (`gpu.layers`, 8 bytes a
+  pixel: 5.0 MB at 900×700, 10.5 MB for a 390×844 portrait at the capped device
+  pixel ratio 2).
   Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
   (42 MB colour) and the caption says the set is reduced.
 - **Navigation.** Walk (the recorded path, look-around, two-finger swipe to
   step), Orbit (drag, pinch, pan), Reset, as the surface page. It opens in Walk
-  at the recorded pose whose view holds the **most observed surface**: every
-  ⌈n/32⌉-th recorded pose (29 of 198 on the canonical world) is rendered at
-  40×64 in the phone's portrait aspect through the real blend, and the
-  observed pixels are summed weighted by distance squared (surface area, not
-  pixel count). The horizon is levelled to `CONFIG.up`.
+  at the recorded pose whose **rendered frame is most drawn**, with a mild
+  preference for wider content: every ⌈n/32⌉-th recorded pose is rendered at 64
+  px on the long side **in the canvas's own aspect** through the real blend,
+  scored `drawn × (0.85 + 0.15 × min(1, mean distance / (2.5 × z_ref)))` (drawn =
+  mean evidence alpha), then refined around the best at a third of the step
+  (35 renders on the canonical world). Revised 2026-09-17: the first rule,
+  observed pixels × distance², preferred far half-empty views and opened the
+  canonical world at pose 71 (46% observed, 52% black). The horizon is levelled
+  to `CONFIG.up`.
 - **Live.** The page polls the revision route every 10 s (backing off to 120 s
   while `live` is false and nothing changed). A new `appearance.revision`
   fetches the manifest and only the chunks whose digest it lacks, overwrites

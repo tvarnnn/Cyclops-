@@ -65,11 +65,35 @@ PAGE_REVISION = "appearance:1"
 ASTC_LAYER_CAP = 192
 RGBA8_LAYER_CAP = 48
 
-# Display mapping of the dim captured frames: a gain, a highlight shoulder
-# above 0.7 (not a clamp), and a mild gamma. It is the same for every pixel;
-# it adds no lighting and moves no colour between surfaces.
+# Display mapping of the dim captured frames: a gain, a hue-preserving
+# highlight roll-off above 0.6 that approaches 0.97 and never reaches white (not
+# a clamp), and a mild gamma. It is the same for every pixel; it adds no
+# lighting and moves no colour between surfaces.
 DISPLAY_EXPOSURE = 1.8
 DISPLAY_GAMMA = 1.15
+# Where the roll-off starts. Canonical world, 6 views: 0.6 put 12.3% of drawn
+# pixels at >= 240 (first page 18.1%, 0.75 18.9%); none reach 250 either way.
+TONE_KNEE = 0.6
+
+# The blend (WORLD-BUILDER-WORLDS.md §4), measured on the canonical world by the
+# fix-it viewer-polish lane (Glasses-scratch/wb-final-recon/fixit/viewer-polish):
+# - a source's WEIGHT rises over 80 source pixels in from its image border (its
+#   evidence keeps 20): a keyframe's rectangle showed as a brightness step on
+#   walls. Seam excess (gradient on source switches minus nearby, 8-bit, 34
+#   views): first page 6.67, soft weights with a 20 px feather 5.59, 80 px 5.16,
+#   with the texture gradient beside the seams 3.75 / 3.40 / 3.50;
+# - softmax temperature 0.07 rad of penalty: 0.15 removed a little more seam
+#   (5.01) but blurred texture (3.06);
+# - the room fades out over 8 CSS px where it borders nothing (screen space);
+# - robust consensus among the k + 2 best sources, full strength;
+# - a changed choice of sources crossfades over 280 ms;
+# - proxy no kept image covers is drawn as the background (with the same soft
+#   edge), not as a dark tint: on wide views the tint read as dark shards.
+BLEND_TEMPERATURE = 0.07
+BORDER_FEATHER_PX = 80
+EDGE_FADE_PX = 8
+CONSENSUS = 1.0
+SOURCE_FADE_MS = 280
 
 
 class AppearanceViewerUnavailable(Exception):
@@ -159,7 +183,13 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "rgba8_layer_cap": RGBA8_LAYER_CAP,
         "exposure": DISPLAY_EXPOSURE,
         "gamma": DISPLAY_GAMMA,
+        "tone_knee": TONE_KNEE,
         "k": 4,
+        "blend_temperature": BLEND_TEMPERATURE,
+        "border_feather_px": BORDER_FEATHER_PX,
+        "edge_fade_px": EDGE_FADE_PX,
+        "consensus": CONSENSUS,
+        "source_fade_ms": SOURCE_FADE_MS,
     }
 
 
