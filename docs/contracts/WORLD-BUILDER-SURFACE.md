@@ -16,8 +16,13 @@ distance field that was fused from posed depth maps.
 
 The depth maps are the dense stage's: monocular depth per keyframe, fitted by
 a robust affine to the sparse points the global solve triangulated, gated on a
-held-out residual. This stage adds the fusion, the surface, and nothing else
-about where geometry comes from.
+held-out residual. Before fusion, each frame's affine depth is passed through
+the **depth consistency field** (`WORLD-BUILDER-DENSE.md` §11): a smooth
+per-keyframe scale-and-offset correction solved jointly over every gated frame
+against the sparse points and against the other frames' depth, and applied
+only when held-out checks say it helps. This stage adds that correction, the
+fusion, the surface, the plane snap (§3), and nothing else about where
+geometry comes from.
 
 ## 2. What this artifact CLAIMS
 
@@ -67,12 +72,25 @@ about where geometry comes from.
 
    One measurement, not a property: on the canonical capture, the faces within
    0.5 units of the walked path went from 2,330 (all contradicted) to 0.
-4. **The coordinate frame is the solve's**, identical to
+4. **The frames were made to agree before they were fused, or the manifest
+   says why not.** `detail.depth_consistency.state` is `applied` when every
+   gated frame's depth was fused through the correction field, and then the
+   field beat the plain affine on held-out sparse points AND on held-out frame
+   pairs (`detail.depth_consistency.heldout`). Any other state -- `refused`,
+   `failed`, `skipped`, or the key absent (built before 2026-09-17) -- means
+   the plain affine was fused. The evidence tests of claim 1 count frames by
+   the same corrected depth that was fused.
+
+   This is a claim about agreement, not about truth. Frames can agree on a
+   wall that every one of them bends the same way: on the canonical capture
+   the corrected walls bow by about 5-8 voxels over 8-10 units, where the solve
+   has almost no sparse points to say otherwise.
+5. **The coordinate frame is the solve's**, identical to
    `solve/<session>/solution.json`: world-to-camera poses, `x_cam = R·X + t`,
    OpenCV axes with y down. It is NOT the frame `world.json`'s
    `pose_convention` block describes, which belongs to the derived tree's
    segment-local poses.
-5. **Scale is inherited, never invented.** `manifest.scale` is copied verbatim
+6. **Scale is inherited, never invented.** `manifest.scale` is copied verbatim
    from the world's `ScaleState`. When the world's scale is `unknown` so is
    the artifact's, and no length in the viewer is labelled in metres.
 
@@ -88,7 +106,7 @@ future change that fills unobserved space must break the format identifier
 rather than quietly relax this.** A reader that sees `wb-surface-mesh/1` is
 entitled to believe every triangle was measured.
 
-Two things that are permitted and are not closure, because both are bounded
+Three things that are permitted and are not closure, because all are bounded
 by observation:
 
 - **Averaging inside the truncation band.** A voxel's value is the weighted
@@ -98,6 +116,33 @@ by observation:
   the marching-cubes staircase. `manifest.detail.median_vertex_move_voxels`
   records how far, in voxels, the median vertex moved; a reader may treat that
   as the artifact's geometric slack.
+- **Plane snap** (`params.plane_snap`, on by default; `surface.snap_planes`).
+
+  *What it is.* After smoothing, large planes are found in the mesh itself.
+  A plane is snapped only if all three hold:
+  - its connected area is at least `snap_min_area_frac` x (scene scale)^2
+    (6 square units on the canonical capture);
+  - its own least-squares fit has RMS at most `snap_tol_voxels` (2.5 voxels);
+  - at least `snap_min_frames` (8) keyframes' fused depth measures it.
+
+  A vertex of an accepted plane moves only along the plane's normal, onto the
+  plane: fully within the tolerance, smoothly less out to twice it, and not at
+  all beyond. Only vertices within twice the tolerance whose (neighbourhood-
+  smoothed) normal is within 20 degrees of the plane's are candidates.
+
+  *What it is not.* It adds no vertex and no face, removes none, closes no
+  hole, and never moves a vertex by more than twice the tolerance or in any
+  direction but the plane's normal. A plane therefore never extends past the
+  surface that was reconstructed, and a hole in a wall stays a hole. Structure
+  that stands off a plane by more than twice the tolerance (a picture frame, a
+  shelf), or that is turned away from it, does not move. It is not a claim that
+  the room is made of planes: a surface the gates refuse keeps its measured
+  shape. It does not fix a bend the frames share -- separate segments of one
+  bowed wall can snap to slightly different planes.
+
+  `detail.plane_snap` records every accepted plane (area, fit RMS in voxels,
+  measuring frames, normal, point, moved p50/p99 in voxels), the count of
+  refused candidates, `vertices_moved`, `area_snapped` and `max_move`.
 
 ## 4. Layout
 
@@ -185,19 +230,21 @@ distinguishable from corruption.
 | `format` | `wb-surface-mesh/1` |
 | `schema_version` | 1 |
 | `input_digest` | the solve this was built from; compare with the live solve to detect staleness |
-| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle). Recomputing it from `params` alone does not reproduce it |
+| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle). It includes the consistency solver's version and parameter digest and the plane snap's parameters and version, so every surface built before them is rebuilt. Recomputing it from `params` alone does not reproduce it |
 | `params` | the full parameter set, including `quality` |
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
 | `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |
 | `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `max(floor, min(rel * d, trunc_max_voxels * voxel))` when `rel > 0` (the floor wins over the cap), and `floor` alone when `rel` is 0 |
 | `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason; `null` when the filter did not run |
+| `detail.depth_consistency` | the consistency field this surface was fused through (added 2026-09-17): `state` (`applied`, `refused`, `failed`, `skipped`), `reason`, `frames`, `cells`, `heldout.before` / `heldout.after` (held-out sparse-point `sfm` and held-out frame-pair `cross` median relative error, the plain affine vs the field), `warm_start`, `seconds`, `gpu_peak_mb`, `key`, `reused`. Only `applied` means corrected depth was fused. A surface built while the solve `failed` is never reported "already built": the next build tries the solve again |
+| `detail.plane_snap` | the plane snap's record (§3): `plane_count`, `plane_areas`, `planes[]`, `rejected`, `vertices_moved`, `area_snapped`, `max_move`, `tol`, `min_area`, `min_frames`, `seconds`. `null` when `params.plane_snap` is off |
 | `detail.voxel_coarsened_by` | how far the block budget (`params.max_blocks`) coarsened the voxel. A walk the budget cannot hold after 12 coarsening attempts is refused (`unavailable`, naming the budget) rather than built over it |
 | `voxel`, `truncation` | in scene units. `truncation` is the band a sample at the scene scale actually got, cap included (manifests written before 2026-09-16 recorded the uncapped request) |
 | `frames_used`, `frames_offered` | how much of the walk contributed |
 | `vertices`, `faces` | of level 0 |
 | `levels` | per level: level, vertices, faces, bytes |
 | `canonical_level`, `mobile_level` | which rung is the archive and which the phone gets |
-| `seconds` | per stage |
+| `seconds` | per stage: `depth`, `consistency`, `fuse`, `mesh`, `snap`, `pack` |
 | `scale` | inherited verbatim, with a note saying so |
 | `closure` | the sentence stating that unobserved space is absent, and that a hole may also be space the frames disagreed about |
 
@@ -323,4 +370,6 @@ Derived, and rebuildable from authoritative data alone:
 The authoritative inputs are the session's keyframes and the global solve.
 Deleting `surface/` loses nothing that cannot be rebuilt. The depth maps under
 `dense/<session>/work/` are shared with the point stage and are themselves
-derived; if they have been pruned, the stage recomputes them.
+derived; if they have been pruned, the stage recomputes them. So are
+`dense/<session>/consistency.json` and `consistency_field.npz`: deleting them
+costs one cold solve (about 35 s on the canonical capture).

@@ -59,6 +59,7 @@ from tower.world_builder.surface import (
     weld_mesh,
     extract_sealed,
     fill_enclosed,
+    snap_planes,
     taubin_smooth,
     truncation_for,
     truncation_rel,
@@ -354,6 +355,11 @@ class _Frames:
         poses = solution.poses or {}
         self.items = []
         self.kids = {}
+        self.image_sha1 = {}
+        # The consistency field (`depth_consistency.py`), when one was applied:
+        # `prepared` then yields corrected depth rather than the plain affine.
+        self.correction = None
+        self.consistency = None
         held = []
         for r in align.get("records", []):
             if not r.get("ok"):
@@ -370,6 +376,7 @@ class _Frames:
             if not (work / "depth" / f"{ki:05d}.npy").exists():
                 continue
             self.kids[ki] = r["kid"]
+            self.image_sha1[ki] = r.get("image_sha1")
             self.items.append((ki, float(r["a"]), float(r["b"]),
                                np.array(pose["rotation"], float).reshape(3, 3),
                                np.array(pose["translation"], float),
@@ -414,6 +421,10 @@ class _Frames:
                 continue
             z = _depth_from_prediction(pred, a, b, self.kind)
             zt = torch.as_tensor(np.asarray(z, np.float32), device=device)
+            if self.correction is not None:
+                # Validity below is decided on the CORRECTED depth, which is
+                # the depth that is fused.
+                zt = self.correction.correct(ki, zt)
             ok, cosang = depth_validity(
                 zt, self.K, params, median_depth,
                 max_depth=depth_bound(params, median_depth, zmax))
@@ -515,6 +526,17 @@ def surfacify(store, world_id: str, session_id: str, *,
         voxel = params.voxel_frac * median_depth
         trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
 
+        if params.depth_consistency:
+            t = time.time()
+            _status(root, state=STATE_RUNNING, stage=STAGE_CONSISTENCY)
+            consistency = _consistency(work.parent, frames, solution, params, median_depth,
+                                       should_stop)
+            seconds[STAGE_CONSISTENCY] = round(time.time() - t, 2)
+            if consistency.state == "stopped" or _stopped(should_stop):
+                return _stop(root, STAGE_CONSISTENCY, seconds)
+            frames.correction = consistency.field
+            frames.consistency = consistency.summary()
+
         result = _build(root, frames, params, median_depth, voxel, trunc,
                         seconds, should_stop, progress)
         if result.state != STATE_OK:
@@ -567,6 +589,28 @@ def surfacify(store, world_id: str, session_id: str, *,
         return SurfaceResult(state=STATE_FAILED, detail=str(exc))
     finally:
         lock.release()
+
+
+STAGE_CONSISTENCY = "consistency"
+
+
+def _consistency(dense_root, frames, solution, params, median_depth, should_stop):
+    """The consistency field for these frames; never raises. A failure is a
+    `failed` record and the plain affine, not a failed surface."""
+    from tower.world_builder.depth_consistency import (  # noqa: PLC0415
+        STATE_FAILED as C_FAILED,
+        ConsistencyResult,
+        ensure_consistency,
+    )
+
+    try:
+        return ensure_consistency(dense_root, frames, solution, params, median_depth,
+                                  should_stop=should_stop)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[Tower][WorldBuilder][surface] consistency field failed; "
+                         "fusing the plain affine")
+        return ConsistencyResult(C_FAILED, {"state": C_FAILED,
+                                            "reason": f"{type(exc).__name__}: {exc}"})
 
 
 def _unavailable(root: Path, detail: str) -> SurfaceResult:
@@ -822,7 +866,6 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         keep, evidence_stats = evidence_filter(V, F, views, frames.K, trunc_at, params,
                                                device)
         V, F, C = keep_faces(V, F, C, keep)
-    del views
     if not len(F):
         if evidence_stats and evidence_stats.get("faces_in"):
             s = evidence_stats
@@ -841,6 +884,17 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     V, moved = taubin_smooth(V, F, params.smooth_iterations,
                              params.smooth_lambda, params.smooth_mu)
     seconds[STAGE_MESH] = round(time.time() - t, 2)
+    snap_stats = None
+    if params.plane_snap and len(F):
+        if _stopped(should_stop):
+            return _stop(root, STAGE_MESH, seconds)
+        t = time.time()
+        # After smoothing, so the snap is the last thing to move a vertex, and
+        # against the depth the fusion used.
+        V, snap_stats = snap_planes(V, F, views, frames.K, params, voxel, median_depth,
+                                    device)
+        seconds[STAGE_SNAP] = round(time.time() - t, 2)
+    del views
     if _stopped(should_stop):
         return _stop(root, STAGE_MESH, seconds)
 
@@ -898,8 +952,24 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                            "truncation_rel": trel,
                            "evidence_filter": evidence_stats,
                            "mobile_page_fit": mobile_fit,
+                           "depth_consistency": frames.consistency,
+                           "plane_snap": _snap_summary(snap_stats),
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
+
+
+STAGE_SNAP = "snap"
+
+
+def _snap_summary(stats):
+    """The snap record for the manifest: counts and areas, and each plane's
+    fit; not the rejected examples, which stay in the log."""
+    if stats is None:
+        return None
+    keep = {k: v for k, v in stats.items() if k != "rejected_examples"}
+    keep["planes"] = [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in p.items()}
+                      for p in stats.get("planes", [])]
+    return keep
 
 
 def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4):
@@ -1136,6 +1206,12 @@ def _already_built(root: Path, digest, pdigest, force: bool):
     if digest is None or man.get("input_digest") != digest:
         return None
     if man.get("params_digest") != pdigest:
+        return None
+    # A surface fused from the plain affine because the consistency solve
+    # FAILED (not refused: a refusal is a decision about the data) is not what
+    # these parameters build; the next build tries the solve again.
+    detail = man.get("detail") if isinstance(man.get("detail"), dict) else {}
+    if ((detail or {}).get("depth_consistency") or {}).get("state") == "failed":
         return None
     levels = man.get("levels") or []
     if not levels or not all(level_file_whole(root, lv) for lv in levels):
