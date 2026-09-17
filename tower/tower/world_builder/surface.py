@@ -437,6 +437,32 @@ class SurfaceParams:
     `digest_fields` (so artifacts built before it keep their digest); the
     pipeline appends the detector's rule id to the params digest instead."""
 
+    low_weight_hidden_test: bool = True
+    """Remove a LOW-WEIGHT face (`low_weight_evidence`) that the kept surface
+    hides from every frame that supported it (`hidden_low_weight`): cast from
+    each supporting frame's centre to the face, the first kept surface is nearer
+    than the face by more than the fusion band.
+
+    WHY. A frame supports a face when its depth at the face's pixel lies within
+    the band of it. If kept surface stands between that camera and the face, the
+    frame's depth passed THROUGH that surface there -- a depth overshoot or a
+    mixed pixel -- and is no evidence for the face. A full-weight face has other
+    evidence; a low-weight face with only such support is a sheet no camera
+    that measured it could have seen. On the canonical capture those sheets
+    stood mostly behind walls, where no frame can ever contradict them, so the
+    "nothing saw through it" test admitted them. They are most of the surface no
+    kept keyframe image can see (`Glasses-scratch/wb-final-recon/fixit/final/
+    WALKTHROUGH.md` section 2), drawn as dark slabs from outside and novel views.
+
+    Measured with 10% of keyframes held out of fusion
+    (`Glasses-scratch/wb-final-recon/fixit/moved/MOVED.md`): it removed 26% of
+    the kept low-weight faces (5% of the surface area). Held-out frames
+    supported AND could see 0.5% of the removed faces, against 44% of the
+    low-weight faces kept; of the removed faces some held-out frame measured,
+    98% were hidden from every one of those frames too; held-out frames saw
+    through the removed faces 11.5% of the time, the kept low-weight faces
+    4.3%."""
+
     quality: str = "final"
     """`final` or `live`. Recorded in the manifest so a reader -- and the
     wearer -- can tell a coarse reconstruction built during the walk from the
@@ -504,6 +530,9 @@ class SurfaceParams:
             # no low-weight face and decimated with boundary weight 1.
             ("low-weight", self.low_weight_evidence, self.low_weight_min_parallax,
              LOW_WEIGHT_VERSION),
+            # A surface built before it existed kept low-weight sheets their own
+            # supporting cameras could not see.
+            ("low-weight-hidden", self.low_weight_hidden_test),
             ("lod-boundary", self.lod_boundary_weight),
         )
         if self.fill_gap_frac > 0:
@@ -1715,6 +1744,82 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     stats["dropped_support"] = int((~ok_support).sum())
     stats["faces_kept"] = int(keep.sum())
     return keep.cpu().numpy(), stats
+
+
+def hidden_low_weight(V, F, keep, weak, views, K, trunc_at, device=None):
+    """Which kept LOW-WEIGHT faces the kept surface hides from every frame that
+    supported them (`SurfaceParams.low_weight_hidden_test`).
+
+    `keep` and `weak` are bools per face: the evidence filter's decision and the
+    low-weight flag. The occluders are all faces in `keep`. A frame supports a
+    face exactly as in `evidence_filter` (valid depth at the centroid's pixel,
+    within `trunc_at` of it). For each supporting frame the ray from the frame's
+    centre to the centroid is cast through the kept surface; the face is hidden
+    from that frame when the first hit is nearer than the face by more than the
+    band (converted from depth to ray length), so a face's own neighbours never
+    hide it. A face hidden from at least one supporting frame and visible from
+    none is returned for removal. It only ever removes.
+
+    Returns (drop mask over faces, stats).
+    """
+    import torch
+
+    F = np.asarray(F, np.int64)
+    keep = np.asarray(keep, bool)
+    cand = np.nonzero(keep & np.asarray(weak, bool))[0]
+    stats = {"weak_tested": int(len(cand)), "dropped_weak_hidden": 0, "hidden_rays": 0}
+    drop = np.zeros(len(F), bool)
+    if not len(cand):
+        return drop, stats
+    try:
+        import open3d as o3d
+    except ImportError as exc:  # pragma: no cover - environment
+        raise SurfaceUnavailable(f"open3d is not installed ({exc})") from None
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Vn = np.asarray(V, np.float32)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(Vn), o3d.core.Tensor(F[keep].astype(np.uint32)))
+    Pn = Vn[F[cand]].mean(axis=1)
+    P = torch.as_tensor(Pn, device=dev)
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    visible = np.zeros(len(cand), np.int32)
+    hidden = np.zeros(len(cand), np.int32)
+    for depth, valid, R, t in views:
+        depth = depth.to(dev).float()
+        valid = valid.to(dev)
+        R = R.to(dev).float()
+        t = t.to(dev).float()
+        H, W = depth.shape
+        pc = P @ R.T + t
+        z = pc[:, 2]
+        zc = z.clamp(min=1e-6)
+        u = torch.round(pc[:, 0] / zc * fx + cx).long()
+        v = torch.round(pc[:, 1] / zc * fy + cy).long()
+        m = (z > 1e-4) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        flat = v.clamp(0, H - 1) * W + u.clamp(0, W - 1)
+        d = depth.reshape(-1)[flat]
+        m &= valid.reshape(-1)[flat] & torch.isfinite(d)
+        tr = trunc_at(d)
+        sel = torch.nonzero(m & ((d - z).abs() <= tr)).squeeze(1)
+        if sel.numel() == 0:
+            continue
+        sel_n = sel.cpu().numpy()
+        centre = (-(R.T @ t)).cpu().numpy().astype(np.float32)
+        ray = Pn[sel_n] - centre
+        dist = np.linalg.norm(ray, axis=1)
+        rays = np.empty((len(sel_n), 6), np.float32)
+        rays[:, :3] = centre
+        rays[:, 3:] = ray / np.maximum(dist, 1e-9)[:, None]
+        hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        margin = tr[sel].cpu().numpy() * dist / np.maximum(z[sel].cpu().numpy(), 1e-6)
+        h = hit < dist - margin
+        hidden[sel_n] += h
+        visible[sel_n] += ~h
+        stats["hidden_rays"] += int(len(sel_n))
+    gone = (hidden > 0) & (visible == 0)
+    drop[cand[gone]] = True
+    stats["dropped_weak_hidden"] = int(gone.sum())
+    return drop, stats
 
 
 def keep_faces(V, F, C, keep):
