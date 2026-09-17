@@ -1129,6 +1129,16 @@ class TestTheFinalChain:
         assert report["appearance"]["state"] == "stopped"
         assert "depth_work_pruned_bytes" not in report["surface"]
 
+    def test_a_stopped_appearance_keeps_the_depth_work_even_if_the_stop_is_not_sticky(
+            self, tmp_path, calls):
+        """The prune decision must not depend on `should_stop` still answering
+        True after the appearance returned `stopped`."""
+        calls["appearance_state"] = "stopped"
+        report = self._run(tmp_path, calls)
+        assert calls["order"] == ["surface", "appearance"]
+        assert report["appearance"]["state"] == "stopped"
+        assert "depth_work_pruned_bytes" not in report["surface"]
+
     def test_a_surface_that_did_not_build_gets_no_appearance_and_no_prune(self, tmp_path, calls):
         calls["surface_state"] = "failed"
         report = self._run(tmp_path, calls)

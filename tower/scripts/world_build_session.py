@@ -1427,11 +1427,13 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
         should_stop=should_stop,
     )
     report["surface"] = {"attempted": True, **surface_result.as_dict()}
+    appearance_interrupted = False
     # The final appearance, on the final surface, BEFORE the depth work
     # is pruned below: it reads each frame's fill mask and raw depth
     # prediction from that work. Skipped on a hard stop like the rest.
     if appearance and surface_result.state == "ok":
         if should_stop():
+            appearance_interrupted = True
             report["appearance"] = {
                 "attempted": False,
                 "reason": f"hard stop ({stop_source()}) during finalization",
@@ -1447,7 +1449,12 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                 should_stop=should_stop,
             )
             report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
-    if prune_depth_work and surface_result.state == "ok" and not should_stop():
+            appearance_interrupted = appearance_result.state == "stopped"
+    # Decided by what the appearance REPORTED as well as by asking again: a
+    # stop predicate need not stay true once the stage it stopped has returned
+    # (measured: a run stopped in the appearance then pruned the work it needed).
+    if (prune_depth_work and surface_result.state == "ok" and not appearance_interrupted
+            and not should_stop()):
         # The per-frame depth work is ~0.5 GB for a walk and nothing in
         # the product reads it once the final surface exists; a later
         # rebuild recomputes it. The dense stage prunes its own when on.
