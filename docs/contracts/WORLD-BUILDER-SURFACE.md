@@ -41,6 +41,12 @@ geometry comes from.
      (not a ratio), and its supporting cameras span `low_weight_min_parallax`
      (0.05: the diagonal of their centres' bounding box over the face's
      distance to the box's centre). With it off, only full-weight cubes emit.
+     With `low_weight_hidden_test` (on by default, since 2026-09-17) a kept
+     low-weight face is then removed when the kept surface hides it from
+     **every** frame that supported it: the ray from each supporting frame's
+     centre to the face meets kept surface nearer than the face by more than
+     the fusion band. Such support is depth that passed through that surface,
+     not evidence for the face.
    - *Distinct frames.* At least `min_support_frames` (2) distinct frames
      measured depth within their truncation of the face.
    - *Not seen through, not seen from behind.* Frames that measured depth
@@ -60,6 +66,31 @@ geometry comes from.
    contradiction ratio, the back-facing test, the component prune, the
    grazing limit or the far bound gained almost no pixels and added
    contradicted geometry, and none of them changed.
+
+   Why hidden low-weight faces are removed, measured
+   (`Glasses-scratch/wb-final-recon/fixit/moved/MOVED.md`): the admitted
+   low-weight faces included sheets behind walls that some frame's depth
+   reached through the wall and that no frame could ever see through, because
+   the wall blocks every view; they were most of the surface no kept keyframe
+   image covers. With 10% of keyframes held out of fusion the test removed 26%
+   of the kept low-weight faces (5% of the surface area); held-out frames
+   supported and could see 0.5% of them (44% of the low-weight faces kept),
+   98% of the removed faces a held-out frame measured were hidden from every
+   such frame too, and held-out frames saw through them 11.5% of the time
+   (kept low-weight faces 4.3%). The appearance's phone-tier coverage of the
+   proxy rose from 95.1% to 97.7%.
+
+   **Moved objects are not detected.** No rule keys on WHEN frames measured a
+   face. Measured on the same capture: kept faces whose supporting and
+   see-through frames fall in disjoint time windows are real (the split
+   predicts 97-99% of held-out votes), but they are split by VIEWPOINT as
+   much as by time: the mean supporting and see-through camera positions stand
+   0.7-1.0 face distances apart (median), within a quarter of the distance for
+   fewer than 5% of them -- and the ones inspected were static walls
+   whose monocular depth disagrees from a different distance. Removing the
+   earlier state would cut holes in real walls. A thin moved object (a phone on
+   a desk) is inside the fusion band and invisible to any depth test; a door
+   swung between passes is removed by the contradiction test where it is.
 2. **Space that was never measured is absent, not closed.** Unobserved cells
    keep zero weight, and no cube with an unobserved corner emits. The surface
    stops at the edge of what was seen.
@@ -269,7 +300,7 @@ distinguishable from corruption.
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
 | `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |
 | `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `max(floor, min(rel * d, trunc_max_voxels * voxel))` when `rel > 0` (the floor wins over the cap), and `floor` alone when `rel` is 0 |
-| `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason (`dropped_support`, `dropped_contradicted`, `dropped_back_facing`, and for low-weight faces `dropped_weak_seen_through`, `dropped_weak_parallax`), with `faces_in`, `faces_kept`, and `weak_in` / `weak_kept` (low-weight faces offered and kept; absent when `low_weight_evidence` is off or the enclosed fill is on, which does not use it); `null` when the filter did not run |
+| `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason (`dropped_support`, `dropped_contradicted`, `dropped_back_facing`, and for low-weight faces `dropped_weak_seen_through`, `dropped_weak_parallax`, `dropped_weak_hidden`), with `faces_in`, `faces_kept`, and `weak_in` / `weak_kept` (low-weight faces offered and kept, after the hidden test; absent when `low_weight_evidence` is off or the enclosed fill is on, which does not use it); `weak_tested` and `hidden_rays` (the low-weight faces the hidden test examined and the rays it cast; absent when `low_weight_hidden_test` is off); `null` when the filter did not run |
 | `detail.depth_consistency` | the consistency field this surface was fused through (added 2026-09-17): `state` (`applied`, `refused`, `failed`, `skipped`), `reason`, `frames`, `cells`, `heldout.before` / `heldout.after` (held-out sparse-point `sfm` and held-out frame-pair `cross` median relative error, the plain affine vs the field), `warm_start`, `seconds`, `gpu_peak_mb`, `key`, `reused`. Only `applied` means corrected depth was fused. A surface built while the solve `failed` is never reported "already built": the next build tries the solve again |
 | `detail.plane_snap` | the plane snap's record (§3): `plane_count`, `plane_areas`, `planes[]`, `rejected`, `vertices_moved`, `area_snapped`, `max_move`, `tol`, `min_area`, `min_frames`, `seconds`. `null` when `params.plane_snap` is off |
 | `detail.voxel_coarsened_by` | how far the block budget (`params.max_blocks`) coarsened the voxel. A walk the budget cannot hold after 12 coarsening attempts is refused (`unavailable`, naming the budget) rather than built over it |

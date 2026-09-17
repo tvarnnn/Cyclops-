@@ -55,6 +55,7 @@ from tower.world_builder.surface import (
     depth_validity,
     drop_small_components,
     evidence_filter,
+    hidden_low_weight,
     keep_faces,
     weld_mesh,
     extract_sealed,
@@ -947,6 +948,16 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     if len(F) and (params.min_support_frames > 0 or params.contradiction_ratio > 0):
         keep, evidence_stats = evidence_filter(V, F, views, frames.K, trunc_at, params,
                                                device, weak=weak)
+        if weak is not None and params.low_weight_hidden_test and keep.any():
+            # Low-weight sheets no supporting camera could see (SurfaceParams.
+            # low_weight_hidden_test), tested against the surface just kept.
+            hidden, hidden_stats = hidden_low_weight(V, F, keep, weak, views, frames.K,
+                                                     trunc_at, device)
+            keep &= ~hidden
+            evidence_stats.update(hidden_stats)
+            evidence_stats["weak_kept"] = (evidence_stats.get("weak_kept", 0)
+                                           - hidden_stats["dropped_weak_hidden"])
+            evidence_stats["faces_kept"] = int(keep.sum())
         V, F, C = keep_faces(V, F, C, keep)
     elif weak is not None and weak.any():
         # A low-weight face is admitted by the frame tests or not at all.
@@ -961,9 +972,10 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                       f"{s.get('dropped_contradicted', 0)} were seen past by at least "
                       f"{params.contradiction_ratio:g}x as many frames as measured "
                       f"them, {s.get('dropped_back_facing', 0)} were seen only "
-                      f"from behind, and {s.get('dropped_weak_seen_through', 0) + s.get('dropped_weak_parallax', 0)} "
-                      "low-weight faces were seen through or measured from too narrow "
-                      "a baseline")
+                      f"from behind, and {s.get('dropped_weak_seen_through', 0) + s.get('dropped_weak_parallax', 0) + s.get('dropped_weak_hidden', 0)} "
+                      "low-weight faces were seen through, measured from too narrow "
+                      "a baseline, or hidden by kept surface from every frame that "
+                      "measured them")
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
                   "a surface")
@@ -1148,7 +1160,10 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
              "contradiction_ratio times as many saw through it"
              + (("; where a corner fell short of min_weight, only if no frame "
                  "saw through the face and its supporting cameras spanned "
-                 "low_weight_min_parallax") if params.low_weight_evidence else
+                 "low_weight_min_parallax"
+                 + (", and not where the kept surface hid it from every frame "
+                    "that measured it" if params.low_weight_hidden_test else ""))
+                if params.low_weight_evidence else
                 "; and all eight reached min_weight")
              + ", so unobserved space is absent rather than closed over; a hole "
                "may also be space the frames disagreed about")),
