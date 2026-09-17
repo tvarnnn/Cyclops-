@@ -63,7 +63,7 @@ Per session:
 5. **An interrupted session is not hidden and is not presented as finished.** `state: "interrupted"` with `has_geometry: true` is a world a person can open and look at (the render route serves it); the row must say interrupted and must not say complete. A live Tower has no reason to hide the 2026-09-06 walk, and every reason not to call it finished.
 6. **Worlds with no sessions are shells**, left by a builder that opened a world and never received a frame (96 of 162 on the Windows box). A picker may fold them away; it must not offer them as the primary rows.
 2. **A world that cannot be read is omitted, never invented.** A session that cannot be read is omitted from its world.
-3. **No imagery, no paths.** `capture_id` is an opaque id, not a location.
+3. **No imagery, no paths.** `capture_id` is an opaque id, not a location. This listing still carries none. Imagery is served by exactly one route family, §4b, deliberately and under its own contract; nothing here or in §4 or §4a carries it.
 4. Opening a world means: subscribe with `world_id` (+ `session_id`) on the status channel, then pull geometry exactly as for the live world. There is no second geometry path.
 
 ## 4. `GET /worlds/{world_id}/render` — the interactive viewer
@@ -144,14 +144,26 @@ page to find out.
 | `session_id` | string, optional | as §4; resolved the same way |
 | `view` | string, optional | as §4. `view=diagnostics` reports the **sparse** rung, because that is the page §4 serves for it. A client showing the diagnostics rendering has nothing to follow and should not ask (the iOS app does not) |
 
-**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str, "live": bool}`,
+**200** `{"session_id": str, "representation": "surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool}}`,
 `Cache-Control: no-store`. **404** exactly when §4 would 404.
+
+`appearance` (additive, 2026-09-17) follows the session's appearance artifact
+(`WORLD-BUILDER-APPEARANCE.md`): `revision` is
+`<session_id>/appearance:<build_id>` exactly when
+`GET /worlds/{id}/appearance/{session_id}/manifest` would answer 200, and `null`
+otherwise — no artifact, a purged world, or **a session whose redaction label no
+longer matches the one the artifact was built under**, so a page holding
+textures drops them when it sees `null`. `current` is false when the artifact
+was built from an earlier solve or on an earlier surface. It is opaque, compared
+for equality, and **deliberately not part of `revision`**: a page that blends
+keyframes follows appearance builds itself, and folding them into the page
+revision would swap the page, and reset the wearer's camera, on every one.
 
 `live` (additive, 2026-09-16) is `true` while something is building **this
 session**: the world's writer lock is held by a live builder and this session is
 the one it is writing (record still open, or finalization still `pending`), or
-this session's surface or dense stage reports `running` from a live process
-**and has not yet published**: a stage whose `manifest.json` is newer than its
+this session's surface, appearance (added 2026-09-17) or dense stage reports
+`running` from a live process **and has not yet published**: a stage whose `manifest.json` is newer than its
 `running` `status.json` has written its result and is not live, although `ok`
 lands a moment later. Otherwise a poll in that gap reported the finished build as
 live, and a client that offers live builds rather than swapping them in missed
@@ -202,3 +214,31 @@ Every page §4 serves carries the same two values in its head, within its first
    carries no `wb-revision` rather than a false one. A client that does not
    step down the ladder by itself (the iOS app neither swaps nor offers a worse rung,
    `WORLD-BUILDER-IOS.md` §10) sees nothing change.
+
+## 4b. `GET /worlds/{world_id}/appearance/{session_id}/…` — the keyframes a phone blends
+
+Added 2026-09-17. **The first route family that serves imagery**, deliberately:
+the wearer's redacted keyframes, masked and bundled for view-dependent blending
+over the surface. The whole contract is `WORLD-BUILDER-APPEARANCE.md` §9; in
+short:
+
+| route | body |
+|---|---|
+| `…/manifest` | the appearance manifest, plus `currency` |
+| `…/chunk/{digest}` | a keyframe bundle (ASTC 6×6 for the phone, WebP everywhere) |
+| `…/proxy/{digest}` | the proxy mesh the keyframes were prepared against (`WBSURF01`) |
+
+- `Cache-Control: no-store`, `Pragma: no-cache`, `X-Content-Type-Options: nosniff`
+  on every response including 404s; no `ETag` or `Last-Modified`; a 200 carries
+  `X-World-Redaction` with the label that was actually applied.
+- **The redaction label is re-checked on every request**: a session whose
+  `redaction` differs from the one the artifact was built under answers 404
+  ("appearance is stale against the session's redaction record"), as does a
+  world with `images_purged`.
+- `digest` is 32 lower-hex and must be named by the current manifest. URLs carry
+  no path, file name or capture sequence number.
+- `world_id` passes `contained_world_id`; `session_id` must be one of the
+  world's sessions.
+- §4's page is unchanged by this: it still loads nothing from anywhere and its
+  CSP is still `default-src 'none'`. How a page reaches these routes is the
+  phone lane's design, not this route's.
