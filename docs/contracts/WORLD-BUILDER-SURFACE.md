@@ -185,7 +185,7 @@ distinguishable from corruption.
 | `format` | `wb-surface-mesh/1` |
 | `schema_version` | 1 |
 | `input_digest` | the solve this was built from; compare with the live solve to detect staleness |
-| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle). Recomputing it from `params` alone does not reproduce it |
+| `params_digest` | input digest plus every parameter that affects the result, then `|` and the depth backend's name (a different network changes every triangle), then `|set:<name>@<digest>` when the session reads a re-redacted keyframe set (`WORLD-BUILDER-APPEARANCE.md` §6.5). Recomputing it from `params` alone does not reproduce it |
 | `params` | the full parameter set, including `quality` |
 | `median_scene_depth` | the scene scale: the median camera-frame depth of the solve's sparse observations by gated frames (`scene_scale_source` says `sparse-observation-depth`), or the dense-depth median over every frame when the solve carries too few observations (`dense-depth-median`). Voxel size is a fraction of it |
 | `detail` | the build's record (added 2026-09-16; absent from manifests written before). Artifacts without it carry the same record in `status.json` `result.detail` until the next status write |

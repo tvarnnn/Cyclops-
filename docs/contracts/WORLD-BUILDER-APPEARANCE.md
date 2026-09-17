@@ -2,7 +2,7 @@
 
 Contract identifier: `wb-appearance-keyframes/1`.
 
-**Living document.** Added 2026-09-17 (fix-it campaign, appearance stage).
+**Living document.** Added 2026-09-17 (fix-it campaign, appearance stage). §6.5 (re-redaction) added 2026-09-17.
 
 | | |
 |---|---|
@@ -45,9 +45,10 @@ Tower does not render; it prepares.
 ## 2. What this artifact CLAIMS
 
 1. **Every non-transparent texel is a pixel a camera recorded, after face
-   redaction.** Pixels come only from `sessions/<sid>/images/<seq>.jpg`, through
-   one provenance function (`appearance.keyframe_source`), under an exact
-   redaction-label allowlist (§6). Nothing is inpainted, hallucinated, borrowed
+   redaction.** Pixels come only from the session's keyframe set
+   (`sessions/<sid>/images/<seq>.jpg`, or the re-redacted set it was switched
+   to, §6.5), through one provenance function (`appearance.keyframe_source`),
+   under an exact redaction-label allowlist (§6). Nothing is inpainted, hallucinated, borrowed
    from a neighbour, or synthesised.
 2. **Unobserved stays unobserved.** A texel whose pixel was redaction fill, a
    solid near-black block, or an occluder is transparent. A surface point that
@@ -314,16 +315,21 @@ survived exactly in every encoding measured.
 
 ### 6.1 The one source
 
-Pixels are read only from `sessions/<sid>/images/<seq>.jpg`, only inside
-`appearance.keyframe_source`. This stage never opens `solve/<sid>/images`
+Pixels are read only from the session's keyframe set, only inside
+`appearance.keyframe_source`. Which set is `WorldStore.keyframe_image_set`'s
+answer, read once per build with its label: `sessions/<sid>/images/` under
+`session.json`'s `redaction`, or the re-redacted set a session was explicitly
+switched to, under that set's label (§6.5). This stage never opens `solve/<sid>/images`
 (unredacted), raw captures, `sources.json`, `dense/<sid>/work/undist`
 (TELEA-inpainted inside the fill), `solution.rgb` or `points.json` colours.
 The undistortion is the solve's own (`global_solve._undistort_maps`).
 
 ### 6.2 The label
 
-`session.json` `redaction` is read once per build, recorded, and read again
-before the manifest is written; a change in between aborts the publish.
+The keyframe set's label -- `session.json` `redaction`, or the re-redacted
+set's (§6.5) -- is read once per build with the set, recorded, and read again
+before the manifest is written; a change of either in between aborts the
+publish.
 
 | session label | treatment |
 |---|---|
@@ -357,7 +363,8 @@ re-redacted; the final build after Stop sees the real label.
 
 | key | meaning |
 |---|---|
-| `session_redaction` | the label read from `session.json` (`null` when absent or unreadable) |
+| `session_redaction` | the label of the keyframe set read: `session.json`'s, or the re-redacted set's (§6.5); `null` when absent or unreadable |
+| `keyframe_image_set` | `null` for `sessions/<sid>/images/`; `images.redacted-<gate>@<set digest>` when the session was switched to a re-redacted set (§6.5) |
 | `redaction_effective` | the label actually applied |
 | `redactor_applied_here` | `FaceRedactor.label` when this build re-redacted, else `null` |
 | `label_trusted` | whether the stored label was on the allowlist |
@@ -377,11 +384,108 @@ Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 
 `params_digest` is the SHA-256 of: the schema version, the solve's
 `input_digest`, the proxy's SHA-256 and its source surface build, the
-depth stage's `cache_key`, `session_redaction`, `redactor_applied_here`,
+depth stage's `cache_key`, `session_redaction`, `keyframe_image_set`,
+`redactor_applied_here`,
 `fill_rule`, `unobserved_rule`, `per_frame_sha1_digest`, the occluder, exposure
 and selection parameters, and the encoder names and versions. Any change to any
 of them rebuilds; an equal digest with every named file whole is
 "already built" (`--force` rebuilds anyway).
+
+### 6.5 Re-redaction: an explicit switch to a lighter, current redaction
+
+Worlds captured under an **older rule of the same family** -- the ungated
+`faces-detected-and-filled/yunet-2023mar@0.30`, `…+plausibility1`,
+`…+plausibility2` -- carry that rule's false positives. On the canonical capture
+the ungated rule filled 12.61% of all pixels (box masks), almost all of it the
+wearer's hands, a lit PC case and bare wall; `plausibility3` on the same raw
+frames fills 5.99%, and the page's opening pose (ki 148) goes from 52.0% to 0%.
+`scripts/world_reredact.py` recovers that, by hand, never during a walk:
+
+```
+.venv\Scripts\python.exe scripts/world_reredact.py --root <root> --world <id> [--session <sid>] --dry-run
+.venv\Scripts\python.exe scripts/world_reredact.py --root <root> --world <id> [--session <sid>] --apply
+.venv\Scripts\python.exe scripts/world_reredact.py --root <root> --world <id> [--session <sid>] --revert
+```
+
+**What it writes.** `sessions/<sid>/images.redacted-<gate>/` (for today's gate,
+`images.redacted-plausibility3/`): one `<seq>.jpg` per keyframe and a
+`record.json` (`wb-reredaction-record/1`: tool version, stored label, set label,
+redactor label and model, the verification rule, the invariant, per-origin
+counts, fill totals, the stored and set digests, and per frame its `origin`,
+`detail`, `stored_sha1`, `sha1`, `raw_sha1`, fill pixel counts and recovered
+pixels). Then, **last and atomically**, `sessions/<sid>/redaction_set.json`
+(`wb-redaction-set/1`): `{active, redaction, stored_redaction, set_digest,
+record, tool_version, switched_at, history}`. `sessions/<sid>/images/` and
+`session.json` are never written. `--revert` rewrites the pointer with
+`active: null`; the set stays on disk, and a later `--apply` of the same result
+re-points to it.
+
+**Who honours it: one accessor.** `WorldStore.keyframe_image_set(world,
+session)` returns the directory and the label every build reads: the dense
+depth stage (`keyframe_image_bytes`), the surface (through the depth stage), this
+stage (`keyframe_source`, the label policy, the pack-time and serve-time label
+checks) and so the render revision's `appearance` object. A pointer is honoured
+only when `active` names an existing `images.redacted-*` directory beside
+`images/`, it carries a label and a digest, and its `stored_redaction` still
+equals `session.json`'s `redaction`; anything else reads as no switch.
+
+**Per frame.** A frame's set image is the current redactor's output on its raw
+capture frame only if all of these hold, else the set holds the **stored
+keyframe's bytes** and the record says why:
+
+| check | origin when it fails |
+|---|---|
+| a `sources.json` entry exists and reads, resolved against the Tower root (`TOWER_SOURCES_ROOT`, else `tower/`), never the cwd | `stored:raw-missing` |
+| the raw frame decodes at the stored keyframe's exact shape, every difference over 40 lies within 2 px of stored near-black (≤ 12) with at most 0.1% unexplained, and the mean absolute difference elsewhere is ≤ 3 (canonical: 398/398 true pairs, 0/397 adjacent keyframes) | `stored:raw-unverified` |
+| the redactor's result is not labelled `none` | `stored:redaction-none` |
+| **the new fill lies inside the stored fill** (fill = output ≤ 12 where the raw frame differs by > 25; stored fill dilated 3 px): re-redaction may only un-fill | `stored:fill-outside-stored` (logged) |
+| the output is a fresh image, the raw frame with nothing changed by > 40 further than 4 px from its fill | `stored:output-not-raw-plus-fill` |
+| at least 64 px were recovered | `stored:nothing-recovered` |
+
+Raw bytes are read in exactly one function (`reredaction.reredact_frame`) and
+never leave it; a set image is the redactor's own encode, a fresh q90 encode of
+the decoded frame when nothing was filled, or the stored bytes.
+
+**The whole step refuses, and nothing is switched,** when: the label is `none`,
+empty, absent or unknown (those take §6.2's re-redaction of the stored bytes); it
+is already the current label; the session has not ended; the world is purged or
+held by a live writer; no redactor is available, or its label is not the one
+this step writes (`reredaction.TARGET_LABEL`, versioned in code); any exception
+is raised; a stored keyframe is unreadable or changes during the run; no frame
+recovers anything; or a pointer is already active.
+
+**The set's label.** A switched session reads under the current label, so the
+allowlist in §6.2 applies unchanged. That is honest only if every frame's fill
+contains what the current rule fills on its raw frame: a re-redacted frame is
+that rule's output; a frame kept as `stored:nothing-recovered` has the same
+fill; a frame kept for any other reason holds the stored rule's fill, which
+contains the current rule's only for the ungated rule (every gate only removes
+boxes from the same detection pass). **So from `plausibility1` or
+`plausibility2`, an apply that would keep any frame for another reason is
+refused whole.**
+
+**Caches.** A switch changes the pixels without changing the solve, so the
+set's identity (`images.redacted-<gate>@<set digest>`, absent for `images/`)
+is part of the depth stage's cache key and `align.json`
+(`keyframe_image_set`), the fuse key, the dense points manifest, the surface
+`params_digest`, and this artifact's `params_digest` and provenance. It is
+appended only when a set is active, so no cache made before this existed is
+invalidated. Depth predictions are still reused per frame by image SHA-1, so an
+apply re-predicts only the frames whose bytes changed. After `--apply` (or
+`--revert`): `world_surface.py`, then `world_appearance.py`.
+
+**Measured on a copy of the canonical world** (b2a75ab4…, 398 keyframes,
+ungated label): 89 frames re-redacted, 309 `stored:nothing-recovered`, no
+invariant failure, no unverified raw frame; box-mask fill 12.61% → 5.99%
+(difference masks 9.83% → 4.86%), 22 frames over half filled (was 38), 7 over
+70% (was 16); ki 148 52.0% → 0%, ki 120 63.7% unchanged. 24 s on the CPU.
+
+**What it does not change.** Face recall on a real bystander is not measured by
+that capture (it has none); the case for `plausibility3` rests on its composites
+(1 of 3,232 held-out close faces lost against the ungated rule). Recovered pixels
+are first-person imagery (the wearer's hands and legs, screens, room contents)
+and inherit the session's privacy tags. When a world's raw frames are gone the
+step cannot run; a set already written is unaffected.
 
 ## 7. `manifest.json`
 
@@ -462,8 +566,9 @@ anything else is 404. URLs carry no path, file name or sequence number.
 - a world root is configured, the world and session exist, the world is not
   `images_purged` ("appearance imagery was purged");
 - a manifest exists and reads ("no appearance for this session");
-- the manifest's `session_redaction` equals `session.json`'s `redaction`
-  **now** ("appearance is stale against the session's redaction record");
+- the manifest's `session_redaction` and `keyframe_image_set` equal the
+  session's keyframe set's label and identity **now** (§6.5) ("appearance is
+  stale against the session's redaction record");
 - for a file, the manifest names it and its bytes on disk have the recorded
   size ("no such appearance file").
 
