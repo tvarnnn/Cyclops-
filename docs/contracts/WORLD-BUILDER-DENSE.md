@@ -192,8 +192,11 @@ hold raw frames, and `session.redaction` is the only record that says which. An
 earlier version of this stage asserted the boundary in a docstring and read the
 directory unconditionally.
 
-1. It reads `session.redaction` first. Anything absent, unreadable or `none`
-   means the stored keyframes are **not** trusted as redacted.
+1. It reads the keyframe set once, through `WorldStore.keyframe_image_set`:
+   `images/` under `session.redaction`, or the re-redacted set the session was
+   explicitly switched to under that set's label
+   (`WORLD-BUILDER-APPEARANCE.md` §6.5). Anything absent, unreadable or `none`
+   means the keyframes are **not** trusted as redacted.
 2. When the session says they were redacted, it reads the world's own keyframe
    image.
 3. When the session says they were not, it **applies the redaction itself**
@@ -223,6 +226,18 @@ wherever the engine had filled a face. The final build after Stop then reused
 that empty mask by image hash. The rule is versioned as `fill_rule` on each
 record and on the stage, and it is part of the depth cache key. A prediction or
 a cached stage made under another rule is not reused.
+
+**The raw frame's path** is the solve's `sources.json` entry, resolved against
+the Tower root (`TOWER_SOURCES_ROOT`, else `tower/`), never against the process
+cwd. Relative entries (`data\captures\…`) used to resolve against the cwd, so a
+stage run from anywhere but `tower/` found no raw frame and fell back to the
+shape guess, which misses a fill box touching dark scene.
+
+**A re-redaction switch** changes the keyframes without changing the solve, so
+its set identity is appended to the depth and fuse cache keys, recorded as
+`keyframe_image_set` in `align.json` and the points manifest, and checked by the
+surface's depth-cache test. It is absent (and every older key unchanged) while
+builds read `images/`.
 
 ## 8. `GET /worlds` — the `dense` object
 

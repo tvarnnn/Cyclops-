@@ -327,7 +327,10 @@ touching or within 5% (of the frame's short side) of the frame edge is also
 filled on facelike landmarks alone, because a close face cut by the edge is
 found at no reduced scale; landmarks too broken to judge always fill.
 `plausibility2` lacked the edge exception. `plausibility1` differed above 25%
-everywhere, where facelike landmarks alone filled the box. The gate exists because on real
+everywhere, where facelike landmarks alone filled the box. An older session can
+be explicitly re-redacted on the Tower under the current rule
+(`WORLD-BUILDER-APPEARANCE.md` §6.5); its `session.json` label does not change,
+and the appearance it builds carries the current label in `X-World-Redaction`. The gate exists because on real
 captures 220 of 240 detections were not faces (hands, a cup, bare wall) and
 blacked out 12.6% of every frame; it changes what is filled, not the
 detector or its threshold. Nothing parses any of these values. Never "redacted", "anonymised"

@@ -249,6 +249,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "surface_built_at": surface.get("built_at"),
         "depth_cache_key": align.get("cache_key"),
         "session_redaction": policy.session_redaction,
+        "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
         "redactor_applied_here": policy.redactor_label,
         "fill_rule": FILL_RULE,
         "unobserved_rule": A.UNOBSERVED_RULE,
@@ -436,12 +437,14 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     seconds[STAGE_ENCODE] = round(time.time() - t4, 2)
 
     # -- publish ------------------------------------------------------------
-    now_label = A.read_session_redaction(store, world_id, session_id)
-    if now_label != policy.session_redaction:
+    now_label, now_set = A.keyframe_set_identity(store, world_id, session_id)
+    built_set = getattr(policy.image_set, "cache_token", None)
+    if now_label != policy.session_redaction or now_set != built_set:
         _discard_unpublished(root, written)
         raise A.AppearanceUnavailable(
             f"the session's redaction label changed during the build "
-            f"({policy.session_redaction!r} -> {now_label!r}); not published")
+            f"({policy.session_redaction!r} -> {now_label!r}, keyframe set "
+            f"{built_set!r} -> {now_set!r}); not published")
     if _stopped(should_stop):
         return _stop(root, STAGE_ENCODE, seconds, discard=(root, written))
 
@@ -491,6 +494,9 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "params": params.as_dict(),
         "appearance_provenance": {
             "session_redaction": policy.session_redaction,
+            # The re-redacted keyframe set these pixels came from (contract
+            # section 6.5); null for the capture's own keyframes.
+            "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
             "redaction_effective": policy.effective,
             "redactor_applied_here": policy.redactor_label,
             "label_trusted": policy.trusted,
@@ -716,7 +722,9 @@ def read_appearance_file(store, world_id: str, session_id: str, kind: str, diges
 
 def label_matches(store, world_id: str, session_id: str, manifest: dict) -> bool:
     prov = manifest.get("appearance_provenance") or {}
-    return prov.get("session_redaction") == A.read_session_redaction(store, world_id, session_id)
+    label, image_set = A.keyframe_set_identity(store, world_id, session_id)
+    return (prov.get("session_redaction") == label
+            and prov.get("keyframe_image_set") == image_set)
 
 
 def appearance_currency(store, world_id: str, session_id: str, manifest: dict | None) -> dict:

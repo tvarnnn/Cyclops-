@@ -2092,7 +2092,22 @@ def _artifacts_block(store, world_id, session_id, world, session=None) -> dict:
     # did exactly that. Null means "not established".
     present = None
     count = None
+    # A re-redacted keyframe set the session was switched to
+    # (`world_reredact.py --apply`), reported beside the stored one rather
+    # than in place of it: `redaction` stays what the SESSION recorded, and
+    # `images/` is still on disk. Null when builds read `images/`.
+    reredacted_set = None
     if session_id is not None:
+        try:
+            image_set = store.keyframe_image_set(world_id, session_id)
+        except Exception:  # noqa: BLE001 -- a report, never a failure
+            image_set = None
+        if image_set is not None and image_set.reredacted:
+            try:
+                set_count = sum(1 for _ in image_set.directory.glob("*.jpg"))
+            except OSError:
+                set_count = None
+            reredacted_set = {"redaction": image_set.redaction, "count": set_count}
         images = store.images_dir(world_id, session_id)
         try:
             if images.exists():
@@ -2113,6 +2128,7 @@ def _artifacts_block(store, world_id, session_id, world, session=None) -> dict:
             "redaction": (
                 session.redaction if session is not None else "none"
             ),
+            "reredacted_set": reredacted_set,
             "fetchable": False,
             "reason": (
                 "no artifact transfer contract exists, and these remain "

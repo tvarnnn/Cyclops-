@@ -316,7 +316,9 @@ short:
   on every response including 404s; no `ETag` or `Last-Modified`; a 200 carries
   `X-World-Redaction` with the label that was actually applied.
 - **The redaction label is re-checked on every request**: a session whose
-  `redaction` differs from the one the artifact was built under answers 404
+  keyframe set's label or identity differs from the one the artifact was built
+  under (including a re-redaction switch or its revert,
+  `WORLD-BUILDER-APPEARANCE.md` §6.5) answers 404
   ("appearance is stale against the session's redaction record"), as does a
   world with `images_purged`.
 - `digest` is 32 lower-hex and must be named by the current manifest. URLs carry
