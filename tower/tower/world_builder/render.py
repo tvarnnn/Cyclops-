@@ -120,6 +120,21 @@ CAMERA_COLOUR = (20, 20, 20)
 # The page states the count instead.
 NEUTRAL_POINT_COLOUR = (138, 138, 138)
 
+# WHICH POINT COLOURS MAY BE DRAWN AT ALL (privacy lane L1, 2026-09-17).
+#
+# The global solver's `rgb` is pycolmap's mean over the observing pixels of the
+# images COLMAP was given, and those are the RAW capture frames, undistorted
+# (`global_solve.prepare_images` prefers the raw frame; measured: 177 of 181
+# filled frames are non-black inside the redaction fill). On the canonical
+# capture 536 of 14,415 points take their colour ONLY from pixels the face
+# redactor removed. Drawing that colour put unredacted imagery on the page.
+#
+# So a colour is drawn only when its row names a source on this list, and no
+# producer writes one today: every point is drawn neutral until something
+# recolours the cloud from redacted keyframes and says so. Unknown never means
+# drawable.
+DRAWABLE_RGB_SOURCES = frozenset({"redacted-keyframes"})
+
 # Photometric colour is quantised to 5 bits per channel before it reaches
 # the page. Two reasons, both measured on world 52ed8e0a's re-solve:
 #
@@ -316,7 +331,8 @@ def load_segments(store: WorldStore, world_id: str, session_id: str) -> dict:
         colour = row.get("rgb")
         known = (isinstance(colour, (list, tuple)) and len(colour) == 3
                  and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                         for v in colour))
+                         for v in colour)
+                 and row.get("rgb_source") in DRAWABLE_RGB_SOURCES)
         colours_by_segment.setdefault(index, []).append(
             ([int(v) for v in colour], True) if known
             else (list(NEUTRAL_POINT_COLOUR), False)
@@ -866,16 +882,16 @@ def _frame_summary(descriptor: dict, *, other_shared: int, unregistered_rows: li
         parts = [f"{_count(points, 'point')} from one segment that could not be "
                  "placed with any other, drawn in its own frame at its own scale."]
     if points and uncoloured == points:
-        parts.append("None of them carry a measured colour, so every point is "
-                     "drawn neutral grey.")
+        parts.append("None of them carry a colour measured from redacted imagery, "
+                     "so every point is drawn neutral grey.")
     elif uncoloured:
-        parts.append(f"{_count(uncoloured, 'point')} carry no measured colour and "
-                     "are drawn neutral grey.")
+        parts.append(f"{_count(uncoloured, 'point')} carry no colour measured from "
+                     "redacted imagery and are drawn neutral grey.")
     elif points:
         # Stated positively rather than left out. "How much of this is a
         # measurement and how much is a placeholder" is the question this
         # line exists to answer, and silence answers it either way.
-        parts.append("Every point carries a measured colour.")
+        parts.append("Every point carries a colour measured from redacted imagery.")
     if sampling and sampling.get("subsampled"):
         parts.append("Thinned for drawing from "
                      f"{_count(int(sampling['points_total']), 'point')}.")
