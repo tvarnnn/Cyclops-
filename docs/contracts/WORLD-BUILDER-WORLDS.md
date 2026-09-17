@@ -89,9 +89,10 @@ Added 2026-09-06 on the Mac integration branch, so a saved world can be
 **200** `text/html`, `Cache-Control: no-store`. Every page but the appearance
 page is self-contained: no external script, stylesheet, image or fetch, so a
 web view that refuses every navigation but the initial one shows it whole. The
-appearance page fetches its imagery through exactly one transport, below. One finger orbits,
-two fingers pinch to zoom and drag to pan; on a desktop, drag / wheel /
-shift-drag.
+appearance page fetches its imagery through exactly one transport, below. On the sparse,
+dense and surface pages one finger orbits, two fingers pinch to zoom and drag to
+pan; on a desktop, drag / wheel / shift-drag. The appearance page navigates
+differently (its "Navigation" below).
 
 **The appearance page** (2026-09-17, `tower/tower/world_builder/appearance_render.py`
 + `appearance_viewer.html`). The top rung, served whenever
@@ -126,7 +127,17 @@ enforced).
   mesh, depth-prepassed; eight candidate keyframes chosen per frame on the CPU
   from a 32×24 probe of the proxy (a keyframe already on screen scores ×1.12, so
   the choice changes less while the camera moves), plus up to four still fading
-  out of the previous choice (12 bound at most). **A changed choice crossfades**:
+  out of the previous choice (12 bound at most). **The choice covers first**
+  (revised 2026-09-17, fix-it nav lane): a probe point counts for a keyframe only
+  when it is in that keyframe's frame and **visible in its depth** (a CPU copy
+  of the device-rendered source depth, min-pooled to 8 source px a texel,
+  2 bytes × 45×80 a layer, 0.9 MB for 128), its score fades smoothly with the
+  angle to the viewing ray out to 85° (not a hard 60° cut), and the greedy pick
+  adds 0.6 for every probe point no chosen keyframe covers yet — so a surface
+  that only an oblique keyframe saw is bound before a better angle on surface
+  already covered. The first rule bound, beside the canonical world's door, eight
+  keyframes that held 1–6% of the wall and none of the ones that walked toward
+  it (97%, at 75–85°), and drew a real, imaged wall as "not captured". **A changed choice crossfades**:
   every bound source carries a presence that moves 0 ↔ 1 over 280 ms.
   Per fragment, each source gets a **confidence**, the product of soft tests —
   in its frame (weight rises over 80 source px from its image border), visible
@@ -134,7 +145,10 @@ enforced).
   resolution and min-pooled 4×4 into an R16UI array; the test fades from 1.5% to
   4.5% beyond it, and where the nearest depth block is in doubt it is evaluated
   on the 2×2 neighbouring blocks and interpolated), within 60° of the viewing ray
-  (fading from 46°), its **alpha as a weight** (APPEARANCE §5.6), and its
+  (fading from 46°) **or, with a low tail weight 0.08, within 85°** for a
+  source that did not see the surface edge-on (the fragment's screen-space
+  facing, used for that alone and never as light: a keyframe grazing a floor
+  paints a stretched streak), its **alpha as a weight** (APPEARANCE §5.6), and its
   presence — so no test switches a source on or off between neighbouring pixels.
   Penalty = angle + 0.15·distance ratio (capped) + 0.10·(1 − quality) +
   2·(1 − confidence)³. The **k = 4** best blend with weight
@@ -148,7 +162,7 @@ enforced).
   (exposure 1.8, a hue-preserving roll-off above 0.6 that approaches 0.97 and
   never reaches white, γ 1.15).
   The layer's alpha is the **evidence** 1 − Π(1 − confidence′), where
-  confidence′ uses a 20 px border feather and only the last 3° before 60° (the
+  confidence′ uses a 20 px border feather and only the last 5° before 85° (the
   angle lowers a source's weight, not the evidence that it saw the point), so a
   place every source masked fades out instead of cutting. The frame is that
   layer composited over the **background, a dark smooth vignette, never a
@@ -173,9 +187,59 @@ enforced).
   pixel ratio 2).
   Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
   (42 MB colour) and the caption says the set is reduced.
-- **Navigation.** Walk (the recorded path, look-around, two-finger swipe to
-  step), Orbit (drag, pinch, pan), Reset, as the surface page. It opens in Walk
-  at the recorded pose whose **rendered frame is most drawn**, with a mild
+- **Navigation** (revised 2026-09-17, fix-it nav lane). This representation is
+  photographic where the wearer stood and looked and dark from anywhere else:
+  the walkthrough found every orbit behind or outside the room 99–100% dark, and
+  orbiting was the first thing a person tried. So there is **no free orbit**. One
+  camera `{position, yaw, pitch}`, levelled to `CONFIG.up`, moves freely **inside
+  a capture-supported envelope** (`NAV` in the page, pure, run under node by the
+  Tower's tests):
+  - **Where.** A tube around the recorded walk: 1.0 scene unit across, 0.6 along
+    the vertical, soft from 0.55 of it. Consecutive recorded poses more than 2.0
+    apart are not joined (a jump in the record is not a corridor).
+  - **Which way.** A **support field** over position and look direction, built
+    on the page after the images land (and again for a new build), in slices so
+    the page stays interactive: 6,000 area-weighted points on the proxy; a point
+    is *seen* by a bound phone-tier keyframe when it is in its frame and visible
+    in its depth (the CPU copy above); on a grid 0.5 apart inside the tube (2,033
+    points on the canonical world, 1.56 MB) each of 384 cube-map directions keeps
+    how well its nearest proxy point is coloured from there — 1 when a keyframe
+    that saw it is within 60° of that ray, ½ at 80°, 0 past 85° (the blend's
+    tail). A view's support is the mean over a 12×9 grid of its rays,
+    trilinear between grid points; outside the tube it is 0. Measured on the
+    canonical world over 200 reachable views: drawn ≈ 1.19 × support − 0.24
+    (r = 0.95), so the thresholds are **0.92** (resistance starts) and **0.80**
+    (it stops).
+  - **How it feels.** A step that makes things worse inside the soft band is
+    taken in small sub-steps, each scaled by (1 − b)², b the smoothstep through
+    the band, so motion slows toward the edge and never passes it: no wall, no
+    snap. A released camera drifts back inside (position toward 0.55 of the tube
+    with a 450 ms time constant; look along the support gradient at up to
+    0.5 rad/s × b). A resisted push shows *Not captured beyond here* for about a
+    second. **A recorded pose is never "beyond"**: arriving at one sets its own
+    support as the ceiling of both thresholds, so a partly dark recorded view is
+    neither pushed nor locked.
+  - **The envelope only limits the camera; it paints nothing.** Dark places
+    inside it stay dark.
+  - **Controls.** Touch: one finger drags the look (the room follows the
+    finger), two fingers drag to move sideways and up/down, pinch moves forward
+    and back (log of the spread × 2 units). Desktop (debug): left drag looks,
+    right or shift drag moves, the wheel moves forward/back, W A S D Q E fly,
+    ←/→ step the walk, O is Overview. Motion coasts after a flick (220 ms time
+    constant). Buttons: **Overview**, **←**, **→** (the recorded walk), **Reset**
+    (the opening).
+  - **Stepping the walk glides**: eased position and the short way round in
+    yaw, 350–1100 ms by distance and turn, instead of jumping (the walkthrough's
+    worst flicker steps were path jumps). Any touch interrupts a glide.
+  - **Overview** replaces Orbit: the best-supported **raised** vantage in the
+    envelope. The field proposes (points at least 0.15 above the walk, within
+    0.85 of the tube, 12 yaws × 2 downward pitches, support ≥ 0.92, scored
+    support × (0.8 + 0.2 × wide content)), and the real blend decides between
+    the top six by the opening's score; the camera glides there.
+  - Before the field is built (a second or so after the images land) the camera
+    is not limited and Overview is disabled.
+
+  It opens at the recorded pose whose **rendered frame is most drawn**, with a mild
   preference for wider content: every ⌈n/32⌉-th recorded pose is rendered at 64
   px on the long side **in the canvas's own aspect** through the real blend,
   scored `drawn × (0.85 + 0.15 × min(1, mean distance / (2.5 × z_ref)))` (drawn =
@@ -215,9 +279,12 @@ enforced).
   masked as unreliable (redaction, hands, views that disagreed); nothing there
   is filled in. Where the geometry underneath is wrong, images smear or double.
   Scale is unknown, so distances are relative.*
-- `window.__wbAppearance` also exposes `walk`, `orbitView`, `setView`,
-  `coverage` and `snapshot` for verification; they read the page and move its
-  camera, nothing else.
+- `window.__wbAppearance` also exposes `walk`, `setView`, `coverage`,
+  `snapshot`, `camera`, `shotMode`, `clock`, and for navigation `pose`,
+  `setPose`, `support`, `navStats`, `navReady`, `sampleReachable`, `input`,
+  `step`, `overview` and `frame`, for verification; they read the page and move
+  its camera, nothing else. `orbitView` remains only to measure the views the
+  removed Orbit mode reached.
 
 **The route serves one of two pages and they differ, deliberately.** This
 section described only the sparse one until the dense viewer shipped; what
