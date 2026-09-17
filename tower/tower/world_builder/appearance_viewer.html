@@ -36,6 +36,9 @@ button[disabled]{opacity:.4}
 #msg.on{display:grid}
 .spacer{flex:1}
 #pos{font-variant-numeric:tabular-nums;color:var(--dim);font-size:12px}
+#hint{position:fixed;left:50%;bottom:calc(104px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:6px 12px;border-radius:14px;
+  background:rgba(11,13,16,.55);color:var(--dim);font-size:12px;pointer-events:none;opacity:0;
+  transition:opacity .35s ease}
 </style>
 </head>
 <body>
@@ -43,14 +46,14 @@ button[disabled]{opacity:.4}
 <div id="caption"></div>
 <div id="status"></div>
 <div id="bar">
-  <button id="bOrbit" aria-pressed="false">Orbit</button>
-  <button id="bWalk" aria-pressed="false">Walk</button>
-  <button id="bPrev">&#8592;</button>
+  <button id="bOverview">Overview</button>
+  <button id="bPrev" aria-label="Previous recorded view">&#8592;</button>
   <button id="bNext">&#8594;</button>
   <span id="pos"></span>
   <span class="spacer"></span>
   <button id="bReset">Reset</button>
 </div>
+<div id="hint" aria-live="polite">Not captured beyond here</div>
 <div id="msg"></div>
 <script>
 "use strict";
@@ -202,6 +205,320 @@ const FOLLOW = (() => {
   return {decide, mustReplace, nextDelay, BASE_MS, CEILING_MS, HOLD_MAX_MS};
 })();
 /* ---------- end follower */
+
+/* ---------- navigation: where the camera may go (pure; tested under node) ---------- */
+/* Contract: WORLD-BUILDER-WORLDS.md §4 "Navigation". No DOM, no GL.
+   This representation is photographic where the wearer stood and looked, and
+   dark from anywhere else: the fix-it walkthrough found every orbit behind or
+   outside the room 99-100% dark, and free orbit was the first thing a person
+   tried. So the camera moves freely only inside a CAPTURE-SUPPORTED ENVELOPE:
+   - a tube around the recorded walk (R_MAX across, V_MAX along the vertical),
+     soft from R_SOFT;
+   - a SUPPORT FIELD over position and look direction: on a grid of points in
+     the tube (SPACING apart), which fraction of a view in each direction lands
+     on proxy surface that a bound keyframe SAW (visible in its own depth) from
+     within 85 degrees of that view's ray. It is built on the page from what
+     the page itself can draw (the phone-tier layers and their depth), so it
+     needs nothing new from the Tower and follows a new build.
+   A step that makes things worse near the boundary is scaled down smoothly
+   (never a wall, never a snap), a released camera drifts gently back inside,
+   and the page shows a hint. The envelope ONLY limits the camera: it paints
+   nothing, and the dark places inside it stay dark. */
+const NAV = (() => {
+  const R_SOFT = 0.55, R_MAX = 1.0, V_MAX = 0.6;      // scene units (median scene depth ~4)
+  // View support: resisted below T_HI, stops at T_LO. Measured on the canonical
+  // world (200 reachable views): the field is optimistic, drawn ~ 1.19 x support
+  // - 0.24 (r = 0.95), so these sit where drawn is ~0.72 and ~0.85.
+  const T_LO = 0.80, T_HI = 0.92;
+  const SPACING = 0.5, FACE = 8, CELLS = 6 * FACE * FACE;
+  const JUMP = 2.0;                                   // a longer gap in the recorded path is not a corridor
+  const PITCH_MAX = 1.3;
+  const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  const nrm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
+  const crs = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+
+  /* A direction's cell on a cube map (no trigonometry: this runs millions of times). */
+  function cellOf(x, y, z){
+    const ax = Math.abs(x), ay = Math.abs(y), az = Math.abs(z);
+    let f, u, v, m;
+    if (ax >= ay && ax >= az){ m = ax; f = x > 0 ? 0 : 1; u = y; v = z; }
+    else if (ay >= az){ m = ay; f = y > 0 ? 2 : 3; u = x; v = z; }
+    else { m = az; f = z > 0 ? 4 : 5; u = x; v = y; }
+    if (!(m > 0)) return -1;
+    const i = Math.min(FACE - 1, Math.floor((u / m + 1) * 0.5 * FACE));
+    const j = Math.min(FACE - 1, Math.floor((v / m + 1) * 0.5 * FACE));
+    return (f * FACE + j) * FACE + i;
+  }
+  /* How well a source at angle `ang` (radians, between its ray and the view's
+     ray to the same point) colours it: 1 to 60 degrees, half by 80, none by 85
+     -- the blend's own tail (FS_BLEND). */
+  function angleWeight(ang){ return 1 - 0.5 * smooth(1.0472, 1.40, ang) - 0.5 * smooth(1.40, 1.48, ang); }
+
+  /* The recorded walk: points, and the segments short enough to be walked. */
+  function makePath(cams, up){
+    const n = cams.length, P = new Float64Array(n * 3), ok = new Uint8Array(Math.max(0, n - 1));
+    for (let i = 0; i < n; i++){ P[i*3] = cams[i][0]; P[i*3+1] = cams[i][1]; P[i*3+2] = cams[i][2]; }
+    for (let i = 0; i + 1 < n; i++){
+      const d = Math.hypot(P[i*3+3]-P[i*3], P[i*3+4]-P[i*3+1], P[i*3+5]-P[i*3+2]);
+      ok[i] = d <= JUMP ? 1 : 0;
+    }
+    return {n, P, ok, up: nrm(up)};
+  }
+  /* Distance to the walk in envelope units (1 = the edge): across / R_MAX and
+     along the vertical / V_MAX, with the nearest recorded pose. */
+  function pathDist(path, p){
+    const {n, P, ok, up} = path;
+    const ux = up[0], uy = up[1], uz = up[2], ir2 = 1 / (R_MAX * R_MAX), iv2 = 1 / (V_MAX * V_MAX);
+    let best = Infinity, bi = 0, bx = 0, by = 0, bz = 0;
+    for (let i = 0; i < n; i++){
+      const dx = p[0]-P[i*3], dy = p[1]-P[i*3+1], dz = p[2]-P[i*3+2], dv = dx*ux + dy*uy + dz*uz;
+      const e2 = Math.max(0, dx*dx + dy*dy + dz*dz - dv*dv) * ir2 + dv * dv * iv2;
+      if (e2 < best){ best = e2; bi = i; bx = P[i*3]; by = P[i*3+1]; bz = P[i*3+2]; }
+    }
+    for (let i = 0; i + 1 < n; i++){
+      if (!ok[i]) continue;
+      const ax = P[i*3], ay = P[i*3+1], az = P[i*3+2];
+      const sx = P[i*3+3]-ax, sy = P[i*3+4]-ay, sz = P[i*3+5]-az, ss = sx*sx + sy*sy + sz*sz;
+      if (ss <= 1e-12) continue;
+      const t = ((p[0]-ax)*sx + (p[1]-ay)*sy + (p[2]-az)*sz) / ss;
+      if (!(t > 0 && t < 1)) continue;
+      const cx = ax + sx*t, cy = ay + sy*t, cz = az + sz*t;
+      const dx = p[0]-cx, dy = p[1]-cy, dz = p[2]-cz, dv = dx*ux + dy*uy + dz*uz;
+      const e2 = Math.max(0, dx*dx + dy*dy + dz*dz - dv*dv) * ir2 + dv * dv * iv2;
+      if (e2 < best){ best = e2; bi = t < 0.5 ? i : i + 1; bx = cx; by = cy; bz = cz; }
+    }
+    return {e: Math.sqrt(best), index: bi, closest: best < Infinity ? [bx, by, bz] : null};
+  }
+
+  /* The support field. `input`: {samples: Float32Array (x,y,z)*N on the proxy,
+     seenOff: Int32Array N+1 and seenIdx: Int32Array (CSR: the sources that saw
+     each sample), centres: Float32Array (x,y,z) per source, path}. Built in
+     slices (`fieldWork`) so the page stays interactive. */
+  function fieldJob(input){
+    const {path} = input, pad = R_MAX + SPACING;
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < path.n; i++) for (let k = 0; k < 3; k++){
+      lo[k] = Math.min(lo[k], path.P[i*3+k] - pad); hi[k] = Math.max(hi[k], path.P[i*3+k] + pad);
+    }
+    const dims = [0, 1, 2].map(k => Math.max(1, Math.ceil((hi[k] - lo[k]) / SPACING) + 1));
+    const index = new Int32Array(dims[0] * dims[1] * dims[2]).fill(-1);
+    const where = [];
+    for (let z = 0; z < dims[2]; z++) for (let y = 0; y < dims[1]; y++) for (let x = 0; x < dims[0]; x++){
+      const p = [lo[0] + x * SPACING, lo[1] + y * SPACING, lo[2] + z * SPACING];
+      if (!path.n || pathDist(path, p).e > 1 + SPACING * 1.2) continue;   // a margin for interpolation
+      index[(z * dims[1] + y) * dims[0] + x] = where.length / 3;
+      where.push(p[0], p[1], p[2]);
+    }
+    const count = where.length / 3;
+    return {input, lo, dims, index, where: Float32Array.from(where), count,
+            cov: new Uint8Array(count * CELLS), dist: new Uint8Array(count * CELLS),
+            next: 0, done: count === 0};
+  }
+  function fieldWork(F, budget){
+    const {samples, seenOff, seenIdx, centres} = F.input;
+    const N = samples.length / 3;
+    const front = new Float32Array(CELLS), who = new Int32Array(CELLS);
+    const end = Math.min(F.count, F.next + budget);
+    for (let a = F.next; a < end; a++){
+      const px = F.where[a*3], py = F.where[a*3+1], pz = F.where[a*3+2];
+      front.fill(Infinity); who.fill(-1);
+      for (let s = 0; s < N; s++){
+        const dx = samples[s*3] - px, dy = samples[s*3+1] - py, dz = samples[s*3+2] - pz;
+        const d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < 0.0025) continue;
+        const c = cellOf(dx, dy, dz);
+        if (c >= 0 && d2 < front[c]){ front[c] = d2; who[c] = s; }
+      }
+      const base = a * CELLS;
+      for (let c = 0; c < CELLS; c++){
+        const s = who[c];
+        if (s < 0) continue;
+        const X0 = samples[s*3], X1 = samples[s*3+1], X2 = samples[s*3+2];
+        const d = Math.sqrt(front[c]);
+        const vx = (px - X0) / d, vy = (py - X1) / d, vz = (pz - X2) / d;
+        let best = 0;
+        for (let j = seenOff[s]; j < seenOff[s + 1]; j++){
+          const k = seenIdx[j];
+          let cx = centres[k*3] - X0, cy = centres[k*3+1] - X1, cz = centres[k*3+2] - X2;
+          const l = Math.hypot(cx, cy, cz) || 1;
+          const w = angleWeight(Math.acos(Math.max(-1, Math.min(1, (cx*vx + cy*vy + cz*vz) / l))));
+          if (w > best){ best = w; if (best >= 1) break; }
+        }
+        F.cov[base + c] = Math.round(best * 255);
+        F.dist[base + c] = Math.min(255, Math.round(d * 16));
+      }
+    }
+    F.next = end; F.done = end >= F.count;
+    return F.done;
+  }
+
+  /* The rays of a view (camera space: right, up, forward), cached per shape. */
+  const rayCache = new Map();
+  function viewRays(fy, aspect){
+    const key = fy.toFixed(3) + "/" + aspect.toFixed(3);
+    if (rayCache.has(key)) return rayCache.get(key);
+    const t = Math.tan(fy / 2), nx = 12, ny = 9, out = [];
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++){
+      out.push([((i + 0.5) / nx * 2 - 1) * t * aspect, ((j + 0.5) / ny * 2 - 1) * t, 1]);
+    }
+    if (rayCache.size > 16) rayCache.clear();
+    rayCache.set(key, out);
+    return out;
+  }
+  /* Support of the view from `p` looking along `fwd`: the fraction of its rays
+     a kept source colours (trilinear over the grid; outside the grid is 0), and
+     the mean distance to what they land on. */
+  function support(F, p, fwd, up, fy, aspect){
+    if (!F || !F.done || !F.count) return {s: 0, dist: 0};
+    const f = nrm(fwd), r = nrm(crs(f, up)), u = crs(r, f);
+    const rays = viewRays(fy, aspect), cells = new Int32Array(rays.length);
+    for (let i = 0; i < rays.length; i++){
+      const q = rays[i];
+      cells[i] = cellOf(r[0]*q[0] + u[0]*q[1] + f[0], r[1]*q[0] + u[1]*q[1] + f[1], r[2]*q[0] + u[2]*q[1] + f[2]);
+    }
+    const g = [0, 1, 2].map(k => (p[k] - F.lo[k]) / SPACING);
+    const g0 = g.map(Math.floor), fr = g.map((v, k) => v - g0[k]);
+    let s = 0, dsum = 0, dw = 0;
+    for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++){
+      const w = (dx ? fr[0] : 1 - fr[0]) * (dy ? fr[1] : 1 - fr[1]) * (dz ? fr[2] : 1 - fr[2]);
+      if (w <= 0) continue;
+      const x = g0[0] + dx, y = g0[1] + dy, z = g0[2] + dz;
+      if (x < 0 || y < 0 || z < 0 || x >= F.dims[0] || y >= F.dims[1] || z >= F.dims[2]) continue;
+      const a = F.index[(z * F.dims[1] + y) * F.dims[0] + x];
+      if (a < 0) continue;
+      let cs = 0, ds = 0, dn = 0;
+      for (const c of cells){
+        if (c < 0) continue;
+        const v = F.cov[a * CELLS + c];
+        cs += v;
+        if (v > 0){ ds += F.dist[a * CELLS + c] / 16; dn++; }
+      }
+      s += w * cs / 255 / cells.length;
+      if (dn){ dsum += w * ds / dn; dw += w; }
+    }
+    return {s, dist: dw ? dsum / dw : 0};
+  }
+
+  /* How far past the soft edge a camera is, 0 (inside) .. 1 (at the limit). */
+  function positionBound(e){ return smooth(R_SOFT / R_MAX, 1, e); }
+  function lookBound(s, floor){
+    const hi = Math.min(T_HI, floor), lo = Math.min(T_LO, hi - 0.12);
+    return 1 - smooth(lo, hi, s);
+  }
+
+  /* One frame of camera motion. `cam` {p, yaw, pitch, floor}; `ctl` {look:
+     [dyaw, dpitch], move: [right, up, forward] (scene units, camera frame),
+     held: a finger or key is down}; `V` {dir(yaw, pitch), up, fy, aspect}.
+     `floor` is the support of the last recorded pose the camera arrived at, so
+     a recorded view that is itself partly dark is never "beyond" and never
+     pushed. Returns the next camera and how hard it was resisted (0..1). */
+  function step(F, path, cam, ctl, dt, V){
+    const out = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor ?? 1, resisted: 0};
+    const ready = !!(F && F.done && F.count);
+    const sup = (p, yaw, pitch) => ready ? support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect).s : 1;
+    const posB = p => ready && path && path.n ? positionBound(pathDist(path, p).e) : 0;
+    const look = ctl.look || [0, 0], move = ctl.move || [0, 0, 0];
+    // Large inputs (a fast flick, a slow frame) are taken in small sub-steps,
+    // so the resistance feels the same whatever the frame rate.
+    const resistOnce = (b0, b1, scale) => {
+      if (b1 <= b0) return 1;
+      out.resisted = Math.max(out.resisted, b1);
+      return Math.pow(Math.max(0, 1 - b1), 2) * scale;
+    };
+    if (look[0] || look[1]){
+      const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(look[0], look[1]) / 0.03)));
+      for (let i = 0; i < n; i++){
+        const b0 = lookBound(sup(out.p, out.yaw, out.pitch), out.floor);
+        let dy = look[0] / n, dp = look[1] / n, b1 = 0;
+        for (let t = 0; t < 4; t++){
+          b1 = lookBound(sup(out.p, out.yaw + dy, Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + dp))), out.floor);
+          if (b1 < 0.999 || b1 <= b0) break;
+          dy /= 2; dp /= 2;
+        }
+        const k = resistOnce(b0, b1, 1);
+        out.yaw += dy * k; out.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + dp * k));
+      }
+    }
+    if (move[0] || move[1] || move[2]){
+      const f = V.dir(out.yaw, out.pitch), r = nrm(crs(f, V.up));
+      const D = [0, 1, 2].map(k => r[k] * move[0] + V.up[k] * move[1] + f[k] * move[2]);
+      const bAt = p => Math.max(posB(p), lookBound(sup(p, out.yaw, out.pitch), out.floor));
+      const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(D[0], D[1], D[2]) / 0.05)));
+      for (let i = 0; i < n; i++){
+        const b0 = bAt(out.p);
+        let d = D.map(x => x / n), b1 = 0;
+        for (let t = 0; t < 4; t++){
+          b1 = bAt([out.p[0] + d[0], out.p[1] + d[1], out.p[2] + d[2]]);
+          if (b1 < 0.999 || b1 <= b0) break;
+          d = d.map(x => x / 2);
+        }
+        const k = resistOnce(b0, b1, 1);
+        out.p = [out.p[0] + d[0] * k, out.p[1] + d[1] * k, out.p[2] + d[2] * k];
+      }
+    }
+    if (!ctl.held && ready && dt > 0){
+      // released: drift back inside, gently
+      const pd = pathDist(path, out.p), pb = positionBound(pd.e);
+      if (pb > 0 && pd.closest && pd.e > 0){
+        const target = R_SOFT / R_MAX / pd.e, k = (1 - Math.exp(-dt / 450)) * pb;
+        for (let i = 0; i < 3; i++){
+          const want = pd.closest[i] + (out.p[i] - pd.closest[i]) * target;
+          out.p[i] += (want - out.p[i]) * k;
+        }
+      }
+      const s = sup(out.p, out.yaw, out.pitch), lb = lookBound(s, out.floor);
+      if (lb > 0.02){
+        const e = 0.08;
+        const gy = sup(out.p, out.yaw + e, out.pitch) - sup(out.p, out.yaw - e, out.pitch);
+        const gp = sup(out.p, out.yaw, Math.min(PITCH_MAX, out.pitch + e)) - sup(out.p, out.yaw, Math.max(-PITCH_MAX, out.pitch - e));
+        const gl = Math.hypot(gy, gp);
+        if (gl > 0.01){
+          const rate = 0.5 * lb * dt / 1000;               // radians this frame
+          out.yaw += gy / gl * rate; out.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + gp / gl * rate));
+        }
+      }
+    }
+    if (ready && sup(out.p, out.yaw, out.pitch) >= T_HI) out.floor = 1;
+    return out;
+  }
+
+  /* A uniformly random reachable view (verification: the measured
+     distribution of what a person can reach). `rand` returns [0, 1). */
+  function sampleReachable(F, path, V, rand, tries = 4000){
+    for (let t = 0; t < tries; t++){
+      const i = Math.floor(rand() * path.n);
+      const o = [rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1];
+      const p = [path.P[i*3] + o[0] * R_MAX, path.P[i*3+1] + o[1] * R_MAX, path.P[i*3+2] + o[2] * R_MAX];
+      if (pathDist(path, p).e > 1) continue;
+      const yaw = rand() * 2 * Math.PI - Math.PI, pitch = (rand() * 2 - 1) * 0.9;
+      const s = support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect).s;
+      if (s < T_LO) continue;
+      return {p, yaw, pitch, support: s};
+    }
+    return null;
+  }
+
+  /* Glide between two cameras (stepping along the walk): eased, the shorter
+     way round in yaw. */
+  function glide(a, b, t){
+    const k = smooth(0, 1, t);
+    let dy = b.yaw - a.yaw;
+    dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+    return {p: [0, 1, 2].map(i => a.p[i] + (b.p[i] - a.p[i]) * k), yaw: a.yaw + dy * k,
+            pitch: a.pitch + (b.pitch - a.pitch) * k};
+  }
+  function glideMs(a, b){
+    const d = Math.hypot(b.p[0]-a.p[0], b.p[1]-a.p[1], b.p[2]-a.p[2]);
+    let dy = b.yaw - a.yaw; dy = Math.abs(Math.atan2(Math.sin(dy), Math.cos(dy)));
+    return Math.max(400, Math.min(1600, 300 * d + 320 * dy + 250 * Math.abs(b.pitch - a.pitch)));
+  }
+
+  return {smooth, cellOf, angleWeight, makePath, pathDist, fieldJob, fieldWork, support, positionBound,
+          lookBound, step, sampleReachable, glide, glideMs,
+          R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX};
+})();
+/* ---------- end navigation */
 
 /* ---------- formats ------------------------------------------------------- */
 function view(Type, buffer, offset, count){
@@ -396,7 +713,8 @@ void main(){
    that source (the artifact's alpha, feathered inward from every mask:
    redaction, hands, disagreement), visible from that source (its depth, the
    test bilinear over the 2x2 depth blocks where the nearest block is in
-   doubt), within 60 degrees of the viewing ray (fading from 46), and present
+   doubt), within 60 degrees of the viewing ray (fading from 46; a low tail to
+   85 for a source that did not see the surface edge-on), and present
    (fading in or out of the chosen set). No test switches a source on or off
    between two neighbouring pixels, so neighbouring pixels never change sources
    abruptly.
@@ -474,6 +792,11 @@ float cdist(vec3 a, vec3 b){
 }
 void main(){
   vec3 dv = uEye - vX; float distv = max(length(dv), 1e-6); dv /= distv;
+  // The surface's own facing (screen-space, per fragment): used ONLY to keep an
+  // oblique source from painting a surface it saw edge-on (a stretched streak),
+  // never as light.
+  vec3 fn = cross(dFdx(vX), dFdy(vX)); float fl = length(fn);
+  vec3 facing = fl > 1e-12 ? fn / fl : dv;
   float pen[MAXC]; float conf[MAXC]; vec3 col[MAXC]; float sat[MAXC];
   int n = 0; float pmin = 1e9; float miss = 1.0;
   for (int i = 0; i < uN; i++){
@@ -487,7 +810,13 @@ void main(){
     if (bf <= 0.0) continue;
     vec3 ds = uC[i] - vX; float dists = length(ds); ds /= max(dists, 1e-6);
     float ang = acos(clamp(dot(ds, dv), -1.0, 1.0));
-    float aw = 1.0 - smoothstep(0.80, 1.0472, ang);
+    // Weight: full to 46 degrees, fading by 60, then a low TAIL out to 85, so
+    // a surface only an oblique source saw is still drawn from it (the tail
+    // loses to any source within 60 degrees through the penalty's softmax).
+    // the tail only for a source that saw the surface from well off its plane
+    float edgeOn = smoothstep(0.12, 0.35, abs(dot(facing, ds)));
+    float tail = mix(1.0, edgeOn, smoothstep(1.0, 1.1, ang));
+    float aw = max(1.0 - smoothstep(0.80, 1.0472, ang), 0.08 * (1.0 - smoothstep(1.30, 1.48, ang)) * tail);
     if (aw <= 0.0) continue;
     vec4 c = texture(uCol, vec3(uv / uWH, uLayer[i]));
     gTaps += 1.0;
@@ -503,8 +832,8 @@ void main(){
     conf[i] = a * bf * vis * aw * uPres[i];
     float lc = 1.0 - conf[i];
     // Evidence says only that the source SAW the point: its angle lowers the
-    // weight (aw) but not the evidence, except in the last 3 degrees to 60.
-    float ev = a * smoothstep(0.5, 20.0, e) * vis * (1.0 - smoothstep(1.0, 1.0472, ang)) * uPres[i];
+    // weight (aw) but not the evidence, except in the last 5 degrees to 85.
+    float ev = a * smoothstep(0.5, 20.0, e) * vis * (1.0 - smoothstep(1.40, 1.48, ang)) * tail * uPres[i];
     pen[i] = ang + 0.15 * min(max(dists / distv - 1.0, 0.0), 3.0) + 0.10 * (1.0 - uQ[i])
            + 2.0 * lc * lc * lc;
     pmin = min(pmin, pen[i]);
@@ -742,6 +1071,7 @@ async function main(){
     gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
     gl.colorMask(true, true, true, true);
     const R = new Float32Array(9), clear = new Uint32Array([65535, 0, 0, 0]);
+    const raw = new Uint32Array(DW * DH * 4), CW = Math.ceil(DW / 2), CH = Math.ceil(DH / 2);
     for (const L of list){
       const kf = L.kf;
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbSrc); gl.viewport(0, 0, KW, KH);
@@ -766,8 +1096,18 @@ async function main(){
       gl.bindVertexArray(null);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       gl.enable(gl.DEPTH_TEST);
+      // A CPU copy, min-pooled once more (8 source px a texel): what the
+      // source choice and the navigation envelope test visibility against.
+      gl.readPixels(0, 0, DW, DH, gl.RGBA_INTEGER, gl.UNSIGNED_INT, raw);
+      const cpu = new Uint16Array(CW * CH).fill(65535);
+      for (let y = 0; y < DH; y++) for (let x = 0; x < DW; x++){
+        const q = raw[(y * DW + x) * 4], o = (y >> 1) * CW + (x >> 1);
+        if (q < cpu[o]) cpu[o] = q;
+      }
+      L.cpuDepth = cpu;
       L.depthReady = true;
     }
+    S.cpuDepthBytes = layers.filter(x => x.cpuDepth).length * CW * CH * 2;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fbSrc); gl.deleteFramebuffer(fbDst);
     gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
@@ -893,6 +1233,7 @@ async function main(){
     manifest = man;
     chosenFor = null;
     S.buildId = man.build_id; S.layers = layers.filter(x => x.ready).length;
+    if (S.phase === "ready" || S.phase === "withdrawn") buildNav();
     gpuTotal();
     status("");
     updateCaption();
@@ -1036,13 +1377,21 @@ async function main(){
   }
   S.refresh = () => serial(pollOnce);
 
-  /* -------- camera (the surface page's conventions) ---------------------- */
-  let mode = cams.length ? "walk" : "orbit";
+  /* -------- camera: a free camera inside the capture envelope (NAV) ------- */
+  /* One camera, {p, yaw, pitch}, levelled to UP. The recorded walk is where it
+     starts and what prev/next glide along; look and move are free inside the
+     envelope NAV describes. Stepping between recorded poses GLIDES (eased, the
+     short way round) instead of jumping: the walkthrough's worst flicker steps
+     were path jumps. */
   let ci = 0, opening = -1;
-  const look = {yaw: 0, pitch: 0};
-  const orbit = {yaw: 0.6, pitch: -0.35, dist: 1, target: [0,0,0]};
-  let fovScale = 1, override = null;
+  let override = null;          // verification: an exact camera
   let B = null;
+  let cam = {p: [0, 0, 0], yaw: 0, pitch: 0, floor: 1};
+  let glideState = null;        // {from, to, t, ms, index}
+  let navPath = null, navField = null, navJob = null, navGeneration = 0, overviewPose = null;
+  const ctl = {look: [0, 0], move: [0, 0, 0], held: false};
+  const vel = {look: [0, 0], move: [0, 0, 0]};   // inertia, per ms
+  const keys = new Set();
   function basis(){
     const ref = Math.abs(UP[0]) < 0.9 ? [1,0,0] : [0,0,1];
     const e1 = norm3(cross3(UP, ref)), e2 = cross3(e1, UP);
@@ -1059,22 +1408,15 @@ async function main(){
     return {yaw: Math.atan2(dot3(d, B.e2), dot3(d, B.e1)),
             pitch: Math.asin(Math.max(-1, Math.min(1, dot3(d, UP))))};
   }
-  function resetOrbitToCamera(){
-    if (cams.length){
-      const c = cams[ci], f = norm3([c[3],c[4],c[5]]);
-      const d = CONFIG.median_scene_depth || diag * 0.2;
-      orbit.target = [c[0]+f[0]*d, c[1]+f[1]*d, c[2]+f[2]*d];
-      const yp = yawPitchOf(f); orbit.yaw = yp.yaw; orbit.pitch = yp.pitch; orbit.dist = d;
-    } else {
-      orbit.yaw = 0.6; orbit.pitch = -0.35; orbit.dist = diag * 0.9; orbit.target = centre.slice();
+  function poseOf(i, yaw = 0, pitch = 0){
+    if (!cams.length){
+      const yp = {yaw: 0.6, pitch: -0.35}, d = dirFrom(yp.yaw, yp.pitch);
+      return {p: [centre[0]-d[0]*diag*0.9, centre[1]-d[1]*diag*0.9, centre[2]-d[2]*diag*0.9], yaw: yp.yaw, pitch: yp.pitch};
     }
-  }
-  function walkEye(i, yaw, pitch){
     const c = cams[Math.max(0, Math.min(cams.length-1, i))];
     const yp = yawPitchOf([c[3],c[4],c[5]]);
-    const d = dirFrom(yp.yaw + yaw, Math.max(-1.45, Math.min(1.45, yp.pitch + pitch)));
-    const eye = [c[0], c[1], c[2]];
-    return [eye, [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]]];
+    return {p: [c[0], c[1], c[2]], yaw: yp.yaw + yaw,
+            pitch: Math.max(-NAV.PITCH_MAX, Math.min(NAV.PITCH_MAX, yp.pitch + pitch))};
   }
   function currentCamera(aspectOverride){
     const aspect = aspectOverride || canvas.width / Math.max(1, canvas.height);
@@ -1082,17 +1424,220 @@ async function main(){
       return {eye: override.eye, at: override.target, up: override.up, fy: override.fovY, aspect,
               near: 0.02, far: diag * 12};
     }
-    let eye, at;
-    if (mode === "walk" && cams.length){ [eye, at] = walkEye(ci, look.yaw, look.pitch); }
-    else {
-      const d = dirFrom(orbit.yaw, orbit.pitch), t = orbit.target;
-      eye = [t[0]-d[0]*orbit.dist, t[1]-d[1]*orbit.dist, t[2]-d[2]*orbit.dist]; at = t.slice();
-    }
-    let fy = (mode === "walk" ? 1.25 : 0.95) * fovScale;
+    const d = dirFrom(cam.yaw, cam.pitch), eye = cam.p.slice();
     const fyForH = 2 * Math.atan(Math.tan(1.12 / 2) / aspect);
-    fy = Math.min(1.75, Math.max(fy, fyForH));
-    const near = mode === "walk" ? Math.max(0.02, diag * 0.0015) : Math.max(diag * 0.0015, orbit.dist * 0.01);
-    return {eye, at, fy, aspect, near, far: diag * 12};
+    const fy = Math.min(1.75, Math.max(1.25, fyForH));
+    return {eye, at: [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]], fy, aspect,
+            near: Math.max(0.02, diag * 0.0015), far: diag * 12};
+  }
+  function navView(){
+    const c = currentCamera();
+    return {dir: dirFrom, up: UP, fy: c.fy, aspect: c.aspect};
+  }
+  function supportOf(pose){
+    if (!navField || !navField.done) return null;
+    const V = navView();
+    return NAV.support(navField, pose.p, dirFrom(pose.yaw, pose.pitch), UP, V.fy, V.aspect);
+  }
+  /* Arriving at a recorded pose: its own support is the floor, so a partly
+     dark recorded view is never "beyond" and never pushed away. */
+  function floorAt(pose){
+    const s = supportOf(pose);
+    return s && s.s < NAV.T_HI ? Math.max(0.05, s.s) : 1;
+  }
+  function setPose(pose){
+    override = null; glideState = null;
+    cam = {p: pose.p.slice(), yaw: pose.yaw, pitch: pose.pitch, floor: 1};
+    cam.floor = floorAt(cam);
+    vel.look = [0, 0]; vel.move = [0, 0, 0];
+  }
+  function glideTo(pose, index){
+    override = null;
+    const from = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch};
+    glideState = {from, to: pose, t: 0, ms: NAV.glideMs(from, pose), index};
+    vel.look = [0, 0]; vel.move = [0, 0, 0];
+    requestDraw();
+  }
+  /* The hint at the envelope's edge: subtle, and gone a moment after. */
+  let hintTimer = null;
+  function hint(level){
+    if (level < 0.35) return;
+    const h = $("hint");
+    h.style.opacity = String(Math.min(0.9, 0.3 + level));
+    S.hints = (S.hints || 0) + 1;
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => { h.style.opacity = "0"; }, 1100);
+  }
+  const KEY_SPEED = 1.1 / 1000;          // scene units per ms
+  /* Advance the camera by dt ms: a glide, or input + inertia through NAV.step.
+     Returns whether it is still moving (the frame loop keeps drawing). */
+  function navUpdate(dt){
+    if (override) return false;
+    if (glideState){
+      glideState.t += dt;
+      const t = Math.min(1, glideState.t / glideState.ms);
+      const g = NAV.glide(glideState.from, glideState.to, t);
+      cam = {p: g.p, yaw: g.yaw, pitch: g.pitch, floor: 1};
+      if (t >= 1){
+        if (glideState.index !== undefined && glideState.index !== null) ci = glideState.index;
+        glideState = null; cam.floor = floorAt(cam);
+        return false;
+      }
+      return true;
+    }
+    if (dt <= 0) dt = 16;
+    // keys (desktop debug): W/S forward, A/D sideways, Q/E down/up, held
+    const km = [(keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0), (keys.has("e") ? 1 : 0) - (keys.has("q") ? 1 : 0),
+                (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0)];
+    for (let i = 0; i < 3; i++) ctl.move[i] += km[i] * KEY_SPEED * dt;
+    const held = ctl.held || keys.size > 0;
+    if (!held){
+      const k = Math.exp(-dt / 220);
+      for (let i = 0; i < 2; i++){ ctl.look[i] += vel.look[i] * dt; vel.look[i] *= k; if (Math.abs(vel.look[i]) < 2e-6) vel.look[i] = 0; }
+      for (let i = 0; i < 3; i++){ ctl.move[i] += vel.move[i] * dt; vel.move[i] *= k; if (Math.abs(vel.move[i]) < 2e-6) vel.move[i] = 0; }
+    }
+    const pushing = ctl.look[0] || ctl.look[1] || ctl.move[0] || ctl.move[1] || ctl.move[2];
+    const next = NAV.step(navField, navPath, cam, {look: ctl.look, move: ctl.move, held}, dt, navView());
+    ctl.look = [0, 0]; ctl.move = [0, 0, 0];
+    const moved = Math.abs(next.yaw - cam.yaw) + Math.abs(next.pitch - cam.pitch)
+      + Math.hypot(next.p[0]-cam.p[0], next.p[1]-cam.p[1], next.p[2]-cam.p[2]) > 1e-5;
+    if (pushing && next.resisted > 0){
+      hint(next.resisted);
+      // the resisted share of a flick is spent, not stored
+      if (next.resisted > 0.6){ vel.look = [0, 0]; vel.move = [0, 0, 0]; }
+    }
+    S.resisted = next.resisted;
+    cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor};
+    if (moved && navPath && navPath.n) ci = NAV.pathDist(navPath, cam.p).index;
+    const coasting = vel.look.some(v => v) || vel.move.some(v => v);
+    return moved || coasting || keys.size > 0;
+  }
+
+  /* The envelope's support field, built in slices after the images land (and
+     again when a new build changes the layers). Samples: area-weighted points
+     on the proxy; a sample is SEEN by a layer when it is in that layer's frame
+     and visible in its depth. */
+  function mulberry(seed){ return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const NAV_SAMPLES = 6000;
+  function navInput(){
+    const ready = layers.filter(L => L.ready && L.depthReady && L.kf && L.cpuDepth);
+    if (!mesh || !ready.length || !cams.length) return null;
+    const {pos, idx, lo, span, nI} = mesh, nF = nI / 3;
+    const P = i => [lo[0] + pos[i*3] / 65535 * span[0], lo[1] + pos[i*3+1] / 65535 * span[1], lo[2] + pos[i*3+2] / 65535 * span[2]];
+    const cum = new Float64Array(nF);
+    let total = 0;
+    for (let f = 0; f < nF; f++){
+      const a = P(idx[f*3]), b = P(idx[f*3+1]), c = P(idx[f*3+2]);
+      const cr = cross3([b[0]-a[0], b[1]-a[1], b[2]-a[2]], [c[0]-a[0], c[1]-a[1], c[2]-a[2]]);
+      total += 0.5 * Math.hypot(cr[0], cr[1], cr[2]); cum[f] = total;
+    }
+    const rand = mulberry(20260917), samples = new Float32Array(NAV_SAMPLES * 3);
+    for (let s = 0; s < NAV_SAMPLES; s++){
+      const r = rand() * total;
+      let l = 0, h = nF - 1;
+      while (l < h){ const m = (l + h) >> 1; if (cum[m] < r) l = m + 1; else h = m; }
+      const a = P(idx[l*3]), b = P(idx[l*3+1]), c = P(idx[l*3+2]);
+      let u = rand(), v = rand(); if (u + v > 1){ u = 1 - u; v = 1 - v; }
+      for (let k = 0; k < 3; k++) samples[s*3+k] = a[k] + (b[k]-a[k]) * u + (c[k]-a[k]) * v;
+    }
+    const centres = new Float32Array(ready.length * 3), off = new Int32Array(NAV_SAMPLES + 1), seen = [];
+    ready.forEach((L, k) => { const kf = L.kf, Rr = kf.rotation, t = kf.translation;
+      const C = kf._C || (kf._C = [-(Rr[0]*t[0]+Rr[3]*t[1]+Rr[6]*t[2]), -(Rr[1]*t[0]+Rr[4]*t[1]+Rr[7]*t[2]), -(Rr[2]*t[0]+Rr[5]*t[1]+Rr[8]*t[2])]);
+      centres.set(C, k * 3); });
+    for (let s = 0; s < NAV_SAMPLES; s++){
+      const X0 = samples[s*3], X1 = samples[s*3+1], X2 = samples[s*3+2];
+      for (let k = 0; k < ready.length; k++){
+        const kf = ready[k].kf, Rr = kf.rotation, t = kf.translation, I = kf.intrinsics;
+        const z = Rr[6]*X0 + Rr[7]*X1 + Rr[8]*X2 + t[2]; if (z < 0.05) continue;
+        const u = I.fx * (Rr[0]*X0 + Rr[1]*X1 + Rr[2]*X2 + t[0]) / z + I.cx;
+        const v = I.fy * (Rr[3]*X0 + Rr[4]*X1 + Rr[5]*X2 + t[1]) / z + I.cy;
+        if (u < 8 || v < 8 || u > KW - 8 || v > KH - 8) continue;
+        if (!sourceVisible(ready[k], z, u, v)) continue;
+        seen.push(k);
+      }
+      off[s + 1] = seen.length;
+    }
+    return {samples, seenOff: off, seenIdx: Int32Array.from(seen), centres, path: navPath};
+  }
+  function buildNav(){
+    const gen = ++navGeneration;
+    const t0 = performance.now();
+    const input = navInput();
+    if (!input){ return; }
+    const job = NAV.fieldJob(input);
+    navJob = job;
+    S.nav = {phase: "building", voxels: job.count, samples: NAV_SAMPLES, sources: input.centres.length / 3,
+             seen: input.seenIdx.length, bytes: job.cov.byteLength * 2, inputMs: performance.now() - t0};
+    let spent = performance.now() - t0;
+    const slice = () => {
+      if (gen !== navGeneration) return;
+      const t = performance.now();
+      while (!NAV.fieldWork(job, 24) && performance.now() - t < 14){ /* a frame's worth */ }
+      spent += performance.now() - t;
+      if (!job.done){ setTimeout(slice, 0); return; }
+      navField = job; navJob = null; overviewPose = null;
+      S.nav.phase = "ready"; S.nav.ms = Math.round(spent);
+      cam.floor = floorAt(cam);
+      $("bOverview").disabled = false;
+      requestDraw();
+    };
+    setTimeout(slice, 0);
+  }
+
+  /* Overview: the best-supported RAISED vantage inside the envelope. The field
+     proposes (support x a mild preference for wide content, from points at
+     least 0.15 above the walk), the real blend decides (drawn fraction of a
+     small render, the opening's score), best of the top few. */
+  function findOverview(){
+    if (!navField || !navField.done) return null;
+    const t0 = performance.now(), V = navView(), F = navField;
+    const ref = CONFIG.median_scene_depth || diag * 0.25, found = [];
+    for (let a = 0; a < F.count; a++){
+      const p = [F.where[a*3], F.where[a*3+1], F.where[a*3+2]];
+      const pd = NAV.pathDist(navPath, p);
+      if (pd.e > 0.85 || !pd.closest) continue;
+      const rise = dot3([p[0]-pd.closest[0], p[1]-pd.closest[1], p[2]-pd.closest[2]], UP);
+      if (rise < 0.15) continue;
+      for (let k = 0; k < 12; k++) for (const pitch of [-0.5, -0.3]){
+        const yaw = -Math.PI + k * Math.PI / 6;
+        const r = NAV.support(F, p, dirFrom(yaw, pitch), UP, V.fy, V.aspect);
+        if (r.s < NAV.T_HI) continue;
+        found.push({p, yaw, pitch, s: r.s, score: r.s * (0.8 + 0.2 * Math.min(1, r.dist / (2.5 * ref)))});
+      }
+    }
+    found.sort((x, y) => y.score - x.score);
+    const top = [];
+    for (const f of found){
+      if (top.every(o => Math.hypot(o.p[0]-f.p[0], o.p[1]-f.p[1], o.p[2]-f.p[2]) > 1.0 || Math.abs(o.yaw - f.yaw) > 0.6)) top.push(f);
+      if (top.length >= 6) break;
+    }
+    if (!top.length) return null;
+    const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
+    const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
+    const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
+    const save = cam, saveOverride = override;
+    override = null;
+    let best = null;
+    for (const f of top){
+      cam = {p: f.p, yaw: f.yaw, pitch: f.pitch, floor: 1};
+      const r = drawnFraction(currentCamera(aspect), w, h);
+      f.drawn = r.drawn; f.rendered = openingScore(r);
+      if (!best || f.rendered > best.rendered) best = f;
+    }
+    cam = save; override = saveOverride;
+    S.overview = {ms: Math.round(performance.now() - t0), considered: found.length,
+                  top: top.map(f => ({support: +f.s.toFixed(3), drawn: +f.drawn.toFixed(3), score: +f.rendered.toFixed(3)})),
+                  chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn}};
+    return best && {p: best.p.slice(), yaw: best.yaw, pitch: best.pitch};
+  }
+  function overview(){
+    if (!navField || !navField.done) return false;
+    if (!overviewPose) overviewPose = findOverview();
+    if (!overviewPose) return false;
+    glideTo(overviewPose, null);
+    return true;
   }
 
   /* -------- source choice (CPU, from a 32x24 probe of the proxy) --------- */
@@ -1122,6 +1667,30 @@ async function main(){
     gl.uniform1f(G.probe.u.uFar, zmax * 3);
     drawMesh();
   }
+  /* Which sources to bind for this view. Revised 2026-09-17 (fix-it nav lane):
+     the first rule scored a source 0 beyond 60 degrees from the viewing ray
+     and never asked whether it could SEE the point, so on the wall right of
+     the door it bound eight keyframes that do not contain the wall (1-6% of
+     its pixels) and left out the ones that walked toward it (97%, seen at
+     75-85 degrees): a real, imaged wall drawn as "not captured". Now a probe
+     point counts for a source only if it is in that source's frame and
+     VISIBLE from it (the source's own depth, the CPU copy), the angle fades
+     smoothly out to 85 degrees instead of stopping at 60, and the greedy pick
+     puts COVERAGE first: a point no chosen source can colour yet is worth
+     more than a better angle on a point already covered. The angle still
+     ranks sources, and the blend still weights them by penalty, so an oblique
+     source only shows where nothing better saw the surface. */
+  const COVER_BONUS = 0.6;
+  function sourceVisible(L, z, u, v){
+    const cpu = L.cpuDepth;
+    if (!cpu) return true;
+    const cw = Math.ceil(DW / 2), ch = Math.ceil(DH / 2);
+    const x = Math.min(cw - 1, Math.max(0, Math.floor(u / 8))), y = Math.min(ch - 1, Math.max(0, Math.floor(v / 8)));
+    const q = cpu[y * cw + x];
+    if (q >= 65535) return false;
+    const zs = q / 65534 * zmax;
+    return z <= zs * 1.03 + 0.03;
+  }
   function choose(cam, pts, sticky = true){
     const ready = layers.filter(L => L.ready && L.depthReady && L.kf);
     // A source already on screen keeps its place unless another is clearly
@@ -1138,11 +1707,14 @@ async function main(){
         const u = I.fx * (Rr[0]*X[0] + Rr[1]*X[1] + Rr[2]*X[2] + t[0]) / z + I.cx;
         const v = I.fy * (Rr[3]*X[0] + Rr[4]*X[1] + Rr[5]*X[2] + t[1]) / z + I.cy;
         if (u < 8 || v < 8 || u > KW - 8 || v > KH - 8) continue;
+        if (!sourceVisible(ready[s], z, u, v)) continue;
         const a = [C[0]-X[0], C[1]-X[1], C[2]-X[2]], b = [cam.eye[0]-X[0], cam.eye[1]-X[1], cam.eye[2]-X[2]];
         const la = Math.hypot(a[0],a[1],a[2]), lb = Math.hypot(b[0],b[1],b[2]) || 1e-6;
         const ang = Math.acos(Math.max(-1, Math.min(1, dot3(a, b) / (la * lb))));
+        const cover = 1 - NAV.smooth(1.30, 1.48, ang);
+        if (cover <= 0) continue;
         const pen = ang + 0.15 * Math.max(la / lb - 1, 0);
-        score[s * n + p] = Math.max(0, 1 - pen / maxang) * (0.5 + 0.5 * (kf.quality ?? 1));
+        score[s * n + p] = cover * (0.15 + 0.85 * Math.max(0, 1 - pen / maxang)) * (0.5 + 0.5 * (kf.quality ?? 1));
       }
       const held = sticky && active.get(ready[s]);
       if (held && held.target) for (let p = 0; p < n; p++) score[s * n + p] *= 1.12;
@@ -1154,7 +1726,8 @@ async function main(){
         if (chosen.includes(s)) continue;
         let g = 0;
         for (let p = 0; p < n; p++){ const q = score[s*n+p];
-          if (q > b1[p]) g += (q - b1[p]) + 0.5 * (b1[p] - b2[p]); else if (q > b2[p]) g += 0.5 * (q - b2[p]); }
+          if (q > b1[p]) g += (q - b1[p]) + 0.5 * (b1[p] - b2[p]) + (b1[p] > 0 ? 0 : COVER_BONUS);
+          else if (q > b2[p]) g += 0.5 * (q - b2[p]); }
         if (g > bg){ bg = g; best = s; }
       }
       if (best < 0) break;
@@ -1315,22 +1888,26 @@ async function main(){
   function frame(sync){
     if (!G || gl.isContextLost() || !mesh || !G.col) return;
     resize();
-    const cam = currentCamera(), MVP = matrices(cam), key = camKey(cam);
     const now = performance.now();
     const dt = clockMs !== null ? clockMs : (lastFrameT ? Math.min(100, now - lastFrameT) : 0);
     lastFrameT = now;
+    // Under a verification clock only the verification's own frames advance
+    // time; the page's animation frames just redraw.
+    const tick = clockMs !== null && !sync ? 0 : dt;
+    const navMoving = tick > 0 || clockMs === null ? navUpdate(tick) : false;
+    const cam = currentCamera(), MVP = matrices(cam), key = camKey(cam);
     // A verification hook without a clock asks for the settled picture.
     const instant = (sync && clockMs === null) || !active.size;
     if (sync || !chosen.length){ chosen = chooseSync(cam, MVP); chosenFor = key; setChosen(chosen, instant); }
     else if (chosenFor !== key && !startAsyncProbe(cam, MVP)){
       chosen = chooseSync(cam, MVP); chosenFor = key; setChosen(chosen, instant);
     }
-    const fading = updatePresence(dt);
+    const fading = updatePresence(tick);
     drawBlend(cam, MVP, bound());
-    if (fading && !sync) requestDraw();
+    if ((fading || navMoving) && !sync) requestDraw();
     S.choice = chosen.map(L => L.kf && L.kf.ki);
     S.bound = bound().map(({L, p}) => [L.kf && L.kf.ki, +p.toFixed(3)]);
-    $("pos").textContent = !override && mode === "walk" && cams.length ? (ci + 1) + " / " + cams.length : "";
+    $("pos").textContent = !override && cams.length ? (ci + 1) + " / " + cams.length : "";
     if (S.timing.firstFrameMs === undefined && S.layers > 0) S.timing.firstFrameMs = performance.now() - T0;
   }
 
@@ -1378,12 +1955,12 @@ async function main(){
     const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
     const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
     const step = Math.max(1, Math.ceil(cams.length / 32));
-    const saveMode = mode, saveOverride = override;
-    override = null; mode = "walk";
+    const saveCam = cam, saveOverride = override;
+    override = null;
     const seen = new Map();
     const score = i => {
       if (!seen.has(i)){
-        ci = i; look.yaw = 0; look.pitch = 0;
+        const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
         const r = drawnFraction(currentCamera(aspect), w, h);
         seen.set(i, {score: openingScore(r), drawn: r.drawn, distance: r.distance});
       }
@@ -1395,7 +1972,7 @@ async function main(){
     for (let i = Math.max(0, best - step + fine); i <= Math.min(cams.length - 1, best + step - fine); i += fine){
       const s = score(i); if (s > bestScore){ bestScore = s; best = i; }
     }
-    mode = saveMode; override = saveOverride;
+    cam = saveCam; override = saveOverride;
     S.timing.openingMs = performance.now() - t;
     const b = seen.get(best) || {};
     S.opening = {index: best, step, fine, tested: seen.size, score: bestScore,
@@ -1460,89 +2037,98 @@ async function main(){
   }, false);
 
   /* -------- input ------------------------------------------------------------ */
+  /* Touch: one finger drags the look, two fingers drag to move sideways and
+     up/down (the room follows the fingers), pinch moves forward and back.
+     Desktop (debug): left drag looks, right or shift drag moves, the wheel
+     moves forward/back, W A S D Q E fly, arrow keys step the walk, O overview.
+     Every input goes through NAV.step, and motion coasts after release. */
   const pts = new Map();
-  let gesture = null, walkSwipe = 0;
+  let gesture = null, lastMoveT = 0, mouseMove = false;
   function two(){ const v = [...pts.values()];
     return {d: Math.hypot(v[0].x-v[1].x, v[0].y-v[1].y), x:(v[0].x+v[1].x)/2, y:(v[0].y+v[1].y)/2}; }
+  const MOVE_PER_PX = 0.004, PINCH_UNITS = 2.0;
+  function lookPerPx(){ return currentCamera().fy / Math.max(1, canvas.clientHeight); }
+  function feel(look, move, now){
+    // input this frame, and a running estimate of its velocity for the coast
+    const ms = Math.max(8, Math.min(60, now - lastMoveT)); lastMoveT = now;
+    for (let i = 0; i < 2; i++){ ctl.look[i] += look[i]; vel.look[i] = 0.5 * vel.look[i] + 0.5 * look[i] / ms; }
+    for (let i = 0; i < 3; i++){ ctl.move[i] += move[i]; vel.move[i] = 0.5 * vel.move[i] + 0.5 * move[i] / ms; }
+  }
+  function interrupt(){ glideState = null; }
   canvas.addEventListener("pointerdown", e => {
     try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* synthetic */ }
     pts.set(e.pointerId, {x: e.clientX, y: e.clientY});
-    gesture = pts.size >= 2 ? two() : null; walkSwipe = 0;
+    gesture = pts.size >= 2 ? two() : null;
+    mouseMove = e.pointerType === "mouse" && (e.button === 2 || e.shiftKey);
+    ctl.held = true; vel.look = [0, 0]; vel.move = [0, 0, 0]; lastMoveT = performance.now();
+    if (glideState) interrupt();
+    override = null;
     e.preventDefault();
   }, {passive: false});
   canvas.addEventListener("pointermove", e => {
     const p = pts.get(e.pointerId);
     if (!p) return;
-    override = null;
     const dx = e.clientX - p.x, dy = e.clientY - p.y;
     p.x = e.clientX; p.y = e.clientY;
-    if (pts.size === 1){
-      if (mode === "walk"){
-        look.yaw -= dx * 0.005;
-        look.pitch = Math.max(-1.3, Math.min(1.3, look.pitch - dy * 0.005));
-      } else {
-        orbit.yaw -= dx * 0.008;
-        orbit.pitch = Math.max(-1.45, Math.min(1.45, orbit.pitch - dy * 0.008));
-      }
+    const now = performance.now();
+    if (pts.size === 1 && !mouseMove){
+      const k = lookPerPx();
+      feel([-dx * k, dy * k], [0, 0, 0], now);      // the room follows the finger
+    } else if (pts.size === 1 && mouseMove){
+      feel([0, 0], [-dx * MOVE_PER_PX, dy * MOVE_PER_PX, 0], now);
     } else if (pts.size >= 2 && gesture){
       const g = two();
-      if (mode === "orbit"){
-        orbit.dist = Math.max(diag*0.01, Math.min(diag*6, orbit.dist * (gesture.d / Math.max(1, g.d))));
-        const cam = currentCamera();
-        const f = norm3([cam.at[0]-cam.eye[0], cam.at[1]-cam.eye[1], cam.at[2]-cam.eye[2]]);
-        const r = norm3(cross3(f, UP)), u = cross3(r, f);
-        const k = orbit.dist * 0.0022, mx = g.x - gesture.x, my = g.y - gesture.y;
-        for (let i = 0; i < 3; i++) orbit.target[i] += (-r[i]*mx + u[i]*my) * k;
-      } else {
-        fovScale = Math.max(0.5, Math.min(1.4, fovScale * (gesture.d / Math.max(1, g.d))));
-        walkSwipe += g.x - gesture.x;
-        while (Math.abs(walkSwipe) >= 70){ step(walkSwipe < 0 ? 1 : -1); walkSwipe -= Math.sign(walkSwipe) * 70; }
-      }
+      feel([0, 0], [-(g.x - gesture.x) * MOVE_PER_PX, (g.y - gesture.y) * MOVE_PER_PX,
+                    Math.log(Math.max(1, g.d) / Math.max(1, gesture.d)) * PINCH_UNITS], now);
       gesture = g;
     }
     requestDraw(); e.preventDefault();
   }, {passive: false});
-  function up(e){ pts.delete(e.pointerId); gesture = pts.size >= 2 ? two() : null; requestDraw(); }
+  function up(e){
+    pts.delete(e.pointerId); gesture = pts.size >= 2 ? two() : null;
+    if (!pts.size){
+      ctl.held = false; mouseMove = false;
+      if (performance.now() - lastMoveT > 90){ vel.look = [0, 0]; vel.move = [0, 0, 0]; }   // a pause is not a flick
+    }
+    requestDraw();
+  }
   canvas.addEventListener("pointerup", up);
   canvas.addEventListener("pointercancel", up);
   canvas.addEventListener("lostpointercapture", up);
+  canvas.addEventListener("contextmenu", e => e.preventDefault());
   canvas.addEventListener("touchmove", e => e.preventDefault(), {passive: false});
   for (const n of ["gesturestart", "gesturechange", "gestureend"])
     document.addEventListener(n, e => e.preventDefault(), {passive: false});
   canvas.addEventListener("wheel", e => {
+    if (glideState) interrupt();
     override = null;
-    if (mode === "orbit") orbit.dist = Math.max(diag*0.01, Math.min(diag*6, orbit.dist * Math.exp(e.deltaY * 0.0012)));
-    else fovScale = Math.max(0.5, Math.min(1.4, fovScale * Math.exp(e.deltaY * 0.001)));
+    ctl.move[2] += -e.deltaY * 0.0025;
     requestDraw(); e.preventDefault();
   }, {passive: false});
   addEventListener("keydown", e => {
-    if (e.key === "ArrowRight") step(1); else if (e.key === "ArrowLeft") step(-1);
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (k === "ArrowRight") step(1); else if (k === "ArrowLeft") step(-1);
+    else if (k === "o") overview();
+    else if ("wasdqe".includes(k) && k.length === 1){ if (glideState) interrupt(); override = null; keys.add(k); requestDraw(); }
   });
+  addEventListener("keyup", e => { keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key); });
+  addEventListener("blur", () => { keys.clear(); ctl.held = false; pts.clear(); });
 
   function step(d){
     if (!cams.length) return;
-    override = null; ci = Math.max(0, Math.min(cams.length-1, ci + d));
-    look.yaw = 0; look.pitch = 0; requestDraw();
-  }
-  function setMode(m){
-    override = null; mode = m;
-    $("bOrbit").setAttribute("aria-pressed", String(m === "orbit"));
-    $("bWalk").setAttribute("aria-pressed", String(m === "walk"));
-    if (m === "orbit") resetOrbitToCamera();
-    look.yaw = 0; look.pitch = 0; fovScale = 1;
-    requestDraw();
+    const i = Math.max(0, Math.min(cams.length-1, ci + d));
+    glideTo(poseOf(i), i); ci = i;
   }
   function reset(){
-    override = null; ci = opening >= 0 ? opening : 0;
-    look.yaw = 0; look.pitch = 0; fovScale = 1;
-    resetOrbitToCamera(); setMode(cams.length ? "walk" : "orbit");
+    const i = opening >= 0 ? opening : 0;
+    glideTo(poseOf(i), i); ci = i;
   }
-  $("bOrbit").onclick = () => setMode("orbit");
-  $("bWalk").onclick = () => { if (cams.length) setMode("walk"); };
-  $("bPrev").onclick = () => { if (mode === "walk") step(-1); };
-  $("bNext").onclick = () => { if (mode === "walk") step(1); };
+  $("bOverview").onclick = () => overview();
+  $("bPrev").onclick = () => step(-1);
+  $("bNext").onclick = () => step(1);
   $("bReset").onclick = reset;
-  if (!cams.length){ $("bWalk").disabled = true; $("bPrev").disabled = true; $("bNext").disabled = true; }
+  $("bOverview").disabled = true;
+  if (!cams.length){ $("bPrev").disabled = true; $("bNext").disabled = true; }
   addEventListener("resize", requestDraw);
 
   /* -------- caption: exactly what this is ---------------------------------- */
@@ -1573,13 +2159,23 @@ async function main(){
   /* -------- verification hooks (read-only, and harmless on the phone) ------- */
   S.setView = (v) => { override = {eye: v.eye, target: v.target, up: v.up ? norm3(v.up) : null,
     fovY: (v.fovYDeg || 70) * Math.PI / 180}; frame(true); return S.choice; };
-  S.walk = (i, yawDeg = 0, pitchDeg = 0) => { override = null; mode = "walk"; ci = i; look.yaw = yawDeg * Math.PI / 180;
-    look.pitch = pitchDeg * Math.PI / 180; fovScale = 1; frame(true); return {index: ci, of: cams.length}; };
-  S.orbitView = (yawDeg, pitchDeg, distScale = 1, around = null) => { override = null; mode = "orbit";
-    ci = around !== null ? around : (opening >= 0 ? opening : 0);
-    resetOrbitToCamera(); orbit.yaw += yawDeg * Math.PI / 180; orbit.pitch = Math.max(-1.45, Math.min(1.45, orbit.pitch + pitchDeg * Math.PI / 180));
-    orbit.dist *= distScale; frame(true); return true; };
-  S.reset = () => { reset(); frame(true); };
+  S.walk = (i, yawDeg = 0, pitchDeg = 0) => { ci = Math.max(0, Math.min(cams.length - 1, i));
+    setPose(poseOf(ci, yawDeg * Math.PI / 180, pitchDeg * Math.PI / 180)); frame(true);
+    return {index: ci, of: cams.length}; };
+  /* The free orbit this page USED to offer (orbit about the point a recorded
+     pose looked at), kept only so a measurement can show where it went. */
+  S.orbitView = (yawDeg, pitchDeg, distScale = 1, around = null) => {
+    const i = around !== null ? around : (opening >= 0 ? opening : 0);
+    const c = cams[Math.max(0, Math.min(cams.length - 1, i))], f = norm3([c[3], c[4], c[5]]);
+    const d = CONFIG.median_scene_depth || diag * 0.2;
+    const target = [c[0]+f[0]*d, c[1]+f[1]*d, c[2]+f[2]*d], yp = yawPitchOf(f);
+    const dir = dirFrom(yp.yaw + yawDeg * Math.PI / 180,
+                        Math.max(-1.45, Math.min(1.45, yp.pitch + pitchDeg * Math.PI / 180)));
+    const dist = d * distScale;
+    override = {eye: [target[0]-dir[0]*dist, target[1]-dir[1]*dist, target[2]-dir[2]*dist], target, up: null,
+                fovY: 0.95};
+    frame(true); return true; };
+  S.reset = () => { reset(); if (glideState){ glideState.t = glideState.ms; } frame(true); };
   S.coverage = () => {
     const cam = currentCamera(), MVP = matrices(cam);
     const w = canvas.width, h = canvas.height, px = new Uint8Array(w * h * 4);
@@ -1606,11 +2202,35 @@ async function main(){
     drawBlend(cam, MVP, bound()); return u; };
   S.clock = (ms) => { clockMs = ms === null || ms === undefined ? null : +ms; return clockMs; };
   S.snapshot = () => { frame(true); return canvas.toDataURL("image/png"); };
+  // Navigation, for verification: the pose, the envelope, a scripted input
+  // (the same path a finger takes: NAV.step inside frame()), one clocked frame.
+  S.pose = () => ({p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor, index: ci,
+                   gliding: !!glideState, resisted: S.resisted || 0});
+  S.setPose = (pose) => { setPose(pose); frame(true); return S.pose(); };
+  S.navStats = () => S.nav || null;
+  S.navReady = () => !!(navField && navField.done);
+  S.support = (pose) => { const r = supportOf(pose || cam); if (!r) return null;
+    const pd = navPath && navPath.n ? NAV.pathDist(navPath, (pose || cam).p) : null;
+    return {support: r.s, dist: r.dist, envelope: pd ? pd.e : null}; };
+  S.sampleReachable = (n, seed = 1) => { if (!navField || !navField.done) return [];
+    const rand = mulberry(seed), V = navView(), out = [];
+    for (let i = 0; i < n; i++){ const r = NAV.sampleReachable(navField, navPath, V, rand); if (r) out.push(r); }
+    return out; };
+  S.input = (c) => { override = null;
+    if (c.look){ ctl.look[0] += c.look[0]; ctl.look[1] += c.look[1]; }
+    if (c.move){ for (let i = 0; i < 3; i++) ctl.move[i] += c.move[i]; }
+    if (c.vel){ vel.look = (c.vel.look || [0, 0]).slice(); vel.move = (c.vel.move || [0, 0, 0]).slice(); }
+    if (c.held !== undefined) ctl.held = !!c.held;
+    return true; };
+  S.step = (d) => { step(d); return ci; };
+  S.overview = () => overview();
+  S.frame = () => { frame(true); return S.pose(); };
 
   /* -------- start ------------------------------------------------------------ */
   try {
     buildGL();
     basis();
+    navPath = cams.length ? NAV.makePath(cams, UP) : null;
     S.phase = "loading";
     status("Loading the images…");
     await serial(() => loadRevision(CONFIG.appearance_revision || null));
@@ -1619,13 +2239,13 @@ async function main(){
     resize();
     opening = chooseOpening();
     ci = opening >= 0 ? opening : 0;
-    resetOrbitToCamera();
+    setPose(poseOf(ci));
     updateCaption();
-    setMode(cams.length ? "walk" : "orbit");
     frame(true);
     S.phase = "ready";
     S.timing.bootMs = performance.now() - T0;
     gpuTotal();
+    buildNav();
     follow();
   } catch (e){
     if (S.phase !== "failed") fail("The images could not be placed: " + (e && e.message ? e.message : e));

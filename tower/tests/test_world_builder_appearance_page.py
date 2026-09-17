@@ -296,6 +296,10 @@ class TestThePage:
         blend = text[text.index("const FS_BLEND"):text.index("/* ---------- main")]
         for lighting in ("dot(n,", "normalize(cross(dFdx", "hemi", "uUpView"):
             assert lighting not in blend
+        # the fragment's facing exists only to keep an oblique source from
+        # painting a surface it saw edge-on; it never reaches a colour
+        uses = [line for line in blend.splitlines() if "facing" in line and "//" not in line.split("facing")[0]]
+        assert len(uses) == 2 and "vec3 facing =" in uses[0] and "float edgeOn =" in uses[1], uses
 
     def test_it_levels_the_horizon_and_walks_the_recorded_path(self, built):
         from tower.world_builder.appearance_render import build_appearance_config
@@ -613,3 +617,214 @@ assert.strictEqual(FOLLOW.decide({error: "timeout"}, page).action, "none");
 assert.strictEqual(FOLLOW.nextDelay({action: "none", live: true}, 80000), FOLLOW.BASE_MS);
 assert.strictEqual(FOLLOW.nextDelay({action: "none", live: null}, 10000), 20000);
 """
+
+
+# ---------------------------------------------------------------------------
+# fix-it nav lane: the capture envelope (NAV, run under node) and the source
+# choice that draws what an oblique keyframe saw
+# ---------------------------------------------------------------------------
+
+
+def _nav_source():
+    text = _template()
+    start = text.index("/* ---------- navigation: where the camera may go")
+    return text[start:text.index("/* ---------- end navigation */", start)]
+
+
+# A synthetic room: a recorded walk along +x through the origin, one wall at
+# z = 3 facing it, seen by every recorded camera, and nothing anywhere else.
+NAV_ROOM = r"""
+const up = [0, 1, 0];
+const cams = [];
+for (let i = 0; i <= 10; i++) cams.push([i * 0.5, 0, 0, 0, 0, 1]);
+const path = NAV.makePath(cams, up);
+const samples = [], off = [0], idx = [];
+for (let x = -4; x <= 9; x += 0.1) for (let y = -2.5; y <= 2.5; y += 0.1){
+  samples.push(x, y, 3);
+  for (let k = 0; k < cams.length; k++) idx.push(k);
+  off.push(idx.length);
+}
+const centres = Float32Array.from(cams.flatMap(c => [c[0], c[1], c[2]]));
+const F = NAV.fieldJob({samples: Float32Array.from(samples), seenOff: Int32Array.from(off),
+                        seenIdx: Int32Array.from(idx), centres, path});
+let slices = 0;
+while (!NAV.fieldWork(F, 50)) slices++;
+const dir = (yaw, pitch) => [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+const V = {dir, up, fy: 1.25, aspect: 1.2};
+const sup = (p, yaw, pitch = 0) => NAV.support(F, p, dir(yaw, pitch), up, V.fy, V.aspect).s;
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const at = [2.5, 0, 0];
+"""
+
+
+def _run_nav(script):
+    """The page's own NAV unit, verbatim, a synthetic room, then `script`."""
+    import subprocess
+
+    program = ("const assert = require('assert');\n" + _nav_source() + "\n" + NAV_ROOM + "\n"
+               + script + "\nconsole.log('nav ok');\n")
+    r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "nav ok" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
+
+class TestTheEnvelope:
+
+    def test_the_field_is_support_where_the_walk_looked_and_nothing_elsewhere(self):
+        _run_nav(r"""
+assert.ok(F.done && F.count > 0 && slices > 0, "built in slices, so the page stays interactive");
+assert.ok(sup(at, 0) > 0.95, "facing the wall every camera saw: " + sup(at, 0));
+assert.strictEqual(sup(at, Math.PI), 0, "behind the walk nothing was seen, so nothing is supported");
+assert.ok(sup(at, Math.PI / 2) < 0.5, "sideways, half the view is empty");
+assert.strictEqual(sup([2.5, 0, -9], 0), 0, "far outside the tube there is no support at all");
+// every direction has exactly one cube cell, and opposite ones differ
+const cells = new Set();
+for (let i = 0; i < 4000; i++){
+  const d = [Math.sin(i * 1.7) * Math.cos(i * 0.31), Math.cos(i * 1.3), Math.sin(i * 0.77)];
+  const c = NAV.cellOf(d[0], d[1], d[2]);
+  assert.ok(c >= 0 && c < NAV.CELLS);
+  assert.notStrictEqual(c, NAV.cellOf(-d[0], -d[1], -d[2]));
+  cells.add(c);
+}
+assert.ok(cells.size > NAV.CELLS * 0.9);
+// the angle weight is the blend's tail: full to 60 degrees, none past 85
+assert.strictEqual(NAV.angleWeight(1.0), 1);
+assert.ok(NAV.angleWeight(1.40) > 0.4 && NAV.angleWeight(1.40) < 0.6);
+assert.strictEqual(NAV.angleWeight(1.50), 0);
+""")
+
+    def test_moving_out_is_resisted_smoothly_and_never_passes_the_edge(self):
+        _run_nav(r"""
+for (const move of [[0, 0, -0.05], [0.05, 0, 0], [0, 0.05, 0], [0, 0, -0.4]]){
+  let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, maxE = 0, resisted = 0, prevStep = Infinity;
+  for (let i = 0; i < 400; i++){
+    const n = NAV.step(F, path, cam, {look: [0, 0], move, held: true}, 16, V);
+    const stepLen = dist(n.p, cam.p);
+    assert.ok(stepLen <= Math.hypot(...move) + 1e-9, "never more than was asked");
+    if (NAV.pathDist(path, cam.p).e > NAV.R_SOFT / NAV.R_MAX + 0.05)
+      assert.ok(stepLen <= prevStep + 1e-9, "past the soft edge each push moves less: no wall, no snap");
+    prevStep = stepLen;
+    maxE = Math.max(maxE, NAV.pathDist(path, n.p).e);
+    resisted = Math.max(resisted, n.resisted);
+    cam = n;
+  }
+  assert.ok(maxE <= 1 + 1e-9, "the envelope's edge is never passed: " + maxE + " " + move);
+  assert.ok(maxE > 0.75, "but most of the way there is free: " + maxE + " " + move);
+  assert.ok(resisted > 0.35, "and the page is told, so it can show the hint");
+}
+""")
+
+    def test_a_released_camera_drifts_back_inside_without_a_jump(self):
+        _run_nav(r"""
+let cam = {p: [2.5, 0, -0.95], yaw: 0, pitch: 0, floor: 1};
+let e = NAV.pathDist(path, cam.p).e;
+for (let i = 0; i < 400; i++){
+  const n = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+  assert.ok(dist(n.p, cam.p) < 0.02, "a drift, never a snap");
+  const e1 = NAV.pathDist(path, n.p).e;
+  assert.ok(e1 <= e + 1e-9);
+  e = e1; cam = n;
+}
+assert.ok(e < 0.65 && e > 0.5, "back to the soft edge, not dragged to the walk: " + e);
+// a held camera is not moved by the drift
+const held = NAV.step(F, path, {p: [2.5, 0, -0.95], yaw: 0, pitch: 0, floor: 1}, {look: [0, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.deepStrictEqual(held.p, [2.5, 0, -0.95]);
+""")
+
+    def test_looking_toward_what_was_never_captured_is_resisted(self):
+        _run_nav(r"""
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, least = 1, resisted = 0;
+for (let i = 0; i < 400; i++){
+  cam = NAV.step(F, path, cam, {look: [0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+  least = Math.min(least, sup(cam.p, cam.yaw)); resisted = Math.max(resisted, cam.resisted);
+}
+assert.ok(least >= NAV.T_LO - 0.02, "the look stops before the view is mostly dark: " + least);
+assert.ok(cam.yaw > 0.5, "but it turns freely while the view is supported: " + cam.yaw);
+assert.ok(resisted > 0.35);
+for (let i = 0; i < 400; i++) cam = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.ok(sup(cam.p, cam.yaw) >= NAV.T_HI - 0.05, "released, it eases back toward what was seen");
+// turning back toward the wall is not held back (the field is sampled on a
+// cube map, so support is only monotone to within a cell)
+const back = NAV.step(F, path, cam, {look: [-0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.ok(cam.yaw - back.yaw > 0.027 && back.resisted < 0.1, (cam.yaw - back.yaw) + " " + back.resisted);
+""")
+
+    def test_a_recorded_view_that_is_itself_dark_is_never_pushed(self):
+        _run_nav(r"""
+// the wearer looked away from the wall: support 0, but it is a recorded pose
+const pose = {p: at.slice(), yaw: Math.PI, pitch: 0, floor: 0.05};
+const n = NAV.step(F, path, pose, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.strictEqual(n.yaw, Math.PI); assert.deepStrictEqual(n.p, at);
+// and without a field (still building) nothing is limited at all
+const free = NAV.step(null, path, {p: at.slice(), yaw: 0, pitch: 0}, {look: [2, 0], move: [0, 0, -5], held: true}, 16, V);
+assert.strictEqual(free.yaw, 2); assert.strictEqual(free.resisted, 0);
+""")
+
+    def test_stepping_along_the_walk_glides(self):
+        _run_nav(r"""
+const a = {p: [0, 0, 0], yaw: 3.0, pitch: 0}, b = {p: [1, 0, 0], yaw: -3.0, pitch: 0.2};
+assert.deepStrictEqual(NAV.glide(a, b, 0).p, a.p);
+const end = NAV.glide(a, b, 1);
+assert.ok(dist(end.p, b.p) < 1e-12 && Math.abs(Math.cos(end.yaw) - Math.cos(b.yaw)) < 1e-12);
+const mid = NAV.glide(a, b, 0.5);
+assert.ok(Math.abs(Math.cos(mid.yaw) - Math.cos(Math.PI)) < 1e-9, "the short way round, through pi");
+let prev = a;
+for (let t = 0.02; t <= 1.0001; t += 0.02){
+  const g = NAV.glide(a, b, t);
+  assert.ok(dist(g.p, prev.p) < 0.05, "no frame of a glide is a jump");
+  prev = g;
+}
+assert.ok(NAV.glideMs(a, b) >= 400 && NAV.glideMs(a, {p: [30, 0, 0], yaw: 3, pitch: 0}) <= 1600);
+// a gap in the recorded walk longer than JUMP is not a corridor
+const gap = NAV.makePath([[0, 0, 0, 0, 0, 1], [NAV.JUMP + 3, 0, 0, 0, 0, 1]], up);
+assert.ok(NAV.pathDist(gap, [(NAV.JUMP + 3) / 2, 0, 0]).e > 1);
+""")
+
+    def test_reachable_samples_are_inside_and_supported(self):
+        _run_nav(r"""
+let seed = 7; const rand = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+for (let i = 0; i < 40; i++){
+  const r = NAV.sampleReachable(F, path, V, rand);
+  assert.ok(r, "found one");
+  assert.ok(NAV.pathDist(path, r.p).e <= 1 && r.support >= NAV.T_LO);
+}
+""")
+
+
+class TestTheNavigationWiring:
+    """On the page's source: input goes through NAV, there is no free orbit,
+    the envelope never paints, and the source choice covers first."""
+
+    def test_every_input_goes_through_the_envelope(self):
+        text = _template()
+        update = _section(text, "function navUpdate(", "function mulberry(")
+        assert "NAV.step(navField, navPath, cam," in update
+        assert "NAV.glide(" in update, "stepping between recorded poses glides"
+        frame = _section(text, "function frame(sync){", "function drawnFraction(")
+        assert frame.index("navUpdate(tick)") < frame.index("currentCamera()")
+        inp = _section(text, "/* -------- input ---", "/* -------- caption")
+        assert "orbit" not in inp.lower(), "free orbit is gone"
+        assert "feel(" in inp and "pinch" in inp.lower()
+        assert 'id="bOrbit"' not in text and 'id="bOverview"' in text and 'id="hint"' in text
+        assert "Not captured beyond here" in text
+
+    def test_the_envelope_limits_the_camera_and_paints_nothing(self):
+        text = _template()
+        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        composite = _section(text, "const FS_COMPOSITE", "}`;")
+        for shader in (blend, composite):
+            assert "navField" not in shader and "support" not in shader.lower()
+        nav = _nav_source()
+        for gl_call in ("gl.", "document.", "fetch(", "window."):
+            assert gl_call not in nav, "NAV is pure: " + gl_call
+
+    def test_the_source_choice_covers_what_a_source_can_see_first(self):
+        text = _template()
+        choose = _section(text, "function choose(", "/* -------- drawing")
+        assert "sourceVisible(ready[s], z, u, v)" in choose
+        assert "COVER_BONUS" in choose and "NAV.smooth(1.30, 1.48, ang)" in choose
+        assert "Math.max(0, 1 - pen / maxang) * (0.5" not in choose, "the 60-degree cut is gone"
+        depth = _section(text, "function renderSourceDepth(", "/* -------- loading")
+        assert "gl.readPixels(0, 0, DW, DH, gl.RGBA_INTEGER, gl.UNSIGNED_INT" in depth
+        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        assert "0.08 * (1.0 - smoothstep(1.30, 1.48, ang))" in blend
+        assert "(1.0 - smoothstep(1.40, 1.48, ang))" in blend
