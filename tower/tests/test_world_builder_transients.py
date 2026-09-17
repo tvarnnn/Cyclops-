@@ -327,6 +327,56 @@ class TestWithoutADetector:
         assert isinstance(T.default_backend_factory(T.COMPONENT_ONEFORMER), T.OneFormerBackend)
         assert "not installed" in T._packages_missing("no_such_package_for_transients")
 
+    @pytest.mark.parametrize("how", ["probe", "load"])
+    def test_a_union_without_grounding_dino_keeps_the_oneformer_masks(self, world, how):
+        """Review 1, m1: the final `union` build on a machine that cannot fetch
+        Grounding DINO / SAM recorded `unavailable` and no masks at all, so the
+        finished world showed hands the walk's OneFormer masks had hidden. It
+        now keeps OneFormer's masks and records the partial state."""
+        oneformer = Stub()
+
+        def factory(component):
+            if component == T.COMPONENT_GDSAM:
+                if how == "probe":
+                    return Stub(reason="grounding dino is not in the cache (offline)")(component)
+                return Stub(run_error=T.TransientDetectorUnavailable(
+                    "grounding dino is not in the cache (offline)"))(component)
+            return oneformer(component)
+
+        report = _ensure(world, factory, params=T.TransientParams())
+        assert report.state == T.STATE_OK
+        assert report.params.mode == T.MODE_ONEFORMER and report.requested.mode == T.MODE_UNION
+        assert "offline" in report.partial
+        assert set(oneformer.computed(T.COMPONENT_ONEFORMER)) == set(range(len(world.kids)))
+        mask = report.mask(HAND_KI)
+        assert mask is not None and mask[HAND[0]:HAND[1], HAND[2]:HAND[3]].all()
+        record = report.record()
+        assert record["mode"] == T.MODE_ONEFORMER and record["partial"] == report.partial
+        assert record["rule"] == T.TransientParams.live().rule_id()
+        assert record["requested_rule"] == T.TransientParams().rule_id()
+
+        # through the appearance: masked, recorded as partial, and a later build
+        # that can run the union is not "already built"
+        result = world.build(redactor_factory=_never_redact, transient_backend_factory=factory,
+                             params=A.AppearanceParams(selection_samples=4000))
+        assert result.state == AP.STATE_OK, result.detail
+        man = world.manifest()
+        assert man["transients"]["partial"] and man["transients"]["state"] == T.STATE_OK
+        entry = next(k for k in man["keyframes"] if k["ki"] == HAND_KI)
+        assert entry["transient_mask"]["mode"] == T.MODE_ONEFORMER
+        again = world.build(redactor_factory=_never_redact, transient_backend_factory=Stub(),
+                            params=A.AppearanceParams(selection_samples=4000))
+        assert again.detail != AP.ALREADY_BUILT
+        assert world.manifest()["transients"]["partial"] is None
+
+    def test_oneformer_itself_missing_is_still_unavailable(self, world):
+        def factory(component):
+            reason = "oneformer is not in the cache" if component == T.COMPONENT_ONEFORMER else None
+            return Stub(reason=reason)(component)
+
+        report = _ensure(world, factory, params=T.TransientParams())
+        assert report.state == T.STATE_UNAVAILABLE and report.partial is None
+
     def test_a_detector_that_becomes_available_rebuilds_the_appearance(self, world):
         world.build(redactor_factory=_never_redact, transient_backend_factory=Stub(reason="later"))
         before = world.manifest()["params_digest"]

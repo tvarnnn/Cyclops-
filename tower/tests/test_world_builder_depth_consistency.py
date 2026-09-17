@@ -153,7 +153,9 @@ def _world(tmp_path, *, n_frames=10, digest="d1", perturb=True, seed=0):
                         "fill_rule": FILL_RULE})
     align = {"kind": "depth", "camera": camera, "backend": DenseParams().backend,
              "input_digest": digest, "digest": digest, "fill_rule": FILL_RULE,
-             "records": records}
+             "records": records,
+             # the depth stage's record of the label it read under (review 1, M3)
+             "redaction": "faces-detected-and-filled/yunet-2023mar@0.30+plausibility1", "keyframes_were_redacted_at_capture": True}
     (dense / "align.json").write_text(json.dumps(align))
     return store, solution, dense, align, truth
 

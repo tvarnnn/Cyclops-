@@ -369,6 +369,52 @@ def test_new_fill_outside_the_stored_fill_keeps_the_stored_frame(cap, caplog):
     assert plan.refusal == "no frame has recoverable fill; nothing to switch"
 
 
+FACE_ONLY_IN_FRAME_0 = (60, 100, 10, 60)
+
+
+class _FrameZeroDiffers(Rule):
+    """Frame 0 gets `first` (an extra "face" the stored ungated keyframe leaves
+    raw, or an output that is not raw plus boxes); every other frame BOX_B
+    only, so BOX_A is recovered there. Review 1, repro r1."""
+
+    def __init__(self, raw0, first):
+        super().__init__()
+        self.raw0, self.first = raw0, first
+
+    def redact(self, data):
+        img = _dec(data)
+        if float(np.abs(img.astype(int) - self.raw0.astype(int)).mean()) < 3.0:
+            if self.first == RR.KEPT_OUTPUT_NOT_RAW:
+                return RedactionResult(
+                    image_bytes=_enc(cv2.GaussianBlur(_filled(img, [BOX_B]), (9, 9), 4)),
+                    label=self.label, regions=1)
+            self.boxes = (BOX_B, FACE_ONLY_IN_FRAME_0)
+        else:
+            self.boxes = (BOX_B,)
+        return super().redact(data)
+
+
+@pytest.mark.parametrize("origin", [RR.KEPT_FILL_OUTSIDE_STORED, RR.KEPT_OUTPUT_NOT_RAW])
+def test_a_frame_measured_not_to_meet_the_target_refuses_the_apply_under_any_label(cap, origin):
+    """M1: the set's label must be true for every frame in it. A frame kept
+    because the current rule filled outside the stored fill (or its output is
+    not raw plus boxes) is the ungated superset argument failing, so a set
+    holding it cannot carry the current label: refused whole, nothing written,
+    no pointer, readers stay on images/ under the stored label."""
+    plan = cap.plan(_FrameZeroDiffers(_dec(cap.raw_bytes[cap.kids[0]]), origin))
+    assert plan.frames[0].origin == origin
+    assert len(plan.recovered_frames) == N - 1, "the other frames did recover box A"
+    assert plan.refusal and origin in plan.refusal
+    before = cap.stored_hashes()
+    with pytest.raises(RR.ReredactionRefused):
+        RR.apply_plan(cap.store, plan)
+    image_set = cap.store.keyframe_image_set(W, S)
+    assert not image_set.reredacted and image_set.redaction == UNGATED
+    assert cap.store.read_redaction_set_pointer(W, S) is None
+    assert not (cap.store.session_dir(W, S) / RR.set_name()).exists()
+    assert cap.stored_hashes() == before
+
+
 def test_reredacted_fill_is_subset_of_ungated_fill_with_the_real_detector():
     """7: the real YuNet. The current gate only removes boxes from the ungated
     detection pass, so on real faces at several sizes and positions (including
@@ -801,6 +847,60 @@ def test_appearance_follows_the_switch_and_its_served_label(tmp_path):
 
     w.store.write_redaction_set_pointer(WORLD, SESSION, {**pointer, "active": None})
     assert client.get(url).status_code == 404
+
+
+@pytest.mark.parametrize("recorded", ["field", "params_digest"])
+def test_a_revert_takes_the_sets_surface_off_every_rung_until_it_is_rebuilt(tmp_path, recorded):
+    """Review 1, m4: after `--revert` the appearance route 404s at once, but the
+    surface built from the set -- its vertex colours are that set's pixels --
+    was still drawn. A surface (or dense artifact) recording a set the session
+    no longer reads is not drawable: not on the ladder, not in the revision,
+    not in the listing, and a pinned request is refused."""
+    from tower.results.world_builder_render import (
+        WorldRenderUnavailable,
+        build_world_render,
+    )
+    from tower.world_builder.store import (
+        built_from_an_inactive_keyframe_set,
+        surface_artifact_drawable,
+    )
+
+    from tests.test_world_builder_appearance import SESSION, WORLD, World
+
+    w = World(tmp_path, label=UNGATED)
+    name = "images.redacted-plausibility3"
+    (w.store.session_dir(WORLD, SESSION) / name).mkdir()
+    pointer = {"active": name, "redaction": CURRENT, "stored_redaction": UNGATED,
+               "set_digest": "abc"}
+    w.store.write_redaction_set_pointer(WORLD, SESSION, pointer)
+    token = w.store.keyframe_image_set(WORLD, SESSION).cache_token
+    manifest_path = w.store.world_dir(WORLD) / "surface" / SESSION / "manifest.json"
+    man = json.loads(manifest_path.read_text())
+    if recorded == "field":
+        man["keyframe_image_set"] = token
+    else:                                   # a surface built before the field existed
+        man["params_digest"] = f"digest-1|x|moge2-vitl|set:{token}|transients:off"
+    manifest_path.write_text(json.dumps(man))
+
+    assert surface_artifact_drawable(w.store, WORLD, SESSION)
+    assert "wb-representation\" content=\"surface\"" in build_world_render(
+        w.store, WORLD, SESSION, representation="surface")
+
+    w.store.write_redaction_set_pointer(WORLD, SESSION, {**pointer, "active": None})   # --revert
+    assert built_from_an_inactive_keyframe_set(w.store, WORLD, SESSION, "surface")
+    assert not surface_artifact_drawable(w.store, WORLD, SESSION)
+    with pytest.raises(WorldRenderUnavailable):
+        build_world_render(w.store, WORLD, SESSION, representation="surface")
+    with pytest.raises(WorldRenderUnavailable):
+        build_world_render(w.store, WORLD, SESSION)
+
+    # a surface built from the capture's own images/ is never stale by this test
+    man.pop("keyframe_image_set", None)
+    man["params_digest"] = "digest-1|x|moge2-vitl|transients:off"
+    manifest_path.write_text(json.dumps(man))
+    assert surface_artifact_drawable(w.store, WORLD, SESSION)
+    w.store.write_redaction_set_pointer(WORLD, SESSION, pointer)
+    assert surface_artifact_drawable(w.store, WORLD, SESSION)
 
 
 # ---------------------------------------------------------------------------

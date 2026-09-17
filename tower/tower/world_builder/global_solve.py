@@ -525,6 +525,27 @@ def prepare_images(
 # The solve.
 
 
+
+# THE SPARSE POINT COLOUR THAT IS PERSISTED (privacy lane L1; review 1, m5).
+#
+# pycolmap's `point.color` is the mean of the observing pixels of the images
+# COLMAP was given, and those are the RAW capture frames, undistorted: on the
+# canonical capture 536 of 14,415 points take their colour ONLY from pixels the
+# face redactor removed. The page stopped drawing it (`render.DRAWABLE_RGB_SOURCES`),
+# but `solution.npz` `rgb` and `derived/*/points.json` `rgb` still persisted it,
+# and a persisted colour attribute is an appearance artifact. So every writer
+# writes this neutral grey instead -- the same grey the page draws for "no
+# colour" (`render.NEUTRAL_POINT_COLOUR`) -- and the fields stay, with their
+# shapes, so every reader of either file is unchanged. Nothing recolours from
+# redacted keyframes yet; when something does it must say so with an
+# `rgb_source` the page allows.
+WITHHELD_POINT_RGB = (138, 138, 138)
+
+
+def withheld_rgb(n: int) -> np.ndarray:
+    """(n, 3) uint8 of `WITHHELD_POINT_RGB`."""
+    return np.tile(np.asarray(WITHHELD_POINT_RGB, np.uint8), (int(n), 1)).reshape(-1, 3)
+
 @dataclass
 class Solution:
     """A global solution over a set of keyframes, as persisted."""
@@ -597,7 +618,7 @@ def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
         lambda handle: np.savez_compressed(
             handle,
             xyz=solution.xyz.astype(np.float32),
-            rgb=solution.rgb.astype(np.uint8),
+            rgb=withheld_rgb(len(solution.xyz)),   # never the solver's colour
             component=solution.component.astype(np.int32),
             first_keyframe=solution.first_keyframe.astype(np.int32),
             track_length=solution.track_length.astype(np.int32),
@@ -929,7 +950,7 @@ def _solution_from_reconstructions(
             if not owners:
                 continue
             xyz.append([float(v) for v in point.xyz])
-            rgb.append([int(v) for v in point.color])
+            rgb.append(list(WITHHELD_POINT_RGB))   # never point.color: raw pixels
             comp.append(component_index)
             first.append(min(owners))
             track.append(len(elements))
@@ -1232,7 +1253,7 @@ def merge(
                 new_point_rows.append({
                     "segment_index": segment,
                     "xyz": [float(v) for v in local_xyz[j]],
-                    "rgb": [int(v) for v in solution.rgb[p]],
+                    "rgb": list(WITHHELD_POINT_RGB),   # never the solver's colour
                 })
             # No support rows for a solved segment. support.json's feature
             # index is defined over the ORB keypoints the chain re-detects

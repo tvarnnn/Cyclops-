@@ -73,7 +73,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -646,6 +646,13 @@ class TransientReport:
     refused: dict = field(default_factory=dict)
     seconds: dict = field(default_factory=dict)
     gpu_peak_mb: float | None = None
+    # A `union` build that could run only OneFormer (review 1, m1): the mode
+    # that was asked for, and why the masks are OneFormer's alone. `params` is
+    # then the OneFormer rule the masks were actually made under, so every
+    # consumer digest differs from a whole union build's and a later build with
+    # the network rebuilds.
+    requested: TransientParams | None = None
+    partial: str | None = None
 
     @property
     def available(self) -> bool:
@@ -681,7 +688,8 @@ class TransientReport:
             "detail": self.detail,
             "mode": self.params.mode,
             "rule": self.params.rule_id() if self.state == STATE_OK else None,
-            "requested_rule": self.params.rule_id(),
+            "requested_rule": (self.requested or self.params).rule_id(),
+            "partial": self.partial,
             "models": self.params.models() if self.state == STATE_OK else {},
             "frames_masked": len(self.keys) if self.state == STATE_OK else 0,
             "computed": self.computed,
@@ -715,12 +723,17 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
         return report
     factory = backend_factory or BACKEND_FACTORY
     backends = [factory(c) for c in params.components]
+    missing_components = {}
     for b in backends:
         reason = b.probe()
         if reason:
             _log_unavailable_once(reason)
-            report.state, report.detail = STATE_UNAVAILABLE, reason
+            missing_components[b.component] = reason
+    if missing_components:
+        if not _can_fall_back(params, missing_components):
+            report.state, report.detail = STATE_UNAVAILABLE, next(iter(missing_components.values()))
             return report
+        params, backends = _fall_back(report, params, backends, missing_components)
     if policy is None:
         try:
             policy = A.resolve_label_policy(store, world_id, session_id, redactor_factory)
@@ -778,7 +791,9 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
 
         peak = _reset_peak()
         computed = set()
-        for backend in backends:
+        for backend in list(backends):
+            if backend.component not in params.components:
+                continue
             c = backend.component
             todo = [ki for ki in missing[c] if ki in pixels]
             if not todo:
@@ -796,6 +811,13 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
                 timings = backend.run(items, params, emit, should_stop)
             except TransientDetectorUnavailable as exc:
                 _log_unavailable_once(str(exc))
+                if _can_fall_back(params, {c: str(exc)}):
+                    # Its weights could not be fetched at load (offline): keep
+                    # the OneFormer masks rather than discard every mask.
+                    params, backends = _fall_back(report, params, backends, {c: str(exc)})
+                    wanted = {ki: [(comp, key) for comp, key in keys if comp in params.components]
+                              for ki, keys in wanted.items()}
+                    continue
                 report.state, report.detail = STATE_UNAVAILABLE, str(exc)
                 report.keys = {}
                 return report
@@ -827,6 +849,30 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
                     world_id, session_id, len(report.keys), report.computed, report.cached,
                     params.mode, report.seconds["total"])
     return report
+
+
+def _can_fall_back(params: TransientParams, missing: dict) -> bool:
+    """A `union` whose Grounding DINO + SAM component cannot run still has
+    OneFormer -- which the live child ran all walk, so its weights are on disk.
+    Nothing else falls back: `oneformer` without OneFormer has no masks."""
+    return (params.mode == MODE_UNION and COMPONENT_ONEFORMER not in missing
+            and set(missing) <= {COMPONENT_GDSAM})
+
+
+def _fall_back(report: TransientReport, params: TransientParams, backends, missing: dict):
+    """Continue in `oneformer` mode and say so (review 1, m1): the final build
+    after Stop on a machine that cannot fetch Grounding DINO or SAM used to
+    record `unavailable` with no masks at all, discarding the OneFormer masks
+    the walk had cached -- so the finished world showed hands the live one had
+    masked."""
+    why = "; ".join(f"{c}: {r}" for c, r in sorted(missing.items()))
+    effective = replace(params, mode=MODE_ONEFORMER)
+    report.requested = report.requested or params
+    report.params = effective
+    report.partial = (f"{params.mode} was requested but only {MODE_ONEFORMER} could run ({why}); "
+                      "these masks are OneFormer's alone")
+    logger.warning("[Tower][WorldBuilder][transients] %s", report.partial)
+    return effective, [b for b in backends if b.component in effective.components]
 
 
 def _reset_peak():

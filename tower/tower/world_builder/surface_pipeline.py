@@ -237,19 +237,21 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
     align_path = root / "align.json"
     prior = None
     set_token = store.keyframe_image_set(world_id, session_id).cache_token
+    from tower.world_builder.dense_pipeline import (
+        _depth_cache_key,
+        depth_trust_now,
+        reusable_predictions,
+    )
+
+    trust = depth_trust_now(store, world_id, session_id)
     if align_path.exists():
         try:
             cached = json.loads(align_path.read_text())
         except (OSError, ValueError):
             cached = None
         if cached and _depth_cache_usable(cached, root, solution, dparams,
-                                          image_set=set_token):
+                                          image_set=set_token, trust=trust):
             return cached, root / "work"
-
-    from tower.world_builder.dense_pipeline import (
-        _depth_cache_key,
-        reusable_predictions,
-    )
 
     # Never `prior=cached`: `prior` resumes whole records, fits included, and
     # a cache that was not usable above is by definition for another solve.
@@ -265,13 +267,14 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
         align["input_digest"] = solution.input_digest
         align["digest"] = solution.input_digest
         align["cache_key"] = _depth_cache_key(solution.input_digest, dparams,
-                                              align.get("keyframe_image_set"))
+                                              align.get("keyframe_image_set"),
+                                              align.get("redaction_trust"))
     write_json_atomic(align_path, align)
     return align, root / "work"
 
 
 def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
-                        image_set: str | None = None) -> bool:
+                        image_set: str | None = None, trust: str | None = None) -> bool:
     """A cached depth stage is reusable only if it came from this solve, this
     network, and still has its per-frame maps on disk.
 
@@ -317,6 +320,17 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
     # existed reads as.
     if cached.get("keyframe_image_set") != image_set:
         return False
+    # THE TRUST DECISION IT READ THE PIXELS UNDER (`dense_pipeline.recorded_trust`).
+    # A walk's stage re-redacted under `none` and recorded those bytes' SHA-1;
+    # after Stop the label is trusted, the solve digest is often unchanged, and
+    # reusing the walk's records made the final appearance refuse every frame
+    # the re-redaction had touched (review 1, M3). `trust` is what a stage run
+    # now would record; every production caller passes it.
+    if trust is not None:
+        from tower.world_builder.dense_pipeline import recorded_trust  # noqa: PLC0415
+
+        if recorded_trust(cached) != trust:
+            return False
     records = [r for r in cached.get("records", []) if r.get("ok")]
     if not records:
         return False
@@ -591,7 +605,8 @@ def surfacify(store, world_id: str, session_id: str, *,
         _mark_superseded(root, {lv["file"] for lv in result.levels})
         _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
                         scale_source, transients=dict(frames.transients.record(),
-                                                      frames_fused_with_mask=frames.masked))
+                                                      frames_fused_with_mask=frames.masked),
+                        keyframe_image_set=set_token)
         _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
         _status(root, state=STATE_OK, input_digest=digest,
                 params_digest=pdigest, result=result.as_dict())
@@ -1096,7 +1111,7 @@ def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4,
 
 
 def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
-                    scale_source=None, transients=None):
+                    scale_source=None, transients=None, keyframe_image_set=None):
     filled = params.fill_radius_voxels() > 0
     try:
         detail = json.loads(result.detail) if result.detail else None
@@ -1115,6 +1130,11 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
         "built_at": time.time(),
         "input_digest": digest,
         "params_digest": pdigest,
+        # The re-redacted keyframe set the colours came from, null for the
+        # capture's own `images/` (APPEARANCE §6.5). A surface built from a set
+        # the session no longer reads is not drawable
+        # (`store.built_from_an_inactive_keyframe_set`).
+        "keyframe_image_set": keyframe_image_set,
         "params": {k: (list(v) if isinstance(v, tuple) else v)
                    for k, v in params.__dict__.items()},
         "median_scene_depth": median_depth,

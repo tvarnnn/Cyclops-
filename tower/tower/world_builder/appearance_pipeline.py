@@ -51,6 +51,17 @@ PRUNE_GRACE_S = 120.0
 STAGING_GRACE_S = 600.0
 ALREADY_BUILT = "already built from these inputs with these parameters (--force rebuilds)"
 STALE_LABEL_DETAIL = "appearance is stale against the session's redaction record"
+# The files the previous manifests named, for PRUNE_GRACE_S after they were
+# superseded (contract section 9): a page that fetched the manifest one build
+# ago is still loading that manifest's chunks when the next build publishes.
+SUPERSEDED_NAME = "superseded.json"
+
+# What the revision route says about an appearance it does not serve now
+# (contract section 9, `appearance.state`).
+SERVED = "served"
+REBUILDING = "rebuilding"
+WITHDRAWN = "withdrawn"
+ABSENT = "absent"
 
 _DIGEST_CHARS = frozenset("0123456789abcdef")
 
@@ -118,6 +129,28 @@ def is_digest(value) -> bool:
 
 def _file_name(kind: str, digest: str) -> str:
     return f"{kind[0]}.{digest}.bin"
+
+
+def proxy_without_colours(mesh: bytes) -> bytes:
+    """The WBSURF01 phone level with every vertex colour set to zero.
+
+    The page draws only positions and indices, and the proxy's colours are the
+    depth stage's pixels averaged into the surface -- imagery the page never
+    uses. Served over the appearance route they were a copy of those pixels
+    under the appearance's label check instead of the surface's (review 1, M2).
+    Same length and layout, so every reader of the format is unchanged."""
+    import struct  # noqa: PLC0415
+
+    from tower.world_builder.surface import MESH_MAGIC  # noqa: PLC0415
+
+    if len(mesh) < 48 or mesh[:8] != MESH_MAGIC:
+        raise A.AppearanceUnavailable("the surface's phone level is not a surface mesh")
+    n_vertices = struct.unpack_from("<I", mesh, 8)[0]
+    start = 48 + 6 * n_vertices
+    end = start + 3 * n_vertices
+    if end > len(mesh):
+        raise A.AppearanceUnavailable("the surface's phone level is shorter than its header")
+    return mesh[:start] + bytes(end - start) + mesh[end:]
 
 
 def named_files(manifest: dict | None) -> dict:
@@ -202,7 +235,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     if surface is None:
         raise A.AppearanceUnavailable("no surface artifact to use as the proxy")
     level = int(surface.get("mobile_level", 0))
-    proxy_bytes = read_surface_level(store, world_id, session_id, level, manifest=surface)
+    proxy_bytes = proxy_without_colours(
+        read_surface_level(store, world_id, session_id, level, manifest=surface))
     proxy_digest = content_digest(proxy_bytes)
     V, F, _C, _N = read_mesh_bytes(proxy_bytes)
     if not len(F):
@@ -275,7 +309,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "unobserved_rule": A.UNOBSERVED_RULE,
         "alpha_ring_px": A.ALPHA_RING_PX,
         "per_frame_sha1_digest": frame_digest,
-        "transients": {"rule": tparams.rule_id(), "state": treport.state,
+        "transients": {"rule": treport.params.rule_id(), "state": treport.state,
+                       "partial": treport.partial,
                        "frames_digest": treport.frames_digest()},
         "params": params.as_dict(),
         "encoders": {k: [v["encoder"], v["version"], v["quality"], v["available"]]
@@ -507,7 +542,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "detector_fraction": (None if fr.detector is None
                                   else round(float(fr.detector.mean()), 4)),
             "transient_mask": (None if fr.detector is None
-                               else {"mode": tparams.mode, "rule": tparams.rule_id()}),
+                               else {"mode": treport.params.mode,
+                                     "rule": treport.params.rule_id()}),
             "occluder": fr.occluder_record,
             "transient": fr.extra.get("transient"),
             "source_sha1": src.source_sha1, "image_sha1": src.image_sha1,
@@ -522,6 +558,13 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
                     if fr.extra.get("transient") and not fr.extra["transient"].get("applied", True)]
     seconds["total"] = round(time.time() - t0, 2)
     build_id = f"{time.time_ns():x}{os.getpid():x}"
+    provenance = {
+        "session_redaction": policy.session_redaction,
+        "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
+        "redactor_applied_here": policy.redactor_label,
+        "label_trusted": policy.trusted,
+    }
+    epoch = appearance_epoch(read_manifest_at(root), provenance, build_id)
     manifest = {
         "format": A.APPEARANCE_FORMAT,
         "schema_version": A.APPEARANCE_SCHEMA_VERSION,
@@ -531,6 +574,10 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "input_digest": solution.input_digest,
         "params_digest": pdigest,
         "params": params.as_dict(),
+        # Contract section 9: unchanged while every build may replace the one
+        # before it in place on an open page; a new value when textures built
+        # under the previous one must be dropped first.
+        "epoch": epoch,
         "appearance_provenance": {
             "session_redaction": policy.session_redaction,
             # The re-redacted keyframe set these pixels came from (contract
@@ -610,6 +657,45 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     return result
 
 
+def textures_carry_over(previous: dict | None, current: dict | None) -> bool:
+    """Whether an open page may keep drawing textures of a build under
+    `previous` provenance while it replaces them with a build under `current`.
+
+    THE ONE RULE (contract section 9), decided here and published as the
+    manifest's `epoch`, so neither the page nor the app carries an allowlist:
+
+    - the keyframe set must be the same (a re-redaction switch or revert changes
+      the pixels themselves);
+    - a build that used the STORED bytes was trusted because of its label, so a
+      different label drops it;
+    - a build that RE-REDACTED the stored bytes was trusted because of the
+      redactor, whatever the label said, so a label change does not drop it --
+      provided that redactor's label is itself on the allowlist. This is the
+      ordinary Stop: a walk's builds re-redact under `none`, and the final
+      build uses the stored bytes under the real label.
+    """
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    if previous.get("keyframe_image_set") != current.get("keyframe_image_set"):
+        return False
+    if previous.get("label_trusted"):
+        return (bool(current.get("label_trusted"))
+                and previous.get("session_redaction") == current.get("session_redaction"))
+    return A.label_is_trusted(previous.get("redactor_applied_here"))
+
+
+def appearance_epoch(previous_manifest: dict | None, provenance: dict, build_id: str) -> str:
+    """The previous manifest's epoch when its textures carry over, else this
+    build's id: unique, so an epoch never comes back (a page stamped with a
+    dropped epoch always sees a change)."""
+    if isinstance(previous_manifest, dict):
+        prev_epoch = previous_manifest.get("epoch")
+        if isinstance(prev_epoch, str) and prev_epoch and textures_carry_over(
+                previous_manifest.get("appearance_provenance"), provenance):
+            return prev_epoch
+    return build_id
+
+
 def _scale_note(world) -> dict:
     scale = getattr(world, "scale", None)
     scale = scale.to_json_dict() if hasattr(scale, "to_json_dict") else dict(
@@ -618,15 +704,28 @@ def _scale_note(world) -> dict:
     return scale
 
 
-def _write_once(path: Path, data: bytes) -> None:
-    """Content-addressed: a file already there with this name and size is this
-    content (and may be named by the live manifest, so it is not rewritten)."""
+def _file_is(path: Path, size: int, digest: str) -> bool:
+    """Whether the file holds exactly the content its name promises: its size
+    AND its content digest. A same-size corrupt file is not it (review 1, m10):
+    the routes check the digest and would 404 it for good."""
     try:
-        if path.stat().st_size == len(data):
-            os.utime(path, None)
-            return
+        if path.stat().st_size != size:
+            return False
+        return content_digest(path.read_bytes()) == digest
     except OSError:
-        pass
+        return False
+
+
+def _write_once(path: Path, data: bytes) -> None:
+    """Content-addressed: a file already there with this name and this content
+    is not rewritten (it may be named by the live manifest); anything else under
+    the name -- a truncated or corrupted copy -- is replaced atomically."""
+    if _file_is(path, len(data), content_digest(data)):
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return
     write_bytes_atomic(path, lambda handle, d=data: handle.write(d))
 
 
@@ -669,10 +768,7 @@ def _already_built(root: Path, pdigest: str, force: bool):
     if man is None or man.get("params_digest") != pdigest:
         return None
     for name, size in named_files(man).items():
-        try:
-            if (root / name).stat().st_size != size:
-                return None
-        except OSError:
+        if not _file_is(root / name, size, name.split(".")[1]):
             return None
     kfs = man.get("keyframes") or []
     return AppearanceResult(
@@ -683,15 +779,46 @@ def _already_built(root: Path, pdigest: str, force: bool):
 
 
 def _mark_superseded(root: Path, keep: set) -> None:
+    """Start the grace of every file the manifest on disk names and the next
+    one will not: its mtime (what `_prune` measures) and an entry in
+    `superseded.json` (what the routes serve from, section 9)."""
     previous = _current_manifest(root)
     if not previous:
         return
     now = time.time()
-    for name in set(named_files(previous)) - keep:
+    gone = {name: size for name, size in named_files(previous).items() if name not in keep}
+    for name in gone:
         try:
             os.utime(root / name, (now, now))
         except OSError:
             pass
+    entries = [e for e in read_superseded(root) if now - e["at"] < PRUNE_GRACE_S]
+    if gone:
+        prov = previous.get("appearance_provenance") or {}
+        entries.append({"at": now, "build_id": previous.get("build_id"),
+                        "session_redaction": prov.get("session_redaction"),
+                        "keyframe_image_set": prov.get("keyframe_image_set"),
+                        "files": gone})
+    try:
+        write_json_atomic(root / SUPERSEDED_NAME, {"schema_version": 1, "entries": entries})
+    except OSError:
+        logger.warning("[Tower][WorldBuilder][appearance] could not record superseded files "
+                       "under %s; a page loading the previous build may need to refetch", root)
+
+
+def read_superseded(root: Path) -> list:
+    """The well-formed entries of `superseded.json`, oldest first; [] for
+    anything missing or malformed."""
+    try:
+        doc = json.loads((root / SUPERSEDED_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for e in (doc.get("entries") if isinstance(doc, dict) else None) or []:
+        if (isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+                and isinstance(e.get("files"), dict)):
+            out.append(e)
+    return out
 
 
 def _prune(root: Path, keep: set, older_than_s: float = PRUNE_GRACE_S) -> None:
@@ -748,23 +875,65 @@ def read_appearance_manifest(store, world_id: str, session_id: str) -> dict | No
     return read_manifest_at(appearance_dir(store, world_id, session_id))
 
 
+def servable_size(root: Path, name: str, manifest: dict, now: float | None = None) -> int | None:
+    """The recorded size of a file the route may serve under `manifest`, or None.
+
+    Named by `manifest`, OR by a manifest it superseded less than
+    PRUNE_GRACE_S ago whose redaction label and keyframe set are this
+    manifest's -- which the caller has just checked against the session record,
+    so the label check applies to the superseded files unchanged. A build under
+    another label never lends its files to this one (review 1, M4)."""
+    size = named_files(manifest).get(name)
+    if size is not None:
+        return size
+    prov = manifest.get("appearance_provenance") or {}
+    now = time.time() if now is None else now
+    for entry in reversed(read_superseded(root)):
+        if now - entry["at"] >= PRUNE_GRACE_S:
+            continue
+        if (entry.get("session_redaction") != prov.get("session_redaction")
+                or entry.get("keyframe_image_set") != prov.get("keyframe_image_set")):
+            continue
+        size = entry["files"].get(name)
+        if isinstance(size, int):
+            return size
+    return None
+
+
 def read_appearance_file(store, world_id: str, session_id: str, kind: str, digest: str,
                          manifest: dict) -> bytes | None:
-    """The bytes of a file the manifest names, checked against its recorded size
-    and its content digest; None for anything else."""
+    """The bytes of a file the manifest names (or a recently superseded one
+    under the same label names, `servable_size`), checked against its recorded
+    size and its content digest; None for anything else."""
     if kind not in ("chunk", "proxy") or not is_digest(digest):
         return None
     name = _file_name(kind, digest)
-    size = named_files(manifest).get(name)
+    root = appearance_dir(store, world_id, session_id)
+    size = servable_size(root, name, manifest)
     if size is None:
         return None
     try:
-        data = (appearance_dir(store, world_id, session_id) / name).read_bytes()
+        data = (root / name).read_bytes()
     except OSError:
         return None
     if len(data) != size or content_digest(data) != digest:
         return None
     return data
+
+
+def withdrawal_state(store, world_id: str, session_id: str, manifest: dict | None) -> str:
+    """What the revision route reports for a manifest the routes do not serve
+    because its label no longer matches: `rebuilding` when an open page may keep
+    what it drew while the next build comes (`textures_carry_over` from this
+    manifest to the keyframe set as it is now -- the ordinary Stop), else
+    `withdrawn`."""
+    if not isinstance(manifest, dict):
+        return ABSENT
+    label, image_set = A.keyframe_set_identity(store, world_id, session_id)
+    now = {"session_redaction": label, "keyframe_image_set": image_set,
+           "label_trusted": A.label_is_trusted(label)}
+    prov = manifest.get("appearance_provenance") or {}
+    return REBUILDING if textures_carry_over(prov, now) else WITHDRAWN
 
 
 def label_matches(store, world_id: str, session_id: str, manifest: dict) -> bool:

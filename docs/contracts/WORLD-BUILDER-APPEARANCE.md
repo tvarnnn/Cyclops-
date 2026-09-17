@@ -453,6 +453,24 @@ publish.
 During a walk the session label is `none` until Stop, so live builds are
 re-redacted; the final build after Stop sees the real label.
 
+**One allowlist for every stage that reads keyframe pixels** (review 1, M2).
+`appearance.label_is_trusted` is also the depth stage's rule
+(`dense_pipeline.run_depth_stage`, and again inside `keyframe_image_bytes`, which
+refuses a caller's "redacted" for a label off the allowlist): `+plausibility2`,
+`…@0.50`, `redacted` or any unknown string are re-redacted there too, never
+read as `world-keyframe`. Its pixels become `undist/`, the surface's vertex
+colours and the dense points, so one session is never built under two trust
+decisions. The depth stage records the decision in `align.json` as
+`redaction_trust` (`appearance.pixel_trust_token`: `trusted:<label>` or
+`rerun:<label or none>&<redactor label>`) and it is part of the depth cache key
+(§6.4).
+
+**The proxy carries no colour.** The proxy file this artifact publishes is the
+surface's phone level with every vertex colour byte set to zero
+(`appearance_pipeline.proxy_without_colours`): same layout and length, positions
+and indices unchanged. The page never drew them, and they are the depth stage's
+pixels, so the appearance route no longer serves them.
+
 ### 6.3 What the manifest records
 
 `appearance_provenance`:
@@ -479,16 +497,32 @@ Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 ### 6.4 Cache key
 
 `params_digest` is the SHA-256 of: the schema version, the solve's
-`input_digest`, the proxy's SHA-256 and its source surface build, the
-depth stage's `cache_key`, `session_redaction`, `keyframe_image_set`,
+`input_digest`, the proxy's SHA-256 (of the colourless proxy) and its source
+surface build, the depth stage's `cache_key`, `session_redaction`, `keyframe_image_set`,
 `redactor_applied_here`,
 `fill_rule`, `unobserved_rule`, `per_frame_sha1_digest`, the transient
-detector's `{rule, state, frames_digest}` (SHA-1 over every keyframe's
+detector's `{rule, state, partial, frames_digest}` (`rule` is the rule the masks
+were actually made under, §10; SHA-1 over every keyframe's
 component cache keys: a rule change, a new model revision, or masks that
 appeared since, all rebuild), the occluder, exposure, detector-mode and
 selection parameters, and the encoder names and versions. Any change to any
 of them rebuilds; an equal digest with every named file whole is
-"already built" (`--force` rebuilds anyway).
+"already built" (`--force` rebuilds anyway). "Whole" means the recorded size
+**and** the content digest the file is named by: a same-size corrupt file is not
+"already built", and a build writing a name whose file on disk does not hash to
+it replaces it (review 1, m10).
+
+**The depth stage's cache** (`dense/<sid>/align.json`, shared by the dense and
+surface stages) is keyed on the solve digest, the network, the component, the
+fill rule, the keyframe set **and the trust decision** (`|trust:<token>`,
+2026-09-17, review 1 M3). A walk's depth stage runs under `none` and records the
+SHA-1 of the RE-REDACTED bytes; after Stop the label is trusted and the solve
+digest is often unchanged, and reusing the walk's `align.json` made the final
+appearance refuse every frame the re-redaction had changed
+(`refused-no-fill-mask`). Now the final stage refits (predictions are still
+reused per frame by image SHA-1). An `align.json` written before the token
+existed is reused only when it recorded using the stored bytes of a label that
+is still on the allowlist (`dense_pipeline.recorded_trust`).
 
 ### 6.5 Re-redaction: an explicit switch to a lighter, current redaction
 
@@ -561,7 +595,14 @@ fill; a frame kept for any other reason holds the stored rule's fill, which
 contains the current rule's only for the ungated rule (every gate only removes
 boxes from the same detection pass). **So from `plausibility1` or
 `plausibility2`, an apply that would keep any frame for another reason is
-refused whole.**
+refused whole.** And **from any label**, an apply is refused whole when a frame
+was kept because a measurement contradicts that argument: `fill-outside-stored`
+(the current rule filled pixels the stored keyframe leaves raw) or
+`output-not-raw-plus-fill` (review 1, M1). The set's label must be true for
+every frame in it; before this, such a frame was published under the current
+label and trusted by every reader. Frames kept because their raw frame is
+missing or unverified, or the redactor returned `none`, still rest on the
+ungated superset argument, which no measurement contradicted for them.
 
 **Caches.** A switch changes the pixels without changing the solve, so the
 set's identity (`images.redacted-<gate>@<set digest>`, absent for `images/`)
@@ -571,7 +612,14 @@ is part of the depth stage's cache key and `align.json`
 appended only when a set is active, so no cache made before this existed is
 invalidated. Depth predictions are still reused per frame by image SHA-1, so an
 apply re-predicts only the frames whose bytes changed. After `--apply` (or
-`--revert`): `world_surface.py`, then `world_appearance.py`.
+`--revert`): `world_surface.py`, then `world_appearance.py`. Until then, a
+surface or dense artifact that records a re-redacted set the session no longer
+reads (a `--revert`; the surface manifest's `keyframe_image_set`, or `|set:` in
+an older `params_digest`) **is not drawable**: the render ladder, the revision
+route and the listing step past it, and a pinned request for that rung is 404
+(`store.built_from_an_inactive_keyframe_set`, review 1 m4). An artifact built
+from `images/` is never stale by this test: every label a switch accepts fills
+at least what the set fills.
 
 **Measured on a copy of the canonical world** (b2a75ab4…, 398 keyframes,
 ungated label): 89 frames re-redacted, 309 `stored:nothing-recovered`, no
@@ -598,6 +646,7 @@ step cannot run; a set already written is unaffected.
 | `input_digest` | the solve this was built from |
 | `params_digest` | §6.4 |
 | `params` | every parameter |
+| `epoch` | §9: the `build_id` of the first build whose textures later builds may replace in place; unchanged while they may |
 | `appearance_provenance` | §6.3 |
 | `camera` | `{fx, fy, cx, cy, width, height}`, the solve camera |
 | `proxy` | `{digest, bytes, vertices, faces, format: "wb-surface-mesh/1", source: {surface_built_at, surface_input_digest, surface_params_digest, surface_quality, level}}` |
@@ -608,7 +657,7 @@ step cannot run; a set already written is unaffected.
 | `selection` | `{phone_budget, phone, tower, coverage: {phone: {seen1, seen2}, all: {…}}, objective}` |
 | `exposure` | `{model, observations, points, abs_log_residual_before, abs_log_residual_after, gain_range}`, and for `gain+slope+vignette` also `{coordinates, vignette: [k1, k2], slope_abs_median, abs_log_residual_after_centre, abs_log_residual_after_edge}` (§5.4); observations are a seeded sample of at most 6,000,000 |
 | `occluders` | `{frames_with_occluders, total_pixels, mean_fraction, near_mean_fraction, transient_mean_fraction, frames_with_near, frames_with_transient, misregistered_frames_unmasked, rule}` |
-| `transients` | §5.3a: `{state (ok, unavailable, failed, off), detail, mode, rule (null unless ok), requested_rule, models, frames_masked, computed, cached, refused, frames_digest, seconds, gpu_peak_mb}` |
+| `transients` | §5.3a: `{state (ok, unavailable, failed, off), detail, mode, rule (null unless ok), requested_rule, partial, models, frames_masked, computed, cached, refused, frames_digest, seconds, gpu_peak_mb}`. `partial` is null, or why a `union` request ran OneFormer only (§10) |
 | `seconds` | per stage (`detector` is the time to ensure the masks) |
 | `scale` | inherited, with a note |
 
@@ -657,8 +706,18 @@ All `GET`, same origin and containment rules as `WORLD-BUILDER-WORLDS.md` §4
 | `/worlds/{world_id}/appearance/{session_id}/chunk/{digest}` | chunk bytes, `application/octet-stream` |
 | `/worlds/{world_id}/appearance/{session_id}/proxy/{digest}` | proxy mesh bytes, `application/octet-stream` |
 
-`digest` must be 32 lower-hex characters **and** named by the current manifest;
-anything else is 404. URLs carry no path, file name or sequence number.
+`digest` must be 32 lower-hex characters **and** named by the current manifest
+**or by a manifest it superseded less than `PRUNE_GRACE_S` (120 s) ago under the
+same `session_redaction` and `keyframe_image_set`** (2026-09-17, review 1 M4);
+anything else is 404. The superseded names live in
+`appearance/<sid>/superseded.json` (`{schema_version, entries: [{at, build_id,
+session_redaction, keyframe_image_set, files: {name: bytes}}]}`), written just
+before the new manifest; the prune removes their files after the same grace.
+A page that fetched a manifest one build ago is still loading its chunks when
+the next build publishes, which during a walk is every solve; before this every
+changed chunk 404ed and the page failed for good. The label check runs first and
+unchanged, and a build under another label never lends its files. URLs carry no
+path, file name or sequence number.
 
 **Headers on every response, 200 or 404:** `Cache-Control: no-store`,
 `Pragma: no-cache`, `X-Content-Type-Options: nosniff`, and no `ETag` or
@@ -685,26 +744,59 @@ handler gives WebKit the decoded bytes with no `Content-Encoding`
 - the manifest's `session_redaction` and `keyframe_image_set` equal the
   session's keyframe set's label and identity **now** (§6.5) ("appearance is
   stale against the session's redaction record");
-- for a file, the manifest names it and its bytes on disk have the recorded
-  size ("no such appearance file").
+- for a file, the manifest (or a superseded one, above) names it and its bytes
+  on disk have the recorded size and content digest ("no such appearance file").
 
 The label is re-checked on every request, so a relabelled session stops
-serving its old textures immediately.
+serving its old textures immediately: the routes 404 at once, an open page
+drops its textures at its next poll (`state: withdrawn`, below), and the iOS
+memory copy is never answered without a fresh authorisation from the Tower
+(`WORLD-BUILDER-IOS.md` §10).
 
 `GET /worlds/{world_id}/render/revision` (`WORLD-BUILDER-WORLDS.md` §4a) carries
-an additive `appearance` object: `{"revision": str | null, "current": bool}`.
-`revision` is `<session_id>/appearance:<build_id>` exactly when the manifest
-route would answer 200, else `null`. It is opaque and compared for equality. It
-is deliberately **not** folded into the page `revision`: the page follows
+an additive `appearance` object: `{"revision": str | null, "current": bool,
+"state": str, "epoch": str | null}`. `revision` is
+`<session_id>/appearance:<build_id>` exactly when the manifest route would
+answer 200, else `null`. It is opaque and compared for equality. It is
+deliberately **not** folded into the page `revision`: the page follows
 appearance builds itself, and a page swap for every appearance build would
 reset the wearer's camera.
+
+`state` (2026-09-17, review 1 B1) says what an open page does with what it drew:
+
+| `state` | when | an open page |
+|---|---|---|
+| `served` | `revision` is a string | draws it; a new `revision` is loaded in place |
+| `rebuilding` | the label or set changed **in a way its textures carry over** (below): the ordinary Stop, `none` → the real label, over a walk build that re-redacted every frame with a trusted redactor | keeps drawing, keeps polling at the base rate, loads the final build in place when it lands; says it is finishing |
+| `withdrawn` | any other label or set change, or a purged world | drops every texture now, says why, **keeps polling** (backing off), draws a rebuild when one is served |
+| `absent` | no artifact | as `withdrawn` |
+
+Nothing is SERVED during `rebuilding`: a page that opens or restores in the gap
+gets the surface. Every ordinary Stop used to make `revision` `null` with nothing
+else; the page deleted its textures and stopped polling for good, and the final
+build came back under the same page revision, so nothing ever replaced it.
+
+**Epochs.** Textures **carry over** from one build to the next when the keyframe
+set is the same and either the earlier build used the stored bytes under the
+same trusted label, or it re-redacted every frame with a redactor whose label is
+on the allowlist (`appearance_pipeline.textures_carry_over`, the one rule). Each
+manifest records `epoch`: the previous manifest's when textures carry over, else
+its own `build_id` (unique, so an epoch never returns). `appearance.epoch` is the
+served manifest's; the page compares it before applying a new build and drops
+first when it differs (a label change and a rebuild inside one poll, review 1
+m7). The **page** revision of the appearance rung is
+`<session_id>/appearance:<PAGE_REVISION>@<epoch>`: an ordinary build or the Stop
+transition does not move it (no reload, no camera reset), and a withdrawal-class
+rebuild does, so an app follower replaces a page that dropped its textures.
 
 **Who calls these.** Only the appearance page of `WORLD-BUILDER-WORLDS.md` §4,
 through the transport it names: on the phone the app's `glasses-world:` scheme
 handler, which proxies exactly these three routes and the revision route for the
 world and session on screen, through an ephemeral session with no URL cache, and
-drops its in-memory copy of bundles whenever a manifest or revision request stops
-answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
+answers a bundle from its in-memory copy only while the Tower answered this
+session's manifest with 200 within the last 20 s (revalidating the manifest
+first otherwise), and drops the copy whenever a manifest or revision request
+stops answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
 
 ## 10. Live, final, rebuilding
 
@@ -716,6 +808,19 @@ answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
   until Stop): 27.5 ms a keyframe with the current redactor. Measured on the
   canonical world (374 keyframes, trusted label so no re-redaction): 45 s on a
   quiet card, 90 s with another lane holding it at 98%.
+- **Live cadence** (review 1, m9). Measured, not re-run here (the card is shared):
+  the fix-it integration lane's live child on the canonical copy spent 36.1 s in
+  the appearance against ~37 s in the warm surface stages it follows (depth
+  cached, consistency 20.2 s, fuse 6.4, mesh 4.0, snap 1.1, pack 5.5; the 97 s of
+  cold OneFormer masks are a first-child cost the appearance then reuses); four
+  canonical appearance builds took 38–77 s. So the appearance roughly **doubles
+  a warm live child**, and the next live surface waits for it. Running it on
+  every other surface would halve that share and leave the page on a build two
+  surfaces old, drawn over a proxy one surface behind (`current: false`). It
+  stays on every surface: the page shows only the appearance rung, a
+  re-registration is visible there first, and the child launches on the newest
+  solve whenever it finishes, so a slower child skips solves rather than queueing
+  them. Revisit with a phone-side measurement of how often a wearer notices.
 - **Detector, live and final.** The live presets use `mode: oneformer`; the
   final build after Stop uses `union`. Measured on the canonical world, RTX 5070
   shared with another lane (73–88% utilisation), models already cached on disk:
@@ -728,7 +833,14 @@ answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
   the Grounding DINO + SAM component to the OneFormer masks the walk already
   cached (the cache is per component): 301 keyframes in 97.5 s at Stop. The
   live child's own run: 251 new keyframes in 80.5 s. Each mask records its mode.
-  A first run downloads 2.14 GB (934 + 323 + 881 MB, logged).
+  A first run downloads 2.14 GB (934 + 323 + 881 MB, logged). **When Grounding
+  DINO or SAM cannot run** (offline and not cached, at probe or at load) a
+  `union` request continues as `oneformer` and records it: `state: ok`, `mode` and
+  `rule` OneFormer's, `requested_rule` the union's, `partial` the reason
+  (2026-09-17, review 1 m1). Before, it recorded `unavailable` with no masks at
+  all, and the finished world showed hands the walk had masked. The digest names
+  the rule actually applied, so a later build that can run the union rebuilds.
+  OneFormer itself missing is still `unavailable`.
 - **Final.** After Stop the builder runs the final surface, then the final
   appearance, then prunes the depth stage's work — in that order, because the
   appearance needs `_fill.npy` and `_pred.npy`
@@ -738,7 +850,12 @@ answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
   field); the live child is terminated first. A hard stop skips whatever has
   not started, and **after a hard stop the depth work is not pruned**, so the
   stopped appearance can be rebuilt without recomputing it (2026-09-17; before,
-  it was pruned and `world_appearance.py` then refused every frame).
+  it was pruned and `world_appearance.py` then refused every frame). **The depth
+  work is pruned only after an appearance that answered `ok`** (or when the
+  appearance is off): an `unavailable` or `failed` final appearance keeps it
+  (review 1, m2), because the commonest causes -- a live child's lock whose
+  process has not exited, a redactor that did not load -- are transient, and the
+  rebuild needs the work.
 - **Rebuild** from authoritative data alone:
 
   ```

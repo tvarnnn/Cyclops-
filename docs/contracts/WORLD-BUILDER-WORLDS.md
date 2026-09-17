@@ -56,6 +56,7 @@ Per session:
 | `state` | string | One word, the status channel's lifecycle vocabulary: `receiving` (a live builder, session open), `finalizing` (a live builder, session stopped — the final solve and build are running), `complete` (finished; `finalization.state == "complete"` **and** geometry on disk, or an older record that stopped and built), `interrupted` (killed mid-walk, killed mid-finalization, stopped by a request or an error, **or a session whose manifest records real figures and whose derived tree is gone** — something happened to this session, which is what the word claims), `unbuilt` (**there is nothing to open**: a record that stopped and never built, or one whose build ran and found nothing — a dark corridor, a blank wall, a calibration that never arrived. iOS renders it “No geometry”, which is the whole claim. It is deliberately NOT `interrupted`: nothing was interrupted, and saying so tells a wearer the walk failed when it merely found nothing). Additive (2026-09-06, live-history lane); **amended 2026-09-10**, which is why the contract id moved: `complete` gained the `has_geometry` requirement and `interrupted` gained the manifest-without-a-tree case, so a word a phone already implements now arrives in states it did not before. An older phone does **not** decode this payload at all: `WorldListingDecoder.listing` compares the id for equality and returns `nil` for the whole body on a mismatch, so Saved Worlds is empty rather than wrong. That is the intended behaviour of a dated identifier and it is why the app must be rebuilt from this branch. |
 | `keyframes_journaled` | int | Lines in the keyframe journal. On a record that never stopped `keyframes_accepted` is still the zero written at start; this is what actually landed (467 on the 09-06 walk against a recorded 0). Show this when the two disagree. Additive (2026-09-06) |
 | `finalization` | object \| null | The builder's own record of what happened after the session stopped: `{state: pending\|complete\|interrupted, final_solve: pending\|solved\|skipped\|failed\|unavailable\|null, started_at, updated_at, detail}`. `null` on records written before 2026-09-06 and on sessions that never stopped. Additive (2026-09-06) |
+| `appearance` | object \| null | **The appearance artifact, reported as the imagery it is** (additive, 2026-09-17, review 1 m6): `{format, state: served\|rebuilding\|withdrawn, quality, keyframes, keyframes_phone, bytes, redaction, redaction_effective, label_trusted, keyframe_image_set, privacy_tags, retains_raw_imagery, imagery, retention}`. `state` is `APPEARANCE.md` §9's: whether the routes serve it now. `redaction` is the label it was built under and `redaction_effective` what was applied; `imagery` says *first-person keyframe imagery of a private space; best-effort face redaction with measured false negatives; not anonymised*; `retention` says it is kept with the world until rebuilt or purged. No URL, id or path: the page reaches it through §4b only. `null` when the session has none |
 
 ## 3. Rules
 
@@ -184,15 +185,29 @@ enforced).
   canonical world at pose 71 (46% observed, 52% black). The horizon is levelled
   to `CONFIG.up`.
 - **Live.** The page polls the revision route every 10 s (backing off to 120 s
-  while `live` is false and nothing changed). A new `appearance.revision`
-  fetches the manifest and only the chunks whose digest it lacks, overwrites
-  layers in place (a keyframe that left the phone tier frees its layer), renders
-  source depth for moved or new layers, and keeps the camera: no navigation, no
-  reload. `appearance.revision: null` deletes every texture at once and says the
-  images are no longer served.
-- **Context loss.** Textures are not kept in page memory: on restore the page
-  fetches the manifest, proxy and chunks again through the same transport (so
-  the Tower's label check runs again) and keeps the camera.
+  while `live` is false and nothing changed). What a poll means is one pure unit
+  in the page, `FOLLOW` (`decide`, `mustReplace`, `nextDelay`), run under node by
+  the Tower's tests (review 1, B1). A new `appearance.revision` fetches the
+  manifest and only the chunks whose digest it lacks, overwrites layers in place
+  (a keyframe that left the phone tier frees its layer), renders source depth
+  for moved or new layers, and keeps the camera: no navigation, no reload —
+  **unless the new manifest's `epoch` differs from the one on screen**, when every
+  texture is dropped first. `appearance.state: rebuilding` (the ordinary Stop)
+  keeps the textures, keeps polling at 10 s and captions *finishing the world*;
+  after 20 minutes without a served build the page drops them and says so.
+  `withdrawn`, `absent`, an old Tower's bare `null`, or a revision 404 naming a
+  world or session that is gone (m3) deletes every texture at once and says why —
+  **and keeps polling**, so a rebuild that is served again is drawn again without
+  closing the viewer. A chunk or proxy that 404s while loading (the next build
+  published and the file left its grace) refetches the manifest and tries once
+  more (M4).
+- **Context loss.** Textures and the manifest are not kept across it: on
+  restore the page fetches the manifest again, then the proxy and chunks,
+  through the same transport (so the Tower's label check runs again, and a build
+  or withdrawal that happened meanwhile is honoured) and keeps the camera. If
+  WebKit has not restored the context after 3 s the page asks for it
+  (`WEBGL_lose_context.restoreContext`); after 10 s it reloads itself, which the
+  app allows for exactly this page (`WORLD-BUILDER-IOS.md` §10; review 1 m8).
 - **Caption.** *Captured images on reconstructed geometry · N of M keyframes
   shown* (· *still building as you walk*, · the currency reason when behind),
   then: *These are the camera's own frames, with faces redacted, placed on the
@@ -260,7 +275,7 @@ page to find out.
 | `view` | string, optional | as §4. `view=diagnostics` reports the **sparse** rung, because that is the page §4 serves for it. A client showing the diagnostics rendering has nothing to follow and should not ask (the iOS app does not) |
 | `viewer` | string, optional | as §4, and it must match the page request's: without `appearance-1` the rung reported is the one §4 would serve a client that cannot draw the appearance page (`surface` or lower). A poll that dropped it while an appearance page is on screen would be told `surface` and swap the page down. The iOS app sends it on its native poll, and its scheme handler adds it to the page's own proxied poll (`WORLD-BUILDER-IOS.md` §10). `appearance` in the body is reported either way |
 
-**200** `{"session_id": str, "representation": "appearance"|"surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool}}`,
+**200** `{"session_id": str, "representation": "appearance"|"surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool, "state": "served"|"rebuilding"|"withdrawn"|"absent", "epoch": str|null}}`,
 `Cache-Control: no-store`. **404** exactly when §4 would 404.
 
 `appearance` (additive, 2026-09-17) follows the session's appearance artifact
@@ -268,8 +283,11 @@ page to find out.
 `<session_id>/appearance:<build_id>` exactly when
 `GET /worlds/{id}/appearance/{session_id}/manifest` would answer 200, and `null`
 otherwise — no artifact, a purged world, or **a session whose redaction label no
-longer matches the one the artifact was built under**, so a page holding
-textures drops them when it sees `null`. `current` is false when the artifact
+longer matches the one the artifact was built under**. `state` says which, and
+what a page holding textures does (`WORLD-BUILDER-APPEARANCE.md` §9): keep them
+through `rebuilding` (the ordinary Stop), drop them on `withdrawn` or `absent`,
+and in every case keep asking. `epoch` changes exactly when an open page must
+drop its textures before drawing the served build. `current` is false when the artifact
 was built from an earlier solve or on an earlier surface. It is opaque, compared
 for equality, and **deliberately not part of `revision`**: a page that blends
 keyframes follows appearance builds itself, and folding them into the page
@@ -298,12 +316,18 @@ Every page §4 serves carries the same two values in its head, within its first
 2. It changes when the page §4 would serve changes rung, or when the surface or
    dense artifact behind the served rung is rebuilt, or when the session §4
    would choose changes: every revision is prefixed with the chosen session id.
-3. The appearance rung's revision is the constant `<session_id>/appearance:1`,
-   the page PROGRAM's version (`appearance_render.PAGE_REVISION`), not the
-   appearance build: the page follows builds itself (`appearance.revision`), so a
-   new build never changes `revision` and never makes a client reload the page.
+3. The appearance rung's revision is `<session_id>/appearance:1@<epoch>`: the
+   page PROGRAM's version (`appearance_render.PAGE_REVISION`) and the served
+   manifest's `epoch` (APPEARANCE §9), not the appearance build: the page follows
+   builds itself (`appearance.revision`), so an ordinary build, and the Stop
+   transition, never change `revision` and never make a client reload the page.
    Stepping onto the rung, off it (a relabelled or purged session steps down to
-   the surface), or a Tower update that bumps the page version does change it.
+   the surface), a rebuild that starts a new epoch (a relabel, a re-redaction
+   switch or revert, a purge and rebuild), or a Tower update that bumps the page
+   version does change it. Until 2026-09-17 it was the constant
+   `<session_id>/appearance:1`, so a page that had dropped its textures was
+   stamped exactly like its rebuild and was never replaced (review 1, B1). A
+   manifest built before epochs existed answers `appearance:1`.
    The sparse rung's revision is the constant `<session_id>/sparse`. The derived
    tree is rewritten every few keyframes during a walk, and a picture that
    reloaded on each of those would be unusable to look at; the step the wearer
@@ -359,8 +383,10 @@ short:
   `WORLD-BUILDER-APPEARANCE.md` §6.5) answers 404
   ("appearance is stale against the session's redaction record"), as does a
   world with `images_purged`.
-- `digest` is 32 lower-hex and must be named by the current manifest. URLs carry
-  no path, file name or capture sequence number.
+- `digest` is 32 lower-hex and must be named by the current manifest, or by one
+  it superseded less than 120 s ago under the same label and keyframe set
+  (APPEARANCE §9, review 1 M4). URLs carry no path, file name or capture
+  sequence number.
 - `world_id` passes `contained_world_id`; `session_id` must be one of the
   world's sessions.
 - The only page that reaches these routes is §4's appearance page, through the

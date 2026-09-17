@@ -139,6 +139,70 @@ async function fetchJSON(route, what){
   return JSON.parse(new TextDecoder().decode(b));
 }
 
+/* ---------- follower: what a revision poll means (pure; tested under node) ---------- */
+/* Contract: WORLD-BUILDER-WORLDS.md §4 "Following" and WORLD-BUILDER-APPEARANCE.md §9.
+   No DOM, no GL, no fetch: `decide` turns one poll's outcome into one action,
+   `mustReplace` says whether a manifest's textures may be overwritten in place,
+   `nextDelay` paces the polls. The page below only carries the actions out.
+
+   Review 1, B1: `appearance.revision: null` used to be terminal. Every ordinary
+   Stop turns the session label from `none` into the real one, the routes stop
+   serving the walk's build until the final one lands, and the page deleted its
+   textures and stopped polling for good. Now:
+   - `rebuilding` (the label changed in a way the Tower says the textures carry
+     over): keep drawing, keep polling, pick the next build up in place;
+   - `withdrawn` / `absent` / a 404 naming a world or session that is gone: drop
+     the textures NOW, say why, and keep polling (slowly) so a rebuild returns;
+   - a served build whose `epoch` differs from the one on screen: drop first,
+     then draw it (m7: a label change and a rebuild inside one poll). */
+const FOLLOW = (() => {
+  const BASE_MS = 10000, CEILING_MS = 120000;
+  // How long the walk's images are kept on screen waiting for the final build.
+  // The final stages run minutes after Stop; past this the page degrades.
+  const HOLD_MAX_MS = 20 * 60 * 1000;
+  const GONE = /^(no world |world .* has no session )/;
+  function decide(poll, page){
+    page = page || {};
+    if (!poll || poll.error !== undefined) return {action: "none", live: null};
+    if (poll.absent !== undefined){
+      if (GONE.test(String(poll.absent || "")))
+        return {action: "drop", live: false,
+                reason: "This world is no longer on the Tower, so its images were removed from this view."};
+      return {action: "none", live: null};
+    }
+    const body = poll.ok || {};
+    const a = body.appearance || {};
+    const live = body.live === undefined ? null : body.live;
+    if (typeof a.revision === "string" && a.revision){
+      return a.revision !== page.revision ? {action: "load", live, revision: a.revision}
+                                          : {action: "none", live};
+    }
+    if (a.state === "rebuilding"){
+      const since = page.holdingSince;
+      if (since !== null && since !== undefined && (page.now - since) > HOLD_MAX_MS)
+        return {action: "drop", live,
+                reason: "The finished world's images did not arrive, so the walk's images were removed. "
+                  + "Close and reopen the world to see what it has now."};
+      return {action: "hold", live};
+    }
+    return {action: "drop", live,
+            reason: "These images are no longer served for this world (its redaction record changed, "
+              + "or its imagery was removed). This view will show them again if they are rebuilt."};
+  }
+  function epochOf(man){ return man && typeof man.epoch === "string" && man.epoch ? man.epoch : null; }
+  function mustReplace(shown, next){
+    if (!shown) return false;                       // nothing on screen to keep
+    const a = epochOf(shown), b = epochOf(next);
+    return a === null || b === null || a !== b;     // unknown is never "the same"
+  }
+  function nextDelay(result, delay){
+    if (result && (result.action === "load" || result.action === "hold" || result.live === true)) return BASE_MS;
+    return Math.min(CEILING_MS, Math.max(BASE_MS, (delay || BASE_MS) * 2));
+  }
+  return {decide, mustReplace, nextDelay, BASE_MS, CEILING_MS, HOLD_MAX_MS};
+})();
+/* ---------- end follower */
+
 /* ---------- formats ------------------------------------------------------- */
 function view(Type, buffer, offset, count){
   if (offset % Type.BYTES_PER_ELEMENT === 0) return new Type(buffer, offset, count);
@@ -528,6 +592,7 @@ async function main(){
   /* -------- GL state that a context loss takes away ---------------------- */
   let G = null;                 // programs, buffers, textures
   let ext = null;
+  let loseExt = null;           // WEBGL_lose_context: asks a lost context back
   let mesh = null;              // decoded proxy (kept: a restored context rebuilds from it)
   let manifest = null;          // the manifest the layers were filled from
   const layers = [];            // per texture layer: {id, digest, slot, ready, depthReady, kf}
@@ -558,6 +623,7 @@ async function main(){
 
   function buildGL(){
     ext = gl.getExtension("WEBGL_compressed_texture_astc");
+    loseExt = loseExt || gl.getExtension("WEBGL_lose_context");
     G = {
       view: program(VS_VIEW, FS_NOTHING),
       probe: program(VS_VIEW, FS_PROBE),
@@ -870,58 +936,102 @@ async function main(){
   let busy = Promise.resolve();
   function serial(fn){ const p = busy.then(fn, fn); busy = p.catch(() => {}); return p; }
 
+  /* Bring the page to the manifest the Tower serves NOW. Always a fresh fetch
+     of the manifest, so the Tower's redaction check runs again (boot, a new
+     build, a restored context). A build under another epoch drops what is on
+     screen first (FOLLOW.mustReplace). A chunk or proxy that 404s -- the next
+     build published while this one loaded and the file left its grace --
+     refetches the manifest and tries once more (review 1, M4). */
   async function loadRevision(revision){
-    const gen = loadGeneration;
-    const man = await fetchJSON(R.manifest, "the appearance manifest");
-    if (gen !== loadGeneration) return;
-    await applyManifest(man, gen);
-    if (gen !== loadGeneration) return;
-    S.revision = revision || S.revision;
+    for (let attempt = 0; ; attempt++){
+      const gen0 = loadGeneration;
+      const man = await fetchJSON(R.manifest, "the appearance manifest");
+      if (gen0 !== loadGeneration) return;
+      if (FOLLOW.mustReplace(manifest, man)) clearTextures();
+      const gen = loadGeneration;
+      try {
+        await applyManifest(man, gen);
+      } catch (e){
+        if (e && e.absent && attempt === 0){
+          S.refetches = (S.refetches || 0) + 1;
+          loadGeneration++;          // the first attempt's workers stop at their next check
+          continue;
+        }
+        throw e;
+      }
+      if (gen !== loadGeneration) return;
+      S.revision = revision || S.revision;
+      S.epoch = man.epoch || null;
+      return;
+    }
   }
 
-  /* The imagery was withdrawn (a changed redaction record, a purge): the
-     textures go, now, and the page says why rather than showing old images. */
-  function dropAppearance(reason){
+  /* Free every texture and forget which keyframe is where; the page, the
+     camera and the proxy mesh stay. The next manifest is applied as a first. */
+  function clearTextures(){
     loadGeneration++;
     if (G && G.col){ gl.deleteTexture(G.col); gl.deleteTexture(G.dep); G.col = null; G.dep = null; }
-    for (const L of layers){ L.ready = false; L.id = null; L.kf = null; }
+    layers.length = 0;
+    active.clear(); chosen = []; chosenFor = null;
     manifest = null; S.layers = 0; S.gpu.colour = 0; S.gpu.depth = 0; gpuTotal();
-    fail(reason);
+  }
+
+  /* The imagery was withdrawn (a changed redaction record, a purge, a world
+     that is gone): the textures go, now, and the page says why rather than
+     showing old images. NOT terminal: the page keeps asking, and a rebuild
+     that is served again is drawn again. */
+  function dropAppearance(reason){
+    clearTextures();
+    S.phase = "withdrawn"; S.drops = (S.drops || 0) + 1; S.revision = null; S.epoch = null;
+    holdingSince = null;
+    const m = $("msg"); m.textContent = reason; m.classList.add("on");
+    status("");
   }
 
   /* -------- following new appearance builds (no reload, no camera reset) - */
-  let pollDelay = 10000;
+  let pollDelay = FOLLOW.BASE_MS;
+  let holdingSince = null;       // when `rebuilding` was first seen, while it lasts
   async function pollOnce(){
-    let body;
-    try { body = await fetchJSON(R.revision, "the render revision"); }
-    catch (e){
-      if (e.absent) return {live: false};
-      return {live: null};
+    if (!G) return {action: "none", live: null};      // a lost context restores first
+    let poll;
+    try { poll = {ok: await fetchJSON(R.revision, "the render revision")}; }
+    catch (e){ poll = e && e.absent ? {absent: e.message} : {error: String(e && e.message || e)}; }
+    const r = FOLLOW.decide(poll, {revision: S.revision, holdingSince, now: Date.now()});
+    S.lastAction = r.action;
+    const a = (poll.ok && poll.ok.appearance) || {};
+    if (r.action === "hold"){
+      if (holdingSince === null) holdingSince = Date.now();
+      S.holding = true;
+      updateCaption();
+      return r;
     }
-    const a = body && body.appearance;
-    if (!a || a.revision === null || a.revision === undefined){
-      dropAppearance("These images are no longer served for this world (its redaction record changed, "
-                     + "or its imagery was removed). Close and reopen the world to see what remains.");
-      return {live: false, dropped: true};
+    holdingSince = null; S.holding = false;
+    if (r.action === "drop"){
+      if (S.phase !== "withdrawn" || manifest) dropAppearance(r.reason);
+      return r;
     }
-    CONFIG.current = !!a.current;
-    if (a.revision !== S.revision){
+    if (r.action === "load"){
+      CONFIG.current = !!a.current;
       const before = S.revision;
-      await loadRevision(a.revision);
+      await loadRevision(r.revision);
       if (S.revision !== before) S.appends++;
-      return {live: body.live, changed: true};
+      if (S.layers && S.phase === "withdrawn"){
+        S.phase = "ready"; $("msg").classList.remove("on"); requestDraw();
+      }
+      updateCaption();
+      return r;
     }
+    if (a.current !== undefined) CONFIG.current = !!a.current;
     updateCaption();
-    return {live: body.live, changed: false};
+    return r;
   }
   async function follow(){
     for (;;){
       await new Promise(res => setTimeout(res, pollDelay));
       if (S.phase === "failed") return;
       let r;
-      try { r = await serial(pollOnce); } catch (e){ S.errors.push(String(e && e.message || e)); r = {live: null}; }
-      if (r.dropped) return;
-      pollDelay = (r.changed || r.live === true) ? 10000 : Math.min(120000, pollDelay * 2);
+      try { r = await serial(pollOnce); } catch (e){ S.errors.push(String(e && e.message || e)); r = {action: "none", live: null}; }
+      pollDelay = FOLLOW.nextDelay(r, pollDelay);
     }
   }
   S.refresh = () => serial(pollOnce);
@@ -1294,6 +1404,13 @@ async function main(){
   }
 
   /* -------- context loss ---------------------------------------------------- */
+  /* WebKit often never fires `webglcontextrestored` after a real loss (review 1,
+     m8). So: ask for the context back after RESTORE_ASK_MS, and reload the page
+     after RESTORE_RELOAD_MS -- the app lets exactly this page reload itself
+     (WORLD-BUILDER-IOS.md §10) -- rather than sit on "Restoring…" for good. */
+  const RESTORE_ASK_MS = 3000, RESTORE_RELOAD_MS = 10000;
+  let restoreTimers = [];
+  function clearRestoreTimers(){ for (const t of restoreTimers) clearTimeout(t); restoreTimers = []; }
   canvas.addEventListener("webglcontextlost", e => {
     e.preventDefault();
     S.contextLosses++;
@@ -1304,19 +1421,39 @@ async function main(){
     const m = $("msg");
     m.textContent = "The graphics context was taken away (usually memory pressure). Restoring…";
     m.classList.add("on");
+    clearRestoreTimers();
+    restoreTimers.push(setTimeout(() => {
+      try { if (loseExt) loseExt.restoreContext(); } catch (_) { /* not lost any more, or not allowed */ }
+    }, RESTORE_ASK_MS));
+    restoreTimers.push(setTimeout(() => {
+      if (G) return;
+      S.reloadRequested = true;
+      location.reload();
+    }, RESTORE_RELOAD_MS));
   }, false);
   canvas.addEventListener("webglcontextrestored", () => {
-    // Imagery is not kept in page memory: it is fetched again, through the same
-    // transport and the same redaction check, and the camera stays where it was.
-    const man = manifest; manifest = null;
+    clearRestoreTimers();
+    // Imagery is not kept in page memory, and neither is the MANIFEST: it is
+    // fetched again, through the same transport and the same redaction check
+    // (a label changed or a purge while the context was gone is honoured, and
+    // so is a build that published meanwhile), and the camera stays where it
+    // was. Reapplying the old in-page manifest skipped that check and 404ed on
+    // every chunk a newer build had replaced (review 1, M4 and M5).
+    manifest = null;
+    layers.length = 0;
     serial(async () => {
       try {
         buildGL();
-        for (const L of layers){ L.id = null; L.kf = null; L.ready = false; L.depthReady = false; }
-        await applyManifest(man || await fetchJSON(R.manifest, "the appearance manifest"), loadGeneration);
-        $("msg").classList.remove("on");
+        await loadRevision(S.revision);
+        if (S.phase !== "withdrawn") $("msg").classList.remove("on");
         requestDraw();
       } catch (e){
+        if (e && e.absent){
+          dropAppearance("These images are no longer served for this world (its redaction record "
+                         + "changed, or its imagery was removed). This view will show them again if "
+                         + "they are rebuilt.");
+          return;
+        }
         fail("The graphics context came back but the images could not be placed again: " + e.message);
       }
     });
@@ -1417,7 +1554,8 @@ async function main(){
     const bits = [];
     if (manifest){
       bits.push(S.layers + " of " + S.keyframesInManifest + " keyframes shown");
-      if (manifest.quality === "live") bits.push("still building as you walk");
+      if (S.holding) bits.push("finishing the world: these are the walk's images until the final ones arrive");
+      else if (manifest.quality === "live") bits.push("still building as you walk");
     }
     if (CONFIG.current === false){
       const reason = manifest && manifest.currency && manifest.currency.reason || CONFIG.currency_reason;

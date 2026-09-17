@@ -158,21 +158,57 @@ def appearance_file(store: WorldStore, world_id: str, session_id: str, kind: str
     return data, _label(manifest)
 
 
+def _not_served_state(store: WorldStore, world_id: str, session_id: str, reason: str) -> str:
+    """`rebuilding`, `withdrawn` or `absent` for an appearance the routes do
+    not serve now (§9 `appearance.state`)."""
+    if reason == AP.STALE_LABEL_DETAIL:
+        contained = contained_world_id(store, world_id)
+        manifest = (AP.read_appearance_manifest(store, contained, session_id)
+                    if contained is not None else None)
+        return AP.withdrawal_state(store, contained, session_id, manifest)
+    if reason == "appearance imagery was purged":
+        return AP.WITHDRAWN
+    return AP.ABSENT
+
+
 def appearance_revision(store: WorldStore, world_id: str, session_id: str) -> dict:
-    """`{revision, current}` for the revision route (§9). Never raises: a
-    revision probe that cannot read something answers `null`."""
+    """`{revision, current, state, epoch}` for the revision route (§9). Never
+    raises: a revision probe that cannot read something answers `null`.
+
+    `state` is `served` exactly when `revision` is a string. Otherwise it says
+    what an open page should do with what it already drew:
+
+    - `rebuilding`: the label changed in a way its textures carry over
+      (`appearance_pipeline.textures_carry_over`; the ordinary Stop, `none` ->
+      the real label, over a walk-time build that re-redacted every frame). Keep
+      drawing, keep asking; the next build is expected.
+    - `withdrawn`: the label changed any other way, or the imagery was purged.
+      Drop the textures now; keep asking.
+    - `absent`: there is no appearance (never built, or the world is gone).
+
+    `epoch` is the served manifest's (§9): it changes exactly when an open page
+    must drop its textures before drawing the new build.
+    """
+    not_served = {"revision": None, "current": False, "state": AP.ABSENT, "epoch": None}
     try:
         contained, manifest = _servable_manifest(store, world_id, session_id)
-    except AppearanceNotServed:
-        return {"revision": None, "current": False}
+    except AppearanceNotServed as exc:
+        try:
+            state = _not_served_state(store, world_id, session_id, exc.reason)
+        except Exception:  # noqa: BLE001 -- the safe answer is to drop
+            logger.debug("[Tower][WorldBuilder] appearance state probe failed", exc_info=True)
+            state = AP.WITHDRAWN
+        return {**not_served, "state": state}
     except Exception:  # noqa: BLE001 -- a probe must not 500 the revision route
         logger.debug("[Tower][WorldBuilder] appearance revision probe failed", exc_info=True)
-        return {"revision": None, "current": False}
+        return {**not_served, "state": AP.WITHDRAWN}
     build = manifest.get("build_id")
     if not isinstance(build, str):
-        return {"revision": None, "current": False}
+        return {**not_served, "state": AP.WITHDRAWN}
     try:
         current = bool(AP.appearance_currency(store, contained, session_id, manifest)["current"])
     except Exception:  # noqa: BLE001
         current = False
-    return {"revision": f"{session_id}/appearance:{build}", "current": current}
+    epoch = manifest.get("epoch")
+    return {"revision": f"{session_id}/appearance:{build}", "current": current,
+            "state": AP.SERVED, "epoch": epoch if isinstance(epoch, str) else None}

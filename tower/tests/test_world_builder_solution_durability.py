@@ -594,3 +594,17 @@ def test_the_staging_name_carries_a_pid_the_sweeper_can_find(tmp_path):
     # Alive, so it stays.
     assert sweep_abandoned_staging(tmp_path) == 0
     assert mine.exists()
+
+
+def test_the_solvers_point_colour_is_never_persisted(tmp_path):
+    """Review 1, m5 (privacy L1): pycolmap's point colour is a mean of RAW frame
+    pixels. `solution.npz` keeps its `rgb` array, same shape and dtype, but it
+    holds the neutral grey, whatever the in-memory solution carried."""
+    workspace = _workspace(tmp_path)
+    solution = _solution(64)
+    assert (solution.rgb != 138).any()
+    write_solution(workspace, solution)
+    with np.load(workspace.arrays_path) as arrays:
+        rgb = arrays["rgb"]
+    assert rgb.shape == (64, 3) and rgb.dtype == np.uint8
+    assert (rgb == np.asarray(global_solve.WITHHELD_POINT_RGB, np.uint8)).all()
