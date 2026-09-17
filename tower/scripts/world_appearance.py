@@ -76,7 +76,8 @@ def _inspect(store, world_id, sid) -> dict:
         "encodings": by_enc, "proxy": man["proxy"],
         "provenance": man["appearance_provenance"],
         "selection": man["selection"], "exposure": man["exposure"],
-        "occluders": man["occluders"], "seconds": man["seconds"],
+        "occluders": man["occluders"], "transients": man.get("transients"),
+        "seconds": man["seconds"],
         "currency": appearance_currency(store, world_id, sid, man),
     }
 
@@ -94,6 +95,9 @@ def main(argv=None) -> int:
     ap.add_argument("--live", action="store_true",
                     help="the walk-time preset: the same rules, less sampling")
     ap.add_argument("--phone-budget", dest="phone_budget", type=int)
+    ap.add_argument("--transients", dest="transient_detector",
+                    choices=("union", "oneformer", "off"),
+                    help="the transient detector (default: union; oneformer with --live)")
     ap.add_argument("--device", help="torch device for the GPU stages (default: cuda if available)")
     args = ap.parse_args(argv)
 
@@ -112,6 +116,8 @@ def main(argv=None) -> int:
     overrides = {}
     if args.phone_budget is not None:
         overrides["phone_budget"] = args.phone_budget
+    if args.transient_detector is not None:
+        overrides["transient_detector"] = args.transient_detector
     params = AppearanceParams.live(**overrides) if args.live else AppearanceParams(**overrides)
     failures = 0
     for sid in sessions:
@@ -129,6 +135,10 @@ def main(argv=None) -> int:
               f"{result.excluded} excluded, {result.chunks} chunks, "
               f"{result.bytes / 1e6:.1f} MB")
         print(f"  {time.time() - t:.1f}s total  {result.seconds}")
+        tr = (read_appearance_manifest(store, args.world, sid) or {}).get("transients") or {}
+        print(f"  transients {tr.get('state')} ({tr.get('mode')}): "
+              f"{tr.get('frames_masked', 0)} masked"
+              + (f" -- {tr['detail']}" if tr.get("detail") else ""))
     return 1 if failures and failures == len(sessions) else 0
 
 

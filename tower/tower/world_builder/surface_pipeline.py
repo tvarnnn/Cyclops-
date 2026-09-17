@@ -346,6 +346,9 @@ class _Frames:
 
     def __init__(self, align: dict, work: Path, solution, params: SurfaceParams):
         self.work = work
+        # `transients.TransientReport`, attached once the masks are ensured.
+        self.transients = None
+        self.masked = 0
         self.kind = align.get("kind", "disparity")
         cam = align.get("camera") or solution.camera or {}
         self.K = np.array([[cam["fx"], 0, cam["cx"]],
@@ -420,6 +423,13 @@ class _Frames:
             if fill is not None:
                 ok &= ~_dilate_fill(torch.as_tensor(fill, device=device),
                                     params.fill_margin_px)
+            # The wearer's hands, arms and held phone: zero weight. Neither a
+            # measurement (a hand on the desk is within depth noise of the desk
+            # and fuses into it as a bump with the hand's colour) nor a carve.
+            det = self.transients.mask(ki) if self.transients is not None else None
+            if det is not None and det.shape == tuple(ok.shape):
+                ok &= ~torch.as_tensor(det, device=device)
+                self.masked += 1
             if not bool(ok.any()):
                 continue
             fw = float(np.clip((params.gate_rel - ho) / max(params.gate_rel, 1e-9),
@@ -441,7 +451,8 @@ def surfacify(store, world_id: str, session_id: str, *,
               should_stop=None,
               progress: Callable[[str, int, int], None] | None = None,
               force: bool = False,
-              backend: str | None = None) -> SurfaceResult:
+              backend: str | None = None,
+              transient_backend_factory=None) -> SurfaceResult:
     """Build the surface of one solved session. Idempotent, stop-aware."""
     from tower.world_builder.global_solve import load_solution
 
@@ -481,6 +492,10 @@ def surfacify(store, world_id: str, session_id: str, *,
         # The depth backend changes every triangle; a request for a different
         # network must not be answered "already built".
         pdigest = _params_digest(params, digest) + "|" + (backend or DenseParams().backend)
+        from tower.world_builder.transients import TransientParams  # noqa: PLC0415
+
+        tparams = TransientParams(mode=params.transient_detector)
+        pdigest += "|transients:" + tparams.rule_id()
 
         done = _already_built(root, digest, pdigest, force)
         if done is not None:
@@ -509,6 +524,19 @@ def surfacify(store, world_id: str, session_id: str, *,
                 root, "no keyframe passed the alignment gate, so there is "
                       "nothing to fuse")
 
+        # The transient detector's masks, computed for keyframes that have none
+        # under this rule yet (new keyframes, during a walk) and cached beside
+        # the depth work for the appearance stage after this one.
+        _status(root, state=STATE_RUNNING, stage=STAGE_TRANSIENTS,
+                input_digest=digest, params_digest=pdigest)
+        t = time.time()
+        frames.transients = _ensure_transients(
+            store, world_id, session_id, solution, intrinsics, align, work, frames,
+            tparams, should_stop, progress, transient_backend_factory)
+        seconds[STAGE_TRANSIENTS] = round(time.time() - t, 2)
+        if frames.transients.state == "stopped" or _stopped(should_stop):
+            return _stop(root, STAGE_TRANSIENTS, seconds)
+
         median_depth, scale_source = _scene_scale(frames, solution)
         if not (median_depth > 0):
             return _unavailable(root, "the solve has no usable scene depth")
@@ -523,7 +551,8 @@ def surfacify(store, world_id: str, session_id: str, *,
         scale = _scale_note(store, world_id)
         _mark_superseded(root, {lv["file"] for lv in result.levels})
         _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
-                        scale_source)
+                        scale_source, transients=dict(frames.transients.record(),
+                                                      frames_fused_with_mask=frames.masked))
         _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
         _status(root, state=STATE_OK, input_digest=digest,
                 params_digest=pdigest, result=result.as_dict())
@@ -567,6 +596,31 @@ def surfacify(store, world_id: str, session_id: str, *,
         return SurfaceResult(state=STATE_FAILED, detail=str(exc))
     finally:
         lock.release()
+
+
+STAGE_TRANSIENTS = "transients"
+
+
+def _ensure_transients(store, world_id, session_id, solution, intrinsics, align, work,
+                       frames, tparams, should_stop, progress, backend_factory):
+    """`transients.ensure_transient_masks` over the gated frames. Never fails
+    the surface: a machine that cannot run the detector fuses without masks and
+    the manifest says `unavailable`."""
+    from tower.world_builder import transients as T  # noqa: PLC0415
+
+    records = {int(r["ki"]): r for r in align.get("records", [])
+               if isinstance(r, dict) and r.get("ki") is not None}
+    try:
+        return T.ensure_transient_masks(
+            store, world_id, session_id, [(ki, frames.kids[ki]) for ki, *_ in frames.items],
+            intrinsics=intrinsics, camera=solution.camera, align_records=records,
+            depth_dir=work / "depth", params=tparams, backend_factory=backend_factory,
+            should_stop=should_stop, progress=progress)
+    except Exception as exc:  # noqa: BLE001 -- a quality mask never fails the surface
+        logger.exception("[Tower][WorldBuilder][surface] %s/%s: transient masks failed",
+                         world_id, session_id)
+        return T.TransientReport(state=T.STATE_FAILED, params=tparams,
+                                 detail=f"{type(exc).__name__}: {exc}")
 
 
 def _unavailable(root: Path, detail: str) -> SurfaceResult:
@@ -936,7 +990,7 @@ def _fit_mobile_page(parent, mesh, buf, target, page_bytes, attempts: int = 4):
 
 
 def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
-                    scale_source=None):
+                    scale_source=None, transients=None):
     filled = params.fill_radius_voxels() > 0
     try:
         detail = json.loads(result.detail) if result.detail else None
@@ -970,6 +1024,9 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
         "mobile_level": params.mobile_level,
         "seconds": result.seconds,
         "scale": scale,
+        # WORLD-BUILDER-SURFACE.md §2: whether the wearer's hands were masked
+        # out of fusion. `state` other than `ok` means they were NOT.
+        "transients": transients or {"state": "off", "detail": "not recorded"},
         "closure": (
             ("enclosed-fill: unobserved voxels bracketed by observed field in "
              f"at least {params.fill_enclose_dirs} of 26 directions within "

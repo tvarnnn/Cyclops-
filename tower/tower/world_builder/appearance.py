@@ -127,6 +127,9 @@ class AppearanceParams:
     transient_frame_max: float = 0.2
     transient_shift_px: int = 6
     transient_open_cells: int = 1
+    # the transient DETECTOR (transients.py, contract §5.3a): `union`
+    # (Grounding DINO + SAM 2.1 with OneFormer), `oneformer`, or `off`
+    transient_detector: str = "union"
     # exposure (§5.4)
     exposure_grid_px: int = 16
     exposure_vis_tol: float = 0.03
@@ -159,7 +162,10 @@ class AppearanceParams:
         worse than being coarse, but a relaxed privacy or occluder rule is not
         coarse, it is wrong -- so neither moves."""
         base = dict(quality="live", selection_samples=30_000, exposure_grid_px=24,
-                    exposure_iterations=20, transient_grid_px=12)
+                    exposure_iterations=20, transient_grid_px=12,
+                    # OneFormer only during a walk: the union costs about
+                    # twice as much per keyframe (contract §10).
+                    transient_detector="oneformer")
         base.update(overrides)
         return cls(**base)
 
@@ -1104,7 +1110,14 @@ class PreparedFrame:
     sharpness: float = 0.0
     quality: float = 1.0
     extra: dict = field(default_factory=dict)
+    # The transient detector's mask (transients.py), or None when this frame
+    # has none. Kept apart from `source.unobserved`, which is the privacy
+    # mask: this one is a quality mask and may be absent; that one may not.
+    detector: np.ndarray | None = None
 
     @property
     def transparent_core(self) -> np.ndarray:
-        return self.source.unobserved | self.occluder
+        core = self.source.unobserved | self.occluder
+        if self.detector is not None:
+            core = core | self.detector
+        return core

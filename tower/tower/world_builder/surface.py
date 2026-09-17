@@ -348,6 +348,13 @@ class SurfaceParams:
     of them into one field would place geometry at meaningless relative
     scales."""
 
+    transient_detector: str = "union"
+    """Which transient detector masks the wearer's hands, arms and held phone
+    out of fusion (`transients.py`; `union`, `oneformer` or `off`). A masked
+    pixel has zero weight: it neither measures nor carves. Not in
+    `digest_fields` (so artifacts built before it keep their digest); the
+    pipeline appends the detector's rule id to the params digest instead."""
+
     quality: str = "final"
     """`final` or `live`. Recorded in the manifest so a reader -- and the
     wearer -- can tell a coarse reconstruction built during the walk from the
@@ -378,6 +385,8 @@ class SurfaceParams:
             canonical_level=0,
             mobile_level=1,
             min_component_frac=0.0003,
+            # One model during a walk; the union at Stop (WORLD-BUILDER-SURFACE.md §2).
+            transient_detector="oneformer",
             quality="live",
         )
         base.update(overrides)
