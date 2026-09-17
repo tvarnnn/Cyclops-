@@ -369,6 +369,28 @@ class TestTheCacheIsTheirs:
         solution.input_digest = "d2"
         assert DC.consistency_key(frames, solution, sp, CP, 5, 2) != k1
 
+    def test_hand_masks_are_part_of_what_the_solve_reads(self, tmp_path):
+        store, solution, dense, align, truth = _world(tmp_path, digest="d1")
+        frames = _frames(align, dense, solution)
+        sp = S.SurfaceParams()
+        k1 = DC.consistency_key(frames, solution, sp, CP, 5, 2)
+
+        class _Report:
+            def __init__(self, rule, digest):
+                self._r = {"rule": rule, "state": "ok", "frames_digest": digest}
+
+            def record(self):
+                return self._r
+
+            def mask(self, ki):
+                return None
+
+        frames.transients = _Report("union@1", "a")
+        k2 = DC.consistency_key(frames, solution, sp, CP, 5, 2)
+        frames.transients = _Report("union@1", "b")
+        k3 = DC.consistency_key(frames, solution, sp, CP, 5, 2)
+        assert len({k1, k2, k3}) == 3
+
     def test_a_missing_field_file_is_not_a_cache(self, tmp_path):
         store, solution, dense, align, truth = _world(tmp_path)
         frames = _frames(align, dense, solution)

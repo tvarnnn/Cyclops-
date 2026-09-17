@@ -259,6 +259,16 @@ class ConsistencyField:
 # ---------------------------------------------------------------------------
 
 
+def _transient_token(frames):
+    """Which hand masks the solve excluded: their rule and state. A mask that
+    appears, changes rule, or becomes unavailable changes what the solve reads."""
+    report = getattr(frames, "transients", None)
+    if report is None:
+        return None
+    record = report.record() if hasattr(report, "record") else {}
+    return [record.get("rule"), record.get("state"), record.get("frames_digest")]
+
+
 def consistency_key(frames, solution, surface_params, cparams: ConsistencyParams,
                     outer: int, warm_outer: int) -> str:
     """Everything the solve reads. A new solve, a refit affine, a changed
@@ -272,6 +282,7 @@ def consistency_key(frames, solution, surface_params, cparams: ConsistencyParams
     payload = json.dumps([
         CONSISTENCY_VERSION, cparams.digest(), int(outer), int(warm_outer),
         getattr(solution, "input_digest", None), frames.kind, K, items,
+        _transient_token(frames),
         (p.edge_rel, p.max_grazing_deg, p.anchor_depth_multiple, p.max_depth_frac,
          p.fill_margin_px, p.gate_rel),
     ], default=str)
@@ -312,6 +323,13 @@ class _Data:
             if fill_np.any():
                 ok &= ~_dilate_fill(torch.as_tensor(fill_np, device=device),
                                     surface_params.fill_margin_px)
+            # The wearer's hands, arms and held phone are not the room: they
+            # move between frames, so letting them vote would bend the field
+            # toward agreeing with a hand.
+            reports = getattr(frames, "transients", None)
+            det = reports.mask(ki) if reports is not None else None
+            if det is not None and tuple(det.shape) == tuple(ok.shape):
+                ok &= ~torch.as_tensor(np.asarray(det, bool), device=device)
             zs = z[::7, ::7]
             zs = zs[zs > 0]
             kis.append(int(ki))
