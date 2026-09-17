@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import math
 import struct
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -75,6 +76,7 @@ SURFACE_SCHEMA_VERSION = 1
 # level shipped as a 7.89 MB page (live replay D).
 MOBILE_PAGE_BYTES = 6 * 1024 * 1024
 MESH_MAGIC = b"WBSURF01"
+SNAP_VERSION = 1
 
 STAGE_DEPTH = "depth"
 STAGE_FUSE = "fuse"
@@ -348,6 +350,43 @@ class SurfaceParams:
     of them into one field would place geometry at meaningless relative
     scales."""
 
+    # -- cross-frame depth consistency (`depth_consistency.py`) --------------
+    depth_consistency: bool = True
+    """Fuse each frame's depth through the jointly solved smooth correction
+    field rather than its plain affine fit. Frames disagreed with each other by
+    6-12 voxels about where a wall is; this is what makes them agree. A field
+    the held-out checks refuse, or a solve that fails, falls back to the plain
+    affine and `manifest.detail.depth_consistency` says so."""
+
+    consistency_outer: int = 5
+    """Outer (re-correspondence) iterations of a cold solve."""
+
+    consistency_warm_outer: int = 2
+    """Outer iterations when warm-started from the previous solve's field.
+    Two matched a cold solve on the canonical capture; one came within
+    0.03 points of it in 8 s."""
+
+    # -- plane snap (`snap_planes`) -----------------------------------------
+    plane_snap: bool = True
+    """After extraction, move vertices that already lie on a large, measured
+    plane onto it, within `snap_tol_voxels`. Nothing is added, extended or
+    filled; see `snap_planes`."""
+
+    snap_min_area_frac: float = 0.27
+    """Smallest plane snapped, as a fraction of the squared scene scale:
+    6 square units on the canonical capture (scale 4.72). At 1.5 units the
+    gate accepted desk tops and small ceiling pieces and flattened objects."""
+
+    snap_tol_voxels: float = 2.5
+    """Fit tolerance and snap distance, in voxels: the cross-frame spread
+    that remains on walls and ceiling after the consistency field. A plane
+    whose own RMS exceeds it is not snapped; a vertex farther than twice it
+    from the plane does not move."""
+
+    snap_min_frames: int = 8
+    """Distinct keyframes whose depth must measure a plane before it is
+    snapped."""
+
     quality: str = "final"
     """`final` or `live`. Recorded in the manifest so a reader -- and the
     wearer -- can tell a coarse reconstruction built during the walk from the
@@ -379,6 +418,8 @@ class SurfaceParams:
             mobile_level=1,
             min_component_frac=0.0003,
             quality="live",
+            consistency_outer=3,
+            consistency_warm_outer=1,
         )
         base.update(overrides)
         return cls(**base)
@@ -402,11 +443,27 @@ class SurfaceParams:
             self.smooth_iterations, self.smooth_lambda, self.smooth_mu,
             self.lod_face_targets, self.component, self.quality,
             self.max_blocks, "lod-cascade", ("mobile-page", self.mobile_page_bytes),
+            # Always present, deliberately: a surface fused before the field
+            # and the snap existed is NOT what these parameters build.
+            ("depth-consistency", self._consistency_digest()),
+            ("plane-snap", self.plane_snap, self.snap_min_area_frac,
+             self.snap_tol_voxels, self.snap_min_frames, SNAP_VERSION),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
                            self.fill_sealed_only)
         return base
+
+    def _consistency_digest(self):
+        if not self.depth_consistency:
+            return "off"
+        from tower.world_builder.depth_consistency import (  # noqa: PLC0415
+            CONSISTENCY_VERSION,
+            ConsistencyParams,
+        )
+
+        return (CONSISTENCY_VERSION, ConsistencyParams().digest(),
+                self.consistency_outer, self.consistency_warm_outer)
 
     def fill_radius_voxels(self) -> int:
         """March length in voxels for the configured closable gap; 0 = off."""
@@ -1673,6 +1730,222 @@ def vertex_normals(V, F):
         np.add.at(N, F[:, i], fn)
     ln = np.linalg.norm(N, axis=1, keepdims=True)
     return (N / np.maximum(ln, 1e-12)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# plane snap
+# ---------------------------------------------------------------------------
+
+
+def _vertex_adjacency(n, F):
+    from scipy.sparse import coo_matrix
+
+    e0 = np.concatenate([F[:, 0], F[:, 1], F[:, 2], F[:, 1], F[:, 2], F[:, 0]])
+    e1 = np.concatenate([F[:, 1], F[:, 2], F[:, 0], F[:, 0], F[:, 1], F[:, 2]])
+    A = coo_matrix((np.ones(len(e0), np.float32), (e0, e1)), shape=(n, n)).tocsr()
+    A.data[:] = 1.0
+    return A
+
+
+def snap_planes(V, F, views, K, params: SurfaceParams, voxel: float, median_depth: float,
+                device=None, *, max_planes: int = 40, seed: int = 0):
+    """Move vertices that already lie on a large, measured plane onto it.
+
+    WHAT THIS IS. After the consistency field, frames agree on a wall to about
+    2.5 voxels, and the surface still undulates inside that. For a plane that
+    is large (`snap_min_area_frac` of the squared scene scale), flat to within
+    the tolerance by its own fit, and measured by at least `snap_min_frames`
+    keyframes' depth, each vertex already on it -- within twice the tolerance,
+    with its normal within 20 degrees of the plane's -- moves along the
+    plane's normal onto it: fully within the tolerance, smoothly less out to
+    twice it. The normal gate reads the vertex normal smoothed over its
+    neighbourhood, so neighbouring vertices are gated alike.
+
+    WHAT THIS IS NOT. It adds no vertex and no face, closes no hole, and
+    moves no vertex farther than twice the tolerance or in any direction but
+    the normal: a plane never extends past what was reconstructed. Structure
+    standing off the plane by more than twice the tolerance, or turned away
+    from it (a shelf edge, a light switch's sides), does not move.
+
+    `views` are the (depth, valid, R, t) the evidence filter used, i.e. the
+    corrected depth. Returns (V as float32, record).
+    """
+    import torch
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    t0 = time.time()
+    tol = float(params.snap_tol_voxels) * float(voxel)
+    min_area = float(params.snap_min_area_frac) * float(median_depth) ** 2
+    record = {"version": SNAP_VERSION, "tol": tol, "tol_voxels": params.snap_tol_voxels,
+              "min_area": min_area, "min_frames": params.snap_min_frames,
+              "planes": [], "rejected": 0, "rejected_examples": [],
+              "vertices_moved": 0, "area_snapped": 0.0}
+    V = np.asarray(V)
+    F = np.asarray(F, np.int64)
+    if not len(F) or tol <= 0:
+        record["seconds"] = round(time.time() - t0, 2)
+        return V.astype(np.float32), record
+    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    nV = len(V)
+    V64 = V.astype(np.float64)
+    N = vertex_normals(V.astype(np.float32), F).astype(np.float64)
+    A = _vertex_adjacency(nV, F)
+    Ns = N.copy()
+    for _ in range(3):
+        Ns = A @ Ns + Ns
+        Ns /= np.maximum(np.linalg.norm(Ns, axis=1, keepdims=True), 1e-12)
+    fa = 0.5 * np.linalg.norm(np.cross(V64[F[:, 1]] - V64[F[:, 0]],
+                                       V64[F[:, 2]] - V64[F[:, 0]]), axis=1)
+    va = np.zeros(nV)
+    for k in range(3):
+        np.add.at(va, F[:, k], fa / 3)
+    cosn = math.cos(math.radians(20.0))
+    Vt = torch.as_tensor(V64, device=dev, dtype=torch.float32)
+    Nt = torch.as_tensor(N, device=dev, dtype=torch.float32)
+    At = torch.as_tensor(va, device=dev, dtype=torch.float32)
+    free = np.ones(nV, bool)
+    rng = np.random.default_rng(seed)
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    stack = {}
+
+    def measuring_frames(P):
+        if not stack:
+            stack["Z"] = torch.stack([z.to(dev).to(torch.float16) for z, _o, _r, _t in views])
+            stack["OK"] = torch.stack([o.to(dev) for _z, o, _r, _t in views])
+            stack["R"] = torch.stack([r.to(dev).float() for _z, _o, r, _t in views])
+            stack["t"] = torch.stack([t.to(dev).float() for _z, _o, _r, t in views])
+        Z, OK, Rs, ts = stack["Z"], stack["OK"], stack["R"], stack["t"]
+        H, W = Z.shape[1:]
+        X = torch.as_tensor(P, device=dev, dtype=torch.float32)
+        count = 0
+        for s0 in range(0, len(Rs), 64):
+            pc = torch.einsum("fij,pj->fpi", Rs[s0:s0 + 64], X) + ts[s0:s0 + 64, None]
+            zz = pc[..., 2]
+            u = (pc[..., 0] / zz.clamp(min=1e-6) * float(K[0, 0]) + float(K[0, 2])).round().long()
+            v = (pc[..., 1] / zz.clamp(min=1e-6) * float(K[1, 1]) + float(K[1, 2])).round().long()
+            inb = (zz > 1e-4) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            fidx = torch.arange(s0, s0 + len(pc), device=dev)[:, None].expand_as(u)
+            uc, vc = u.clamp(0, W - 1), v.clamp(0, H - 1)
+            dm = Z[fidx, vc, uc].float()
+            vm = OK[fidx, vc, uc] & inb & torch.isfinite(dm)
+            band = tol + 0.01 * zz
+            meas = vm & ((dm - zz).abs() < band)
+            vis = vm & (dm > zz - band)
+            nm = meas.sum(1)
+            count += int(((nm >= 25) & (nm.float() >= 0.25 * vis.sum(1).float().clamp(min=1))).sum())
+        return count
+
+    snapped_w = np.zeros(nV)
+    dist = np.zeros(nV)
+    owner = np.full(nV, -1, np.int64)
+    planes = []
+    for _it in range(max_planes * 3):
+        fi = np.nonzero(free)[0]
+        if len(fi) < 64:
+            break
+        fi_t = torch.as_tensor(fi, device=dev)
+        seeds = fi[rng.integers(0, len(fi), 512)]
+        sn = torch.as_tensor(Ns[seeds], device=dev, dtype=torch.float32)
+        sp = Vt[torch.as_tensor(seeds, device=dev)]
+        sub = fi_t[torch.randperm(len(fi), generator=gen)[:200_000].to(dev)]
+        scale = len(fi) / sub.numel()
+        Vs_, Ns_, As_ = Vt[sub], Nt[sub], At[sub]
+        best, bscore = None, 0.0
+        for s0 in range(0, 512, 64):
+            d = ((Vs_[None] - sp[s0:s0 + 64, None]) * sn[s0:s0 + 64, None]).sum(-1)
+            al = (Ns_[None] * sn[s0:s0 + 64, None]).sum(-1).abs()
+            score = (((d.abs() < tol) & (al > cosn)).float() * As_[None]).sum(1) * scale
+            k = int(score.argmax())
+            if float(score[k]) > bscore:
+                bscore, best = float(score[k]), s0 + k
+        if best is None or bscore < min_area:
+            break
+        n = Ns[seeds[best]].copy()
+        c = V64[seeds[best]].copy()
+        for _ in range(3):
+            d = (V64 - c) @ n
+            m = (np.abs(d) < 2 * tol) & (np.abs(N @ n) > cosn) & free
+            if m.sum() < 3:
+                break
+            w = va[m]
+            c = (V64[m] * w[:, None]).sum(0) / max(w.sum(), 1e-12)
+            _, _, vt = np.linalg.svd((V64[m] - c) * np.sqrt(w)[:, None], full_matrices=False)
+            n = vt[2] if vt[2] @ n > 0 else -vt[2]
+        d = (V64 - c) @ n
+        inl = (np.abs(d) < 2 * tol) & (np.abs(N @ n) > cosn) & free
+        fin = inl[F].all(1)
+        Ff = F[fin]
+        if len(Ff):
+            gph = coo_matrix((np.ones(len(Ff) * 2), (np.concatenate([Ff[:, 0], Ff[:, 1]]),
+                                                     np.concatenate([Ff[:, 1], Ff[:, 2]]))),
+                             shape=(nV, nV))
+            ncomp, lab = connected_components(gph, directed=False)
+            flab = lab[Ff[:, 0]]
+            carea = np.bincount(flab, weights=fa[fin], minlength=ncomp)
+            for comp in np.argsort(-carea):
+                if carea[comp] < min_area:
+                    break
+                vid = np.unique(Ff[flab == comp])
+                P = V64[vid]
+                w = va[vid]
+                cc = (P * w[:, None]).sum(0) / max(w.sum(), 1e-12)
+                _, _, vt = np.linalg.svd((P - cc) * np.sqrt(w)[:, None], full_matrices=False)
+                nn = vt[2] if vt[2] @ n > 0 else -vt[2]
+                r = (P - cc) @ nn
+                rms = float(np.sqrt((w * r ** 2).sum() / max(w.sum(), 1e-12)))
+                smp = vid[rng.choice(len(vid), min(3000, len(vid)), replace=False)]
+                nf = measuring_frames(V64[smp]) if rms <= tol else 0
+                rec = {"area": float(carea[comp]), "rms_voxels": rms / voxel, "frames": nf,
+                       "vertices": int(len(vid))}
+                if rms > tol or nf < params.snap_min_frames:
+                    record["rejected"] += 1
+                    if len(record["rejected_examples"]) < 20:
+                        record["rejected_examples"].append(rec)
+                    continue
+                dd = (V64[vid] - cc) @ nn
+                wgt = np.clip((2 * tol - np.abs(dd)) / tol, 0, 1)
+                wgt = wgt * wgt * (3 - 2 * wgt)
+                # The SMOOTHED normal: a marching-cubes vertex normal swings
+                # by tens of degrees between neighbours, and gating on it left
+                # single vertices unmoved among moved ones -- spikes. Measured
+                # on the canonical capture: wall_b faces >10 deg 17.8% gating
+                # on raw normals with weight averaging, 14.2% on smoothed.
+                wgt *= np.clip((np.abs(Ns[vid] @ nn) - cosn) / (1 - cosn) * 4, 0, 1)
+                better = wgt > snapped_w[vid]
+                vv = vid[better]
+                snapped_w[vv] = wgt[better]
+                dist[vv] = dd[better]
+                owner[vv] = len(planes)
+                rec.update(normal=[float(x) for x in nn], point=[float(x) for x in cc])
+                planes.append(rec)
+        free &= ~inl
+        if len(planes) >= max_planes:
+            break
+
+    Vout = V64.copy()
+    if planes:
+        own = owner >= 0
+        w = snapped_w
+        normals = np.array([p["normal"] for p in planes])
+        disp = -(dist * w)
+        idx = np.nonzero(own & (w > 0))[0]
+        Vout[idx] += disp[idx, None] * normals[owner[idx]]
+        moved = np.abs(disp[idx])
+        for pid, p in enumerate(planes):
+            m = owner[idx] == pid
+            p["moved_voxels_p50_p99"] = ([float(np.percentile(moved[m], q) / voxel)
+                                          for q in (50, 99)] if m.any() else [0.0, 0.0])
+        record["vertices_moved"] = int(len(idx))
+        record["area_snapped"] = float(va[own & (w > 0.5)].sum())
+        record["max_move"] = float(moved.max()) if len(moved) else 0.0
+    record["planes"] = planes
+    record["plane_count"] = len(planes)
+    record["plane_areas"] = [round(p["area"], 3) for p in planes]
+    stack.clear()
+    record["seconds"] = round(time.time() - t0, 2)
+    return Vout.astype(np.float32), record
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,8 @@ Three rules follow, and they are the whole compatibility story:
     points_l1.bin     canonical
     points_l2.bin     mobile
     align.json        per-frame alignment record and gate decisions
+    consistency.json  the depth consistency field's record (§11); written by the surface stage
+    consistency_field.npz  the field itself (§11), only while an applied one exists
     status.json       ok | running | stopped | failed | unavailable
     fused.npz         intermediate; regenerable, not part of the contract
     work/             intermediate; regenerable, not part of the contract
@@ -324,3 +326,110 @@ dishonesty from mislabelling them.
 `manifest.input_digest` is additive; a reader that does not know the key behaves
 exactly as before, and the format identifier does not move for it.
 
+## 11. The depth consistency field
+
+Added 2026-09-17. `tower/tower/world_builder/depth_consistency.py`.
+
+### Why
+
+`align.json` fits each keyframe's prediction with one affine. Every frame is
+then smooth on its own, but frames disagree with each other about where a
+surface is: on the canonical capture a 0.3-unit patch of wall sits at offsets
+with a median spread of 6-12 voxels across frames, about a truncation band.
+Fused, that is the crumpled, holey surface. The field is a low-order,
+per-frame correction solved so the frames agree.
+
+### The model
+
+For a gated keyframe with plain affine depth `z_aff` (from its `align.json`
+record, unchanged):
+
+    z'(u, v) = exp(g(u, v)) * z_aff(u, v) + o(u, v) * m
+
+- `g` and `o` are uniform cubic B-splines over the image, 3 x 6 cells (6 x 9
+  control points each). Pixel `(u, v)` sits at `(u / (W - 1), v / (H - 1))` of
+  the grid. Both are zero at the plain affine.
+- `m` is the frame's median positive `z_aff` (every 7th pixel), stored.
+
+### The solve
+
+- **SfM anchors.** Cauchy loss on `log(z' / z_sfm)` (sigma 2%) at the solve's
+  observations by gated frames, outside the redaction fill. A seeded 10% of 3-D
+  POINTS is held out of every term.
+- **Cross-frame consistency.** Pixels of frame i are back-projected with `z'_i`
+  and projected into its 10 most co-visible frames (by shared sparse points)
+  and 6 revisits at least 15 keyframes apart. The residual is point-to-plane
+  against frame j's corrected surface, relative to depth, Cauchy sigma 1%.
+  **Occlusion-gated:** only projections that land on j's eroded valid pixels,
+  at an incidence cosine above 0.25, within a gate of 6% that tightens to
+  clamp(4 MAD, 2%, 6%). Correspondences are recomputed each outer iteration.
+- **Weak prior.** Ridge toward zero on `g` and `o`, and second differences of
+  the control grid.
+- **Bounds.** At most 4M correspondences (samples per frame shrink on long
+  walks), loss evaluated in 1M chunks, 5 outer x 60 LBFGS iterations cold,
+  a 240 s budget.
+
+### The decision
+
+After the solve, on data it never saw, two errors are measured for the plain
+affine and for the field:
+
+- the median relative depth error at the held-out points;
+- the median point-to-plane disagreement on frame pairs disjoint from the
+  fitted pairs, at fresh pixels. A walk too short to have such pairs uses the
+  fitted pairs at fresh pixels, and says `cross_check: fit-pairs-fresh-pixels`.
+
+The field is **refused** if either error gets worse, if it is not finite, or
+if the 99th percentile of `|g|` exceeds 0.5. The baseline affine was fitted on
+the held-out points too, so the test favours the baseline.
+
+| `state` | meaning | depth fused by the surface stage |
+|---|---|---|
+| `applied` | the field passed both held-out checks | corrected |
+| `refused` | a check failed; `reason` names it | plain affine |
+| `failed` | the solve raised or diverged; `reason` says how. Not reused as a cache: the next build solves again | plain affine |
+| `skipped` | fewer than 2 frames, fewer than 10 fit anchors, or fewer than 30 held-out anchors to judge with | plain affine |
+
+### Caching and warm start
+
+`consistency.json` carries a `key`: a hash of the solver version and
+parameters, the outer-iteration counts, the solve's `input_digest`, the depth
+kind, the camera, every gated frame's `(ki, kid, a, b, image_sha1,
+z_sparse_max)`, and the validity and gate parameters. A record with the same
+key is reused (`applied` only while `consistency_field.npz` carries that key
+too). A different key re-solves.
+
+When re-solving, a previous `consistency_field.npz` warm-starts every frame it
+knows, which is the live path: each background global solve changes the key.
+Frames it does not know start at zero. A warm solve runs
+`SurfaceParams.consistency_warm_outer` outer iterations (2 final, 1 live).
+
+### The files
+
+`consistency_field.npz`: `version` (1), `key`, `ki` (int64, N), `G` and `O`
+(float32, N x 9 x 6: rows down, columns across), `med` (float32, N), `cells`
+([3, 6]), `offset_field`, `shape` ([H, W]). About 0.2 MB for 352 frames.
+
+`consistency.json` also records `heldout` (before/after `sfm` and `cross`),
+`frames`, `anchors_fit`, `anchors_held_out`, `pairs`, `samples_per_frame`,
+`warm_start {used, frames, outer}`, `history` (per outer iteration),
+`scale_field_abs_p50_p99`, `seconds`, `optimise_seconds`, `gpu_peak_mb`,
+`solve_digest`.
+
+### Who reads it
+
+The surface stage only. `align.json` is never rewritten and keeps the plain
+affine as each frame's provenance. **The point artifact (`points_l*.bin`) is
+fused from the plain affine** and makes no consistency claim.
+
+### Measured (canonical capture, 352 frames, RTX 5070)
+
+| | plain affine | field |
+|---|---|---|
+| held-out sparse-point error, median | 2.07% | 1.07% |
+| held-out frame-pair disagreement, median | 2.32% | 0.58% |
+
+- Cold solve: 33 s on an idle GPU, 1.9 GB peak.
+- Warm from a field solved over the first 80% of the walk: 8.6 s with one
+  outer iteration (1.10% / 0.60%), 13.7 s with two (1.08% / 0.58%).
+- 800 synthetic keyframes at 359 x 639: 49 s cold, 2.6 GB peak allocated.
