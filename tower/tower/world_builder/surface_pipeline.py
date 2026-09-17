@@ -1179,7 +1179,11 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
              "min_support_frames distinct frames measured it and fewer than "
              "contradiction_ratio times as many saw through it"
              + (("; where a corner fell short of min_weight, only if no frame "
-                 "saw through the face and its supporting cameras spanned "
+                 "saw through the face"
+                 + (" (or, measured by at least low_weight_through_min_support "
+                    "frames, at most low_weight_through_frac of that many did)"
+                    if params.low_weight_through_frac > 0 else "")
+                 + " and its supporting cameras spanned "
                  "low_weight_min_parallax"
                  + (", and not where the kept surface hid it from every frame "
                     "that measured it" if params.low_weight_hidden_test else ""))

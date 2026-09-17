@@ -37,8 +37,10 @@ geometry comes from.
      `min_weight` emits a full-weight face. With `low_weight_evidence` (on by
      default, since 2026-09-17) a cube observed at every corner that did NOT
      all reach `min_weight` emits a **low-weight** face, which the frame tests
-     below must admit under two more conditions: **no** frame saw through it
-     (not a ratio), and its supporting cameras span `low_weight_min_parallax`
+     below must admit under two more conditions: no frame saw through it --
+     or, since 2026-09-17, when at least `low_weight_through_min_support` (8)
+     distinct frames supported it, at most `low_weight_through_frac` (0.34) of
+     that many did -- and its supporting cameras span `low_weight_min_parallax`
      (0.05: the diagonal of their centres' bounding box over the face's
      distance to the box's centre). With it off, only full-weight cubes emit.
      With `low_weight_hidden_test` (on by default, since 2026-09-17) a kept
@@ -79,6 +81,27 @@ geometry comes from.
    such frame too, and held-out frames saw through them 11.5% of the time
    (kept low-weight faces 4.3%). The appearance's phone-tier coverage of the
    proxy rose from 95.1% to 97.7%.
+
+   Why a few see-through frames are tolerated, measured
+   (`Glasses-scratch/wb-final-recon/fixit/geom2/GEOM2.md`): the black tears
+   in the ceiling around the fan and the cracks along the hutch's top board
+   were low-weight faces that many frames of one pass supported and one or two
+   frames of another pass "saw through", because the passes placed that far
+   surface a band apart (the ceiling: 15 frames from 14 units away against 2
+   from under the fan). With 10% of keyframes held out of fusion, the faces the
+   tolerance admits were contradicted by held-out frames 5.6% of the time (all
+   kept faces 4.4%); where they are the nearest surface the held-out depth
+   agrees on 67% of pixels and the mesh stands in front of it on 6.5% (whole
+   surface 79% / 8.7%). A floor of 5 supporters instead of 8 admitted faces
+   contradicted 9.6% of the time, and was not taken.
+
+   Measured and NOT adopted in the same round: keeping the near side of a
+   depth edge (the rim of a shelf board the edge test rejects) added faces
+   held-out frames contradicted 30% of the time and pixels in front of the
+   held-out depth 17% of the time, for 0.1 point of black; lowering
+   `contradiction_ratio` to 1 removed faces held-out frames contradicted 48% of
+   the time but also removed half-right ceiling around the fan and the laptop
+   on the bed, adding 0.3-0.6 points of black. Neither changed.
 
    **Moved objects are not detected.** No rule keys on WHEN frames measured a
    face. Measured on the same capture: kept faces whose supporting and

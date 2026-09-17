@@ -303,6 +303,34 @@ class SurfaceParams:
     were contradicted by held-out frames nearly as often as the rest of the surface
     (5.3% vs 4.4%); with no parallax test, 8.3%."""
 
+    low_weight_through_frac: float = 0.34
+    """A low-weight face that MANY frames measured may be seen through by a
+    few: at most this fraction of its supporting frames, and only when at least
+    `low_weight_through_min_support` distinct frames supported it. 0 restores
+    "no frame at all may see through a low-weight face".
+
+    WHY. Two passes of a walk can place the same far surface a band apart. On
+    the canonical capture the ceiling around the fan was supported by 15 frames
+    of the pass at the far end of the room (ki 130-145, 14 units away) and
+    "seen through" by 2 frames of the pass under the fan (ki 161-180), whose
+    depth put the ceiling a little higher; the zero-see-through rule cut the
+    ceiling there into the fan-shaped black tears the visual review ranked
+    first, and the same pattern left black cracks along the hutch's top board.
+
+    Measured with 10% of keyframes held out of fusion
+    (`Glasses-scratch/wb-final-recon/fixit/geom2/GEOM2.md`): the faces this
+    admits (21,774) were contradicted by held-out frames (seen through more
+    often than supported) 5.6% of the time; all kept faces 4.4%, the low-weight
+    faces the zero rule keeps 5.9%. Where they are the nearest surface, the
+    held-out depth agrees on 67% of pixels and the mesh stands in front of it
+    on 6.5% (the whole surface: 79% / 8.7%). With support >= 5 instead of 8
+    the admitted faces were contradicted 9.6% of the time; with a ratio of
+    0.2 and support >= 3, 8.7%. No-surface pixels: opening view 1.70 ->
+    1.54%, the ceiling from pose 99 7.87 -> 6.90%, the bed side 17.1 -> 15.7%."""
+
+    low_weight_through_min_support: int = 8
+    """See `low_weight_through_frac`."""
+
     # -- surface cleanup ----------------------------------------------------
     min_component_frac: float = 0.0001
     """Connected components smaller than this fraction of the largest are
@@ -534,6 +562,10 @@ class SurfaceParams:
             # supporting cameras could not see.
             ("low-weight-hidden", self.low_weight_hidden_test),
             ("lod-boundary", self.lod_boundary_weight),
+            # A surface built before it existed refused a low-weight face that
+            # any frame at all saw through.
+            ("low-weight-through", self.low_weight_through_frac,
+             self.low_weight_through_min_support),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
@@ -1629,7 +1661,9 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     `weak`, a bool per face, marks LOW-WEIGHT faces (`extract_mesh(weak_floor=)`,
     `SurfaceParams.low_weight_evidence`): cubes observed at every corner but not
     to `min_weight`. Such a face must pass every test above and two more: no
-    frame at all saw through it, and its supporting cameras span
+    frame saw through it -- or, when at least `low_weight_through_min_support`
+    frames supported it, no more than `low_weight_through_frac` of that many --
+    and its supporting cameras span
     `low_weight_min_parallax` (the diagonal of their centres' bounding box over
     the face's distance to that box's centre).
 
@@ -1726,7 +1760,12 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
         keep &= ~back
     if weak_idx is not None:
         seen_through = torch.zeros(nF, dtype=torch.bool, device=dev)
-        seen_through[weak_idx] = thru[weak_idx] > 0
+        tw, sw = thru[weak_idx].float(), sup[weak_idx].float()
+        # A few see-through frames against many supporters are tolerated
+        # (`SurfaceParams.low_weight_through_frac`).
+        tolerated = ((tw <= float(params.low_weight_through_frac) * sw)
+                     & (sw >= int(params.low_weight_through_min_support)))
+        seen_through[weak_idx] = (tw > 0) & ~tolerated
         stats["dropped_weak_seen_through"] = int((keep & seen_through).sum())
         keep &= ~seen_through
         spread = torch.where(wsup[:, None], cam_hi - cam_lo, torch.zeros_like(cam_hi)).norm(dim=1)
