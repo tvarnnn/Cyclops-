@@ -77,6 +77,7 @@ SURFACE_SCHEMA_VERSION = 1
 MOBILE_PAGE_BYTES = 6 * 1024 * 1024
 MESH_MAGIC = b"WBSURF01"
 SNAP_VERSION = 1
+LOW_WEIGHT_VERSION = 1
 
 STAGE_DEPTH = "depth"
 STAGE_FUSE = "fuse"
@@ -268,6 +269,40 @@ class SurfaceParams:
     could not resolve it: a thin pole two near frames measured is removed if
     four distant frames smoothed it into the wall behind."""
 
+    low_weight_evidence: bool = True
+    """Let a cube whose eight corners were all OBSERVED (weight > 0) but did not
+    all reach `min_weight` emit, and admit its faces only on stricter frame
+    tests (`evidence_filter`): the `min_support_frames`, contradiction and
+    back-facing tests as for every face, and in addition NO frame saw through
+    the face, and its supporting cameras span `low_weight_min_parallax`.
+
+    WHY. `min_weight` is a sum of 1/z^2-falloff, incidence-weighted samples, so
+    it is a distance-and-angle threshold, not a frame count: a wall 2x a frame's
+    median depth earns a quarter of a sample per frame, and one seen at 60
+    degrees half of that. After the consistency field made frames agree (pair
+    disagreement 2.2% -> 0.56%), `min_weight` and the all-corner gate were the
+    rule behind 56% of the black pixels at the walk poses of the canonical
+    capture and 38% at the novel views -- the left wall, the wall beside the
+    door, the ceiling, the floor in front of the desk -- although two or more
+    frames had measured those surfaces and none had seen past them
+    (`Glasses-scratch/wb-final-recon/fixit/holes/HOLES.md`).
+
+    Measured against 10% of keyframes held out of fusion: the faces this admits
+    were seen through by the held-out frames 5.3% of the time, the faces the
+    unrelaxed rules keep 4.4%; relaxing `min_weight` WITHOUT the extra tests
+    admitted faces seen through 17% of the time, and the ratio, back-facing and
+    component rules added contradicted geometry wherever they were relaxed.
+    Off, the field emits only where every corner reached `min_weight`, as
+    before. Not applied when the enclosed-hole fill is on."""
+
+    low_weight_min_parallax: float = 0.05
+    """For a low-weight face: the diagonal of the bounding box of its supporting
+    cameras' centres divided by the distance from the face to that box's
+    centre. Monocular depth from nearly one viewpoint agrees with itself; frames
+    only seconds apart are not independent evidence. At 0.05 the admitted faces
+    were contradicted by held-out frames nearly as often as the rest of the surface
+    (5.3% vs 4.4%); with no parallax test, 8.3%."""
+
     # -- surface cleanup ----------------------------------------------------
     min_component_frac: float = 0.0001
     """Connected components smaller than this fraction of the largest are
@@ -324,6 +359,15 @@ class SurfaceParams:
     before it, not from level 0: decimation grows as faces^1.37, and on a
     20-30 minute walk decimating every level from the full mesh projected to
     41-72 minutes of packing alone."""
+
+    lod_boundary_weight: float = 100.0
+    """Quadric decimation's weight on boundary edges (`decimate`). A surface
+    that stops where the evidence stops is mostly boundary, and at the default
+    weight of 1 the phone level's decimation pulled those rims inward: on the
+    canonical capture it opened 0.2-0.4% of each view's pixels that level 0
+    covered, as black cracks along shelf edges and silhouettes. At 100 that
+    halves, at the same page bytes (the level carries ~7% fewer faces, since a
+    rim keeps more vertices). 1 is the old behaviour."""
 
     max_blocks: int = 360_000
     """The field's budget, in 8^3 blocks: ~3.4 GiB of field at 20 bytes a
@@ -456,6 +500,11 @@ class SurfaceParams:
             ("depth-consistency", self._consistency_digest()),
             ("plane-snap", self.plane_snap, self.snap_min_area_frac,
              self.snap_tol_voxels, self.snap_min_frames, SNAP_VERSION),
+            # Always present too: a surface built before these existed emitted
+            # no low-weight face and decimated with boundary weight 1.
+            ("low-weight", self.low_weight_evidence, self.low_weight_min_parallax,
+             LOW_WEIGHT_VERSION),
+            ("lod-boundary", self.lod_boundary_weight),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
@@ -897,7 +946,7 @@ class SurfaceVolume:
     # -- extraction ---------------------------------------------------------
 
     def extract_mesh(self, min_weight: float, *, tile_blocks: int = 12,
-                     only_blocks=None, progress=None, tag=None):
+                     only_blocks=None, progress=None, tag=None, weak_floor=None):
         """Marching cubes over the observed part of the field only.
 
         A cube emits triangles only when ALL EIGHT of its corner voxels carry
@@ -920,6 +969,14 @@ class SurfaceVolume:
         `tag`, a (n_blocks, 512) bool tensor such as the one `fill_enclosed`
         returns, is sampled at every emitted vertex; when it is given the
         return is (V, F, C, G) with G the per-vertex flag, otherwise (V, F, C).
+
+        `weak_floor`, when given, lowers the emission gate to "all eight corners
+        carry MORE than `weak_floor` of weight" -- observed, not necessarily
+        `min_weight` -- and appends S, a per-face bool: True where all eight
+        corners did reach `min_weight`. A face with S False is a low-weight face
+        that only `evidence_filter(weak=~S)` may admit
+        (`SurfaceParams.low_weight_evidence`). An unobserved corner still never
+        emits: weight exactly 0 is not above any floor >= 0.
         """
         import torch
         from skimage import measure
@@ -928,6 +985,9 @@ class SurfaceVolume:
                  np.zeros((0, 3), np.uint8))
         if tag is not None:
             empty = empty + (np.zeros(0, bool),)
+        if weak_floor is not None:
+            empty = empty + (np.zeros(0, bool),)
+            weak_floor = max(0.0, float(weak_floor))
         if self.n_blocks == 0:
             return empty
 
@@ -940,7 +1000,7 @@ class SurfaceVolume:
             return empty
         lo, hi = bc_sel.min(0), bc_sel.max(0)
 
-        Vs, Fs, Cs, Gs, nv = [], [], [], [], 0
+        Vs, Fs, Cs, Gs, Ss, nv = [], [], [], [], [], 0
         tiles = occupied_tiles(bc_all, lo, hi, tile_blocks)
         nb = tile_blocks + 1                       # one block of halo
         n = nb * BLOCK
@@ -995,15 +1055,18 @@ class SurfaceVolume:
             dw[dest] = self.w[bidx].reshape(-1)
             # The cube a face was generated in: every vertex lies on one of
             # its edges, so the floor of the centroid names it.
-            observed = (dw >= min_weight).reshape(1, 1, n, n, n)
-            cube_ok = (-torch.nn.functional.max_pool3d(
-                -observed.to(torch.float32), 2, 1)).reshape(n - 1, n - 1, n - 1) > 0.5
+            # The smallest corner weight of every cube: the gate is on it.
+            corner_min = (-torch.nn.functional.max_pool3d(
+                -dw.reshape(1, 1, n, n, n), 2, 1)).reshape(-1)
             ci = np.clip(np.floor(verts[faces].mean(axis=1)).astype(np.int64), 0, n - 2)
             m = n - 1
             clin = torch.as_tensor(ci[:, 0] * m * m + ci[:, 1] * m + ci[:, 2],
                                    device=self.dev)
-            keep = cube_ok.reshape(-1)[clin].cpu().numpy()
+            fmin = corner_min[clin]
+            strong = (fmin >= min_weight).cpu().numpy()
+            keep = strong if weak_floor is None else (fmin > weak_floor).cpu().numpy()
             faces = faces[keep]
+            strong = strong[keep]
             if not len(faces):
                 continue
             used = np.unique(faces)
@@ -1021,6 +1084,7 @@ class SurfaceVolume:
 
             world = (verts[used] + np.array([bx, by, bz]) * BLOCK + 0.5) * self.voxel
             Vs.append(world.astype(np.float32))
+            Ss.append(strong)
             Fs.append(remap[faces] + nv)
             Cs.append(np.clip(cq, 0, 255).astype(np.uint8))
             nv += len(used)
@@ -1032,6 +1096,8 @@ class SurfaceVolume:
         out = (np.concatenate(Vs), np.concatenate(Fs), np.concatenate(Cs))
         if tag is not None:
             out = out + (np.concatenate(Gs),)
+        if weak_floor is not None:
+            out = out + (np.concatenate(Ss),)
         return out
 
 
@@ -1507,7 +1573,7 @@ def extract_sealed(vol: SurfaceVolume, min_weight: float, fill: EnclosedFill, *,
 
 
 def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None,
-                    *, chunk: int = 2_000_000):
+                    *, chunk: int = 2_000_000, weak=None):
     """Which faces the frames, counted one by one, actually support.
 
     `views` yields (depth, valid, R, t) per frame, exactly the depth and
@@ -1530,6 +1596,13 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
 
     The contradiction test is the ratio above and nothing stronger: a near
     thing measured by more than half as many frames as saw past it stays.
+
+    `weak`, a bool per face, marks LOW-WEIGHT faces (`extract_mesh(weak_floor=)`,
+    `SurfaceParams.low_weight_evidence`): cubes observed at every corner but not
+    to `min_weight`. Such a face must pass every test above and two more: no
+    frame at all saw through it, and its supporting cameras span
+    `low_weight_min_parallax` (the diagonal of their centres' bounding box over
+    the face's distance to that box's centre).
 
     Returns (keep mask over faces, stats).
     """
@@ -1556,6 +1629,17 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     P = torch.cat(cents)
     N = torch.cat(norms)
     del Vt, cents, norms, tri
+    weak_idx = None
+    if weak is not None:
+        weak_idx = torch.as_tensor(np.nonzero(np.asarray(weak, bool))[0], device=dev)
+        stats["weak_in"] = int(weak_idx.numel())
+        if weak_idx.numel() == 0:
+            weak_idx = None
+    if weak_idx is not None:
+        Pw = P[weak_idx]
+        wsup = torch.zeros(len(Pw), dtype=torch.bool, device=dev)
+        cam_lo = torch.full((len(Pw), 3), float("inf"), device=dev)
+        cam_hi = torch.full((len(Pw), 3), -float("inf"), device=dev)
     for depth, valid, R, t in views:
         depth = depth.to(dev).float()
         valid = valid.to(dev)
@@ -1581,6 +1665,26 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
             facing = ((centre - P[s0:s0 + chunk]) * N[s0:s0 + chunk]).sum(1) > 0
             front[s0:s0 + chunk] += (s_ & facing).to(torch.int16)
             thru[s0:s0 + chunk] += (m & (r > tr)).to(torch.int16)
+        if weak_idx is not None:
+            # The supporting cameras of the low-weight faces: the same test as
+            # above, repeated on that subset, keeping the centres' bounds.
+            for s0 in range(0, len(Pw), chunk):
+                pc = Pw[s0:s0 + chunk] @ R.T + t
+                z = pc[:, 2]
+                zc = z.clamp(min=1e-6)
+                u = torch.round(pc[:, 0] / zc * fx + cx).long()
+                v = torch.round(pc[:, 1] / zc * fy + cy).long()
+                m = (z > 1e-4) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                flat = v.clamp(0, H - 1) * W + u.clamp(0, W - 1)
+                d = depth.reshape(-1)[flat]
+                m &= valid.reshape(-1)[flat] & torch.isfinite(d)
+                s_ = m & ((d - z).abs() <= trunc_at(d))
+                sl = slice(s0, s0 + chunk)
+                cam_lo[sl] = torch.where(s_[:, None], torch.minimum(cam_lo[sl], centre[None]),
+                                         cam_lo[sl])
+                cam_hi[sl] = torch.where(s_[:, None], torch.maximum(cam_hi[sl], centre[None]),
+                                         cam_hi[sl])
+                wsup[sl] |= s_
     ok_support = sup >= int(params.min_support_frames)
     keep = ok_support.clone()
     if params.contradiction_ratio > 0:
@@ -1591,6 +1695,23 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
         back = (front == 0) & ok_support
         stats["dropped_back_facing"] = int((keep & back).sum())
         keep &= ~back
+    if weak_idx is not None:
+        seen_through = torch.zeros(nF, dtype=torch.bool, device=dev)
+        seen_through[weak_idx] = thru[weak_idx] > 0
+        stats["dropped_weak_seen_through"] = int((keep & seen_through).sum())
+        keep &= ~seen_through
+        spread = torch.where(wsup[:, None], cam_hi - cam_lo, torch.zeros_like(cam_hi)).norm(dim=1)
+        dist = torch.where(wsup[:, None], (cam_hi + cam_lo) * 0.5 - Pw,
+                           torch.zeros_like(Pw)).norm(dim=1).clamp(min=1e-6)
+        narrow = torch.zeros(nF, dtype=torch.bool, device=dev)
+        narrow[weak_idx] = ~(spread / dist >= float(params.low_weight_min_parallax))
+        stats["dropped_weak_parallax"] = int((keep & narrow).sum())
+        keep &= ~narrow
+        weak_all = torch.zeros(nF, dtype=torch.bool, device=dev)
+        weak_all[weak_idx] = True
+        stats["weak_kept"] = int((keep & weak_all).sum())
+    elif weak is not None:
+        stats["weak_kept"] = 0
     stats["dropped_support"] = int((~ok_support).sum())
     stats["faces_kept"] = int(keep.sum())
     return keep.cpu().numpy(), stats
@@ -1610,7 +1731,7 @@ def keep_faces(V, F, C, keep):
 # ---------------------------------------------------------------------------
 
 
-def weld_mesh(V, F, C, quantum: float):
+def weld_mesh(V, F, C, quantum: float, *, return_index: bool = False):
     """Merge the duplicate vertices and triangles the tile seams produce.
 
     `extract_mesh` runs marching cubes per tile with one block of halo, so
@@ -1626,26 +1747,32 @@ def weld_mesh(V, F, C, quantum: float):
     Positions are snapped to a `quantum` grid only to decide identity; the
     surviving vertex keeps its own float position. Two triangles are the same
     triangle when they have the same three vertices in any order.
+
+    With `return_index` a fifth value is returned: for every surviving face,
+    its index in the input `F`, so per-face attributes can follow the weld.
     """
     V = np.asarray(V)
     F = np.asarray(F, np.int64)
     empty_stats = {"vertices_merged": 0, "faces_duplicate": 0, "faces_degenerate": 0}
     if not len(F):
-        return V, F, C, empty_stats
+        return (V, F, C, empty_stats) + ((np.zeros(0, np.int64),) if return_index else ())
     key = np.round(V / quantum).astype(np.int64)
     _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
     inverse = inverse.reshape(-1)
     F2 = inverse[F]
     degenerate = ((F2[:, 0] == F2[:, 1]) | (F2[:, 1] == F2[:, 2])
                   | (F2[:, 0] == F2[:, 2]))
+    source = np.nonzero(~degenerate)[0]
     F2 = F2[~degenerate]
     _, keep = np.unique(np.sort(F2, axis=1), axis=0, return_index=True)
     n_before = len(F2)
-    F2 = F2[np.sort(keep)]
+    keep = np.sort(keep)
+    F2 = F2[keep]
     stats = {"vertices_merged": int(len(V) - len(first)),
              "faces_duplicate": int(n_before - len(F2)),
              "faces_degenerate": int(degenerate.sum())}
-    return (V[first], F2, None if C is None else np.asarray(C)[first], stats)
+    out = (V[first], F2, None if C is None else np.asarray(C)[first], stats)
+    return out + ((source[keep],) if return_index else ())
 
 
 def drop_small_components(V, F, C, min_frac: float):
@@ -1708,8 +1835,11 @@ def taubin_smooth(V, F, iterations: int, lam: float, mu: float):
     return P.astype(np.float32), moved
 
 
-def decimate(V, F, C, target_faces: int):
-    """Quadric decimation to a face budget, carrying vertex colour."""
+def decimate(V, F, C, target_faces: int, boundary_weight: float = 1.0):
+    """Quadric decimation to a face budget, carrying vertex colour.
+
+    `boundary_weight` is open3d's weight on boundary edges; see
+    `SurfaceParams.lod_boundary_weight`."""
     if target_faces <= 0 or len(F) <= target_faces:
         return V, F, C
     import open3d as o3d
@@ -1719,7 +1849,8 @@ def decimate(V, F, C, target_faces: int):
         o3d.utility.Vector3iVector(np.asarray(F, np.int32)))
     if C is not None:
         m.vertex_colors = o3d.utility.Vector3dVector(np.asarray(C, np.float64) / 255.0)
-    m = m.simplify_quadric_decimation(int(target_faces))
+    m = m.simplify_quadric_decimation(int(target_faces),
+                                      boundary_weight=float(boundary_weight))
     V2 = np.asarray(m.vertices, np.float32)
     F2 = np.asarray(m.triangles, np.int64)
     C2 = (np.clip(np.asarray(m.vertex_colors) * 255.0, 0, 255).astype(np.uint8)

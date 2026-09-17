@@ -1026,7 +1026,7 @@ class TestTheFieldHasABudget:
         import inspect
 
         body = inspect.getsource(SP._build)
-        assert "decimate(*source, target)" in body
+        assert "*source, target, boundary_weight=params.lod_boundary_weight" in body
 
     def test_the_status_names_the_stage_that_is_running(self, tmp_path):
         store = _synthetic_world(tmp_path)
