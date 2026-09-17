@@ -571,18 +571,20 @@ final class WorldRenderViewAddressTests: XCTestCase {
 
     private static let host = URL(string: "http://stub.invalid")!
 
-    /// The product view's URL is byte-for-byte the one this app has always
-    /// asked for. A Tower that has never heard of `view` is never sent it.
+    /// The product view sends no `view`: a Tower that has never heard of it is
+    /// never sent it. It does declare `viewer=appearance-1` (§4), which such a
+    /// Tower ignores.
     func testTheProductViewSendsNoViewParameterAtAll() {
         let url = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: "s1"), baseURL: Self.host
         )
-        XCTAssertEqual(url?.absoluteString, "http://stub.invalid/worlds/w1/render?session_id=s1")
+        XCTAssertEqual(url?.absoluteString,
+                       "http://stub.invalid/worlds/w1/render?session_id=s1&viewer=appearance-1")
 
         let unpinned = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: nil), baseURL: Self.host
         )
-        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render")
+        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render?viewer=appearance-1")
     }
 
     func testTheDiagnosticsViewAsksForItByName() {
@@ -592,7 +594,7 @@ final class WorldRenderViewAddressTests: XCTestCase {
         )
         XCTAssertEqual(
             url?.absoluteString,
-            "http://stub.invalid/worlds/w1/render?session_id=s1&view=diagnostics"
+            "http://stub.invalid/worlds/w1/render?session_id=s1&view=diagnostics&viewer=appearance-1"
         )
     }
 

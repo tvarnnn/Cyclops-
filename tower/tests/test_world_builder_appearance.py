@@ -865,7 +865,8 @@ class TestTheRoutes:
 
         world.build(redactor_factory=_never_redact)
         client = TestClient(_app(world.root))
-        rev = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION})
+        rev = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION,
+                                                                      "viewer": "appearance-1"})
         assert rev.status_code == 200
         appearance = rev.json()["appearance"]
         assert appearance["revision"] == f"{SESSION}/appearance:{world.manifest()['build_id']}"
@@ -875,7 +876,8 @@ class TestTheRoutes:
         assert r.status_code == 404 and r.json()["detail"] == AP.STALE_LABEL_DETAIL
         chunk = world.manifest()["chunks"][0]["digest"]
         assert client.get(f"/worlds/{WORLD}/appearance/{SESSION}/chunk/{chunk}").status_code == 404
-        rev2 = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION})
+        rev2 = client.get(f"/worlds/{WORLD}/render/revision", params={"session_id": SESSION,
+                                                                       "viewer": "appearance-1"})
         assert rev2.json()["appearance"]["revision"] is None
         # The appearance page is no longer served: the rung steps down to the
         # surface, and that (not an appearance build) moves the page revision.

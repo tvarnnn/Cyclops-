@@ -47,6 +47,21 @@ nonisolated enum WorldAssetScheme {
         return components.url
     }
 
+    /// What this app declares it can draw, sent as `viewer=` on the page and
+    /// revision requests (`WORLD-BUILDER-WORLDS.md` §4). The Tower's `auto`
+    /// ladder offers the appearance page only to a client that declares it,
+    /// because a build older than this scheme handler cannot fetch its imagery
+    /// and was served a page that drew nothing.
+    ///
+    /// Sent on EVERY request that decides a rung -- the page (`WorldRenderClient
+    /// .url`), the native revision poll (`WorldRenderClient.revisionURL`) and the
+    /// page's own revision poll proxied by the scheme handler
+    /// (`WorldAssetRequest.towerURL`) -- so all three agree on the rung. One of
+    /// them answering without it would report "surface" about an appearance page
+    /// on screen, and the follower would swap the page down.
+    static let viewerCapability = "appearance-1"
+    static let viewerQueryName = "viewer"
+
     /// RFC 3986 unreserved characters only; everything else, `/` included, is
     /// percent-encoded. The same set `WorldRenderClient` uses.
     static func encoded(_ id: String) -> String? {
@@ -78,7 +93,8 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
     /// `/worlds/<w>/appearance/<s>/proxy/<digest>`
     case appearanceProxy(digest: String)
     /// `/worlds/<w>/render/revision?session_id=<s>`: how the page follows new
-    /// appearance builds without being reloaded.
+    /// appearance builds without being reloaded. Proxied WITH the app's
+    /// `viewer` declaration added (`towerURL`), which the page does not send.
     case renderRevision
 
     /// `worldID` is the world the viewer was opened for. `sessionID` is the
@@ -152,7 +168,11 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
         case .renderRevision:
             guard let session else { return nil }
             components.percentEncodedPath = "\(base)/worlds/\(world)/render/revision"
-            components.percentEncodedQuery = "session_id=\(session)"
+            // The page asks without a declaration; the app is the one that can
+            // draw the appearance page, so the handler adds it. Without it the
+            // Tower would answer the rung an old app gets (surface).
+            components.percentEncodedQuery = "session_id=\(session)&"
+                + "\(WorldAssetScheme.viewerQueryName)=\(WorldAssetScheme.viewerCapability)"
         case .appearanceManifest:
             guard let session else { return nil }
             components.percentEncodedPath = "\(base)/worlds/\(world)/appearance/\(session)/manifest"

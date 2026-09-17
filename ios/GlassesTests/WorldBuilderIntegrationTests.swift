@@ -2460,12 +2460,13 @@ final class WorldRenderViewerTests: XCTestCase {
         let pinned = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: "s1"), baseURL: Self.host
         )
-        XCTAssertEqual(pinned?.absoluteString, "http://stub.invalid/worlds/w1/render?session_id=s1")
+        XCTAssertEqual(pinned?.absoluteString,
+                       "http://stub.invalid/worlds/w1/render?session_id=s1&viewer=appearance-1")
 
         let unpinned = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: nil), baseURL: Self.host
         )
-        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render")
+        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render?viewer=appearance-1")
     }
 
     /// A wire-supplied id stays one path component. A `/` inside it must not
@@ -2475,7 +2476,8 @@ final class WorldRenderViewerTests: XCTestCase {
             for: WorldRenderTarget(worldID: "a/b c", sessionID: "s&1"), baseURL: Self.host
         )
         XCTAssertEqual(url?.path, "/worlds/a/b c/render")
-        XCTAssertEqual(url?.absoluteString, "http://stub.invalid/worlds/a%2Fb%20c/render?session_id=s%261")
+        XCTAssertEqual(url?.absoluteString,
+                       "http://stub.invalid/worlds/a%2Fb%20c/render?session_id=s%261&viewer=appearance-1")
     }
 
     func testAnEmptyIdIsRefusedRatherThanAddressed() {
@@ -4568,7 +4570,23 @@ final class WorldRenderRevisionTests: XCTestCase {
         let target = WorldRenderTarget(worldID: "w1", sessionID: "s1", view: .diagnostics)
         let url = WorldRenderClient.revisionURL(for: target, baseURL: Self.host)
         XCTAssertEqual(url?.path, "/worlds/w1/render/revision")
-        XCTAssertEqual(url?.query, "session_id=s1")
+        XCTAssertEqual(url?.query, "session_id=s1&viewer=appearance-1")
+    }
+
+    /// The page, the native revision poll and the page's own proxied poll all
+    /// declare the appearance capability, so the Tower names the same rung to
+    /// all three (`WORLD-BUILDER-WORLDS.md` §4 `viewer`). A poll without it is
+    /// told "surface" about an appearance page and swaps the page down.
+    func testEveryRungDecidingRequestDeclaresTheAppearanceCapability() {
+        let target = WorldRenderTarget(worldID: "w1", sessionID: nil)
+        for url in [WorldRenderClient.url(for: target, baseURL: Self.host),
+                    WorldRenderClient.revisionURL(for: target, baseURL: Self.host),
+                    WorldAssetRequest.renderRevision.towerURL(baseURL: Self.host, worldID: "w1",
+                                                              sessionID: "s1")] {
+            let items = URLComponents(url: url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            XCTAssertEqual(items.filter { $0.name == "viewer" }.map(\.value), ["appearance-1"],
+                           url!.absoluteString)
+        }
     }
 
     func testThePageSaysWhichRevisionItIs() {
@@ -5187,7 +5205,9 @@ final class WorldAssetTransportTests: XCTestCase {
                        "http://stub.invalid/tower/worlds/w1/appearance/s1/chunk/\(Self.digest)")
         XCTAssertEqual(tower(.appearanceProxy(digest: Self.digest)),
                        "http://stub.invalid/tower/worlds/w1/appearance/s1/proxy/\(Self.digest)")
-        XCTAssertEqual(tower(.renderRevision), "http://stub.invalid/tower/worlds/w1/render/revision?session_id=s1")
+        XCTAssertEqual(tower(.renderRevision),
+                       "http://stub.invalid/tower/worlds/w1/render/revision?session_id=s1&viewer=appearance-1",
+                       "the handler adds the app's declaration the page does not send")
         XCTAssertNil(WorldAssetRequest.appearanceManifest.towerURL(baseURL: Self.host, worldID: "w1", sessionID: nil))
     }
 

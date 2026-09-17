@@ -21,6 +21,8 @@ APP_POLICY = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe
 DEBUG_POLICY = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
                 "connect-src 'self'")
 STRICT_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+# What the iOS app built with the appearance page declares (§4 `viewer`).
+V = "appearance-1"
 
 
 @pytest.fixture
@@ -57,17 +59,17 @@ class TestTheLadder:
     def test_auto_serves_the_appearance_when_one_can_be_served(self, built):
         from tower.results.world_builder_render import build_world_render
 
-        html = build_world_render(built.store, WORLD, SESSION)
+        html = build_world_render(built.store, WORLD, SESSION, viewer=V)
         assert _meta(html, "wb-representation") == "appearance"
         assert "Captured images on reconstructed geometry" in html
 
     def test_the_page_and_the_revision_route_agree(self, built):
         from tower.results.world_builder_render import build_render_revision, build_world_render
 
-        rev = build_render_revision(built.store, WORLD, SESSION)
+        rev = build_render_revision(built.store, WORLD, SESSION, viewer=V)
         assert rev["representation"] == "appearance"
         assert rev["revision"] == f"{SESSION}/appearance:1"
-        html = build_world_render(built.store, WORLD, SESSION)
+        html = build_world_render(built.store, WORLD, SESSION, viewer=V)
         assert _meta(html, "wb-revision") == rev["revision"]
         assert _config(html)["appearance_revision"] == rev["appearance"]["revision"]
 
@@ -76,9 +78,9 @@ class TestTheLadder:
         phone reload it and reset the wearer's camera on every solve."""
         from tower.results.world_builder_render import build_render_revision
 
-        first = build_render_revision(built.store, WORLD, SESSION)
+        first = build_render_revision(built.store, WORLD, SESSION, viewer=V)
         built.build(force=True, redactor_factory=_never_redact)
-        second = build_render_revision(built.store, WORLD, SESSION)
+        second = build_render_revision(built.store, WORLD, SESSION, viewer=V)
         assert second["appearance"]["revision"] != first["appearance"]["revision"]
         assert second["revision"] == first["revision"]
         assert second["representation"] == "appearance"
@@ -89,10 +91,10 @@ class TestTheLadder:
         from tower.results.world_builder_render import build_render_revision, build_world_render
 
         built.write_surface(subdivisions=12)
-        rev = build_render_revision(built.store, WORLD, SESSION)
+        rev = build_render_revision(built.store, WORLD, SESSION, viewer=V)
         assert rev["representation"] == "appearance"
         assert rev["appearance"]["current"] is False
-        config = _config(build_world_render(built.store, WORLD, SESSION))
+        config = _config(build_world_render(built.store, WORLD, SESSION, viewer=V))
         assert config["current"] is False and config["currency_reason"]
 
     def test_a_relabelled_session_steps_down_to_the_surface(self, built):
@@ -103,9 +105,10 @@ class TestTheLadder:
         )
 
         built.set_label("faces-detected-and-filled/yunet-2023mar@0.30+plausibility1")
-        html = build_world_render(built.store, WORLD, SESSION)
+        html = build_world_render(built.store, WORLD, SESSION, viewer=V)
         assert _meta(html, "wb-representation") == "surface"
-        assert build_render_revision(built.store, WORLD, SESSION)["representation"] == "surface"
+        assert build_render_revision(built.store, WORLD, SESSION,
+                                     viewer=V)["representation"] == "surface"
         with pytest.raises(WorldRenderUnavailable):
             build_world_render(built.store, WORLD, SESSION, representation="appearance")
 
@@ -114,13 +117,14 @@ class TestTheLadder:
 
         record = built.store.read_world(WORLD)
         built.store.write_world(type(record)(**{**record.__dict__, "images_purged": True}))
-        assert _meta(build_world_render(built.store, WORLD, SESSION), "wb-representation") != "appearance"
+        assert _meta(build_world_render(built.store, WORLD, SESSION, viewer=V),
+                     "wb-representation") != "appearance"
 
     def test_a_world_without_appearance_gets_the_page_it_got_before(self, tmp_path):
         from tower.results.world_builder_render import build_world_render
 
         world = World(tmp_path)
-        auto = build_world_render(world.store, WORLD, SESSION)
+        auto = build_world_render(world.store, WORLD, SESSION, viewer=V)
         assert _meta(auto, "wb-representation") == "surface"
         assert auto == build_world_render(world.store, WORLD, SESSION, representation="surface")
 
@@ -147,9 +151,9 @@ class TestTheLadder:
         # This synthetic world has no sparse tree, so the sparse page is absent:
         # a 404, never the appearance page in its place.
         with pytest.raises(WorldRenderUnavailable):
-            build_world_render(built.store, WORLD, SESSION, view="diagnostics")
-        assert build_render_revision(built.store, WORLD, SESSION,
-                                     view="diagnostics")["representation"] == "sparse"
+            build_world_render(built.store, WORLD, SESSION, view="diagnostics", viewer=V)
+        assert build_render_revision(built.store, WORLD, SESSION, view="diagnostics",
+                                     viewer=V)["representation"] == "sparse"
 
     def test_an_appearance_module_that_will_not_import_costs_nothing(self, built, monkeypatch):
         import builtins
@@ -165,7 +169,7 @@ class TestTheLadder:
 
         monkeypatch.setitem(sys.modules, "tower.world_builder.appearance_render", None)
         monkeypatch.setattr(builtins, "__import__", broken)
-        html = build_world_render(built.store, WORLD, SESSION)
+        html = build_world_render(built.store, WORLD, SESSION, viewer=V)
         assert _meta(html, "wb-representation") == "surface"
 
     def test_a_page_that_cannot_be_composed_falls_back(self, built, monkeypatch):
@@ -176,7 +180,68 @@ class TestTheLadder:
             raise AR.AppearanceViewerUnavailable("simulated")
 
         monkeypatch.setattr(AR, "build_appearance_page", refuse)
-        assert _meta(build_world_render(built.store, WORLD, SESSION), "wb-representation") == "surface"
+        assert _meta(build_world_render(built.store, WORLD, SESSION, viewer=V),
+                     "wb-representation") == "surface"
+
+
+class TestOldApps:
+    """An iOS build older than the appearance page has no `glasses-world:` scheme
+    handler: it loads every page with `loadHTMLString` and could fetch none of
+    the appearance imagery. It declares nothing, so `auto` must give it the
+    surface page it got before the rung existed (§4 `viewer`)."""
+
+    def test_auto_without_the_declaration_is_the_surface(self, built):
+        from tower.results.world_builder_render import build_render_revision, build_world_render
+
+        html = build_world_render(built.store, WORLD, SESSION)
+        assert _meta(html, "wb-representation") == "surface"
+        assert html == build_world_render(built.store, WORLD, SESSION, representation="surface")
+        rev = build_render_revision(built.store, WORLD, SESSION)
+        assert rev["representation"] == "surface"
+        assert _meta(html, "wb-revision") == rev["revision"]
+        # The appearance is still reported: it is additive data, not a rung.
+        assert rev["appearance"]["revision"] is not None
+
+    def test_only_the_named_token_declares_it(self, built):
+        from tower.results.world_builder_render import (
+            build_render_revision,
+            build_world_render,
+            viewer_draws_appearance,
+        )
+
+        for viewer in (None, "", "appearance", "appearance-2", "APPEARANCE-1", "surface-1",
+                       "appearance-1x", " , "):
+            assert not viewer_draws_appearance(viewer), viewer
+            assert _meta(build_world_render(built.store, WORLD, SESSION, viewer=viewer),
+                         "wb-representation") == "surface", viewer
+            assert build_render_revision(built.store, WORLD, SESSION,
+                                         viewer=viewer)["representation"] == "surface", viewer
+        for viewer in ("appearance-1", "future-2,appearance-1", " appearance-1 ,x"):
+            assert viewer_draws_appearance(viewer), viewer
+            assert _meta(build_world_render(built.store, WORLD, SESSION, viewer=viewer),
+                         "wb-representation") == "appearance", viewer
+
+    def test_a_pinned_rung_is_served_without_the_declaration(self, built):
+        """A caller naming the rung is asking for that page (a desktop debug
+        session, a test); the gate is on `auto` only."""
+        from tower.results.world_builder_render import build_world_render
+
+        html = build_world_render(built.store, WORLD, SESSION, representation="appearance")
+        assert _meta(html, "wb-representation") == "appearance"
+
+    def test_the_routes_gate_on_the_query(self, built):
+        client = _client(built)
+        old = client.get(f"/worlds/{WORLD}/render")
+        assert old.status_code == 200 and _meta(old.text, "wb-representation") == "surface"
+        assert old.headers["content-security-policy"] == STRICT_POLICY
+        new = client.get(f"/worlds/{WORLD}/render", params={"viewer": V})
+        assert new.status_code == 200 and _meta(new.text, "wb-representation") == "appearance"
+        assert client.get(f"/worlds/{WORLD}/render/revision").json()["representation"] == "surface"
+        assert client.get(f"/worlds/{WORLD}/render/revision",
+                          params={"viewer": V}).json()["representation"] == "appearance"
+        # An unknown or odd declaration is ignored, never refused.
+        odd = client.get(f"/worlds/{WORLD}/render", params={"viewer": "x" * 2000})
+        assert odd.status_code == 200 and _meta(odd.text, "wb-representation") == "surface"
 
 
 class TestThePage:
@@ -249,11 +314,11 @@ class TestTheRoute:
 
     def test_the_header_policy_matches_the_page(self, built):
         client = _client(built)
-        app = client.get(f"/worlds/{WORLD}/render")
+        app = client.get(f"/worlds/{WORLD}/render", params={"viewer": V})
         assert app.status_code == 200
         assert app.headers["content-security-policy"] == APP_POLICY == _meta_policy(app.text)
         assert app.headers["cache-control"] == "no-store"
-        debug = client.get(f"/worlds/{WORLD}/render", params={"transport": "tower"})
+        debug = client.get(f"/worlds/{WORLD}/render", params={"transport": "tower", "viewer": V})
         assert debug.headers["content-security-policy"] == DEBUG_POLICY == _meta_policy(debug.text)
 
     def test_every_other_page_keeps_the_strict_policy(self, built):
@@ -274,6 +339,6 @@ class TestTheRoute:
         client = _client(built)
         r = client.get(f"/worlds/{WORLD}/render", params={"representation": "appearance"})
         assert r.status_code == 200 and _meta(r.text, "wb-representation") == "appearance"
-        rev = client.get(f"/worlds/{WORLD}/render/revision").json()
+        rev = client.get(f"/worlds/{WORLD}/render/revision", params={"viewer": V}).json()
         assert rev["representation"] == "appearance"
         assert len(json.dumps(rev)) < 512

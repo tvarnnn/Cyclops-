@@ -468,6 +468,14 @@ Consumes `WORLD-BUILDER-WORLDS.md` §4 (the page) and §4a (its revision). Added
 2026-09-16 after an adversarial review of the viewer. Nothing below has been
 compiled or run on a device yet; `docs/agent-handoffs/` names the Mac checks.
 
+**The capability declaration** (2026-09-17). Every rung-deciding request
+carries `viewer=appearance-1` (`WorldAssetScheme.viewerCapability`): the page
+URL (`WorldRenderClient.url`), the native revision poll
+(`WorldRenderClient.revisionURL`) and the page's own revision poll as the scheme
+handler proxies it. The Tower offers the appearance rung to `auto` only on that
+declaration (WORLDS §4 `viewer`), so an app built before this transport keeps
+getting the surface page it can draw.
+
 **The page.** `WorldRenderClient.page(for:)` fetches the HTML with an
 **ephemeral `URLSession` with no URL cache** (`WorldAssetClient.sharedUncachedSession`;
 requests `.reloadIgnoringLocalAndRemoteCacheData`) and hands the string to a
@@ -487,7 +495,8 @@ WORLDS §4, which fetches its imagery:
   answers exactly: the page (`/worlds/<w>/render`, no query, from memory);
   `/worlds/<w>/appearance/<s>/manifest`; `…/chunk/<digest>` and
   `…/proxy/<digest>` with a 32 lower-hex digest; and
-  `/worlds/<w>/render/revision?session_id=<s>` (that query and no other).
+  `/worlds/<w>/render/revision?session_id=<s>` (that query and no other; the
+  handler proxies it as `?session_id=<s>&viewer=appearance-1`, WORLDS §4a).
   `<w>` is the world the viewer was opened for; `<s>` is the session the page
   draws — the target's session, or the one the page's own `wb-revision` names.
   **Everything else is a 404 from the handler and never reaches the Tower**:

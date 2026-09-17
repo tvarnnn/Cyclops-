@@ -232,15 +232,19 @@ nonisolated struct WorldRenderClient {
     }
 
     /// The revision route's address: the page's own path plus `/revision`,
-    /// with the session and without `view`, which does not change what is
-    /// built.
+    /// with the session and the `viewer` declaration, and without `view`,
+    /// which does not change what is built. The declaration must match the
+    /// page's: a revision answered without it names the surface rung while an
+    /// appearance page is on screen.
     static func revisionURL(for target: WorldRenderTarget, baseURL: URL) -> URL? {
         guard
             let page = url(for: target, baseURL: baseURL),
             var components = URLComponents(url: page, resolvingAgainstBaseURL: false)
         else { return nil }
         components.percentEncodedPath += "/revision"
-        let kept = (components.queryItems ?? []).filter { $0.name == "session_id" }
+        let kept = (components.queryItems ?? []).filter {
+            $0.name == "session_id" || $0.name == WorldAssetScheme.viewerQueryName
+        }
         components.queryItems = kept.isEmpty ? nil : kept
         return components.url
     }
@@ -267,11 +271,17 @@ nonisolated struct WorldRenderClient {
             query.append(URLQueryItem(name: "session_id", value: sessionID))
         }
         // Only for the diagnostics rendering. The product view sends no `view`
-        // parameter, so its URL is unchanged from every build before this one
-        // and a Tower that has never heard of the parameter is never sent it.
+        // parameter, so a Tower that has never heard of the parameter is never
+        // sent it.
         if target.view != .product {
             query.append(URLQueryItem(name: "view", value: target.view.rawValue))
         }
+        // What this app can draw (`WORLD-BUILDER-WORLDS.md` §4): the Tower's
+        // `auto` offers the appearance page only to a client that says so,
+        // because an older build cannot fetch its imagery. A Tower older than
+        // the parameter ignores it (FastAPI drops unknown query parameters).
+        query.append(URLQueryItem(name: WorldAssetScheme.viewerQueryName,
+                                  value: WorldAssetScheme.viewerCapability))
         components.queryItems = query.isEmpty ? nil : query
         return components.url
     }

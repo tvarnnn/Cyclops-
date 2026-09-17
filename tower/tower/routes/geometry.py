@@ -157,6 +157,7 @@ def world_render_revision(
     world_id: str, request: Request,
     session_id: str | None = Query(default=None),
     view: str | None = Query(default=None),
+    viewer: str | None = Query(default=None),
 ) -> JSONResponse:
     """Which picture `GET /worlds/{id}/render` would serve now, as a revision.
 
@@ -166,7 +167,8 @@ def world_render_revision(
     compared with is stamped into the page it already has.
     """
     try:
-        payload = build_render_revision(_store(request), world_id, session_id, view=view)
+        payload = build_render_revision(_store(request), world_id, session_id, view=view,
+                                        viewer=viewer)
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None
     return JSONResponse(json_safe(payload), headers={"Cache-Control": "no-store"})
@@ -200,8 +202,9 @@ def world_render(
     # The adapter owns what "no view asked for" means.
     view: str | None = Query(default=None),
     # Which reconstruction to serve. "auto" is the product default and means
-    # the best one this session actually has -- surface, then dense points,
-    # then sparse. The named values exist so a developer, a test, or the
+    # the best one this session actually has -- appearance (only for a client
+    # declaring `viewer=appearance-1`), surface, then dense points, then
+    # sparse. The named values exist so a developer, a test, or the
     # diagnostics screen can pin one and compare; naming a representation
     # the session does not have falls back rather than failing, because the
     # caller asking for a better picture should never get no picture.
@@ -213,6 +216,12 @@ def world_render(
     # routes. `tower`: a desktop debug mode, only when named, fetching from this
     # origin. Every other page fetches nothing and ignores it.
     transport: str = Query(default="app", pattern="^(app|tower)$"),
+    # What the client can draw (WORLD-BUILDER-WORLDS.md §4). `auto` offers the
+    # appearance page only to a client declaring `appearance-1`: an iOS build
+    # older than that page has no scheme handler to fetch its imagery through,
+    # and was served a page that could fetch nothing. Comma-separated tokens;
+    # unknown ones are ignored, never a 422.
+    viewer: str | None = Query(default=None),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -230,6 +239,7 @@ def world_render(
         html = build_world_render(
             _store(request), world_id, session_id, max_points=max_points,
             view=view, representation=representation, transport=transport,
+            viewer=viewer,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None

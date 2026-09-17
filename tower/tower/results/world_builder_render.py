@@ -211,6 +211,38 @@ REPRESENTATION_SURFACE = "surface"
 REPRESENTATION_LADDER = (REPRESENTATION_APPEARANCE, REPRESENTATION_SURFACE,
                          REPRESENTATION_DENSE, REPRESENTATION_SPARSE)
 
+# What a client says it can draw, `WORLD-BUILDER-WORLDS.md` §4 (`viewer`).
+#
+# `auto` offers the appearance rung ONLY to a client that declares it. The
+# appearance page is not self-contained: it fetches its imagery through the
+# app's `glasses-world:` scheme handler, which an iOS build older than the rung
+# does not have. Such a build loads every page with `loadHTMLString`, sends no
+# `viewer`, and before this gate was served an appearance page that could fetch
+# nothing -- a broken picture where the surface used to be. Without the
+# declaration `auto` starts at the surface, exactly the page that build got
+# before the rung existed.
+#
+# A query parameter rather than a header: the page is fetched natively, but the
+# page's own revision poll goes through the scheme handler, and a parameter in
+# the proxied URL is visible in the handler's whitelist and its tests, where a
+# header would be one more thing to forget to copy. Comma-separated tokens, so
+# a later client can declare more than one; unknown tokens are ignored, never a
+# 422 (a newer app talking to an older Tower still gets a picture).
+VIEWER_APPEARANCE = "appearance-1"
+
+
+def viewer_capabilities(viewer: str | None) -> frozenset:
+    """The capability tokens a `viewer` value declares (empty for `None`)."""
+    if not viewer:
+        return frozenset()
+    return frozenset(token.strip() for token in str(viewer).split(",") if token.strip())
+
+
+def viewer_draws_appearance(viewer: str | None) -> bool:
+    """Whether the client can load the appearance page (§4 `viewer`)."""
+    return VIEWER_APPEARANCE in viewer_capabilities(viewer)
+
+
 # Transports of the appearance page (`appearance_render.TRANSPORTS`), named
 # here so the route has a default without importing the cartridge.
 TRANSPORT_APP = "app"
@@ -308,7 +340,8 @@ def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
 
 
 def build_render_revision(store: WorldStore, world_id: str,
-                          session_id: str | None, view: str | None = None) -> dict:
+                          session_id: str | None, view: str | None = None,
+                          viewer: str | None = None) -> dict:
     """What `GET /worlds/{id}/render` would serve now, as a revision.
 
     Walks the same ladder in the same order, but by the artifact checks the
@@ -316,6 +349,11 @@ def build_render_revision(store: WorldStore, world_id: str,
     disagree only when an artifact passes its header check and then fails to
     parse, and that disagreement costs one extra page fetch, not a loop: the
     phone records the revision it was told before comparing pages.
+
+    `viewer` gates the appearance rung exactly as it gates `auto` in
+    `build_world_render`: a client that does not declare it is told the rung
+    it would be served, so an old app's follower never chases a page it cannot
+    draw. `appearance` is reported either way (it is additive data).
     """
     contained = contained_world_id(store, world_id)
     if contained is None:
@@ -326,7 +364,8 @@ def build_render_revision(store: WorldStore, world_id: str,
     appearance = _appearance_revision(store, world_id, chosen)
     if view == VIEW_DIAGNOSTICS:
         rung = REPRESENTATION_SPARSE
-    elif (appearance.get("revision") is not None
+    elif (viewer_draws_appearance(viewer)
+          and appearance.get("revision") is not None
           and (revision := render_revision(
               store, world_id, chosen, REPRESENTATION_APPEARANCE)) is not None):
         rung = REPRESENTATION_APPEARANCE
@@ -540,7 +579,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
                        max_points: int | None = None,
                        view: str | None = None,
                        representation: str = REPRESENTATION_AUTO,
-                       transport: str = TRANSPORT_APP) -> str:
+                       transport: str = TRANSPORT_APP,
+                       viewer: str | None = None) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -549,6 +589,11 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     a separator Starlette's route pattern does not exclude, and every
     store path below is joined from this id. An id that escapes the root
     is "no world", and the id is answered under its canonical spelling.
+
+    `viewer` is what the client declared it can draw (`viewer_draws_appearance`).
+    `auto` starts at the appearance rung only for a client that declared it,
+    and at the surface otherwise; a PINNED `representation=appearance` is served
+    regardless, because a caller that names the rung is asking for that page.
     """
     contained = contained_world_id(store, world_id)
     if contained is None:
@@ -565,7 +610,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         if own is not None:
             revisions[rung] = f"{chosen}/{own}"
     wanted = (representation if representation in REPRESENTATION_LADDER
-              else REPRESENTATION_APPEARANCE)
+              else REPRESENTATION_APPEARANCE if viewer_draws_appearance(viewer)
+              else REPRESENTATION_SURFACE)
     # The solver's diagnostic view IS the sparse page -- only it has the
     # diagnostic rendering -- so asking for it with no representation pinned
     # starts the ladder at sparse. Starting at the surface served the surface
