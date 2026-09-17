@@ -146,9 +146,10 @@ enforced).
   4.5% beyond it, and where the nearest depth block is in doubt it is evaluated
   on the 2×2 neighbouring blocks and interpolated), within 60° of the viewing ray
   (fading from 46°) **or, with a low tail weight 0.08, within 85°** for a
-  source that did not see the surface edge-on (the fragment's screen-space
-  facing, used for that alone and never as light: a keyframe grazing a floor
-  paints a stretched streak), its **alpha as a weight** (APPEARANCE §5.6), and its
+  source that did not see the surface edge-on (judged by the proxy's **smooth
+  vertex normal**, its facet's where it has none, used for that alone and never
+  as light: a keyframe grazing a floor paints a stretched streak), its **alpha
+  as a weight** (APPEARANCE §5.6), and its
   presence — so no test switches a source on or off between neighbouring pixels.
   Penalty = angle + 0.15·distance ratio (capped) + 0.10·(1 − quality) +
   2·(1 − confidence)³. The **k = 4** best blend with weight
@@ -158,9 +159,43 @@ enforced).
   for its brightness-relative distance d to it, so a colour a minority of good
   sources saw (a door standing open in a few frames) is voted down. Each sample
   is divided by its keyframe's photometric model (APPEARANCE §5.4: gain, tilt,
-  falloff). **Unshaded**: no lighting term; one display mapping for every pixel
-  (exposure 1.8, a hue-preserving roll-off above 0.6 that approaches 0.97 and
-  never reaches white, γ 1.15).
+  falloff). **Unshaded**: no lighting term; one display mapping for every pixel,
+  **the keyframes' own brightness** (exposure 1.0, γ 1.0, a hue-preserving
+  roll-off above 0.8 that approaches 0.97 and never reaches white). Revised
+  2026-09-17 (fix-it blotch lane, after the visual review): the first mapping
+  (exposure 1.8, γ 1.15, knee 0.6) drew the render 1.19–2.04× as bright as the
+  keyframe at the keyframe's own pose and field of view (median 1.66, NCC 0.85);
+  now median 1.01×, NCC 0.94 on the same 10 poses.
+  Measured and **not** adopted (same lane, 16 views): down-weighting and
+  blurring a source by the anisotropy of its projection (no change in speckle,
+  blotch, seams or the oblique smears), sharpening the weights toward the
+  strongest source where sources disagree (the doubled phone stayed doubled;
+  seam excess +1.4), a visibility tolerance scaled by incidence (no change in
+  speckle; seam excess +0.5), and pulling the weights toward the keyframes
+  nearest in the walk to the strongest one where sources disagree (the chair
+  legs painted from two passes stayed two; seam excess +0.7 on 9 of the visual
+  review's views).
+  **The display field of view is the capture's** (same lane, visual review item
+  1): the viewport fits inside the keyframes' own frustum (72° × 45° on the
+  canonical world, from the manifest's `camera`): never taller than a keyframe,
+  and no wider than 1.25 × a keyframe on the tangent (`CONFIG.view_margin`). A
+  portrait phone is decided by the vertical (about 69° × 35°); a 900×700 canvas by
+  the width (41° × 51°). The first page drew 72° vertical in landscape (~85°
+  horizontal) and 97° in portrait — twice what any photo framed — and that
+  margin was where the black, the speckle and the oblique smears lived. Measured
+  on every 10th walk pose, landscape, margin 1.0 / 1.2 / 1.4: drawn 99.0 / 97.7 /
+  96.3% (88.5% before), seam excess 2.3 / 2.7 / 2.9 (5.9 before).
+  **Thin cracks in the proxy are closed on the screen** (same lane): the phone
+  proxy is decimated and filtered and 35% of its edges are open, so a wall seen
+  at a grazing angle showed its pinholes and cracks as black speckle (on the
+  canonical world the largest single cause of the speckle on the wall right of
+  the door). After the proxy's own fragments, a full-screen pass reads the
+  layer's depth: a pixel with no surface whose row or column has surface on
+  both sides within 4 CSS px, two pixels deep, **with each side's slope
+  predicting the other to 3% of the distance** (one plane, not an occluding
+  edge), is placed on that plane and shaded by the same function as the proxy —
+  from source pixels that see that point, or not at all. A void, an edge or
+  anything wider stays empty.
   The layer's alpha is the **evidence** 1 − Π(1 − confidence′), where
   confidence′ uses a 20 px border feather and only the last 5° before 85° (the
   angle lowers a source's weight, not the evidence that it saw the point), so a
@@ -173,7 +208,17 @@ enforced).
   as a tint (revised 2026-09-17: on wide views the tint read as dark angular
   shards floating in the room); it still writes depth in the prepass, so it
   still hides what is behind it. Fading is only ever inward; a pixel with no
-  evidence never gains colour. (A fade by distance over the mesh to its
+  evidence never gains colour. **A void is an unlit fog, not a cut-out** (same
+  lane): the background is lifted toward 0.35 × the mostly grey (10% hue) mean of
+  what is drawn nearby, read from a mip level about 24 texels across the frame's
+  short side, fading to the plain background where nothing is drawn within that
+  footprint; and the drawn room's alpha is multiplied by
+  1 − 0.2 × (1 − smoothstep(0.3, 0.9, coarse coverage)), so a large void dims
+  its surroundings over tens of pixels while a pinhole changes nothing. The fog
+  has no texture and no detail and never raises a pixel's alpha.
+  **Nothing is drawn until the opening pose is chosen**; the room then fades in
+  from the background over 450 ms (the first page drew a pose-1 close-up while
+  the images landed and cut to the opening). (A fade by distance over the mesh to its
   open edges was built and rejected: 17% of the canonical proxy's edges are open,
   and its sliver triangles with three rim vertices went fully transparent,
   shredding walls into dark triangles.)
@@ -182,9 +227,10 @@ enforced).
   192): 13.1 MB colour + 3.7 MB depth + 3.7 MB proxy buffers = 20.5 MB on the
   canonical world, reported in `window.__wbAppearance.gpu` / `gpuBytes`. Beside
   it, not in it, both scaling with the canvas: the drawing buffer (about 7 bytes
-  a pixel) and the surface layer + blurred coverage (`gpu.layers`, 8 bytes a
-  pixel: 5.0 MB at 900×700, 10.5 MB for a 390×844 portrait at the capped device
-  pixel ratio 2).
+  a pixel) and the surface layer with its mip levels, its depth texture and the
+  blurred coverage (`gpu.layers`, about 10.3 bytes a pixel: 6.5 MB at 900×700,
+  13.6 MB for a 390×844 portrait at the capped device pixel ratio 2). The
+  opening's and Overview's 64-px renders keep one more small set.
   Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
   (42 MB colour) and the caption says the set is reduced.
 - **Navigation** (revised 2026-09-17, fix-it nav lane). This representation is
@@ -219,6 +265,36 @@ enforced).
     second. **A recorded pose is never "beyond"**: arriving at one sets its own
     support as the ceiling of both thresholds, so a partly dark recorded view is
     neither pushed nor locked.
+  - **Quality, not only coverage** (revised 2026-09-17, fix-it blotch lane,
+    visual review item 3: the old envelope stopped ON the ugly frame). Each
+    keyframe's contribution to a field point is its angle weight × how squarely
+    it saw the surface (0.2 + 0.8 · smoothstep(0.1, 0.4, cos incidence), from the
+    sampled face's normal); each proxy sample is × 0.7 when one keyframe alone
+    saw it and × 0.3 within 0.35 of a **large hole** (a loop of open edges at
+    least 0.8 around; thin cracks are closed on the screen and do not count).
+    Thresholds: resisted below **0.80**, stopped at **0.68**; a worsening step is
+    scaled by (1 − smoothstep(0.35, 1, b))², so the first third of the band is
+    free and a push in a good place is not sluggish. Measured over 250 random
+    views in the tube at the capture's field of view, a view is good (drawn ≥ 0.9,
+    blotch ≤ 2.5%, seam excess ≤ 8) for 96% at support ≥ 0.80, 75% at 0.70–0.80
+    and 64–68% at 0.60–0.70. Below a recorded pose's own support the band is
+    0.06 wide: from a weak recorded view the camera may not wander into anything
+    weaker. The support field is honest but coarse: its correlation with the
+    rendered drawn fraction is 0.71 over all views and 0.41 within the recorded
+    pitch range.
+  - **Pitch** stays within what the walk looked at (the recorded range plus
+    0.2 rad each way, resisted over its last 0.2 rad): the review's torn ceiling
+    was one vertical drag from the opening.
+  - **Distance**: the camera keeps 0.55 scene units from the nearest proxy
+    sample (resisted from 0.85): nearer, a 360×640 keyframe is magnified past
+    its resolution.
+  - **Looking across a gap**: a look held against the edge that keeps pushing
+    (0.3 rad of resisted input) glides to the first direction within half a
+    turn whose support is at least 0.80, instead of parking on the edge frame.
+  - **Before the field is built the camera does not move** (review item 5:
+    early input escaped the envelope and the page then took the escaped
+    camera's support as its floor). When the field completes, the floor is the
+    support of the recorded pose the camera is at, never of wherever it is.
   - **The envelope only limits the camera; it paints nothing.** Dark places
     inside it stay dark.
   - **Controls.** Touch: one finger drags the look (the room follows the
@@ -231,13 +307,24 @@ enforced).
   - **Stepping the walk glides**: eased position and the short way round in
     yaw, 350–1100 ms by distance and turn, instead of jumping (the walkthrough's
     worst flicker steps were path jumps). Any touch interrupts a glide.
-  - **Overview** replaces Orbit: the best-supported **raised** vantage in the
-    envelope. The field proposes (points at least 0.15 above the walk, within
-    0.85 of the tube, 12 yaws × 2 downward pitches, support ≥ 0.92, scored
-    support × (0.8 + 0.2 × wide content)), and the real blend decides between
-    the top six by the opening's score; the camera glides there.
+  - **Overview** replaces Orbit: a **raised** vantage in the envelope that
+    looks at the room. The field proposes (points at least 0.15 above the walk,
+    within 0.85 of the tube and at least 1.2 from the opening pose, 12 yaws × 2
+    downward pitches, support ≥ 0.68 and mean supported distance ≥ 0.5 × the
+    scene's median depth), scored support × (0.5 + 0.5 × distance) × (0.5 + 0.5
+    × facing what the walk looked at, the mean of the recorded look targets);
+    the real blend decides between the top twelve (spread by position and yaw)
+    by drawn × (0.4 + 0.6 × rendered distance) × facing × (0.3 + 0.7 ×
+    min(1, colour spread / 0.2)); the camera glides there. Revised 2026-09-17
+    (fix-it blotch lane): at the capture's field of view the old score chose a
+    frame-filling close-up of the door edge (100% drawn, nothing to see), and in
+    landscape it landed about 0.6 from the opening.
+  - **Prev/next skip poses that render badly**: once the field is built every
+    recorded pose is rendered in the background at the opening's 64-px size, and
+    ←/→ step to the next pose whose drawn fraction is at least 0.8 (an unscored
+    pose counts as good; with none ahead the camera stays and the hint shows).
   - Before the field is built (a second or so after the images land) the camera
-    is not limited and Overview is disabled.
+    does not move and Overview is disabled.
 
   It opens at the recorded pose whose **rendered frame is most drawn**, with a mild
   preference for wider content: every ⌈n/32⌉-th recorded pose is rendered at 64
@@ -247,7 +334,9 @@ enforced).
   (35 renders on the canonical world). Revised 2026-09-17: the first rule,
   observed pixels × distance², preferred far half-empty views and opened the
   canonical world at pose 71 (46% observed, 52% black). The horizon is levelled
-  to `CONFIG.up`.
+  to `CONFIG.up`. The caption is one line (*Captured images on reconstructed
+  geometry* and an **About** button); what the images are and what the dark
+  areas mean open on tap (the four-line disclaimer covered 11–13% of the frame).
 - **Live.** The page polls the revision route every 10 s (backing off to 120 s
   while `live` is false and nothing changed). What a poll means is one pure unit
   in the page, `FOLLOW` (`decide`, `mustReplace`, `nextDelay`), run under node by

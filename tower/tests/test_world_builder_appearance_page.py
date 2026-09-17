@@ -293,13 +293,16 @@ class TestThePage:
         from tower.world_builder.appearance_render import viewer_template_path
 
         text = viewer_template_path().read_text(encoding="utf-8")
-        blend = text[text.index("const FS_BLEND"):text.index("/* ---------- main")]
+        blend = text[text.index("const GLSL_SHADE"):text.index("/* ---------- main")]
         for lighting in ("dot(n,", "normalize(cross(dFdx", "hemi", "uUpView"):
             assert lighting not in blend
-        # the fragment's facing exists only to keep an oblique source from
-        # painting a surface it saw edge-on; it never reaches a colour
+        # the surface's facing (the proxy's smooth vertex normal) exists only to
+        # keep an oblique source from painting a surface it saw edge-on; it
+        # never reaches a colour
         uses = [line for line in blend.splitlines() if "facing" in line and "//" not in line.split("facing")[0]]
-        assert len(uses) == 2 and "vec3 facing =" in uses[0] and "float edgeOn =" in uses[1], uses
+        assert len(uses) == 2 and "vec3 facing = N;" in uses[0] and "float cosI = abs(dot(facing, ds));" in uses[1], uses
+        cos_uses = [line for line in blend.splitlines() if "cosI" in line and "//" not in line.split("cosI")[0]]
+        assert len(cos_uses) == 2 and "float edgeOn = smoothstep(0.12, 0.35, cosI);" in cos_uses[1], cos_uses
 
     def test_it_levels_the_horizon_and_walks_the_recorded_path(self, built):
         from tower.world_builder.appearance_render import build_appearance_config
@@ -356,7 +359,7 @@ class TestTheBlend:
         assert config["consensus"] == R.CONSENSUS
 
     def test_no_test_switches_a_source_on_or_off_between_neighbouring_pixels(self):
-        blend = _section(_template(), "const FS_BLEND", "/* ---------- main")
+        blend = _section(_template(), "const GLSL_SHADE", "/* ---------- main")
         # the first page's hard cuts
         assert "pc.z > zs * 1.03" not in blend
         assert "if (ang > 1.0472) continue;" not in blend
@@ -368,14 +371,14 @@ class TestTheBlend:
         assert "exp(-(pen[i] - pmin) / uTemp)" in blend
 
     def test_a_minority_colour_is_voted_down(self):
-        blend = _section(_template(), "const FS_BLEND", "/* ---------- main")
+        blend = _section(_template(), "const GLSL_SHADE", "/* ---------- main")
         assert "uConsensus" in blend and "float cdist(" in blend
         # the voters are the k + 2 best, never every candidate
         assert "vthr = (n > k + 2) ? s[k + 2]" in blend
 
     def test_the_photometric_model_is_applied(self):
         text = _template()
-        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         assert "uGain[i] * exp(dot(uSlope[i], q) + uVig.x * r2 + uVig.y * r2 * r2)" in blend
         assert "kf.gain_slope" in text and "man.exposure.vignette" in text
 
@@ -383,7 +386,7 @@ class TestTheBlend:
         from tower.world_builder.appearance_render import build_appearance_config
 
         text = _template()
-        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         ceiling = float(re.search(r"#define TONE_CEILING ([0-9.]+)", blend).group(1))
         assert ceiling < 0.99                                   # the brightest output is not white
         assert "float y = uKnee + span * (1.0 - exp(-(m - uKnee) / span));" in blend
@@ -394,7 +397,7 @@ class TestTheBlend:
     def test_a_changed_choice_of_sources_crossfades(self):
         text = _template()
         assert "function setChosen(" in text and "function updatePresence(" in text
-        assert "uPres[i]" in _section(text, "const FS_BLEND", "/* ---------- main")
+        assert "uPres[i]" in _section(text, "const GLSL_SHADE", "/* ---------- main")
         maxc = int(re.search(r"const MAXC = (\d+);", text).group(1))
         cands = int(re.search(r"candidates: (\d+),", text).group(1))
         assert maxc > cands                                     # room for sources fading out
@@ -409,7 +412,7 @@ class TestTheBlend:
 
     def test_proxy_nobody_saw_is_drawn_as_nothing_but_still_occludes(self):
         text = _template()
-        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         assert "if (!observed){ o = vec4(0.0); return; }" in blend      # no tint, no fog
         assert "uFogLift" not in text and "uGhost" not in text
         # the depth prepass still draws the whole proxy before the blend
@@ -754,9 +757,10 @@ assert.ok(cam.yaw - back.yaw > 0.027 && back.resisted < 0.1, (cam.yaw - back.yaw
 const pose = {p: at.slice(), yaw: Math.PI, pitch: 0, floor: 0.05};
 const n = NAV.step(F, path, pose, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
 assert.strictEqual(n.yaw, Math.PI); assert.deepStrictEqual(n.p, at);
-// and without a field (still building) nothing is limited at all
-const free = NAV.step(null, path, {p: at.slice(), yaw: 0, pitch: 0}, {look: [2, 0], move: [0, 0, -5], held: true}, 16, V);
-assert.strictEqual(free.yaw, 2); assert.strictEqual(free.resisted, 0);
+// and without a field (still building) the camera does not move at all:
+// early input used to escape the envelope (visual review, item 5)
+const wait = NAV.step(null, path, {p: at.slice(), yaw: 0, pitch: 0}, {look: [2, 0], move: [0, 0, -5], held: true}, 16, V);
+assert.strictEqual(wait.yaw, 0); assert.deepStrictEqual(wait.p, at); assert.strictEqual(wait.waiting, true);
 """)
 
     def test_stepping_along_the_walk_glides(self):
@@ -809,7 +813,7 @@ class TestTheNavigationWiring:
 
     def test_the_envelope_limits_the_camera_and_paints_nothing(self):
         text = _template()
-        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         composite = _section(text, "const FS_COMPOSITE", "}`;")
         for shader in (blend, composite):
             assert "navField" not in shader and "support" not in shader.lower()
@@ -825,6 +829,211 @@ class TestTheNavigationWiring:
         assert "Math.max(0, 1 - pen / maxang) * (0.5" not in choose, "the 60-degree cut is gone"
         depth = _section(text, "function renderSourceDepth(", "/* -------- loading")
         assert "gl.readPixels(0, 0, DW, DH, gl.RGBA_INTEGER, gl.UNSIGNED_INT" in depth
-        blend = _section(text, "const FS_BLEND", "/* ---------- main")
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         assert "0.08 * (1.0 - smoothstep(1.30, 1.48, ang))" in blend
         assert "(1.0 - smoothstep(1.40, 1.48, ang))" in blend
+
+
+# ---------------------------------------------------------------------------
+# fix-it blotch lane: cracks, voids, the capture's field of view and exposure,
+# and an envelope that stops before the ugly frame
+# ---------------------------------------------------------------------------
+
+
+class TestTheCracksAndVoids:
+    """On the page's source (the shaders run only in a browser; measured by the
+    blotch lane, Glasses-scratch/wb-final-recon/fixit/blotch)."""
+
+    def test_a_thin_crack_is_closed_only_across_one_plane_and_shaded_from_sources(self):
+        text = _template()
+        fill = _section(text, "const FS_FILL", "const FS_COPY")
+        assert "if (dAt(p) < 1.0) discard;" in fill, "only where the proxy drew nothing"
+        assert "if (!h && !v) discard;" in fill, "a gap with surface on both sides, or nothing"
+        assert "if (k > uFillR) break;" in fill, "thin: bounded by the fill radius"
+        assert "if (da2 >= 1.0 || db2 >= 1.0) return false;" in fill
+        assert "0.03 * zb" in fill and "0.03 * za" in fill, "each side's slope predicts the other"
+        assert "shade(P, normalize(N), o);" in fill, "the proxy's own shading: source pixels or nothing"
+        for inpaint in ("textureLod", "uL", "texelFetch(uCol"):
+            assert inpaint not in fill.split("${GLSL_SHADE}")[1], "no colour from neighbouring screen pixels"
+        pass_ = _section(text, "function blendPass(", "  let pending = false")
+        assert pass_.index("drawMesh();") < pass_.index("G.fill") and "lay.fb3" in pass_
+        assert "Math.min(8, Math.round(OPT.fillPx * dpr))" in pass_
+
+    def test_a_void_is_an_unlit_fog_that_never_makes_a_pixel_look_observed(self):
+        text = _template()
+        composite = _section(text, "const FS_COMPOSITE", "}`;")
+        assert "float alpha = layer.a;" in composite
+        # alpha only shrinks: the edge fade and the wide fade multiply it
+        assert "alpha *= smoothstep(0.5, 0.97, s / n);" in composite
+        assert "alpha *= 1.0 - uWide * (1.0 - smoothstep(0.3, 0.9, coarse.a));" in composite
+        assert "alpha +=" not in composite and "alpha = max" not in composite
+        # the fog is the coarse level (no texture), mostly grey
+        assert "textureLod(uL, (vec2(p) + 0.5) / vec2(uSize), uFogLod)" in composite
+        assert "mix(vec3(lum), near, 0.1)" in composite
+        draw = _section(text, "function drawBlend(", "function shadeUniforms(")
+        assert "Math.log2(Math.min(w, h) / 24)" in draw and "gl.generateMipmap(gl.TEXTURE_2D)" in draw
+
+    def test_the_proxy_normals_are_read_for_obliquity(self):
+        text = _template()
+        assert "const nrm = hasN ? view(Int8Array, buf, off + nV * 9, nV * 3) : null;" in text
+        assert "gl.vertexAttribPointer(1, 3, gl.BYTE, true, 0, 0);" in text
+
+    def test_the_rejected_blend_changes_are_not_in_the_shader(self):
+        blend = _section(_template(), "const GLSL_SHADE", "/* ---------- main")
+        for rejected in ("uStretch", "uAgree", "uSlack", "planeStep", "spread", "uCoherent", "uKi"):
+            assert rejected not in blend, rejected
+
+    def test_the_matrix_inverse_the_fill_unprojects_with(self):
+        text = _template()
+        m = text[text.index("const M = {"):text.index("const norm3")]
+        program = ("const assert = require('assert');\n" + m + r"""
+const P = M.persp(1.1, 0.6, 0.05, 400), V = M.look([1, 2, 3], [0.5, 1.7, -2], [0, 1, 0]);
+const A = M.mul(P, V), I = M.mul(M.inv(A), A);
+for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++)
+  assert.ok(Math.abs(I[c * 4 + r] - (r === c ? 1 : 0)) < 1e-4, "inverse: " + r + "," + c + " " + I[c * 4 + r]);
+console.log("inv ok");
+""")
+        import subprocess
+
+        r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and "inv ok" in r.stdout, (r.stdout + r.stderr)[-2000:]
+
+
+class TestTheCapturesOwnLook:
+
+    def test_the_display_field_of_view_is_the_keyframes(self):
+        text = _template()
+        cam = _section(text, "function currentCamera(", "function navView(")
+        assert "fy: viewFovY(aspect)" in cam
+        assert "return 2 * Math.atan(Math.min(KT.v, OPT.viewMargin * KT.h / aspect));" in cam
+        assert "if (cf.fx > 0 && cf.fy > 0) KT = {v: KH / 2 / cf.fy, h: KW / 2 / cf.fx};" in text
+
+    def test_the_display_mapping_matches_the_keyframes_brightness(self, built):
+        from tower.world_builder import appearance_render as R
+
+        config = R.build_appearance_config(built.store, WORLD, SESSION)
+        assert config["exposure"] == R.DISPLAY_EXPOSURE == 1.0
+        assert config["gamma"] == R.DISPLAY_GAMMA == 1.0
+        assert config["tone_knee"] == R.TONE_KNEE == 0.8
+        assert config["view_margin"] == R.VIEW_MARGIN == 1.25
+        assert config["crack_fill_px"] == R.CRACK_FILL_PX > 0
+        assert config["void_fog"] == R.VOID_FOG and config["void_wide_fade"] == R.VOID_WIDE_FADE
+        text = _template()
+        assert "gl.uniform1f(P.u.uExposure, OPT.exposure); gl.uniform1f(P.u.uGamma, OPT.gamma);" in text
+
+    def test_the_caption_is_one_line_until_asked(self):
+        text = _template()
+        cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert "more.hidden = !captionOpen;" in cap and "let captionOpen = false;" in text
+        assert "#caption .more[hidden]{display:none}" in text
+
+    def test_nothing_is_drawn_before_the_opening_and_it_fades_in(self):
+        text = _template()
+        frame = _section(text, "function frame(sync){", "function drawnFraction(")
+        assert frame.index("if (shownAt === null) return;") < frame.index("drawBlend(")
+        start = _section(text, "/* -------- start ---", "main().catch")
+        assert start.index("setPose(poseOf(ci));") < start.index("shownAt =") < start.index("frame(true);")
+        assert "uShow" in _section(text, "const FS_COMPOSITE", "}`;")
+
+
+class TestTheEnvelopeStopsBeforeTheUglyFrame:
+
+    def test_the_floor_after_the_build_is_the_recorded_poses(self):
+        text = _template()
+        build = _section(text, "function buildNav(){", "/* Overview:")
+        assert "cam.floor = floorAt(poseOf(ci));" in build and "cam.floor = floorAt(cam);" not in build
+        update = _section(text, "function navUpdate(", "function mulberry(")
+        assert "if (next.waiting){ vel.look = [0, 0]; vel.move = [0, 0, 0];" in update
+
+    def test_the_field_rates_quality_not_only_coverage(self):
+        text = _template()
+        nav = _nav_source()
+        assert "* (seenQ ? seenQ[j] / 255 : 1)" in nav and "if (sampleQ) best *= sampleQ[s] / 255;" in nav
+        inp = _section(text, "function navInput(", "function voidEdges(")
+        assert "NAV.smooth(0.1, 0.4, cosI)" in inp and "holeNear(X0, X1, X2) ? 0.3 : 1" in inp
+        _run_nav(r"""
+// the same room, but every sample seen only obliquely and beside a hole
+const q = F.input;
+const G2 = NAV.fieldJob(Object.assign({}, q, {seenQ: new Uint8Array(q.seenIdx.length).fill(128),
+                                               sampleQ: new Uint8Array(q.samples.length / 3).fill(128)}));
+while (!NAV.fieldWork(G2, 500));
+const s1 = NAV.support(F, at, dir(0, 0), up, V.fy, V.aspect).s, s2 = NAV.support(G2, at, dir(0, 0), up, V.fy, V.aspect).s;
+assert.ok(s1 > 0.95 && s2 < 0.3, "poor evidence is poor support: " + s1 + " " + s2);
+""")
+
+    def test_the_camera_keeps_a_distance_from_the_surface(self):
+        _run_nav(r"""
+// something standing 1.4 in front of the walk (the support is unchanged)
+const F3 = Object.assign({}, F, {input: Object.assign({}, F.input, {samples: Float32Array.from([...F.input.samples, 2.5, 0, 1.4])})});
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+for (let i = 0; i < 600; i++) cam = NAV.step(F3, path, cam, {look: [0, 0], move: [0, 0, 0.02], held: true}, 16, V);
+const d = NAV.nearest(F3, cam.p);
+assert.ok(d >= NAV.D_MIN - 1e-6, "never nearer than D_MIN: " + d);
+assert.ok(d < NAV.D_SOFT + 0.1, "but it did get close: " + d);
+assert.ok(NAV.closeBound(F, [2.5, 0, 0]) === 0 && NAV.closeBound(F, [2.5, 0, 3 - NAV.D_MIN]) > 0.999);
+""")
+
+    def test_a_push_in_a_good_place_is_not_sluggish(self):
+        _run_nav(r"""
+// inside the free part of the band a step is taken whole
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+const n = NAV.step(F, path, cam, {look: [0, 0], move: [0.04, 0, 0], held: true}, 16, V);
+assert.ok(Math.abs(dist(n.p, cam.p) - 0.04) < 1e-9, "a push along the walk moves what was asked: " + dist(n.p, cam.p));
+""")
+
+    def test_a_look_held_against_the_edge_crosses_to_the_next_supported_direction(self):
+        _run_nav(r"""
+// at the wall-facing spot, turning right past the edge: the field has support
+// only toward +z, so from yaw -pi/2 pushing further there is nothing within
+// half a turn except back through the wall
+const y = NAV.lookAcross(F, at, Math.PI, 0, 1, V);
+assert.ok(y !== null, "found the wall on the far side");
+assert.ok(NAV.support(F, at, dir(y, 0), up, V.fy, V.aspect).s >= NAV.T_HI);
+assert.ok(y - Math.PI > 0.3 && y - Math.PI <= Math.PI + 1e-9);
+assert.strictEqual(NAV.lookAcross(null, at, 0, 0, 1, V), null);
+""")
+        text = _template()
+        update = _section(text, "function navUpdate(", "function mulberry(")
+        assert "NAV.lookAcross(navField, cam.p, cam.yaw, cam.pitch, Math.sign(lookYaw), V)" in update
+        assert "glideTo({p: cam.p.slice(), yaw: y, pitch: cam.pitch}, null);" in update
+
+    def test_the_walk_buttons_skip_poses_that_render_badly(self):
+        _run_nav(r"""
+const q = [0.95, 0.4, 0.5, 0.9, -1, 0.3];
+assert.strictEqual(NAV.nextPose(q, 0, 1, 0.8), 3, "skips 1 and 2");
+assert.strictEqual(NAV.nextPose(q, 3, 1, 0.8), 4, "an unscored pose counts as good");
+assert.strictEqual(NAV.nextPose(q, 4, 1, 0.8), 4, "nothing good ahead: stay");
+assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8), 0);
+""")
+        text = _template()
+        step = _section(text, "  function step(d){", "  let poseQ")
+        assert "NAV.nextPose(poseQ, ci, d, POSE_MIN)" in step
+        assert "scorePoses();" in _section(text, "function buildNav(){", "/* Overview:")
+
+    def test_overview_is_a_distinct_vantage(self):
+        over = _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
+        assert "< OVERVIEW_AWAY) continue;" in over
+        assert "r.dist < OVERVIEW_DEPTH * ref" in over and "0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref))" in over
+
+    def test_the_look_stays_within_the_pitch_the_walk_looked_at(self):
+        _run_nav(r"""
+const VP = Object.assign({}, V, {pitchMin: -0.4, pitchMax: 0.3});
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, prev = 0, resisted = 0;
+for (let i = 0; i < 300; i++){
+  const n = NAV.step(F, path, cam, {look: [0, 0.02], move: [0, 0, 0], held: true}, 16, VP);
+  assert.ok(n.pitch <= 0.3 + 1e-9, "never above the recorded range: " + n.pitch);
+  if (n.pitch > 0.3 - NAV.PITCH_SOFT) assert.ok(n.pitch - cam.pitch <= prev + 1e-9, "slowing, not a wall");
+  prev = n.pitch - cam.pitch; resisted = Math.max(resisted, n.resisted); cam = n;
+}
+assert.ok(cam.pitch > 0.2 && resisted > 0.35, cam.pitch + " " + resisted);
+for (let i = 0; i < 300; i++) cam = NAV.step(F, path, cam, {look: [0, -0.02], move: [0, 0, 0], held: true}, 16, VP);
+assert.ok(cam.pitch >= -0.4 - 1e-9 && cam.pitch < -0.3, "and not below it: " + cam.pitch);
+""")
+        text = _template()
+        assert "pitchMin: pitchRange[0], pitchMax: pitchRange[1]" in text and "recordedPitch();" in text
+
+    def test_pressing_overview_twice_works(self):
+        text = _template()
+        # the statistics used to be assigned over the verification hook
+        assert "S.overviewStats = {" in text and "S.overview = {" not in text
+        assert "S.overview = () => overview();" in text

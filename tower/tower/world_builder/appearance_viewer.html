@@ -29,6 +29,9 @@ button[disabled]{opacity:.4}
   background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,0));
   font-size:12px;color:var(--dim);pointer-events:none}
 #caption b{color:var(--ink);font-weight:600}
+#caption button{pointer-events:auto;min-height:24px;padding:1px 8px;margin-left:6px;font-size:11px;border-radius:10px;vertical-align:baseline}
+#caption .more{display:block;margin-top:4px}
+#caption .more[hidden]{display:none}
 #status{position:fixed;left:12px;bottom:calc(64px + env(safe-area-inset-bottom));font-size:12px;
   color:var(--dim);pointer-events:none;font-variant-numeric:tabular-nums}
 #msg{position:fixed;inset:0;display:none;place-content:center;padding:28px;text-align:center;
@@ -98,7 +101,9 @@ const OPT = {
   temp: +(Q.get("temp") || CONFIG.blend_temperature || 0.07),
   fadePx: Math.max(0, Math.min(12, +(Q.get("fadepx") || CONFIG.edge_fade_px || 8))),
   // Where the highlight roll-off starts (display value, below the 0.97 ceiling).
-  knee: Math.max(0.3, Math.min(0.9, +(Q.get("knee") || CONFIG.tone_knee || 0.6))),
+  exposure: +(Q.get("gain") ?? CONFIG.exposure ?? 1.0),
+  gamma: +(Q.get("gamma") ?? CONFIG.gamma ?? 1.0),
+  knee: Math.max(0.3, Math.min(0.9, +(Q.get("knee") || CONFIG.tone_knee || 0.8))),
   // How far in from a source image's border its weight rises (source pixels):
   // wide, so a keyframe's rectangle never switches on as a hard step. Its
   // EVIDENCE (what the frame shows at all) keeps a narrow 20 px feather.
@@ -106,6 +111,13 @@ const OPT = {
   exposureModel: Q.get("expo") || "full",
   consensus: Q.get("consensus") !== null ? +Q.get("consensus") : (CONFIG.consensus ?? 1),
   fadeMs: +(Q.get("fadems") || CONFIG.source_fade_ms || 280),
+  // Thin cracks in the proxy closed on the screen (CSS px across, 0 = off),
+  // and the look of a void: the unlit fog's strength and how much a large
+  // void dims the room around it (WORLD-BUILDER-WORLDS.md §4).
+  fillPx: Math.max(0, Math.min(8, +(Q.get("fill") ?? CONFIG.crack_fill_px ?? 4))),
+  viewMargin: Math.max(0.8, Math.min(1.6, +(Q.get("fov") ?? CONFIG.view_margin ?? 1.25))),
+  fog: +(Q.get("fog") ?? CONFIG.void_fog ?? 0.35),
+  wide: +(Q.get("wide") ?? CONFIG.void_wide_fade ?? 0.2),
   forceWebp: Q.get("enc") === "webp",
   debugMode: +(Q.get("dbg") || 0),
   preserve: Q.get("preserve") === "1",
@@ -226,13 +238,25 @@ const FOLLOW = (() => {
    nothing, and the dark places inside it stay dark. */
 const NAV = (() => {
   const R_SOFT = 0.55, R_MAX = 1.0, V_MAX = 0.6;      // scene units (median scene depth ~4)
-  // View support: resisted below T_HI, stops at T_LO. Measured on the canonical
-  // world (200 reachable views): the field is optimistic, drawn ~ 1.19 x support
-  // - 0.24 (r = 0.95), so these sit where drawn is ~0.72 and ~0.85.
-  const T_LO = 0.80, T_HI = 0.92;
+  // View support: resisted below T_HI, stops at T_LO. Revised 2026-09-17 (fix-it
+  // blotch lane): support now rates QUALITY, not only coverage -- each source's
+  // incidence, one source or several, and whether the point sits beside a
+  // large hole in the proxy -- at the capture's field of view. Measured on the
+  // canonical world over 250 random views in the tube, a view is "good" (drawn
+  // >= 0.9, blotch <= 2.5%, seam excess <= 8) for 96% of views at support >=
+  // 0.80, 75% at 0.70-0.80 and 64-68% at 0.60-0.70. Resistance is felt from
+  // about 0.76 (B_FREE) and the view stops at 0.68.
+  const T_LO = 0.68, T_HI = 0.80;
+  // How close the camera may come to the surface (scene units): nearer, a
+  // 360x640 keyframe is magnified past its resolution (the review's keyboard
+  // and monitor close-ups). Resisted from D_SOFT, stopped at D_MIN.
+  const D_MIN = 0.55, D_SOFT = 0.85;
+  // Resistance scales a worsening step by (1 - smooth(B_FREE, 1, b))^2: free
+  // in the first part of the band, so a push in a good place is not sluggish.
+  const B_FREE = 0.35;
   const SPACING = 0.5, FACE = 8, CELLS = 6 * FACE * FACE;
   const JUMP = 2.0;                                   // a longer gap in the recorded path is not a corridor
-  const PITCH_MAX = 1.3;
+  const PITCH_MAX = 1.3, PITCH_SOFT = 0.2;
   const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
   const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
   const nrm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
@@ -316,7 +340,7 @@ const NAV = (() => {
             next: 0, done: count === 0};
   }
   function fieldWork(F, budget){
-    const {samples, seenOff, seenIdx, centres} = F.input;
+    const {samples, seenOff, seenIdx, seenQ, sampleQ, centres} = F.input;
     const N = samples.length / 3;
     const front = new Float32Array(CELLS), who = new Int32Array(CELLS);
     const end = Math.min(F.count, F.next + budget);
@@ -342,9 +366,11 @@ const NAV = (() => {
           const k = seenIdx[j];
           let cx = centres[k*3] - X0, cy = centres[k*3+1] - X1, cz = centres[k*3+2] - X2;
           const l = Math.hypot(cx, cy, cz) || 1;
-          const w = angleWeight(Math.acos(Math.max(-1, Math.min(1, (cx*vx + cy*vy + cz*vz) / l))));
+          const w = angleWeight(Math.acos(Math.max(-1, Math.min(1, (cx*vx + cy*vy + cz*vz) / l))))
+            * (seenQ ? seenQ[j] / 255 : 1);
           if (w > best){ best = w; if (best >= 1) break; }
         }
+        if (sampleQ) best *= sampleQ[s] / 255;
         F.cov[base + c] = Math.round(best * 255);
         F.dist[base + c] = Math.min(255, Math.round(d * 16));
       }
@@ -400,10 +426,25 @@ const NAV = (() => {
     return {s, dist: dw ? dsum / dw : 0};
   }
 
+  /* The distance from p to the nearest proxy sample, and how close that is to
+     the limit, 0 (free) .. 1 (at D_MIN). */
+  function nearest(F, p){
+    const A = F && F.input && F.input.samples;
+    if (!A) return Infinity;
+    let b = Infinity;
+    for (let i = 0; i < A.length; i += 3){
+      const dx = A[i] - p[0], dy = A[i+1] - p[1], dz = A[i+2] - p[2], d2 = dx*dx + dy*dy + dz*dz;
+      if (d2 < b) b = d2;
+    }
+    return Math.sqrt(b);
+  }
+  function closeBound(F, p){ return 1 - smooth(D_MIN, D_SOFT, nearest(F, p)); }
   /* How far past the soft edge a camera is, 0 (inside) .. 1 (at the limit). */
   function positionBound(e){ return smooth(R_SOFT / R_MAX, 1, e); }
   function lookBound(s, floor){
-    const hi = Math.min(T_HI, floor), lo = Math.min(T_LO, hi - 0.12);
+    // below a recorded pose's own support the band is narrow: from a weak
+    // recorded view the camera may not wander into anything weaker
+    const hi = Math.min(T_HI, floor), lo = Math.min(T_LO, hi - 0.06);
     return 1 - smooth(lo, hi, s);
   }
 
@@ -416,34 +457,44 @@ const NAV = (() => {
   function step(F, path, cam, ctl, dt, V){
     const out = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor ?? 1, resisted: 0};
     const ready = !!(F && F.done && F.count);
+    // Until the field exists nothing can say where the capture ends, so the
+    // camera does not move at all (the review: early input escaped the
+    // envelope, and the page then kept the escaped camera out there).
+    if (!ready){ out.waiting = true; return out; }
     const sup = (p, yaw, pitch) => ready ? support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect).s : 1;
     const posB = p => ready && path && path.n ? positionBound(pathDist(path, p).e) : 0;
     const look = ctl.look || [0, 0], move = ctl.move || [0, 0, 0];
+    // Pitch: within what the recorded walk looked at (V.pitchMin/Max, the
+    // recorded range plus a margin), resisted over its last PITCH_SOFT: the
+    // review's torn ceiling and floor blobs were one vertical drag away.
+    const pLo = V.pitchMin ?? -PITCH_MAX, pHi = V.pitchMax ?? PITCH_MAX;
+    const clampP = x => Math.max(pLo, Math.min(pHi, x));
+    const pitchB = x => Math.max(smooth(pHi - PITCH_SOFT, pHi, x), smooth(-pLo - PITCH_SOFT, -pLo, -x));
     // Large inputs (a fast flick, a slow frame) are taken in small sub-steps,
     // so the resistance feels the same whatever the frame rate.
     const resistOnce = (b0, b1, scale) => {
       if (b1 <= b0) return 1;
       out.resisted = Math.max(out.resisted, b1);
-      return Math.pow(Math.max(0, 1 - b1), 2) * scale;
+      return Math.pow(1 - smooth(B_FREE, 1, b1), 2) * scale;
     };
     if (look[0] || look[1]){
       const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(look[0], look[1]) / 0.03)));
       for (let i = 0; i < n; i++){
-        const b0 = lookBound(sup(out.p, out.yaw, out.pitch), out.floor);
+        const b0 = Math.max(lookBound(sup(out.p, out.yaw, out.pitch), out.floor), pitchB(out.pitch));
         let dy = look[0] / n, dp = look[1] / n, b1 = 0;
         for (let t = 0; t < 4; t++){
-          b1 = lookBound(sup(out.p, out.yaw + dy, Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + dp))), out.floor);
+          b1 = Math.max(lookBound(sup(out.p, out.yaw + dy, clampP(out.pitch + dp)), out.floor), pitchB(clampP(out.pitch + dp)));
           if (b1 < 0.999 || b1 <= b0) break;
           dy /= 2; dp /= 2;
         }
         const k = resistOnce(b0, b1, 1);
-        out.yaw += dy * k; out.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + dp * k));
+        out.yaw += dy * k; out.pitch = clampP(out.pitch + dp * k);
       }
     }
     if (move[0] || move[1] || move[2]){
       const f = V.dir(out.yaw, out.pitch), r = nrm(crs(f, V.up));
       const D = [0, 1, 2].map(k => r[k] * move[0] + V.up[k] * move[1] + f[k] * move[2]);
-      const bAt = p => Math.max(posB(p), lookBound(sup(p, out.yaw, out.pitch), out.floor));
+      const bAt = p => Math.max(posB(p), lookBound(sup(p, out.yaw, out.pitch), out.floor), closeBound(F, p));
       const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(D[0], D[1], D[2]) / 0.05)));
       for (let i = 0; i < n; i++){
         const b0 = bAt(out.p);
@@ -471,16 +522,29 @@ const NAV = (() => {
       if (lb > 0.02){
         const e = 0.08;
         const gy = sup(out.p, out.yaw + e, out.pitch) - sup(out.p, out.yaw - e, out.pitch);
-        const gp = sup(out.p, out.yaw, Math.min(PITCH_MAX, out.pitch + e)) - sup(out.p, out.yaw, Math.max(-PITCH_MAX, out.pitch - e));
+        const gp = sup(out.p, out.yaw, clampP(out.pitch + e)) - sup(out.p, out.yaw, clampP(out.pitch - e));
         const gl = Math.hypot(gy, gp);
         if (gl > 0.01){
           const rate = 0.5 * lb * dt / 1000;               // radians this frame
-          out.yaw += gy / gl * rate; out.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, out.pitch + gp / gl * rate));
+          out.yaw += gy / gl * rate; out.pitch = clampP(out.pitch + gp / gl * rate);
         }
       }
     }
     if (ready && sup(out.p, out.yaw, out.pitch) >= T_HI) out.floor = 1;
     return out;
+  }
+
+  /* Looking ACROSS a gap: a look held against the edge that keeps pushing is
+     taken over the unsupported stretch to the first well-supported direction
+     beyond it (up to half a turn), so turning round is possible without
+     parking on the worst frame. Returns that yaw, or null. */
+  function lookAcross(F, p, yaw, pitch, sign, V){
+    if (!F || !F.done || !F.count) return null;
+    for (let a = 0.35; a <= Math.PI + 1e-9; a += 0.0873){
+      const y = yaw + sign * a;
+      if (support(F, p, V.dir(y, pitch), V.up, V.fy, V.aspect).s >= T_HI) return y;
+    }
+    return null;
   }
 
   /* A uniformly random reachable view (verification: the measured
@@ -514,9 +578,19 @@ const NAV = (() => {
     return Math.max(400, Math.min(1600, 300 * d + 320 * dy + 250 * Math.abs(b.pitch - a.pitch)));
   }
 
+  /* Stepping along the walk: the next recorded pose in direction d whose
+     rendered quality is known and at least `min` (unknown counts as good).
+     Returns the index, or `from` when there is none. */
+  function nextPose(q, from, d, min){
+    for (let i = from + d; i >= 0 && i < q.length; i += d){
+      if (!(q[i] >= 0) || q[i] >= min) return i;
+    }
+    return from;
+  }
+
   return {smooth, cellOf, angleWeight, makePath, pathDist, fieldJob, fieldWork, support, positionBound,
-          lookBound, step, sampleReachable, glide, glideMs,
-          R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX};
+          lookBound, step, sampleReachable, glide, glideMs, nearest, closeBound, lookAcross, nextPose,
+          R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE};
 })();
 /* ---------- end navigation */
 
@@ -543,10 +617,13 @@ function decodeMesh(buf){
   let off = 48;
   const need = off + nV * (6 + 3 + (hasN ? 3 : 0)) + nI * (u16 ? 2 : 4);
   if (buf.byteLength !== need) throw new Error("proxy mesh length mismatch");
-  const pos = view(Uint16Array, buf, off, nV * 3); off += nV * 6 + nV * 3 + (hasN ? nV * 3 : 0);
+  const pos = view(Uint16Array, buf, off, nV * 3);
+  // normals (int8, x127) follow the colours; used only to judge obliquity
+  const nrm = hasN ? view(Int8Array, buf, off + nV * 9, nV * 3) : null;
+  off += nV * 6 + nV * 3 + (hasN ? nV * 3 : 0);
   const idx = u16 ? view(Uint16Array, buf, off, nI) : view(Uint32Array, buf, off, nI);
   const span = [Math.max(hi[0]-lo[0],1e-9), Math.max(hi[1]-lo[1],1e-9), Math.max(hi[2]-lo[2],1e-9)];
-  return {pos, idx, lo, hi, span, nV, nI, u32: !u16};
+  return {pos, nrm, idx, lo, hi, span, nV, nI, u32: !u16};
 }
 /* WBAPCK01 (WORLD-BUILDER-APPEARANCE.md §4.1). */
 function decodeChunk(buf){
@@ -571,6 +648,15 @@ const M = {
     for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;},
   persp(fy,asp,n,f){const t=1/Math.tan(fy/2),o=new Float32Array(16);
     o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f);return o;},
+  inv(m){const o=new Float32Array(16);
+    const a=m[0],b=m[1],c=m[2],d=m[3],e=m[4],f=m[5],g=m[6],h=m[7],i=m[8],j=m[9],k=m[10],l=m[11],n=m[12],p=m[13],q=m[14],r=m[15];
+    const A=a*f-b*e,B=a*g-c*e,C=a*h-d*e,D=b*g-c*f,E=b*h-d*f,F=c*h-d*g,G2=i*p-j*n,H=i*q-k*n,I=i*r-l*n,J=j*q-k*p,K=j*r-l*p,L=k*r-l*q;
+    let det=A*L-B*K+C*J+D*I-E*H+F*G2; if(!det) return o; det=1/det;
+    o[0]=(f*L-g*K+h*J)*det;o[1]=(-b*L+c*K-d*J)*det;o[2]=(p*F-q*E+r*D)*det;o[3]=(-j*F+k*E-l*D)*det;
+    o[4]=(-e*L+g*I-h*H)*det;o[5]=(a*L-c*I+d*H)*det;o[6]=(-n*F+q*C-r*B)*det;o[7]=(i*F-k*C+l*B)*det;
+    o[8]=(e*K-f*I+h*G2)*det;o[9]=(-a*K+b*I-d*G2)*det;o[10]=(n*E-p*C+r*A)*det;o[11]=(-i*E+j*C-l*A)*det;
+    o[12]=(-e*J+f*H-g*G2)*det;o[13]=(a*J-b*H+c*G2)*det;o[14]=(-n*D+p*B-q*A)*det;o[15]=(i*D-j*B+k*A)*det;
+    return o;},
   look(eye,at,up){
     let z=[eye[0]-at[0],eye[1]-at[1],eye[2]-at[2]];let l=Math.hypot(...z)||1;z=z.map(v=>v/l);
     let x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]];
@@ -599,10 +685,10 @@ const MAXC = 12;
 const VS_VIEW = `#version 300 es
 precision highp float;
 invariant gl_Position;
-in vec3 aQ;
+in vec3 aQ; in vec3 aN;
 uniform mat4 uMVP; uniform vec3 uLo; uniform vec3 uSpan;
-out vec3 vX;
-void main(){ vec3 p = uLo + aQ * uSpan; vX = p; gl_Position = uMVP * vec4(p, 1.0); }`;
+out vec3 vX; out vec3 vN;
+void main(){ vec3 p = uLo + aQ * uSpan; vX = p; vN = aN; gl_Position = uMVP * vec4(p, 1.0); }`;
 
 /* What "not captured" looks like: a dark, smooth vignette. Never a texture. */
 const GLSL_BACKGROUND = `
@@ -622,7 +708,18 @@ vec3 background(){
    kept image saw it, the room fades out over a few pixels into the same calm
    background instead of a stair-stepped cut or a dark surface -- and only
    inward: a pixel with no evidence never gains colour. Proxy nobody's image
-   covers still writes depth, so it still hides what is behind it. */
+   covers still writes depth, so it still hides what is behind it.
+
+   Two things keep a void from reading as a hard black cut-out (a door-leaf
+   "T", the band under a shelf), and neither is content:
+   - the fade WIDENS with the size of the void: the layer's coarse coverage (a
+     mip level about a thirtieth of the frame across) dims the drawn room near
+     a large void over tens of pixels, and does nothing near a pinhole;
+   - the void is not pure black but an UNLIT FOG: the background lifted by a
+     fraction of the coarse, grey LUMINANCE of what is drawn around it. It has
+     no texture, no hue of its own and no detail (the coarse level is ~30 px a
+     texel, smoothed), it fades to the plain background a few tens of pixels
+     into a void, and it never makes a pixel look observed. */
 const FS_COVER_H = `#version 300 es
 precision highp float;
 uniform sampler2D uL; uniform int uRadius; uniform ivec2 uSize;
@@ -640,6 +737,7 @@ void main(){
 const FS_COMPOSITE = `#version 300 es
 precision highp float;
 uniform sampler2D uL; uniform sampler2D uCover; uniform int uRadius; uniform ivec2 uSize;
+uniform float uFogLod; uniform float uFog; uniform float uWide; uniform float uShow;
 ${GLSL_BACKGROUND}
 out vec4 o;
 void main(){
@@ -655,7 +753,17 @@ void main(){
     }
     alpha *= smoothstep(0.5, 0.97, s / n);
   }
-  o = vec4(mix(background(), layer.rgb, alpha), 1.0);
+  vec3 base = background();
+  if (uFog > 0.0 || uWide > 0.0){
+    vec4 coarse = textureLod(uL, (vec2(p) + 0.5) / vec2(uSize), uFogLod);
+    alpha *= 1.0 - uWide * (1.0 - smoothstep(0.3, 0.9, coarse.a));
+    // the mean of what is drawn nearby (undrawn texels are zero), mostly grey,
+    // present only where something is drawn within the coarse footprint
+    vec3 near = coarse.rgb / max(coarse.a, 0.02);
+    float lum = dot(near, vec3(0.299, 0.587, 0.114));
+    base = mix(base, uFog * mix(vec3(lum), near, 0.1), smoothstep(0.02, 0.5, coarse.a));
+  }
+  o = vec4(mix(background(), mix(base, layer.rgb, alpha), uShow), 1.0);
 }`;
 
 const FS_NOTHING = `#version 300 es
@@ -713,29 +821,48 @@ void main(){
    that source (the artifact's alpha, feathered inward from every mask:
    redaction, hands, disagreement), visible from that source (its depth, the
    test bilinear over the 2x2 depth blocks where the nearest block is in
-   doubt), within 60 degrees of the viewing ray (fading from 46; a low tail to
-   85 for a source that did not see the surface edge-on), and present
-   (fading in or out of the chosen set). No test switches a source on or off
-   between two neighbouring pixels, so neighbouring pixels never change sources
-   abruptly.
+   doubt), within 60 degrees of the viewing ray (fading from 46; a low tail
+   to 85 for a source that did not see the surface edge-on, judged by the
+   proxy's smooth vertex normal), and present (fading in or out of the chosen
+   set). No test switches a source on or off between two neighbouring pixels,
+   so neighbouring pixels never change sources abruptly.
 
    Weights: the k best penalties blend, with a softmax of the penalty
    (temperature uTemp) and a smooth cut just below the (k+1)-th penalty; a
-   low-confidence sample is pushed down the ranking continuously. Then a
-   robust CONSENSUS over the best few sources: a colour most of them agree on
-   keeps its weight, a minority colour (a door that stood open in a few frames,
-   an object moved during the walk) is down-weighted. Each sample is divided by
+   low-confidence sample is pushed down the ranking continuously. Then a robust
+   CONSENSUS over the best few sources: a colour most of them agree on keeps
+   its weight, a minority colour (a door that stood open in a few frames, an
+   object moved during the walk) is down-weighted. Each sample is divided by
    its keyframe's photometric model: per-channel gain x exp(tilt . (xn, yn) +
    vignette(r2)) (WORLD-BUILDER-APPEARANCE.md §5.4).
+
+   Measured and NOT kept (fix-it blotch lane, 16 views): down-weighting and
+   blurring sources by the anisotropy of their projection (no measurable
+   change in speckle, blotch or seam, and no visible change to the oblique
+   smears), sharpening the weights toward the strongest source where sources
+   disagree (the doubled phone stayed doubled; seam excess +1.4), and a
+   visibility tolerance scaled by the source's incidence (no change in speckle;
+   seam excess +0.5), and pulling the weights toward the keyframes nearest in the
+   walk to the strongest one where sources disagree (the chair legs painted
+   from two passes stayed two; seam excess +0.7 on 9 reviewer views).
 
    Output: the colour, with alpha = the evidence 1 - prod(1 - confidence), so
    a place every source masked fades to the background; the composite then
    softens the border with nothing drawn (above). Fading is only ever INWARD:
    no pixel beyond the evidence gains colour.
-   UNSHADED: the images carry their own light; no lighting term is applied. */
-const FS_BLEND = `#version 300 es
-precision highp float; precision highp int;
-precision highp sampler2DArray; precision highp usampler2DArray;
+   UNSHADED: the images carry their own light; the surface normal is used only
+   to judge how obliquely a source saw the surface, never as light.
+
+   The same `shade` runs for the proxy's own fragments (FS_BLEND) and for a
+   THIN CRACK in the proxy (FS_FILL): the phone proxy is decimated and filtered,
+   and about a third of its edges are open, so a wall seen at a grazing angle
+   shows its pinholes and cracks as black speckle. FS_FILL finds a pixel with
+   no surface whose both sides, along a row or a column and within uFillR
+   pixels, are the SAME plane (each side's slope predicts the other), places
+   the point on that plane, and shades it exactly like the proxy: from real
+   source pixels that see it, or not at all. A real void, an occluding edge or
+   anything wider stays empty. */
+const GLSL_SHADE = `
 #define MAXC ${MAXC}
 #define NS 7
 #define TONE_CEILING 0.97
@@ -748,7 +875,6 @@ uniform vec2 uVig;
 uniform vec2 uWH; uniform ivec2 uDWH; uniform float uZmax; uniform vec3 uEye;
 uniform float uExposure; uniform float uGamma; uniform int uMode; uniform float uFar;
 uniform float uTemp; uniform float uConsensus; uniform float uBorder; uniform float uKnee;
-in vec3 vX; out vec4 o;
 ${GLSL_BACKGROUND}
 vec3 tone(vec3 x){
   // Hue-preserving highlight roll-off on the largest channel: linear to the
@@ -790,33 +916,43 @@ float cdist(vec3 a, vec3 b){
   // against a wall is large
   return length(a - b) / (0.08 + 0.5 * (dot(a, vec3(0.3333)) + dot(b, vec3(0.3333))));
 }
-void main(){
-  vec3 dv = uEye - vX; float distv = max(length(dv), 1e-6); dv /= distv;
-  // The surface's own facing (screen-space, per fragment): used ONLY to keep an
-  // oblique source from painting a surface it saw edge-on (a stretched streak),
-  // never as light.
-  vec3 fn = cross(dFdx(vX), dFdy(vX)); float fl = length(fn);
-  vec3 facing = fl > 1e-12 ? fn / fl : dv;
+void shade(vec3 P, vec3 N, out vec4 o){
+  vec3 dv = uEye - P; float distv = max(length(dv), 1e-6); dv /= distv;
+  vec3 facing = N;
   float pen[MAXC]; float conf[MAXC]; vec3 col[MAXC]; float sat[MAXC];
   int n = 0; float pmin = 1e9; float miss = 1.0;
+  float dAll = 1.0, dNoMask = 1.0, dNoVis = 1.0, dNoTail = 1.0;
   for (int i = 0; i < uN; i++){
     pen[i] = -1.0;
     if (uPres[i] <= 0.0) continue;
-    vec3 pc = uR[i] * vX + uT[i];
+    vec3 pc = uR[i] * P + uT[i];
     if (pc.z < 0.02) continue;
     vec2 uv = vec2(uIntr[i].x * pc.x / pc.z + uIntr[i].z, uIntr[i].y * pc.y / pc.z + uIntr[i].w);
     float e = min(min(uv.x, uWH.x - uv.x), min(uv.y, uWH.y - uv.y));
     float bf = smoothstep(0.5, uBorder, e);
     if (bf <= 0.0) continue;
-    vec3 ds = uC[i] - vX; float dists = length(ds); ds /= max(dists, 1e-6);
+    vec3 ds = uC[i] - P; float dists = length(ds); ds /= max(dists, 1e-6);
     float ang = acos(clamp(dot(ds, dv), -1.0, 1.0));
     // Weight: full to 46 degrees, fading by 60, then a low TAIL out to 85, so
     // a surface only an oblique source saw is still drawn from it (the tail
     // loses to any source within 60 degrees through the penalty's softmax).
     // the tail only for a source that saw the surface from well off its plane
-    float edgeOn = smoothstep(0.12, 0.35, abs(dot(facing, ds)));
+    float cosI = abs(dot(facing, ds));
+    float edgeOn = smoothstep(0.12, 0.35, cosI);
     float tail = mix(1.0, edgeOn, smoothstep(1.0, 1.1, ang));
     float aw = max(1.0 - smoothstep(0.80, 1.0472, ang), 0.08 * (1.0 - smoothstep(1.30, 1.48, ang)) * tail);
+    if (uMode >= 6){
+      // attribution: the evidence this pixel would have without one test
+      vec4 cD = texture(uCol, vec3(uv / uWH, uLayer[i]));
+      float aD = clamp((cD.a - 0.02) / 0.96, 0.0, 1.0);
+      float fD = 1.0 - smoothstep(1.40, 1.48, ang);
+      float visD = fD > 0.0 ? visibility(uLayer[i], pc.z, uv) : 0.0;
+      float g0 = smoothstep(0.5, 20.0, e) * fD * uPres[i];
+      dAll *= 1.0 - g0;
+      dNoMask *= 1.0 - g0 * visD * tail;
+      dNoVis *= 1.0 - g0 * aD * tail;
+      dNoTail *= 1.0 - g0 * aD * visD;
+    }
     if (aw <= 0.0) continue;
     vec4 c = texture(uCol, vec3(uv / uWH, uLayer[i]));
     gTaps += 1.0;
@@ -897,6 +1033,9 @@ void main(){
   }
   if (uMode == 5){ o = vec4(gTaps / 255.0, float(uN) / 255.0, 0.0, 1.0); return; }
   if (uMode == 4){ o = vec4(observed ? float(int(uLayer[top]) + 1) / 255.0 : 0.0, 0.0, 0.0, 1.0); return; }
+  if (uMode == 6){ o = vec4(alpha, 1.0 - dNoTail, 1.0 - dNoVis, 1.0); return; }
+  if (uMode == 7){ o = vec4(1.0 - dNoMask, 1.0 - dAll, observed ? 1.0 : 0.0, 1.0); return; }
+  if (uMode == 8){ o = vec4(observed ? pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma)) : vec3(1.0, 0.0, 1.0), 1.0); return; }
   // The layer: colour and evidence. Proxy no kept image covers is alpha 0:
   // drawn exactly as "nothing" (the background), while its depth still hides
   // what is behind it.
@@ -904,6 +1043,97 @@ void main(){
   vec3 c = pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma));
   o = vec4(c, alpha);
 }`;
+const FS_BLEND = `#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2DArray; precision highp usampler2DArray;
+${GLSL_SHADE}
+in vec3 vX; in vec3 vN; out vec4 o;
+void main(){
+  // the smooth vertex normal where the proxy carries one, else the facet's
+  vec3 N = length(vN) > 0.2 ? normalize(vN) : cross(dFdx(vX), dFdy(vX));
+  if (length(N) < 1e-12) N = uEye - vX;
+  shade(vX, normalize(N), o);
+  if (uMode == 10) o = vec4(0.0, 1.0, 0.0, 1.0);
+}`;
+const FS_FILL = `#version 300 es
+precision highp float; precision highp int;
+precision highp sampler2DArray; precision highp usampler2DArray;
+${GLSL_SHADE}
+uniform highp sampler2D uDepthT; uniform mat4 uInvVP; uniform ivec2 uSize; uniform vec2 uNF; uniform int uFillR;
+out vec4 o;
+float dAt(ivec2 q){
+  if (q.x < 0 || q.y < 0 || q.x >= uSize.x || q.y >= uSize.y) return 1.0;
+  return texelFetch(uDepthT, q, 0).r;
+}
+float lin(float d){ return uNF.x * uNF.y / max(uNF.y - d * (uNF.y - uNF.x), 1e-9); }
+vec3 unproj(vec2 pix, float d){
+  vec4 h = uInvVP * vec4(pix / vec2(uSize) * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+  return h.xyz / h.w;
+}
+/* A thin gap along one axis: the nearest surface pixel on each side within
+   uFillR, two surface pixels deep on each side, and the two sides one plane
+   (window depth is linear across a plane in screen space, so each side's
+   slope must predict the other side to 3% of the distance). */
+bool across(ivec2 p, ivec2 ax, out float d, out float gap, out vec3 A, out vec3 B, out int ia, out int ib){
+  int a = 0, b = 0; ia = 0; ib = 0;
+  for (int k = 1; k <= 8; k++){
+    if (k > uFillR) break;
+    if (a == 0 && dAt(p - ax * k) < 1.0) a = k;
+    if (b == 0 && dAt(p + ax * k) < 1.0) b = k;
+    if (a > 0 && b > 0) break;
+  }
+  d = 1.0; gap = 1e9; A = vec3(0.0); B = vec3(0.0);
+  if (a == 0 || b == 0) return false;
+  float da = dAt(p - ax * a), da2 = dAt(p - ax * (a + 1));
+  float db = dAt(p + ax * b), db2 = dAt(p + ax * (b + 1));
+  if (da2 >= 1.0 || db2 >= 1.0) return false;
+  float span = float(a + b);
+  float pa = da + (da - da2) * span, pb = db + (db - db2) * span;
+  if (pa >= 1.0 || pb >= 1.0 || pa <= 0.0 || pb <= 0.0) return false;
+  float za = lin(da), zb = lin(db);
+  if (abs(lin(pa) - zb) > 0.03 * zb || abs(lin(pb) - za) > 0.03 * za) return false;
+  d = mix(da, db, float(a) / span); gap = span; ia = a; ib = b;
+  // tangent endpoints one pixel further out: a longer baseline, a steadier normal
+  A = unproj(vec2(p - ax * (a + 1)) + 0.5, da2); B = unproj(vec2(p + ax * (b + 1)) + 0.5, db2);
+  return true;
+}
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  if (dAt(p) < 1.0) discard;
+  float d1, g1, d2, g2; vec3 A1, B1, A2, B2; int iA1, iB1, iA2, iB2;
+  bool h = across(p, ivec2(1, 0), d1, g1, A1, B1, iA1, iB1);
+  bool v = across(p, ivec2(0, 1), d2, g2, A2, B2, iA2, iB2);
+  if (!h && !v) discard;
+  bool useH = h && (!v || g1 <= g2);
+  float d = useH ? d1 : d2;
+  vec3 P = unproj(vec2(p) + 0.5, d);
+  vec3 N = (h && v) ? cross(B1 - A1, B2 - A2) : vec3(0.0);
+  if (length(N) < 1e-12){
+    // one axis only (a crack running along the other): the second tangent is
+    // the surface beside the crack, next to either end
+    ivec2 ax = useH ? ivec2(1, 0) : ivec2(0, 1), pe = useH ? ivec2(0, 1) : ivec2(1, 0);
+    vec3 A = useH ? A1 : A2, B = useH ? B1 : B2;
+    ivec2 ea = p - ax * (useH ? iA1 : iA2), eb = p + ax * (useH ? iB1 : iB2);
+    vec3 T2 = vec3(0.0);
+    for (int t = 0; t < 2; t++){
+      ivec2 e = t == 0 ? ea : eb;
+      float dp = dAt(e + pe * 3), dm = dAt(e - pe * 3), d0 = dAt(e);
+      if (dp < 1.0 && dm < 1.0){ T2 = unproj(vec2(e + pe * 3) + 0.5, dp) - unproj(vec2(e - pe * 3) + 0.5, dm); break; }
+      if (dp < 1.0){ T2 = unproj(vec2(e + pe * 3) + 0.5, dp) - unproj(vec2(e) + 0.5, d0); break; }
+      if (dm < 1.0){ T2 = unproj(vec2(e) + 0.5, d0) - unproj(vec2(e - pe * 3) + 0.5, dm); break; }
+    }
+    N = cross(B - A, T2);
+    // nothing beside it either: facing the eye (it only rates obliquity)
+    if (length(N) < 1e-12) N = uEye - P;
+  }
+  shade(P, normalize(N), o);
+  if (uMode == 10) o = vec4(1.0, 0.0, 0.0, 1.0);
+}`;
+/* A debug or measurement layer, as it is. */
+const FS_COPY = `#version 300 es
+precision highp float;
+uniform sampler2D uL; out vec4 o;
+void main(){ o = texelFetch(uL, ivec2(gl_FragCoord.xy), 0); }`;
 
 /* ---------- main --------------------------------------------------------- */
 async function main(){
@@ -927,6 +1157,7 @@ async function main(){
   const layers = [];            // per texture layer: {id, digest, slot, ready, depthReady, kf}
   let capacity = 0, encoding = null, KW = 0, KH = 0, DW = 0, DH = 0, zmax = 1;
   let centre = [0,0,0], diag = 1;
+  let KT = null;                // the keyframes' half-angle tangents {v, h}
 
   function compile(type, src){
     const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
@@ -937,7 +1168,7 @@ async function main(){
     const p = gl.createProgram();
     gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
     gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
-    gl.bindAttribLocation(p, 0, "aQ");
+    gl.bindAttribLocation(p, 0, "aQ"); gl.bindAttribLocation(p, 1, "aN");
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
     const u = {};
@@ -961,7 +1192,9 @@ async function main(){
       pool: program(VS_FULL, FS_POOL),
       coverH: program(VS_FULL, FS_COVER_H),
       composite: program(VS_FULL, FS_COMPOSITE),
-      lay: null,
+      fill: program(VS_FULL, FS_FILL),
+      copy: program(VS_FULL, FS_COPY),
+      lays: new Map(),
       vao: null, vbo: null, ibo: null, col: null, dep: null,
       probeFB: null, probeTex: null, probeRB: null, pbo: null,
     };
@@ -984,25 +1217,44 @@ async function main(){
                           [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
       gl.texParameteri(target, k, v);
   }
-  /* The surface layer and its horizontally blurred coverage, at canvas size. */
+  /* The surface layer (colour + evidence, with mip levels for the composite's
+     coarse coverage), its depth as a texture (read by the crack fill), and the
+     horizontally blurred coverage. One set per size: the canvas, and the small
+     renders the opening and the overview score. */
   function ensureLayers(w, h){
-    if (G.lay && G.lay.w === w && G.lay.h === h) return G.lay;
-    if (G.lay){ gl.deleteTexture(G.lay.c1); gl.deleteTexture(G.lay.c2); gl.deleteRenderbuffer(G.lay.rb);
-                gl.deleteFramebuffer(G.lay.fb1); gl.deleteFramebuffer(G.lay.fb2); }
-    const make = (fmt) => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texStorage2D(gl.TEXTURE_2D, 1, fmt, w, h); nearest(gl.TEXTURE_2D); return t; };
-    const c1 = make(gl.RGBA8), c2 = make(gl.R8);
-    const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    const key = w + "x" + h;
+    let lay = G.lays.get(key);
+    if (lay) return lay;
+    if (G.lays.size >= 3){
+      for (const [k, L] of G.lays){
+        if (k === canvas.width + "x" + canvas.height) continue;
+        gl.deleteTexture(L.c1); gl.deleteTexture(L.c2); gl.deleteTexture(L.dt);
+        gl.deleteFramebuffer(L.fb1); gl.deleteFramebuffer(L.fb2); gl.deleteFramebuffer(L.fb3);
+        G.lays.delete(k); break;
+      }
+    }
+    const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
+    const c1 = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, c1);
+    gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, w, h);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    const c2 = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, c2);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, w, h); nearest(gl.TEXTURE_2D);
+    const dt = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, dt);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, w, h); nearest(gl.TEXTURE_2D);
     const fb1 = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb1);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, c1, 0);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, dt, 0);
     const fb2 = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb2);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, c2, 0);
+    const fb3 = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb3);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, c1, 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    G.lay = {w, h, rb, fb1, fb2, c1, c2};
-    S.gpu.layers = w * h * (4 + 3 + 1);
-    return G.lay;
+    lay = {w, h, c1, c2, dt, fb1, fb2, fb3};
+    G.lays.set(key, lay);
+    if (w === canvas.width && h === canvas.height) S.gpu.layers = Math.round(w * h * (4 * 4 / 3 + 4 + 1));
+    return lay;
   }
 
   function uploadMesh(){
@@ -1011,10 +1263,16 @@ async function main(){
     G.vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, G.vbo);
     gl.bufferData(gl.ARRAY_BUFFER, mesh.pos, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+    if (G.nbo){ gl.deleteBuffer(G.nbo); G.nbo = null; }
+    if (mesh.nrm){
+      G.nbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, G.nbo);
+      gl.bufferData(gl.ARRAY_BUFFER, mesh.nrm, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.BYTE, true, 0, 0);
+    } else { gl.disableVertexAttribArray(1); gl.vertexAttrib3f(1, 0, 0, 0); }
     G.ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, G.ibo);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
     G.idxType = mesh.u32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
-    S.gpu.proxy = mesh.pos.byteLength + mesh.idx.byteLength;
+    S.gpu.proxy = mesh.pos.byteLength + mesh.idx.byteLength + (mesh.nrm ? mesh.nrm.byteLength : 0);
     centre = [mesh.lo[0]+mesh.span[0]/2, mesh.lo[1]+mesh.span[1]/2, mesh.lo[2]+mesh.span[2]/2];
     diag = Math.hypot(mesh.span[0], mesh.span[1], mesh.span[2]) || 1;
     zmax = diag * 2;
@@ -1163,6 +1421,8 @@ async function main(){
     if (first){
       encoding = chooseEncoding(man);
       KW = man.camera.width; KH = man.camera.height;
+      const cf = man.camera;
+      if (cf.fx > 0 && cf.fy > 0) KT = {v: KH / 2 / cf.fy, h: KW / 2 / cf.fx};
       DW = Math.ceil(KW / 4); DH = Math.ceil(KH / 4);
       const budget = (man.selection && man.selection.phone_budget) || 128;
       const cap = encoding === "astc-6x6-rgba" ? (CONFIG.astc_layer_cap || 192) : (CONFIG.rgba8_layer_cap || 48);
@@ -1248,6 +1508,7 @@ async function main(){
      layer -> {p: 0..1, target: 0|1}. */
   const active = new Map();
   let clockMs = null, lastFrameT = 0;
+  let shownAt = null;           // when the opening first drew (the fade-in)
   function setChosen(next, instant){
     const want = new Set(next);
     for (const [L, e] of active){ if (!want.has(L)){ if (instant) active.delete(L); else e.target = 0; } }
@@ -1425,14 +1686,35 @@ async function main(){
               near: 0.02, far: diag * 12};
     }
     const d = dirFrom(cam.yaw, cam.pitch), eye = cam.p.slice();
-    const fyForH = 2 * Math.atan(Math.tan(1.12 / 2) / aspect);
-    const fy = Math.min(1.75, Math.max(1.25, fyForH));
-    return {eye, at: [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]], fy, aspect,
+    return {eye, at: [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]], fy: viewFovY(aspect), aspect,
             near: Math.max(0.02, diag * 0.0015), far: diag * 12};
+  }
+  /* The display field of view is the CAPTURE's: the viewport fits inside the
+     keyframes' own frustum (72 x 45 degrees on the canonical world): never
+     taller than a keyframe, and no wider than OPT.viewMargin times a keyframe
+     on the tangent. The first page drew 72 degrees vertical in landscape (~85
+     horizontal) and 97 in portrait -- twice what any photo framed -- and that
+     margin is where the black, the speckle and the oblique smears lived. A
+     portrait phone is about the keyframe's own shape (the vertical decides); a
+     landscape canvas is limited by the width, where a margin of 1.25 keeps a
+     usable view (measured 1.0 / 1.2 / 1.4: 99.0 / 97.7 / 96.3% drawn at the
+     walk poses, seam excess 2.3 / 2.7 / 2.9, against 88.5% and 5.9 before). */
+  function viewFovY(aspect){
+    if (!KT) return Math.min(1.75, Math.max(1.25, 2 * Math.atan(Math.tan(1.12 / 2) / aspect)));
+    return 2 * Math.atan(Math.min(KT.v, OPT.viewMargin * KT.h / aspect));
   }
   function navView(){
     const c = currentCamera();
-    return {dir: dirFrom, up: UP, fy: c.fy, aspect: c.aspect};
+    return {dir: dirFrom, up: UP, fy: c.fy, aspect: c.aspect, pitchMin: pitchRange[0], pitchMax: pitchRange[1]};
+  }
+  /* The pitch the recorded walk looked at, plus 0.2 rad each way. */
+  let pitchRange = [-NAV.PITCH_MAX, NAV.PITCH_MAX];
+  function recordedPitch(){
+    if (!cams.length) return;
+    let lo = Infinity, hi = -Infinity;
+    for (const c of cams){ const p = yawPitchOf([c[3], c[4], c[5]]).pitch; lo = Math.min(lo, p); hi = Math.max(hi, p); }
+    pitchRange = [Math.max(-NAV.PITCH_MAX, lo - 0.2), Math.min(NAV.PITCH_MAX, hi + 0.2)];
+    S.pitchRange = pitchRange;
   }
   function supportOf(pose){
     if (!navField || !navField.done) return null;
@@ -1469,6 +1751,7 @@ async function main(){
     hintTimer = setTimeout(() => { h.style.opacity = "0"; }, 1100);
   }
   const KEY_SPEED = 1.1 / 1000;          // scene units per ms
+  let pushAcross = 0;                    // look pushed against the edge (radians)
   /* Advance the camera by dt ms: a glide, or input + inertia through NAV.step.
      Returns whether it is still moving (the frame loop keeps drawing). */
   function navUpdate(dt){
@@ -1497,8 +1780,25 @@ async function main(){
       for (let i = 0; i < 3; i++){ ctl.move[i] += vel.move[i] * dt; vel.move[i] *= k; if (Math.abs(vel.move[i]) < 2e-6) vel.move[i] = 0; }
     }
     const pushing = ctl.look[0] || ctl.look[1] || ctl.move[0] || ctl.move[1] || ctl.move[2];
+    const lookYaw = ctl.look[0];
     const next = NAV.step(navField, navPath, cam, {look: ctl.look, move: ctl.move, held}, dt, navView());
     ctl.look = [0, 0]; ctl.move = [0, 0, 0];
+    if (next.waiting){ vel.look = [0, 0]; vel.move = [0, 0, 0]; S.waiting = true; return false; }
+    S.waiting = false;
+    // A look held against the edge that keeps pushing crosses to the next
+    // well-supported direction instead of parking on the edge frame.
+    if (lookYaw && next.resisted > 0.85 && Math.abs(next.yaw - cam.yaw) < Math.abs(lookYaw) * 0.25){
+      pushAcross += Math.abs(lookYaw);
+      if (pushAcross > 0.3){
+        pushAcross = 0;
+        const V = navView(), y = NAV.lookAcross(navField, cam.p, cam.yaw, cam.pitch, Math.sign(lookYaw), V);
+        if (y !== null){
+          S.crossings = (S.crossings || 0) + 1;
+          glideTo({p: cam.p.slice(), yaw: y, pitch: cam.pitch}, null);
+          return true;
+        }
+      }
+    } else if (!lookYaw || next.resisted < 0.5) pushAcross = 0;
     const moved = Math.abs(next.yaw - cam.yaw) + Math.abs(next.pitch - cam.pitch)
       + Math.hypot(next.p[0]-cam.p[0], next.p[1]-cam.p[1], next.p[2]-cam.p[2]) > 1e-5;
     if (pushing && next.resisted > 0){
@@ -1534,6 +1834,8 @@ async function main(){
       total += 0.5 * Math.hypot(cr[0], cr[1], cr[2]); cum[f] = total;
     }
     const rand = mulberry(20260917), samples = new Float32Array(NAV_SAMPLES * 3);
+    const normals = new Float32Array(NAV_SAMPLES * 3);
+    const holeNear = voidEdges();
     for (let s = 0; s < NAV_SAMPLES; s++){
       const r = rand() * total;
       let l = 0, h = nF - 1;
@@ -1541,8 +1843,11 @@ async function main(){
       const a = P(idx[l*3]), b = P(idx[l*3+1]), c = P(idx[l*3+2]);
       let u = rand(), v = rand(); if (u + v > 1){ u = 1 - u; v = 1 - v; }
       for (let k = 0; k < 3; k++) samples[s*3+k] = a[k] + (b[k]-a[k]) * u + (c[k]-a[k]) * v;
+      const fn = norm3(cross3([b[0]-a[0], b[1]-a[1], b[2]-a[2]], [c[0]-a[0], c[1]-a[1], c[2]-a[2]]));
+      normals.set(fn, s * 3);
     }
-    const centres = new Float32Array(ready.length * 3), off = new Int32Array(NAV_SAMPLES + 1), seen = [];
+    const centres = new Float32Array(ready.length * 3), off = new Int32Array(NAV_SAMPLES + 1), seen = [], seenQ = [];
+    const sampleQ = new Uint8Array(NAV_SAMPLES);
     ready.forEach((L, k) => { const kf = L.kf, Rr = kf.rotation, t = kf.translation;
       const C = kf._C || (kf._C = [-(Rr[0]*t[0]+Rr[3]*t[1]+Rr[6]*t[2]), -(Rr[1]*t[0]+Rr[4]*t[1]+Rr[7]*t[2]), -(Rr[2]*t[0]+Rr[5]*t[1]+Rr[8]*t[2])]);
       centres.set(C, k * 3); });
@@ -1556,10 +1861,73 @@ async function main(){
         if (u < 8 || v < 8 || u > KW - 8 || v > KH - 8) continue;
         if (!sourceVisible(ready[k], z, u, v)) continue;
         seen.push(k);
+        // how squarely this source saw the surface: a grazing source smears
+        const C = ready[k].kf._C, dx = C[0] - X0, dy = C[1] - X1, dz = C[2] - X2;
+        const cosI = Math.abs(normals[s*3] * dx + normals[s*3+1] * dy + normals[s*3+2] * dz) / (Math.hypot(dx, dy, dz) || 1);
+        seenQ.push(Math.round(255 * (0.2 + 0.8 * NAV.smooth(0.1, 0.4, cosI))));
       }
       off[s + 1] = seen.length;
+      // one source only is fragile; beside a large hole in the proxy the view
+      // shows the hole
+      const n = off[s + 1] - off[s];
+      sampleQ[s] = Math.round(255 * (n >= 2 ? 1 : 0.7) * (holeNear(X0, X1, X2) ? 0.3 : 1));
     }
-    return {samples, seenOff: off, seenIdx: Int32Array.from(seen), centres, path: navPath};
+    return {samples, seenOff: off, seenIdx: Int32Array.from(seen), seenQ: Uint8Array.from(seenQ), sampleQ,
+            centres, path: navPath};
+  }
+  /* Large holes in the proxy: boundary edges (used by one face), joined into
+     loops, kept when a loop's perimeter is at least HOLE_PERIMETER (a thin
+     crack is closed on the screen by FS_FILL and does not count). Returns
+     near(x, y, z): is a point within HOLE_REACH of such a loop. */
+  const HOLE_PERIMETER = 0.8, HOLE_REACH = 0.35;
+  function voidEdges(){
+    const {pos, idx, lo, span, nI, nV} = mesh;
+    const keys = new Float64Array(nI);
+    for (let f = 0; f < nI; f += 3) for (let e = 0; e < 3; e++){
+      const a = idx[f + e], b = idx[f + (e + 1) % 3];
+      keys[f + e] = a < b ? a * nV + b : b * nV + a;
+    }
+    keys.sort();
+    const parent = new Int32Array(nV).map((_, i) => i);
+    const find = x => { while (parent[x] !== x){ parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    const P = i => [lo[0] + pos[i*3] / 65535 * span[0], lo[1] + pos[i*3+1] / 65535 * span[1], lo[2] + pos[i*3+2] / 65535 * span[2]];
+    const edges = [];
+    for (let i = 0; i < nI; ){
+      let j = i + 1; while (j < nI && keys[j] === keys[i]) j++;
+      if (j - i === 1){
+        const a = Math.floor(keys[i] / nV), b = keys[i] - a * nV;
+        edges.push(a, b);
+        const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb;
+      }
+      i = j;
+    }
+    const perim = new Map();
+    for (let e = 0; e < edges.length; e += 2){
+      const pa = P(edges[e]), pb = P(edges[e + 1]), r = find(edges[e]);
+      perim.set(r, (perim.get(r) || 0) + Math.hypot(pa[0]-pb[0], pa[1]-pb[1], pa[2]-pb[2]));
+    }
+    const cell = HOLE_REACH, grid = new Map();
+    const keyOf = (x, y, z) => Math.floor(x / cell) + "," + Math.floor(y / cell) + "," + Math.floor(z / cell);
+    let big = 0;
+    for (let e = 0; e < edges.length; e += 2){
+      if ((perim.get(find(edges[e])) || 0) < HOLE_PERIMETER) continue;
+      big++;
+      for (const v of [edges[e], edges[e + 1]]){
+        const p = P(v), k = keyOf(p[0], p[1], p[2]);
+        if (!grid.has(k)) grid.set(k, []);
+        grid.get(k).push(p);
+      }
+    }
+    S.navHoles = {openEdges: edges.length / 2, loops: perim.size, largeLoopEdges: big};
+    return (x, y, z) => {
+      const i = Math.floor(x / cell), j = Math.floor(y / cell), k = Math.floor(z / cell);
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++){
+        const list = grid.get((i + a) + "," + (j + b) + "," + (k + c));
+        if (!list) continue;
+        for (const p of list) if (Math.hypot(p[0] - x, p[1] - y, p[2] - z) < HOLE_REACH) return true;
+      }
+      return false;
+    };
   }
   function buildNav(){
     const gen = ++navGeneration;
@@ -1579,7 +1947,11 @@ async function main(){
       if (!job.done){ setTimeout(slice, 0); return; }
       navField = job; navJob = null; overviewPose = null;
       S.nav.phase = "ready"; S.nav.ms = Math.round(spent);
-      cam.floor = floorAt(cam);
+      S.nav.holeSamples = Array.from(input.sampleQ).filter(q => q < 128).length;
+      // the floor comes from the recorded pose the camera is at, never from
+      // wherever it happens to be (review 2026-09-17, item 5)
+      if (!glideState && cams.length) cam.floor = floorAt(poseOf(ci));
+      scorePoses();
       $("bOverview").disabled = false;
       requestDraw();
     };
@@ -1590,28 +1962,42 @@ async function main(){
      proposes (support x a mild preference for wide content, from points at
      least 0.15 above the walk), the real blend decides (drawn fraction of a
      small render, the opening's score), best of the top few. */
+  /* At the capture's field of view a drawn-only score chose a close-up of the
+     door edge (100% drawn): the overview also needs depth -- its view's mean
+     distance at least OVERVIEW_DEPTH x the scene's median, and the score
+     favours distance. */
+  const OVERVIEW_AWAY = 1.2, OVERVIEW_DEPTH = 0.5;
   function findOverview(){
     if (!navField || !navField.done) return null;
     const t0 = performance.now(), V = navView(), F = navField;
     const ref = CONFIG.median_scene_depth || diag * 0.25, found = [];
+    // what the walk looked at most: the mean of the recorded look targets
+    const focus = [0, 0, 0];
+    for (const c of cams) for (let k = 0; k < 3; k++) focus[k] += (c[k] + c[k + 3] * ref) / cams.length;
     for (let a = 0; a < F.count; a++){
       const p = [F.where[a*3], F.where[a*3+1], F.where[a*3+2]];
       const pd = NAV.pathDist(navPath, p);
       if (pd.e > 0.85 || !pd.closest) continue;
       const rise = dot3([p[0]-pd.closest[0], p[1]-pd.closest[1], p[2]-pd.closest[2]], UP);
       if (rise < 0.15) continue;
+      // a vantage visibly different from where the page opened
+      const o = poseOf(opening >= 0 ? opening : 0);
+      if (Math.hypot(p[0]-o.p[0], p[1]-o.p[1], p[2]-o.p[2]) < OVERVIEW_AWAY) continue;
       for (let k = 0; k < 12; k++) for (const pitch of [-0.5, -0.3]){
         const yaw = -Math.PI + k * Math.PI / 6;
         const r = NAV.support(F, p, dirFrom(yaw, pitch), UP, V.fy, V.aspect);
-        if (r.s < NAV.T_HI) continue;
-        found.push({p, yaw, pitch, s: r.s, score: r.s * (0.8 + 0.2 * Math.min(1, r.dist / (2.5 * ref)))});
+        // an overview looks at the room, not at a wall a metre away
+        if (r.s < NAV.T_LO || r.dist < OVERVIEW_DEPTH * ref) continue;
+        const toward = dot3(dirFrom(yaw, pitch), norm3([focus[0]-p[0], focus[1]-p[1], focus[2]-p[2]]));
+        found.push({p, yaw, pitch, s: r.s, toward,
+                    score: r.s * (0.5 + 0.5 * Math.min(1, r.dist / (1.5 * ref))) * (0.5 + 0.5 * Math.max(0, toward))});
       }
     }
     found.sort((x, y) => y.score - x.score);
     const top = [];
     for (const f of found){
       if (top.every(o => Math.hypot(o.p[0]-f.p[0], o.p[1]-f.p[1], o.p[2]-f.p[2]) > 1.0 || Math.abs(o.yaw - f.yaw) > 0.6)) top.push(f);
-      if (top.length >= 6) break;
+      if (top.length >= 12) break;
     }
     if (!top.length) return null;
     const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
@@ -1622,12 +2008,18 @@ async function main(){
     let best = null;
     for (const f of top){
       cam = {p: f.p, yaw: f.yaw, pitch: f.pitch, floor: 1};
-      const r = drawnFraction(currentCamera(aspect), w, h);
-      f.drawn = r.drawn; f.rendered = openingScore(r);
+      const r = drawnFraction(currentCamera(aspect), w, h, true);
+      f.drawn = r.drawn; f.distance = r.distance; f.spread = r.spread;
+      // drawn, deep, toward what the walk looked at, and with something in it
+      // (a plain wall or a door filling the frame has little colour spread)
+      f.rendered = r.drawn * (0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref)))
+        * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.3 + 0.7 * Math.min(1, r.spread / 0.2));
       if (!best || f.rendered > best.rendered) best = f;
     }
     cam = save; override = saveOverride;
-    S.overview = {ms: Math.round(performance.now() - t0), considered: found.length,
+    // NOT S.overview: that is the verification hook, and assigning the
+    // statistics over it made the second press a TypeError
+    S.overviewStats = {ms: Math.round(performance.now() - t0), considered: found.length,
                   top: top.map(f => ({support: +f.s.toFixed(3), drawn: +f.drawn.toFixed(3), score: +f.rendered.toFixed(3)})),
                   chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn}};
     return best && {p: best.p.slice(), yaw: best.yaw, pitch: best.pitch};
@@ -1753,48 +2145,56 @@ async function main(){
   const U9 = new Float32Array(9 * MAXC), U3a = new Float32Array(3 * MAXC), U3b = new Float32Array(3 * MAXC),
         U3c = new Float32Array(3 * MAXC), U4 = new Float32Array(4 * MAXC), U1 = new Float32Array(MAXC),
         UQ = new Float32Array(MAXC), U2 = new Float32Array(2 * MAXC), UPRES = new Float32Array(MAXC);
+  /* Every frame, measurement and debug mode draws the same way: the surface
+     layer (proxy fragments, then thin cracks closed) into an offscreen set,
+     then either the composite (mode 0) or the layer as it is (a debug mode). */
   function drawBlend(cam, MVP, list, modeOverride, target){
     const mode = modeOverride ?? OPT.debugMode;
-    if (mode !== 0 || target){
-      // debug modes and measurements: the surface layer's own output
-      blendPass(cam, MVP, list, mode, target ? target.fb : null,
-                target ? target.w : canvas.width, target ? target.h : canvas.height);
-      return;
-    }
-    const w = canvas.width, h = canvas.height, lay = ensureLayers(w, h);
-    const radius = Math.round(OPT.fadePx * Math.min(window.devicePixelRatio || 1, 2));
-    blendPass(cam, MVP, list, 0, lay.fb1, w, h);
+    const w = target ? target.w : canvas.width, h = target ? target.h : canvas.height;
+    const dpr = target ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const lay = ensureLayers(w, h);
+    blendPass(cam, MVP, list, mode, lay, w, h, dpr);
     gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
     gl.bindVertexArray(null);
+    const out = target ? target.fb : null;
+    if (mode !== 0){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, out); gl.viewport(0, 0, w, h);
+      gl.useProgram(G.copy.p);
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, lay.c1);
+      gl.uniform1i(G.copy.u.uL, 3);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+      return;
+    }
+    const radius = Math.round(OPT.fadePx * dpr);
     gl.bindFramebuffer(gl.FRAMEBUFFER, lay.fb2); gl.viewport(0, 0, w, h);
     gl.useProgram(G.coverH.p);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, lay.c1);
     gl.uniform1i(G.coverH.u.uL, 3); gl.uniform1i(G.coverH.u.uRadius, radius);
     gl.uniform2i(G.coverH.u.uSize, w, h);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, w, h);
-    gl.useProgram(G.composite.p);
+    const coarse = OPT.fog > 0 || OPT.wide > 0;
+    if (coarse){ gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, lay.c1); gl.generateMipmap(gl.TEXTURE_2D); }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, out); gl.viewport(0, 0, w, h);
+    const C = G.composite;
+    gl.useProgram(C.p);
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, lay.c2);
-    gl.uniform1i(G.composite.u.uL, 3); gl.uniform1i(G.composite.u.uCover, 4);
-    gl.uniform1i(G.composite.u.uRadius, radius); gl.uniform2i(G.composite.u.uSize, w, h);
-    gl.uniform2f(G.composite.u.uRes, w, h);
+    gl.uniform1i(C.u.uL, 3); gl.uniform1i(C.u.uCover, 4);
+    gl.uniform1i(C.u.uRadius, radius); gl.uniform2i(C.u.uSize, w, h);
+    gl.uniform2f(C.u.uRes, w, h);
+    // the coarse level: about 24 texels across the frame's short side
+    gl.uniform1f(C.u.uFogLod, Math.max(0, Math.log2(Math.min(w, h) / 24)));
+    const show = shownAt === null ? 1 : Math.min(1, (performance.now() - shownAt) / 450);
+    gl.uniform1f(C.u.uShow, show * show * (3 - 2 * show));
+    if (show < 1) requestDraw();
+    gl.uniform1f(C.u.uFog, coarse ? OPT.fog : 0); gl.uniform1f(C.u.uWide, coarse ? OPT.wide : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
   }
-  function blendPass(cam, MVP, list, mode, fb, w, h){
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.viewport(0, 0, w, h);
-    gl.clearColor(0, 0, 0, fb && mode === 0 ? 0 : 1);
-    gl.depthMask(true); gl.colorMask(true, true, true, true);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!mesh) return;
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
-    gl.colorMask(false, false, false, false);
-    gl.useProgram(G.view.p); meshUniforms(G.view); gl.uniformMatrix4fv(G.view.u.uMVP, false, MVP);
-    drawMesh();
-    gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
-    const P = G.blend;
-    gl.useProgram(P.p); meshUniforms(P);
-    gl.uniformMatrix4fv(P.u.uMVP, false, MVP);
+  function shadeUniforms(P, cam, list, mode, w, h){
+    meshUniforms(P);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.dep);
     gl.uniform1i(P.u.uCol, 0); gl.uniform1i(P.u.uDep, 1);
@@ -1824,11 +2224,45 @@ async function main(){
     gl.uniform4fv(P.u.uIntr, U4); gl.uniform1fv(P.u.uQ, UQ);
     gl.uniform2f(P.u.uWH, KW, KH); gl.uniform2i(P.u.uDWH, DW, DH);
     gl.uniform1f(P.u.uZmax, zmax); gl.uniform3f(P.u.uEye, cam.eye[0], cam.eye[1], cam.eye[2]);
-    gl.uniform1f(P.u.uExposure, CONFIG.exposure || 1.8); gl.uniform1f(P.u.uGamma, CONFIG.gamma || 1.15);
+    gl.uniform1f(P.u.uExposure, OPT.exposure); gl.uniform1f(P.u.uGamma, OPT.gamma);
     gl.uniform1i(P.u.uMode, mode);
     gl.uniform1f(P.u.uFar, zmax * 3);
+  }
+  function blendPass(cam, MVP, list, mode, lay, w, h, dpr){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lay.fb1); gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, mode === 0 ? 0 : 1);
+    gl.depthMask(true); gl.colorMask(true, true, true, true);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (!mesh) return;
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+    gl.colorMask(false, false, false, false);
+    gl.useProgram(G.view.p); meshUniforms(G.view); gl.uniformMatrix4fv(G.view.u.uMVP, false, MVP);
+    drawMesh();
+    gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
+    const P = G.blend;
+    gl.useProgram(P.p);
+    shadeUniforms(P, cam, list, mode, w, h);
+    gl.uniformMatrix4fv(P.u.uMVP, false, MVP);
     drawMesh();
     gl.depthMask(true); gl.depthFunc(gl.LESS);
+    const fillR = Math.min(8, Math.round(OPT.fillPx * dpr));
+    if (fillR > 0){
+      // thin cracks in the proxy: the same shading at the plane across them
+      gl.bindFramebuffer(gl.FRAMEBUFFER, lay.fb3); gl.viewport(0, 0, w, h);
+      gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+      gl.bindVertexArray(null);
+      const F = G.fill;
+      gl.useProgram(F.p);
+      shadeUniforms(F, cam, list, mode, w, h);
+      gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, lay.dt);
+      gl.uniform1i(F.u.uDepthT, 5);
+      gl.uniformMatrix4fv(F.u.uInvVP, false, M.inv(MVP));
+      gl.uniform2i(F.u.uSize, w, h); gl.uniform2f(F.u.uNF, cam.near, cam.far);
+      gl.uniform1i(F.u.uFillR, fillR);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
@@ -1887,6 +2321,8 @@ async function main(){
   }
   function frame(sync){
     if (!G || gl.isContextLost() || !mesh || !G.col) return;
+    // nothing is drawn until the opening pose is chosen; then it fades in
+    if (shownAt === null) return;
     resize();
     const now = performance.now();
     const dt = clockMs !== null ? clockMs : (lastFrameT ? Math.min(100, now - lastFrameT) : 0);
@@ -1914,7 +2350,7 @@ async function main(){
   /* How much of a small render of `cam`, at the canvas's own aspect, is DRAWN:
      the mean of the evidence alpha, and the
      mean viewing distance of what is drawn. */
-  function drawnFraction(cam, w, h){
+  function drawnFraction(cam, w, h, content){
     const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
     const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
@@ -1928,6 +2364,21 @@ async function main(){
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    // optionally how much there is to see: the spread of the drawn colour
+    let spread = 0;
+    if (content){
+      drawBlend(cam, MVP, picks, 8, {fb, w, h});
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      const col = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, col);
+      let n = 0, m = 0, m2 = 0;
+      for (let i = 0; i < col.length; i += 4){
+        if (px[i] < 128) continue;
+        const y = (0.299 * col[i] + 0.587 * col[i+1] + 0.114 * col[i+2]) / 255;
+        n++; m += y; m2 += y * y;
+      }
+      if (n) spread = Math.sqrt(Math.max(0, m2 / n - (m / n) * (m / n)));
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
     let drawn = 0, dsum = 0;
@@ -1937,7 +2388,7 @@ async function main(){
       if (a <= 0) continue;
       drawn += a; dsum += a * (px[i+1] * 256 + px[i+2]) / 65535 * far;
     }
-    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0};
+    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread};
   }
   /* The opening view: the recorded pose whose rendered frame is most DRAWN,
      with a mild preference (at most 15%) for wider content -- a view of the
@@ -1975,6 +2426,8 @@ async function main(){
     cam = saveCam; override = saveOverride;
     S.timing.openingMs = performance.now() - t;
     const b = seen.get(best) || {};
+    if (poseQ.length !== cams.length) poseQ = new Array(cams.length).fill(-1);
+    for (const [k, v] of seen) poseQ[k] = v.drawn;
     S.opening = {index: best, step, fine, tested: seen.size, score: bestScore,
                  drawn: b.drawn, distance: b.distance, size: [w, h]};
     return best;
@@ -2114,10 +2567,40 @@ async function main(){
   addEventListener("keyup", e => { keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key); });
   addEventListener("blur", () => { keys.clear(); ctl.held = false; pts.clear(); });
 
+  /* Prev/next walk only through recorded poses that render well: a pose whose
+     drawn fraction (the opening's measure, at this canvas) is below POSE_MIN
+     is skipped (review: 35 of 198 poses under 70% drawn, 59-94 half black). */
+  const POSE_MIN = 0.8;
   function step(d){
     if (!cams.length) return;
-    const i = Math.max(0, Math.min(cams.length-1, ci + d));
+    const i = NAV.nextPose(poseQ, ci, d, POSE_MIN);
+    if (i === ci){ hint(0.6); return; }
     glideTo(poseOf(i), i); ci = i;
+  }
+  let poseQ = [], poseJob = 0;
+  function scorePoses(){
+    const gen = ++poseJob, t0 = performance.now();
+    if (poseQ.length !== cams.length) poseQ = new Array(cams.length).fill(-1);
+    let i = 0;
+    const slice = () => {
+      if (gen !== poseJob || !G) return;
+      const t = performance.now();
+      while (i < cams.length && performance.now() - t < 12){
+        if (!(poseQ[i] >= 0)){
+          const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
+          const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
+          const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
+          const save = cam, saveOverride = override; override = null;
+          const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
+          poseQ[i] = drawnFraction(currentCamera(aspect), w, h).drawn;
+          cam = save; override = saveOverride;
+        }
+        i++;
+      }
+      if (i < cams.length){ setTimeout(slice, 16); return; }
+      S.poses = {ms: Math.round(performance.now() - t0), below: poseQ.filter(x => x < POSE_MIN).length, min: POSE_MIN};
+    };
+    setTimeout(slice, 0);
   }
   function reset(){
     const i = opening >= 0 ? opening : 0;
@@ -2132,6 +2615,7 @@ async function main(){
   addEventListener("resize", requestDraw);
 
   /* -------- caption: exactly what this is ---------------------------------- */
+  let captionOpen = false;
   function updateCaption(){
     const cap = $("caption");
     cap.textContent = "";
@@ -2148,12 +2632,22 @@ async function main(){
       bits.push(reason ? String(reason) : "built from an earlier reconstruction");
     }
     if (encoding === "webp-rgba") bits.push("reduced set: this device has no compressed-texture support");
+    // One short line by default; what it is and what the dark areas mean on
+    // tap (the review: four lines covered 11-13% of the frame).
     let note = "These are the camera's own frames, with faces redacted, placed on the reconstructed room. "
       + "Dark areas are places no kept frame saw, or that were masked as unreliable (redaction, hands, "
       + "views that disagreed); nothing there is filled in. Where the geometry underneath is wrong, "
       + "images smear or double.";
     if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
-    cap.append(head, bits.length ? " · " + bits.join(" · ") : "", document.createElement("br"), note);
+    const more = document.createElement("span");
+    more.className = "more";
+    more.textContent = (bits.length ? bits.join(" · ") + ". " : "") + note;
+    more.hidden = !captionOpen;
+    const toggle = document.createElement("button");
+    toggle.id = "bInfo"; toggle.textContent = captionOpen ? "Less" : "About";
+    toggle.setAttribute("aria-expanded", String(captionOpen));
+    toggle.onclick = () => { captionOpen = !captionOpen; updateCaption(); };
+    cap.append(head, toggle, more);
   }
 
   /* -------- verification hooks (read-only, and harmless on the phone) ------- */
@@ -2223,6 +2717,7 @@ async function main(){
     if (c.held !== undefined) ctl.held = !!c.held;
     return true; };
   S.step = (d) => { step(d); return ci; };
+  S.poseQuality = () => poseQ.slice();
   S.overview = () => overview();
   S.frame = () => { frame(true); return S.pose(); };
 
@@ -2231,6 +2726,7 @@ async function main(){
     buildGL();
     basis();
     navPath = cams.length ? NAV.makePath(cams, UP) : null;
+    recordedPitch();
     S.phase = "loading";
     status("Loading the images…");
     await serial(() => loadRevision(CONFIG.appearance_revision || null));
@@ -2241,6 +2737,8 @@ async function main(){
     ci = opening >= 0 ? opening : 0;
     setPose(poseOf(ci));
     updateCaption();
+    // verification captures want the settled picture; a person sees a fade
+    shownAt = DEBUG && OPT.preserve ? -1e9 : performance.now();
     frame(true);
     S.phase = "ready";
     S.timing.bootMs = performance.now() - T0;
