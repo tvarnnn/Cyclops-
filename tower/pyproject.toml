@@ -52,6 +52,21 @@ dense = [
     "torch>=2.4",
     "transformers>=4.44",
 ]
+# The appearance stage (tower/world_builder/appearance.py,
+# docs/contracts/WORLD-BUILDER-APPEARANCE.md). Needs `dense` (torch, the depth
+# work) as well.
+#   astc-encoder-py  MIT wrapper of ARM astcenc (Apache-2.0); a cp37-abi3 wheel,
+#                    depends on archspec only. The phone's ASTC 6x6 chunks.
+#                    Chosen over etcpak/ETC2 on measurement: 43.8 dB vs 39.5 dB
+#                    at 102,720 vs 230,400 bytes a keyframe. Without it the
+#                    stage still publishes the WebP fallback and says so.
+#   open3d           the proxy ray caster (Embree). Already imported by
+#                    `surface.decimate`; declared here because this stage
+#                    cannot run without it.
+appearance = [
+    "astc-encoder-py==0.1.12",
+    "open3d>=0.19",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a

@@ -315,7 +315,25 @@ def build_render_revision(store: WorldStore, world_id: str,
             # The session is in the revision, so an open picture whose session
             # the Tower chose notices when the Tower would choose a newer one.
             "revision": f"{chosen}/{revision}",
-            "live": session_build_running(store, world_id, chosen)}
+            "live": session_build_running(store, world_id, chosen),
+            # WORLD-BUILDER-APPEARANCE.md §9. Separate from `revision` on
+            # purpose: the page follows appearance builds itself, and folding
+            # them into the page revision would swap the page -- and reset the
+            # wearer's camera -- on every one. `null` exactly when the
+            # appearance route would 404, including a changed redaction label.
+            "appearance": _appearance_revision(store, world_id, chosen)}
+
+
+def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> dict:
+    try:
+        from tower.results.world_builder_appearance import (  # noqa: PLC0415
+            appearance_revision,
+        )
+
+        return appearance_revision(store, world_id, session_id)
+    except Exception:  # noqa: BLE001 -- the page revision must survive an appearance bug
+        logger.debug("[Tower][WorldBuilder] appearance revision failed", exc_info=True)
+        return {"revision": None, "current": False}
 
 
 def _stage_running(status_path, is_stale) -> bool:
@@ -395,6 +413,12 @@ def session_build_running(store: WorldStore, world_id: str, session_id: str) -> 
         )
 
         if _stage_running(world_dir / "surface" / session_id / "status.json",
+                          surface_status_is_stale):
+            return True
+        # The appearance stage runs after the surface in the same child and
+        # writes the same kind of status; while it runs, a better picture is
+        # still coming.
+        if _stage_running(world_dir / "appearance" / session_id / "status.json",
                           surface_status_is_stale):
             return True
     except Exception:  # noqa: BLE001 -- a surface module that will not import

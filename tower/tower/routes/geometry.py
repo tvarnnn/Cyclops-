@@ -13,9 +13,15 @@ and the hash off the event loop with no executor of our own.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from tower.results.envelope import json_safe
+from tower.results.world_builder_appearance import (
+    NO_STORE_HEADERS,
+    AppearanceNotServed,
+    appearance_file,
+    appearance_manifest,
+)
 from tower.results.world_builder_geometry import (
     build_manifest,
     build_segment,
@@ -89,6 +95,60 @@ def geometry_segment(
     if chunk is None:
         raise HTTPException(status_code=404, detail="no such segment")
     return chunk
+
+
+def _appearance_store(request: Request):
+    root = getattr(request.app.state, "world_root", None)
+    if root is None:
+        raise HTTPException(status_code=404, detail="no world root is configured",
+                            headers=NO_STORE_HEADERS)
+    return store_from_root(root)
+
+
+def _appearance_headers(label: str) -> dict:
+    return {**NO_STORE_HEADERS, "X-World-Redaction": label}
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/manifest")
+def appearance_manifest_route(world_id: str, session_id: str, request: Request) -> JSONResponse:
+    """The appearance artifact's manifest (`WORLD-BUILDER-APPEARANCE.md` §9).
+
+    Imagery metadata of a private space: `no-store`, no validators, and the
+    session's redaction label re-checked on every request -- a relabelled
+    session answers 404 rather than its old textures.
+    """
+    try:
+        payload, label = appearance_manifest(_appearance_store(request), world_id, session_id)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    return JSONResponse(json_safe(payload), headers=_appearance_headers(label))
+
+
+def _appearance_bytes(request: Request, world_id: str, session_id: str, kind: str,
+                      digest: str) -> Response:
+    try:
+        data, label = appearance_file(_appearance_store(request), world_id, session_id,
+                                      kind, digest)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    return Response(content=data, media_type="application/octet-stream",
+                    headers=_appearance_headers(label))
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/chunk/{digest}")
+def appearance_chunk_route(world_id: str, session_id: str, digest: str,
+                           request: Request) -> Response:
+    """One keyframe bundle, by the content digest the manifest names."""
+    return _appearance_bytes(request, world_id, session_id, "chunk", digest)
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/proxy/{digest}")
+def appearance_proxy_route(world_id: str, session_id: str, digest: str,
+                           request: Request) -> Response:
+    """The proxy mesh the appearance was built against (`WBSURF01`)."""
+    return _appearance_bytes(request, world_id, session_id, "proxy", digest)
 
 
 @router.get("/worlds/{world_id}/render/revision")
