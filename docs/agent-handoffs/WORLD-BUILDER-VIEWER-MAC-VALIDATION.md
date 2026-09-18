@@ -107,16 +107,19 @@ count, count it:
 
 ```sh
 cd ~/Projects/Glasses-worktrees/wb-final-recon
+count() { awk -v c="$1" '$0 ~ "^final class " c {f=1; next} /^final class /{f=0}   f && /^    func test/{n++} END{print n+0}' "$2"; }
 for c in WorldAssetTransportTests WorldRenderRevisionTests WorldRenderViewerTests; do
-  printf '%s ' "$c"
-  awk "/^final class $c/,0" ios/GlassesTests/WorldBuilderIntegrationTests.swift | grep -c '    func test'
+  echo "$c $(count $c ios/GlassesTests/WorldBuilderIntegrationTests.swift)"
 done
-printf 'WorldRenderRepresentationTests '
-awk '/^final class WorldRenderRepresentationTests/,0' ios/GlassesTests/WorldPresentationTests.swift | grep -c '    func test'
+echo "WorldRenderRepresentationTests $(count WorldRenderRepresentationTests ios/GlassesTests/WorldPresentationTests.swift)"
 ```
 
-At this lane's head that prints **18, 39, 21, 9**. Record what it prints on the
-Mac and what `xcodebuild` executed; they must agree.
+At this lane's head that prints **18, 40, 21, 9** (at `f6d5520`: 15, 35, 21, 9).
+Record what it prints on the Mac and what `xcodebuild` executed; they must
+agree. Note the range has to STOP at the next `final class`: an
+`awk '/^final class X/,0'` runs to end of file and counts every later class
+too, which is one of the ways this file grew three different numbers for one
+class.
 
 Timing-sensitive, name them if they flake:
 `testAnAppearanceOnlyChangeNeverReloadsThePage`,
