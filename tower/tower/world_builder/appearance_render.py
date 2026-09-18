@@ -105,7 +105,22 @@ SOURCE_FADE_MS = 280
 #   and shaded from the sources like the proxy;
 # - a void is an unlit fog of the coarse grey luminance around it, and dims
 #   the room near it by up to VOID_WIDE_FADE.
-VIEW_MARGIN = 1.25
+# The fix-it framing lane (Glasses-scratch/wb-final-recon/fixit/framing):
+# - cutting the viewport to the keyframe exactly took the damage out and left a
+#   viewfinder so tight that 61% of the reachable views were a clean, well-lit,
+#   empty wall. The frame is the capture's plus a MARGIN on each tangent:
+#   VIEW_MARGIN on the horizontal and VIEW_MARGIN_V on the vertical (which only
+#   binds on a portrait canvas, where the keyframe's own vertical decides).
+#   Swept 1.0/1.15/1.25/1.4/1.6 over the 40 walk poses and 20 look-arounds:
+#   1.4 keeps drawn at 95.9% on the walk poses (96.9% at 1.25) for 12% more
+#   detail, and breaks two of the 61 shots by more than 5 points of drawn;
+#   1.6 breaks thirteen.
+# - STANDOFF is how close the camera may come to the proxy: at 0.55 it could be
+#   pressed against a wall and fill the frame with one blurred patch that the
+#   envelope scored as fully supported.
+VIEW_MARGIN = 1.4
+VIEW_MARGIN_V = 1.15
+STANDOFF = 1.0
 CRACK_FILL_PX = 4
 VOID_FOG = 0.35
 VOID_WIDE_FADE = 0.2
@@ -206,6 +221,8 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "consensus": CONSENSUS,
         "source_fade_ms": SOURCE_FADE_MS,
         "view_margin": VIEW_MARGIN,
+        "view_margin_v": VIEW_MARGIN_V,
+        "standoff": STANDOFF,
         "crack_fill_px": CRACK_FILL_PX,
         "void_fog": VOID_FOG,
         "void_wide_fade": VOID_WIDE_FADE,

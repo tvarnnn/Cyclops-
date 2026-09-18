@@ -901,11 +901,17 @@ console.log("inv ok");
 
 class TestTheCapturesOwnLook:
 
-    def test_the_display_field_of_view_is_the_keyframes(self):
+    def test_the_display_field_of_view_is_the_keyframes_plus_a_bounded_margin(self):
+        """The frame is the capture's own, widened by a margin on each tangent
+        (the fix-it framing lane: cut to the keyframe exactly, more than half
+        of the reachable views were a clean empty wall) and capped, so no
+        canvas shape and no margin can make the page look like a fisheye."""
         text = _template()
         cam = _section(text, "function currentCamera(", "function navView(")
         assert "fy: viewFovY(aspect)" in cam
-        assert "return 2 * Math.atan(Math.min(KT.v, OPT.viewMargin * KT.h / aspect));" in cam
+        assert "const FOV_MAX_V = 1.48, FOV_MAX_H = 1.75;" in cam
+        assert "const t = Math.min(OPT.viewMarginV * KT.v, OPT.viewMargin * KT.h / aspect," in cam
+        assert "Math.tan(FOV_MAX_V / 2), Math.tan(FOV_MAX_H / 2) / aspect);" in cam
         assert "if (cf.fx > 0 && cf.fy > 0) KT = {v: KH / 2 / cf.fy, h: KW / 2 / cf.fx};" in text
 
     def test_the_display_mapping_matches_the_keyframes_brightness(self, built):
@@ -915,7 +921,9 @@ class TestTheCapturesOwnLook:
         assert config["exposure"] == R.DISPLAY_EXPOSURE == 1.0
         assert config["gamma"] == R.DISPLAY_GAMMA == 1.0
         assert config["tone_knee"] == R.TONE_KNEE == 0.8
-        assert config["view_margin"] == R.VIEW_MARGIN == 1.25
+        assert config["view_margin"] == R.VIEW_MARGIN == 1.4
+        assert config["view_margin_v"] == R.VIEW_MARGIN_V == 1.15
+        assert config["standoff"] == R.STANDOFF == 1.0
         assert config["crack_fill_px"] == R.CRACK_FILL_PX > 0
         assert config["void_fog"] == R.VOID_FOG and config["void_wide_fade"] == R.VOID_WIDE_FADE
         text = _template()
@@ -1000,14 +1008,15 @@ assert.strictEqual(NAV.lookAcross(null, at, 0, 0, 1, V), null);
     def test_the_walk_buttons_skip_poses_that_render_badly(self):
         _run_nav(r"""
 const q = [0.95, 0.4, 0.5, 0.9, -1, 0.3];
-assert.strictEqual(NAV.nextPose(q, 0, 1, 0.8), 3, "skips 1 and 2");
-assert.strictEqual(NAV.nextPose(q, 3, 1, 0.8), 4, "an unscored pose counts as good");
-assert.strictEqual(NAV.nextPose(q, 4, 1, 0.8), 4, "nothing good ahead: stay");
-assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8), 0);
+assert.strictEqual(NAV.nextPose(q, 0, 1, 0.8).index, 3, "skips 1 and 2");
+assert.strictEqual(NAV.nextPose(q, 0, 1, 0.8).skipped, 2);
+assert.strictEqual(NAV.nextPose(q, 3, 1, 0.8).index, 4, "an unscored pose counts as good");
+assert.strictEqual(NAV.nextPose(q, 4, 1, 0.8).index, 4, "nothing good ahead: stay");
+assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8).index, 0);
 """)
         text = _template()
         step = _section(text, "  function step(d){", "  let poseQ")
-        assert "NAV.nextPose(poseQ, ci, d, POSE_MIN)" in step
+        assert "NAV.nextPose(poseQ, ci, d, POSE_MIN, poseC, POSE_CONTENT)" in step
         assert "scorePoses();" in _section(text, "function buildNav(){", "/* Overview:")
 
     def test_overview_is_a_distinct_vantage(self):
@@ -1037,3 +1046,195 @@ assert.ok(cam.pitch >= -0.4 - 1e-9 && cam.pitch < -0.3, "and not below it: " + c
         # the statistics used to be assigned over the verification hook
         assert "S.overviewStats = {" in text and "S.overview = {" not in text
         assert "S.overview = () => overview();" in text
+
+
+# ---------------------------------------------------------------------------
+# fix-it framing lane: a wider frame than the capture's, and a score that knows
+# the difference between a view that is drawn and one that has something in it
+# ---------------------------------------------------------------------------
+
+# The same synthetic room, with CONTENT: the right half of the wall (x > 2.5)
+# holds texture, the left half is blank. Coverage is identical across both.
+NAV_CONTENT = r"""
+const sampleC = new Uint8Array(samples.length / 3);
+for (let s = 0; s < sampleC.length; s++) sampleC[s] = samples[s * 3] > 2.5 ? 255 : 0;
+const FC = NAV.fieldJob({samples: Float32Array.from(samples), seenOff: Int32Array.from(off),
+                         seenIdx: Int32Array.from(idx), centres, sampleC, path});
+while (!NAV.fieldWork(FC, 50)) { /* build it */ }
+const con = (p, yaw, pitch = 0) => NAV.support(FC, p, dir(yaw, pitch), up, V.fy, V.aspect).c;
+const supC = (p, yaw, pitch = 0) => NAV.support(FC, p, dir(yaw, pitch), up, V.fy, V.aspect).s;
+"""
+
+
+class TestTheFrameAndWhatIsInIt:
+    """The fix-it framing lane. The display frame is the capture's plus a
+    margin; the envelope knows a drawn-but-empty view from a room view, and
+    nudges away from it without ever refusing a deliberate look."""
+
+    def test_the_field_carries_content_beside_coverage(self):
+        _run_nav(NAV_CONTENT + r"""
+// the same wall, equally well covered from both halves
+assert.ok(Math.abs(supC(at, 0.6) - supC(at, -0.6)) < 0.08, "coverage does not tell them apart");
+assert.ok(con(at, 0.6) > 0.7, "the textured half: " + con(at, 0.6));
+assert.ok(con(at, -0.6) < 0.15, "the blank half: " + con(at, -0.6));
+// richness is the 0..1 reading of it, and monotone between the thresholds
+assert.strictEqual(NAV.richness(NAV.C_LO), 0);
+assert.strictEqual(NAV.richness(NAV.C_HI), 1);
+let last = -1;
+for (let c = 0; c <= 0.5; c += 0.01){ const r = NAV.richness(c); assert.ok(r >= last - 1e-12); last = r; }
+// a field built without content says nothing rather than something wrong
+assert.strictEqual(NAV.support(F, at, dir(0, 0), up, V.fy, V.aspect).c, 0);
+""")
+
+    def test_a_featureless_view_is_a_nudge_and_never_a_wall(self):
+        _run_nav(NAV_CONTENT + r"""
+// the bound itself can never reach the value at which a step is refused
+assert.strictEqual(NAV.contentBound(0), NAV.C_BOUND_MAX);
+assert.ok(NAV.C_BOUND_MAX < 0.999, "a content bound must never refuse a step");
+assert.strictEqual(NAV.contentBound(1), 0);
+// Looking from the textured half to the blank half: slower, but it gets there.
+// (Past yaw -0.85 this synthetic wall runs out and the SUPPORT limit takes
+// over, a different mechanism, so the content nudge is measured inside the
+// supported range.)
+let cam = {p: at.slice(), yaw: 0.6, pitch: 0, floor: 1}, worst = 1, steps = 0;
+while (cam.yaw > -0.7 && steps < 400){
+  const n = NAV.step(FC, path, cam, {look: [-0.01, 0], move: [0, 0, 0], held: true}, 16, V);
+  worst = Math.min(worst, Math.abs(n.yaw - cam.yaw) / 0.01);
+  cam = n; steps++;
+}
+assert.ok(cam.yaw <= -0.7, "the deliberate look reached the blank wall: " + cam.yaw);
+assert.ok(steps >= 130, "it never went faster than asked: " + steps);
+assert.ok(worst < 0.95, "it was resisted on the way: " + worst);
+assert.ok(worst > 0.2, "but never stopped: " + worst);
+""")
+
+    def test_released_on_nothing_the_look_eases_toward_content_and_stops(self):
+        _run_nav(NAV_CONTENT + r"""
+// parked on the blank half with nothing held: the look eases toward the texture
+let cam = {p: at.slice(), yaw: -0.7, pitch: 0, floor: 1};
+const start = cam.yaw;
+for (let i = 0; i < 600; i++) cam = NAV.step(FC, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.ok(cam.yaw > start, "it eased toward what there is to see: " + start + " -> " + cam.yaw);
+assert.ok(cam.yaw - start <= NAV.C_DRIFT_MAX + 1e-6, "and no further than the budget: " + (cam.yaw - start));
+// it stops of its own accord, either because the budget ran out or because the
+// view now has something in it -- here, the latter
+const settled = NAV.support(FC, cam.p, dir(cam.yaw, cam.pitch), up, V.fy, V.aspect);
+assert.ok(NAV.richness(settled.c) >= NAV.C_SETTLE, "it settled on content: " + settled.c);
+const still = NAV.step(FC, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.strictEqual(still.yaw, cam.yaw, "and then it stays put");
+// a finger down is the person's own look: it does not move at all
+let held = {p: at.slice(), yaw: -0.7, pitch: 0, floor: 1};
+for (let i = 0; i < 600; i++) held = NAV.step(FC, path, held, {look: [0, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.strictEqual(held.yaw, -0.7, "a deliberate look is never taken away");
+// and a look of the person's own gives the budget back
+const after = NAV.step(FC, path, cam, {look: [-0.05, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.strictEqual(after.cdrift, 0);
+// on a view that already has content in it there is no ease at all
+let rich = {p: at.slice(), yaw: 0.6, pitch: 0, floor: 1};
+for (let i = 0; i < 300; i++) rich = NAV.step(FC, path, rich, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.strictEqual(rich.yaw, 0.6, "a room view is left alone");
+""")
+
+    def test_the_walk_buttons_skip_what_is_empty_and_cap_the_skipping(self):
+        _run_nav(r"""
+// drawn well enough everywhere, but 1 and 2 have nothing in them
+const q = [0.95, 0.95, 0.95, 0.95], c = [0.9, 0.05, 0.05, 0.8];
+assert.strictEqual(NAV.nextPose(q, 0, 1, 0.8, c, 0.28).index, 3, "an empty pose is skipped too");
+// a long bad run is NOT skipped whole: the step lands on the best of it, so a
+// stretch of the walk is never jumped over and the walk stays representative
+const qq = [0.95], cc = [0.9];
+for (let i = 0; i < 3 * NAV.MAX_SKIP; i++){ qq.push(0.5); cc.push(0.1); }
+qq.push(0.95); cc.push(0.9);
+qq[3] = 0.79; cc[3] = 0.27;          // the least bad of the run
+const r = NAV.nextPose(qq, 0, 1, 0.8, cc, 0.28);
+assert.strictEqual(r.capped, true);
+assert.strictEqual(r.skipped, 2, "poses 1 and 2 were passed over, and no more");
+assert.ok(r.index <= NAV.MAX_SKIP + 1, "never more than MAX_SKIP passed over: " + r.index);
+assert.strictEqual(r.index, 3, "and it lands on the best of the run");
+// with no content array it is the old rule exactly
+assert.strictEqual(NAV.nextPose([0.95, 0.4, 0.9], 0, 1, 0.8).index, 2);
+""")
+        text = _template()
+        cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert 'at most " + NAV.MAX_SKIP + " in a row' in cap, "the caption says the walk is shortened"
+
+    def test_the_reachable_sampler_respects_the_standoff(self):
+        _run_nav(r"""
+// the sampler used to ignore the standoff the camera itself obeys, so the
+// measured distribution held views pressed against a wall
+const rand = (s => () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)(7);
+let n = 0;
+for (let i = 0; i < 200; i++){
+  const r = NAV.sampleReachable(F, path, V, rand);
+  if (!r) continue;
+  n++;
+  assert.ok(NAV.nearest(F, r.p) >= NAV.D_MIN - 1e-9, "inside the standoff: " + NAV.nearest(F, r.p));
+  assert.ok(NAV.pathDist(path, r.p).e <= 1 + 1e-9);
+  assert.ok(r.support >= NAV.T_LO);
+  assert.ok(r.rich >= 0 && r.rich <= 1);
+}
+assert.ok(n > 100, "the envelope is still reachable: " + n);
+// and the grid the standoff is asked through answers exactly what the sweep did
+for (let i = 0; i < 50; i++){
+  const p = [rand() * 12 - 4, rand() * 5 - 2.5, rand() * 6 - 1.5];
+  let b = Infinity;
+  for (let j = 0; j < F.input.samples.length; j += 3){
+    const dx = F.input.samples[j]-p[0], dy = F.input.samples[j+1]-p[1], dz = F.input.samples[j+2]-p[2];
+    b = Math.min(b, dx*dx + dy*dy + dz*dz);
+  }
+  assert.ok(Math.abs(NAV.nearest(F, p) - Math.sqrt(b)) < 1e-9, "the grid is exact");
+}
+""")
+
+    def test_the_scores_that_choose_a_view_all_use_the_rendered_detail(self):
+        text = _template()
+        assert "detail = dn ? ds / dn : 0;" in _section(text, "function drawnFraction(", "/* The opening view")
+        opening = _section(text, "function openingScore(", "function chooseOpening(")
+        assert "detailTerm(r.detail || 0)" in opening
+        over = _section(text, "const OVERVIEW_AWAY", "function overview(){")
+        assert "r.c < minContent) continue;" in over and "minContent = OVERVIEW_CONTENT" in over
+        # and the content filter can never leave the button dead
+        assert "while (!found.length && minContent > 0)" in over
+        assert "detailTerm(r.detail || 0)" in over and "r.spread / 0.2" not in over
+        poses = _section(text, "function scorePoses(", "function reset(")
+        assert "poseQ[i] = r.drawn; poseC[i] = r.detail || 0;" in poses
+        assert "const POSE_MIN = 0.8, POSE_CONTENT = EMPTY_DETAIL;" in text, \
+            "the walk's own 'empty' cut is the calibrated one, not a second guess"
+
+    def test_the_source_detail_comes_from_the_sources_own_pixels(self):
+        """The per-sample content is measured on the keyframes themselves, on
+        the same grid as their depth, and a masked pixel is never content."""
+        text = _template()
+        assert "const FS_DETAIL = `#version 300 es" in text
+        det = _section(text, "const FS_DETAIL", "/* The blend.")
+        assert "if (c.a < 0.5) continue;" in det, "a redaction box is not content"
+        assert "float sd = sqrt(max(0.0, m2 / n - (m / n) * (m / n)));" in det
+        src = _section(text, "function renderSourceDepth(", "/* -------- loading and live append")
+        assert "L.cpuDetail = cd;" in src and "gl.useProgram(G.detail.p);" in src
+        nav = _section(text, "function navInput(", "/* Large holes in the proxy")
+        assert "sourceDetail(ready[k], u, v)" in nav and "sampleC[s] = Math.round(255" in nav
+
+    def test_the_drift_back_inside_obeys_the_standoff(self):
+        """A push stopped by the standoff used to drift back to a spot INSIDE
+        it, because the release drift aimed at the recorded walk and the
+        recorded walk passes close to the desk."""
+        text = _template()
+        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* Looking ACROSS")
+        assert "if (nearest(F, to) >= Math.min(D_MIN, nearest(F, out.p))) out.p = to;" in step
+        _run_nav(r"""
+// a surface right on the walk, closer than the standoff
+const near = Float32Array.from([...F.input.samples, 2.5, 0, 0.4]);
+const F4 = Object.assign({}, F, {input: Object.assign({}, F.input, {samples: near})});
+let cam = {p: [2.5, 0, -0.9], yaw: 0, pitch: 0, floor: 1};
+const d0 = NAV.nearest(F4, cam.p);
+for (let i = 0; i < 400; i++) cam = NAV.step(F4, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+const d1 = NAV.nearest(F4, cam.p);
+assert.ok(d1 >= Math.min(NAV.D_MIN, d0) - 1e-9, "the drift never went inside the standoff: " + d0 + " -> " + d1);
+""")
+
+    def test_the_edge_hint_is_for_the_edge_and_not_for_a_dull_view(self):
+        text = _template()
+        update = _section(text, "function navUpdate(", "function mulberry(")
+        assert "hint(next.hard || 0);" in update
+        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* Looking ACROSS")
+        assert "const h = lookBound(r.s, out.floor); hard = h;" in step

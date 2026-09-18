@@ -115,7 +115,14 @@ const OPT = {
   // and the look of a void: the unlit fog's strength and how much a large
   // void dims the room around it (WORLD-BUILDER-WORLDS.md §4).
   fillPx: Math.max(0, Math.min(8, +(Q.get("fill") ?? CONFIG.crack_fill_px ?? 4))),
-  viewMargin: Math.max(0.8, Math.min(1.6, +(Q.get("fov") ?? CONFIG.view_margin ?? 1.25))),
+  // How far past the capture's own frustum the page may draw, on each tangent.
+  // The frame is the capture's plus a margin, not the capture's exactly: a
+  // viewport cut to the keyframe made more than half of the reachable views a
+  // clean, well-lit, empty rectangle (FINAL2 §7). Measured §"the sweep".
+  viewMargin: Math.max(0.8, Math.min(2.0, +(Q.get("fov") ?? CONFIG.view_margin ?? 1.4))),
+  viewMarginV: Math.max(0.8, Math.min(2.0, +(Q.get("fovv") ?? CONFIG.view_margin_v ?? 1.15))),
+  // How close the camera may come to the proxy (scene units).
+  standoff: Math.max(0.2, Math.min(4.0, +(Q.get("sd") ?? CONFIG.standoff ?? 1.0))),
   fog: +(Q.get("fog") ?? CONFIG.void_fog ?? 0.35),
   wide: +(Q.get("wide") ?? CONFIG.void_wide_fade ?? 0.2),
   forceWebp: Q.get("enc") === "webp",
@@ -249,8 +256,33 @@ const NAV = (() => {
   const T_LO = 0.68, T_HI = 0.80;
   // How close the camera may come to the surface (scene units): nearer, a
   // 360x640 keyframe is magnified past its resolution (the review's keyboard
-  // and monitor close-ups). Resisted from D_SOFT, stopped at D_MIN.
-  const D_MIN = 0.55, D_SOFT = 0.85;
+  // and monitor close-ups), and the frame fills with one blurred patch of wall
+  // that scores as fully supported. Resisted from D_SOFT, stopped at D_MIN.
+  // Measured over 200 reachable views at D_MIN 0.55 / 0.8 / 1.0 / 1.25 / 1.5
+  // (FRAMING.md §3).
+  // (NAV is lifted out of this page and run on its own under node by the tests,
+  // where there is no OPT; the default is the same one OPT carries.)
+  const STANDOFF = (typeof OPT === "object" && OPT && OPT.standoff) || 1.0;
+  const D_MIN = STANDOFF, D_SOFT = STANDOFF + 0.30;
+  // CONTENT. A view that is drawn and empty is a failure at the product's bar,
+  // and support rated a covered blank wall exactly as highly as the desk. Each
+  // proxy sample carries how much TEXTURE the keyframes that saw it hold there
+  // (`navInput`, from the sources' own local contrast), the field keeps it per
+  // direction beside the coverage, and a view's content is the mean over its
+  // rays. It is a NUDGE, never a wall: the content bound is capped at
+  // C_BOUND_MAX, well under the 0.999 at which a step is refused, so a
+  // deliberate look at a blank wall always goes through -- it is only harder
+  // to drift into and it does not settle there.
+  // Calibrated on the canonical world against the review's own measure: over
+  // 260 views (40 walk poses, 20 look-arounds, 200 reachable), the field's
+  // content correlates 0.58 with the mean |Laplacian| of the 900x700 capture,
+  // and the cut that best reproduces that measure's "clean but empty" call is
+  // content 0.19 (agreeing on 76.5%). Resistance is felt below B_FREE-worth of
+  // bound, which C_BOUND_MAX x (1 - richness) crosses at content 0.19 exactly.
+  const C_LO = 0.13, C_HI = 0.28, C_BOUND_MAX = 0.55;
+  // Released on a featureless view the look eases toward content, at most
+  // C_DRIFT_MAX radians in total and never while a finger is down.
+  const C_DRIFT_MAX = 0.30, C_DRIFT_RATE = 0.30, C_SETTLE = 0.60, C_GRAD_EPS = 0.30;
   // Resistance scales a worsening step by (1 - smooth(B_FREE, 1, b))^2: free
   // in the first part of the band, so a push in a good place is not sluggish.
   const B_FREE = 0.35;
@@ -337,10 +369,11 @@ const NAV = (() => {
     const count = where.length / 3;
     return {input, lo, dims, index, where: Float32Array.from(where), count,
             cov: new Uint8Array(count * CELLS), dist: new Uint8Array(count * CELLS),
+            con: new Uint8Array(count * CELLS), near: null,
             next: 0, done: count === 0};
   }
   function fieldWork(F, budget){
-    const {samples, seenOff, seenIdx, seenQ, sampleQ, centres} = F.input;
+    const {samples, seenOff, seenIdx, seenQ, sampleQ, sampleC, centres} = F.input;
     const N = samples.length / 3;
     const front = new Float32Array(CELLS), who = new Int32Array(CELLS);
     const end = Math.min(F.count, F.next + budget);
@@ -373,6 +406,7 @@ const NAV = (() => {
         if (sampleQ) best *= sampleQ[s] / 255;
         F.cov[base + c] = Math.round(best * 255);
         F.dist[base + c] = Math.min(255, Math.round(d * 16));
+        F.con[base + c] = sampleC ? sampleC[s] : 0;
       }
     }
     F.next = end; F.done = end >= F.count;
@@ -396,7 +430,7 @@ const NAV = (() => {
      a kept source colours (trilinear over the grid; outside the grid is 0), and
      the mean distance to what they land on. */
   function support(F, p, fwd, up, fy, aspect){
-    if (!F || !F.done || !F.count) return {s: 0, dist: 0};
+    if (!F || !F.done || !F.count) return {s: 0, dist: 0, c: 0};
     const f = nrm(fwd), r = nrm(crs(f, up)), u = crs(r, f);
     const rays = viewRays(fy, aspect), cells = new Int32Array(rays.length);
     for (let i = 0; i < rays.length; i++){
@@ -405,7 +439,7 @@ const NAV = (() => {
     }
     const g = [0, 1, 2].map(k => (p[k] - F.lo[k]) / SPACING);
     const g0 = g.map(Math.floor), fr = g.map((v, k) => v - g0[k]);
-    let s = 0, dsum = 0, dw = 0;
+    let s = 0, dsum = 0, dw = 0, cs2 = 0, cw = 0;
     for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++){
       const w = (dx ? fr[0] : 1 - fr[0]) * (dy ? fr[1] : 1 - fr[1]) * (dz ? fr[2] : 1 - fr[2]);
       if (w <= 0) continue;
@@ -413,28 +447,61 @@ const NAV = (() => {
       if (x < 0 || y < 0 || z < 0 || x >= F.dims[0] || y >= F.dims[1] || z >= F.dims[2]) continue;
       const a = F.index[(z * F.dims[1] + y) * F.dims[0] + x];
       if (a < 0) continue;
-      let cs = 0, ds = 0, dn = 0;
+      let cs = 0, ds = 0, dn = 0, con = 0;
       for (const c of cells){
         if (c < 0) continue;
         const v = F.cov[a * CELLS + c];
         cs += v;
-        if (v > 0){ ds += F.dist[a * CELLS + c] / 16; dn++; }
+        if (v > 0){ ds += F.dist[a * CELLS + c] / 16; dn++; if (F.con) con += F.con[a * CELLS + c] / 255; }
       }
       s += w * cs / 255 / cells.length;
-      if (dn){ dsum += w * ds / dn; dw += w; }
+      if (dn){ dsum += w * ds / dn; dw += w; cs2 += w * con / dn; cw += w; }
     }
-    return {s, dist: dw ? dsum / dw : 0};
+    // Content is the mean over the rays that land on something: a view that is
+    // half empty is judged on the half it shows, not diluted by the void, which
+    // `s` already answers for.
+    return {s, dist: dw ? dsum / dw : 0, c: cw ? cs2 / cw : 0};
   }
+  /* How rich a view is, 0 (featureless) .. 1 (the desk), from its content. */
+  function richness(c){ return smooth(C_LO, C_HI, c); }
+  /* Resisting a featureless view: a NUDGE. Capped well under 1, so a step is
+     slowed and never refused. */
+  function contentBound(c){ return C_BOUND_MAX * (1 - richness(c)); }
 
   /* The distance from p to the nearest proxy sample, and how close that is to
-     the limit, 0 (free) .. 1 (at D_MIN). */
-  function nearest(F, p){
-    const A = F && F.input && F.input.samples;
-    if (!A) return Infinity;
-    let b = Infinity;
+     the limit, 0 (free) .. 1 (at D_MIN). A uniform hash grid over the samples,
+     so this is a handful of cells rather than all 6,000 (the standoff is asked
+     for at every sub-step of every move, and by the reachable sampler). */
+  function sampleGrid(A){
+    if (!A || !A.length) return null;
+    const cell = 0.5, g = new Map();
     for (let i = 0; i < A.length; i += 3){
-      const dx = A[i] - p[0], dy = A[i+1] - p[1], dz = A[i+2] - p[2], d2 = dx*dx + dy*dy + dz*dz;
-      if (d2 < b) b = d2;
+      const k = Math.floor(A[i]/cell) + "," + Math.floor(A[i+1]/cell) + "," + Math.floor(A[i+2]/cell);
+      let v = g.get(k); if (!v){ v = []; g.set(k, v); }
+      v.push(i);
+    }
+    return {cell, g, A};
+  }
+  function nearest(F, p){
+    const S0 = F && F.input && F.input.samples;
+    if (!S0) return Infinity;
+    // rebuilt whenever the samples change, so a stale grid can never answer
+    if (!F.near || F.near.A !== S0) F.near = sampleGrid(S0);
+    const {cell, g, A} = F.near;
+    const i0 = Math.floor(p[0]/cell), j0 = Math.floor(p[1]/cell), k0 = Math.floor(p[2]/cell);
+    // widen until something is found or the ring is already past the answer
+    let b = Infinity;
+    for (let r = 0; r <= 12; r++){
+      for (let a = -r; a <= r; a++) for (let bb = -r; bb <= r; bb++) for (let c = -r; c <= r; c++){
+        if (r > 0 && Math.max(Math.abs(a), Math.abs(bb), Math.abs(c)) !== r) continue;
+        const list = g.get((i0+a) + "," + (j0+bb) + "," + (k0+c));
+        if (!list) continue;
+        for (const i of list){
+          const dx = A[i]-p[0], dy = A[i+1]-p[1], dz = A[i+2]-p[2], d2 = dx*dx + dy*dy + dz*dz;
+          if (d2 < b) b = d2;
+        }
+      }
+      if (b < Infinity && Math.sqrt(b) <= r * cell) break;
     }
     return Math.sqrt(b);
   }
@@ -455,13 +522,22 @@ const NAV = (() => {
      a recorded view that is itself partly dark is never "beyond" and never
      pushed. Returns the next camera and how hard it was resisted (0..1). */
   function step(F, path, cam, ctl, dt, V){
-    const out = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor ?? 1, resisted: 0};
+    const out = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor ?? 1,
+                 cdrift: cam.cdrift || 0, resisted: 0, hard: 0};
     const ready = !!(F && F.done && F.count);
     // Until the field exists nothing can say where the capture ends, so the
     // camera does not move at all (the review: early input escaped the
     // envelope, and the page then kept the escaped camera out there).
     if (!ready){ out.waiting = true; return out; }
-    const sup = (p, yaw, pitch) => ready ? support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect).s : 1;
+    const at = (p, yaw, pitch) => support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect);
+    const sup = (p, yaw, pitch) => ready ? at(p, yaw, pitch).s : 1;
+    // What a direction is worth: unsupported is a LIMIT ("not captured beyond
+    // here"), featureless is a NUDGE. `hard` keeps the limit's own share, so
+    // the edge hint is shown for the edge and never for a dull view.
+    let hard = 0;
+    const viewB = (p, yaw, pitch) => { const r = at(p, yaw, pitch);
+      const h = lookBound(r.s, out.floor); hard = h;
+      return Math.max(h, contentBound(r.c)); };
     const posB = p => ready && path && path.n ? positionBound(pathDist(path, p).e) : 0;
     const look = ctl.look || [0, 0], move = ctl.move || [0, 0, 0];
     // Pitch: within what the recorded walk looked at (V.pitchMin/Max, the
@@ -472,39 +548,46 @@ const NAV = (() => {
     const pitchB = x => Math.max(smooth(pHi - PITCH_SOFT, pHi, x), smooth(-pLo - PITCH_SOFT, -pLo, -x));
     // Large inputs (a fast flick, a slow frame) are taken in small sub-steps,
     // so the resistance feels the same whatever the frame rate.
-    const resistOnce = (b0, b1, scale) => {
+    const resistOnce = (b0, b1, scale, h1) => {
       if (b1 <= b0) return 1;
       out.resisted = Math.max(out.resisted, b1);
+      out.hard = Math.max(out.hard || 0, h1 || 0);
       return Math.pow(1 - smooth(B_FREE, 1, b1), 2) * scale;
     };
     if (look[0] || look[1]){
+      out.cdrift = 0;                                      // a look of the person's own starts the budget again
       const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(look[0], look[1]) / 0.03)));
       for (let i = 0; i < n; i++){
-        const b0 = Math.max(lookBound(sup(out.p, out.yaw, out.pitch), out.floor), pitchB(out.pitch));
-        let dy = look[0] / n, dp = look[1] / n, b1 = 0;
+        const b0 = Math.max(viewB(out.p, out.yaw, out.pitch), pitchB(out.pitch));
+        let dy = look[0] / n, dp = look[1] / n, b1 = 0, h1 = 0;
         for (let t = 0; t < 4; t++){
-          b1 = Math.max(lookBound(sup(out.p, out.yaw + dy, clampP(out.pitch + dp)), out.floor), pitchB(clampP(out.pitch + dp)));
+          b1 = Math.max(viewB(out.p, out.yaw + dy, clampP(out.pitch + dp)), pitchB(clampP(out.pitch + dp)));
+          h1 = Math.max(hard, pitchB(clampP(out.pitch + dp)));
           if (b1 < 0.999 || b1 <= b0) break;
           dy /= 2; dp /= 2;
         }
-        const k = resistOnce(b0, b1, 1);
+        const k = resistOnce(b0, b1, 1, h1);
         out.yaw += dy * k; out.pitch = clampP(out.pitch + dp * k);
       }
     }
     if (move[0] || move[1] || move[2]){
       const f = V.dir(out.yaw, out.pitch), r = nrm(crs(f, V.up));
       const D = [0, 1, 2].map(k => r[k] * move[0] + V.up[k] * move[1] + f[k] * move[2]);
-      const bAt = p => Math.max(posB(p), lookBound(sup(p, out.yaw, out.pitch), out.floor), closeBound(F, p));
+      let moveHard = 0;
+      const bAt = p => { const v = viewB(p, out.yaw, out.pitch), pb = posB(p), cb = closeBound(F, p);
+        moveHard = Math.max(hard, pb, cb);
+        return Math.max(pb, v, cb); };
       const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(D[0], D[1], D[2]) / 0.05)));
       for (let i = 0; i < n; i++){
         const b0 = bAt(out.p);
-        let d = D.map(x => x / n), b1 = 0;
+        let d = D.map(x => x / n), b1 = 0, h1 = 0;
         for (let t = 0; t < 4; t++){
           b1 = bAt([out.p[0] + d[0], out.p[1] + d[1], out.p[2] + d[2]]);
+          h1 = moveHard;
           if (b1 < 0.999 || b1 <= b0) break;
           d = d.map(x => x / 2);
         }
-        const k = resistOnce(b0, b1, 1);
+        const k = resistOnce(b0, b1, 1, h1);
         out.p = [out.p[0] + d[0] * k, out.p[1] + d[1] * k, out.p[2] + d[2] * k];
       }
     }
@@ -513,22 +596,50 @@ const NAV = (() => {
       const pd = pathDist(path, out.p), pb = positionBound(pd.e);
       if (pb > 0 && pd.closest && pd.e > 0){
         const target = R_SOFT / R_MAX / pd.e, k = (1 - Math.exp(-dt / 450)) * pb;
-        for (let i = 0; i < 3; i++){
+        const to = [0, 1, 2].map(i => {
           const want = pd.closest[i] + (out.p[i] - pd.closest[i]) * target;
-          out.p[i] += (want - out.p[i]) * k;
-        }
+          return out.p[i] + (want - out.p[i]) * k;
+        });
+        // The drift back inside obeys the standoff too. It did not, and a push
+        // stopped by a LARGER standoff drifted back to a spot inside it (the
+        // recorded walk itself passes within 0.3 of the proxy in places).
+        if (nearest(F, to) >= Math.min(D_MIN, nearest(F, out.p))) out.p = to;
       }
-      const s = sup(out.p, out.yaw, out.pitch), lb = lookBound(s, out.floor);
-      if (lb > 0.02){
-        const e = 0.08;
-        const gy = sup(out.p, out.yaw + e, out.pitch) - sup(out.p, out.yaw - e, out.pitch);
-        const gp = sup(out.p, out.yaw, clampP(out.pitch + e)) - sup(out.p, out.yaw, clampP(out.pitch - e));
+      const here = at(out.p, out.yaw, out.pitch), lb = lookBound(here.s, out.floor);
+      // Released on a view that is drawn but empty, the look eases toward what
+      // there is something to see: a person who turns to a blank wall on
+      // purpose keeps it (the finger is down; and the ease stops after
+      // C_DRIFT_MAX radians), but the camera does not SETTLE on nothing.
+      const rich = richness(here.c), cb = rich < C_SETTLE ? 1 - rich / C_SETTLE : 0;
+      const budget = Math.max(0, C_DRIFT_MAX - (out.cdrift || 0));
+      const wantC = cb > 0.02 && budget > 0;
+      if (lb > 0.02 || wantC){
+        // The support gradient says where the capture is, over a small angle.
+        // The content gradient says where the ROOM is, and is asked over a wide
+        // one (C_GRAD_EPS): a blank wall is featureless for tens of degrees, so
+        // a fine difference there is exactly zero and says nothing. It reads
+        // the raw content, not its 0..1 richness, which is flat once clamped.
+        let gy = 0, gp = 0;
+        if (lb > 0.02){
+          const e = 0.08;
+          gy += sup(out.p, out.yaw + e, out.pitch) - sup(out.p, out.yaw - e, out.pitch);
+          gp += sup(out.p, out.yaw, clampP(out.pitch + e)) - sup(out.p, out.yaw, clampP(out.pitch - e));
+        }
+        if (wantC){
+          const e = C_GRAD_EPS, c = (yaw, pitch) => at(out.p, yaw, pitch).c;
+          gy += c(out.yaw + e, out.pitch) - c(out.yaw - e, out.pitch);
+          gp += c(out.yaw, clampP(out.pitch + e)) - c(out.yaw, clampP(out.pitch - e));
+        }
         const gl = Math.hypot(gy, gp);
-        if (gl > 0.01){
-          const rate = 0.5 * lb * dt / 1000;               // radians this frame
+        if (gl > 0.005){
+          let rate = 0.5 * lb * dt / 1000;                 // radians this frame
+          if (wantC) rate = Math.min(budget, rate + C_DRIFT_RATE * cb * dt / 1000);
+          out.cdrift = (out.cdrift || 0) + (wantC ? rate : 0);
           out.yaw += gy / gl * rate; out.pitch = clampP(out.pitch + gp / gl * rate);
         }
       }
+    } else {
+      out.cdrift = 0;                                      // a finger is down: the look is the person's
     }
     if (ready && sup(out.p, out.yaw, out.pitch) >= T_HI) out.floor = 1;
     return out;
@@ -555,10 +666,13 @@ const NAV = (() => {
       const o = [rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1];
       const p = [path.P[i*3] + o[0] * R_MAX, path.P[i*3+1] + o[1] * R_MAX, path.P[i*3+2] + o[2] * R_MAX];
       if (pathDist(path, p).e > 1) continue;
+      // the standoff is part of where the camera may BE, so the measured
+      // distribution has to respect it too (it did not, before)
+      if (nearest(F, p) < D_MIN) continue;
       const yaw = rand() * 2 * Math.PI - Math.PI, pitch = (rand() * 2 - 1) * 0.9;
-      const s = support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect).s;
-      if (s < T_LO) continue;
-      return {p, yaw, pitch, support: s};
+      const r = support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect);
+      if (r.s < T_LO) continue;
+      return {p, yaw, pitch, support: r.s, content: r.c, rich: richness(r.c)};
     }
     return null;
   }
@@ -578,19 +692,42 @@ const NAV = (() => {
     return Math.max(400, Math.min(1600, 300 * d + 320 * dy + 250 * Math.abs(b.pitch - a.pitch)));
   }
 
-  /* Stepping along the walk: the next recorded pose in direction d whose
-     rendered quality is known and at least `min` (unknown counts as good).
-     Returns the index, or `from` when there is none. */
-  function nextPose(q, from, d, min){
+  /* Stepping along the walk: the next recorded pose in direction d that is
+     worth arriving at -- rendered well enough (`q`, the drawn fraction, at
+     least `min`) AND with something in it (`c`, the content, at least `cmin`).
+     A pose whose quality is unknown counts as good.
+
+     Skipping is CAPPED. Skipping every poor pose would walk the person past
+     whole stretches of the capture and misrepresent it, so at most MAX_SKIP
+     poses are passed over in one press; if a longer run would be skipped, the
+     step lands on the BEST pose in that run rather than jumping the lot. The
+     caption says so. Returns {index, skipped, capped}. */
+  const MAX_SKIP = 4;
+  function nextPose(q, from, d, min, c, cmin){
+    const okAt = i => {
+      if (q[i] >= 0 && q[i] < min) return false;
+      if (c && c[i] >= 0 && c[i] < (cmin ?? -1)) return false;
+      return true;
+    };
+    const score = i => (q[i] >= 0 ? q[i] : 1) * (c && c[i] >= 0 ? Math.max(0.05, c[i]) : 1);
+    let run = [];
     for (let i = from + d; i >= 0 && i < q.length; i += d){
-      if (!(q[i] >= 0) || q[i] >= min) return i;
+      if (okAt(i)) return {index: i, skipped: run.length, capped: false};
+      run.push(i);
+      if (run.length > MAX_SKIP){
+        let best = run[0];
+        for (const j of run) if (score(j) > score(best)) best = j;
+        return {index: best, skipped: run.indexOf(best), capped: true};
+      }
     }
-    return from;
+    return {index: from, skipped: 0, capped: false};
   }
 
   return {smooth, cellOf, angleWeight, makePath, pathDist, fieldJob, fieldWork, support, positionBound,
           lookBound, step, sampleReachable, glide, glideMs, nearest, closeBound, lookAcross, nextPose,
-          R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE};
+          richness, contentBound, sampleGrid,
+          R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE,
+          C_LO, C_HI, C_BOUND_MAX, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, MAX_SKIP};
 })();
 /* ---------- end navigation */
 
@@ -813,6 +950,32 @@ void main(){
     m = min(m, texelFetch(uSrc, q, 0).r);
   }
   o = uvec4(m, 0u, 0u, 0u);
+}`;
+
+/* How much there is TO SEE in a keyframe, per 4x4 block of its own pixels: the
+   standard deviation of luma over the block, over the pixels the artifact's
+   alpha keeps (a redaction box is not content). This is the page's cheap stand
+   -in for the review's "mean |Laplacian| over the drawn region": it is measured
+   once per source, on the source's own pixels, and the navigation envelope
+   carries it to every proxy sample and every direction (`navInput`). R is the
+   contrast, G how much of the block was kept. */
+const FS_DETAIL = `#version 300 es
+precision highp float; precision highp sampler2DArray;
+uniform sampler2DArray uCol; uniform int uLayer; uniform ivec2 uSrcSize; uniform float uScale;
+out vec4 o;
+void main(){
+  ivec2 b = ivec2(gl_FragCoord.xy) * 4;
+  float n = 0.0, m = 0.0, m2 = 0.0;
+  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++){
+    ivec2 q = min(b + ivec2(i, j), uSrcSize - 1);
+    vec4 c = texelFetch(uCol, ivec3(q, uLayer), 0);
+    if (c.a < 0.5) continue;
+    float y = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+    n += 1.0; m += y; m2 += y * y;
+  }
+  if (n < 4.0){ o = vec4(0.0, n / 16.0, 0.0, 1.0); return; }
+  float sd = sqrt(max(0.0, m2 / n - (m / n) * (m / n)));
+  o = vec4(clamp(sd * uScale, 0.0, 1.0), n / 16.0, 0.0, 1.0);
 }`;
 
 /* The blend. For every bound source: project; a confidence in [0, 1] that is
@@ -1156,6 +1319,10 @@ async function main(){
   let manifest = null;          // the manifest the layers were filled from
   const layers = [];            // per texture layer: {id, digest, slot, ready, depthReady, kf}
   let capacity = 0, encoding = null, KW = 0, KH = 0, DW = 0, DH = 0, zmax = 1;
+  // What a keyframe's local contrast is worth as "content": the standard
+  // deviation of luma over a 4x4 source block, x DETAIL_SCALE, clamped to 1.
+  // A plain wall in this capture measures 0.005-0.02, the desk 0.05-0.20.
+  const DETAIL_SCALE = 4.0;
   let centre = [0,0,0], diag = 1;
   let KT = null;                // the keyframes' half-angle tangents {v, h}
 
@@ -1190,6 +1357,7 @@ async function main(){
       blend: program(VS_VIEW, FS_BLEND),
       source: program(VS_SOURCE, FS_SOURCE),
       pool: program(VS_FULL, FS_POOL),
+      detail: program(VS_FULL, FS_DETAIL),
       coverH: program(VS_FULL, FS_COVER_H),
       composite: program(VS_FULL, FS_COMPOSITE),
       fill: program(VS_FULL, FS_FILL),
@@ -1330,6 +1498,14 @@ async function main(){
     gl.colorMask(true, true, true, true);
     const R = new Float32Array(9), clear = new Uint32Array([65535, 0, 0, 0]);
     const raw = new Uint32Array(DW * DH * 4), CW = Math.ceil(DW / 2), CH = Math.ceil(DH / 2);
+    // the same shape as the pooled depth, so one index reads both
+    const detTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, detTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, DW, DH);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fbDet = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbDet);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, detTex, 0);
+    const det = new Uint8Array(DW * DH * 4);
     for (const L of list){
       const kf = L.kf;
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbSrc); gl.viewport(0, 0, KW, KH);
@@ -1363,12 +1539,38 @@ async function main(){
         if (q < cpu[o]) cpu[o] = q;
       }
       L.cpuDepth = cpu;
+      // and how much there is to see in this keyframe, on the same grid
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbDet); gl.viewport(0, 0, DW, DH);
+      gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(G.detail.p);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, G.col);
+      gl.uniform1i(G.detail.u.uCol, 0);
+      gl.uniform1i(G.detail.u.uLayer, L.index);
+      gl.uniform2i(G.detail.u.uSrcSize, KW, KH);
+      gl.uniform1f(G.detail.u.uScale, DETAIL_SCALE);
+      gl.bindVertexArray(null);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.enable(gl.DEPTH_TEST);
+      gl.readPixels(0, 0, DW, DH, gl.RGBA, gl.UNSIGNED_BYTE, det);
+      const cd = new Uint8Array(CW * CH);
+      for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++){
+        let s = 0, n = 0;
+        for (let j = 0; j < 2; j++) for (let i = 0; i < 2; i++){
+          const sx = x * 2 + i, sy = y * 2 + j;
+          if (sx >= DW || sy >= DH) continue;
+          const o = (sy * DW + sx) * 4;
+          if (det[o + 1] < 64) continue;                   // the block was mostly masked
+          s += det[o]; n++;
+        }
+        cd[y * CW + x] = n ? Math.round(s / n) : 0;
+      }
+      L.cpuDetail = cd;
       L.depthReady = true;
     }
-    S.cpuDepthBytes = layers.filter(x => x.cpuDepth).length * CW * CH * 2;
+    S.cpuDepthBytes = layers.filter(x => x.cpuDepth).length * CW * CH * 3;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.deleteFramebuffer(fbSrc); gl.deleteFramebuffer(fbDst);
-    gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
+    gl.deleteFramebuffer(fbSrc); gl.deleteFramebuffer(fbDst); gl.deleteFramebuffer(fbDet);
+    gl.deleteTexture(tex); gl.deleteTexture(detTex); gl.deleteRenderbuffer(rb);
     S.timing.sourceDepthMs = (S.timing.sourceDepthMs || 0) + performance.now() - t;
   }
 
@@ -1474,7 +1676,9 @@ async function main(){
           if (L.id !== kf.id) continue;
           await uploadSlot(chunk, ref.slot, L);
           if (generation !== loadGeneration || !G) return;
-          if (!samePose(L.kf, kf)) L.depthReady = false;
+          // A layer's CONTENT is measured from its own pixels, so a new image in
+          // the same slot must be measured again, not only a moved camera.
+          if (!samePose(L.kf, kf) || L.digest !== ref.digest) L.depthReady = false;
           L.kf = kf; L.digest = ref.digest; L.slot = ref.slot; L.ready = true;
           done++;
         }
@@ -1689,19 +1893,30 @@ async function main(){
     return {eye, at: [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]], fy: viewFovY(aspect), aspect,
             near: Math.max(0.02, diag * 0.0015), far: diag * 12};
   }
-  /* The display field of view is the CAPTURE's: the viewport fits inside the
-     keyframes' own frustum (72 x 45 degrees on the canonical world): never
-     taller than a keyframe, and no wider than OPT.viewMargin times a keyframe
-     on the tangent. The first page drew 72 degrees vertical in landscape (~85
-     horizontal) and 97 in portrait -- twice what any photo framed -- and that
-     margin is where the black, the speckle and the oblique smears lived. A
-     portrait phone is about the keyframe's own shape (the vertical decides); a
-     landscape canvas is limited by the width, where a margin of 1.25 keeps a
-     usable view (measured 1.0 / 1.2 / 1.4: 99.0 / 97.7 / 96.3% drawn at the
-     walk poses, seam excess 2.3 / 2.7 / 2.9, against 88.5% and 5.9 before). */
+  /* The display field of view is the CAPTURE's frame plus a MARGIN: no taller
+     than OPT.viewMarginV times a keyframe's vertical tangent and no wider than
+     OPT.viewMargin times its horizontal one. The first page drew 72 degrees
+     vertical in landscape (~85 horizontal) and 97 in portrait -- twice what
+     any photo framed -- and that margin is where the black, the speckle and
+     the oblique smears lived. Cutting it to the keyframe exactly (margin 1.25,
+     which in landscape is width-limited and in portrait is the keyframe's own
+     vertical) took the damage out and left a viewfinder so tight that 61% of
+     reachable views were a clean, well-lit, empty wall (FINAL2 §7).
+     Measured here over the 40 walk poses + 20 look-arounds at 900x700, margin
+     1.0 / 1.15 / 1.25 / 1.4 / 1.6: drawn 98.2 / 97.5 / 96.9 / 95.9 / 94.3%
+     (walk), speckle 0.093 / 0.124 / 0.144 / 0.168 / 0.207%, blotch 1.25 / 1.45
+     / 1.55 / 1.70 / 1.88%, detail 5.17 / 5.80 / 6.40 / 7.16 / 8.01, featureless
+     30 / 20 / 20 / 17.5 / 12.5%. 1.6 buys the most content and breaks 13 of the
+     61 shots by more than 5 points of drawn (walk060 -15, walk070 -16: the
+     ragged torn band at the door frame comes back); 1.4 breaks two, by 7.
+     FOV_MAX caps both tangents so no canvas shape can make the frame look like
+     a fisheye whatever the margin is. */
+  const FOV_MAX_V = 1.48, FOV_MAX_H = 1.75;          // 85 and 100 degrees
   function viewFovY(aspect){
     if (!KT) return Math.min(1.75, Math.max(1.25, 2 * Math.atan(Math.tan(1.12 / 2) / aspect)));
-    return 2 * Math.atan(Math.min(KT.v, OPT.viewMargin * KT.h / aspect));
+    const t = Math.min(OPT.viewMarginV * KT.v, OPT.viewMargin * KT.h / aspect,
+                       Math.tan(FOV_MAX_V / 2), Math.tan(FOV_MAX_H / 2) / aspect);
+    return 2 * Math.atan(t);
   }
   function navView(){
     const c = currentCamera();
@@ -1802,12 +2017,12 @@ async function main(){
     const moved = Math.abs(next.yaw - cam.yaw) + Math.abs(next.pitch - cam.pitch)
       + Math.hypot(next.p[0]-cam.p[0], next.p[1]-cam.p[1], next.p[2]-cam.p[2]) > 1e-5;
     if (pushing && next.resisted > 0){
-      hint(next.resisted);
+      hint(next.hard || 0);          // the edge hint is for the EDGE, not for a dull view
       // the resisted share of a flick is spent, not stored
       if (next.resisted > 0.6){ vel.look = [0, 0]; vel.move = [0, 0, 0]; }
     }
-    S.resisted = next.resisted;
-    cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor};
+    S.resisted = next.resisted; S.resistedHard = next.hard || 0;
+    cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor, cdrift: next.cdrift};
     if (moved && navPath && navPath.n) ci = NAV.pathDist(navPath, cam.p).index;
     const coasting = vel.look.some(v => v) || vel.move.some(v => v);
     return moved || coasting || keys.size > 0;
@@ -1847,12 +2062,13 @@ async function main(){
       normals.set(fn, s * 3);
     }
     const centres = new Float32Array(ready.length * 3), off = new Int32Array(NAV_SAMPLES + 1), seen = [], seenQ = [];
-    const sampleQ = new Uint8Array(NAV_SAMPLES);
+    const sampleQ = new Uint8Array(NAV_SAMPLES), sampleC = new Uint8Array(NAV_SAMPLES);
     ready.forEach((L, k) => { const kf = L.kf, Rr = kf.rotation, t = kf.translation;
       const C = kf._C || (kf._C = [-(Rr[0]*t[0]+Rr[3]*t[1]+Rr[6]*t[2]), -(Rr[1]*t[0]+Rr[4]*t[1]+Rr[7]*t[2]), -(Rr[2]*t[0]+Rr[5]*t[1]+Rr[8]*t[2])]);
       centres.set(C, k * 3); });
     for (let s = 0; s < NAV_SAMPLES; s++){
       const X0 = samples[s*3], X1 = samples[s*3+1], X2 = samples[s*3+2];
+      let det = 0;
       for (let k = 0; k < ready.length; k++){
         const kf = ready[k].kf, Rr = kf.rotation, t = kf.translation, I = kf.intrinsics;
         const z = Rr[6]*X0 + Rr[7]*X1 + Rr[8]*X2 + t[2]; if (z < 0.05) continue;
@@ -1865,15 +2081,20 @@ async function main(){
         const C = ready[k].kf._C, dx = C[0] - X0, dy = C[1] - X1, dz = C[2] - X2;
         const cosI = Math.abs(normals[s*3] * dx + normals[s*3+1] * dy + normals[s*3+2] * dz) / (Math.hypot(dx, dy, dz) || 1);
         seenQ.push(Math.round(255 * (0.2 + 0.8 * NAV.smooth(0.1, 0.4, cosI))));
+        // what there is to SEE here: the best of the sources that saw it, since
+        // one keyframe that resolved the shelf is enough for the shelf to be
+        // there. A grazing source is discounted: its texture is smeared.
+        det = Math.max(det, sourceDetail(ready[k], u, v) * (0.4 + 0.6 * NAV.smooth(0.1, 0.4, cosI)));
       }
       off[s + 1] = seen.length;
+      sampleC[s] = Math.round(255 * Math.min(1, det));
       // one source only is fragile; beside a large hole in the proxy the view
       // shows the hole
       const n = off[s + 1] - off[s];
       sampleQ[s] = Math.round(255 * (n >= 2 ? 1 : 0.7) * (holeNear(X0, X1, X2) ? 0.3 : 1));
     }
     return {samples, seenOff: off, seenIdx: Int32Array.from(seen), seenQ: Uint8Array.from(seenQ), sampleQ,
-            centres, path: navPath};
+            sampleC, centres, path: navPath};
   }
   /* Large holes in the proxy: boundary edges (used by one face), joined into
      loops, kept when a loop's perimeter is at least HOLE_PERIMETER (a thin
@@ -1937,7 +2158,7 @@ async function main(){
     const job = NAV.fieldJob(input);
     navJob = job;
     S.nav = {phase: "building", voxels: job.count, samples: NAV_SAMPLES, sources: input.centres.length / 3,
-             seen: input.seenIdx.length, bytes: job.cov.byteLength * 2, inputMs: performance.now() - t0};
+             seen: input.seenIdx.length, bytes: job.cov.byteLength * 3, inputMs: performance.now() - t0};
     let spent = performance.now() - t0;
     const slice = () => {
       if (gen !== navGeneration) return;
@@ -1948,6 +2169,8 @@ async function main(){
       navField = job; navJob = null; overviewPose = null;
       S.nav.phase = "ready"; S.nav.ms = Math.round(spent);
       S.nav.holeSamples = Array.from(input.sampleQ).filter(q => q < 128).length;
+      S.nav.contentMean = +(Array.from(input.sampleC).reduce((a, b) => a + b, 0) / 255 / NAV_SAMPLES).toFixed(4);
+      S.nav.featurelessSamples = Array.from(input.sampleC).filter(c => c / 255 < NAV.C_LO).length;
       // the floor comes from the recorded pose the camera is at, never from
       // wherever it happens to be (review 2026-09-17, item 5)
       if (!glideState && cams.length) cam.floor = floorAt(poseOf(ci));
@@ -1966,14 +2189,22 @@ async function main(){
      door edge (100% drawn): the overview also needs depth -- its view's mean
      distance at least OVERVIEW_DEPTH x the scene's median, and the score
      favours distance. */
-  const OVERVIEW_AWAY = 1.2, OVERVIEW_DEPTH = 0.5;
+  /* At a narrow landscape frame this still chose a desk close-up at 99.6%
+     drawn: "drawn, deep, toward the walk, with colour spread" is satisfied by a
+     bright door beside a dark wall. The field's own CONTENT now filters the
+     candidates and the rendered DETAIL decides between them, and the depth
+     floor is raised so a wall a metre away cannot be an overview. */
+  const OVERVIEW_AWAY = 1.2, OVERVIEW_DEPTH = 0.8, OVERVIEW_CONTENT = 0.19, OVERVIEW_RANGE = 1.0;
   function findOverview(){
     if (!navField || !navField.done) return null;
     const t0 = performance.now(), V = navView(), F = navField;
-    const ref = CONFIG.median_scene_depth || diag * 0.25, found = [];
+    const ref = CONFIG.median_scene_depth || diag * 0.25;
+    let found = [], minContent = OVERVIEW_CONTENT, relaxed = 0;
     // what the walk looked at most: the mean of the recorded look targets
     const focus = [0, 0, 0];
     for (const c of cams) for (let k = 0; k < 3; k++) focus[k] += (c[k] + c[k + 3] * ref) / cams.length;
+    const search = () => {
+    found = [];
     for (let a = 0; a < F.count; a++){
       const p = [F.where[a*3], F.where[a*3+1], F.where[a*3+2]];
       const pd = NAV.pathDist(navPath, p);
@@ -1986,13 +2217,20 @@ async function main(){
       for (let k = 0; k < 12; k++) for (const pitch of [-0.5, -0.3]){
         const yaw = -Math.PI + k * Math.PI / 6;
         const r = NAV.support(F, p, dirFrom(yaw, pitch), UP, V.fy, V.aspect);
-        // an overview looks at the room, not at a wall a metre away
-        if (r.s < NAV.T_LO || r.dist < OVERVIEW_DEPTH * ref) continue;
+        // an overview looks at the room, not at a wall a metre away, and not at
+        // a clean empty panel
+        if (r.s < NAV.T_LO || r.dist < OVERVIEW_DEPTH * ref || r.c < minContent) continue;
         const toward = dot3(dirFrom(yaw, pitch), norm3([focus[0]-p[0], focus[1]-p[1], focus[2]-p[2]]));
-        found.push({p, yaw, pitch, s: r.s, toward,
-                    score: r.s * (0.5 + 0.5 * Math.min(1, r.dist / (1.5 * ref))) * (0.5 + 0.5 * Math.max(0, toward))});
+        found.push({p, yaw, pitch, s: r.s, c: r.c, toward,
+                    score: r.s * (0.5 + 0.5 * Math.min(1, r.dist / (1.5 * ref)))
+                      * (0.5 + 0.5 * Math.max(0, toward)) * (0.3 + 0.7 * NAV.richness(r.c))});
       }
     }
+    };
+    // The content filter must never leave the button dead: a world whose whole
+    // envelope is featureless still gets its best vantage.
+    search();
+    while (!found.length && minContent > 0){ minContent = Math.max(0, minContent - 0.07); relaxed++; search(); }
     found.sort((x, y) => y.score - x.score);
     const top = [];
     for (const f of found){
@@ -2009,19 +2247,33 @@ async function main(){
     for (const f of top){
       cam = {p: f.p, yaw: f.yaw, pitch: f.pitch, floor: 1};
       const r = drawnFraction(currentCamera(aspect), w, h, true);
-      f.drawn = r.drawn; f.distance = r.distance; f.spread = r.spread;
-      // drawn, deep, toward what the walk looked at, and with something in it
-      // (a plain wall or a door filling the frame has little colour spread)
+      f.drawn = r.drawn; f.distance = r.distance; f.spread = r.spread; f.detail = r.detail;
+      f.depthSpread = r.depthSpread;
+      // Drawn, toward what the walk looked at, with something in it -- the
+      // DETAIL of the real render, not its colour spread, since a bright door
+      // beside a dark wall has all the colour spread in the world and nothing
+      // in it -- and, as a tie-break, holding a RANGE of the room rather than
+      // one surface at one distance. On the canonical world all twelve
+      // candidates are the same desk area (fig/ov_candidates.jpg): this walk
+      // never stood back from it, so no vantage inside the envelope frames the
+      // whole room and the range term only orders views of the desk.
       f.rendered = r.drawn * (0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref)))
-        * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.3 + 0.7 * Math.min(1, r.spread / 0.2));
+        * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.15 + 0.85 * detailTerm(r.detail || 0))
+        * (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)));
       if (!best || f.rendered > best.rendered) best = f;
     }
     cam = save; override = saveOverride;
     // NOT S.overview: that is the verification hook, and assigning the
     // statistics over it made the second press a TypeError
     S.overviewStats = {ms: Math.round(performance.now() - t0), considered: found.length,
-                  top: top.map(f => ({support: +f.s.toFixed(3), drawn: +f.drawn.toFixed(3), score: +f.rendered.toFixed(3)})),
-                  chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn}};
+                  minContent, relaxed,
+                  top: top.map(f => ({support: +f.s.toFixed(3), content: +f.c.toFixed(3), drawn: +f.drawn.toFixed(3),
+                                      detail: +(f.detail || 0).toFixed(4), range: +(f.depthSpread || 0).toFixed(2),
+                                      score: +f.rendered.toFixed(3)})),
+                  topPoses: top.map(f => ({p: f.p, yaw: f.yaw, pitch: f.pitch})),
+                  chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn,
+                                   detail: +(best.detail || 0).toFixed(4),
+                                   range: +(best.depthSpread || 0).toFixed(2)}};
     return best && {p: best.p.slice(), yaw: best.yaw, pitch: best.pitch};
   }
   function overview(){
@@ -2082,6 +2334,14 @@ async function main(){
     if (q >= 65535) return false;
     const zs = q / 65534 * zmax;
     return z <= zs * 1.03 + 0.03;
+  }
+  /* How much this source holds at (u, v), 0 .. 1 -- the same grid. */
+  function sourceDetail(L, u, v){
+    const cd = L.cpuDetail;
+    if (!cd) return 0;
+    const cw = Math.ceil(DW / 2), ch = Math.ceil(DH / 2);
+    const x = Math.min(cw - 1, Math.max(0, Math.floor(u / 8))), y = Math.min(ch - 1, Math.max(0, Math.floor(v / 8)));
+    return cd[y * cw + x] / 255;
   }
   function choose(cam, pts, sticky = true){
     const ready = layers.filter(L => L.ready && L.depthReady && L.kf);
@@ -2364,40 +2624,78 @@ async function main(){
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    // optionally how much there is to see: the spread of the drawn colour
-    let spread = 0;
+    // optionally how much there is to see: the spread of the drawn colour, and
+    // its DETAIL -- the mean |Laplacian| of luma over the drawn part, which is
+    // the review's own measure (FINAL2 §5) at this small size. Spread cannot
+    // tell a bright door beside a dark wall (high spread, nothing in it) from
+    // the desk; the Laplacian can, so the scores below use `detail`.
+    let spread = 0, detail = 0;
     if (content){
       drawBlend(cam, MVP, picks, 8, {fb, w, h});
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
       const col = new Uint8Array(w * h * 4);
       gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, col);
+      const Y = new Float32Array(w * h);
       let n = 0, m = 0, m2 = 0;
-      for (let i = 0; i < col.length; i += 4){
+      for (let i = 0, k = 0; i < col.length; i += 4, k++){
+        Y[k] = (0.299 * col[i] + 0.587 * col[i+1] + 0.114 * col[i+2]) / 255;
         if (px[i] < 128) continue;
-        const y = (0.299 * col[i] + 0.587 * col[i+1] + 0.114 * col[i+2]) / 255;
-        n++; m += y; m2 += y * y;
+        n++; m += Y[k]; m2 += Y[k] * Y[k];
       }
       if (n) spread = Math.sqrt(Math.max(0, m2 / n - (m / n) * (m / n)));
+      // one pixel in from the drawn edge, so the hard step at a void's rim is
+      // not counted as detail
+      let dn = 0, ds = 0;
+      for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++){
+        const k = y * w + x, o = k * 4;
+        if (px[o] < 128 || px[o - 4] < 128 || px[o + 4] < 128
+            || px[o - w * 4] < 128 || px[o + w * 4] < 128) continue;
+        ds += Math.abs(4 * Y[k] - Y[k-1] - Y[k+1] - Y[k-w] - Y[k+w]);
+        dn++;
+      }
+      detail = dn ? ds / dn : 0;
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
     let drawn = 0, dsum = 0;
-    const far = zmax * 3;
+    const far = zmax * 3, dists = [];
     for (let i = 0; i < px.length; i += 4){
       const a = px[i] / 255;
       if (a <= 0) continue;
-      drawn += a; dsum += a * (px[i+1] * 256 + px[i+2]) / 65535 * far;
+      const d = (px[i+1] * 256 + px[i+2]) / 65535 * far;
+      drawn += a; dsum += a * d;
+      if (a > 0.5) dists.push(d);
     }
-    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread};
+    // How much of the ROOM a view holds: the 10-90 spread of the distance to
+    // what it draws. A close-up of one shelf sits at ONE distance however far
+    // the camera is from it; a view of the room runs from the near furniture to
+    // the far wall. Drawn, mean distance and detail all liked the shelf.
+    let depthSpread = 0;
+    if (dists.length > 20){
+      dists.sort((a, b) => a - b);
+      depthSpread = dists[Math.floor(dists.length * 0.9)] - dists[Math.floor(dists.length * 0.1)];
+    }
+    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread, detail, depthSpread};
   }
-  /* The opening view: the recorded pose whose rendered frame is most DRAWN,
-     with a mild preference (at most 15%) for wider content -- a view of the
-     room over a close-up of one shelf. Scored at the canvas's real aspect;
-     coarse over the walk, then refined around the best. */
+  /* The opening view: the recorded pose whose rendered frame is most DRAWN and
+     has the most IN it. Drawn alone opened the page on poses that were 100%
+     drawn and featureless; the detail term is what separates the desk from a
+     clean wall, and it is deliberately the larger of the two shaping terms.
+     Scored at the canvas's real aspect; coarse over the walk, then refined
+     around the best.
+
+     Two numbers, both measured (FRAMING.md §4): EMPTY_DETAIL is the cut at
+     which this small render reproduces the review's "clean but empty" call --
+     0.0574, agreeing on 90.4% of 260 views, correlation 0.876 with the offline
+     measure on the full 900x700 frame. DETAIL_REF is what a good room view of
+     this world measures (the walk poses' median), so the score's ramp spans
+     "nothing" to "the desk" rather than saturating at the first pose. */
+  const EMPTY_DETAIL = 0.0574, DETAIL_REF = 0.12;
+  function detailTerm(d){ return Math.max(0, Math.min(1, d / DETAIL_REF)); }
   function openingScore(r){
     const ref = CONFIG.median_scene_depth || diag * 0.25;
     const wide = Math.max(0, Math.min(1, r.distance / (2.5 * ref)));
-    return r.drawn * (0.85 + 0.15 * wide);
+    return r.drawn * (0.85 + 0.15 * wide) * (0.35 + 0.65 * detailTerm(r.detail || 0));
   }
   function chooseOpening(){
     if (!cams.length) return -1;
@@ -2412,8 +2710,8 @@ async function main(){
     const score = i => {
       if (!seen.has(i)){
         const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
-        const r = drawnFraction(currentCamera(aspect), w, h);
-        seen.set(i, {score: openingScore(r), drawn: r.drawn, distance: r.distance});
+        const r = drawnFraction(currentCamera(aspect), w, h, true);
+        seen.set(i, {score: openingScore(r), drawn: r.drawn, distance: r.distance, detail: r.detail});
       }
       return seen.get(i).score;
     };
@@ -2426,10 +2724,10 @@ async function main(){
     cam = saveCam; override = saveOverride;
     S.timing.openingMs = performance.now() - t;
     const b = seen.get(best) || {};
-    if (poseQ.length !== cams.length) poseQ = new Array(cams.length).fill(-1);
-    for (const [k, v] of seen) poseQ[k] = v.drawn;
+    if (poseQ.length !== cams.length){ poseQ = new Array(cams.length).fill(-1); poseC = new Array(cams.length).fill(-1); }
+    for (const [k, v] of seen){ poseQ[k] = v.drawn; poseC[k] = v.detail || 0; }
     S.opening = {index: best, step, fine, tested: seen.size, score: bestScore,
-                 drawn: b.drawn, distance: b.distance, size: [w, h]};
+                 drawn: b.drawn, distance: b.distance, detail: b.detail, size: [w, h]};
     return best;
   }
 
@@ -2570,35 +2868,43 @@ async function main(){
   /* Prev/next walk only through recorded poses that render well: a pose whose
      drawn fraction (the opening's measure, at this canvas) is below POSE_MIN
      is skipped (review: 35 of 198 poses under 70% drawn, 59-94 half black). */
-  const POSE_MIN = 0.8;
+  /* A pose is worth arriving at when it renders well (POSE_MIN of the frame
+     drawn) and there is something in it (POSE_CONTENT of a room view's detail).
+     Skipping is capped at NAV.MAX_SKIP in one press -- see NAV.nextPose. */
+  const POSE_MIN = 0.8, POSE_CONTENT = EMPTY_DETAIL;
   function step(d){
     if (!cams.length) return;
-    const i = NAV.nextPose(poseQ, ci, d, POSE_MIN);
-    if (i === ci){ hint(0.6); return; }
-    glideTo(poseOf(i), i); ci = i;
+    const r = NAV.nextPose(poseQ, ci, d, POSE_MIN, poseC, POSE_CONTENT);
+    if (r.index === ci){ hint(0.6); return; }
+    S.lastStep = {from: ci, to: r.index, skipped: r.skipped, capped: r.capped};
+    glideTo(poseOf(r.index), r.index); ci = r.index;
   }
-  let poseQ = [], poseJob = 0;
+  let poseQ = [], poseC = [], poseJob = 0;
   function scorePoses(){
     const gen = ++poseJob, t0 = performance.now();
-    if (poseQ.length !== cams.length) poseQ = new Array(cams.length).fill(-1);
+    if (poseQ.length !== cams.length){ poseQ = new Array(cams.length).fill(-1); poseC = new Array(cams.length).fill(-1); }
     let i = 0;
     const slice = () => {
       if (gen !== poseJob || !G) return;
       const t = performance.now();
       while (i < cams.length && performance.now() - t < 12){
-        if (!(poseQ[i] >= 0)){
+        if (!(poseQ[i] >= 0) || !(poseC[i] >= 0)){
           const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
           const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
           const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
           const save = cam, saveOverride = override; override = null;
           const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
-          poseQ[i] = drawnFraction(currentCamera(aspect), w, h).drawn;
+          const r = drawnFraction(currentCamera(aspect), w, h, true);
+          poseQ[i] = r.drawn; poseC[i] = r.detail || 0;
           cam = save; override = saveOverride;
         }
         i++;
       }
       if (i < cams.length){ setTimeout(slice, 16); return; }
-      S.poses = {ms: Math.round(performance.now() - t0), below: poseQ.filter(x => x < POSE_MIN).length, min: POSE_MIN};
+      S.poses = {ms: Math.round(performance.now() - t0), below: poseQ.filter(x => x < POSE_MIN).length,
+                 empty: poseC.filter(x => x >= 0 && x < POSE_CONTENT).length,
+                 skipped: poseQ.filter((x, k) => x < POSE_MIN || poseC[k] < POSE_CONTENT).length,
+                 min: POSE_MIN, content: POSE_CONTENT, maxSkip: NAV.MAX_SKIP};
     };
     setTimeout(slice, 0);
   }
@@ -2638,6 +2944,9 @@ async function main(){
       + "Dark areas are places no kept frame saw, or that were masked as unreliable (redaction, hands, "
       + "views that disagreed); nothing there is filled in. Where the geometry underneath is wrong, "
       + "images smear or double.";
+    note += " The arrows step through the recorded walk and pass over poses that render badly or show"
+      + " nothing, at most " + NAV.MAX_SKIP + " in a row -- so the walk you are shown is shorter than the one"
+      + " that was recorded, but never skips a whole stretch of it.";
     if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
     const more = document.createElement("span");
     more.className = "more";
@@ -2705,7 +3014,19 @@ async function main(){
   S.navReady = () => !!(navField && navField.done);
   S.support = (pose) => { const r = supportOf(pose || cam); if (!r) return null;
     const pd = navPath && navPath.n ? NAV.pathDist(navPath, (pose || cam).p) : null;
-    return {support: r.s, dist: r.dist, envelope: pd ? pd.e : null}; };
+    return {support: r.s, dist: r.dist, content: r.c, rich: NAV.richness(r.c),
+            standoff: navField ? NAV.nearest(navField, (pose || cam).p) : null,
+            envelope: pd ? pd.e : null}; };
+  // the constants a measurement needs to name what it swept
+  S.navConst = () => ({viewMargin: OPT.viewMargin, viewMarginV: OPT.viewMarginV,
+    D_MIN: NAV.D_MIN, D_SOFT: NAV.D_SOFT, C_LO: NAV.C_LO, C_HI: NAV.C_HI,
+    C_BOUND_MAX: NAV.C_BOUND_MAX, C_DRIFT_MAX: NAV.C_DRIFT_MAX, C_SETTLE: NAV.C_SETTLE,
+    MAX_SKIP: NAV.MAX_SKIP, POSE_MIN, POSE_CONTENT, DETAIL_REF,
+    T_LO: NAV.T_LO, T_HI: NAV.T_HI});
+  S.poseContent = () => poseC.slice();
+  S.detailOf = (w = 96) => { const aspect = canvas.width / Math.max(1, canvas.height);
+    const hh = Math.max(24, Math.round(w / aspect));
+    return drawnFraction(currentCamera(aspect), w, hh, true); };
   S.sampleReachable = (n, seed = 1) => { if (!navField || !navField.done) return [];
     const rand = mulberry(seed), V = navView(), out = [];
     for (let i = 0; i < n; i++){ const r = NAV.sampleReachable(navField, navPath, V, rand); if (r) out.push(r); }

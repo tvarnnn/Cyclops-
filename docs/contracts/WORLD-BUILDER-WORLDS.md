@@ -175,16 +175,30 @@ enforced).
   nearest in the walk to the strongest one where sources disagree (the chair
   legs painted from two passes stayed two; seam excess +0.7 on 9 of the visual
   review's views).
-  **The display field of view is the capture's** (same lane, visual review item
-  1): the viewport fits inside the keyframes' own frustum (72° × 45° on the
-  canonical world, from the manifest's `camera`): never taller than a keyframe,
-  and no wider than 1.25 × a keyframe on the tangent (`CONFIG.view_margin`). A
-  portrait phone is decided by the vertical (about 69° × 35°); a 900×700 canvas by
-  the width (41° × 51°). The first page drew 72° vertical in landscape (~85°
+  **The display field of view is the capture's frame plus a margin** (same lane,
+  visual review item 1; widened 2026-09-17 by the fix-it framing lane): the
+  viewport is no taller than `CONFIG.view_margin_v` × a keyframe's vertical
+  tangent and no wider than `CONFIG.view_margin` × its horizontal one (the
+  keyframes are 72° × 45° on the canonical world, from the manifest's `camera`),
+  and both tangents are capped so that no canvas shape and no margin can make
+  the page look like a fisheye (85° vertical, 100° horizontal). A portrait phone
+  is decided by the vertical (about 77° × 40° at 1.15); a 900×700 canvas by the
+  width (46° × 57° at 1.40). The first page drew 72° vertical in landscape (~85°
   horizontal) and 97° in portrait — twice what any photo framed — and that
-  margin was where the black, the speckle and the oblique smears lived. Measured
-  on every 10th walk pose, landscape, margin 1.0 / 1.2 / 1.4: drawn 99.0 / 97.7 /
-  96.3% (88.5% before), seam excess 2.3 / 2.7 / 2.9 (5.9 before).
+  margin was where the black, the speckle and the oblique smears lived. Cutting
+  it to the keyframe exactly took the damage out and left a viewfinder so tight
+  that **61% of the reachable views were a clean, well-lit, empty wall**, so the
+  margin came back with the damage measured. Landscape, over the 40 walk poses
+  and 20 look-arounds, margin 1.0 / 1.15 / 1.25 / 1.4 / 1.6: drawn 98.2 / 97.5 /
+  96.9 / 95.9 / 94.3% at the walk poses, speckle 0.093 / 0.124 / 0.144 / 0.168 /
+  0.207%, blotch 1.25 / 1.45 / 1.55 / 1.70 / 1.88%, detail 5.2 / 5.8 / 6.4 /
+  7.2 / 8.0, featureless 30 / 20 / 20 / 17.5 / 12.5%. **1.40** is the largest
+  margin that breaks no more than two of the 61 shots by over 5 points of drawn;
+  1.6 breaks thirteen. Portrait, `view_margin_v` 1.0 / 1.15 / 1.3 / 1.45: drawn
+  95.1 / 94.4 / 93.5 / 93.3%, speckle 0.27 / 0.32 / 0.35 / 0.36%, detail 9.3 /
+  10.3 / 11.1 / 11.3; portrait has no featureless views at any margin, and
+  **1.15** is taken because it is what makes the portrait Overview a view of the
+  room rather than a bed-corner close-up.
   **Thin cracks in the proxy are closed on the screen** (same lane): the phone
   proxy is decimated and filtered and 35% of its edges are open, so a wall seen
   at a grazing angle showed its pinholes and cracks as black speckle (on the
@@ -282,12 +296,53 @@ enforced).
     weaker. The support field is honest but coarse: its correlation with the
     rendered drawn fraction is 0.71 over all views and 0.41 within the recorded
     pitch range.
+  - **Content, not only quality** (added 2026-09-17, fix-it framing lane). A
+    view can be 100% drawn, clean, and hold nothing — a plain wall, a plain
+    ceiling, a blank door panel — and support rated it exactly as highly as the
+    desk. Every proxy sample now also carries **how much there is to see** there:
+    when a keyframe's depth pass runs, a second pass measures that keyframe's
+    own local contrast (the standard deviation of luma over each 4×4 block of
+    its pixels, over the pixels its alpha keeps, so a redaction box is not
+    content), and a sample takes the best of the sources that saw it, discounted
+    for a grazing source. The field keeps that per direction beside the
+    coverage, and a view's content is the mean over the rays that land on
+    something. Calibrated on the canonical world against the review's own
+    measure (mean |Laplacian| over the drawn region of the 900×700 frame) over
+    260 views: the field's content correlates 0.58 with it and a cut at 0.19
+    reproduces its "clean but empty" call on 76.5%; the same Laplacian measured
+    on the page's own 64-px scoring render correlates **0.876** and its cut
+    (0.0574) agrees on **90.4%**, so the scores that can afford a render use
+    that one and the envelope uses the field.
+    Content is a **nudge, never a wall**. Its bound is
+    0.55 × (1 − smoothstep(0.13, 0.28, content)), capped well below the 0.999 at
+    which a step is refused, so a deliberate look at a blank wall always goes
+    through — it is at most 40% slower, and only while the view is getting
+    worse, so panning along a wall is not resisted at all. The edge hint (*Not
+    captured beyond here*) is shown for the support edge only, never for a dull
+    view. On **release**, a camera left on a featureless view eases toward
+    content along the content gradient (asked over a wide 0.30 rad, since a
+    blank wall is featureless for tens of degrees), at most 0.30 rad in total,
+    stopping as soon as the view has something in it; any look of the person's
+    own gives the budget back, and a finger down stops it entirely. Measured
+    over 200 reachable views, released for two seconds: featureless 44.5% →
+    29.0% (31 rescued, 0 lost), mean turn 4.7°, largest 18.2°, 80 of 200 did not
+    move, drawn 93.5% → 94.8%.
   - **Pitch** stays within what the walk looked at (the recorded range plus
     0.2 rad each way, resisted over its last 0.2 rad): the review's torn ceiling
     was one vertical drag from the opening.
-  - **Distance**: the camera keeps 0.55 scene units from the nearest proxy
-    sample (resisted from 0.85): nearer, a 360×640 keyframe is magnified past
-    its resolution.
+  - **Distance**: the camera keeps `CONFIG.standoff` scene units from the
+    nearest proxy sample (resisted from 0.30 beyond it): nearer, a 360×640
+    keyframe is magnified past its resolution and the frame fills with one
+    blurred patch that the field scores as fully supported. Raised from 0.55 to
+    **1.0** by the fix-it framing lane, which also found that the standoff is
+    close to inert on the canonical world — the tube and the support threshold
+    already hold the camera 2.2 units off the proxy on average, and a hard push
+    forward from 17 recorded poses reached 0.86 at a standoff of 0.55 and 1.19
+    at 1.15 — while 1.5 starts to fight the recorded walk, which itself passes
+    within 0.3 of the proxy in places. The **reachable sampler** applies the
+    standoff too (it did not, so the measured distribution used to contain views
+    the camera could not reach), and so does the drift back inside: a push
+    stopped by the standoff must not drift to a spot within it.
   - **Looking across a gap**: a look held against the edge that keeps pushing
     (0.3 rad of resisted input) glides to the first direction within half a
     turn whose support is at least 0.80, instead of parking on the edge frame.
@@ -314,19 +369,36 @@ enforced).
     scene's median depth), scored support × (0.5 + 0.5 × distance) × (0.5 + 0.5
     × facing what the walk looked at, the mean of the recorded look targets);
     the real blend decides between the top twelve (spread by position and yaw)
-    by drawn × (0.4 + 0.6 × rendered distance) × facing × (0.3 + 0.7 ×
-    min(1, colour spread / 0.2)); the camera glides there. Revised 2026-09-17
-    (fix-it blotch lane): at the capture's field of view the old score chose a
-    frame-filling close-up of the door edge (100% drawn, nothing to see), and in
-    landscape it landed about 0.6 from the opening.
-  - **Prev/next skip poses that render badly**: once the field is built every
-    recorded pose is rendered in the background at the opening's 64-px size, and
-    ←/→ step to the next pose whose drawn fraction is at least 0.8 (an unscored
-    pose counts as good; with none ahead the camera stays and the hint shows).
+    by drawn × (0.4 + 0.6 × rendered distance) × facing × (0.15 + 0.85 × rendered
+    **detail**) × (0.5 + 0.5 × its **depth range**, the 10–90 spread of the
+    distance to what it draws, over the scene's median depth); the camera glides
+    there. Revised 2026-09-17 (fix-it blotch lane): at the capture's field of
+    view the old score chose a frame-filling close-up of the door edge (100%
+    drawn, nothing to see), and in landscape it landed about 0.6 from the
+    opening. Revised again the same day (fix-it framing lane): the candidates
+    are now filtered by the field's **content** (≥ 0.19, relaxed in steps until
+    something passes, so the button is never dead) and by a raised depth floor
+    (0.8 × the median), colour spread is replaced by the rendered detail, and the
+    depth range breaks ties. In portrait this makes the Overview the room in one
+    frame. **In landscape it does not**: on the canonical world all twelve
+    candidates are the same desk area, because the recorded walk never stood
+    back from it, so no vantage inside the envelope frames the whole room.
+  - **Prev/next skip poses that render badly, and poses with nothing in them**:
+    once the field is built every recorded pose is rendered in the background at
+    the opening's 64-px size, and ←/→ step to the next pose whose drawn fraction
+    is at least 0.8 **and whose rendered detail is at least `EMPTY_DETAIL`** (an
+    unscored pose counts as good; with none ahead the camera stays and the hint
+    shows). **Skipping is capped**: at most 4 poses are passed over in one press,
+    and a longer bad run lands on the best pose in it rather than being jumped
+    whole, so the walk that is shown is shorter than the one recorded but never
+    misses a stretch of it. The caption says so. On the canonical world 18 of
+    198 poses are skipped (17 for drawn, 7 for detail).
   - Before the field is built (a second or so after the images land) the camera
     does not move and Overview is disabled.
 
-  It opens at the recorded pose whose **rendered frame is most drawn**, with a mild
+  It opens at the recorded pose whose **rendered frame is most drawn and has the
+  most in it** (drawn × (0.85 + 0.15 × wide) × (0.35 + 0.65 × rendered detail),
+  the detail term added by the fix-it framing lane), with a mild
   preference for wider content: every ⌈n/32⌉-th recorded pose is rendered at 64
   px on the long side **in the canvas's own aspect** through the real blend,
   scored `drawn × (0.85 + 0.15 × min(1, mean distance / (2.5 × z_ref)))` (drawn =
@@ -335,8 +407,11 @@ enforced).
   observed pixels × distance², preferred far half-empty views and opened the
   canonical world at pose 71 (46% observed, 52% black). The horizon is levelled
   to `CONFIG.up`. The caption is one line (*Captured images on reconstructed
-  geometry* and an **About** button); what the images are and what the dark
-  areas mean open on tap (the four-line disclaimer covered 11–13% of the frame).
+  geometry* and an **About** button); what the images are, what the dark
+  areas mean, and that the arrows pass over poses that render badly or show
+  nothing (at most 4 in a row, so the walk shown is shorter than the one
+  recorded but never misses a stretch of it) open on tap (the four-line
+  disclaimer covered 11–13% of the frame).
 - **Live.** The page polls the revision route every 10 s (backing off to 120 s
   while `live` is false and nothing changed). What a poll means is one pure unit
   in the page, `FOLLOW` (`decide`, `mustReplace`, `nextDelay`), run under node by
@@ -371,7 +446,8 @@ enforced).
 - `window.__wbAppearance` also exposes `walk`, `setView`, `coverage`,
   `snapshot`, `camera`, `shotMode`, `clock`, and for navigation `pose`,
   `setPose`, `support`, `navStats`, `navReady`, `sampleReachable`, `input`,
-  `step`, `overview` and `frame`, for verification; they read the page and move
+  `step`, `overview`, `frame`, `poseQuality`, `poseContent`, `navConst` and
+  `detailOf`, for verification; they read the page and move
   its camera, nothing else. `orbitView` remains only to measure the views the
   removed Orbit mode reached.
 
