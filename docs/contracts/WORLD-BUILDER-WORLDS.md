@@ -105,7 +105,10 @@ back up on every solve, resetting the wearer's camera twice. The page says it is
 behind instead (`WORLD-BUILDER-APPEARANCE.md` §8: currency is reported, never
 enforced).
 
-- **A shell, not a data page.** About 70 KB on the canonical world: the WebGL2
+- **A shell, not a data page.** About 180 KB on the canonical world (175,436 B
+  at `f6d5520`, and it has grown with every lane; "about 70 KB" was the first
+  build's figure and stood uncorrected until review 2). It carries no imagery
+  and no geometry: the WebGL2
   renderer, the recorded camera path (`surface_render._camera_path`), the
   vertical (`surface_render.surface_up` measured on the proxy, seeded by the
   cameras), and the four addresses it fetches, relative to `CONFIG.base`:
@@ -224,12 +227,23 @@ enforced).
   still hides what is behind it. Fading is only ever inward; a pixel with no
   evidence never gains colour. **A void is an unlit fog, not a cut-out** (same
   lane): the background is lifted toward 0.35 × the mostly grey (10% hue) mean of
-  what is drawn nearby, read from a mip level about 24 texels across the frame's
+  what is INKED nearby, read from a mip level about 24 texels across the frame's
   short side, fading to the plain background where nothing is drawn within that
   footprint; and the drawn room's alpha is multiplied by
-  1 − 0.2 × (1 − smoothstep(0.3, 0.9, coarse coverage)), so a large void dims
-  its surroundings over tens of pixels while a pinhole changes nothing. The fog
-  has no texture and no detail and never raises a pixel's alpha.
+  1 − 0.2 × (1 − smoothstep(0.02, 0.35, that footprint's mean alpha)), so a
+  large void dims its surroundings over tens of pixels while a pinhole changes
+  nothing. The fog has no texture and no detail and never raises a pixel's
+  alpha. **It is always darker than the room beside it**, which is what makes a
+  void read as "nothing was seen here" rather than as something: the layer is
+  written PREMULTIPLIED, so the mip level is the mean of what is actually on the
+  screen, and 0.35 of that cannot reach it. Corrected 2026-09-17 (review 2,
+  P-2): the mean was taken over an unpremultiplied layer and divided by the mean
+  ALPHA, which is evidence and not coverage — at colour 0.97 with evidence 0.5,
+  routine where few sources saw a wall, that is 1.94, and the fog came out at
+  about 0.68 grey, brighter than the wall it was a hole beside. The same
+  confusion dimmed a fully covered but 40%-confident region as though it were
+  the edge of a hole (P-2b), which is why the wide fade's knee is on 0.02–0.35
+  now.
   **Nothing is drawn until the opening pose is chosen**; the room then fades in
   from the background over 450 ms (the first page drew a pose-1 close-up while
   the images landed and cut to the opening). (A fade by distance over the mesh to its
@@ -423,10 +437,19 @@ enforced).
   texture is dropped first. `appearance.state: rebuilding` (the ordinary Stop)
   keeps the textures, keeps polling at 10 s and captions *finishing the world*;
   after 20 minutes without a served build the page drops them and says so.
-  `withdrawn`, `absent`, an old Tower's bare `null`, or a revision 404 naming a
-  world or session that is gone (m3) deletes every texture at once and says why —
+  `withdrawn`, `absent`, `unavailable`, an old Tower's bare `null`, or a
+  revision 404 naming a world or session that is gone (m3) deletes every texture
+  at once and says why —
   **and keeps polling**, so a rebuild that is served again is drawn again without
-  closing the viewer. A chunk or proxy that 404s while loading (the next build
+  closing the viewer. The reason differs: `unavailable` is the Tower's own
+  appearance code having raised, and the page says *the Tower could not answer
+  for this world's images just now* rather than telling the wearer their
+  redaction record changed (2026-09-17, review 2 m-15).
+  **A boot that places no imagery takes the same path**: it says so, keeps
+  polling, and finishes its opening when a build it can draw arrives. It used to
+  `fail()`, which stops the script above the follower, so the page never asked
+  again — and the app could not tell, because the page reported `didFinish` like
+  any other (2026-09-17, review 2 M-0). A chunk or proxy that 404s while loading (the next build
   published and the file left its grace) refetches the manifest and tries once
   more (M4).
 - **Context loss.** Textures and the manifest are not kept across it: on
@@ -434,15 +457,37 @@ enforced).
   through the same transport (so the Tower's label check runs again, and a build
   or withdrawal that happened meanwhile is honoured) and keeps the camera. If
   WebKit has not restored the context after 3 s the page asks for it
-  (`WEBGL_lose_context.restoreContext`); after 10 s it reloads itself, which the
-  app allows for exactly this page (`WORLD-BUILDER-IOS.md` §10; review 1 m8).
+  (`WEBGL_lose_context.restoreContext`, re-fetched per context); after 10 s it
+  reloads itself, which the app allows for exactly this page
+  (`WORLD-BUILDER-IOS.md` §10; review 1 m8). The reload is a **watchdog, not a
+  one-shot**: `webglcontextrestored` re-arms it (to 90 s) instead of cancelling
+  it, and only a restore that finished — drawn, or saying truthfully that there
+  is nothing to draw — clears it. It used to be cancelled by the first statement
+  of the restore handler, before the manifest and every chunk were fetched
+  again, so the slowest and least reliable part of the restore ran with no
+  escape at all (2026-09-17, review 2 P-1). Every fetch the page makes is
+  bounded by an `AbortController` at 45 s for the same reason: on
+  `glasses-world:` a request settles only if the app's handler answers it, and a
+  handler that loses a task would otherwise leave the page waiting for ever.
 - **Caption.** *Captured images on reconstructed geometry · N of M keyframes
-  shown* (· *still building as you walk*, · the currency reason when behind),
+  shown* — N and M are both the PHONE tier, so the figure is "of what this
+  device was offered" and not "of what the Tower keeps" — (· *still building as
+  you walk*, · the currency reason when behind, · a reduced set and **which
+  side** lacks compressed textures: this device, or a Tower that built none),
   then: *These are the camera's own frames, with faces redacted, placed on the
-  reconstructed room. Dark areas are places no kept frame saw, or that were
-  masked as unreliable (redaction, hands, views that disagreed); nothing there
-  is filled in. Where the geometry underneath is wrong, images smear or double.
-  Scale is unknown, so distances are relative.*
+  reconstructed room. A grey haze is a place no kept frame saw, or that was
+  masked as unreliable (redaction, hands, views that disagreed) — it is always
+  darker than the room around it and it is never an image of anything. Cracks a
+  few pixels wide between two parts of one surface are closed from the frames on
+  either side; nothing wider is. Where the geometry underneath is wrong, images
+  smear or double.* then the pose-skipping sentence, then *Scale is unknown, so
+  distances are relative.*
+  It said *"Dark areas … nothing there is filled in"* until 2026-09-17: written
+  before the crack fill and the void fog and not revisited, so the page's own
+  caption denied two things the page does (review 2, M-5). The replacement
+  states the BOUND rather than a denial, which is the part a wearer can act on.
+  The native caption above the web view says the same in one line
+  (`WORLD-BUILDER-IOS.md` §10).
 - `window.__wbAppearance` also exposes `walk`, `setView`, `coverage`,
   `snapshot`, `camera`, `shotMode`, `clock`, and for navigation `pose`,
   `setPose`, `support`, `navStats`, `navReady`, `sampleReachable`, `input`,
@@ -507,18 +552,20 @@ page to find out.
 | `view` | string, optional | as §4. `view=diagnostics` reports the **sparse** rung, because that is the page §4 serves for it. A client showing the diagnostics rendering has nothing to follow and should not ask (the iOS app does not) |
 | `viewer` | string, optional | as §4, and it must match the page request's: without `appearance-1` the rung reported is the one §4 would serve a client that cannot draw the appearance page (`surface` or lower). A poll that dropped it while an appearance page is on screen would be told `surface` and swap the page down. The iOS app sends it on its native poll, and its scheme handler adds it to the page's own proxied poll (`WORLD-BUILDER-IOS.md` §10). `appearance` in the body is reported either way |
 
-**200** `{"session_id": str, "representation": "appearance"|"surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool, "state": "served"|"rebuilding"|"withdrawn"|"absent", "epoch": str|null}}`,
+**200** `{"session_id": str, "representation": "appearance"|"surface"|"dense"|"sparse", "revision": str, "live": bool, "appearance": {"revision": str|null, "current": bool, "state": "served"|"rebuilding"|"withdrawn"|"absent"|"unavailable", "epoch": str|null}}`,
 `Cache-Control: no-store`. **404** exactly when §4 would 404.
 
 `appearance` (additive, 2026-09-17) follows the session's appearance artifact
 (`WORLD-BUILDER-APPEARANCE.md`): `revision` is
 `<session_id>/appearance:<build_id>` exactly when
 `GET /worlds/{id}/appearance/{session_id}/manifest` would answer 200, and `null`
-otherwise — no artifact, a purged world, or **a session whose redaction label no
-longer matches the one the artifact was built under**. `state` says which, and
+otherwise — no artifact, a purged world, **a session whose redaction label no
+longer matches the one the artifact was built under**, or the Tower's own
+appearance code having raised (`unavailable`, 2026-09-17: a crash is not a
+privacy event and must not be reported as one). `state` says which, and
 what a page holding textures does (`WORLD-BUILDER-APPEARANCE.md` §9): keep them
-through `rebuilding` (the ordinary Stop), drop them on `withdrawn` or `absent`,
-and in every case keep asking. `epoch` changes exactly when an open page must
+through `rebuilding` (the ordinary Stop), drop them on `withdrawn`, `absent` or
+`unavailable`, and in every case keep asking. `epoch` changes exactly when an open page must
 drop its textures before drawing the served build. `current` is false when the artifact
 was built from an earlier solve or on an earlier surface. It is opaque, compared
 for equality, and **deliberately not part of `revision`**: a page that blends

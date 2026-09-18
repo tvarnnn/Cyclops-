@@ -4569,14 +4569,16 @@ final class WorldRenderRevisionTests: XCTestCase {
     }
 
     private func readyModel(
-        page html: String, revision: String, view: WorldRenderView = .product, sessionID: String? = "s1"
+        page html: String, revision: String, view: WorldRenderView = .product,
+        sessionID: String? = "s1", assets: WorldAssetSchemeHandler? = nil
     ) async -> WorldRenderViewerModel {
         StubbedGeometryProtocol.reset(routes: [
             Self.pagePath: (200, html),
             Self.revisionPath: (200, revision),
         ])
         let model = WorldRenderViewerModel(
-            target: WorldRenderTarget(worldID: "w1", sessionID: sessionID, view: view), client: client())
+            target: WorldRenderTarget(worldID: "w1", sessionID: sessionID, view: view),
+            client: client(), assets: assets)
         model.revisionPollInterval = .milliseconds(20)
         await model.load()
         model.pageEvent(.rendered)
@@ -4851,16 +4853,189 @@ final class WorldRenderRevisionTests: XCTestCase {
                                 appearance: appearance, appearanceState: state)
         }
         typealias M = WorldRenderViewerModel
-        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest("b", "served", .appearance)), false)
-        XCTAssertNil(M.appearanceReturned(after: true, latest: latest("b", "served", .appearance)))
-        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, "rebuilding", .surface)), false,
-                       "the Stop gap is not a withdrawal")
-        XCTAssertEqual(M.appearanceReturned(after: true, latest: latest(nil, "rebuilding", .surface)), true)
-        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, "withdrawn", .surface)), true)
-        XCTAssertEqual(M.appearanceReturned(after: false, latest: latest(nil, nil, .surface)), true,
-                       "a Tower that does not say is a withdrawal")
-        XCTAssertEqual(M.appearanceReturned(after: true, latest: latest("b", "served", .surface)), false,
+        func follow(_ withdrawn: Bool, waited: Bool = false, pageRecovered: Bool = false,
+                    _ revision: WorldRenderRevision) -> WorldAppearanceFollow
+        {
+            M.appearanceFollow(withdrawn: withdrawn, waitedForThePage: waited,
+                               pageRecovered: pageRecovered, latest: revision)
+        }
+        XCTAssertEqual(follow(false, latest("b", "served", .appearance)),
+                       .keepWatching(withdrawn: false))
+        XCTAssertEqual(follow(false, latest(nil, "rebuilding", .surface)),
+                       .keepWatching(withdrawn: false), "the Stop gap is not a withdrawal")
+        XCTAssertEqual(follow(true, latest(nil, "rebuilding", .surface)),
+                       .keepWatching(withdrawn: true), "and it does not end one either")
+        XCTAssertEqual(follow(false, latest(nil, "withdrawn", .surface)),
+                       .keepWatching(withdrawn: true))
+        XCTAssertEqual(follow(false, latest(nil, nil, .surface)),
+                       .keepWatching(withdrawn: true), "a Tower that does not say is a withdrawal")
+        XCTAssertEqual(follow(true, latest("b", "served", .surface)),
+                       .keepWatching(withdrawn: false),
                        "served but not the rung this app is given: nothing to reload into")
+        // Served again, on this rung, after a withdrawal: the page gets the
+        // first move, and only one poll of it.
+        XCTAssertEqual(follow(true, latest("b", "served", .appearance)),
+                       .waitOnePollForThePage)
+        XCTAssertEqual(follow(true, pageRecovered: true, latest("b", "served", .appearance)),
+                       .leaveItToThePage, "the page took the imagery back; the app does nothing")
+        XCTAssertEqual(follow(true, waited: true, latest("b", "served", .appearance)),
+                       .replaceThePage, "the page did not; the app replaces it")
+        XCTAssertEqual(follow(true, waited: true, pageRecovered: true,
+                              latest("b", "served", .appearance)),
+                       .leaveItToThePage, "a page that recovered late still wins")
+    }
+
+    /// Review 2, M-1. The flag that brings a withdrawn appearance back used to
+    /// be cleared BEFORE the refresh that uses it, and `refresh` returns
+    /// silently on any fetch failure -- so one unreachable moment disarmed the
+    /// recovery for the life of the screen. This drives exactly that: the
+    /// appearance is withdrawn, comes back, and the page route is failing when
+    /// the app first reaches for it.
+    ///
+    /// Without the fix the second `set(route:)` below changes nothing, because
+    /// the flag is already false, the page revision is unchanged (a pre-epoch
+    /// world -- review 2, A-1), and nothing else can ever replace the page.
+    func testAFailedRecoveryFetchIsTriedAgainRatherThanDisarmingTheRecovery() async {
+        let shown = page("appearance", "s1/appearance:1")
+        let model = await readyModel(page: shown, revision: appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b1", state: "served"))
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "surface", page: "s1/surface:9", build: nil, state: "withdrawn")))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 4 }
+        // The Tower serves the appearance again, but the page route is down:
+        // the rebuild finished and the link dropped, which is the same Tower
+        // and the same second.
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (503, "gone for a moment"))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b2", state: "served")))
+        let tried = await waitUntil {
+            StubbedGeometryProtocol.requestCount(for: Self.pagePath) >= 2
+        }
+        XCTAssertTrue(tried, "the recovery reached for the page")
+        // Now the Tower answers again. The recovery must still be armed.
+        let rebuilt = page("appearance", "s1/appearance:1", body: "rebuilt")
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, rebuilt))
+        let replaced = await waitUntil { model.state == .rendering(html: rebuilt) }
+        await stop(follow)
+        XCTAssertTrue(replaced, "one failed fetch must not spend the only recovery this screen has")
+    }
+
+    /// Review 2, M-2. The page's own follower refetches the manifest through
+    /// the scheme handler and redraws IN PLACE, keeping the camera. The app
+    /// must notice that and do nothing, rather than replacing the document a
+    /// few seconds later -- which resets the camera to the opening pose and
+    /// re-downloads every chunk.
+    func testAPageThatTookItsImageryBackIsNotReloadedUnderTheReader() async {
+        let shown = page("appearance", "s1/appearance:1")
+        let assets = WorldAssetSchemeHandler(
+            worldID: "w1",
+            client: WorldAssetClient(baseURL: Self.host, session: StubbedGeometryProtocol.makeSession()))
+        assets.sessionID = "s1"
+        let model = await readyModel(page: shown, revision: appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b1", state: "served"),
+            assets: assets)
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "surface", page: "s1/surface:9", build: nil, state: "withdrawn")))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 4 }
+        // The page's own recovery, exactly as it happens: the page fetches the
+        // manifest through the scheme handler and the Tower answers 200. That,
+        // and only that, is how the app can know the page's script is alive and
+        // has taken the imagery back.
+        StubbedGeometryProtocol.set(route: "/worlds/w1/appearance/s1/manifest", to: (200, "{}"))
+        _ = try? await assets.answer(.appearanceManifest, sessionID: "s1")
+        XCTAssertNotNil(assets.servedAppearanceToPageAt, "fixture: the page's manifest fetch was recorded")
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b2", state: "served")))
+        let polled = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 9 }
+        await stop(follow)
+        XCTAssertTrue(polled)
+        XCTAssertEqual(model.state, .ready(html: shown), "the document the reader is looking at stayed")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1,
+                       "the page recovered itself; the app must not download it again")
+    }
+
+    /// Review 2, m-2 and m-1. The branch M-1 and M-2 exist for -- a Tower that
+    /// predates epochs, where the page revision AND the page bytes are
+    /// unchanged -- had no test at all: the one that named it replaced the page
+    /// body first, which takes the ordinary `html != current` path. This enters
+    /// `refresh`'s `evenIfUnchanged, html == current` branch, and proves the
+    /// hazard that lived there: a reload of the identical page that then fails
+    /// to draw must put the picture back, not take the world away.
+    func testReloadingTheIdenticalPageStillHasSomethingToFallBackTo() async {
+        let shown = page("appearance", "s1/appearance:1")
+        let model = await readyModel(page: shown, revision: appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b1", state: "served"))
+        let follow = Task { await model.followRevisions() }
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 2 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "surface", page: "s1/surface:9", build: nil, state: "withdrawn")))
+        _ = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= 4 }
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, appearanceBody(
+            rung: "appearance", page: "s1/appearance:1", build: "b2", state: "served")))
+        // The same bytes come back, so this is the identical-page reload.
+        let reloading = await waitUntil { model.state == .rendering(html: shown) }
+        XCTAssertTrue(reloading, "the identical page was loaded again")
+        // And it kills the content process past its budget. Before the fix
+        // there was no fallback here, so this went to the failure view and the
+        // reader lost a world that had been drawing a moment earlier.
+        model.pageEvent(.gaveUpAfterTerminations(3))
+        await stop(follow)
+        XCTAssertEqual(model.state, .rendering(html: shown), "the picture is put back, not a failure")
+        XCTAssertTrue(model.newerPictureRefused, "and the caption offers Try again")
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: shown))
+    }
+
+    /// Review 2, m-16. An appearance page with no `wb-revision` stamp, opened
+    /// without a pinned session, has no session for the scheme handler to
+    /// proxy: every manifest, chunk and proxy request is refused locally and
+    /// the Tower log shows nothing at all. The page boots into "No image of
+    /// this world could be placed" and the field report reads "it opened
+    /// empty".
+    func testAnAppearancePageThatNamesNoSessionCannotReachItsImagery() {
+        typealias M = WorldRenderViewerModel
+        let unpinned = WorldRenderTarget(worldID: "w1", sessionID: nil, view: .product)
+        let pinned = WorldRenderTarget(worldID: "w1", sessionID: "s1", view: .product)
+        let unstamped = unstampedPage("appearance")
+        XCTAssertTrue(M.pageCannotReachItsImagery(html: unstamped, target: unpinned))
+        XCTAssertFalse(M.pageCannotReachItsImagery(
+            html: page("appearance", "s1/appearance:1"), target: unpinned),
+                       "the page's own stamp names the session")
+        XCTAssertFalse(M.pageCannotReachItsImagery(html: unstamped, target: pinned),
+                       "the screen named the session")
+        XCTAssertFalse(M.pageCannotReachItsImagery(html: unstampedPage("surface"), target: unpinned),
+                       "a surface page carries its data and fetches nothing")
+    }
+
+    /// And what the screen does about it: one refetch (the Tower race is
+    /// narrow), then a sentence with a control, rather than a page that reports
+    /// finishing and shows nothing.
+    func testAnUnreachableAppearancePageIsRefetchedOnceThenSaidOutLoud() async {
+        StubbedGeometryProtocol.reset(routes: [Self.pagePath: (200, unstampedPage("appearance"))])
+        let model = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil, view: .product),
+            client: client())
+        await model.load()
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2,
+                       "the race is refetched once before it is reported")
+        XCTAssertTrue(model.state.failureMessage?.contains("without the session") == true,
+                      "the wearer is told, rather than shown an empty room: \(model.state)")
+        XCTAssertTrue(model.state.failureIsRetryable)
+
+        // A page that does name its session costs no extra fetch at all, so
+        // the guard is free on every load that was going to work.
+        let good = page("appearance", "s1/appearance:1")
+        StubbedGeometryProtocol.reset(routes: [Self.pagePath: (200, good)])
+        let second = WorldRenderViewerModel(
+            target: WorldRenderTarget(worldID: "w1", sessionID: nil, view: .product),
+            client: client())
+        await second.load()
+        XCTAssertEqual(second.state, .rendering(html: good))
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 1)
     }
 
     func testAnUnchangedRevisionFetchesNoPage() async {
@@ -5243,6 +5418,10 @@ final class WorldAssetTransportTests: XCTestCase {
 
     private static let host = URL(string: "http://stub.invalid/tower")!
     private static let digest = "0123456789abcdef0123456789abcdef"
+    /// One per bundle a restored context re-asks for (checklist A4 expects 8).
+    private static let eightDigests = (0..<8).map { i in
+        String(repeating: String(i), count: 32)
+    }
 
     private func parse(_ string: String, method: String? = "GET", world: String = "w1",
                        session: String? = "s1") -> WorldAssetRequest? {
@@ -5294,6 +5473,35 @@ final class WorldAssetTransportTests: XCTestCase {
                      "with no session known, only the page is served")
         XCTAssertNil(parse("\(base)/render", world: ""))
         XCTAssertNil(WorldAssetRequest.parse(nil, method: "GET", worldID: "w1", sessionID: "s1"))
+    }
+
+    /// The other half of the name above, which the whitelist test only argues
+    /// (review 2, m-13): a refused request must make **no network request at
+    /// all**, not merely fail to parse. Driven through the handler against the
+    /// stubbed Tower, counting what arrived.
+    func testARefusedRequestReachesTheTowerZeroTimes() async {
+        let (assets, _) = handler(clock: Date())
+        StubbedGeometryProtocol.reset(routes: [
+            Self.manifestPath: (200, "{}"),
+            "/tower/worlds/w1/appearance/s2/manifest": (200, "{}"),
+            "/tower/worlds/w2/appearance/s1/manifest": (200, "{}"),
+            Self.chunkPath: (200, "bytes"),
+        ])
+        // Each of these parses to nothing, so `start` answers a local 404 and
+        // `answer` is never reached. Asserted on the Tower's side of the wire.
+        for refused in ["glasses-world://tower/worlds/w1/appearance/s2/manifest",
+                        "glasses-world://tower/worlds/w2/appearance/s1/manifest",
+                        "glasses-world://tower/worlds/w1/appearance/s1/chunk/" + String(repeating: "z", count: 32)]
+        {
+            XCTAssertNil(parse(refused), refused)
+        }
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: "/tower/worlds/w1/appearance/s2/manifest"), 0)
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: "/tower/worlds/w2/appearance/s1/manifest"), 0)
+        // And the positive control, so the count above is not zero because the
+        // stub was never wired up: a whitelisted request does arrive.
+        _ = try? await assets.answer(.appearanceManifest, sessionID: "s1")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.manifestPath), 1,
+                       "fixture: the stub does see the requests that are allowed")
     }
 
     func testAWhitelistedRequestIsProxiedToTheTowerRouteOfTheSameName() {
@@ -5358,11 +5566,27 @@ final class WorldAssetTransportTests: XCTestCase {
         XCTAssertEqual(page.cachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
     }
 
+    /// Review 2, m-13: the name claims more than a non-persistent data store.
+    /// "Keeps nothing" is four separate promises, and three of them were not
+    /// checked -- including the one PRIVACY.md 3.6 leans on hardest, that the
+    /// imagery does not outlive the viewer.
     func testTheViewerWebViewKeepsNothingAndRegistersTheScheme() {
         let assets = WorldAssetSchemeHandler(worldID: "w1")
         let configuration = WorldRenderWebView.makeConfiguration(assets: assets)
-        XCTAssertFalse(configuration.websiteDataStore.isPersistent)
+        XCTAssertFalse(configuration.websiteDataStore.isPersistent,
+                       "nothing the page stores outlives the viewer")
         XCTAssertTrue(configuration.urlSchemeHandler(forURLScheme: WorldAssetScheme.name) === assets)
+        XCTAssertTrue(configuration.dataDetectorTypes.isEmpty,
+                      "no data detector turns a coordinate in the room into a phone number")
+        XCTAssertFalse(configuration.allowsInlineMediaPlayback)
+        // Nothing the transport fetches is written anywhere but memory, and
+        // memory is bounded and released. `WorldAssetClient`'s configuration is
+        // the other half of that promise.
+        let session = WorldAssetClient.uncachedConfiguration()
+        XCTAssertNil(session.urlCache)
+        XCTAssertNil(session.httpCookieStorage)
+        XCTAssertEqual(session.requestCachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
+        XCTAssertEqual(WorldAssetSchemeHandler.cacheLimit, 64 << 20)
     }
 
     func testTheHandlerReachesOnlyTheSessionThePageDraws() {
@@ -5521,13 +5745,89 @@ final class WorldAssetTransportTests: XCTestCase {
         XCTAssertFalse(WorldAssetSchemeHandler.revisionServesAppearance(Data("not json".utf8)))
     }
 
+    /// The caption says what the page does, and stops saying what it stopped
+    /// doing (review 2, M-5 and M-6).
+    ///
+    /// The old version of this test asserted `"nothing is filled in"`, a claim
+    /// `21d6f1a` made false, and did not check it against anything — so the
+    /// suite's only caption test was what locked the untrue sentence in place.
+    /// The retraction is asserted, not just the replacement: a caption is a
+    /// promise, and the way this one went wrong was by keeping a promise the
+    /// page had stopped keeping.
     func testTheAppearanceRungIsCaptionedForWhatItIs() {
         let caption = WorldRenderRepresentation.caption(for: .appearance)
         XCTAssertTrue(caption.contains("faces redacted"))
-        XCTAssertTrue(caption.contains("nothing is filled in"))
+        XCTAssertTrue(caption.contains("Grey haze is where no kept image looked"),
+                      "a void is drawn as grey fog, not as a dark gap")
+        XCTAssertTrue(caption.contains("only cracks a few pixels wide are filled"),
+                      "FS_FILL closes thin cracks, and the caption bounds what it closes")
         XCTAssertTrue(caption.contains("Not to scale"))
+        XCTAssertFalse(caption.contains("nothing is filled in"),
+                       "the page fills thin cracks; the caption must not deny it")
+        XCTAssertFalse(caption.contains("Dark gaps"),
+                       "a void is haze, and the fog can only ever darken")
         XCTAssertNotEqual(caption, WorldRenderRepresentation.caption(for: .surface))
         XCTAssertEqual(WorldRenderRepresentation.declared(
             in: "<head><meta name=\"wb-representation\" content=\"appearance\"></head>"), .appearance)
+    }
+
+    /// Review 2, M-3 and M-4: a task WebKit never stopped, whose web view has
+    /// gone, must be answered by nobody; and the imagery must not outlive the
+    /// viewer.
+    func testTheImageryDiesWithTheViewerAndNoTaskOutlivesItsWebView() async {
+        let (assets, _) = handler(clock: Date())
+        StubbedGeometryProtocol.reset(routes: [Self.manifestPath: (200, "{}"),
+                                               Self.chunkPath: (200, "bytes")])
+        _ = try? await assets.answer(.appearanceChunk(digest: Self.digest), sessionID: "s1")
+        XCTAssertGreaterThan(assets.cacheBytes, 0, "fixture: something is held")
+        XCTAssertTrue(assets.isAttached)
+
+        // The web view is torn down. The copy survives -- the viewer may be
+        // about to build another web view -- but nothing may be answered.
+        assets.detach()
+        XCTAssertFalse(assets.isAttached, "no scheme task is answered after dismantleUIView")
+        XCTAssertGreaterThan(assets.cacheBytes, 0,
+                             "a new web view for the same viewer must not re-download 13 MB")
+        assets.attach()
+        XCTAssertTrue(assets.isAttached)
+
+        // The viewer closes. PRIVACY.md 3.6 and WORLD-BUILDER-IOS.md 10 both
+        // say the copy dies here, and before this nothing called `dropCache()`
+        // at all.
+        assets.tearDown()
+        XCTAssertEqual(assets.cacheBytes, 0, "the imagery is dropped when the viewer closes")
+        XCTAssertNil(assets.servedAppearanceToPageAt, "and so is its authorisation")
+        XCTAssertTrue(assets.isAttached,
+                      "`.onDisappear` also fires when the screen is merely covered: dropping the "
+                          + "imagery is cheap, refusing every later request is not")
+    }
+
+    /// Review 2, m-3: a restored context re-asks for every layer at once, and
+    /// each request whose authorisation had expired used to fetch the manifest
+    /// for itself.
+    func testConcurrentRevalidationsShareOneManifestFetch() async {
+        let (assets, expire) = handler(clock: Date())
+        StubbedGeometryProtocol.reset(routes: [Self.manifestPath: (200, "{}"),
+                                               Self.chunkPath: (200, "bytes")])
+        for digest in Self.eightDigests {
+            StubbedGeometryProtocol.set(
+                route: "/tower/worlds/w1/appearance/s1/chunk/\(digest)", to: (200, "bytes"))
+            _ = try? await assets.answer(.appearanceChunk(digest: digest), sessionID: "s1")
+        }
+        let manifestsWhileFilling = StubbedGeometryProtocol.requestCount(for: Self.manifestPath)
+        expire()
+        // All eight in flight at once, which is what a restored context does.
+        // `Task { }` here inherits the test's main actor, so the eight
+        // interleave at their awaits exactly as the handler's own do.
+        var asking: [Task<Void, Never>] = []
+        for digest in Self.eightDigests {
+            asking.append(Task { _ = try? await assets.answer(
+                .appearanceChunk(digest: digest), sessionID: "s1") })
+        }
+        for task in asking { await task.value }
+        XCTAssertEqual(
+            StubbedGeometryProtocol.requestCount(for: Self.manifestPath),
+            manifestsWhileFilling + 1,
+            "eight stale hits revalidate once between them, not eight times")
     }
 }

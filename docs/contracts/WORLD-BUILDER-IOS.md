@@ -487,6 +487,16 @@ the typed fetch errors, the 30 s bound, the render watchdog and the
 still never reach WebKit, so the Tower's CSP reaches the phone only as the
 `<meta http-equiv>` tag every page carries (§4 rule 6).
 
+**An appearance page that names no session is refetched once, then reported.**
+With no pinned session the handler's session comes only from the page's own
+`wb-revision` stamp, and the Tower composes the page unstamped when
+`_appearance_revision` raced away between choosing the rung and stamping it
+(§4a rule 7). Such a page can fetch nothing at all: every manifest, chunk and
+proxy request is refused locally, **the Tower log shows nothing**, and the field
+report reads "the world opened empty". `load()` refetches once — the race is
+narrow and the refetch wins it — and then fails with a retryable sentence rather
+than presenting a page that cannot work (2026-09-17, review 2 m-16).
+
 **The transport** (`WorldAssetTransport.swift`), for the appearance page of
 WORLDS §4, which fetches its imagery:
 
@@ -512,9 +522,22 @@ WORLDS §4, which fetches its imagery:
   sets `Accept-Encoding`) and returns decoded bytes, so WebKit is given the
   decoded body, its decoded `Content-Length`, and **no** `Content-Encoding`
   (`WorldAssetSchemeHandler.responseHeaders`).
-- **Stop and cancel.** A task WebKit stops is removed from the live set and its
-  fetch cancelled; a completion for a stopped task says nothing (answering one
-  raises an Objective-C exception).
+- **Isolation.** The handler is `@MainActor` and the two `WKURLSchemeHandler`
+  requirements are `nonisolated`, hopping with `MainActor.assumeIsolated`
+  (2026-09-17, review 2 C-1). Nonisolated witnesses, because an isolated
+  conformance to an `@objc` protocol is not expressible and
+  `SWIFT_APPROACHABLE_CONCURRENCY` would try to infer one; `assumeIsolated`
+  and not a `Task`, because a `Task` hop would make `stop` asynchronous and
+  let a `start` for a task WebKit had already stopped be processed first.
+- **Stop, cancel and teardown.** A task WebKit stops is removed from the live
+  set and its fetch cancelled; a completion for a stopped task says nothing
+  (answering one raises an Objective-C exception, which Swift cannot catch).
+  `WorldRenderWebView.dismantleUIView` stops the load, clears the navigation
+  delegate and calls `detach()`, which empties the live set and cancels every
+  outstanding fetch — so a task whose web view is gone is answered by nobody,
+  not even if WebKit never delivered its `stop` (2026-09-17, review 2 M-3).
+  The page's fetches are bounded from its own side too (§4 "Following"), so a
+  dropped task cannot leave it waiting for ever.
 - **Memory only.** Chunks and the proxy (content-addressed, immutable) are kept
   in the handler's memory (`WorldAssetMemory`), capped at 64 MB, so a WebContent
   kill does not download 14 MB again. **A copy is answered only under a fresh
@@ -524,22 +547,47 @@ WORLDS §4, which fetches its imagery:
   context — so a page load is authorised by its own manifest request. A hit
   outside the window is revalidated: the handler fetches the manifest first and
   answers from memory only if that is 200; otherwise the copy is dropped and the
-  bundle request goes to the Tower, which applies the label check. The copy and
-  its authorisation are **dropped** whenever a manifest request answers anything
-  but 200 or a revision request stops naming a served appearance, and die with
-  the viewer. Before this a hit was answered with no Tower check at all, so a
-  restore or reload after a relabel or purge redrew withdrawn imagery for up to
-  a poll interval. Tested on the handler (`answer(_:sessionID:)`) against a
-  stubbed Tower, not only on a JSON predicate. Nothing is written to disk.
+  bundle request goes to the Tower, which applies the label check. Concurrent
+  revalidations share ONE manifest fetch (2026-09-17, review 2 m-3): a restored
+  context re-asks for every bundle at once, and eight independent manifest
+  fetches were ~2 MB of redundant transfer and eight redundant label checks in
+  one burst. The copy and its authorisation are **dropped** whenever a manifest
+  request answers anything but 200, or a revision request stops naming a served
+  appearance, or the page on screen changes to a different SESSION, and
+  **`tearDown()` drops them when the viewer closes** — called from the
+  screen's `.onDisappear`, and the first thing that actually implemented the
+  last of those: `dropCache()` had no caller at all and up to 64 MB of
+  first-person room imagery was left to ARC (2026-09-17, review 2 M-4 and m-4).
+  `tearDown()` does not detach the handler, because `.onDisappear` also fires
+  for a screen that is merely covered; `dismantleUIView` is what says the web
+  view is gone. Dropping the imagery early costs a refetch, and only if the
+  page asks again.
+  The copy belongs to the VIEWER, not to the web view: it is owned by
+  `WorldRenderViewerModel`, survives `dismantleUIView`, and a "Try again" that
+  builds a second web view does not re-download it. Before this a hit was
+  answered with no Tower check at all, so a restore or reload after a relabel
+  or purge redrew withdrawn imagery for up to a poll interval. Tested on the
+  handler (`answer(_:sessionID:)`) against a stubbed Tower, not only on a JSON
+  predicate. Nothing is written to disk.
 - **The web view.** `WKWebsiteDataStore.nonPersistent()`, the scheme handler
   registered before the view exists (`WorldRenderWebView.makeConfiguration`),
   no data detectors, no inline media.
 - **Navigation.** `WorldRenderNavigationPolicy.allows(_:isInitialLoad:pageURL:isReload:)`:
   the initial load of exactly the page URL, nothing else — not `about:blank`,
-  not the page with a query, not a second load of it — **except a main-frame
-  reload of exactly the page URL** (2026-09-17, review 1 m8), which the
-  appearance page asks for when WebKit never restores a lost WebGL context. The
-  reload is served the same string from memory and costs the camera.
+  not the page with a query, not a second load of it — **except the page
+  putting itself back**: a main-frame navigation to exactly the page URL after
+  the initial load (2026-09-17, review 1 m8), which the appearance page asks
+  for when WebKit never restores a lost WebGL context. The reload is served
+  the same string from memory and costs the camera, and the screen goes back
+  to a bounded "Drawing the world…" while it happens rather than claiming to
+  be ready over a black rectangle.
+  Both `.reload` and `.other` are accepted for it, and it is **counted**: at
+  most three inside the same 60 s window as the kill budget (2026-09-17,
+  review 2 m-8 and m-9). WebKit does not promise which `WKNavigationType` a
+  script-initiated reload arrives as, and cancelling it because it came as the
+  other one leaves the wearer on "Restoring…" for good — which is the exact
+  failure the reload exists to prevent. The count is what makes accepting
+  `.other` safe.
 - **CSP.** The appearance page's `<meta>` allows `connect-src glasses-world:`
   and nothing else; every other page keeps `default-src 'none'`.
 
@@ -552,14 +600,38 @@ the claim `WORLD-BUILDER-SURFACE.md` §2 claim 2 retracts. It does not say "two
 views": the app cannot see the manifest, and a surface built before the
 per-face filter made no such test. The page's own caption says "at least two
 camera views" only when the manifest shows the filter ran), *Points the Tower measured
-densely…* (dense), *Points the Tower measured from the walk…* (sparse), and a
+densely…* (dense), *Points the Tower measured from the walk…* (sparse),
 *The camera's own images, faces redacted, placed on the reconstructed room.
-Dark gaps were not seen or were masked as unreliable; nothing is filled in. Not
-to scale.* (appearance, 2026-09-17), and a
+Grey haze is where no kept image looked; only cracks a few pixels wide are
+filled, from the images beside them. Not to scale.* (appearance), and a
 rung-neutral *What the Tower reconstructed from the walk. Not to scale.* before
 the page arrives or for a page that declares nothing. Details says the page's
 own Diagnostics button switches views **only** on a sparse (or undeclared) page;
 on a surface or dense page it points at the world screen's Diagnostics instead.
+
+The appearance sentence was rewritten on 2026-09-17 (review 2, M-5). It read
+*"Dark gaps were not seen or were masked as unreliable; nothing is filled in"*,
+written before `21d6f1a`, and both halves stopped being true in opposite
+directions. **Nothing is filled in** is false: a pixel with no surface whose two
+sides within a few device pixels lie on one plane is placed on that plane and
+shaded (§4 "what it draws"). The PIXELS are still camera pixels — the artifact's
+claims in `WORLD-BUILDER-APPEARANCE.md` §2 and §3 are untouched — but the
+geometry under them is synthesised there, and a wearer told "nothing is filled
+in" would read a closed crack as measured. **Dark gaps** is false in the other
+direction: a void is painted as an unlit grey fog lifted from the mean of what
+is inked around it, never as black. The replacement states the bound rather than
+a denial, which is what a wearer can act on: haze means distrust this, a seam a
+few pixels wide may have been closed from its neighbours. A caption that denies
+what is on screen is the same failure as one that overclaims.
+
+**There is always a way to ask again.** The screen's toolbar carries a plain
+**Reload** (`world-render-reload`), which is `load()` — the same thing "Try
+again" calls — and is reachable whatever the screen is showing (2026-09-17,
+review 2 M-0 and m-7). Every other control here is conditional on the model's
+state, and the state that needed one most had none: a page that placed no
+imagery, or whose fetches were all refused, still reports `didFinish`, so the
+screen is `.ready`, the failure view is not shown, and the wearer was left with
+the page's own sentence and a Close.
 
 **Following.** While a page is on screen (`.ready`), the screen's `.task` asks
 `GET /worlds/{id}/render/revision` and compares the answer with the revision
@@ -570,7 +642,7 @@ stamped into the page (`wb-revision`) and with the last revision it acted on:
 | same revision | nothing; no page is fetched |
 | same revision, **new `appearance.revision`** (decoded as `WorldRenderRevision.appearance`) | nothing. The appearance page polls the same route through the scheme and overwrites its texture layers in place, keeping the camera. The follower never reloads the page for an appearance build |
 | while an **appearance** page is on screen: `appearance.state` `rebuilding` (decoded as `appearanceState`; the ordinary Stop), then the appearance served again | nothing. The page kept its textures and loads the final build in place; the page revision (`…@<epoch>`) did not move |
-| while an **appearance** page is on screen: the appearance **withdrawn** (`state` `withdrawn`/`absent`, or no `state` from an older Tower), then served again on the appearance rung, of the same walk | fetches the page and swaps it in **by itself, even when the page revision is unchanged** (review 1, B1): the page dropped its textures, and a page whose script died, or a Tower without epochs, would otherwise stay on "no longer served" for good (`WorldRenderViewerModel.appearanceReturned`) |
+| while an **appearance** page is on screen: the appearance **withdrawn** (`state` `withdrawn`/`absent`/`unavailable`, or no `state` from an older Tower), then served again on the appearance rung, of the same walk | **waits one poll for the page, then replaces it.** The page's own follower refetches the manifest and redraws IN PLACE, keeping the camera; the app can see that it did, because that manifest fetch goes through the scheme handler (`WorldAssetSchemeHandler.servedAppearanceToPageAt`). If it did, the app does nothing at all. If it did not — the script died, or the page never started one — the app fetches the page and swaps it in **by itself, even when the page revision is unchanged** (review 1, B1), which on a pre-epoch world is the only path there is. Exactly one of the two acts: before 2026-09-17 both did, and the slower one won — a camera reset to the opening pose and ~13 MB of chunks fetched again for a page that had already fixed itself (review 2, M-2). The flag is cleared **only after a refresh that actually put a page on screen**; a failed fetch leaves it armed and the next poll tries again, where before one unreachable moment disabled the recovery for the life of the screen (review 2, M-1). `WorldRenderViewerModel.appearanceFollow` is the whole rule, and is pure |
 | a new revision of a **better rung** (sparse → dense → surface → appearance, read from `representation`, never from the opaque revision), of the **same walk** | fetches the page and swaps it in |
 | a new revision of the **same rung** with `live: false`, of the **same walk** | fetches the page and swaps it in. This is any same-rung revision seen while the Tower reports nothing building, which is normally the finished build after Stop (a live build polled in the gap before the final starts also qualifies). A world is not rebuilt after its final build, and a wearer who stopped walking is shown the finished world |
 | a new revision of the **same rung** otherwise (live, or the Tower did not say), or **any** new revision of a better or same rung from **another walk** | shows *"A newer reconstruction is ready. Show it"*; the swap happens only on tap, because a swap reloads the page and resets the reader's camera. The button goes away if the Tower goes back to reporting the revision on screen |

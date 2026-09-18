@@ -1213,7 +1213,11 @@ final class WorldRenderRepresentationTests: XCTestCase {
     }
 
     func testNoCaptionClaimsAScale() {
-        let rungs: [WorldRenderRepresentation?] = [.surface, .dense, .sparse, nil]
+        // `.appearance` was missing from this list, which is how the one rung
+        // whose pixels look like a photograph — and so the one a wearer is
+        // likeliest to measure off — was the one rung not held to the rule
+        // (review 2).
+        let rungs: [WorldRenderRepresentation?] = [.appearance, .surface, .dense, .sparse, nil]
         for rung in rungs {
             XCTAssertTrue(
                 WorldRenderRepresentation.caption(for: rung).localizedCaseInsensitiveContains("not to scale"),

@@ -224,7 +224,19 @@ nonisolated struct WorldAssetResponse: Sendable, Equatable {
 /// private room (`WORLD-BUILDER-APPEARANCE.md` §3), and honouring the Tower's
 /// `no-store` must not depend on which session a caller happened to pass.
 /// Nothing is written to disk by this type, ever.
-nonisolated struct WorldAssetClient: Sendable {
+///
+/// **`nonisolated struct`, and deliberately NOT `: Sendable`** (review 2, C-2).
+/// It was the only `: Sendable` HTTP client in the app; the four siblings
+/// (`ObjectMemoryImageryHTTPClient`, `ExperimentalCVPreviewClient`,
+/// `WorldRenderClient`, `WorldGeometryClient`) are all `nonisolated struct`
+/// with no conformance, and the divergence was not deliberate. The conformance
+/// is not load-bearing: the only instance is a `private let` on the
+/// main-actor `WorldAssetSchemeHandler`, and the `Task` that calls `fetch`
+/// inherits that actor, so nothing here crosses an isolation domain. Declaring
+/// the conformance would additionally have required `URLSession` to be
+/// `Sendable` -- true in recent Foundation, but a promise this type does not
+/// need to make and cannot check from here.
+nonisolated struct WorldAssetClient {
     var baseURL: URL = TowerConfiguration.httpBaseURL
     var session: URLSession
     /// A bundle is ~1.6 MB; bounded all the same (Rule 15).
@@ -374,11 +386,31 @@ nonisolated struct WorldAssetMemory: Sendable {
 
 /// Answers the viewer page's `glasses-world:` requests.
 ///
-/// MainActor, by the project's default isolation, which is where WebKit calls
-/// `start` and `stop`. A `WKURLSchemeTask` must never be answered after WebKit
-/// stopped it -- that raises an Objective-C exception -- so every asynchronous
-/// completion checks that its task is still live, and a stopped task's fetch is
-/// cancelled.
+/// **Isolation, explicitly** (review 2, C-1). The class is `@MainActor` -- which
+/// the project's `SWIFT_DEFAULT_ACTOR_ISOLATION` would have made it anyway, but
+/// a reader should not have to know a build setting to know where this runs --
+/// and the two `WKURLSchemeHandler` requirements are `nonisolated`, hopping
+/// with `MainActor.assumeIsolated`. That combination is deliberate:
+///
+/// - `WKURLSchemeHandler` is an `@objc` protocol. If the SDK does not annotate
+///   it `WK_SWIFT_UI_ACTOR`, `SWIFT_APPROACHABLE_CONCURRENCY`'s
+///   `InferIsolatedConformances` would try to infer a `@MainActor`-isolated
+///   conformance, and an isolated conformance to an `@objc` protocol is not
+///   expressible (an ObjC caller has no way to hop). Nonisolated witnesses take
+///   the question off the table, whichever way the 26.5 SDK spells it.
+/// - The hop is `MainActor.assumeIsolated`, **not** `Task { @MainActor in … }`.
+///   WebKit calls `start` and `stop` on the main thread, so the assumption is
+///   the truth; and a `Task` hop would make `stop` asynchronous, which would let
+///   a `start` for a task WebKit had already stopped be processed first. A
+///   stopped `WKURLSchemeTask` that is answered raises an Objective-C
+///   exception, which Swift cannot catch.
+///
+/// A `WKURLSchemeTask` must never be answered after WebKit stopped it, or after
+/// the web view it belongs to is gone. Three things enforce that: `stop`
+/// removes the task from the live set and cancels its fetch; every asynchronous
+/// completion re-checks the live set; and `detach()` (from
+/// `WorldRenderWebView.dismantleUIView`) empties both, so a task whose web view
+/// has been torn down is never answered at all (review 2, M-3).
 ///
 /// **Memory only.** Content-addressed bundles and the proxy are kept in memory
 /// for the life of this viewer, capped at `WorldAssetMemory.limit`, so a
@@ -386,7 +418,18 @@ nonisolated struct WorldAssetMemory: Sendable {
 /// under a fresh authorisation from the Tower (`WorldAssetMemory`), and dropped
 /// whenever the Tower stops serving this session's appearance, because the
 /// Tower re-checks the redaction label on every request and a copy must not
-/// outlive that check. Nothing is written to disk.
+/// outlive that check. It is also dropped when the viewer closes
+/// (`tearDown()`, called from the screen's `.onDisappear`), which
+/// `PRIVACY.md` §3.6 and `WORLD-BUILDER-IOS.md` §10 both promise and which
+/// nothing used to do (review 2, M-4). Nothing is written to disk.
+///
+/// **Owned by the model, not by the web view's coordinator.** The copy's life
+/// is the VIEWER's, not the `WKWebView`'s: a "Try again" destroys the web view
+/// and builds a new one, and re-downloading 13 MB for that would be the bug the
+/// memory exists to prevent. `WorldRenderViewerModel` holds it, hands it to the
+/// web view, and reads `servedAppearanceToPageAt` to tell a page that recovered
+/// itself from one that did not (review 2, M-2).
+@MainActor
 final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     let worldID: String
     private let client: WorldAssetClient
@@ -402,6 +445,19 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     /// Injectable so a test can move past the authorisation window.
     var clock: () -> Date = { Date() }
 
+    /// When the Tower last answered THIS SESSION'S manifest with 200 for the
+    /// page -- which is the only evidence the app has that the page's own
+    /// script is alive and has taken the imagery back after a withdrawal. The
+    /// page fetches the manifest before any bundle, at boot, on a new build and
+    /// on a restored context (`WORLD-BUILDER-APPEARANCE.md` §9), and the native
+    /// revision poll does NOT come through here, so this timestamp is the
+    /// page's and nobody else's. Read by `WorldRenderViewerModel` (M-2).
+    var servedAppearanceToPageAt: Date? { memory.authorizedAt }
+
+    /// Whether a web view is attached. `false` between `dismantleUIView` and
+    /// the next `makeUIView`, and after `tearDown()`.
+    private(set) var isAttached = true
+
     private var liveTasks: Set<ObjectIdentifier> = []
     private var inflight: [ObjectIdentifier: Task<Void, Never>] = [:]
 
@@ -412,7 +468,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
 
     /// The session a page may reach: the one the viewer was opened for, or --
     /// when the Tower chose -- the one the page's own revision stamp names.
-    static func session(for target: WorldRenderTarget, page html: String?) -> String? {
+    nonisolated static func session(for target: WorldRenderTarget, page html: String?) -> String? {
         if let pinned = target.sessionID { return pinned }
         return WorldRenderRepresentation.session(
             of: html.flatMap { WorldRenderRepresentation.meta(named: "wb-revision", in: $0) })
@@ -420,6 +476,42 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
 
     func dropCache() {
         memory.drop()
+    }
+
+    /// A web view is about to use this handler again. Called from
+    /// `makeUIView`, which is also the only place a new `WKWebView` is built
+    /// for this screen.
+    func attach() {
+        isAttached = true
+    }
+
+    /// WebKit is tearing the web view down (`dismantleUIView`). Every
+    /// outstanding task dies here: its fetch is cancelled and it is taken out
+    /// of the live set, so the completion that is already in flight answers
+    /// nothing. The memory copy is NOT dropped -- the viewer is still open, and
+    /// the next web view (a "Try again", a reload) must not re-download 13 MB.
+    func detach() {
+        isAttached = false
+        liveTasks.removeAll()
+        for task in inflight.values { task.cancel() }
+        inflight.removeAll()
+    }
+
+    /// The viewer closed. `PRIVACY.md` §3.6: "in-memory reuse within one open
+    /// viewer is fine; drop it when the viewer closes."
+    ///
+    /// Deliberately does NOT clear `isAttached`, and that is not an oversight:
+    /// this is called from `.onDisappear`, which also fires when the screen is
+    /// merely covered (a push on top of it), and a handler left permanently
+    /// detached under a web view that is still alive would refuse every fetch
+    /// the page makes for the rest of its life. `dismantleUIView` is what says
+    /// the web view is gone. Dropping the imagery early costs at most a
+    /// refetch; refusing every request costs the world.
+    func tearDown() {
+        liveTasks.removeAll()
+        for task in inflight.values { task.cancel() }
+        inflight.removeAll()
+        dropCache()
     }
 
     /// What the page gets for `asset` (anything but `.page`): from memory under
@@ -432,8 +524,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         case .serve(let hit):
             return hit
         case .revalidate:
-            let manifest = try await client.fetch(.appearanceManifest, worldID: worldID, sessionID: sessionID)
-            memory.record(.appearanceManifest, manifest, now: clock())
+            await revalidate(sessionID: sessionID)
             if case .serve(let hit) = memory.decision(for: asset, now: clock()) {
                 return hit
             }
@@ -445,7 +536,54 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         return response
     }
 
-    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+    /// The manifest fetch that re-earns the authorisation, **once for however
+    /// many bundles are waiting on it** (review 2, m-3).
+    ///
+    /// A restored WebGL context re-uploads every layer at once. With no
+    /// de-duplication, each of the eight bundle requests whose authorisation
+    /// had expired issued its own manifest fetch: ~2 MB of redundant transfer
+    /// and eight redundant label checks on the Tower, in one burst, at the
+    /// moment the phone was already under the memory pressure that lost the
+    /// context. The failure is swallowed rather than thrown because the caller
+    /// falls through to asking the Tower for the bundle itself, which applies
+    /// the same label check and reports the same failure.
+    private var revalidating: Task<Void, Never>?
+
+    private func revalidate(sessionID: String?) async {
+        if let running = revalidating {
+            await running.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.revalidating = nil }
+            guard let manifest = try? await self.client.fetch(
+                .appearanceManifest, worldID: self.worldID, sessionID: sessionID)
+            else { return }
+            self.memory.record(.appearanceManifest, manifest, now: self.clock())
+        }
+        revalidating = task
+        await task.value
+    }
+
+    // MARK: WKURLSchemeHandler
+    //
+    // Both requirements are `nonisolated` witnesses that hop synchronously; see
+    // the type's own comment for why this shape and not an isolated conformance
+    // or a `Task`.
+
+    nonisolated func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        MainActor.assumeIsolated { self.startTask(urlSchemeTask) }
+    }
+
+    nonisolated func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        MainActor.assumeIsolated { self.stopTask(urlSchemeTask) }
+    }
+
+    /// Named `startTask` and not `start`, so nothing here can collide with a
+    /// selector on `NSObject` or on a future `WKURLSchemeHandler`.
+    func startTask(_ urlSchemeTask: any WKURLSchemeTask) {
+        guard isAttached else { return }
         let request = urlSchemeTask.request
         guard let asset = WorldAssetRequest.parse(
             request.url, method: request.httpMethod, worldID: worldID, sessionID: sessionID
@@ -473,8 +611,10 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
             } catch {
                 result = .failure(error)
             }
-            // Back on the main actor: the task inherited it.
-            guard self.liveTasks.remove(id) != nil else { return }
+            // Back on the main actor: the task inherited it. `liveTasks` is
+            // emptied by `stop` AND by `detach`, so this one check covers both
+            // "WebKit stopped this task" and "the web view is gone".
+            guard self.isAttached, self.liveTasks.remove(id) != nil else { return }
             self.inflight[id] = nil
             switch result {
             case .success(let response):
@@ -486,7 +626,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         }
     }
 
-    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+    func stopTask(_ urlSchemeTask: any WKURLSchemeTask) {
         let id = ObjectIdentifier(urlSchemeTask as AnyObject)
         liveTasks.remove(id)
         inflight.removeValue(forKey: id)?.cancel()
@@ -517,7 +657,10 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     private func respond(_ task: any WKURLSchemeTask, status: Int, mimeType: String, data: Data) {
-        guard let url = task.request.url else { return }
+        // Never to a task whose web view has gone: messaging a `WKURLSchemeTask`
+        // after its web view is torn down raises `NSInternalInconsistencyException`,
+        // which is a crash and not a Swift error (review 2, M-3).
+        guard isAttached, let url = task.request.url else { return }
         let headers = Self.responseHeaders(mimeType: mimeType, byteCount: data.count)
         guard let response = HTTPURLResponse(
             url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers
