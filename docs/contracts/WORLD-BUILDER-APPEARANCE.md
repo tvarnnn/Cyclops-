@@ -75,6 +75,14 @@ alpha (0 = no weight). The Tower does not render; it prepares.
   builds one, must be premultiplied: `sum(rgb·a) / sum(a)`), no generative
   completion. Any future change that fills unobserved texels must break the
   format identifier rather than quietly relax this.
+  **This is a claim about the ARTIFACT, and the renderer is held to it**: the
+  page's crack fill (`WORLD-BUILDER-WORLDS.md` §4) synthesises GEOMETRY across a
+  gap a few device pixels wide and then shades it from real source pixels that
+  see that point, or not at all — so no pixel is invented there either, and the
+  page's own caption and the native caption both name the bound rather than
+  claiming nothing is filled (2026-09-17, review 2 M-5). A renderer that painted
+  colour into an unobserved texel would break this claim; one that places a
+  point on the plane its two sides agree on does not.
 - **Not anonymised.** Redaction is best-effort face detection with measured
   false negatives (§6). This artifact is first-person imagery of a private
   space and inherits the session's `privacy_tags` (`raw-imagery`,
@@ -770,6 +778,7 @@ reset the wearer's camera.
 | `rebuilding` | the label or set changed **in a way its textures carry over** (below): the ordinary Stop, `none` → the real label, over a walk build that re-redacted every frame with a trusted redactor | keeps drawing, keeps polling at the base rate, loads the final build in place when it lands; says it is finishing |
 | `withdrawn` | any other label or set change, or a purged world | drops every texture now, says why, **keeps polling** (backing off), draws a rebuild when one is served |
 | `absent` | no artifact | as `withdrawn` |
+| `unavailable` | the Tower's own appearance code raised (2026-09-17, review 2 m-15) | as `withdrawn` — nothing re-checked the label, so a texture must not outlive that check — but the page says *the Tower could not answer for this world's images just now*, not *its redaction record changed*. A crash reported as a privacy event is a lie in the direction that frightens |
 
 Nothing is SERVED during `rebuilding`: a page that opens or restores in the gap
 gets the surface. Every ordinary Stop used to make `revision` `null` with nothing
@@ -785,7 +794,12 @@ its own `build_id` (unique, so an epoch never returns). `appearance.epoch` is th
 served manifest's; the page compares it before applying a new build and drops
 first when it differs (a label change and a rebuild inside one poll, review 1
 m7). The **page** revision of the appearance rung is
-`<session_id>/appearance:<PAGE_REVISION>@<epoch>`: an ordinary build or the Stop
+`<session_id>/appearance:1@<epoch>` — the page PROGRAM's version, which is
+`appearance_render.PAGE_REVISION` and is currently `1`, and the served
+manifest's epoch. (It was written here as `appearance:<PAGE_REVISION>`, which
+expands to `appearance:appearance:1@…` if the constant's name is read as its
+whole value; WORLDS §4a rule 3 always had it right. Corrected 2026-09-17.) An
+ordinary build or the Stop
 transition does not move it (no reload, no camera reset), and a withdrawal-class
 rebuild does, so an app follower replaces a page that dropped its textures.
 
@@ -795,8 +809,10 @@ handler, which proxies exactly these three routes and the revision route for the
 world and session on screen, through an ephemeral session with no URL cache, and
 answers a bundle from its in-memory copy only while the Tower answered this
 session's manifest with 200 within the last 20 s (revalidating the manifest
-first otherwise), and drops the copy whenever a manifest or revision request
-stops answering with a served appearance (`WORLD-BUILDER-IOS.md` §10).
+first otherwise, once for however many bundles are waiting), and drops the copy
+whenever a manifest or revision request stops answering with a served
+appearance, when the page on screen changes session, **and when the viewer
+closes** (`WORLD-BUILDER-IOS.md` §10).
 
 ## 10. Live, final, rebuilding
 

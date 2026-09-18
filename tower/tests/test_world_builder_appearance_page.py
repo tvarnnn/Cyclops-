@@ -185,6 +185,30 @@ class TestTheLadder:
         assert _meta(build_world_render(built.store, WORLD, SESSION, viewer=V),
                      "wb-representation") == "surface"
 
+    def test_an_appearance_bug_is_reported_as_a_bug_not_as_a_relabel(self, built, monkeypatch):
+        """Review 2, m-15. The revision route must survive an exception in the
+        appearance code -- and it did -- but it reported the survival as
+        `withdrawn`, which is the Tower's word for a RELABEL or a PURGE. Both
+        consumers act on it as a privacy event: the page tells the wearer their
+        redaction record changed, and the app records a withdrawal. A traceback
+        is neither. This branch had no test at all on the Python side.
+        """
+        from tower.results import world_builder_appearance as WA
+        from tower.results.world_builder_render import build_render_revision
+
+        def crash(*a, **kw):
+            raise RuntimeError("simulated appearance bug")
+
+        monkeypatch.setattr(WA, "appearance_revision", crash)
+        rev = build_render_revision(built.store, WORLD, SESSION, viewer=V)
+        assert rev["appearance"]["state"] == "unavailable"
+        assert rev["appearance"]["revision"] is None
+        assert rev["appearance"]["current"] is False
+        # and the page revision still answers: the rung steps down, the route
+        # does not 500, and a follower keeps following.
+        assert rev["representation"] in {"surface", "dense", "sparse"}
+        assert isinstance(rev["revision"], str) and rev["revision"]
+
 
 class TestOldApps:
     """An iOS build older than the appearance page has no `glasses-world:` scheme
@@ -275,7 +299,14 @@ class TestThePage:
         from tower.world_builder.appearance_render import build_appearance_page
 
         html = build_appearance_page(built.store, WORLD, SESSION)
-        assert "faces redacted" in html and "nothing there is filled in" in html
+        assert "faces redacted" in html
+        # It said "nothing there is filled in" until review 2 found that the
+        # page had been filling thin cracks and painting voids with fog since
+        # `21d6f1a`. What replaces it is a BOUND rather than a denial: the
+        # wearer is told what is filled and how wide it can be.
+        assert "A grey haze is a place no kept frame saw" in html
+        assert "Cracks a few pixels wide between two parts of one surface are closed" in html
+        assert "nothing there is filled in" not in html
         assert "Scale is unknown" in html
         assert " metres" not in html and " meters" not in html
 
@@ -371,8 +402,26 @@ class TestTheBlend:
         assert "exp(-(pen[i] - pmin) / uTemp)" in blend
 
     def test_a_minority_colour_is_voted_down(self):
+        """The down-weighting, as arithmetic.
+
+        Two substrings proved only that the word `uConsensus` was in the file
+        (review 2, "tests that don't prove their names"). The claim is that a
+        sample far from the agreed colour loses weight CONTINUOUSLY and can
+        never gain any, so the four lines that do that are pinned, along with
+        the sign of each: the medoid weight falls off as exp(-4 D / V), the
+        per-sample weight is divided by 1 + d^2, and `uConsensus` mixes between
+        "no consensus" (1.0) and that -- so consensus 0 is exactly the old
+        behaviour and consensus 1 never raises a weight above `w[i]`.
+        """
         blend = _section(_template(), "const GLSL_SHADE", "/* ---------- main")
-        assert "uConsensus" in blend and "float cdist(" in blend
+        assert "float cdist(" in blend
+        assert "return length(a - b) / (0.08 + 0.5 * (dot(a, vec3(0.3333)) + dot(b, vec3(0.3333))));" in blend
+        # the soft medoid: agreement with the other voters, weighted by theirs
+        assert "float sw = v[j] * exp(-4.0 * D / max(V, 1e-6));" in blend
+        # and the per-sample penalty for disagreeing with it: 1/(1+d^2), mixed
+        # toward 1 by uConsensus, so it only ever multiplies the weight DOWN
+        assert "float d = cdist(col[i], m0) / 0.35;" in blend
+        assert "b = (w[i] + 0.05 * wmax * v[i]) * mix(1.0, 1.0 / (1.0 + d * d), uConsensus);" in blend
         # the voters are the k + 2 best, never every candidate
         assert "vthr = (n > k + 2) ? s[k + 2]" in blend
 
@@ -382,7 +431,17 @@ class TestTheBlend:
         assert "uGain[i] * exp(dot(uSlope[i], q) + uVig.x * r2 + uVig.y * r2 * r2)" in blend
         assert "kf.gain_slope" in text and "man.exposure.vignette" in text
 
-    def test_highlights_roll_off_below_white(self, built):
+    def test_every_colour_the_page_draws_goes_through_the_highlight_roll_off(self, built):
+        """The roll-off, and that nothing escapes it.
+
+        `TONE_CEILING < 0.99` says a constant is small; it does not say the
+        page uses it (review 2). What makes the claim true is that EVERY path
+        out of `shade` that carries a colour goes through `tone()` -- so the
+        shoulder is checked, its shape is checked, and then every
+        non-debug `o = vec4(...)` that carries `acc / ws` is checked to have
+        `tone(` in it. The transfer is also run, in Python, against the same
+        constants the shader is compiled with.
+        """
         from tower.world_builder.appearance_render import build_appearance_config
 
         text = _template()
@@ -393,6 +452,38 @@ class TestTheBlend:
         assert "if (m <= uKnee) return x;" in blend
         knee = build_appearance_config(built.store, WORLD, SESSION)["tone_knee"]
         assert 0.3 <= knee < ceiling
+
+        # Nothing writes the accumulated colour without the roll-off.
+        writes = [ln for ln in blend.splitlines() if "acc / ws" in ln]
+        assert writes, "fixture: the blend still accumulates into acc / ws"
+        for line in writes:
+            assert "tone(" in line, line
+
+        # And the transfer itself: continuous at the knee, monotone, and it
+        # approaches the ceiling without ever reaching it.
+        import math
+
+        def tone(m):
+            if m <= knee:
+                return m
+            span = ceiling - knee
+            return knee + span * (1.0 - math.exp(-(m - knee) / span))
+
+        assert abs(tone(knee) - knee) < 1e-12
+        last = -1.0
+        for i in range(0, 401):
+            m = i / 100.0                                        # past any real value
+            y = tone(m)
+            assert y > last, m
+            last = y
+        # strictly below the ceiling over everything a source can produce (a
+        # value of 1.0 divided by a gain as low as 0.25), and never above it
+        # for any input at all -- the shoulder only saturates ONTO the ceiling,
+        # in the last bits of the float, and never past it
+        assert tone(4.0) < ceiling, tone(4.0)
+        for m in (10.0, 100.0, 1e6):
+            assert tone(m) <= ceiling, (m, tone(m))
+        assert tone(1.0) < 1.0, "a white source does not come out white"
 
     def test_a_changed_choice_of_sources_crossfades(self):
         text = _template()
@@ -411,13 +502,34 @@ class TestTheBlend:
         assert "alpha *= smoothstep(" in composite and "float alpha = layer.a;" in composite
 
     def test_proxy_nobody_saw_is_drawn_as_nothing_but_still_occludes(self):
+        """Both halves, and the mechanism of each.
+
+        "Still occludes" was argued from one `colorMask(...)` string appearing
+        somewhere before `const P = G.blend` (review 2). What it needs is the
+        whole chain: the prepass draws the WHOLE proxy with colour masked off
+        and depth writing ON, the blend then runs with `LEQUAL` against it and
+        depth writes OFF, the two passes share one vertex shader whose
+        `gl_Position` is `invariant` (or the LEQUAL test would crack open on
+        some drivers), and the unobserved fragment writes a transparent pixel
+        rather than `discard`ing -- a `discard` would let what is behind it
+        through, which is the whole difference between "nothing was seen here"
+        and "there is nothing here".
+        """
         text = _template()
         blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         assert "if (!observed){ o = vec4(0.0); return; }" in blend      # no tint, no fog
         assert "uFogLift" not in text and "uGhost" not in text
-        # the depth prepass still draws the whole proxy before the blend
-        pass_ = _section(text, "function blendPass(", "const P = G.blend;")
-        assert "gl.colorMask(false, false, false, false);" in pass_ and "drawMesh();" in pass_
+        fs_blend = _section(text, "const FS_BLEND", "const FS_FILL")
+        assert "discard" not in fs_blend, "a discarded fragment would stop occluding"
+        assert "invariant gl_Position;" in _section(text, "const VS_VIEW", "`;")
+        pass_ = _section(text, "function blendPass(", "  let pending = false")
+        prepass = pass_.index("gl.colorMask(false, false, false, false);")
+        first_draw = pass_.index("drawMesh();")
+        blend_prog = pass_.index("const P = G.blend;")
+        assert prepass < first_draw < blend_prog, "the whole proxy writes depth before anything is shaded"
+        assert "gl.depthMask(true);" in pass_[:prepass + 400]
+        # and the blend then tests against it without writing it
+        assert "gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); gl.depthMask(false);" in pass_
 
     def test_the_opening_is_the_most_drawn_frame_at_the_canvas_aspect(self):
         text = _template()
@@ -562,7 +674,27 @@ class TestTheFollower:
         assert "applyManifest(man" not in restored, "the old in-page manifest is never reapplied"
         lost = _section(text, 'canvas.addEventListener("webglcontextlost"',
                         'canvas.addEventListener("webglcontextrestored"')
-        assert "restoreContext()" in lost and "location.reload()" in lost
+        assert "restoreContext()" in lost and "armReloadWatchdog(RESTORE_RELOAD_MS)" in lost
+        # ORDERING, which is what P-1 was about: this test passed while
+        # `clearRestoreTimers()` was the FIRST statement of the restore handler,
+        # disarming the reload before `buildGL()` and before the manifest and
+        # every chunk were fetched again -- so the slowest, least reliable part
+        # of the restore ran with no escape hatch at all, and a page could sit
+        # on "Restoring..." for ever (review 2, P-1).
+        assert restored.index("clearRestoreTimers();") < restored.index("armReloadWatchdog(RESTORE_FINISH_MS)"), (
+            "the watchdog is re-armed, not cancelled")
+        assert restored.index("armReloadWatchdog(RESTORE_FINISH_MS)") < restored.index("buildGL();"), (
+            "re-armed BEFORE the work it is watching")
+        # and only a restore that actually finished, one way or the other,
+        # clears it
+        assert restored.count("restoreSettled();") >= 3, "every exit from the restore settles it"
+        watchdog = _section(text, "function armReloadWatchdog(", "canvas.addEventListener(\"webglcontextlost\"")
+        assert "if (!restoring) return;" in watchdog and "location.reload();" in watchdog
+        # the fetches the restore makes are themselves bounded, so a task the
+        # app's scheme handler drops cannot hang the page (review 2, P-1/M-3)
+        fetch = _section(text, "async function fetchBytes(", "async function fetchJSON(")
+        assert "new AbortController()" in fetch and "signal: abort.signal" in fetch
+        assert "setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS)" in fetch
 
 
 STOP_SCRIPT = r"""
@@ -601,6 +733,16 @@ assert.strictEqual(FOLLOW.mustReplace({epoch: "b1"}, {epoch: "b9"}), true);
 assert.strictEqual(FOLLOW.mustReplace({epoch: "b1"}, {epoch: "b1"}), false);
 assert.strictEqual(FOLLOW.mustReplace({}, {epoch: "b1"}), true, "an unknown epoch is never the same");
 assert.strictEqual(FOLLOW.mustReplace(null, {epoch: "b1"}), false, "nothing on screen");
+// A Tower-side CRASH is not a privacy event (review 2, m-15): the textures
+// still go, because nothing re-checked the redaction label, but the wearer is
+// not told their redaction record changed.
+const broken = {live: false, appearance: {revision: null, current: false, state: "unavailable", epoch: null}};
+const u = FOLLOW.decide({ok: broken}, page);
+assert.strictEqual(u.action, "drop", "an unanswerable appearance still drops the textures");
+assert.ok(/could not answer/.test(u.reason), "it says the Tower could not answer: " + u.reason);
+assert.ok(!/redaction record/.test(u.reason), "and never blames the redaction record: " + u.reason);
+assert.ok(!/Close and reopen/.test(u.reason), "not a dead end either");
+assert.notStrictEqual(u.reason, FOLLOW.decide({ok: withdrawn}, page).reason);
 """
 
 HOLD_SCRIPT = r"""
@@ -858,18 +1000,56 @@ class TestTheCracksAndVoids:
         pass_ = _section(text, "function blendPass(", "  let pending = false")
         assert pass_.index("drawMesh();") < pass_.index("G.fill") and "lay.fb3" in pass_
         assert "Math.min(8, Math.round(OPT.fillPx * dpr))" in pass_
+        # The BOUND is what the wearer is told about, so it is pinned here too:
+        # a few device pixels, never more, whatever the query string says.
+        assert "Math.max(0, Math.min(8, +(Q.get(\"fill\")" in text, "the radius is clamped at the source"
+        caption = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert "Cracks a few pixels wide between two parts of one surface are closed" in caption, (
+            "the page fills thin cracks and its caption must say so (review 2, M-5)")
+        assert "nothing there is filled in" not in text, "the claim the fill made false"
 
-    def test_a_void_is_an_unlit_fog_that_never_makes_a_pixel_look_observed(self):
+    def test_a_void_is_never_brighter_than_the_room_beside_it(self):
+        """The fog's ARITHMETIC, not its spelling.
+
+        This test used to assert that the composite contained
+        `coarse.rgb / max(coarse.a, 0.02)` -- the very expression that made a
+        void brighter than a half-observed wall (review 2, P-2) -- so the suite
+        was pinning the defect in place under a name that denied it. A
+        source-level test cannot run a fragment shader, but it can check the
+        two facts the result depends on, and each of them fails if the bug
+        comes back:
+
+        1. the layer the mip is built from is PREMULTIPLIED, so the coarse
+           level is the mean of what is INKED (which is what
+           `WORLD-BUILDER-APPEARANCE.md` section 3 already requires of any mip
+           a client builds);
+        2. the fog is that mean scaled by `uFog` and nothing else -- in
+           particular never divided by a mean alpha, which is evidence and not
+           coverage.
+
+        The numeric claim itself is checked where it can be, by rendering:
+        `Glasses-scratch/wb-final-recon/fixit/fix-ios2`.
+        """
         text = _template()
+        blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
         composite = _section(text, "const FS_COMPOSITE", "}`;")
+        # (1) premultiplied out of the shade, divided back out for this pixel
+        assert "o = vec4(c * alpha, alpha);" in blend, "the layer must be premultiplied for the mip"
+        assert "vec3 ink = layer.rgb / max(layer.a, 1.0 / 255.0);" in composite
+        assert "mix(base, ink, alpha)" in composite, "so the drawn room is unchanged"
+        # (2) the fog is uFog x the coarse mean, undivided
+        assert "vec3 near = coarse.rgb;" in composite
+        assert "coarse.a, 0.02" not in composite, "the unpremultiplied divide is the P-2 defect"
+        assert "/ coarse.a" not in composite and "/ max(coarse" not in composite
+        assert "base = mix(base, uFog * mix(vec3(lum), near, 0.1), nearby);" in composite
+        # alpha only ever shrinks: the edge fade and the wide fade multiply it
         assert "float alpha = layer.a;" in composite
-        # alpha only shrinks: the edge fade and the wide fade multiply it
         assert "alpha *= smoothstep(0.5, 0.97, s / n);" in composite
-        assert "alpha *= 1.0 - uWide * (1.0 - smoothstep(0.3, 0.9, coarse.a));" in composite
+        assert "alpha *= 1.0 - uWide * (1.0 - nearby);" in composite
         assert "alpha +=" not in composite and "alpha = max" not in composite
-        # the fog is the coarse level (no texture), mostly grey
+        # and "widen the fade near a big void" reads coverage, not evidence
+        assert "float nearby = smoothstep(0.02, 0.35, coarse.a);" in composite
         assert "textureLod(uL, (vec2(p) + 0.5) / vec2(uSize), uFogLod)" in composite
-        assert "mix(vec3(lum), near, 0.1)" in composite
         draw = _section(text, "function drawBlend(", "function shadeUniforms(")
         assert "Math.log2(Math.min(w, h) / 24)" in draw and "gl.generateMipmap(gl.TEXTURE_2D)" in draw
 
@@ -939,7 +1119,10 @@ class TestTheCapturesOwnLook:
         text = _template()
         frame = _section(text, "function frame(sync){", "function drawnFraction(")
         assert frame.index("if (shownAt === null) return;") < frame.index("drawBlend(")
-        start = _section(text, "/* -------- start ---", "main().catch")
+        # `finishOpening` since review 2 (M-0): a page that boots with nothing
+        # placed reaches this later, when a build it can draw is served, and
+        # without it that recovery would have textures and no opening pose.
+        start = _section(text, "async function finishOpening(", "/* -------- start ---")
         assert start.index("setPose(poseOf(ci));") < start.index("shownAt =") < start.index("frame(true);")
         assert "uShow" in _section(text, "const FS_COMPOSITE", "}`;")
 
@@ -957,7 +1140,7 @@ class TestTheEnvelopeStopsBeforeTheUglyFrame:
         text = _template()
         nav = _nav_source()
         assert "* (seenQ ? seenQ[j] / 255 : 1)" in nav and "if (sampleQ) best *= sampleQ[s] / 255;" in nav
-        inp = _section(text, "function navInput(", "function voidEdges(")
+        inp = _section(text, "function* navInputSteps(", "function* voidEdgesSteps(")
         assert "NAV.smooth(0.1, 0.4, cosI)" in inp and "holeNear(X0, X1, X2) ? 0.3 : 1" in inp
         _run_nav(r"""
 // the same room, but every sample seen only obliquely and beside a hole
@@ -1209,9 +1392,9 @@ for (let i = 0; i < 50; i++){
         det = _section(text, "const FS_DETAIL", "/* The blend.")
         assert "if (c.a < 0.5) continue;" in det, "a redaction box is not content"
         assert "float sd = sqrt(max(0.0, m2 / n - (m / n) * (m / n)));" in det
-        src = _section(text, "function renderSourceDepth(", "/* -------- loading and live append")
+        src = _section(text, "async function renderSourceDepth(", "/* -------- loading and live append")
         assert "L.cpuDetail = cd;" in src and "gl.useProgram(G.detail.p);" in src
-        nav = _section(text, "function navInput(", "/* Large holes in the proxy")
+        nav = _section(text, "function* navInputSteps(", "/* Large holes in the proxy")
         assert "sourceDetail(ready[k], u, v)" in nav and "sampleC[s] = Math.round(255" in nav
 
     def test_the_drift_back_inside_obeys_the_standoff(self):
@@ -1238,3 +1421,164 @@ assert.ok(d1 >= Math.min(NAV.D_MIN, d0) - 1e-9, "the drift never went inside the
         assert "hint(next.hard || 0);" in update
         step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* Looking ACROSS")
         assert "const h = lookBound(r.s, out.floor); hard = h;" in step
+
+
+def _encoding_source():
+    text = _template()
+    start = text.index("/* ---------- encoding: which texture set this phone gets")
+    return text[start:text.index("/* ---------- end encoding */", start)]
+
+
+def _run_encoding(script):
+    """The page's own ENC unit, verbatim, then `script` (with `assert`)."""
+    import subprocess
+
+    program = ("const assert = require('assert');\n" + _encoding_source()
+               + "\n" + script + "\nconsole.log('enc ok');\n")
+    r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "enc ok" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
+
+ENC_ROOM = r"""
+const astcChunk = {encoding: "astc-6x6-rgba", tier: "phone", digest: "a"};
+const webpChunk = {encoding: "webp-rgba", tier: "phone", digest: "b"};
+const kf = (id, rank, chunks, tier) => ({id, rank, tier: tier || "phone", chunks});
+const both = {encodings: {"astc-6x6-rgba": {available: true}, "webp-rgba": {available: true}},
+              chunks: [astcChunk, webpChunk],
+              selection: {phone_budget: 128},
+              keyframes: [kf("k3", 3, {"astc-6x6-rgba": {digest: "a", slot: 0}, "webp-rgba": {digest: "b", slot: 0}}),
+                          kf("k1", 1, {"astc-6x6-rgba": {digest: "a", slot: 1}, "webp-rgba": {digest: "b", slot: 1}}),
+                          kf("k2", 2, {"webp-rgba": {digest: "b", slot: 2}}),
+                          kf("t9", 0, {"astc-6x6-rgba": {digest: "a", slot: 9}}, "tower")]};
+const noAstcBuild = {encodings: {"webp-rgba": {available: true}}, chunks: [webpChunk],
+                     selection: {phone_budget: 128}, keyframes: both.keyframes};
+const astcDeclaredButUnbuilt = {encodings: {"astc-6x6-rgba": {available: true}},
+                                chunks: [webpChunk], selection: {phone_budget: 128},
+                                keyframes: both.keyframes};
+"""
+
+
+class TestTheEncodingChoice:
+    """`ENC`, the page's own unit, under node.
+
+    Pulled out of `main()` by review 2: the ASTC fallback, the phone tier and
+    the layer budget are three things only a device could check, and there was
+    no unit for any of them -- a grep for `astc`, `capacity` or `maxLayers` in
+    this file returned nothing but two context-loss `_section` calls.
+    """
+
+    def test_astc_needs_the_device_the_manifest_and_an_actual_chunk(self):
+        _run_encoding(ENC_ROOM + r"""
+assert.strictEqual(ENC.choose(both, {astc: true}), "astc-6x6-rgba");
+assert.strictEqual(ENC.choose(both, {astc: false}), "webp-rgba", "no extension on this device");
+assert.strictEqual(ENC.choose(both, {astc: true, forceWebp: true}), "webp-rgba", "asked for WebP");
+assert.strictEqual(ENC.choose(noAstcBuild, {astc: true}), "webp-rgba", "the Tower built none");
+assert.strictEqual(ENC.choose(astcDeclaredButUnbuilt, {astc: true}), "webp-rgba",
+                   "declared but no phone chunk to fetch");
+assert.strictEqual(ENC.choose({}, {astc: true}), "webp-rgba", "an empty manifest is not ASTC");
+assert.strictEqual(ENC.choose(both, {}), "webp-rgba", "a device that did not say has no extension");
+""")
+
+    def test_the_phone_tier_is_ranked_and_the_tower_tier_is_never_drawn(self):
+        _run_encoding(ENC_ROOM + r"""
+const astc = ENC.phoneKeyframes(both, "astc-6x6-rgba").map(k => k.id);
+assert.deepStrictEqual(astc, ["k1", "k3"], "rank order, phone tier, and this encoding only");
+const webp = ENC.phoneKeyframes(both, "webp-rgba").map(k => k.id);
+assert.deepStrictEqual(webp, ["k1", "k2", "k3"], "the WebP set is a superset here");
+assert.ok(!webp.includes("t9") && !astc.includes("t9"), "the Tower tier is never drawn on a phone");
+assert.deepStrictEqual(ENC.phoneKeyframes({}, "webp-rgba"), []);
+""")
+
+    def test_the_layer_budget_can_never_exceed_what_the_driver_allows(self):
+        _run_encoding(ENC_ROOM + r"""
+assert.strictEqual(ENC.capacity(both, "astc-6x6-rgba", {astc: 192, rgba8: 48, maxLayers: 2048}), 128,
+                   "the manifest's own budget");
+assert.strictEqual(ENC.capacity(both, "webp-rgba", {astc: 192, rgba8: 48, maxLayers: 2048}), 48,
+                   "the uncompressed cap: 128 RGBA8 layers would be 117 MB");
+assert.strictEqual(ENC.capacity(both, "astc-6x6-rgba", {astc: 192, rgba8: 48, maxLayers: 32}), 32,
+                   "MAX_ARRAY_TEXTURE_LAYERS is the last word");
+assert.strictEqual(ENC.capacity({selection: {phone_budget: 400}}, "astc-6x6-rgba",
+                                {astc: 192, rgba8: 48, maxLayers: 2048}), 192);
+assert.strictEqual(ENC.capacity({}, "astc-6x6-rgba", {astc: 192, rgba8: 48, maxLayers: 2048}), 128,
+                   "no budget in the manifest: the documented default");
+assert.strictEqual(ENC.capacity(both, "astc-6x6-rgba", {maxLayers: 0}), 1, "never zero layers");
+""")
+
+    def test_the_page_uses_the_unit_and_says_which_side_lacks_astc(self):
+        text = _template()
+        assert "function chooseEncoding(man){ return ENC.choose(man, {astc: !!ext" in text
+        assert "capacity = ENC.capacity(man, encoding, {" in text
+        caption = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        # A Tower built without an encoder used to be reported as a phone
+        # without one, so a Tower bug was going to be filed against a phone
+        # (review 2, P-8).
+        assert "this device has no compressed-texture support" in caption
+        assert "the Tower built no compressed textures for this world" in caption
+        assert "encoding_notes" in caption
+
+
+class TestBootingWithNothingPlaced:
+    """Review 2, M-0: a boot that placed no imagery used to be permanently dead
+    on BOTH sides at once, and no control reached it."""
+
+    def test_a_boot_with_no_layers_keeps_asking_instead_of_failing(self):
+        text = _template()
+        start = _section(text, "/* -------- start ---", "main().catch(")
+        assert "if (!S.layers){" in start
+        assert "dropAppearance(" in start, "the same not-terminal path a withdrawal takes"
+        assert 'fail("No image' not in text, "`fail` stops the script above `follow()`"
+        empty = start[start.index("if (!S.layers){"):start.index("await finishOpening();")]
+        assert "follow();" in empty, "a page with nothing placed still asks again"
+
+    def test_a_page_that_recovers_from_that_finishes_its_opening(self):
+        """The recovery needs more than textures: a page that never chose an
+        opening pose has `shownAt === null`, and `frame()` returns before it
+        draws anything at all."""
+        text = _template()
+        poll = _section(text, "async function pollOnce(", "async function follow(")
+        assert "if (shownAt === null) await finishOpening();" in poll
+        opening = _section(text, "async function finishOpening(", "/* -------- start ---")
+        for step in ("opening = await chooseOpening();", "setPose(poseOf(ci));",
+                     "shownAt =", 'S.phase = "ready";', "buildNav();"):
+            assert step in opening, step
+
+
+class TestNothingBlocksTheMainThreadUnbounded:
+    """Review 2, P-3 and P-4. Measured before and after in headless Chrome
+    (`Glasses-scratch/wb-final-recon/fixit/fix-ios2/stats/boot_*.json`): the
+    longest main-thread block during boot fell from 4.6 s to 0.6 s. These are
+    the structural facts that keep it that way."""
+
+    def test_the_per_keyframe_depth_pass_yields_on_a_time_budget(self):
+        text = _template()
+        src = _section(text, "async function renderSourceDepth(", "function renderPendingSourceDepth(")
+        assert "if (performance.now() - sliceStart > SOURCE_DEPTH_SLICE_MS){" in src
+        assert "await new Promise(res => setTimeout(res, 0));" in src
+        # what a frame drawn in the gap would have changed, put back
+        after_yield = src.split("sliceStart = performance.now();")[2][:500]
+        assert "gl.bindFramebuffer(gl.FRAMEBUFFER, fbSrc);" in after_yield
+        assert "gl.depthMask(true); gl.colorMask(true, true, true, true);" in src
+        # and a lost context or a cleared texture set stops it
+        assert "if (!G || !G.dep || !G.col) break;" in src
+        # one pass at a time, because three upload workers ask for it
+        chain = _section(text, "function renderPendingSourceDepth(", "/* -------- loading and live append")
+        assert "depthChain.then(" in chain
+        assert text.count("await renderPendingSourceDepth();") == 2
+
+    def test_the_opening_scan_yields_on_a_time_budget(self):
+        text = _template()
+        opening = _section(text, "async function chooseOpening(", "/* -------- context loss")
+        assert "if (performance.now() - sliceStart > OPENING_SLICE_MS){" in opening
+        assert "const s = await score(i);" in opening
+        assert "opening = await chooseOpening();" in text
+
+    def test_the_navigation_input_is_a_stepper_driven_by_the_same_budget(self):
+        text = _template()
+        assert "function* navInputSteps(" in text and "function* voidEdgesSteps(" in text
+        inp = _section(text, "function* navInputSteps(", "/* Large holes in the proxy")
+        assert inp.count("yield") >= 5, "every heavy loop in it yields"
+        assert "yield* voidEdgesSteps();" in inp, "the hole scan is sliced with it"
+        build = _section(text, "function buildNav(){", "/* Overview: the best-supported")
+        assert "do { r = steps.next(); } while (!r.done && performance.now() - t < 14);" in build, (
+            "the input gets the same 14 ms budget the field work already had")
+        assert "navInput()" not in text, "nothing calls the old unsliced form"

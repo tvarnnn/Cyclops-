@@ -473,6 +473,23 @@ def render_content_security_policy(html: str, transport: str = TRANSPORT_APP) ->
 
 
 def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> dict:
+    """The appearance half of the revision, or `unavailable`.
+
+    Surviving an appearance bug is right: the page revision must still answer.
+    Spelling the survival `withdrawn` was not (review 2, m-15). `withdrawn` is
+    the word the Tower uses for a RELABEL or a PURGE, and both consumers act on
+    it as such: the page tells the wearer *"its redaction record changed, or its
+    imagery was removed"*, and the app records a privacy withdrawal. So a
+    traceback in `world_builder_appearance.py` told a wearer their redaction
+    record had changed.
+
+    `unavailable` is the fifth state (`WORLD-BUILDER-APPEARANCE.md` §9). It does
+    everything `withdrawn` does -- the textures go, because nothing re-checked
+    the label and a copy must not outlive that check, and the page keeps polling
+    -- and it says the true thing while doing it. Logged at `exception` rather
+    than `debug`: a bug that reaches here is a bug, and the Tower's own log was
+    the only place it could be seen.
+    """
     try:
         from tower.results.world_builder_appearance import (  # noqa: PLC0415
             appearance_revision,
@@ -480,8 +497,8 @@ def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> d
 
         return appearance_revision(store, world_id, session_id)
     except Exception:  # noqa: BLE001 -- the page revision must survive an appearance bug
-        logger.debug("[Tower][WorldBuilder] appearance revision failed", exc_info=True)
-        return {"revision": None, "current": False, "state": "withdrawn", "epoch": None}
+        logger.exception("[Tower][WorldBuilder] appearance revision failed")
+        return {"revision": None, "current": False, "state": "unavailable", "epoch": None}
 
 
 def _stage_running(status_path, is_stale) -> bool:
