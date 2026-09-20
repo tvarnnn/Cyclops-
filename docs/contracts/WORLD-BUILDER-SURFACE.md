@@ -181,6 +181,33 @@ geometry comes from.
 7. **Scale is inherited, never invented.** `manifest.scale` is copied verbatim
    from the world's `ScaleState`. When the world's scale is `unknown` so is
    the artifact's, and no length in the viewer is labelled in metres.
+8. **Every vertex carries how well it was measured, and it is a ranking, not
+   a probability** (added 2026-09-18; `SurfaceParams.confidence`, on by
+   default). Beside each level, `conf_lN.<build>.bin` holds one byte a vertex
+   (§5a). 255 does not mean the triangle is correct and 0 does not mean it is
+   absent — every triangle in the file already passed claim 1. It ranks the
+   surface by how much of a photograph it deserves, and it was validated as a
+   ranking on keyframes **held out of the fusion**:
+
+   | measured on 36 held-out keyframes of the canonical capture | |
+   |---|---|
+   | pixels where the held-out frame disagrees with the mesh, ranked by confidence | AUC **0.759** |
+   | pixels where the mesh stands in FRONT of what the frame measured | AUC **0.764** |
+   | faces the held-out frames contradicted (saw through more than they supported) | AUC **0.903** |
+   | faces under 0.30 that held-out frames contradict | **37%**, against 4.4% of the surface at large |
+   | faces under 0.20 | **50%** |
+
+   Half the answer is evidence the fusion counted (how many frames supported
+   the face, its accumulated weight, how many saw through it, and how far the
+   supporting frames' depths spread within the band **after** the consistency
+   solve); half is what the level's own triangles say (aspect, distance to a
+   boundary, normal agreement in the neighbourhood), computed on each level
+   separately so a decimated level is graded on the triangles it has. What is
+   NOT in it, having been measured and found not to predict, is in §5a.
+
+   The number is comparable **within one artifact**, not across captures: it
+   is not calibrated, and it says nothing about appearance — a well-measured
+   wall no keyframe photographed scores high and is still drawn dark.
 
 ## 3. What this artifact PROMISES NOT to claim
 
@@ -241,6 +268,9 @@ by observation:
     mesh_l0.<build>.bin  level 0, the archive
     mesh_l1.<build>.bin  level 1
     mesh_l2.<build>.bin  level 2, the final build's phone level
+    conf_l0.<build>.bin  level 0's per-vertex geometry confidence (§5a)
+    conf_l1.<build>.bin  level 1's
+    conf_l2.<build>.bin  level 2's
     .surface.lock        held while a build runs
     surface.log          the live child's output, when the builder ran one
 ```
@@ -256,7 +286,8 @@ artifact or the new one, never a torn one.
 
 A build is published as a unit. Each build writes its levels under its own
 `<build>` id, and `manifest.json` -- written last -- names them in
-`levels[].file` with their byte counts. Readers resolve a level only through
+`levels[].file` with their byte counts, and its confidence sidecars in
+`levels[].confidence.file` with theirs. Readers resolve a level only through
 the manifest and refuse a file whose size disagrees. A build killed during
 packing therefore leaves orphan level files that nothing names, and the
 previous manifest keeps pointing at the previous build's whole set.
@@ -265,8 +296,8 @@ previous manifest keeps pointing at the previous build's whole set.
 levels for at least two minutes after a newer manifest **replaces** it. The
 grace counts from supersession, not from when the files were written: the
 builder stamps the replaced manifest's level files just before it writes the
-new manifest. Level files no current manifest names are pruned once that grace
-has passed. Pruning runs after each successful publish, and also at the start
+new manifest. Level files and confidence sidecars no current manifest names are
+pruned once that grace has passed, under the same rule and the same grace. Pruning runs after each successful publish, and also at the start
 of every build of the session, including one that finds the session already
 built. A stopped pack removes the levels it wrote, since no manifest names
 them. Staging files left by a killed write are pruned once they are ten
@@ -311,6 +342,98 @@ schema version. An empty mesh — zero vertices, zero indices — is a legal
 artifact and round-trips, because "nothing was reconstructed" has to be
 distinguishable from corruption.
 
+## 5a. `conf_lN.<build>.bin` — the per-vertex geometry confidence
+
+Little-endian. One byte a vertex, in the level's own vertex order.
+
+| offset | type | field |
+|---:|---|---|
+| 0 | `char[8]` | magic, `WBCONF01` |
+| 8 | `uint32` | vertex count |
+| 12 | `uint32` | version (1) |
+| 16 | `uint32` | flags (reserved, 0) |
+| 20 | `uint8[count]` | confidence, 0–255 |
+
+`format` is `wb-surface-confidence/1`. The reader refuses a wrong magic, an
+unknown version, a length that is not exactly `20 + count`, and a count that
+does not match the level it is being read against.
+
+**Why it is not inside `wb-surface-mesh/1`.** Every reader of that format —
+`read_mesh_bytes`, `store._looks_like_mesh`, and both viewer pages' own
+`decodeMesh` — refuses a buffer whose length is not exactly what its header
+implies. A channel appended to the mesh, behind a new flag or not, would break
+all of them at once, including two pages. A sidecar the manifest names costs
+the same bytes, is versioned on its own, and leaves every existing reader
+untouched. **On the wire to a phone** the channel travels differently again:
+the appearance proxy's colour bytes, which have been zero since review 1,
+carry it at no cost at all (`WORLD-BUILDER-APPEARANCE.md` §4.2a).
+
+**How it is computed.** Each component is a score in [0, 1] where 1 is good,
+floored at 0.05 so no single one can answer zero alone, and they are combined
+as a weighted **geometric mean** — not a sum, because the components are not
+interchangeable: a face forty frames measured that no two of them agree about
+is not "mostly fine".
+
+| half | component | what it is | weight |
+|---|---|---|---:|
+| evidence (0.7) | `agreement` | 1 − see-through frames / supporting frames | 2.0 |
+| | `spread` | 1 − RMS of (measured − face) / band over the supporting frames, the cross-frame disagreement local to that face after the consistency solve | 1.0 |
+| | `support` | supporting frames / 40 | 0.5 |
+| | `weight` | the face's smallest corner weight / (4 × `min_weight`) — under 1 exactly where the face came through the low-weight exception | 0.5 |
+| geometry (0.3) | `rim` | edge hops to the surface's boundary / 3 | 1.0 |
+| | `normal` | how far the incident face normals agree | 1.0 |
+| | `shape` | worst incident triangle aspect (circumradius / twice inradius), 1 equilateral, 0 at 6 | 0.5 |
+
+The evidence half is computed once, on level 0, where the fusion counted; it
+reaches a decimated level through the nearest level 0 vertex. The geometry half
+is computed on **each level's own triangles**, so the phone level is graded on
+the slivers decimation gave it.
+
+**Measured and deliberately not used.** Three things were asked for, computed,
+and put to the held-out test, and none is in the score:
+
+| | held-out AUC | why not |
+|---|---|---|
+| parallax of the supporting cameras | 0.56 on the fit half, **0.48** (below chance) on the validation half; adding it takes the combination 0.759 → 0.755 | it is already an admission rule for low-weight faces; as a grade it is noise. Both halves agree |
+| the consistency field's local correction magnitude | 0.61 alone. **The halves disagree**: the fit half says removing it helps by 0.0016, the validation half says adding it helps by 0.0056 (0.759 → 0.765) | the pass that counts every other component does not carry the correction field, and plumbing a per-frame map through fusion costs more than a gain smaller than the disagreement between the halves |
+| plane-snap membership | 0.517 | lifting snapped vertices toward 1 by 0.35 **cost** 0.002 of AUC. A snapped vertex is not measurably better geometry; it is smoother geometry |
+
+**Two components that ship did not survive validation.** On the half of the
+held-out frames nothing was fitted on, dropping `support` raises the AUC from
+0.759 to **0.767** and dropping `weight` raises it to **0.764**; the fit half
+said the opposite of both. They ship at the lowest weight in the table because
+removing them on the strength of the validation half would be fitting to the
+validation half, which is the only unfitted evidence this score has. Only
+`agreement` (−0.032 if dropped) and `spread` (−0.030) earn their weight on
+both halves.
+
+A fitted logistic combination of all ten components, fitted on half the
+held-out frames and scored on the other half, reaches AUC 0.751 — below the
+0.759 of the rule above, because a linear model cannot express "one very bad
+component spoils the vertex". A plain weighted **arithmetic** mean of the
+shipped components, however, reaches 0.769 at pixel level and 0.908 at face
+level, both above the geometric mean. The geometric mean ships because a page
+reads only the bottom of the ranking, and at the worst 2% of faces — the
+budget a fade would spend — it is the better of the two (48.5% of those faces
+contradicted by held-out frames, against 47.0%).
+
+**Honestly, about the geometry half:** on the held-out depth test it adds
+nothing and very slightly costs. On the validation half evidence alone scores
+0.7591 (0.7666 against the in-front label) and 0.7/0.3 scores 0.7589 (0.7642);
+geometry alone scores 0.698. It is kept, at less than half the weight, because
+the held-out frames stand where the wearer stood and never look at the surface
+edge-on from a novel view, and because the level a phone is sent is decimated —
+which damages exactly these three components and nothing the evidence half
+counts.
+
+**The number is not comparable between levels.** Because the geometry half is
+recomputed on each level's own triangles, a decimated level scores
+systematically lower: on the canonical capture level 0's vertices have median
+0.71 and the phone level's 0.34. A reader that thresholds must use a threshold
+for the level it read, or carry one across by matching surface area. Level 0's
+validated 0.20–0.30 band is 0.157–0.243 (bytes 40–62) on that capture's phone
+level.
+
 ## 6. `manifest.json`
 
 | key | meaning |
@@ -330,7 +453,8 @@ distinguishable from corruption.
 | `voxel`, `truncation` | in scene units. `truncation` is the band a sample at the scene scale actually got, cap included (manifests written before 2026-09-16 recorded the uncapped request) |
 | `frames_used`, `frames_offered` | how much of the walk contributed |
 | `vertices`, `faces` | of level 0 |
-| `levels` | per level: level, vertices, faces, bytes |
+| `levels` | per level: level, vertices, faces, bytes, `file`, and `confidence` (§5a): `{file, bytes, vertices, format, version}`, absent when none was built |
+| `confidence` | the channel as a whole: `{format, version, levels, bytes, components, evidence_share}`, or `null`. Absent from manifests written before 2026-09-18, and `null` when `params.confidence` is off or the enclosed fill is on (that path does not produce the corner weight the score is graded on, and it already breaks the format identifier) |
 | `canonical_level`, `mobile_level` | which rung is the archive and which the phone gets |
 | `seconds` | per stage: `depth`, `transients` (ensuring the detector masks), `consistency`, `fuse`, `mesh`, `snap`, `pack` |
 | `transients` | claim 6: the detector report (`state`, `detail`, `mode`, `rule`, `models`, `frames_masked`, `computed`, `cached`, `seconds`, `gpu_peak_mb`) plus `frames_fused_with_mask`. Absent from manifests written before 2026-09-17 |

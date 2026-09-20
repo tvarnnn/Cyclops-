@@ -131,15 +131,38 @@ def _file_name(kind: str, digest: str) -> str:
     return f"{kind[0]}.{digest}.bin"
 
 
-def proxy_without_colours(mesh: bytes) -> bytes:
-    """The WBSURF01 phone level with every vertex colour set to zero.
+PROXY_CONFIDENCE_VERSION = 1
+PROXY_CONFIDENCE_CHANNEL = "r"
+"""Which of the proxy's three colour bytes carries the geometry confidence.
 
-    The page draws only positions and indices, and the proxy's colours are the
-    depth stage's pixels averaged into the surface -- imagery the page never
-    uses. Served over the appearance route they were a copy of those pixels
-    under the appearance's label check instead of the surface's (review 1, M2).
-    Same length and layout, so every reader of the format is unchanged."""
+The proxy's colour block exists in `wb-surface-mesh/1` and has been ZEROED
+since review 1: the page draws only positions and indices, and those bytes were
+a copy of the depth stage's imagery served under the wrong label check. Three
+bytes a vertex were therefore already on the wire, already reaching the page,
+and carrying nothing.
+
+The confidence goes in the first of them. It costs NO additional bytes, it
+changes no length, no offset and no flag, so `read_mesh_bytes`, both viewer
+pages and `store._looks_like_mesh` are untouched -- which matters because those
+pages refuse any buffer that is not exactly the length its header implies, so a
+channel appended to the mesh would break every reader at once. G and B stay
+zero and are reserved."""
+
+
+def proxy_with_confidence(mesh: bytes, confidence=None) -> bytes:
+    """The WBSURF01 phone level with the confidence in its colour bytes.
+
+    `confidence` is one byte a vertex (`surface.vertex_confidence`), in the
+    level's own vertex order, or None -- in which case every colour byte is
+    zeroed, which is what this function did before the channel existed.
+
+    Refuses a channel that is not exactly one byte per vertex of THIS mesh: a
+    confidence from another build would be read against the wrong vertices and
+    would say confident things about the wrong triangles.
+    """
     import struct  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
 
     from tower.world_builder.surface import MESH_MAGIC  # noqa: PLC0415
 
@@ -150,7 +173,15 @@ def proxy_without_colours(mesh: bytes) -> bytes:
     end = start + 3 * n_vertices
     if end > len(mesh):
         raise A.AppearanceUnavailable("the surface's phone level is shorter than its header")
-    return mesh[:start] + bytes(end - start) + mesh[end:]
+    block = np.zeros((n_vertices, 3), np.uint8)
+    if confidence is not None:
+        conf = np.asarray(confidence, np.uint8).reshape(-1)
+        if len(conf) != n_vertices:
+            raise A.AppearanceUnavailable(
+                f"the confidence channel is for {len(conf)} vertices and the "
+                f"proxy has {n_vertices}")
+        block[:, 0] = conf
+    return mesh[:start] + block.tobytes() + mesh[end:]
 
 
 def named_files(manifest: dict | None) -> dict:
@@ -210,8 +241,12 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     from tower.world_builder.dense import depth_from_prediction  # noqa: PLC0415
     from tower.world_builder.dense_pipeline import FILL_RULE, dense_dir  # noqa: PLC0415
     from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
-    from tower.world_builder.surface import read_mesh_bytes  # noqa: PLC0415
+    from tower.world_builder.surface import (  # noqa: PLC0415
+        SurfaceUnavailable,
+        read_mesh_bytes,
+    )
     from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+        read_surface_confidence,
         read_surface_level,
         read_surface_manifest,
     )
@@ -235,8 +270,19 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     if surface is None:
         raise A.AppearanceUnavailable("no surface artifact to use as the proxy")
     level = int(surface.get("mobile_level", 0))
-    proxy_bytes = proxy_without_colours(
-        read_surface_level(store, world_id, session_id, level, manifest=surface))
+    # The surface's own per-vertex geometry confidence for THIS level, carried
+    # into the proxy's already-zeroed colour bytes. A surface built without it
+    # publishes a proxy exactly as before.
+    try:
+        proxy_confidence = read_surface_confidence(store, world_id, session_id, level,
+                                                   manifest=surface)
+    except SurfaceUnavailable as exc:
+        logger.info("[Tower][WorldBuilder][appearance] %s/%s: no geometry "
+                    "confidence for the proxy (%s)", world_id, session_id, exc)
+        proxy_confidence = None
+    proxy_bytes = proxy_with_confidence(
+        read_surface_level(store, world_id, session_id, level, manifest=surface),
+        proxy_confidence)
     proxy_digest = content_digest(proxy_bytes)
     V, F, _C, _N = read_mesh_bytes(proxy_bytes)
     if not len(F):
@@ -602,6 +648,13 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "proxy": {"digest": proxy_digest, "bytes": len(proxy_bytes),
                   "vertices": int(len(V)), "faces": int(len(F)),
                   "format": "wb-surface-mesh/1",
+                  # WORLD-BUILDER-APPEARANCE.md section 4.2a. False means all
+                  # three colour bytes are zero, which a page must read as "no
+                  # confidence known", never as "confidence zero".
+                  "confidence": {"present": proxy_confidence is not None,
+                                 "version": PROXY_CONFIDENCE_VERSION,
+                                 "channel": PROXY_CONFIDENCE_CHANNEL,
+                                 "source_level": level},
                   "source": {"surface_built_at": surface.get("built_at"),
                              "surface_input_digest": surface.get("input_digest"),
                              "surface_params_digest": surface.get("params_digest"),

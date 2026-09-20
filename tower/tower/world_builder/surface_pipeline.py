@@ -43,6 +43,11 @@ from tower.world_builder.surface import (
     STAGE_FUSE,
     STAGE_MESH,
     STAGE_PACK,
+    CONF_EVIDENCE_SHARE,
+    CONF_EVIDENCE_WEIGHTS,
+    CONF_GEOMETRY_WEIGHTS,
+    CONFIDENCE_FORMAT,
+    CONFIDENCE_VERSION,
     SURFACE_FORMAT,
     SURFACE_FORMAT_ENCLOSED_FILL,
     SURFACE_SCHEMA_VERSION,
@@ -64,7 +69,13 @@ from tower.world_builder.surface import (
     taubin_smooth,
     truncation_for,
     truncation_rel,
+    _weighted_geomean,
+    face_evidence_components,
+    face_to_vertex,
+    transfer_vertex_values,
+    vertex_confidence,
     vertex_normals,
+    write_confidence_bytes,
     write_mesh_bytes,
 )
 
@@ -603,12 +614,13 @@ def surfacify(store, world_id: str, session_id: str, *,
             return result
 
         scale = _scale_note(store, world_id)
-        _mark_superseded(root, {lv["file"] for lv in result.levels})
+        published = published_names(result.levels)
+        _mark_superseded(root, published)
         _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
                         scale_source, transients=dict(frames.transients.record(),
                                                       frames_fused_with_mask=frames.masked),
                         keyframe_image_set=set_token)
-        _prune_superseded_levels(root, {lv["file"] for lv in result.levels})
+        _prune_superseded_levels(root, published)
         _status(root, state=STATE_OK, input_digest=digest,
                 params_digest=pdigest, result=result.as_dict())
         return result
@@ -918,6 +930,12 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     t = time.time()
     fill_stats = None
     strong = None
+    face_weight = None
+    # The geometry confidence is graded on the SMALLEST corner weight of each
+    # face's cube, which is the number `min_weight` gates; the enclosed-fill
+    # path does not produce it, and that path already breaks the format
+    # identifier, so it publishes no confidence.
+    want_conf = bool(params.confidence)
     radius = params.fill_radius_voxels()
     if radius > 0:
         # Opt-in only; see `SurfaceParams.fill_gap_frac`. The flag per vertex
@@ -943,26 +961,45 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         # Cubes observed at every corner but not to `min_weight` emit too, and
         # only the frame tests below may admit them (SurfaceParams.
         # low_weight_evidence). `strong` follows each face through the weld.
-        V, F, C, strong = vol.extract_mesh(params.min_weight, progress=progress,
-                                           weak_floor=0.0)
+        out = vol.extract_mesh(params.min_weight, progress=progress,
+                               weak_floor=0.0, return_face_weight=want_conf)
+        if want_conf:
+            V, F, C, strong, face_weight = out
+        else:
+            V, F, C, strong = out
     else:
-        V, F, C = vol.extract_mesh(params.min_weight, progress=progress)
-    if strong is None:
+        out = vol.extract_mesh(params.min_weight, progress=progress,
+                               return_face_weight=want_conf)
+        if want_conf:
+            V, F, C, face_weight = out
+        else:
+            V, F, C = out
+    if strong is None and face_weight is None:
         V, F, C, weld_stats = weld_mesh(V, F, C, quantum=voxel * 1e-3)
     else:
         V, F, C, weld_stats, source = weld_mesh(V, F, C, quantum=voxel * 1e-3,
                                                 return_index=True)
-        strong = strong[source]
+        if strong is not None:
+            strong = strong[source]
+        if face_weight is not None:
+            face_weight = face_weight[source]
     n_blocks, trunc_at = vol.n_blocks, vol.trunc_at
     # The field is done with; the filter below needs the memory more.
     vol.release_field()
     if device.type == "cuda":
         torch.cuda.empty_cache()
     evidence_stats = None
+    counters = None
+    face_evidence = None
     weak = None if strong is None else ~strong
     if len(F) and (params.min_support_frames > 0 or params.contradiction_ratio > 0):
-        keep, evidence_stats = evidence_filter(V, F, views, frames.K, trunc_at, params,
-                                               device, weak=weak)
+        filtered = evidence_filter(V, F, views, frames.K, trunc_at, params,
+                                   device, weak=weak,
+                                   return_counters=want_conf and face_weight is not None)
+        if len(filtered) == 3:
+            keep, evidence_stats, counters = filtered
+        else:
+            keep, evidence_stats = filtered
         if weak is not None and params.low_weight_hidden_test and keep.any():
             # Low-weight sheets no supporting camera could see (SurfaceParams.
             # low_weight_hidden_test), tested against the surface just kept.
@@ -973,6 +1010,17 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             evidence_stats["weak_kept"] = (evidence_stats.get("weak_kept", 0)
                                            - hidden_stats["dropped_weak_hidden"])
             evidence_stats["faces_kept"] = int(keep.sum())
+        if counters is not None:
+            # One score a face, from the counters this pass alone had. It
+            # follows the face through every later filter, and only becomes a
+            # per-vertex number once the topology has stopped changing.
+            face_evidence = _weighted_geomean(
+                face_evidence_components(
+                    sup=counters["support"], thru=counters["through"],
+                    wmin=face_weight, parallax=counters["parallax"],
+                    resid_rms=counters["resid_rms"],
+                    min_weight=params.min_weight),
+                CONF_EVIDENCE_WEIGHTS)[keep]
         V, F, C = keep_faces(V, F, C, keep)
     elif weak is not None and weak.any():
         # A low-weight face is admitted by the frame tests or not at all.
@@ -994,7 +1042,12 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         return _unavailable(
             root, "the fused field held no cell with enough evidence to emit "
                   "a surface")
-    V, F, C, comp_stats = drop_small_components(V, F, C, params.min_component_frac)
+    if face_evidence is None:
+        V, F, C, comp_stats = drop_small_components(V, F, C, params.min_component_frac)
+    else:
+        V, F, C, comp_stats, comp_keep = drop_small_components(
+            V, F, C, params.min_component_frac, return_index=True)
+        face_evidence = face_evidence[comp_keep]
     V, moved = taubin_smooth(V, F, params.smooth_iterations,
                              params.smooth_lambda, params.smooth_mu)
     seconds[STAGE_MESH] = round(time.time() - t, 2)
@@ -1024,6 +1077,12 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # the files that manifest was published with.
     build_id = f"{time.time_ns():x}{os.getpid():x}"
     levels = []
+    # Smoothing and the snap move vertices but change no triangle, so the
+    # topology has stopped changing here and the per-face evidence can become
+    # one number a level 0 vertex.
+    vertex_evidence = (None if face_evidence is None else
+                       face_to_vertex(len(V), V, F, face_evidence))
+    conf_files = []
     source = (V, F, C)
     mobile_fit = None
     for level, target in enumerate(params.lod_face_targets):
@@ -1045,8 +1104,25 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         source = (Vl, Fl, Cl)
         name = f"mesh_l{level}.{build_id}.bin"
         write_bytes_atomic(root / name, lambda handle, data=buf: handle.write(data))
-        levels.append({"level": level, "vertices": int(len(Vl)),
-                       "faces": int(len(Fl)), "bytes": len(buf), "file": name})
+        entry = {"level": level, "vertices": int(len(Vl)),
+                 "faces": int(len(Fl)), "bytes": len(buf), "file": name}
+        if vertex_evidence is not None:
+            # AFTER the mobile fit, so the channel is for the level that
+            # shipped, not the one the fit replaced. The evidence half is
+            # carried from level 0 by nearest vertex; the geometry half is
+            # computed inside `vertex_confidence` on THIS level's triangles.
+            ev = (vertex_evidence if level == 0
+                  else transfer_vertex_values(V, vertex_evidence, Vl))
+            cbuf = write_confidence_bytes(vertex_confidence(Vl, Fl, ev))
+            cname = f"conf_l{level}.{build_id}.bin"
+            write_bytes_atomic(root / cname,
+                               lambda handle, data=cbuf: handle.write(data))
+            conf_files.append(cname)
+            entry["confidence"] = {"file": cname, "bytes": len(cbuf),
+                                   "vertices": int(len(Vl)),
+                                   "format": CONFIDENCE_FORMAT,
+                                   "version": CONFIDENCE_VERSION}
+        levels.append(entry)
     if _stopped(should_stop):
         # A stop that arrived while the last level was being decimated. The
         # levels are on disk under this build's own names, but no manifest
@@ -1061,6 +1137,8 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         vertices=int(len(V)), faces=int(len(F)), blocks=n_blocks,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
         detail=json.dumps({"components": comp_stats,
+                           "confidence": _confidence_summary(vertex_evidence, root,
+                                                             conf_files),
                            "median_vertex_move_voxels": round(moved / voxel, 3),
                            "weld": weld_stats,
                            "voxel_coarsened_by": round(coarsened, 4),
@@ -1072,6 +1150,28 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                            "plane_snap": _snap_summary(snap_stats),
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
+
+
+def _confidence_summary(vertex_evidence, root, conf_files):
+    """What was published as the per-vertex confidence channel, or None.
+
+    The percentiles are of level 0, which is every vertex the fusion counted;
+    a page reads the phone level's own file, whose distribution differs
+    because decimation grades its own triangles.
+    """
+    if vertex_evidence is None:
+        return None
+    byts = 0
+    for name in conf_files:
+        try:
+            byts += (root / name).stat().st_size
+        except OSError:
+            pass
+    return {"format": CONFIDENCE_FORMAT, "version": CONFIDENCE_VERSION,
+            "levels": len(conf_files), "bytes": byts,
+            "components": sorted(CONF_EVIDENCE_WEIGHTS)
+            + sorted(CONF_GEOMETRY_WEIGHTS),
+            "evidence_share": CONF_EVIDENCE_SHARE}
 
 
 STAGE_SNAP = "snap"
@@ -1139,6 +1239,12 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
         "format": SURFACE_FORMAT_ENCLOSED_FILL if filled else SURFACE_FORMAT,
         "record": ("header, then uint16[3] quantised position, uint8[3] rgb, "
                    "int8[3] normal per vertex, then uint16/uint32 indices"),
+        # The per-vertex geometry confidence, in its own file beside each
+        # level (`WORLD-BUILDER-SURFACE.md` section 5a). Null when it was not
+        # built. The mesh format is untouched: every reader of
+        # `wb-surface-mesh/1` refuses a buffer that is not exactly the length
+        # its header implies, so the channel cannot live inside it.
+        "confidence": (detail or {}).get("confidence"),
         "built_at": time.time(),
         "input_digest": digest,
         "params_digest": pdigest,
@@ -1194,6 +1300,24 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
     })
 
 
+def confidence_file(root: Path, entry: dict) -> Path | None:
+    """The confidence sidecar a manifest's level entry names, or None.
+
+    Same rule as `level_file`: a manifest is data, and a path in it is never
+    followed anywhere but this directory.
+    """
+    if not isinstance(entry, dict):
+        return None
+    rec = entry.get("confidence")
+    if not isinstance(rec, dict):
+        return None
+    name = rec.get("file")
+    if (not isinstance(name, str) or "/" in name or "\\" in name
+            or name.startswith(".") or not name.endswith(".bin")):
+        return None
+    return root / name
+
+
 def level_file(root: Path, entry: dict) -> Path | None:
     """The file a manifest's level entry names, or None if it names none safely.
 
@@ -1232,6 +1356,34 @@ PRUNE_GRACE_S = 120.0
 STAGING_GRACE_S = 600.0
 
 
+def published_names(levels) -> set:
+    """Every file name a manifest's levels name: the level AND its sidecar.
+
+    One function, because there is exactly one right answer and
+    `_prune_superseded_levels` deletes whatever is not in it. Built from the
+    level entries rather than from a glob, so an entry that names no sidecar
+    contributes none.
+
+    Counted from real damage, not tidiness. The first build of the canonical
+    capture kept only `{entry["file"]}` here, and the prune then deleted
+    `conf_l0.<build>.bin` -- written five minutes before the manifest, so
+    already past the grace -- out of the very build that was publishing it.
+    The manifest named a file that no longer existed. A small level 0 in a
+    test never reproduces it; the grace is two minutes and a test build takes
+    one second.
+    """
+    keep = set()
+    for entry in levels or []:
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("file"), str):
+            keep.add(entry["file"])
+        rec = entry.get("confidence")
+        if isinstance(rec, dict) and isinstance(rec.get("file"), str):
+            keep.add(rec["file"])
+    return keep
+
+
 def _mark_superseded(root: Path, keep: set) -> None:
     """Stamp the files the manifest about to be replaced names with NOW.
 
@@ -1250,13 +1402,13 @@ def _mark_superseded(root: Path, keep: set) -> None:
         return
     now = time.time()
     for entry in previous.get("levels") or []:
-        path = level_file(root, entry)
-        if path is None or path.name in keep:
-            continue
-        try:
-            os.utime(path, (now, now))
-        except OSError:
-            pass
+        for path in (level_file(root, entry), confidence_file(root, entry)):
+            if path is None or path.name in keep:
+                continue
+            try:
+                os.utime(path, (now, now))
+            except OSError:
+                pass
 
 
 def _prune_superseded_levels(root: Path, keep: set,
@@ -1275,20 +1427,22 @@ def _prune_superseded_levels(root: Path, keep: set,
     level write takes; nothing reads a staging file.
     """
     now = time.time()
-    for path in root.glob("mesh_l*.bin"):
-        if path.name in keep:
-            continue
-        try:
-            if now - path.stat().st_mtime >= older_than_s:
-                path.unlink()
-        except OSError:
-            pass
-    for path in root.glob("mesh_l*.bin.p*.tmp"):
-        try:
-            if now - path.stat().st_mtime >= STAGING_GRACE_S:
-                path.unlink()
-        except OSError:
-            pass
+    for pattern in ("mesh_l*.bin", "conf_l*.bin"):
+        for path in root.glob(pattern):
+            if path.name in keep:
+                continue
+            try:
+                if now - path.stat().st_mtime >= older_than_s:
+                    path.unlink()
+            except OSError:
+                pass
+    for pattern in ("mesh_l*.bin.p*.tmp", "conf_l*.bin.p*.tmp"):
+        for path in root.glob(pattern):
+            try:
+                if now - path.stat().st_mtime >= STAGING_GRACE_S:
+                    path.unlink()
+            except OSError:
+                pass
 
 
 def _sweep_unnamed_levels(root: Path) -> None:
@@ -1305,13 +1459,13 @@ def _sweep_unnamed_levels(root: Path) -> None:
         return
     if not isinstance(current, dict):
         return
-    keep = set()
-    for entry in current.get("levels") or []:
-        path = level_file(root, entry)
-        if path is None:
+    levels = current.get("levels") or []
+    for entry in levels:
+        # A manifest that names a level this directory may not serve is not a
+        # manifest to prune against: it is unreadable, and its files stay.
+        if level_file(root, entry) is None:
             return
-        keep.add(path.name)
-    _prune_superseded_levels(root, keep)
+    _prune_superseded_levels(root, published_names(levels))
 
 
 def _discard_unpublished(root: Path, levels: list) -> None:
@@ -1322,6 +1476,12 @@ def _discard_unpublished(root: Path, levels: list) -> None:
             (root / entry["file"]).unlink()
         except (OSError, KeyError, TypeError):
             pass
+        conf = confidence_file(root, entry)
+        if conf is not None:
+            try:
+                conf.unlink()
+            except OSError:
+                pass
 
 
 # The `detail` of a result that built nothing because the artifact on disk is
@@ -1409,6 +1569,42 @@ def read_surface_level(store, world_id: str, session_id: str, level: int,
         raise SurfaceUnavailable(
             f"surface level {level} changed while it was being read")
     return data
+
+
+def read_surface_confidence(store, world_id: str, session_id: str, level: int,
+                           manifest: dict | None = None):
+    """The per-vertex confidence of one level, as its manifest names it.
+
+    Read through the manifest and checked against its byte count and its
+    vertex count, exactly as `read_surface_level` is: a channel from another
+    build, or one whose length no longer matches the level it grades, is
+    refused here rather than silently mis-indexed.
+
+    Raises `SurfaceUnavailable` when the level has no confidence channel --
+    a surface built before the channel existed, or with
+    `SurfaceParams.confidence` off, has none and is otherwise unchanged.
+    """
+    from tower.world_builder.surface import read_confidence_bytes  # noqa: PLC0415
+
+    root = surface_dir(store, world_id, session_id)
+    man = manifest if manifest is not None else read_surface_manifest(
+        store, world_id, session_id)
+    entry = next((lv for lv in (man or {}).get("levels") or []
+                  if isinstance(lv, dict) and lv.get("level") == level), None)
+    path = confidence_file(root, entry) if entry is not None else None
+    rec = (entry or {}).get("confidence") or {}
+    if path is None or not isinstance(rec.get("bytes"), int):
+        raise SurfaceUnavailable(
+            f"surface level {level} has no confidence channel for this session")
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SurfaceUnavailable(
+            f"surface level {level} confidence is not readable for this session") from exc
+    if len(data) != rec["bytes"]:
+        raise SurfaceUnavailable(
+            f"surface level {level} confidence changed while it was being read")
+    return read_confidence_bytes(data, entry.get("vertices"))
 
 
 def surface_currency(store, world_id: str, session_id: str,

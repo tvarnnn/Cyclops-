@@ -79,6 +79,18 @@ MESH_MAGIC = b"WBSURF01"
 SNAP_VERSION = 1
 LOW_WEIGHT_VERSION = 1
 
+CONFIDENCE_FORMAT = "wb-surface-confidence/1"
+CONFIDENCE_VERSION = 1
+CONF_MAGIC = b"WBCONF01"
+"""`vertex_confidence`, one byte a vertex, in its own file beside the level.
+
+It is NOT inside `wb-surface-mesh/1`. Every reader of that format -- the two
+viewer pages, `read_mesh_bytes`, `store._looks_like_mesh` -- refuses a buffer
+whose length is not exactly what its header implies, so a channel appended to
+the mesh would break all of them at once, and two of those readers are pages
+this lane is not allowed to touch. A sidecar the manifest names costs the same
+bytes, is versioned on its own, and leaves every existing reader alone."""
+
 STAGE_DEPTH = "depth"
 STAGE_FUSE = "fuse"
 STAGE_MESH = "mesh"
@@ -491,6 +503,22 @@ class SurfaceParams:
     through the removed faces 11.5% of the time, the kept low-weight faces
     4.3%."""
 
+    confidence: bool = True
+    """Publish a per-vertex geometry confidence beside every level
+    (`vertex_confidence`, `CONFIDENCE_FORMAT`).
+
+    It answers a question the artifact could not answer before: WHICH PART of
+    this surface is worth painting a photograph onto. The appearance stage
+    carries the phone level's channel into its proxy, and a page that reads it
+    can fade appearance toward the void where the proxy is bad instead of
+    stretching a real photograph over broken geometry -- the ceiling and the
+    door column of `Glasses-scratch/wb-final-recon/fixit/visual-review2/
+    VISUAL-REVIEW-2.md` problems 2 and 3, which that review established are
+    REAL imagery on WRONG geometry, not missing data.
+
+    Off means no sidecar is written and the manifest names none; the levels
+    themselves are byte-identical either way."""
+
     quality: str = "final"
     """`final` or `live`. Recorded in the manifest so a reader -- and the
     wearer -- can tell a coarse reconstruction built during the walk from the
@@ -562,6 +590,10 @@ class SurfaceParams:
             # supporting cameras could not see.
             ("low-weight-hidden", self.low_weight_hidden_test),
             ("lod-boundary", self.lod_boundary_weight),
+            # A surface built before it existed has no confidence sidecar, and
+            # a surface built with a different definition of confidence has the
+            # wrong one. Both must rebuild.
+            ("confidence", self.confidence, CONFIDENCE_VERSION),
             # A surface built before it existed refused a low-weight face that
             # any frame at all saw through.
             ("low-weight-through", self.low_weight_through_frac,
@@ -1007,7 +1039,8 @@ class SurfaceVolume:
     # -- extraction ---------------------------------------------------------
 
     def extract_mesh(self, min_weight: float, *, tile_blocks: int = 12,
-                     only_blocks=None, progress=None, tag=None, weak_floor=None):
+                     only_blocks=None, progress=None, tag=None, weak_floor=None,
+                     return_face_weight: bool = False):
         """Marching cubes over the observed part of the field only.
 
         A cube emits triangles only when ALL EIGHT of its corner voxels carry
@@ -1038,6 +1071,11 @@ class SurfaceVolume:
         that only `evidence_filter(weak=~S)` may admit
         (`SurfaceParams.low_weight_evidence`). An unobserved corner still never
         emits: weight exactly 0 is not above any floor >= 0.
+
+        `return_face_weight` appends W, the per-face SMALLEST corner weight --
+        the quantity the gate above thresholds, kept as a number because the
+        geometry confidence grades it rather than gating on it
+        (`face_evidence_components`).
         """
         import torch
         from skimage import measure
@@ -1049,6 +1087,8 @@ class SurfaceVolume:
         if weak_floor is not None:
             empty = empty + (np.zeros(0, bool),)
             weak_floor = max(0.0, float(weak_floor))
+        if return_face_weight:
+            empty = empty + (np.zeros(0, np.float32),)
         if self.n_blocks == 0:
             return empty
 
@@ -1061,7 +1101,7 @@ class SurfaceVolume:
             return empty
         lo, hi = bc_sel.min(0), bc_sel.max(0)
 
-        Vs, Fs, Cs, Gs, Ss, nv = [], [], [], [], [], 0
+        Vs, Fs, Cs, Gs, Ss, Ws, nv = [], [], [], [], [], [], 0
         tiles = occupied_tiles(bc_all, lo, hi, tile_blocks)
         nb = tile_blocks + 1                       # one block of halo
         n = nb * BLOCK
@@ -1130,6 +1170,8 @@ class SurfaceVolume:
             strong = strong[keep]
             if not len(faces):
                 continue
+            if return_face_weight:
+                Ws.append(fmin.cpu().numpy()[keep].astype(np.float32))
             used = np.unique(faces)
             remap = np.full(len(verts), -1, np.int64)
             remap[used] = np.arange(len(used))
@@ -1159,6 +1201,8 @@ class SurfaceVolume:
             out = out + (np.concatenate(Gs),)
         if weak_floor is not None:
             out = out + (np.concatenate(Ss),)
+        if return_face_weight:
+            out = out + (np.concatenate(Ws),)
         return out
 
 
@@ -1634,7 +1678,8 @@ def extract_sealed(vol: SurfaceVolume, min_weight: float, fill: EnclosedFill, *,
 
 
 def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None,
-                    *, chunk: int = 2_000_000, weak=None):
+                    *, chunk: int = 2_000_000, weak=None,
+                    return_counters: bool = False):
     """Which faces the frames, counted one by one, actually support.
 
     `views` yields (depth, valid, R, t) per frame, exactly the depth and
@@ -1667,7 +1712,16 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     `low_weight_min_parallax` (the diagonal of their centres' bounding box over
     the face's distance to that box's centre).
 
-    Returns (keep mask over faces, stats).
+    `return_counters` additionally returns, per face, everything this pass
+    counted -- supporting and see-through frames, the supporting cameras'
+    parallax, and the RMS of (measured - face) / band over the supporting
+    frames, which is the cross-frame depth disagreement local to that face
+    AFTER the consistency solve, since the depth read here is the corrected
+    depth. The geometry confidence is made of these numbers, and this is the
+    only pass that has them: the field is released before it runs and the
+    frames are dropped after it.
+
+    Returns (keep mask over faces, stats), or (keep, stats, counters).
     """
     import torch
 
@@ -1683,6 +1737,11 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
     sup = torch.zeros(nF, dtype=torch.int16, device=dev)
     thru = torch.zeros(nF, dtype=torch.int16, device=dev)
     front = torch.zeros(nF, dtype=torch.int16, device=dev)
+    r2 = cam_all_lo = cam_all_hi = None
+    if return_counters:
+        r2 = torch.zeros(nF, dtype=torch.float32, device=dev)
+        cam_all_lo = torch.full((nF, 3), float("inf"), device=dev)
+        cam_all_hi = torch.full((nF, 3), -float("inf"), device=dev)
     cents, norms = [], []
     for s0 in range(0, nF, chunk):
         Fc = torch.as_tensor(F[s0:s0 + chunk], device=dev)
@@ -1728,6 +1787,16 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
             facing = ((centre - P[s0:s0 + chunk]) * N[s0:s0 + chunk]).sum(1) > 0
             front[s0:s0 + chunk] += (s_ & facing).to(torch.int16)
             thru[s0:s0 + chunk] += (m & (r > tr)).to(torch.int16)
+            if return_counters:
+                sl = slice(s0, s0 + chunk)
+                rn = torch.where(s_, r / tr.clamp(min=1e-9), torch.zeros_like(r))
+                r2[sl] += rn * rn
+                cam_all_lo[sl] = torch.where(s_[:, None],
+                                             torch.minimum(cam_all_lo[sl], centre[None]),
+                                             cam_all_lo[sl])
+                cam_all_hi[sl] = torch.where(s_[:, None],
+                                             torch.maximum(cam_all_hi[sl], centre[None]),
+                                             cam_all_hi[sl])
         if weak_idx is not None:
             # The supporting cameras of the low-weight faces: the same test as
             # above, repeated on that subset, keeping the centres' bounds.
@@ -1782,7 +1851,24 @@ def evidence_filter(V, F, views, K, trunc_at, params: SurfaceParams, device=None
         stats["weak_kept"] = 0
     stats["dropped_support"] = int((~ok_support).sum())
     stats["faces_kept"] = int(keep.sum())
-    return keep.cpu().numpy(), stats
+    keep_np = keep.cpu().numpy()
+    if not return_counters:
+        return keep_np, stats
+    has = sup > 0
+    n = sup.float().clamp(min=1.0)
+    spread_all = torch.where(has, (cam_all_hi - cam_all_lo).norm(dim=1),
+                             torch.zeros(nF, device=dev))
+    dist_all = torch.where(has[:, None], (cam_all_hi + cam_all_lo) * 0.5 - P,
+                           torch.zeros_like(P)).norm(dim=1).clamp(min=1e-6)
+    counters = {
+        "support": sup.cpu().numpy(),
+        "through": thru.cpu().numpy(),
+        "front": front.cpu().numpy(),
+        "parallax": torch.where(has, spread_all / dist_all,
+                                torch.zeros(nF, device=dev)).cpu().numpy(),
+        "resid_rms": torch.sqrt(r2 / n).cpu().numpy(),
+    }
+    return keep_np, stats, counters
 
 
 def hidden_low_weight(V, F, keep, weak, views, K, trunc_at, device=None):
@@ -1919,7 +2005,7 @@ def weld_mesh(V, F, C, quantum: float, *, return_index: bool = False):
     return out + ((source[keep],) if return_index else ())
 
 
-def drop_small_components(V, F, C, min_frac: float):
+def drop_small_components(V, F, C, min_frac: float, *, return_index: bool = False):
     """Remove connected components smaller than `min_frac` of the largest.
 
     Flying pixels and single-frame noise survive fusion as tiny islands. A
@@ -1927,9 +2013,15 @@ def drop_small_components(V, F, C, min_frac: float):
     the threshold is a small fraction of the LARGEST component rather than an
     absolute face count -- it scales with the scene and does not delete a
     chair because the room is big.
+
+    With `return_index` a fifth value is returned: the kept mask over the
+    input faces, so a per-face attribute can follow the prune.
     """
     if not len(F) or min_frac <= 0:
-        return V, F, C, {"components": 0, "dropped": 0, "faces_dropped": 0}
+        stats = {"components": 0, "dropped": 0, "faces_dropped": 0}
+        if return_index:
+            return V, F, C, stats, np.ones(len(F), bool)
+        return V, F, C, stats
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -1948,7 +2040,8 @@ def drop_small_components(V, F, C, min_frac: float):
     remap[used] = np.arange(len(used))
     stats = {"components": int(ncomp), "dropped": int(ncomp - len(keep_labels)),
              "faces_dropped": int((~keep).sum())}
-    return V[used], remap[F2], (C[used] if C is not None else None), stats
+    out = (V[used], remap[F2], (C[used] if C is not None else None), stats)
+    return out + ((keep,) if return_index else ())
 
 
 def taubin_smooth(V, F, iterations: int, lam: float, mu: float):
@@ -2229,6 +2322,370 @@ def snap_planes(V, F, views, K, params: SurfaceParams, voxel: float, median_dept
     stack.clear()
     record["seconds"] = round(time.time() - t0, 2)
     return Vout.astype(np.float32), record
+
+
+# ---------------------------------------------------------------------------
+# geometry confidence
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS ANSWERS. The appearance product paints the wearer's own photographs
+# onto this surface. Where the surface is right, that is the room; where it is
+# wrong, a real photograph is stretched over broken geometry, and the page
+# cannot tell the two apart -- it paints both at full strength. The independent
+# review (`fixit/visual-review2/VISUAL-REVIEW-2.md`, problems 2 and 3) named the
+# two worst instances: "the ceiling one drag up from the opening looks like
+# water damage and peeling paint", and "a shredded cream-and-black column beside
+# the door". Its mode-2 check established both are OBSERVED imagery, not voids.
+#
+# Every constant below is a saturation point, not a threshold: a component
+# scores 1 where the evidence is as good as it usefully gets and falls to 0
+# where it is as bad as the kept surface ever is. They were set on the
+# canonical capture's own distributions and measured against held-out
+# keyframes; the numbers are in `fixit/confidence/CONFIDENCE.md`.
+
+CONF_SUPPORT_FULL = 40.0
+"""Supporting frames at which the support component saturates.
+
+The median kept face of the canonical capture has 13 supporters and the 90th
+percentile has 50, so saturating at "a couple of frames" makes this component a
+constant 1 over almost the whole surface and it then grades nothing, while the
+raw count predicts at AUC 0.71 on the fit half. 40 was chosen there.
+
+It did not survive validation. On the half of the held-out frames nothing was
+fitted on, TAKING `support` OUT of the combination raises the AUC from 0.759 to
+0.767. It is kept, at the lowest weight there is, because the two halves
+disagree about it and the fit half is the one the constant was chosen on;
+dropping it on the strength of the validation half would be fitting to the
+validation half. `fixit/confidence/CONFIDENCE.md` §4."""
+
+CONF_WEIGHT_FULL_MULTIPLE = 4.0
+"""Fusion weight, as a multiple of `min_weight`, at which the weight
+component saturates. `min_weight` is the admission gate, not the point where
+the evidence stops improving: at 1x this component is a constant 1 over almost
+the whole surface while the raw weight predicts at AUC 0.68 on the fit half.
+
+Same caveat as `CONF_SUPPORT_FULL`, a little smaller: on the validation half,
+dropping `weight` raises the AUC from 0.759 to 0.764."""
+
+CONF_RESID_FULL = 0.60
+"""Cross-frame depth disagreement, in units of the fusion band, at which
+the agreement component reaches 0. Supporters lie within the band by
+definition, so the quantity is bounded by 1; the median kept face is 0.31.
+
+`spread` and `agreement` are the two components that earn their place. On the
+validation half, dropping `spread` costs 0.030 of AUC (0.759 -> 0.729) and
+dropping `agreement` costs 0.032 (-> 0.727). Every other component costs less
+than 0.002, or is negative."""
+
+CONF_ASPECT_FULL = 6.0
+"""Triangle aspect (circumradius / twice inradius; 1 is equilateral) at which
+the shape component reaches 0."""
+
+CONF_RIM_HOPS = 3
+"""Edge hops from a boundary at which the rim component saturates. A vertex ON
+a boundary scores 0: it is the ragged edge of the evidence, and it is where the
+review's "chewed, scalloped or shark-tooth black rim" lives."""
+
+# MEASURED AND DELIBERATELY NOT USED (`fixit/confidence/CONFIDENCE.md`). Each
+# of these was asked for, computed, and put to the held-out test; each is still
+# computed by `face_evidence_components` so a later lane can re-measure it, and
+# none of them is in `CONF_EVIDENCE_WEIGHTS`:
+#
+#   parallax of the supporting cameras -- AUC 0.56 on the fit half and 0.48,
+#     below chance, on the validation half; adding it to the combination takes
+#     that from 0.759 to 0.755. It is already an ADMISSION rule for low-weight
+#     faces. As a grade it is noise, and this is the one refusal both halves
+#     agree on.
+#   the consistency field's local correction magnitude -- AUC 0.61 alone. THE
+#     TWO HALVES DISAGREE: the fit half says removing it improves the
+#     combination by 0.0016, the validation half says adding it improves it by
+#     0.0056 (0.759 -> 0.765). It is not shipped because the pass that counts
+#     the other components does not carry the correction field and plumbing it
+#     through costs a per-frame map for a gain smaller than the disagreement
+#     between the halves. It stays computable; see CONFIDENCE.md §4.
+#   plane-snap membership -- AUC 0.517, and lifting snapped vertices toward 1
+#     by 0.35 COST 0.002 of AUC on the fit half. A snapped vertex is not
+#     measurably better geometry; it is smoother geometry.
+
+CONF_FLOOR = 0.05
+"""No single component may drive the product to zero on its own. Confidence is
+a weighted geometric mean, which without a floor would answer 0 for any face
+with (say) zero parallax however well everything else was measured."""
+
+CONF_EVIDENCE_WEIGHTS = {
+    "support": 0.5, "weight": 0.5, "agreement": 2.0, "spread": 1.0,
+}
+"""Only these four. A component absent from this dict is computed and
+ignored; the block above says what was dropped and why.
+
+`agreement` carries twice the weight of the others because it is what
+separates "surface that is not there" from "surface a little out of place".
+On the validation half, as its weight goes 0 / 1 / 2 / 3 / 4 the AUC against
+the in-front label goes 0.701 / 0.747 / 0.764 / 0.772 / 0.777.
+
+IT IS STILL RISING AT 4, AND 2 IS WHAT SHIPS. The weight was chosen on the fit
+half; the validation half is the only evidence here that nothing was fitted
+on, and spending it to tune the same knob would destroy the one honest
+measurement of this score. The 2 -> 4 move is worth about 0.013 of AUC and is
+there for a later lane with fresh held-out frames to take."""
+
+CONF_GEOMETRY_WEIGHTS = {"shape": 0.5, "rim": 1.0, "normal": 1.0}
+CONF_EVIDENCE_SHARE = 0.7
+"""Evidence against geometry in the final geometric mean.
+
+Honestly: on the held-out DEPTH test the geometry half adds nothing, and very
+slightly costs. On the validation half, evidence alone scores 0.7591 against
+`agree` and 0.7666 against `not in front`; at 0.7 evidence / 0.3 geometry the
+same numbers are 0.7589 and 0.7642. Geometry alone scores 0.698.
+
+It is kept, at less than half the weight, for two things that test cannot see.
+The held-out frames stand where the wearer stood, so they measure the level 0
+surface along the walked path and never look at it edge-on from a novel view;
+and the level a phone is sent is DECIMATED, which damages exactly the shape,
+rim and normal components and nothing the evidence half counts. The stretched
+triangles, the crumple the review calls "shredded" and its "ragged black lace
+edges" are geometry, and geometry is the only half that sees them."""
+
+
+def _face_areas(V, F):
+    V = np.asarray(V, np.float64)
+    F = np.asarray(F, np.int64)
+    return 0.5 * np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]],
+                                         V[F[:, 2]] - V[F[:, 0]]), axis=1)
+
+
+def face_to_vertex(n_vertices: int, V, F, value):
+    """A per-face quantity at each vertex, weighted by face area.
+
+    Area weighting, not a plain mean: a vertex on the rim of a well-measured
+    wall touches one large trustworthy triangle and several slivers, and the
+    slivers must not outvote the wall.
+    """
+    F = np.asarray(F, np.int64)
+    value = np.asarray(value, np.float64)
+    if not len(F):
+        return np.zeros(n_vertices, np.float32)
+    w = np.maximum(_face_areas(V, F), 1e-12)
+    # `bincount`, not `np.add.at`: at three million faces the ufunc-at form
+    # took seconds a call and this takes milliseconds. F.ravel() visits the
+    # three corners of face i together, which is the order `repeat` produces.
+    idx = F.ravel()
+    num = np.bincount(idx, np.repeat(value * w, 3), minlength=n_vertices)
+    den = np.bincount(idx, np.repeat(w, 3), minlength=n_vertices)
+    return (num / np.maximum(den, 1e-12)).astype(np.float32)
+
+
+def face_evidence_components(*, sup, thru, wmin, parallax, resid_rms,
+                             correction=None, min_weight: float) -> dict:
+    """Each counter the fusion kept, as a score in [0, 1] where 1 is good.
+
+    `sup`, `thru`: the evidence filter's supporting and see-through frame
+    counts. `wmin`: the smallest corner weight of the face's cube, which is
+    what `min_weight` gates -- below it the face is a LOW-WEIGHT face admitted
+    only by the see-through and parallax exceptions, so "came through the
+    exception" is this component being under 1, not a separate flag.
+    `parallax`: the supporting cameras' box diagonal over their distance to
+    the face. `resid_rms`: RMS of (measured - face) / band over the supporting
+    frames -- the cross-frame depth disagreement local to the face, AFTER the
+    consistency solve, since the depth these counters read is the corrected
+    depth. `correction`: the consistency field's own correction at the face,
+    as a fraction of depth, averaged over the supporting frames.
+    """
+    sup = np.asarray(sup, np.float64)
+    thru = np.asarray(thru, np.float64)
+    ratio = thru / np.maximum(sup, 1.0)
+    full_weight = max(CONF_WEIGHT_FULL_MULTIPLE * min_weight, 1e-9)
+    out = {
+        "support": np.clip(sup / CONF_SUPPORT_FULL, 0.0, 1.0),
+        "weight": np.clip(np.asarray(wmin, np.float64) / full_weight, 0.0, 1.0),
+        "agreement": np.clip(1.0 - ratio, 0.0, 1.0),
+        "spread": np.clip(1.0 - np.asarray(resid_rms, np.float64) / CONF_RESID_FULL, 0.0, 1.0),
+        # Measured and not weighted; see the block above `CONF_FLOOR`. The
+        # saturation points are the ones they were measured at.
+        "parallax": np.clip(np.asarray(parallax, np.float64) / 0.20, 0.0, 1.0),
+    }
+    if correction is not None:
+        out["correction"] = np.clip(
+            1.0 - np.asarray(correction, np.float64) / 0.12, 0.0, 1.0)
+    return out
+
+
+def mesh_geometry_components(V, F) -> dict:
+    """The three things a level's own triangles say about themselves.
+
+    `shape`: the worst aspect ratio among a vertex's own triangles -- the
+    stretched triangles the review complains about. `rim`: edge hops to the
+    boundary of the surface, where the evidence ran out and the page's inward
+    fade eats the picture. `normal`: how much the incident faces agree about
+    which way the surface faces, which is the crumple the reviewer sees as
+    "shredded".
+
+    Computed on the level's OWN triangles, so decimation is measured rather
+    than inherited: the phone level's slivers are its own.
+    """
+    V = np.asarray(V, np.float64)
+    F = np.asarray(F, np.int64)
+    n = len(V)
+    zero = np.zeros(n, np.float64)
+    if not len(F):
+        return {"shape": zero, "rim": zero, "normal": zero}
+    e = np.stack([
+        np.linalg.norm(V[F[:, 1]] - V[F[:, 2]], axis=1),
+        np.linalg.norm(V[F[:, 2]] - V[F[:, 0]], axis=1),
+        np.linalg.norm(V[F[:, 0]] - V[F[:, 1]], axis=1)], 1)
+    area = np.maximum(_face_areas(V, F), 1e-15)
+    # circumradius / (2 * inradius) = abc(a+b+c) / (16 * area^2); 1 is equilateral
+    aspect = e.prod(1) * e.sum(1) / (16.0 * area ** 2)
+    fshape = np.clip((CONF_ASPECT_FULL - aspect) / (CONF_ASPECT_FULL - 1.0), 0.0, 1.0)
+    # The worst incident face, by one sort and a reduceat rather than
+    # `np.minimum.at`, which is a Python-speed loop at this size.
+    idx = F.ravel()
+    order = np.argsort(idx, kind="stable")
+    isort = idx[order]
+    vsort = np.repeat(fshape, 3)[order]
+    cut = np.flatnonzero(np.r_[True, isort[1:] != isort[:-1]])
+    shape = np.ones(n)
+    shape[isort[cut]] = np.minimum.reduceat(vsort, cut)
+
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    fn = fn / np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-15)
+    acc = np.stack([np.bincount(idx, np.repeat(fn[:, k], 3), minlength=n)
+                    for k in range(3)], 1)
+    cnt = np.bincount(idx, minlength=n).astype(np.float64)
+    normal = np.linalg.norm(acc, axis=1) / np.maximum(cnt, 1.0)
+
+    # A boundary edge belongs to exactly one face; its endpoints are the rim.
+    ends = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], 0)
+    key = np.sort(ends, axis=1)
+    _u, inv, counts = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    bedge = counts[inv.reshape(-1)] == 1
+    onrim = np.zeros(n, bool)
+    onrim[ends[bedge].reshape(-1)] = True
+    hops = np.full(n, CONF_RIM_HOPS, np.float64)
+    hops[onrim] = 0.0
+    if CONF_RIM_HOPS > 0:
+        A = _vertex_adjacency(n, F)
+        frontier = onrim
+        for h in range(1, CONF_RIM_HOPS):
+            frontier = (A @ frontier.astype(np.float32)) > 0
+            fresh = frontier & (hops > h)
+            hops[fresh] = h
+    return {"shape": shape, "rim": hops / max(CONF_RIM_HOPS, 1), "normal": normal}
+
+
+def _weighted_geomean(components: dict, weights: dict) -> np.ndarray:
+    """The weighted geometric mean of the components `weights` names.
+
+    Driven by `weights`, not by `components`: `face_evidence_components`
+    returns every counter that was measured, including the ones the held-out
+    test showed do not predict, and those have to be carried without being
+    believed.
+    """
+    use = [k for k in weights if k in components and weights[k] > 0]
+    total = sum(weights[k] for k in use)
+    if not use:
+        # Nothing was weighted. The answer is 1 -- "no opinion" -- not a
+        # crash and not 0: a zero here would mark an entire surface
+        # untrustworthy because of a configuration mistake.
+        any_ = next(iter(components.values()), None)
+        return np.ones(0 if any_ is None else len(np.atleast_1d(any_)))
+    acc = None
+    for k in use:
+        term = (np.log(np.clip(np.asarray(components[k], np.float64), CONF_FLOOR, 1.0))
+                * (weights[k] / total))
+        acc = term if acc is None else acc + term
+    return np.exp(acc)
+
+
+def vertex_confidence(V, F, evidence) -> np.ndarray:
+    """One byte a vertex: how much this proxy deserves a photograph on it.
+
+    `evidence` is `face_evidence_components` reduced to one per-VERTEX score
+    (`_weighted_geomean`, then `face_to_vertex`), carried from the level the
+    fusion counted. The geometry half is computed HERE, on this level's own
+    triangles, so a decimated level is graded on the triangles it actually has.
+
+    A weighted geometric mean rather than a sum, because the components are
+    not interchangeable: a face forty frames measured that no two of them
+    agree about, or a well-supported face decimation turned into a sliver, is
+    not "mostly fine". Each component is floored at `CONF_FLOOR` so that no
+    single one can answer zero on its own.
+
+    THE MEASUREMENT IS NOT A CLEAN WIN FOR THAT ARGUMENT, and this is where it
+    stands. On the validation half a plain weighted ARITHMETIC mean of the same
+    components ranks better overall -- 0.769 against 0.759 at pixel level,
+    0.908 against 0.903 at face level. The page does not use the whole ranking,
+    it uses the bottom of it, and at the budget a fade would actually spend
+    (the worst 2% of faces) the geometric mean is the better of the two: 48.5%
+    of those faces are contradicted by held-out frames, against 47.0%. Over
+    wider budgets (5-20%) the arithmetic mean edges back ahead by about a
+    point. The two are close everywhere; the geometric mean ships because it
+    wins where the rule reads. `fixit/confidence/CONFIDENCE.md` §4.
+
+    255 does not mean correct and 0 does not mean absent. It is a RANKING, and
+    it was validated as one: on keyframes held out of the fusion it separates
+    the pixels those frames contradict from the pixels they confirm with an
+    AUC of 0.759, and faces under 0.30 are contradicted 8.5 times as often as
+    the surface at large. It is not a probability and a page must not show it
+    as one.
+    """
+    geom = _weighted_geomean(mesh_geometry_components(V, F), CONF_GEOMETRY_WEIGHTS)
+    ev = np.clip(np.asarray(evidence, np.float64), CONF_FLOOR, 1.0)
+    conf = np.exp(CONF_EVIDENCE_SHARE * np.log(ev)
+                  + (1.0 - CONF_EVIDENCE_SHARE) * np.log(np.clip(geom, CONF_FLOOR, 1.0)))
+    return np.clip(np.rint(conf * 255.0), 0, 255).astype(np.uint8)
+
+
+def transfer_vertex_values(V_src, values, V_dst):
+    """A per-vertex quantity carried to a decimated level, by nearest vertex.
+
+    Quadric decimation returns no correspondence, so the evidence a level 0
+    vertex carries reaches a phone-level vertex through the geometry: the
+    nearest level 0 vertex, which after decimation is within about a voxel.
+    """
+    values = np.asarray(values)
+    if not len(V_src) or not len(V_dst):
+        return np.zeros(len(V_dst), values.dtype)
+    from scipy.spatial import cKDTree
+
+    _d, i = cKDTree(np.asarray(V_src, np.float64)).query(np.asarray(V_dst, np.float64))
+    return values[i]
+
+
+_CONF_HEADER = struct.Struct("<8sIII")
+
+
+def write_confidence_bytes(conf) -> bytes:
+    """`wb-surface-confidence/1`: a 20-byte header and one byte a vertex.
+
+    Header: magic `WBCONF01`, u32 vertex count, u32 version, u32 flags
+    (reserved, 0). Then `count` bytes, vertex i's confidence in [0, 255],
+    in the level's own vertex order. Nothing else: no positions, no digest of
+    its own -- the manifest names it beside the level it belongs to, and the
+    count is the guard against reading it against the wrong one.
+    """
+    conf = np.asarray(conf, np.uint8).reshape(-1)
+    return _CONF_HEADER.pack(CONF_MAGIC, len(conf), CONFIDENCE_VERSION, 0) + conf.tobytes()
+
+
+def read_confidence_bytes(buf: bytes, expect_vertices: int | None = None):
+    """Inverse of `write_confidence_bytes`, and the guard a torn file meets."""
+    if len(buf) < _CONF_HEADER.size:
+        raise SurfaceUnavailable("confidence buffer is shorter than its header")
+    magic, n, version, _flags = _CONF_HEADER.unpack_from(buf, 0)
+    if magic != CONF_MAGIC:
+        raise SurfaceUnavailable("confidence buffer has the wrong magic")
+    if version != CONFIDENCE_VERSION:
+        raise SurfaceUnavailable(
+            f"confidence schema {version}, expected {CONFIDENCE_VERSION}")
+    if len(buf) != _CONF_HEADER.size + n:
+        raise SurfaceUnavailable(
+            f"confidence buffer is {len(buf)} bytes, header implies "
+            f"{_CONF_HEADER.size + n}")
+    if expect_vertices is not None and n != expect_vertices:
+        raise SurfaceUnavailable(
+            f"confidence buffer is for {n} vertices, the level has {expect_vertices}")
+    return np.frombuffer(buf, np.uint8, n, _CONF_HEADER.size)
 
 
 # ---------------------------------------------------------------------------
