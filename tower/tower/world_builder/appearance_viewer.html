@@ -38,18 +38,34 @@ button{appearance:none;-webkit-appearance:none;border:1px solid var(--line);back
   border-radius:8px;padding:8px 11px;font:inherit;font-size:13px;min-height:38px;touch-action:manipulation}
 button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 button[disabled]{opacity:.4}
+/* The scrim is a gradient that fades out over the top of the frame, and the
+   About text is longer than the gradient: over a bright frame (the cream door)
+   the tail of it was grey on cream and unreadable -- and it is the paragraph
+   that keeps the page honest, so it is the one that must be legible on every
+   frame. The head keeps the gradient; the expanded text carries its own
+   plate. */
 #caption{position:fixed;left:0;right:0;top:0;
   padding:calc(10px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 10px
           calc(12px + env(safe-area-inset-left));
-  background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,0));
+  background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,.72) 55%,rgba(11,13,16,0));
   font-size:12px;color:var(--dim);pointer-events:none}
-#caption b{color:var(--ink);font-weight:600}
+#caption b{color:var(--ink);font-weight:600;text-shadow:0 1px 3px rgba(0,0,0,.9)}
 #caption button{pointer-events:auto;min-height:24px;padding:1px 8px;margin-left:6px;font-size:11px;border-radius:10px;vertical-align:baseline}
-#caption .more{display:block;margin-top:4px}
+#caption .more{display:block;margin-top:6px;padding:8px 10px;border-radius:8px;
+  background:rgba(8,10,13,.88);color:#d3d7dd;border:1px solid rgba(255,255,255,.08);
+  text-shadow:0 1px 2px rgba(0,0,0,.85)}
 #caption .more[hidden]{display:none}
+/* The status line sits over the frame with no scrim of its own, which was
+   fine while it only ever said "Loading the images…" over a black screen.
+   It now says "Preparing the view…" over the opening, which is a photograph,
+   so it carries the same plate the About text does -- and nothing at all when
+   it has nothing to say. */
 #status{position:fixed;left:calc(12px + env(safe-area-inset-left));
   bottom:calc(64px + env(safe-area-inset-bottom));font-size:12px;
+  padding:3px 8px;border-radius:8px;background:rgba(8,10,13,.82);
+  text-shadow:0 1px 2px rgba(0,0,0,.85);
   color:var(--dim);pointer-events:none;font-variant-numeric:tabular-nums}
+#status:empty{display:none}
 #msg{position:fixed;inset:0;display:none;place-content:center;padding:28px;text-align:center;
   color:var(--dim);background:var(--bg);z-index:5}
 #msg.on{display:grid}
@@ -65,7 +81,11 @@ button[disabled]{opacity:.4}
 <div id="caption"></div>
 <div id="status"></div>
 <div id="bar">
-  <button id="bOverview">Overview</button>
+  <!-- NOT "Overview". On this capture there is no overview to give: the walk
+       never stood back from the desk, so every vantage the envelope holds is
+       a view FROM the desk. The button goes to the best-supported vantage
+       there is, it says so, and it flies there. -->
+  <button id="bOverview" aria-label="Fly to the clearest vantage">Best view</button>
   <button id="bPrev" aria-label="Previous recorded view">&#8592;</button>
   <button id="bNext">&#8594;</button>
   <span id="pos"></span>
@@ -102,6 +122,10 @@ function fail(text){
   $("caption").style.display = "none"; $("status").textContent = "";
 }
 function status(text){ $("status").textContent = text || ""; }
+/* The second or so after the images land, while the support field is built.
+   You can already look and walk; what the page cannot do yet is tell you why
+   a direction is dark, or which vantage is best. It says so. */
+const PREPARING = "Preparing the view…";
 
 const DEBUG = CONFIG.transport === "tower";
 const Q = DEBUG ? new URLSearchParams(location.search) : new URLSearchParams("");
@@ -332,51 +356,85 @@ const ENC = (() => {
    and the page shows a hint. The envelope ONLY limits the camera: it paints
    nothing, and the dark places inside it stay dark. */
 const NAV = (() => {
-  const R_SOFT = 0.55, R_MAX = 1.0, V_MAX = 0.6;      // scene units (median scene depth ~4)
-  // View support: resisted below T_HI, stops at T_LO. Revised 2026-09-17 (fix-it
-  // blotch lane): support now rates QUALITY, not only coverage -- each source's
-  // incidence, one source or several, and whether the point sits beside a
-  // large hole in the proxy -- at the capture's field of view. Measured on the
-  // canonical world over 250 random views in the tube, a view is "good" (drawn
-  // >= 0.9, blotch <= 2.5%, seam excess <= 8) for 96% of views at support >=
-  // 0.80, 75% at 0.70-0.80 and 64-68% at 0.60-0.70. Resistance is felt from
-  // about 0.76 (B_FREE) and the view stops at 0.68.
+  /* LOOKING IS FREE; MOVEMENT IS WHAT THE CAPTURE LIMITS.
+     Revised 2026-09-17 (fix-it interaction lane), after an independent review
+     measured what a finger can actually reach on this page: 24.1 degrees of
+     yaw at the opening pose and then nothing for 57 frames of held drag;
+     across 16 recorded poses a median leftward look of -7.3 degrees, a median
+     upward look of +5.7, and 0.94 of 4.48 units for a deliberate forward push.
+     The escape hatch (`lookAcross`) never fired once in ten 60-frame sweeps.
+     The verdict was "a 24-degree slot you cannot get out of", and it is right:
+     a control that answers a two-inch drag with four degrees reads as a broken
+     page, not as a boundary.
+     So the two are separated. ROTATION is free -- full 360 of yaw from any
+     reachable position, pitch limited only by the neck -- because turning to a
+     wall the glasses never photographed shows honest darkness, which is true
+     and expected. A cage is not. WHERE THE CAMERA MAY BE is still limited, by
+     the two limits that are physically true: the tube around the walk the
+     wearer actually took, and how close a 360x640 frame may be magnified. */
+  // The tube: widened from 1.0 x 0.6 (soft from 0.55 of it), which made the
+  // first half of every sideways push resisted.
+  const R_SOFT = 0.75, R_MAX = 1.5, V_MAX = 0.8;      // scene units (median scene depth ~4.7)
+  // View support: how well the capture covers what a view looks at. It rates
+  // QUALITY, not only coverage -- each source's incidence, one source or
+  // several, and whether the point sits beside a large hole in the proxy -- at
+  // the capture's field of view. Measured on the canonical world over 250
+  // random views in the tube, a view is "good" (drawn >= 0.9, blotch <= 2.5%,
+  // seam excess <= 8) for 96% of views at support >= 0.80, 75% at 0.70-0.80
+  // and 64-68% at 0.60-0.70.
+  // It NO LONGER RESISTS A LOOK (fix-it interaction lane). It is what the page
+  // says a view is worth: below T_LO the page tells you, once and quietly,
+  // that nothing was photographed this way -- and turns anyway. It still
+  // chooses the Best view's candidates and it is still reported.
   const T_LO = 0.68, T_HI = 0.80;
   // How close the camera may come to the surface (scene units): nearer, a
   // 360x640 keyframe is magnified past its resolution (the review's keyboard
   // and monitor close-ups), and the frame fills with one blurred patch of wall
   // that scores as fully supported. Resisted from D_SOFT, stopped at D_MIN.
   // Measured over 200 reachable views at D_MIN 0.55 / 0.8 / 1.0 / 1.25 / 1.5
-  // (FRAMING.md §3).
+  // (FRAMING.md §3), which chose 1.0 -- and 1.0 is, on a bedroom whose median
+  // scene depth is 4.7, a fifth of the room. With the view-quality term gone
+  // from movement this is the limit a forward push actually meets, so it is
+  // back to 0.6: the blurred close-up is a MINOR complaint in the review and
+  // being unable to cross the room is a blocking one.
   // (NAV is lifted out of this page and run on its own under node by the tests,
   // where there is no OPT; the default is the same one OPT carries.)
-  const STANDOFF = (typeof OPT === "object" && OPT && OPT.standoff) || 1.0;
+  const STANDOFF = (typeof OPT === "object" && OPT && OPT.standoff) || 0.6;
   const D_MIN = STANDOFF, D_SOFT = STANDOFF + 0.30;
   // CONTENT. A view that is drawn and empty is a failure at the product's bar,
   // and support rated a covered blank wall exactly as highly as the desk. Each
   // proxy sample carries how much TEXTURE the keyframes that saw it hold there
   // (`navInput`, from the sources' own local contrast), the field keeps it per
   // direction beside the coverage, and a view's content is the mean over its
-  // rays. It is a NUDGE, never a wall: the content bound is capped at
-  // C_BOUND_MAX, well under the 0.999 at which a step is refused, so a
-  // deliberate look at a blank wall always goes through -- it is only harder
-  // to drift into and it does not settle there.
+  // rays.
   // Calibrated on the canonical world against the review's own measure: over
   // 260 views (40 walk poses, 20 look-arounds, 200 reachable), the field's
   // content correlates 0.58 with the mean |Laplacian| of the 900x700 capture,
   // and the cut that best reproduces that measure's "clean but empty" call is
-  // content 0.19 (agreeing on 76.5%). Resistance is felt below B_FREE-worth of
-  // bound, which C_BOUND_MAX x (1 - richness) crosses at content 0.19 exactly.
-  const C_LO = 0.13, C_HI = 0.28, C_BOUND_MAX = 0.55;
-  // Released on a featureless view the look eases toward content, at most
-  // C_DRIFT_MAX radians in total and never while a finger is down.
+  // content 0.19 (agreeing on 76.5%).
+  // Content NEVER RESISTS ANYTHING now (fix-it interaction lane). It chooses
+  // the Best view's candidates, and it is the one thing that may still move
+  // the camera on its own: see C_SETTLE below.
+  const C_LO = 0.13, C_HI = 0.28;
+  // THE SETTLE. Left alone on a featureless view, the look eases toward
+  // something to see -- at most C_DRIFT_MAX radians in total, never while a
+  // finger is down, and NEVER after a look of the person's own. A deliberate
+  // look stays exactly where it was put, for as long as it is left there; the
+  // settle exists for a camera the PAGE placed (an opening, a walk step, the
+  // Best view) that landed on nothing.
   const C_DRIFT_MAX = 0.30, C_DRIFT_RATE = 0.30, C_SETTLE = 0.60, C_GRAD_EPS = 0.30;
   // Resistance scales a worsening step by (1 - smooth(B_FREE, 1, b))^2: free
-  // in the first part of the band, so a push in a good place is not sluggish.
-  const B_FREE = 0.35;
+  // over the first part of the band, so a push in a good place is not sluggish.
+  // Raised from 0.35: the only bounds left are the tube and the standoff, and
+  // both are real edges, so there is no reason to be sluggish before one.
+  const B_FREE = 0.55;
   const SPACING = 0.5, FACE = 8, CELLS = 6 * FACE * FACE;
   const JUMP = 2.0;                                   // a longer gap in the recorded path is not a corridor
-  const PITCH_MAX = 1.3, PITCH_SOFT = 0.2;
+  // Pitch is limited by the NECK, not by the capture: 80 degrees each way,
+  // eased over the last PITCH_SOFT so the limit is a stop and not a wall. It
+  // used to be the recorded walk's own pitch range plus 0.2 rad, which on this
+  // world gave nine of sixteen poses under 7 degrees of upward look.
+  const PITCH_MAX = 1.396, PITCH_SOFT = 0.2;
   const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
   const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
   const nrm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
@@ -552,9 +610,6 @@ const NAV = (() => {
   }
   /* How rich a view is, 0 (featureless) .. 1 (the desk), from its content. */
   function richness(c){ return smooth(C_LO, C_HI, c); }
-  /* Resisting a featureless view: a NUDGE. Capped well under 1, so a step is
-     slowed and never refused. */
-  function contentBound(c){ return C_BOUND_MAX * (1 - richness(c)); }
 
   /* The distance from p to the nearest proxy sample, and how close that is to
      the limit, 0 (free) .. 1 (at D_MIN). A uniform hash grid over the samples,
@@ -596,86 +651,76 @@ const NAV = (() => {
   function closeBound(F, p){ return 1 - smooth(D_MIN, D_SOFT, nearest(F, p)); }
   /* How far past the soft edge a camera is, 0 (inside) .. 1 (at the limit). */
   function positionBound(e){ return smooth(R_SOFT / R_MAX, 1, e); }
+  /* How far off the capture a view is, 0 (well covered) .. 1 (nothing was
+     photographed this way). It no longer resists anything: it is what the page
+     SAYS, and what a measurement reads. */
   function lookBound(s, floor){
-    // below a recorded pose's own support the band is narrow: from a weak
-    // recorded view the camera may not wander into anything weaker
-    const hi = Math.min(T_HI, floor), lo = Math.min(T_LO, hi - 0.06);
+    const hi = Math.min(T_HI, floor ?? 1), lo = Math.min(T_LO, hi - 0.06);
     return 1 - smooth(lo, hi, s);
   }
 
-  /* One frame of camera motion. `cam` {p, yaw, pitch, floor}; `ctl` {look:
-     [dyaw, dpitch], move: [right, up, forward] (scene units, camera frame),
-     held: a finger or key is down}; `V` {dir(yaw, pitch), up, fy, aspect}.
-     `floor` is the support of the last recorded pose the camera arrived at, so
-     a recorded view that is itself partly dark is never "beyond" and never
-     pushed. Returns the next camera and how hard it was resisted (0..1). */
+  /* One frame of camera motion. `cam` {p, yaw, pitch, floor, aimed}; `ctl`
+     {look: [dyaw, dpitch], move: [right, up, forward] (scene units, camera
+     frame), held: a finger or key is down}; `V` {dir(yaw, pitch), up, fy,
+     aspect}. Returns the next camera, how hard it was resisted (0..1), and how
+     far off the capture the view it ends on is (`dark`).
+
+     A LOOK IS NEVER RESISTED. Yaw is free through a full turn; pitch is free
+     to the neck's limit. The capture's edge is shown, not enforced.
+     A MOVE is resisted only by the tube and the standoff -- the two limits
+     that are true about where a camera may stand. How good the view is from
+     where you are going is not one of them: it was, and it is what turned a
+     4.48-unit push into 0.94. */
   function step(F, path, cam, ctl, dt, V){
     const out = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch, floor: cam.floor ?? 1,
-                 cdrift: cam.cdrift || 0, resisted: 0, hard: 0};
+                 cdrift: cam.cdrift || 0, aimed: !!cam.aimed, resisted: 0, hard: 0, dark: 0};
     const ready = !!(F && F.done && F.count);
-    // Until the field exists nothing can say where the capture ends, so the
-    // camera does not move at all (the review: early input escaped the
-    // envelope, and the page then kept the escaped camera out there).
-    if (!ready){ out.waiting = true; return out; }
-    const at = (p, yaw, pitch) => support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect);
-    const sup = (p, yaw, pitch) => ready ? at(p, yaw, pitch).s : 1;
-    // What a direction is worth: unsupported is a LIMIT ("not captured beyond
-    // here"), featureless is a NUDGE. `hard` keeps the limit's own share, so
-    // the edge hint is shown for the edge and never for a dull view.
-    let hard = 0;
-    const viewB = (p, yaw, pitch) => { const r = at(p, yaw, pitch);
-      const h = lookBound(r.s, out.floor); hard = h;
-      return Math.max(h, contentBound(r.c)); };
-    const posB = p => ready && path && path.n ? positionBound(pathDist(path, p).e) : 0;
+    // The field says where the capture COVERS; it is not needed to know where
+    // the camera may stand, so a finger is answered from the first frame (the
+    // review: the page looked ready, answered buttons and ignored the finger).
+    // `waiting` is reported, and nothing waits on it.
+    out.waiting = !ready;
+    const at = (p, yaw, pitch) => ready ? support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect)
+                                        : {s: 1, dist: 0, c: 0};
+    const posB = p => path && path.n ? positionBound(pathDist(path, p).e) : 0;
     const look = ctl.look || [0, 0], move = ctl.move || [0, 0, 0];
-    // Pitch: within what the recorded walk looked at (V.pitchMin/Max, the
-    // recorded range plus a margin), resisted over its last PITCH_SOFT: the
-    // review's torn ceiling and floor blobs were one vertical drag away.
-    const pLo = V.pitchMin ?? -PITCH_MAX, pHi = V.pitchMax ?? PITCH_MAX;
-    const clampP = x => Math.max(pLo, Math.min(pHi, x));
-    const pitchB = x => Math.max(smooth(pHi - PITCH_SOFT, pHi, x), smooth(-pLo - PITCH_SOFT, -pLo, -x));
+    const clampP = x => Math.max(-PITCH_MAX, Math.min(PITCH_MAX, x));
+    const pitchB = x => smooth(PITCH_MAX - PITCH_SOFT, PITCH_MAX, Math.abs(x));
     // Large inputs (a fast flick, a slow frame) are taken in small sub-steps,
     // so the resistance feels the same whatever the frame rate.
-    const resistOnce = (b0, b1, scale, h1) => {
+    const resistOnce = (b0, b1, h1) => {
       if (b1 <= b0) return 1;
       out.resisted = Math.max(out.resisted, b1);
       out.hard = Math.max(out.hard || 0, h1 || 0);
-      return Math.pow(1 - smooth(B_FREE, 1, b1), 2) * scale;
+      return Math.pow(1 - smooth(B_FREE, 1, b1), 2);
     };
     if (look[0] || look[1]){
-      out.cdrift = 0;                                      // a look of the person's own starts the budget again
-      const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(look[0], look[1]) / 0.03)));
-      for (let i = 0; i < n; i++){
-        const b0 = Math.max(viewB(out.p, out.yaw, out.pitch), pitchB(out.pitch));
-        let dy = look[0] / n, dp = look[1] / n, b1 = 0, h1 = 0;
-        for (let t = 0; t < 4; t++){
-          b1 = Math.max(viewB(out.p, out.yaw + dy, clampP(out.pitch + dp)), pitchB(clampP(out.pitch + dp)));
-          h1 = Math.max(hard, pitchB(clampP(out.pitch + dp)));
-          if (b1 < 0.999 || b1 <= b0) break;
-          dy /= 2; dp /= 2;
+      // a look of the person's own: it is theirs, and the settle never takes it
+      out.aimed = true; out.cdrift = 0;
+      out.yaw += look[0];                                  // free, all the way round
+      if (look[1]){
+        const n = Math.min(12, Math.max(1, Math.ceil(Math.abs(look[1]) / 0.03)));
+        for (let i = 0; i < n; i++){
+          const dp = look[1] / n, b0 = pitchB(out.pitch), b1 = pitchB(clampP(out.pitch + dp));
+          const k = resistOnce(b0, b1, 0);                 // the neck, not the capture: no hint
+          out.pitch = clampP(out.pitch + dp * k);
         }
-        const k = resistOnce(b0, b1, 1, h1);
-        out.yaw += dy * k; out.pitch = clampP(out.pitch + dp * k);
       }
     }
     if (move[0] || move[1] || move[2]){
       const f = V.dir(out.yaw, out.pitch), r = nrm(crs(f, V.up));
       const D = [0, 1, 2].map(k => r[k] * move[0] + V.up[k] * move[1] + f[k] * move[2]);
-      let moveHard = 0;
-      const bAt = p => { const v = viewB(p, out.yaw, out.pitch), pb = posB(p), cb = closeBound(F, p);
-        moveHard = Math.max(hard, pb, cb);
-        return Math.max(pb, v, cb); };
-      const n = Math.min(12, Math.max(1, Math.ceil(Math.hypot(D[0], D[1], D[2]) / 0.05)));
+      const bAt = p => Math.max(posB(p), ready ? closeBound(F, p) : 0);
+      const n = Math.min(32, Math.max(1, Math.ceil(Math.hypot(D[0], D[1], D[2]) / 0.05)));
       for (let i = 0; i < n; i++){
         const b0 = bAt(out.p);
-        let d = D.map(x => x / n), b1 = 0, h1 = 0;
+        let d = D.map(x => x / n), b1 = 0;
         for (let t = 0; t < 4; t++){
           b1 = bAt([out.p[0] + d[0], out.p[1] + d[1], out.p[2] + d[2]]);
-          h1 = moveHard;
           if (b1 < 0.999 || b1 <= b0) break;
           d = d.map(x => x / 2);
         }
-        const k = resistOnce(b0, b1, 1, h1);
+        const k = resistOnce(b0, b1, b1);                  // this edge IS the capture's: hint
         out.p = [out.p[0] + d[0] * k, out.p[1] + d[1] * k, out.p[2] + d[2] * k];
       }
     }
@@ -693,62 +738,51 @@ const NAV = (() => {
         // recorded walk itself passes within 0.3 of the proxy in places).
         if (nearest(F, to) >= Math.min(D_MIN, nearest(F, out.p))) out.p = to;
       }
-      const here = at(out.p, out.yaw, out.pitch), lb = lookBound(here.s, out.floor);
-      // Released on a view that is drawn but empty, the look eases toward what
-      // there is something to see: a person who turns to a blank wall on
-      // purpose keeps it (the finger is down; and the ease stops after
-      // C_DRIFT_MAX radians), but the camera does not SETTLE on nothing.
+      // THE SETTLE, and the one rule that keeps it honest: it never touches a
+      // look the person made. `aimed` is set by any look input and cleared
+      // only when the PAGE places the camera (the opening, a walk step, the
+      // Best view). So a deliberate look at a blank wall stays on the blank
+      // wall for as long as it is left there, and a camera the page dropped on
+      // nothing eases toward something -- at most C_DRIFT_MAX in total.
+      const here = at(out.p, out.yaw, out.pitch);
       const rich = richness(here.c), cb = rich < C_SETTLE ? 1 - rich / C_SETTLE : 0;
       const budget = Math.max(0, C_DRIFT_MAX - (out.cdrift || 0));
-      const wantC = cb > 0.02 && budget > 0;
-      if (lb > 0.02 || wantC){
-        // The support gradient says where the capture is, over a small angle.
-        // The content gradient says where the ROOM is, and is asked over a wide
-        // one (C_GRAD_EPS): a blank wall is featureless for tens of degrees, so
-        // a fine difference there is exactly zero and says nothing. It reads
-        // the raw content, not its 0..1 richness, which is flat once clamped.
-        let gy = 0, gp = 0;
-        if (lb > 0.02){
-          const e = 0.08;
-          gy += sup(out.p, out.yaw + e, out.pitch) - sup(out.p, out.yaw - e, out.pitch);
-          gp += sup(out.p, out.yaw, clampP(out.pitch + e)) - sup(out.p, out.yaw, clampP(out.pitch - e));
-        }
-        if (wantC){
-          const e = C_GRAD_EPS, c = (yaw, pitch) => at(out.p, yaw, pitch).c;
-          gy += c(out.yaw + e, out.pitch) - c(out.yaw - e, out.pitch);
-          gp += c(out.yaw, clampP(out.pitch + e)) - c(out.yaw, clampP(out.pitch - e));
-        }
+      if (!out.aimed && cb > 0.02 && budget > 0){
+        // The content gradient says where the ROOM is, asked over a wide angle
+        // (C_GRAD_EPS): a blank wall is featureless for tens of degrees, so a
+        // fine difference there is exactly zero and says nothing. It reads the
+        // raw content, not its 0..1 richness, which is flat once clamped.
+        const e = C_GRAD_EPS, c = (yaw, pitch) => at(out.p, yaw, pitch).c;
+        const gy = c(out.yaw + e, out.pitch) - c(out.yaw - e, out.pitch);
+        const gp = c(out.yaw, clampP(out.pitch + e)) - c(out.yaw, clampP(out.pitch - e));
         const gl = Math.hypot(gy, gp);
         if (gl > 0.005){
-          let rate = 0.5 * lb * dt / 1000;                 // radians this frame
-          if (wantC) rate = Math.min(budget, rate + C_DRIFT_RATE * cb * dt / 1000);
-          out.cdrift = (out.cdrift || 0) + (wantC ? rate : 0);
+          const rate = Math.min(budget, C_DRIFT_RATE * cb * dt / 1000);
+          out.cdrift = (out.cdrift || 0) + rate;
           out.yaw += gy / gl * rate; out.pitch = clampP(out.pitch + gp / gl * rate);
         }
       }
     } else {
       out.cdrift = 0;                                      // a finger is down: the look is the person's
     }
-    if (ready && sup(out.p, out.yaw, out.pitch) >= T_HI) out.floor = 1;
+    // What the view it ended on is worth, for the page to SAY (never to
+    // enforce): 0 where the capture covers this direction, 1 where it does not.
+    // Against the FIXED thresholds, not against `out.floor`. The floor exists so
+    // that a weak recorded view is never treated as "beyond" by a LIMIT, and a
+    // look has no limit any more. Left in the reporting it would have narrowed
+    // the one thing it must not: standing at the dimmest recorded pose in the
+    // world -- the darkest place on it -- is where the page would have gone
+    // quiet about the dark.
+    if (ready) out.dark = lookBound(at(out.p, out.yaw, out.pitch).s, 1);
     return out;
   }
 
-  /* Looking ACROSS a gap: a look held against the edge that keeps pushing is
-     taken over the unsupported stretch to the first well-supported direction
-     beyond it (up to half a turn), so turning round is possible without
-     parking on the worst frame. Returns that yaw, or null. */
-  function lookAcross(F, p, yaw, pitch, sign, V){
-    if (!F || !F.done || !F.count) return null;
-    for (let a = 0.35; a <= Math.PI + 1e-9; a += 0.0873){
-      const y = yaw + sign * a;
-      if (support(F, p, V.dir(y, pitch), V.up, V.fy, V.aspect).s >= T_HI) return y;
-    }
-    return null;
-  }
-
   /* A uniformly random reachable view (verification: the measured
-     distribution of what a person can reach). `rand` returns [0, 1). */
-  function sampleReachable(F, path, V, rand, tries = 4000){
+     distribution of what a person can reach). `rand` returns [0, 1).
+     Since a look is free, EVERY direction is reachable from every reachable
+     position, and this samples them all: `minSupport` is 0 by default, and a
+     measurement that wants the old, support-filtered set asks for T_LO. */
+  function sampleReachable(F, path, V, rand, tries = 4000, minSupport = 0){
     for (let t = 0; t < tries; t++){
       const i = Math.floor(rand() * path.n);
       const o = [rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1];
@@ -757,9 +791,9 @@ const NAV = (() => {
       // the standoff is part of where the camera may BE, so the measured
       // distribution has to respect it too (it did not, before)
       if (nearest(F, p) < D_MIN) continue;
-      const yaw = rand() * 2 * Math.PI - Math.PI, pitch = (rand() * 2 - 1) * 0.9;
+      const yaw = rand() * 2 * Math.PI - Math.PI, pitch = (rand() * 2 - 1) * PITCH_MAX;
       const r = support(F, p, V.dir(yaw, pitch), V.up, V.fy, V.aspect);
-      if (r.s < T_LO) continue;
+      if (r.s < minSupport) continue;
       return {p, yaw, pitch, support: r.s, content: r.c, rich: richness(r.c)};
     }
     return null;
@@ -774,10 +808,13 @@ const NAV = (() => {
     return {p: [0, 1, 2].map(i => a.p[i] + (b.p[i] - a.p[i]) * k), yaw: a.yaw + dy * k,
             pitch: a.pitch + (b.pitch - a.pitch) * k};
   }
+  /* Long enough to read as a flight rather than a jump: the Best view is a few
+     units away, and at the old 1600 ms cap that crossing looked like a
+     teleport to the review. */
   function glideMs(a, b){
     const d = Math.hypot(b.p[0]-a.p[0], b.p[1]-a.p[1], b.p[2]-a.p[2]);
     let dy = b.yaw - a.yaw; dy = Math.abs(Math.atan2(Math.sin(dy), Math.cos(dy)));
-    return Math.max(400, Math.min(1600, 300 * d + 320 * dy + 250 * Math.abs(b.pitch - a.pitch)));
+    return Math.max(400, Math.min(2600, 420 * d + 320 * dy + 250 * Math.abs(b.pitch - a.pitch)));
   }
 
   /* Stepping along the walk: the next recorded pose in direction d that is
@@ -812,10 +849,10 @@ const NAV = (() => {
   }
 
   return {smooth, cellOf, angleWeight, makePath, pathDist, fieldJob, fieldWork, support, positionBound,
-          lookBound, step, sampleReachable, glide, glideMs, nearest, closeBound, lookAcross, nextPose,
-          richness, contentBound, sampleGrid,
+          lookBound, step, sampleReachable, glide, glideMs, nearest, closeBound, nextPose,
+          richness, sampleGrid,
           R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE,
-          C_LO, C_HI, C_BOUND_MAX, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, MAX_SKIP};
+          C_LO, C_HI, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, MAX_SKIP};
 })();
 /* ---------- end navigation */
 
@@ -2107,16 +2144,21 @@ async function main(){
   }
   function navView(){
     const c = currentCamera();
-    return {dir: dirFrom, up: UP, fy: c.fy, aspect: c.aspect, pitchMin: pitchRange[0], pitchMax: pitchRange[1]};
+    return {dir: dirFrom, up: UP, fy: c.fy, aspect: c.aspect};
   }
-  /* The pitch the recorded walk looked at, plus 0.2 rad each way. */
+  /* The pitch the recorded walk looked at. It used to be the LIMIT on looking
+     up and down (plus 0.2 rad each way), which on this world left nine of
+     sixteen poses with under 7 degrees of upward look. The limit is now the
+     neck's (NAV.PITCH_MAX); this is kept because a measurement wants to know
+     where the capture's own pitch ended, and it is reported, not enforced. */
   let pitchRange = [-NAV.PITCH_MAX, NAV.PITCH_MAX];
   function recordedPitch(){
     if (!cams.length) return;
     let lo = Infinity, hi = -Infinity;
     for (const c of cams){ const p = yawPitchOf([c[3], c[4], c[5]]).pitch; lo = Math.min(lo, p); hi = Math.max(hi, p); }
-    pitchRange = [Math.max(-NAV.PITCH_MAX, lo - 0.2), Math.min(NAV.PITCH_MAX, hi + 0.2)];
+    pitchRange = [lo, hi];
     S.pitchRange = pitchRange;
+    S.pitchLimit = [-NAV.PITCH_MAX, NAV.PITCH_MAX];
   }
   function supportOf(pose){
     if (!navField || !navField.done) return null;
@@ -2142,18 +2184,25 @@ async function main(){
     vel.look = [0, 0]; vel.move = [0, 0, 0];
     requestDraw();
   }
-  /* The hint at the envelope's edge: subtle, and gone a moment after. */
-  let hintTimer = null;
-  function hint(level){
+  /* The hint: subtle, and gone a moment after. Two things it says, and they
+     are different things. The EDGE hint is for a push the envelope resisted --
+     there is a limit there and the page enforces it. The DARK hint is for a
+     look that has turned off the capture: nothing is enforced, the turn
+     happened, and this only says why the room went dark. */
+  const HINT_EDGE = "Not captured beyond here";
+  const HINT_DARK = "Nothing was photographed this way";
+  let hintTimer = null, hintSaid = 0;
+  function hint(level, text){
     if (level < 0.35) return;
     const h = $("hint");
+    h.textContent = text || HINT_EDGE;
     h.style.opacity = String(Math.min(0.9, 0.3 + level));
     S.hints = (S.hints || 0) + 1;
+    S.lastHint = h.textContent;
     clearTimeout(hintTimer);
     hintTimer = setTimeout(() => { h.style.opacity = "0"; }, 1100);
   }
   const KEY_SPEED = 1.1 / 1000;          // scene units per ms
-  let pushAcross = 0;                    // look pushed against the edge (radians)
   /* Advance the camera by dt ms: a glide, or input + inertia through NAV.step.
      Returns whether it is still moving (the frame loop keeps drawing). */
   function navUpdate(dt){
@@ -2182,34 +2231,31 @@ async function main(){
       for (let i = 0; i < 3; i++){ ctl.move[i] += vel.move[i] * dt; vel.move[i] *= k; if (Math.abs(vel.move[i]) < 2e-6) vel.move[i] = 0; }
     }
     const pushing = ctl.look[0] || ctl.look[1] || ctl.move[0] || ctl.move[1] || ctl.move[2];
-    const lookYaw = ctl.look[0];
+    const looking = !!(ctl.look[0] || ctl.look[1]);
     const next = NAV.step(navField, navPath, cam, {look: ctl.look, move: ctl.move, held}, dt, navView());
     ctl.look = [0, 0]; ctl.move = [0, 0, 0];
-    if (next.waiting){ vel.look = [0, 0]; vel.move = [0, 0, 0]; S.waiting = true; return false; }
-    S.waiting = false;
-    // A look held against the edge that keeps pushing crosses to the next
-    // well-supported direction instead of parking on the edge frame.
-    if (lookYaw && next.resisted > 0.85 && Math.abs(next.yaw - cam.yaw) < Math.abs(lookYaw) * 0.25){
-      pushAcross += Math.abs(lookYaw);
-      if (pushAcross > 0.3){
-        pushAcross = 0;
-        const V = navView(), y = NAV.lookAcross(navField, cam.p, cam.yaw, cam.pitch, Math.sign(lookYaw), V);
-        if (y !== null){
-          S.crossings = (S.crossings || 0) + 1;
-          glideTo({p: cam.p.slice(), yaw: y, pitch: cam.pitch}, null);
-          return true;
-        }
-      }
-    } else if (!lookYaw || next.resisted < 0.5) pushAcross = 0;
+    // The field may still be building. Input is answered anyway -- the tube is
+    // known from the recorded walk alone, so early input cannot escape the
+    // envelope, which is what the early-input rule was for.
+    S.waiting = !!next.waiting;
     const moved = Math.abs(next.yaw - cam.yaw) + Math.abs(next.pitch - cam.pitch)
       + Math.hypot(next.p[0]-cam.p[0], next.p[1]-cam.p[1], next.p[2]-cam.p[2]) > 1e-5;
     if (pushing && next.resisted > 0){
-      hint(next.hard || 0);          // the edge hint is for the EDGE, not for a dull view
+      hint(next.hard || 0, HINT_EDGE);   // the edge hint is for a resisted PUSH
       // the resisted share of a flick is spent, not stored
       if (next.resisted > 0.6){ vel.look = [0, 0]; vel.move = [0, 0, 0]; }
     }
-    S.resisted = next.resisted; S.resistedHard = next.hard || 0;
-    cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor, cdrift: next.cdrift};
+    // A look that has turned off the capture is not stopped; it is explained,
+    // and only now and then (the finger is turning, the room is dark, one line
+    // is enough).
+    if (looking && next.dark > 0.9 && performance.now() - hintSaid > 4000){
+      hintSaid = performance.now();
+      hint(0.45, HINT_DARK);
+      S.darkLooks = (S.darkLooks || 0) + 1;
+    }
+    S.resisted = next.resisted; S.resistedHard = next.hard || 0; S.dark = next.dark || 0;
+    cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor,
+           cdrift: next.cdrift, aimed: next.aimed};
     if (moved && navPath && navPath.n) ci = NAV.pathDist(navPath, cam.p).index;
     const coasting = vel.look.some(v => v) || vel.move.some(v => v);
     return moved || coasting || keys.size > 0;
@@ -2371,6 +2417,14 @@ async function main(){
   }
   function buildNav(){
     const gen = ++navGeneration;
+    // The one thing the page cannot do until this finishes is EXPLAIN itself.
+    // A look already turns (see `navUpdate`), but a turn into the part of the
+    // room nobody photographed goes black with nothing said, because "nothing
+    // was photographed this way" is exactly what the field is still working
+    // out -- and the Best view is disabled for the same reason. So the page
+    // says so for the second or two it lasts, rather than presenting a
+    // finished surface that quietly knows less than it looks like it does.
+    status(PREPARING);
     const steps = navInputSteps();
     let input = null, job = null, spent = 0, inputMs = 0;
     const slice = () => {
@@ -2410,6 +2464,7 @@ async function main(){
       if (!glideState && cams.length) cam.floor = floorAt(poseOf(ci));
       scorePoses();
       $("bOverview").disabled = false;
+      if ($("status").textContent === PREPARING) status("");
       requestDraw();
     };
     setTimeout(slice, 0);
@@ -2491,6 +2546,22 @@ async function main(){
       // candidates are the same desk area (fig/ov_candidates.jpg): this walk
       // never stood back from it, so no vantage inside the envelope frames the
       // whole room and the range term only orders views of the desk.
+      // TRIED AND REJECTED, 2026-09-18 (fix-it interaction lane): weighting the
+      // range hardest of all in landscape (0.25 + 0.75 x range), on the
+      // argument that if every candidate is the same desk then the only choice
+      // worth making is which one holds the most room. Measured on the
+      // canonical world, it is a NO-OP: with and without it the score picks the
+      // same candidate (drawn 0.887, detail 0.158, range 4.92 of 406
+      // considered). It was reverted for that reason -- the framing lane swept
+      // three scorings and shipped these weights, and there is nothing to show
+      // for overriding a measurement with an argument.
+      // What DID move the destination is the envelope. A wider tube and a
+      // smaller standoff take the candidate set from 205 to 406, and the
+      // winner is now a vantage 0.5 units further back: more room in frame
+      // (range 4.92 against 3.69) and 88.7% drawn against 99.8%, with a
+      // shredded region in the lower right. That is a real side effect of the
+      // movement fix and it is in INTERACTION.md section 7; this score has not
+      // been re-swept against the bigger envelope, and should be.
       f.rendered = r.drawn * (0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref)))
         * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.15 + 0.85 * detailTerm(r.detail || 0))
         * (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)));
@@ -3256,6 +3327,14 @@ async function main(){
     note += " The arrows step through the recorded walk and pass over poses that render badly or show"
       + " nothing, at most " + NAV.MAX_SKIP + " in a row -- so the walk you are shown is shorter than the one"
       + " that was recorded, but never skips a whole stretch of it.";
+    // What the controls will and will not do, said plainly, because the
+    // difference between them is the whole shape of this thing.
+    note += " Turning is free: you can look all the way round and straight up, and where the glasses"
+      + " never looked you will find the room simply dark rather than a wall you cannot turn past."
+      + " Moving is not free -- the camera stays near the path that was actually walked, and a push"
+      + " that slows to nothing has reached the edge of it."
+      + " “Best view” flies to the best-supported vantage in that path; on this capture the wearer"
+      + " never stood back from the desk, so it is a view from the desk and not a view of the whole room.";
     if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
     const more = document.createElement("span");
     more.className = "more";
@@ -3329,16 +3408,23 @@ async function main(){
   // the constants a measurement needs to name what it swept
   S.navConst = () => ({viewMargin: OPT.viewMargin, viewMarginV: OPT.viewMarginV,
     D_MIN: NAV.D_MIN, D_SOFT: NAV.D_SOFT, C_LO: NAV.C_LO, C_HI: NAV.C_HI,
-    C_BOUND_MAX: NAV.C_BOUND_MAX, C_DRIFT_MAX: NAV.C_DRIFT_MAX, C_SETTLE: NAV.C_SETTLE,
+    C_DRIFT_MAX: NAV.C_DRIFT_MAX, C_SETTLE: NAV.C_SETTLE, B_FREE: NAV.B_FREE,
+    R_MAX: NAV.R_MAX, R_SOFT: NAV.R_SOFT, V_MAX: NAV.V_MAX, PITCH_MAX: NAV.PITCH_MAX,
     MAX_SKIP: NAV.MAX_SKIP, POSE_MIN, POSE_CONTENT, DETAIL_REF,
     T_LO: NAV.T_LO, T_HI: NAV.T_HI});
   S.poseContent = () => poseC.slice();
   S.detailOf = (w = 96) => { const aspect = canvas.width / Math.max(1, canvas.height);
     const hh = Math.max(24, Math.round(w / aspect));
     return drawnFraction(currentCamera(aspect), w, hh, true); };
-  S.sampleReachable = (n, seed = 1) => { if (!navField || !navField.done) return [];
+  // `minSupport` 0 (the default) is what a person can now reach: every
+  // direction, from every position in the tube. Pass NAV.T_LO for the
+  // support-filtered set the old envelope allowed, so the two are comparable.
+  S.sampleReachable = (n, seed = 1, minSupport = 0) => { if (!navField || !navField.done) return [];
     const rand = mulberry(seed), V = navView(), out = [];
-    for (let i = 0; i < n; i++){ const r = NAV.sampleReachable(navField, navPath, V, rand); if (r) out.push(r); }
+    for (let i = 0; i < n; i++){
+      const r = NAV.sampleReachable(navField, navPath, V, rand, 4000, minSupport);
+      if (r) out.push(r);
+    }
     return out; };
   S.input = (c) => { override = null;
     if (c.look){ ctl.look[0] += c.look[0]; ctl.look[1] += c.look[1]; }

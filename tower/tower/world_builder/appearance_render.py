@@ -118,9 +118,17 @@ SOURCE_FADE_MS = 280
 # - STANDOFF is how close the camera may come to the proxy: at 0.55 it could be
 #   pressed against a wall and fill the frame with one blurred patch that the
 #   envelope scored as fully supported.
+# The fix-it interaction lane (Glasses-scratch/wb-final-recon/fixit/interaction):
+# - a look is no longer bounded by the capture at all, so the only thing left
+#   between a deliberate forward push and the room is this standoff, and at 1.0
+#   on a world whose median scene depth is 4.7 it was a fifth of the room. An
+#   independent review measured a 4.48-unit push travelling a median 0.94 units.
+#   0.6 is the value that keeps the 360x640 keyframes off the lens without
+#   turning the envelope into a cage; the blurred close-up it guards against is
+#   a MINOR complaint in that review and the cage is a blocking one.
 VIEW_MARGIN = 1.4
 VIEW_MARGIN_V = 1.15
-STANDOFF = 1.0
+STANDOFF = 0.6
 CRACK_FILL_PX = 4
 VOID_FOG = 0.35
 VOID_WIDE_FADE = 0.2

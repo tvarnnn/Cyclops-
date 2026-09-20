@@ -860,37 +860,64 @@ for (const move of [[0, 0, -0.05], [0.05, 0, 0], [0, 0.05, 0], [0, 0, -0.4]]){
 
     def test_a_released_camera_drifts_back_inside_without_a_jump(self):
         _run_nav(r"""
-let cam = {p: [2.5, 0, -0.95], yaw: 0, pitch: 0, floor: 1};
+const out = [2.5, 0, -NAV.R_MAX * 0.95];
+let cam = {p: out.slice(), yaw: 0, pitch: 0, floor: 1};
 let e = NAV.pathDist(path, cam.p).e;
-for (let i = 0; i < 400; i++){
+for (let i = 0; i < 600; i++){
   const n = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
-  assert.ok(dist(n.p, cam.p) < 0.02, "a drift, never a snap");
+  // a fortieth of the tube in a frame: a drift, never a snap (the tube is
+  // 1.5 across now, and the drift covers a proportion of what is left)
+  assert.ok(dist(n.p, cam.p) < 0.02 * NAV.R_MAX, "a drift, never a snap: " + dist(n.p, cam.p));
   const e1 = NAV.pathDist(path, n.p).e;
   assert.ok(e1 <= e + 1e-9);
   e = e1; cam = n;
 }
-assert.ok(e < 0.65 && e > 0.5, "back to the soft edge, not dragged to the walk: " + e);
+const soft = NAV.R_SOFT / NAV.R_MAX;
+assert.ok(e < soft + 0.05 && e > soft - 0.05, "back to the soft edge, not dragged to the walk: " + e);
 // a held camera is not moved by the drift
-const held = NAV.step(F, path, {p: [2.5, 0, -0.95], yaw: 0, pitch: 0, floor: 1}, {look: [0, 0], move: [0, 0, 0], held: true}, 16, V);
-assert.deepStrictEqual(held.p, [2.5, 0, -0.95]);
+const held = NAV.step(F, path, {p: out.slice(), yaw: 0, pitch: 0, floor: 1}, {look: [0, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.deepStrictEqual(held.p, out);
 """)
 
-    def test_looking_toward_what_was_never_captured_is_resisted(self):
+    def test_looking_is_free_all_the_way_round_and_the_darkness_is_told_not_enforced(self):
+        """The fix-it interaction lane. An independent review measured 24.1
+        degrees of reachable yaw at the opening pose and a median leftward look
+        of -7.3 degrees over 16 poses: the support bound multiplied a held drag
+        by about zero. A look is no longer bounded by the capture at all."""
         _run_nav(r"""
-let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, least = 1, resisted = 0;
-for (let i = 0; i < 400; i++){
-  cam = NAV.step(F, path, cam, {look: [0.03, 0], move: [0, 0, 0], held: true}, 16, V);
-  least = Math.min(least, sup(cam.p, cam.yaw)); resisted = Math.max(resisted, cam.resisted);
+// a full turn, one 0.03 rad drag increment at a time, from the spot facing the
+// only wall this synthetic room has: every step arrives whole
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, least = 1, dark = 0, worst = 1;
+for (let i = 0; i < 210; i++){
+  const n = NAV.step(F, path, cam, {look: [0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+  worst = Math.min(worst, (n.yaw - cam.yaw) / 0.03);
+  least = Math.min(least, sup(n.p, n.yaw)); dark = Math.max(dark, n.dark);
+  assert.strictEqual(n.resisted, 0, "a look is never resisted at all");
+  cam = n;
 }
-assert.ok(least >= NAV.T_LO - 0.02, "the look stops before the view is mostly dark: " + least);
-assert.ok(cam.yaw > 0.5, "but it turns freely while the view is supported: " + cam.yaw);
-assert.ok(resisted > 0.35);
-for (let i = 0; i < 400; i++) cam = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
-assert.ok(sup(cam.p, cam.yaw) >= NAV.T_HI - 0.05, "released, it eases back toward what was seen");
-// turning back toward the wall is not held back (the field is sampled on a
-// cube map, so support is only monotone to within a cell)
-const back = NAV.step(F, path, cam, {look: [-0.03, 0], move: [0, 0, 0], held: true}, 16, V);
-assert.ok(cam.yaw - back.yaw > 0.027 && back.resisted < 0.1, (cam.yaw - back.yaw) + " " + back.resisted);
+assert.ok(Math.abs(cam.yaw - 210 * 0.03) < 1e-9, "the whole turn arrived: " + cam.yaw);
+assert.ok(cam.yaw > 2 * Math.PI, "and it is more than a full circle: " + cam.yaw);
+assert.ok(worst > 1 - 1e-12, "no step was ever scaled: " + worst);
+assert.strictEqual(least, 0, "the turn went through the part nothing was captured from");
+assert.ok(dark > 0.9, "and the page was told so, so it can SAY it: " + dark);
+// the same turn the other way reaches the same places: no left/right asymmetry
+let back = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+for (let i = 0; i < 210; i++) back = NAV.step(F, path, back, {look: [-0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.ok(Math.abs(back.yaw + 210 * 0.03) < 1e-9, "and leftward is the same: " + back.yaw);
+// a weak recorded pose is no longer a narrower band, because there is no band
+const weak = NAV.step(F, path, {p: at.slice(), yaw: Math.PI, pitch: 0, floor: 0.05},
+                      {look: [0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.ok(Math.abs(weak.yaw - (Math.PI + 0.03)) < 1e-9, "even from a dark recorded view: " + weak.yaw);
+// and standing at a dark recorded pose does not make the page quiet about the
+// dark. `dark` is measured against the fixed thresholds and not against the
+// floor, so the dimmest pose in the world reports the view exactly as the
+// brightest one does -- the floor is there to stop a LIMIT pushing a weak
+// recorded view away, and there is no limit on a look to soften.
+const same = NAV.step(F, path, {p: at.slice(), yaw: Math.PI, pitch: 0, floor: 1},
+                      {look: [0.03, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.strictEqual(weak.dark, same.dark, "the floor does not dim the warning: "
+                   + weak.dark + " vs " + same.dark);
+assert.ok(weak.dark > 0.9, "and it is a warning: " + weak.dark);
 """)
 
     def test_a_recorded_view_that_is_itself_dark_is_never_pushed(self):
@@ -899,11 +926,47 @@ assert.ok(cam.yaw - back.yaw > 0.027 && back.resisted < 0.1, (cam.yaw - back.yaw
 const pose = {p: at.slice(), yaw: Math.PI, pitch: 0, floor: 0.05};
 const n = NAV.step(F, path, pose, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
 assert.strictEqual(n.yaw, Math.PI); assert.deepStrictEqual(n.p, at);
-// and without a field (still building) the camera does not move at all:
-// early input used to escape the envelope (visual review, item 5)
-const wait = NAV.step(null, path, {p: at.slice(), yaw: 0, pitch: 0}, {look: [2, 0], move: [0, 0, -5], held: true}, 16, V);
-assert.strictEqual(wait.yaw, 0); assert.deepStrictEqual(wait.p, at); assert.strictEqual(wait.waiting, true);
 """)
+
+    def test_the_cold_open_answers_the_finger_before_the_field_exists(self):
+        """Review 2, item 7: at `phase: ready` the page drew the room, enabled
+        its buttons and moved the camera exactly zero for 60 frames of input,
+        with nothing on screen to say why. The field says where the capture
+        COVERS; it is not needed to know where the camera may STAND, which is
+        the recorded walk -- so the finger is answered from the first frame and
+        early input still cannot leave the envelope."""
+        _run_nav(r"""
+const wait = NAV.step(null, path, {p: at.slice(), yaw: 0, pitch: 0},
+                      {look: [2, 0.3], move: [0, 0, 0], held: true}, 16, V);
+assert.strictEqual(wait.waiting, true, "it says the field is not ready");
+assert.strictEqual(wait.yaw, 2, "and turns anyway, by exactly what was asked");
+assert.ok(Math.abs(wait.pitch - 0.3) < 1e-9, "in both axes: " + wait.pitch);
+// a move with no field is still held inside the tube around the recorded walk
+let cam = {p: at.slice(), yaw: 0, pitch: 0};
+for (let i = 0; i < 400; i++) cam = NAV.step(null, path, cam, {look: [0, 0], move: [0, 0.4, 0], held: true}, 16, V);
+assert.ok(NAV.pathDist(path, cam.p).e <= 1 + 1e-9, "early input cannot escape: " + NAV.pathDist(path, cam.p).e);
+assert.ok(cam.p[1] > 0.3, "but it did move: " + cam.p[1]);
+""")
+        text = _template()
+        update = _section(text, "function navUpdate(", "function mulberry(")
+        assert "S.waiting = !!next.waiting;" in update
+        assert "if (next.waiting){" not in update, "a finger is never ignored"
+
+    def test_the_cold_open_says_it_is_preparing_while_it_is(self):
+        """The other half of review 2 item 7. Answering the finger is not the
+        whole fix: a first drag now turns, and on this world it turns into the
+        part of the room nobody photographed, which goes black -- and the
+        sentence that explains that (`Nothing was photographed this way`) is
+        exactly the one the page cannot say until the field is built. So for
+        the second or so it takes, the page says it is preparing, and stops
+        saying it the moment it is not."""
+        text = _template()
+        assert 'const PREPARING = "Preparing the view…";' in text
+        build = _section(text, "  function buildNav(){", "  /* Overview:")
+        assert "status(PREPARING);" in build, "it says so while the field builds"
+        assert build.index("status(PREPARING);") < build.index('$("bOverview").disabled = false;')
+        assert 'if ($("status").textContent === PREPARING) status("");' in build, \
+            "and stops saying it, without wiping a message someone else put there"
 
     def test_stepping_along_the_walk_glides(self):
         _run_nav(r"""
@@ -919,19 +982,33 @@ for (let t = 0.02; t <= 1.0001; t += 0.02){
   assert.ok(dist(g.p, prev.p) < 0.05, "no frame of a glide is a jump");
   prev = g;
 }
-assert.ok(NAV.glideMs(a, b) >= 400 && NAV.glideMs(a, {p: [30, 0, 0], yaw: 3, pitch: 0}) <= 1600);
+// long enough to read as a flight (the Best view is a few units away and the
+// old 1600 ms cap read as a teleport), and still bounded
+assert.ok(NAV.glideMs(a, b) >= 400 && NAV.glideMs(a, {p: [30, 0, 0], yaw: 3, pitch: 0}) <= 2600);
+assert.ok(NAV.glideMs(a, {p: [5, 0, 0], yaw: 3.0, pitch: 0}) > 1600, "a long crossing is not rushed");
 // a gap in the recorded walk longer than JUMP is not a corridor
 const gap = NAV.makePath([[0, 0, 0, 0, 0, 1], [NAV.JUMP + 3, 0, 0, 0, 0, 1]], up);
 assert.ok(NAV.pathDist(gap, [(NAV.JUMP + 3) / 2, 0, 0]).e > 1);
 """)
 
-    def test_reachable_samples_are_inside_and_supported(self):
+    def test_reachable_samples_are_inside_the_envelope_and_face_anywhere(self):
         _run_nav(r"""
 let seed = 7; const rand = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-for (let i = 0; i < 40; i++){
+// what a person can now reach: every direction, from every position in the tube
+let lowest = 1, most = 0;
+for (let i = 0; i < 80; i++){
   const r = NAV.sampleReachable(F, path, V, rand);
   assert.ok(r, "found one");
-  assert.ok(NAV.pathDist(path, r.p).e <= 1 && r.support >= NAV.T_LO);
+  assert.ok(NAV.pathDist(path, r.p).e <= 1, "inside the tube");
+  assert.ok(Math.abs(r.pitch) <= NAV.PITCH_MAX + 1e-9, "within the neck's range");
+  lowest = Math.min(lowest, r.support); most = Math.max(most, r.support);
+}
+assert.strictEqual(lowest, 0, "including directions nothing was captured from");
+assert.ok(most > 0.9, "and directions the capture covers fully");
+// the old, support-filtered set is still measurable, for comparison
+for (let i = 0; i < 20; i++){
+  const r = NAV.sampleReachable(F, path, V, rand, 4000, NAV.T_LO);
+  assert.ok(r && r.support >= NAV.T_LO, "asked for supported views, got supported views");
 }
 """)
 
@@ -1103,7 +1180,12 @@ class TestTheCapturesOwnLook:
         assert config["tone_knee"] == R.TONE_KNEE == 0.8
         assert config["view_margin"] == R.VIEW_MARGIN == 1.4
         assert config["view_margin_v"] == R.VIEW_MARGIN_V == 1.15
-        assert config["standoff"] == R.STANDOFF == 1.0
+        # 0.6 since the fix-it interaction lane: with the view-quality bound
+        # gone from movement, the standoff is the limit a forward push actually
+        # meets, and 1.0 on a world whose median scene depth is 4.7 was a fifth
+        # of the room. The page's own default must agree with the served one.
+        assert config["standoff"] == R.STANDOFF == 0.6
+        assert 'OPT.standoff) || 0.6;' in _template(), "and the page's fallback is the same number"
         assert config["crack_fill_px"] == R.CRACK_FILL_PX > 0
         assert config["void_fog"] == R.VOID_FOG and config["void_wide_fade"] == R.VOID_WIDE_FADE
         text = _template()
@@ -1133,8 +1215,6 @@ class TestTheEnvelopeStopsBeforeTheUglyFrame:
         text = _template()
         build = _section(text, "function buildNav(){", "/* Overview:")
         assert "cam.floor = floorAt(poseOf(ci));" in build and "cam.floor = floorAt(cam);" not in build
-        update = _section(text, "function navUpdate(", "function mulberry(")
-        assert "if (next.waiting){ vel.look = [0, 0]; vel.move = [0, 0, 0];" in update
 
     def test_the_field_rates_quality_not_only_coverage(self):
         text = _template()
@@ -1172,21 +1252,24 @@ const n = NAV.step(F, path, cam, {look: [0, 0], move: [0.04, 0, 0], held: true},
 assert.ok(Math.abs(dist(n.p, cam.p) - 0.04) < 1e-9, "a push along the walk moves what was asked: " + dist(n.p, cam.p));
 """)
 
-    def test_a_look_held_against_the_edge_crosses_to_the_next_supported_direction(self):
+    def test_there_is_no_escape_hatch_left_because_there_is_nothing_to_escape(self):
+        """`lookAcross` was the designed way out of the support edge: a look
+        held against it glided to the next well-supported heading. Over ten
+        60-frame sweeps at five poses on the canonical world it fired zero
+        times (`S.crossings` stayed 0 throughout), and the only behaviour
+        available at the edge was the wall. The edge is gone, so the hatch is
+        gone with it, rather than being left in the page unfired."""
         _run_nav(r"""
-// at the wall-facing spot, turning right past the edge: the field has support
-// only toward +z, so from yaw -pi/2 pushing further there is nothing within
-// half a turn except back through the wall
-const y = NAV.lookAcross(F, at, Math.PI, 0, 1, V);
-assert.ok(y !== null, "found the wall on the far side");
-assert.ok(NAV.support(F, at, dir(y, 0), up, V.fy, V.aspect).s >= NAV.T_HI);
-assert.ok(y - Math.PI > 0.3 && y - Math.PI <= Math.PI + 1e-9);
-assert.strictEqual(NAV.lookAcross(null, at, 0, 0, 1, V), null);
+assert.strictEqual(NAV.lookAcross, undefined, "no crossing: a look never stops");
+assert.strictEqual(NAV.contentBound, undefined, "and nothing bounds a look by its content");
 """)
         text = _template()
         update = _section(text, "function navUpdate(", "function mulberry(")
-        assert "NAV.lookAcross(navField, cam.p, cam.yaw, cam.pitch, Math.sign(lookYaw), V)" in update
-        assert "glideTo({p: cam.p.slice(), yaw: y, pitch: cam.pitch}, null);" in update
+        for gone in ("lookAcross", "pushAcross", "S.crossings"):
+            assert gone not in update, gone
+        # the name survives only where the comment says why it went
+        assert "function lookAcross" not in _nav_source()
+        assert "NAV.lookAcross" not in text
 
     def test_the_walk_buttons_skip_poses_that_render_badly(self):
         _run_nav(r"""
@@ -1207,22 +1290,35 @@ assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8).index, 0);
         assert "< OVERVIEW_AWAY) continue;" in over
         assert "r.dist < OVERVIEW_DEPTH * ref" in over and "0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref))" in over
 
-    def test_the_look_stays_within_the_pitch_the_walk_looked_at(self):
+    def test_the_look_is_limited_by_the_neck_and_not_by_the_capture(self):
+        """It used to stop at the recorded walk's own pitch range plus 0.2 rad,
+        which on the canonical world gave nine of sixteen poses under 7 degrees
+        of upward look. The limit is now 80 degrees each way, whatever the walk
+        happened to point at, eased over its last PITCH_SOFT so it is a stop
+        and not a wall."""
         _run_nav(r"""
-const VP = Object.assign({}, V, {pitchMin: -0.4, pitchMax: 0.3});
-let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, prev = 0, resisted = 0;
+// the recorded walk in this room looks dead level, and the look still goes up
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, prev = Infinity, resisted = 0;
 for (let i = 0; i < 300; i++){
-  const n = NAV.step(F, path, cam, {look: [0, 0.02], move: [0, 0, 0], held: true}, 16, VP);
-  assert.ok(n.pitch <= 0.3 + 1e-9, "never above the recorded range: " + n.pitch);
-  if (n.pitch > 0.3 - NAV.PITCH_SOFT) assert.ok(n.pitch - cam.pitch <= prev + 1e-9, "slowing, not a wall");
+  const n = NAV.step(F, path, cam, {look: [0, 0.02], move: [0, 0, 0], held: true}, 16, V);
+  assert.ok(n.pitch <= NAV.PITCH_MAX + 1e-9, "never past the neck: " + n.pitch);
+  if (n.pitch > NAV.PITCH_MAX - NAV.PITCH_SOFT)
+    assert.ok(n.pitch - cam.pitch <= prev + 1e-9, "slowing, not a wall");
   prev = n.pitch - cam.pitch; resisted = Math.max(resisted, n.resisted); cam = n;
 }
-assert.ok(cam.pitch > 0.2 && resisted > 0.35, cam.pitch + " " + resisted);
-for (let i = 0; i < 300; i++) cam = NAV.step(F, path, cam, {look: [0, -0.02], move: [0, 0, 0], held: true}, 16, VP);
-assert.ok(cam.pitch >= -0.4 - 1e-9 && cam.pitch < -0.3, "and not below it: " + cam.pitch);
+assert.ok(NAV.PITCH_MAX > 1.39, "80 degrees, not 74.5: " + NAV.PITCH_MAX);
+// the last of the range is eased, so it approaches the limit and never
+// reaches it: 300 frames of drag get within 0.05 rad (2.7 degrees) of it
+assert.ok(cam.pitch > NAV.PITCH_MAX - 0.05, "it gets there: " + cam.pitch);
+assert.ok(resisted > 0.35, "and the last of it is eased: " + resisted);
+for (let i = 0; i < 600; i++) cam = NAV.step(F, path, cam, {look: [0, -0.02], move: [0, 0, 0], held: true}, 16, V);
+assert.ok(cam.pitch >= -NAV.PITCH_MAX - 1e-9 && cam.pitch < -NAV.PITCH_MAX + 0.05,
+          "and the same downward: " + cam.pitch);
+// the pitch the WALK looked at is still measured -- it is reported, not enforced
 """)
         text = _template()
-        assert "pitchMin: pitchRange[0], pitchMax: pitchRange[1]" in text and "recordedPitch();" in text
+        assert "pitchMin" not in _section(text, "function navView(", "function supportOf(")
+        assert "recordedPitch();" in text and "S.pitchLimit = [-NAV.PITCH_MAX, NAV.PITCH_MAX];" in text
 
     def test_pressing_overview_twice_works(self):
         text = _template()
@@ -1251,8 +1347,9 @@ const supC = (p, yaw, pitch = 0) => NAV.support(FC, p, dir(yaw, pitch), up, V.fy
 
 class TestTheFrameAndWhatIsInIt:
     """The fix-it framing lane. The display frame is the capture's plus a
-    margin; the envelope knows a drawn-but-empty view from a room view, and
-    nudges away from it without ever refusing a deliberate look."""
+    margin; the envelope knows a drawn-but-empty view from a room view. What it
+    does with that is the fix-it interaction lane's: nothing, while a person is
+    looking, and a small settle for a camera the page itself placed."""
 
     def test_the_field_carries_content_beside_coverage(self):
         _run_nav(NAV_CONTENT + r"""
@@ -1269,31 +1366,34 @@ for (let c = 0; c <= 0.5; c += 0.01){ const r = NAV.richness(c); assert.ok(r >= 
 assert.strictEqual(NAV.support(F, at, dir(0, 0), up, V.fy, V.aspect).c, 0);
 """)
 
-    def test_a_featureless_view_is_a_nudge_and_never_a_wall(self):
+    def test_a_featureless_view_does_not_slow_the_look_at_all(self):
+        """The framing lane made a dull view a nudge rather than a wall (at
+        worst 40% slower). The interaction lane took the nudge out too: review 2
+        found that the two bounds are indistinguishable from the other end of a
+        finger, and that the honest place to say "there is nothing here" is the
+        picture, not the control."""
         _run_nav(NAV_CONTENT + r"""
-// the bound itself can never reach the value at which a step is refused
-assert.strictEqual(NAV.contentBound(0), NAV.C_BOUND_MAX);
-assert.ok(NAV.C_BOUND_MAX < 0.999, "a content bound must never refuse a step");
-assert.strictEqual(NAV.contentBound(1), 0);
-// Looking from the textured half to the blank half: slower, but it gets there.
-// (Past yaw -0.85 this synthetic wall runs out and the SUPPORT limit takes
-// over, a different mechanism, so the content nudge is measured inside the
-// supported range.)
 let cam = {p: at.slice(), yaw: 0.6, pitch: 0, floor: 1}, worst = 1, steps = 0;
 while (cam.yaw > -0.7 && steps < 400){
   const n = NAV.step(FC, path, cam, {look: [-0.01, 0], move: [0, 0, 0], held: true}, 16, V);
   worst = Math.min(worst, Math.abs(n.yaw - cam.yaw) / 0.01);
   cam = n; steps++;
 }
-assert.ok(cam.yaw <= -0.7, "the deliberate look reached the blank wall: " + cam.yaw);
-assert.ok(steps >= 130, "it never went faster than asked: " + steps);
-assert.ok(worst < 0.95, "it was resisted on the way: " + worst);
-assert.ok(worst > 0.2, "but never stopped: " + worst);
+assert.ok(cam.yaw <= -0.7, "the look reached the blank wall: " + cam.yaw);
+assert.ok(worst > 1 - 1e-12, "and every step of the way arrived whole: " + worst);
+assert.strictEqual(steps, 130, "exactly what was asked, no more and no less: " + steps);
+// content still measures the room; it just does not touch the controls
+assert.ok(con(at, 0.6) > 0.7 && con(at, -0.6) < 0.15);
 """)
 
-    def test_released_on_nothing_the_look_eases_toward_content_and_stops(self):
+    def test_a_camera_the_page_placed_settles_and_a_look_of_the_persons_own_never_does(self):
+        """The settle is the only thing that may still move the camera on its
+        own, and the rule that keeps it honest is `aimed`: it is set by any
+        look input and cleared only when the page places the camera. A
+        deliberate look stays exactly where it was put."""
         _run_nav(NAV_CONTENT + r"""
-// parked on the blank half with nothing held: the look eases toward the texture
+// the PAGE placed this camera on the blank half (no `aimed`): it eases toward
+// the texture
 let cam = {p: at.slice(), yaw: -0.7, pitch: 0, floor: 1};
 const start = cam.yaw;
 for (let i = 0; i < 600; i++) cam = NAV.step(FC, path, cam, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
@@ -1309,6 +1409,17 @@ assert.strictEqual(still.yaw, cam.yaw, "and then it stays put");
 let held = {p: at.slice(), yaw: -0.7, pitch: 0, floor: 1};
 for (let i = 0; i < 600; i++) held = NAV.step(FC, path, held, {look: [0, 0], move: [0, 0, 0], held: true}, 16, V);
 assert.strictEqual(held.yaw, -0.7, "a deliberate look is never taken away");
+// AND a look of the person's own, once released, is not taken away either:
+// this is the one that used to move. Turn deliberately onto the blank wall,
+// let go, and wait ten seconds of page time.
+let aimed = {p: at.slice(), yaw: -0.4, pitch: 0, floor: 1};
+for (let i = 0; i < 30; i++) aimed = NAV.step(FC, path, aimed, {look: [-0.01, 0], move: [0, 0, 0], held: true}, 16, V);
+assert.strictEqual(aimed.aimed, true, "the page knows the person aimed it");
+const put = aimed.yaw;
+for (let i = 0; i < 600; i++) aimed = NAV.step(FC, path, aimed, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
+assert.strictEqual(aimed.yaw, put, "a deliberate look stays where it was put: " + put + " -> " + aimed.yaw);
+assert.ok(NAV.richness(NAV.support(FC, aimed.p, dir(aimed.yaw, 0), up, V.fy, V.aspect).c) < 0.2,
+          "and it is still on the blank wall, which is where it was pointed");
 // and a look of the person's own gives the budget back
 const after = NAV.step(FC, path, cam, {look: [-0.05, 0], move: [0, 0, 0], held: true}, 16, V);
 assert.strictEqual(after.cdrift, 0);
@@ -1317,6 +1428,11 @@ let rich = {p: at.slice(), yaw: 0.6, pitch: 0, floor: 1};
 for (let i = 0; i < 300; i++) rich = NAV.step(FC, path, rich, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
 assert.strictEqual(rich.yaw, 0.6, "a room view is left alone");
 """)
+        # the page clears `aimed` only by placing the camera itself
+        text = _template()
+        assert "aimed: next.aimed" in _section(text, "function navUpdate(", "function mulberry(")
+        setp = _section(text, "  function setPose(pose){", "  function glideTo(")
+        assert "aimed" not in setp, "placing the camera starts it un-aimed"
 
     def test_the_walk_buttons_skip_what_is_empty_and_cap_the_skipping(self):
         _run_nav(r"""
@@ -1353,7 +1469,6 @@ for (let i = 0; i < 200; i++){
   n++;
   assert.ok(NAV.nearest(F, r.p) >= NAV.D_MIN - 1e-9, "inside the standoff: " + NAV.nearest(F, r.p));
   assert.ok(NAV.pathDist(path, r.p).e <= 1 + 1e-9);
-  assert.ok(r.support >= NAV.T_LO);
   assert.ok(r.rich >= 0 && r.rich <= 1);
 }
 assert.ok(n > 100, "the envelope is still reachable: " + n);
@@ -1402,7 +1517,7 @@ for (let i = 0; i < 50; i++){
         it, because the release drift aimed at the recorded walk and the
         recorded walk passes close to the desk."""
         text = _template()
-        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* Looking ACROSS")
+        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* A uniformly random reachable view")
         assert "if (nearest(F, to) >= Math.min(D_MIN, nearest(F, out.p))) out.p = to;" in step
         _run_nav(r"""
 // a surface right on the walk, closer than the standoff
@@ -1415,12 +1530,113 @@ const d1 = NAV.nearest(F4, cam.p);
 assert.ok(d1 >= Math.min(NAV.D_MIN, d0) - 1e-9, "the drift never went inside the standoff: " + d0 + " -> " + d1);
 """)
 
-    def test_the_edge_hint_is_for_the_edge_and_not_for_a_dull_view(self):
+    def test_the_edge_hint_is_for_a_push_and_the_dark_one_is_only_an_explanation(self):
+        """Two different things, and they must not be confused. The edge hint
+        means the page stopped you; the dark hint means the page did NOT, and
+        the room ahead is dark because nobody photographed it."""
         text = _template()
         update = _section(text, "function navUpdate(", "function mulberry(")
-        assert "hint(next.hard || 0);" in update
-        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* Looking ACROSS")
-        assert "const h = lookBound(r.s, out.floor); hard = h;" in step
+        assert "hint(next.hard || 0, HINT_EDGE);" in update
+        assert "hint(0.45, HINT_DARK);" in update
+        assert 'const HINT_EDGE = "Not captured beyond here";' in text
+        assert 'const HINT_DARK = "Nothing was photographed this way";' in text
+        step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* A uniformly random reachable view")
+        # the edge the hint is for is the tube and the standoff, and nothing else
+        assert "const bAt = p => Math.max(posB(p), ready ? closeBound(F, p) : 0);" in step
+        assert "out.dark = lookBound(" in step
+        _run_nav(r"""
+// a look never raises `resisted`, so the edge hint can never fire for one
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+for (let i = 0; i < 300; i++){
+  cam = NAV.step(F, path, cam, {look: [0.02, 0], move: [0, 0, 0], held: true}, 16, V);
+  assert.strictEqual(cam.resisted, 0);
+  assert.strictEqual(cam.hard, 0);
+}
+// and a push against the tube does raise it
+let out = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, hard = 0;
+for (let i = 0; i < 400; i++){
+  out = NAV.step(F, path, out, {look: [0, 0], move: [0, 0.05, 0], held: true}, 16, V);
+  hard = Math.max(hard, out.hard);
+}
+assert.ok(hard > 0.35, "the edge hint fires for the edge: " + hard);
+""")
+
+
+# ---------------------------------------------------------------------------
+# fix-it interaction lane: what a finger can actually reach
+# ---------------------------------------------------------------------------
+
+
+class TestWhatAFingerCanReach:
+    """Review 2 measured the page through its own input path and found a
+    24.1-degree slot: looking was bounded by the capture, moving was bounded by
+    the capture FOUR times over (the tube, the standoff, the support of the
+    view from where you were going, and its content). Looking is now free and
+    moving is bounded by the two limits that are true."""
+
+    def test_a_deliberate_push_travels_what_the_envelope_really_allows(self):
+        _run_nav(r"""
+// 40 frames of 0.112, the review's own push: 4.48 units asked, along the walk
+let cam = {p: [0.2, 0, 0], yaw: Math.PI / 2, pitch: 0, floor: 1};
+const a = cam.p.slice();
+for (let i = 0; i < 40; i++) cam = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0.112], held: true}, 16, V);
+const alongWalk = dist(cam.p, a);
+assert.ok(alongWalk > 4.0, "a push along the walk arrives: " + alongWalk + " of 4.48");
+// sideways it is the tube that stops it, and the tube is now 1.5 across
+let side = {p: [2.5, 0, 0], yaw: 0, pitch: 0, floor: 1};
+for (let i = 0; i < 40; i++) side = NAV.step(F, path, side, {look: [0, 0], move: [0.112, 0, 0], held: true}, 16, V);
+const across = Math.abs(side.p[2] - 0) + Math.hypot(side.p[0] - 2.5, side.p[1]);
+assert.ok(NAV.pathDist(path, side.p).e <= 1 + 1e-9, "never out of the tube");
+assert.ok(NAV.R_MAX >= 1.5 && NAV.R_SOFT >= 0.7,
+          "and the tube is wide, and free over most of itself: " + NAV.R_MAX + " " + NAV.R_SOFT);
+// where the view is going is NOT a limit: this push ends facing away from the
+// only wall the room has, and it still travels
+let away = {p: [2.5, 0, 0], yaw: Math.PI, pitch: 0, floor: 1};
+const b = away.p.slice();
+for (let i = 0; i < 40; i++) away = NAV.step(F, path, away, {look: [0, 0], move: [0, 0, 0.112], held: true}, 16, V);
+assert.ok(dist(away.p, b) > 0.9, "into the dark is still a move: " + dist(away.p, b));
+assert.strictEqual(NAV.support(F, away.p, dir(away.yaw, 0), up, V.fy, V.aspect).s, 0,
+                   "and it really is dark there");
+""")
+
+    def test_the_button_does_not_promise_an_overview_this_capture_cannot_give(self):
+        """What was wrong with this button was its name and how fast it
+        arrived, not where it went. The destination is the framing lane's
+        measured choice and is deliberately unchanged: re-weighting it for
+        landscape was tried in this lane and made the view worse (88.1 % drawn
+        against 99.8 %, and a shredded tear where a chair used to be)."""
+        text = _template()
+        assert ">Best view</button>" in text and ">Overview</button>" not in text
+        cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert "Turning is free" in cap and "Moving is not free" in cap
+        assert "never stood back from the desk" in cap
+        over = _section(text, "const OVERVIEW_AWAY", "function overview(){")
+        assert "* (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)));" in over
+        score = over[over.index("f.rendered ="):]
+        assert "aspect" not in score[:score.index(";")], \
+            "the score does not depend on the orientation"
+        assert "TRIED AND REJECTED" in over, "and the rejected experiment is recorded, not repeated"
+        # the flight: a five-unit crossing is no longer clipped to 1600 ms
+        _run_nav(r"""
+const from = {p: [-2.33, 1.64, -4.00], yaw: 0.796, pitch: -0.164};
+const to   = {p: [-1.31, -0.35, 0.82], yaw: 1.047, pitch: -0.500};
+const ms = NAV.glideMs(from, to);
+assert.ok(ms > 2000 && ms <= 2600, "the Best view is flown, not jumped: " + ms + " ms");
+""")
+
+    def test_the_about_text_is_legible_over_a_bright_frame(self):
+        """Review 2, item 9: the caption's gradient scrim stops short of the
+        expanded text, and over the cream door the tail of the paragraph that
+        keeps the page honest was grey on cream."""
+        text = _template()
+        style = _section(text, "#caption{position:fixed", "#status{position:fixed")
+        assert "background:rgba(8,10,13,.88)" in style, "the About text carries its own plate"
+        assert "text-shadow" in style
+        # and so does the status line, which now speaks over the opening frame
+        # rather than only over a black loading screen
+        st = _section(text, "#status{position:fixed", "#msg{position:fixed")
+        assert "background:rgba(8,10,13,.82)" in st and "text-shadow" in st
+        assert "#status:empty{display:none}" in st, "and shows nothing when it has nothing to say"
 
 
 def _encoding_source():

@@ -261,16 +261,39 @@ enforced).
   opening's and Overview's 64-px renders keep one more small set.
   Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
   (42 MB colour) and the caption says the set is reduced.
-- **Navigation** (revised 2026-09-17, fix-it nav lane). This representation is
-  photographic where the wearer stood and looked and dark from anywhere else:
-  the walkthrough found every orbit behind or outside the room 99–100% dark, and
-  orbiting was the first thing a person tried. So there is **no free orbit**. One
-  camera `{position, yaw, pitch}`, levelled to `CONFIG.up`, moves freely **inside
-  a capture-supported envelope** (`NAV` in the page, pure, run under node by the
-  Tower's tests):
-  - **Where.** A tube around the recorded walk: 1.0 scene unit across, 0.6 along
-    the vertical, soft from 0.55 of it. Consecutive recorded poses more than 2.0
-    apart are not joined (a jump in the record is not a corridor).
+- **Navigation** (revised 2026-09-17, fix-it nav lane; **revised again
+  2026-09-18, fix-it interaction lane — looking is now free**). This
+  representation is photographic where the wearer stood and looked and dark from
+  anywhere else: the walkthrough found every orbit behind or outside the room
+  99–100% dark, and orbiting was the first thing a person tried. So there is
+  **no free orbit**. One camera `{position, yaw, pitch}`, levelled to
+  `CONFIG.up` (`NAV` in the page, pure, run under node by the Tower's tests).
+
+  **The two halves are not the same thing, and the page must not treat them as
+  one.** *Which way it faces* is free: a full turn of yaw from any position it
+  can be in, and pitch limited only by the neck. Turning to a wall the glasses
+  never photographed shows honest darkness, which is true and expected; a
+  control that answers a deliberate two-inch drag with four degrees is not a
+  boundary, it is a broken page. *Where it may be* is limited, by the two
+  limits that are physically true: the tube around the walk that was actually
+  recorded, and how close a 360×640 keyframe may be magnified.
+
+  This replaces the rule of 2026-09-17, under which a look was bounded by the
+  support field exactly as a move was. An independent review measured what that
+  cost, through the page's own input path: **24.1° of reachable yaw at the
+  opening pose** (a left drag moved −3.8° and then nothing for the next 57
+  frames of held drag), a median leftward look of **−7.3°** and a median upward
+  look of **+5.7°** across 16 recorded poses, nine of sixteen under +7° upward,
+  fifteen of sixteen under 19° one way while giving 67–100° the other, and a
+  deliberate 4.48-unit forward push travelling a median **0.94 units**. The
+  designed escape from the edge (`lookAcross`) fired **zero times** in ten
+  60-frame sweeps. Roughly 100 of 147 frames of a portrait interaction sequence
+  were static under continuous input.
+  - **Where.** A tube around the recorded walk: **1.5** scene units across,
+    **0.8** along the vertical, soft from **0.75** of it (it was 1.0 × 0.6,
+    soft from 0.55, which left the first half of every sideways push resisted).
+    Consecutive recorded poses more than 2.0 apart are not joined (a jump in the
+    record is not a corridor).
   - **Which way.** A **support field** over position and look direction, built
     on the page after the images land (and again for a new build), in slices so
     the page stays interactive: 6,000 area-weighted points on the proxy; a point
@@ -284,15 +307,26 @@ enforced).
     canonical world over 200 reachable views: drawn ≈ 1.19 × support − 0.24
     (r = 0.95), so the thresholds are **0.92** (resistance starts) and **0.80**
     (it stops).
-  - **How it feels.** A step that makes things worse inside the soft band is
-    taken in small sub-steps, each scaled by (1 − b)², b the smoothstep through
-    the band, so motion slows toward the edge and never passes it: no wall, no
-    snap. A released camera drifts back inside (position toward 0.55 of the tube
-    with a 450 ms time constant; look along the support gradient at up to
-    0.5 rad/s × b). A resisted push shows *Not captured beyond here* for about a
-    second. **A recorded pose is never "beyond"**: arriving at one sets its own
-    support as the ceiling of both thresholds, so a partly dark recorded view is
-    neither pushed nor locked.
+  - **How it feels.** A MOVE that makes things worse inside the soft band is
+    taken in small sub-steps, each scaled by (1 − smoothstep(0.55, 1, b))², b
+    the worse of the tube's bound and the standoff's, so motion slows toward the
+    edge and never passes it: no wall, no snap, and no resistance at all over
+    the first part of the band. A released camera drifts back inside (position
+    toward 0.75 of the tube with a 450 ms time constant). A resisted push shows
+    *Not captured beyond here* for about a second. **A look is never resisted
+    by the capture** — not by support, not by content, not by a recorded pose's
+    own quality. Yaw is therefore never scaled at all and never raises
+    `resisted`. The single exception is the *neck*: the last 0.2 rad before
+    ±80° of pitch is eased, which does raise `resisted` (and so spends a
+    flick's momentum) but leaves `hard` at 0, so the edge hint is never shown
+    for a look. **A recorded pose is never "beyond"**: arriving at one records its own
+    support as the floor (`S.pose().floor`). The floor exists to stop a *limit*
+    pushing a weak recorded view away, so with no limit left on a look it now
+    constrains nothing, and in particular it does **not** enter what the page
+    *says*: `dark` is measured against the fixed T_LO/T_HI, so the dimmest
+    recorded pose in a world reports its view exactly as the brightest one does.
+    Reading it through the floor would have made the darkest place on a world
+    the one place the page went quiet about the dark.
   - **Quality, not only coverage** (revised 2026-09-17, fix-it blotch lane,
     visual review item 3: the old envelope stopped ON the ugly frame). Each
     keyframe's contribution to a field point is its angle weight × how squarely
@@ -300,16 +334,17 @@ enforced).
     sampled face's normal); each proxy sample is × 0.7 when one keyframe alone
     saw it and × 0.3 within 0.35 of a **large hole** (a loop of open edges at
     least 0.8 around; thin cracks are closed on the screen and do not count).
-    Thresholds: resisted below **0.80**, stopped at **0.68**; a worsening step is
-    scaled by (1 − smoothstep(0.35, 1, b))², so the first third of the band is
-    free and a push in a good place is not sluggish. Measured over 250 random
-    views in the tube at the capture's field of view, a view is good (drawn ≥ 0.9,
-    blotch ≤ 2.5%, seam excess ≤ 8) for 96% at support ≥ 0.80, 75% at 0.70–0.80
-    and 64–68% at 0.60–0.70. Below a recorded pose's own support the band is
-    0.06 wide: from a weak recorded view the camera may not wander into anything
-    weaker. The support field is honest but coarse: its correlation with the
-    rendered drawn fraction is 0.71 over all views and 0.41 within the recorded
-    pitch range.
+    Measured over 250 random views in the tube at the capture's field of view, a
+    view is good (drawn ≥ 0.9, blotch ≤ 2.5%, seam excess ≤ 8) for 96% at
+    support ≥ 0.80, 75% at 0.70–0.80 and 64–68% at 0.60–0.70. The support field
+    is honest but coarse: its correlation with the rendered drawn fraction is
+    0.71 over all views and 0.41 within the recorded pitch range.
+    **Since 2026-09-18 support resists nothing.** T_HI (0.80) and T_LO (0.68)
+    are what the page *says*, not what it enforces: a look that ends on a view
+    below T_LO shows *Nothing was photographed this way* — once, quietly, at
+    most every four seconds — and the turn happens in full either way. Support
+    still filters the Best view's candidates and is still reported by
+    `S.support`.
   - **Content, not only quality** (added 2026-09-17, fix-it framing lane). A
     view can be 100% drawn, clean, and hold nothing — a plain wall, a plain
     ceiling, a blank door panel — and support rated it exactly as highly as the
@@ -327,56 +362,82 @@ enforced).
     on the page's own 64-px scoring render correlates **0.876** and its cut
     (0.0574) agrees on **90.4%**, so the scores that can afford a render use
     that one and the envelope uses the field.
-    Content is a **nudge, never a wall**. Its bound is
-    0.55 × (1 − smoothstep(0.13, 0.28, content)), capped well below the 0.999 at
-    which a step is refused, so a deliberate look at a blank wall always goes
-    through — it is at most 40% slower, and only while the view is getting
-    worse, so panning along a wall is not resisted at all. The edge hint (*Not
-    captured beyond here*) is shown for the support edge only, never for a dull
-    view. On **release**, a camera left on a featureless view eases toward
-    content along the content gradient (asked over a wide 0.30 rad, since a
-    blank wall is featureless for tens of degrees), at most 0.30 rad in total,
-    stopping as soon as the view has something in it; any look of the person's
-    own gives the budget back, and a finger down stops it entirely. Measured
-    over 200 reachable views, released for two seconds: featureless 44.5% →
-    29.0% (31 rescued, 0 lost), mean turn 4.7°, largest 18.2°, 80 of 200 did not
-    move, drawn 93.5% → 94.8%.
-  - **Pitch** stays within what the walk looked at (the recorded range plus
-    0.2 rad each way, resisted over its last 0.2 rad): the review's torn ceiling
-    was one vertical drag from the opening.
+    **Content resists nothing either** (2026-09-18). The framing lane made it a
+    nudge rather than a wall — at worst 40% slower; the interaction lane took
+    the nudge out, because from the other end of a finger a nudge and a wall are
+    the same gesture failing, and the honest place to say *there is nothing
+    here* is the picture.
+    What content still does is **the settle**, and it is the only thing that may
+    move the camera on its own. A camera **the page placed** (the opening, a
+    walk step, the Best view) that lands on a featureless view eases along the
+    content gradient (asked over a wide 0.30 rad, since a blank wall is
+    featureless for tens of degrees), at most 0.30 rad in total, stopping as
+    soon as the view has something in it. **A look of the person's own is never
+    settled**: any look input marks the camera `aimed`, which only the page
+    placing the camera clears, so a deliberate look at a blank wall stays on the
+    blank wall for as long as it is left there. A finger down stops the settle
+    entirely. (Before 2026-09-18 the settle applied to a released look as well,
+    and a released look was also eased back along the *support* gradient; both
+    are gone.)
+  - **Pitch** is limited by the neck and not by the capture: **80° each way**
+    (`NAV.PITCH_MAX` = 1.396 rad), eased over its last 0.2 rad so the limit is a
+    stop and not a wall. It used to be the recorded walk's own pitch range plus
+    0.2 rad each way, which on the canonical world left nine of sixteen poses
+    with under 7° of upward look. The recorded range is still computed and
+    reported as `S.pitchRange`, beside `S.pitchLimit`; it is not enforced. What
+    a wearer finds when they look up is whatever the capture holds there, which
+    on this world is a torn ceiling — that is a reconstruction problem and the
+    page does not hide it by refusing to look.
   - **Distance**: the camera keeps `CONFIG.standoff` scene units from the
     nearest proxy sample (resisted from 0.30 beyond it): nearer, a 360×640
     keyframe is magnified past its resolution and the frame fills with one
     blurred patch that the field scores as fully supported. Raised from 0.55 to
-    **1.0** by the fix-it framing lane, which also found that the standoff is
-    close to inert on the canonical world — the tube and the support threshold
-    already hold the camera 2.2 units off the proxy on average, and a hard push
-    forward from 17 recorded poses reached 0.86 at a standoff of 0.55 and 1.19
-    at 1.15 — while 1.5 starts to fight the recorded walk, which itself passes
-    within 0.3 of the proxy in places. The **reachable sampler** applies the
-    standoff too (it did not, so the measured distribution used to contain views
-    the camera could not reach), and so does the drift back inside: a push
-    stopped by the standoff must not drift to a spot within it.
-  - **Looking across a gap**: a look held against the edge that keeps pushing
-    (0.3 rad of resisted input) glides to the first direction within half a
-    turn whose support is at least 0.80, instead of parking on the edge frame.
-  - **Before the field is built the camera does not move** (review item 5:
-    early input escaped the envelope and the page then took the escaped
-    camera's support as its floor). When the field completes, the floor is the
-    support of the recorded pose the camera is at, never of wherever it is.
+    1.0 by the fix-it framing lane, which found it close to inert on the
+    canonical world *because the view-quality bound was stopping the push
+    first*. With that bound gone this is the limit a forward push actually
+    meets, and 1.0 on a world whose median scene depth is 4.7 is a fifth of the
+    room, so it is **0.6** (2026-09-18). The blurred close-up it guards against
+    is a MINOR finding in review 2; being unable to cross the room is a blocking
+    one. The **reachable sampler** applies the standoff too, and so does the
+    drift back inside: a push stopped by the standoff must not drift to a spot
+    within it.
+  - **Looking across a gap** is gone (2026-09-18) — `NAV.lookAcross` is removed,
+    not left unfired. It existed to carry a look held against the support edge
+    across to the next well-supported heading; there is no support edge to be
+    held against any more, and it never fired even when there was.
+  - **Before the field is built the finger is still answered** (2026-09-18).
+    The field says where the capture *covers*; it is not needed to know where
+    the camera may *stand*, which is the recorded walk. So a look turns and a
+    move is held inside the tube from the first frame, and early input still
+    cannot leave the envelope — which is what the rule of 2026-09-17 (*before
+    the field is built the camera does not move*) was protecting. That rule
+    shipped as a fix and read, from the outside, as a page that draws the room,
+    enables its buttons and ignores the finger for several seconds with nothing
+    on screen to say why (review 2, item 7: 40 frames of push and 20 of drag
+    moved the camera exactly zero at `phase: "ready"`). `S.waiting` still
+    reports whether the field is ready; nothing waits on it. When the field
+    completes, the floor is the support of the recorded pose the camera is at,
+    never of wherever it is.
   - **The envelope only limits the camera; it paints nothing.** Dark places
     inside it stay dark.
   - **Controls.** Touch: one finger drags the look (the room follows the
     finger), two fingers drag to move sideways and up/down, pinch moves forward
     and back (log of the spread × 2 units). Desktop (debug): left drag looks,
     right or shift drag moves, the wheel moves forward/back, W A S D Q E fly,
-    ←/→ step the walk, O is Overview. Motion coasts after a flick (220 ms time
-    constant). Buttons: **Overview**, **←**, **→** (the recorded walk), **Reset**
-    (the opening).
+    ←/→ step the walk, O is the Best view. Motion coasts after a flick (220 ms
+    time constant). Buttons: **Best view**, **←**, **→** (the recorded walk),
+    **Reset** (the opening).
   - **Stepping the walk glides**: eased position and the short way round in
-    yaw, 350–1100 ms by distance and turn, instead of jumping (the walkthrough's
-    worst flicker steps were path jumps). Any touch interrupts a glide.
-  - **Overview** replaces Orbit: a **raised** vantage in the envelope that
+    yaw, 400–2600 ms by distance and turn, instead of jumping (the walkthrough's
+    worst flicker steps were path jumps). Any touch interrupts a glide. The cap
+    was 1600 ms until 2026-09-18; the Best view is several units away and at
+    that cap the crossing read as a teleport.
+  - **Best view** (called **Overview** until 2026-09-18, which was a promise
+    this capture cannot keep — from any starting pose it landed on the same
+    close-up of the monitor, about 5 units away, and all twelve candidates the
+    field proposes are the same desk area because the walk never stood back from
+    it; the button is now named for what it does, says so in the About text, and
+    flies rather than jumps). A **raised** vantage in the envelope that
     looks at the room. The field proposes (points at least 0.15 above the walk,
     within 0.85 of the tube and at least 1.2 from the opening pose, 12 yaws × 2
     downward pitches, support ≥ 0.68 and mean supported distance ≥ 0.5 × the
@@ -393,10 +454,25 @@ enforced).
     are now filtered by the field's **content** (≥ 0.19, relaxed in steps until
     something passes, so the button is never dead) and by a raised depth floor
     (0.8 × the median), colour spread is replaced by the rendered detail, and the
-    depth range breaks ties. In portrait this makes the Overview the room in one
+    depth range breaks ties. In portrait this makes it the room in one
     frame. **In landscape it does not**: on the canonical world all twelve
     candidates are the same desk area, because the recorded walk never stood
     back from it, so no vantage inside the envelope frames the whole room.
+    2026-09-18 (fix-it interaction lane): **the score is unchanged.** Weighting
+    the range hardest of all in landscape (0.25 + 0.75 × range) was tried and
+    measured to be a *no-op* on the canonical world — with and without it the
+    same candidate wins — so the framing lane's swept weights stand.
+    What was wrong with the button was its **name** and the **speed** it
+    arrived at: it now says *Best view*, the About text says what that is and
+    why there is no overview to give, and the crossing from the opening —
+    5.3 units — takes **2394 ms** instead of being clipped to 1600.
+    **The destination did move, because the envelope did.** A wider tube and a
+    smaller standoff take the candidate set from 205 to 406, and the winner is
+    a vantage about half a unit further back: more of the room in frame (depth
+    range 4.92 against 3.69) and **88.7 % drawn against 99.8 %**, with a torn
+    region in the lower right. This score has **not** been re-swept against the
+    larger envelope and should be
+    (`fixit\interaction\INTERACTION.md` §7, `fig\sheet_bestview_ba.png`).
   - **Prev/next skip poses that render badly, and poses with nothing in them**:
     once the field is built every recorded pose is rendered in the background at
     the opening's 64-px size, and ←/→ step to the next pose whose drawn fraction
@@ -407,8 +483,15 @@ enforced).
     whole, so the walk that is shown is shorter than the one recorded but never
     misses a stretch of it. The caption says so. On the canonical world 18 of
     198 poses are skipped (17 for drawn, 7 for detail).
-  - Before the field is built (a second or so after the images land) the camera
-    does not move and Overview is disabled.
+  - Before the field is built (a second or so after the images land) the look
+    and the walk work, the status line reads **“Preparing the view…”**, and
+    **Best view** is disabled. Both of the things the field is needed for are
+    things the page *says*, not things it does: which vantage is best, and why
+    a direction is dark. A first drag in that window turns, and on a world like
+    the canonical one it turns straight into the part of the room nobody
+    photographed — so without the line the page would answer the finger with a
+    black screen and no account of it. The line is cleared the moment the field
+    completes, and only if nothing else has since written to the status.
 
   It opens at the recorded pose whose **rendered frame is most drawn and has the
   most in it** (drawn × (0.85 + 0.15 × wide) × (0.35 + 0.65 × rendered detail),
@@ -422,10 +505,15 @@ enforced).
   canonical world at pose 71 (46% observed, 52% black). The horizon is levelled
   to `CONFIG.up`. The caption is one line (*Captured images on reconstructed
   geometry* and an **About** button); what the images are, what the dark
-  areas mean, and that the arrows pass over poses that render badly or show
+  areas mean, that the arrows pass over poses that render badly or show
   nothing (at most 4 in a row, so the walk shown is shorter than the one
-  recorded but never misses a stretch of it) open on tap (the four-line
-  disclaimer covered 11–13% of the frame).
+  recorded but never misses a stretch of it), **that turning is free and
+  moving is not, and what the Best view is**, open on tap (the four-line
+  disclaimer covered 11–13% of the frame). The expanded text carries its own
+  dark plate rather than relying on the caption's gradient scrim: the scrim
+  fades out over the top of the frame and the paragraph is longer than it, so
+  over a bright frame the tail of the sentence that keeps the page honest was
+  grey on cream (2026-09-18, review 2 item 9).
 - **Live.** The page polls the revision route every 10 s (backing off to 120 s
   while `live` is false and nothing changed). What a poll means is one pure unit
   in the page, `FOLLOW` (`decide`, `mustReplace`, `nextDelay`), run under node by
@@ -480,7 +568,14 @@ enforced).
   darker than the room around it and it is never an image of anything. Cracks a
   few pixels wide between two parts of one surface are closed from the frames on
   either side; nothing wider is. Where the geometry underneath is wrong, images
-  smear or double.* then the pose-skipping sentence, then *Scale is unknown, so
+  smear or double.* then the pose-skipping sentence, then (added 2026-09-18)
+  *Turning is free: you can look all the way round and straight up, and where
+  the glasses never looked you will find the room simply dark rather than a
+  wall you cannot turn past. Moving is not free — the camera stays near the
+  path that was actually walked, and a push that slows to nothing has reached
+  the edge of it. "Best view" flies to the best-supported vantage in that path;
+  on this capture the wearer never stood back from the desk, so it is a view
+  from the desk and not a view of the whole room.* — then *Scale is unknown, so
   distances are relative.*
   It said *"Dark areas … nothing there is filled in"* until 2026-09-17: written
   before the crack fill and the void fog and not revisited, so the page's own
