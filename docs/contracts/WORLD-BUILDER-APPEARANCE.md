@@ -33,9 +33,11 @@ Per usable keyframe it holds:
 - a per-channel exposure gain;
 - why it was selected for the phone, or why not.
 
-Plus one **proxy mesh**: a byte-exact copy of the surface artifact's phone
-level at build time, named by its content digest, so the geometry every source's
-visibility was computed against travels with the images.
+Plus one **proxy mesh**: the surface artifact's phone level at build time,
+positions and indices byte for byte, named by its content digest, so the
+geometry every source's visibility was computed against travels with the
+images. Its colour bytes carry the surface's per-vertex geometry confidence
+(§4.2a) instead of the imagery they once held.
 
 A renderer draws the proxy and, per fragment, blends the keyframes that saw
 that point (view-dependent, unstructured-lumigraph style), dividing each
@@ -62,6 +64,8 @@ alpha (0 = no weight). The Tower does not render; it prepares.
 4. **The proxy is the surface artifact's geometry**, not a new reconstruction.
    `proxy.source` names the surface build it was copied from. A better surface
    plugs in by rebuilding this artifact; nothing in this stage changes geometry.
+   That includes the confidence it carries: this stage copies the surface's
+   own bytes and computes nothing (`WORLD-BUILDER-SURFACE.md` claim 8).
 5. **Three occluder masks, and the manifest says which ran.** A depth
    disagreement and a photometric vote (§5.3), neither of which recognises a
    hand; and, when `transients.state` is `ok`, a **detector** mask of the
@@ -147,6 +151,47 @@ Little-endian.
 
 A slot's keyframe is named by the manifest, never by the chunk. Up to 16 slots
 per chunk.
+
+### 4.2a The proxy's colour bytes — the geometry confidence
+
+The proxy's `uint8[3]` per-vertex colour block exists in `wb-surface-mesh/1`
+and has been **zero** since review 1. Three bytes a vertex were already on the
+wire, already reaching the page, and carrying nothing. They now carry:
+
+| byte | meaning |
+|---|---|
+| R | the surface artifact's per-vertex geometry confidence for this level, 0–255, exactly the bytes of `conf_lN.<build>.bin` (`WORLD-BUILDER-SURFACE.md` §5a and claim 8) |
+| G, B | reserved, zero |
+
+`proxy.confidence` in the manifest says whether R is real:
+`{present, version, channel, source_level}`. When `present` is false — a
+surface built before the channel existed, or with `SurfaceParams.confidence`
+off — all three bytes are zero, exactly as before, and a page must treat that
+as "no confidence known", never as "confidence zero".
+
+**This costs no bytes and breaks no reader.** The buffer's length, every
+offset, and every flag are unchanged, so `read_mesh_bytes`, both viewer pages'
+`decodeMesh` and `store._looks_like_mesh` are untouched. A page that wants the
+channel binds the colour attribute that is already in the buffer.
+
+**What a page may do with it.** It is a ranking of the geometry, validated on
+held-out keyframes (claim 8); it is not a probability, not calibrated across
+captures, and says nothing about the imagery. The honest use is to fade
+appearance toward the void treatment where the proxy is bad, so a real
+photograph is not stretched at full strength over geometry the capture
+contradicts. It must never be used to invent, inpaint or extend anything.
+
+**A threshold here is a PHONE-LEVEL threshold.** The channel's geometry half
+is recomputed on each level's own triangles, so the decimated level this
+proxy carries scores systematically lower than the archive level the
+validation was run on — median 0.34 against 0.71 on the canonical capture. A
+page must not reuse a number quoted for level 0
+(`WORLD-BUILDER-SURFACE.md` §5a, last paragraph). The measured phone-level
+equivalent of the validated 0.20–0.30 band is bytes **40–62**, and fading
+across it costs 0.9–1.3% of the drawn area at the walk poses, 3.5% at a novel
+view and 7.1% at a grazing one. The measurement and the offline renders are in
+`Glasses-scratch/wb-final-recon/fixit/confidence/CONFIDENCE.md`. This lane
+recommends the rule; it does not implement it.
 
 ### 4.2 Texel convention
 
@@ -474,10 +519,11 @@ decisions. The depth stage records the decision in `align.json` as
 (§6.4).
 
 **The proxy carries no colour.** The proxy file this artifact publishes is the
-surface's phone level with every vertex colour byte set to zero
-(`appearance_pipeline.proxy_without_colours`): same layout and length, positions
-and indices unchanged. The page never drew them, and they are the depth stage's
-pixels, so the appearance route no longer serves them.
+surface's phone level with every vertex colour byte replaced
+(`appearance_pipeline.proxy_with_confidence`): same layout and length,
+positions and indices unchanged. The page never drew them, and they are the
+depth stage's pixels, so the appearance route no longer serves them. What
+those three bytes carry instead is in §4.2a.
 
 ### 6.3 What the manifest records
 
@@ -657,7 +703,7 @@ step cannot run; a set already written is unaffected.
 | `epoch` | §9: the `build_id` of the first build whose textures later builds may replace in place; unchanged while they may |
 | `appearance_provenance` | §6.3 |
 | `camera` | `{fx, fy, cx, cy, width, height}`, the solve camera |
-| `proxy` | `{digest, bytes, vertices, faces, format: "wb-surface-mesh/1", source: {surface_built_at, surface_input_digest, surface_params_digest, surface_quality, level}}` |
+| `proxy` | `{digest, bytes, vertices, faces, format: "wb-surface-mesh/1", confidence: {present, version, channel, source_level}, source: {surface_built_at, surface_input_digest, surface_params_digest, surface_quality, level}}`. `confidence` is §4.2a; absent from manifests written before 2026-09-18 |
 | `encodings` | per encoding: `{name, texel_format, block, encoder, version, quality, available, ...}`. ASTC is absent when its encoder is not installed, with the reason in `encoding_notes`; the WebP fallback is always present |
 | `chunks` | `[{digest, bytes, encoding, slots, tier}]` |
 | `keyframes` | per usable keyframe, below |

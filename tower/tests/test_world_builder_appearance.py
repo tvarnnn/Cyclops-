@@ -156,8 +156,15 @@ class World:
             "camera": {"fx": FX, "fy": FX, "cx": SW / 2, "cy": SH / 2, "width": W, "height": H},
             "records": self.records}))
 
-    def write_surface(self, subdivisions=10):
-        from tower.world_builder.surface import SURFACE_FORMAT, SURFACE_SCHEMA_VERSION, write_mesh_bytes
+    def write_surface(self, subdivisions=10, confidence=None):
+        from tower.world_builder.surface import (
+            CONFIDENCE_FORMAT,
+            CONFIDENCE_VERSION,
+            SURFACE_FORMAT,
+            SURFACE_SCHEMA_VERSION,
+            write_confidence_bytes,
+            write_mesh_bytes,
+        )
 
         V, F = _box_mesh(3.0, subdivisions)
         buf = write_mesh_bytes(V, F, np.full((len(V), 3), 128, np.uint8))
@@ -165,6 +172,18 @@ class World:
         root.mkdir(parents=True, exist_ok=True)
         name = f"mesh_l0.{time.time_ns():x}.bin"
         (root / name).write_bytes(buf)
+        # A surface built before the channel existed has none, which is the
+        # default here; `confidence` writes one the way the surface stage does.
+        self.surface_confidence = None
+        conf_record = None
+        if confidence is not None:
+            self.surface_confidence = np.asarray(confidence, np.uint8)
+            cbuf = write_confidence_bytes(self.surface_confidence)
+            cname = f"conf_l0.{time.time_ns():x}.bin"
+            (root / cname).write_bytes(cbuf)
+            conf_record = {"file": cname, "bytes": len(cbuf),
+                           "vertices": int(len(V)), "format": CONFIDENCE_FORMAT,
+                           "version": CONFIDENCE_VERSION}
         self.surface_built_at = time.time()
         (root / "manifest.json").write_text(json.dumps({
             "format": SURFACE_FORMAT, "schema_version": SURFACE_SCHEMA_VERSION,
@@ -173,7 +192,8 @@ class World:
             "faces": int(len(F)), "vertices": int(len(V)), "mobile_level": 0,
             "canonical_level": 0,
             "levels": [{"level": 0, "faces": int(len(F)), "vertices": int(len(V)),
-                        "bytes": len(buf), "file": name}]}))
+                        "bytes": len(buf), "file": name,
+                        **({"confidence": conf_record} if conf_record else {})}]}))
         return buf
 
     def build(self, **kw):
@@ -296,9 +316,10 @@ class TestABuild:
             if k["tier"] == A.TIER_PHONE:
                 assert A.ENC_ASTC in k["chunks"] and isinstance(k["rank"], int)
         # the proxy is the surface's phone level, byte for byte -- except its
-        # vertex colours, which are zero: they are the depth stage's pixels,
-        # the page never draws them, and the route must not carry them
-        # (review 1, M2)
+        # vertex colours: they are the depth stage's pixels, the page never
+        # draws them, and the route must not carry them (review 1, M2). This
+        # world's surface has no confidence channel, so they are all zero,
+        # which a page must read as "no confidence known" (APPEARANCE 4.2a).
         from tower.world_builder.surface import read_mesh_bytes
         from tower.world_builder.surface_pipeline import read_surface_level
 
@@ -310,7 +331,10 @@ class TestABuild:
         sV, sF, sC, _sN = read_mesh_bytes(surface)
         assert np.array_equal(pV, sV) and np.array_equal(pF, sF)
         assert sC.any() and not pC.any()
-        assert proxy == AP.proxy_without_colours(surface)
+        assert proxy == AP.proxy_with_confidence(surface, None)
+        assert man["proxy"]["confidence"] == {
+            "present": False, "version": AP.PROXY_CONFIDENCE_VERSION,
+            "channel": AP.PROXY_CONFIDENCE_CHANNEL, "source_level": 0}
         assert man["proxy"]["source"]["surface_built_at"] == world.surface_built_at
         # every chunk reads, holds whole slots, and its name is its content
         for c in man["chunks"]:
