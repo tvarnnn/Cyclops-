@@ -76,6 +76,25 @@ NEARBLACK_OPEN = 16
 UNOBSERVED_DILATE_PX = 2
 UNOBSERVED_RULE = f"fill2|nearblack{NEARBLACK_MAX}open{NEARBLACK_OPEN}|dilate{UNOBSERVED_DILATE_PX}"
 
+# ---------------------------------------------------------------------------
+# the cross-frame redaction consensus
+# ---------------------------------------------------------------------------
+
+# A face is redacted per FRAME. The detector runs on each keyframe alone, so a
+# face found in keyframe A and MISSED in keyframe B is filled in A and
+# published by B -- and the page, blending by view, draws B's pixels at the
+# very pose where A hid them. Measured on the canonical world by the fix-it
+# cross-frame lane (`Glasses-scratch/wb-final-recon/fixit/privleak/PRIVLEAK.md`):
+# 99.4% of the surface some keyframe's fill covered is published by another
+# keyframe, and the one real face in that capture -- a printed portrait,
+# detected and filled in 17 keyframes -- is published, recognisably, by 86
+# others. This mask closes that in 3D: a surface point one keyframe hid is
+# unobserved in EVERY keyframe.
+CONSENSUS_OFF = "off"
+CONSENSUS_PLAUSIBLE = "plausible"
+CONSENSUS_UNION = "union"
+CONSENSUS_MODES = (CONSENSUS_OFF, CONSENSUS_PLAUSIBLE, CONSENSUS_UNION)
+
 # Alpha is 0 over the transparent core dilated by this much: one ASTC 6x6
 # block plus one bilinear tap, so no block that holds a zeroed texel also holds
 # an opaque one, and a bilinear fetch of an opaque texel never reaches a zeroed
@@ -130,6 +149,38 @@ class AppearanceParams:
     # the transient DETECTOR (transients.py, contract §5.3a): `union`
     # (Grounding DINO + SAM 2.1 with OneFormer), `oneformer`, or `off`
     transient_detector: str = "union"
+    # the cross-frame redaction consensus (§5.3b)
+    #   `union`      every fill region is unobserved for every keyframe. The
+    #                guarantee, and on the canonical world it costs 93% of the
+    #                published texels, because that capture's redaction is
+    #                mostly wall-sized false positives.
+    #   `plausible`  only a fill region that could be a face propagates: one
+    #                that is at most `consensus_area_max` of its frame. 20 of
+    #                20 eye-labelled printed-face regions pass; the 56-84%
+    #                false positives do not. 14% of the published texels.
+    #   `off`        per-frame redaction only -- what a build did before this
+    #                mask existed. Never a default.
+    redaction_consensus: str = CONSENSUS_PLAUSIBLE
+    consensus_area_max: float = 0.10
+    # A fill box straddles depth steps; only the surface at the region's own
+    # depth is the surface the hidden thing was on.
+    consensus_depth_tol: float = 0.20
+    # The redactor dilates a face box by 1.6 about its centre (`HEAD_DILATION`),
+    # so the detection is inside 62.5% of the fill. This erodes each region by
+    # this fraction of its shorter side before projecting it, and the 3D
+    # dilation below gives the tolerance back.
+    consensus_erode: float = 0.20
+    # A fill region this much inside the transient detector's hand/arm/phone
+    # mask is the wearer's own hand, not a face, and does not propagate.
+    consensus_hand_overlap: float = 0.5
+    # The voxel side, in pixels at the median proxy depth. With
+    # `consensus_dilate_cells` it is the whole tolerance of the rule: about
+    # 6 px at the median depth here, which is where the cost stops falling
+    # (PRIVLEAK.md: 17.3% of the published texels at 6 px a voxel, 14.6% at 3,
+    # 13.6% at 2).
+    consensus_voxel_px: float = 3.0
+    consensus_dilate_cells: int = 1
+    consensus_dilate_px: int = 2
     # exposure (§5.4)
     exposure_grid_px: int = 16
     exposure_vis_tol: float = 0.03
@@ -170,11 +221,17 @@ class AppearanceParams:
     # never reaches outward past the ring. 0 = the hard edge of the first build.
     alpha_feather_px: int = 8
 
+    def __post_init__(self):
+        if self.redaction_consensus not in CONSENSUS_MODES:
+            raise ValueError(f"unknown redaction consensus mode "
+                             f"{self.redaction_consensus!r}; one of {CONSENSUS_MODES}")
+
     @classmethod
     def live(cls, **overrides) -> "AppearanceParams":
         """The walk-time preset: the same rules, less sampling. Being late is
         worse than being coarse, but a relaxed privacy or occluder rule is not
-        coarse, it is wrong -- so neither moves."""
+        coarse, it is wrong -- so neither the unobserved mask nor the
+        cross-frame redaction consensus moves."""
         base = dict(quality="live", selection_samples=30_000, exposure_grid_px=24,
                     exposure_iterations=20, transient_grid_px=12,
                     # OneFormer only during a walk: the union costs about
@@ -491,6 +548,222 @@ class ProxyCaster:
         rays[:, 3:] = d @ R  # R^T d, per row; z-component 1 in the camera, so t_hit = z
         hit = self.scene.cast_rays(self._o3d.core.Tensor(rays))["t_hit"].numpy()
         return hit.reshape(height, width).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# the cross-frame redaction consensus (contract §5.3b)
+# ---------------------------------------------------------------------------
+
+
+def consensus_rule_id(params: "AppearanceParams") -> str:
+    """The rule a consensus mask was made under, as one string: recorded in the
+    manifest and part of the cache key, so a change rebuilds."""
+    if params.redaction_consensus == CONSENSUS_OFF:
+        return "off"
+    gate = ("any" if params.redaction_consensus == CONSENSUS_UNION
+            else f"area<={params.consensus_area_max:g}")
+    hand = ("" if params.redaction_consensus == CONSENSUS_UNION
+            else f"|nothand>{params.consensus_hand_overlap:g}")
+    return (f"{params.redaction_consensus}|{gate}{hand}|erode{params.consensus_erode:g}"
+            f"|depth{params.consensus_depth_tol:g}|vox{params.consensus_voxel_px:g}px"
+            f"|cells{params.consensus_dilate_cells}|dil{params.consensus_dilate_px}px|v1")
+
+
+def _dilate_keys(keys: np.ndarray, strides, cells: int) -> np.ndarray:
+    """Every voxel within `cells` of one of `keys`, as sorted keys.
+
+    Sparse on purpose: the tolerance is the whole rule, and a dense grid fine
+    enough to state it in a few pixels does not fit (the canonical world at
+    3 px a voxel is 500M cells). The grid is padded by more than `cells`, so
+    an offset never crosses into another row.
+    """
+    if cells <= 0 or not len(keys):
+        return np.unique(keys)
+    r = range(-cells, cells + 1)
+    offsets = np.array([i * strides[0] + j * strides[1] + k * strides[2]
+                        for i in r for j in r for k in r], np.int64)
+    out = keys
+    for c0 in range(0, len(offsets), 9):
+        out = np.unique(np.concatenate(
+            [out] + [keys + o for o in offsets[c0:c0 + 9]]))
+    return out
+
+
+def consensus_regions(unobserved: np.ndarray, zp: np.ndarray, params: "AppearanceParams",
+                      detector: np.ndarray | None = None):
+    """Which parts of a keyframe's privacy mask propagate into 3D, as boolean
+    masks in that keyframe -- one per connected region of the mask.
+
+    `union` takes every region. `plausible` takes only a region that could be a
+    face:
+
+    - at most `consensus_area_max` of the frame. Measured on the canonical
+      world: all 20 eye-labelled printed-face regions are at most 9.95% of
+      their frame, and the regions that make the union unaffordable are
+      56-84%. What this does NOT cover is a face close enough to fill more
+      than a tenth of the frame -- PRIVLEAK.md §7;
+    - not the wearer's own hand, arm or phone, which the transient detector
+      recognises (`transients.py`, 97.7% hand/arm pixel recall). A redaction
+      box over the wearer's own hand is a false positive by construction, and
+      on the canonical world those boxes are most of what the area gate still
+      lets through. When no detector mask exists the region propagates: a
+      missing detector never excuses a privacy mask.
+
+    Each region is eroded by `consensus_erode` of its shorter side (the
+    redactor's head dilation is a deliberate over-reach) and trimmed to its own
+    depth, because a fill box straddling a depth step would otherwise be
+    projected onto surfaces the hidden thing never stood on.
+    """
+    import cv2  # noqa: PLC0415
+
+    out = []
+    if params.redaction_consensus == CONSENSUS_OFF or not unobserved.any():
+        return out
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(unobserved.astype(np.uint8), 8)
+    finite = np.isfinite(zp) & (zp > 0)
+    plausible = params.redaction_consensus == CONSENSUS_PLAUSIBLE
+    for c in range(1, n):
+        area = int(stats[c, cv2.CC_STAT_AREA])
+        frac = area / unobserved.size
+        if plausible and frac > params.consensus_area_max:
+            out.append((None, {"area_fraction": round(frac, 4), "propagated": False,
+                               "reason": "larger than a face"}))
+            continue
+        m = labels == c
+        if plausible and detector is not None and detector.shape == m.shape:
+            inside = float((m & detector).sum()) / max(1, area)
+            if inside > params.consensus_hand_overlap:
+                out.append((None, {"area_fraction": round(frac, 4), "propagated": False,
+                                   "reason": "the wearer's own hand",
+                                   "inside_detector": round(inside, 3)}))
+                continue
+        if params.consensus_erode > 0:
+            side = min(int(stats[c, cv2.CC_STAT_WIDTH]), int(stats[c, cv2.CC_STAT_HEIGHT]))
+            r = int(round(params.consensus_erode * side / 2))
+            if r > 0:
+                k = np.ones((2 * r + 1, 2 * r + 1), np.uint8)
+                eroded = cv2.erode(m.astype(np.uint8), k).astype(bool)
+                # A region too thin to erode keeps the whole of itself: failing
+                # open here would drop a small face's protection silently.
+                m = eroded if eroded.any() else m
+        m &= finite
+        if not m.any():
+            out.append((None, {"area_fraction": round(frac, 4), "propagated": False,
+                               "reason": "no proxy surface behind it"}))
+            continue
+        if params.consensus_depth_tol > 0:
+            zm = float(np.median(zp[m]))
+            m &= (zp > zm / (1 + params.consensus_depth_tol)) & (zp < zm * (1 + params.consensus_depth_tol))
+            if not m.any():
+                out.append((None, {"area_fraction": round(frac, 4), "propagated": False,
+                                   "reason": "no proxy surface behind it"}))
+                continue
+        out.append((m, {"area_fraction": round(frac, 4), "propagated": True,
+                        "surface_pixels": int(m.sum())}))
+    return out
+
+
+class RedactionConsensus:
+    """The surface points some keyframe's redaction fill covered.
+
+    A voxel grid over the proxy's own extent, marked by back-projecting each
+    keyframe's propagating fill regions along the proxy depth, dilated by
+    `consensus_dilate_cells` for pose and depth error, and then read back in
+    every keyframe. What it returns for a keyframe is a privacy mask exactly
+    like the fill: alpha 0, no weight, no colour.
+
+    The grid is the whole tolerance model, so it is stated in pixels: a voxel
+    is `consensus_voxel_px` pixels wide at the median proxy depth, and the
+    total tolerance is that plus `consensus_dilate_cells` of it. It is held as
+    sorted voxel keys, not as an array, because the tolerance that matters is
+    finer than a dense grid of this room would fit.
+    """
+
+    PAD = 8   # cells of empty space around the proxy, so a dilation offset
+    #           never wraps into the next row of the key space
+
+    def __init__(self, V, z_ref: float, K, params: "AppearanceParams"):
+        V = np.asarray(V, np.float32)
+        self.params = params
+        self.voxel = max(float(params.consensus_voxel_px) * float(z_ref) / float(K[0, 0]),
+                         1e-6)
+        pad = (self.PAD + params.consensus_dilate_cells) * self.voxel
+        self.lo = V.min(0) - pad
+        self.dims = np.maximum(1, np.ceil((V.max(0) + pad - self.lo) / self.voxel)
+                               ).astype(np.int64) + 1
+        self.strides = np.array([self.dims[1] * self.dims[2], self.dims[2], 1], np.int64)
+        self._parts: list = []
+        self.keys = np.zeros(0, np.int64)
+        self.marked = 0
+        self.regions = 0
+        self.frames = 0
+        self._final = False
+
+    def _index(self, points):
+        q = np.floor((points - self.lo) / self.voxel).astype(np.int64)
+        np.clip(q, 0, self.dims - 1, out=q)
+        return q @ self.strides
+
+    @staticmethod
+    def _world(zp, mask, R, t, K):
+        H, W = zp.shape
+        ys, xs = np.nonzero(mask)
+        z = zp[ys, xs].astype(np.float32)
+        d = np.stack([(xs + 0.5 - K[0, 2]) / K[0, 0], (ys + 0.5 - K[1, 2]) / K[1, 1],
+                      np.ones_like(z)], -1).astype(np.float32)
+        R = np.asarray(R, np.float32)
+        c = (-R.T @ np.asarray(t, np.float32)).astype(np.float32)
+        return (d * z[:, None]) @ R + c[None]
+
+    def add(self, unobserved, zp, R, t, K, detector=None) -> dict:
+        """Mark what one keyframe hid. Returns its record."""
+        if self._final:
+            raise RuntimeError("the consensus was already finalised")
+        rows = consensus_regions(unobserved, zp, self.params, detector)
+        marked = 0
+        for m, rec in rows:
+            if m is None:
+                continue
+            P = self._world(zp, m, R, t, K)
+            if not len(P):
+                continue
+            keys = np.unique(self._index(P))
+            self._parts.append(keys)
+            marked += len(P)
+            rec["voxels"] = int(len(keys))
+            self.regions += 1
+        if rows:
+            self.frames += 1
+        return {"regions": [r for _m, r in rows], "surface_pixels": marked}
+
+    def finalize(self) -> dict:
+        keys = (np.unique(np.concatenate(self._parts)) if self._parts
+                else np.zeros(0, np.int64))
+        self._parts = []
+        core = int(len(keys))
+        self.keys = _dilate_keys(keys, self.strides, int(self.params.consensus_dilate_cells))
+        self.marked = int(len(self.keys))
+        self._final = True
+        return {"voxel": round(self.voxel, 6), "grid": [int(d) for d in self.dims],
+                "voxels_marked": core, "voxels_dilated": self.marked,
+                "regions_propagated": self.regions, "frames_with_fill": self.frames}
+
+    def query(self, zp, R, t, K) -> np.ndarray:
+        """The pixels of one keyframe whose proxy surface point some keyframe
+        redacted. Pixels with no proxy behind them are never masked: the page
+        cannot draw a source pixel whose own depth is unknown."""
+        H, W = zp.shape
+        out = np.zeros((H, W), bool)
+        if not self.marked:
+            return out
+        ok = np.isfinite(zp) & (zp > 0)
+        if not ok.any():
+            return out
+        q = self._index(self._world(zp, ok, R, t, K))
+        at = np.searchsorted(self.keys, q)
+        np.clip(at, 0, len(self.keys) - 1, out=at)
+        out[ok] = self.keys[at] == q
+        return dilate(out, self.params.consensus_dilate_px)
 
 
 # ---------------------------------------------------------------------------
@@ -1361,10 +1634,16 @@ class PreparedFrame:
     # has none. Kept apart from `source.unobserved`, which is the privacy
     # mask: this one is a quality mask and may be absent; that one may not.
     detector: np.ndarray | None = None
+    # What ANOTHER keyframe's redaction fill covers of the surface this frame
+    # sees (§5.3b). A privacy mask like `source.unobserved`, kept apart from it
+    # because it is a function of every frame, not of this one.
+    consensus: np.ndarray | None = None
 
     @property
     def transparent_core(self) -> np.ndarray:
         core = self.source.unobserved | self.occluder
         if self.detector is not None:
             core = core | self.detector
+        if self.consensus is not None:
+            core = core | self.consensus
         return core

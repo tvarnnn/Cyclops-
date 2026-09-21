@@ -42,6 +42,7 @@ STAGE_PROVENANCE = "provenance"
 STAGE_DETECTOR = "detector"
 STAGE_PROXY = "proxy"
 STAGE_OCCLUDERS = "occluders"
+STAGE_CONSENSUS = "consensus"
 STAGE_EXPOSURE = "exposure"
 STAGE_TRANSIENTS = "transients"
 STAGE_SELECTION = "selection"
@@ -353,6 +354,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "redactor_applied_here": policy.redactor_label,
         "fill_rule": FILL_RULE,
         "unobserved_rule": A.UNOBSERVED_RULE,
+        "consensus_rule": A.consensus_rule_id(params),
         "alpha_ring_px": A.ALPHA_RING_PX,
         "per_frame_sha1_digest": frame_digest,
         "transients": {"rule": treport.params.rule_id(), "state": treport.state,
@@ -425,7 +427,6 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         fr.zp = zp.astype(np.float16)
         fr.occluder = occ
         fr.occluder_record = occ_rec
-        fr.sharpness = A.sharpness(fr.source.rgb, fr.transparent_core)
         kept.append(fr)
         if progress is not None and n % 50 == 0:
             progress(STAGE_OCCLUDERS, n, len(frames))
@@ -435,6 +436,45 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         raise A.AppearanceUnavailable(
             "no keyframe survived provenance, pose, depth and proxy checks"
             + (f" (refused: {refused})" if refused else ""))
+
+    # -- the cross-frame redaction consensus (contract §5.3b) ---------------
+    # The reference depth is the median over every kept frame's proxy depth:
+    # the consensus voxel and the selection's falloff are both stated in it.
+    zsamp = np.concatenate([fr.zp[::8, ::8][np.isfinite(fr.zp[::8, ::8])].astype(np.float32)
+                            for fr in frames])
+    z_ref = float(np.median(zsamp)) if zsamp.size else 1.0
+    t1b = time.time()
+    consensus_record = {"mode": params.redaction_consensus,
+                        "rule": A.consensus_rule_id(params)}
+    if params.redaction_consensus != A.CONSENSUS_OFF:
+        _status(root, state=STATE_RUNNING, stage=STAGE_CONSENSUS, params_digest=pdigest)
+        cons = A.RedactionConsensus(V, z_ref, K, params)
+        sources = 0
+        for fr in frames:
+            if _stopped(should_stop):
+                return _stop(root, STAGE_CONSENSUS, seconds)
+            rec = cons.add(fr.source.unobserved, fr.zp.astype(np.float32), fr.R, fr.t, K,
+                           fr.detector)
+            fr.extra["consensus_source"] = rec["regions"] or None
+            sources += sum(1 for r in rec["regions"] if r.get("propagated"))
+        consensus_record.update(cons.finalize())
+        for fr in frames:
+            if _stopped(should_stop):
+                return _stop(root, STAGE_CONSENSUS, seconds)
+            m = cons.query(fr.zp.astype(np.float32), fr.R, fr.t, K)
+            fr.consensus = m if m.any() else None
+        cfrac = [float(fr.consensus.mean()) if fr.consensus is not None else 0.0
+                 for fr in frames]
+        consensus_record.update({
+            "frames_masked": int(sum(1 for f in cfrac if f > 0)),
+            "mean_fraction": round(float(np.mean(cfrac)), 5),
+            "max_fraction": round(float(np.max(cfrac)), 5) if cfrac else 0.0,
+            "regions_refused": _region_reasons(frames),
+        })
+        del cons
+    seconds[STAGE_CONSENSUS] = round(time.time() - t1b, 2)
+    for fr in frames:
+        fr.sharpness = A.sharpness(fr.source.rgb, fr.transparent_core)
 
     # -- exposure -----------------------------------------------------------
     t2 = time.time()
@@ -484,9 +524,6 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             # Disagrees with the rest of the walk nearly everywhere: a
             # misregistered keyframe. Kept, but chosen for the phone last.
             fr.quality *= max(params.quality_floor, 1.0 - vrec["disagreeing_fraction"])
-    zsamp = np.concatenate([fr.zp[::8, ::8][np.isfinite(fr.zp[::8, ::8])].astype(np.float32)
-                            for fr in frames])
-    z_ref = float(np.median(zsamp)) if zsamp.size else 1.0
     pts, nrm = A.sample_proxy_points(V, F, params.selection_samples, params.seed)
     scores = A.score_points(pts, nrm, [fr.zp for fr in frames], opaque,
                             [fr.R for fr in frames], [fr.t for fr in frames], K,
@@ -581,6 +618,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "quality": round(fr.quality, 4),
             "sharpness": round(fr.sharpness, 2),
             "unobserved_fraction": round(float(src.unobserved.mean()), 4),
+            "consensus_fraction": (None if fr.consensus is None
+                                   else round(float(fr.consensus.mean()), 4)),
             "occluder_fraction": round(float(fr.occluder.mean()), 4),
             "transparent_fraction": round(float((~opaque[i]).mean()), 4),
             "near_fraction": fr.extra.get("near_fraction"),
@@ -609,6 +648,7 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
         "redactor_applied_here": policy.redactor_label,
         "label_trusted": policy.trusted,
+        "redaction_consensus": consensus_record,
     }
     epoch = appearance_epoch(read_manifest_at(root), provenance, build_id)
     manifest = {
@@ -634,6 +674,11 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "label_trusted": policy.trusted,
             "fill_rule": FILL_RULE,
             "unobserved_rule": A.UNOBSERVED_RULE,
+            # §5.3b: what one keyframe hid is unobserved in every keyframe.
+            # `mode: off` means this build did NOT apply it, whatever else it
+            # says: a reader must not infer the guarantee from the key's
+            # presence.
+            "redaction_consensus": consensus_record,
             "alpha_ring_px": A.ALPHA_RING_PX,
             "source": A.SOURCE_SESSION_KEYFRAMES,
             "frames": {"used": len(frames), "refused": refused},
@@ -710,6 +755,30 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     return result
 
 
+def consensus_rule_of(provenance: dict | None) -> str | None:
+    """The cross-frame consensus rule a provenance record names, or None when
+    it does not name one (a manifest written before §5.3b existed, or the
+    revision route's partial record). `off` is a rule like any other."""
+    if not isinstance(provenance, dict):
+        return None
+    rec = provenance.get("redaction_consensus")
+    if isinstance(rec, dict):
+        rule = rec.get("rule")
+        return rule if isinstance(rule, str) else None
+    return rec if isinstance(rec, str) else None
+
+
+def _region_reasons(frames) -> dict:
+    """Why each fill region did not propagate, counted (contract §5.3b)."""
+    out: dict = {}
+    for fr in frames:
+        for r in fr.extra.get("consensus_source") or []:
+            if not r.get("propagated"):
+                key = r.get("reason") or "unknown"
+                out[key] = out.get(key, 0) + 1
+    return out
+
+
 def textures_carry_over(previous: dict | None, current: dict | None) -> bool:
     """Whether an open page may keep drawing textures of a build under
     `previous` provenance while it replaces them with a build under `current`.
@@ -726,10 +795,18 @@ def textures_carry_over(previous: dict | None, current: dict | None) -> bool:
       provided that redactor's label is itself on the allowlist. This is the
       ordinary Stop: a walk's builds re-redact under `none`, and the final
       build uses the stored bytes under the real label.
+    - the cross-frame redaction consensus (§5.3b) must be the same rule. Its
+      masks are privacy, so textures made under a weaker rule -- or under none
+      -- may not stay on screen while a stronger build loads. Compared only
+      when the caller states the rule, so the revision route's "what would a
+      build now trust" question is unchanged.
     """
     if not isinstance(previous, dict) or not isinstance(current, dict):
         return False
     if previous.get("keyframe_image_set") != current.get("keyframe_image_set"):
+        return False
+    want = consensus_rule_of(current)
+    if want is not None and consensus_rule_of(previous) != want:
         return False
     if previous.get("label_trusted"):
         return (bool(current.get("label_trusted"))
