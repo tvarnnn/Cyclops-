@@ -231,6 +231,33 @@ by observation:
   the marching-cubes staircase. `manifest.detail.median_vertex_move_voxels`
   records how far, in voxels, the median vertex moved; a reader may treat that
   as the artifact's geometric slack.
+
+  **A rim is smoothed along the rim** (`params.smooth_boundary_curve`, on by
+  default). A surface that stops where the evidence stops is mostly boundary —
+  48% of the canonical capture's phone-level faces touch one — and a boundary
+  vertex's neighbours all lie on one side of it, so the surface umbrella both
+  dragged the rim across the surface, away from where the evidence ended, and
+  left the staircase *along* the rim untouched, since none of the neighbours it
+  averaged was itself on the rim. A boundary vertex with exactly two boundary
+  neighbours now takes the same lambda/mu passes over its own boundary
+  polyline; a junction (any other count) is held still; every interior vertex
+  keeps the surface umbrella. No face and no vertex is added or removed, and
+  the only interior vertices that move differently are a rim's own neighbours
+  (63% of interior vertices do not move at all; p99 0.13 voxels).
+
+  Measured on the canonical capture
+  (`Glasses-scratch/wb-final-recon/fixit/rims/RIMS.md`): at level 0 the rim
+  roughness — a boundary vertex's distance from the midpoint of its two
+  boundary neighbours — falls from 0.31 to 0.17 voxels (p90 0.71 to 0.32), the
+  boundary from 192,064 to 157,481 voxels long, and the rim's drift across the
+  surface from −0.29 to −0.18 voxels, so 2.8% more area survives. At the phone
+  level, 8,045 boundary loops become 4,203 and 7,167 pinholes become 3,574.
+  Against 10% of keyframes held out of fusion, the pixels it gains and the
+  pixels it loses agree with the held-out depth equally often (45.2% against
+  44.1%), it gains 17x more than it loses, and the whole surface's agreement is
+  unchanged (75.7 / 6.9 / 17.4%). `detail.rims` records which operator ran and
+  what rim it left. It is in the params digest, so a surface built before it
+  rebuilds.
 - **Plane snap** (`params.plane_snap`, on by default; `surface.snap_planes`).
 
   *What it is.* After smoothing, large planes are found in the mesh itself.
@@ -448,6 +475,7 @@ level.
 | `detail.truncation_floor`, `detail.truncation_rel` | the truncation band of a sample measured at depth `d` is `max(floor, min(rel * d, trunc_max_voxels * voxel))` when `rel > 0` (the floor wins over the cap), and `floor` alone when `rel` is 0 |
 | `detail.evidence_filter` | faces removed by claim 1's frame tests, by reason (`dropped_support`, `dropped_contradicted`, `dropped_back_facing`, and for low-weight faces `dropped_weak_seen_through`, `dropped_weak_parallax`, `dropped_weak_hidden`), with `faces_in`, `faces_kept`, and `weak_in` / `weak_kept` (low-weight faces offered and kept, after the hidden test; absent when `low_weight_evidence` is off or the enclosed fill is on, which does not use it); `weak_tested` and `hidden_rays` (the low-weight faces the hidden test examined and the rays it cast; absent when `low_weight_hidden_test` is off); `null` when the filter did not run |
 | `detail.depth_consistency` | the consistency field this surface was fused through (added 2026-09-17): `state` (`applied`, `refused`, `failed`, `skipped`), `reason`, `frames`, `cells`, `heldout.before` / `heldout.after` (held-out sparse-point `sfm` and held-out frame-pair `cross` median relative error, the plain affine vs the field), `warm_start`, `seconds`, `gpu_peak_mb`, `key`, `reused`. Only `applied` means corrected depth was fused. A surface built while the solve `failed` is never reported "already built": the next build tries the solve again |
+| `detail.rims` | the level-0 boundary the smoothing left (added 2026-09-21; absent from manifests written before): `smoothing` (`curve` or `umbrella`, per `params.smooth_boundary_curve`), `boundary_edges`, `length_voxels`, `junction_vertices`, and `roughness_voxels` / `roughness_voxels_p90` — the median and p90 distance of a boundary vertex from the midpoint of its two boundary neighbours, in voxels. It is how ragged the rims are, and the number §3's rim smoothing exists to move. Measured after the smoothing and before the plane snap, which moves vertices again (about +2% of boundary length on the canonical capture). `roughness_voxels` is `null` for a closed surface |
 | `detail.plane_snap` | the plane snap's record (§3): `plane_count`, `plane_areas`, `planes[]`, `rejected`, `vertices_moved`, `area_snapped`, `max_move`, `tol`, `min_area`, `min_frames`, `seconds`. `null` when `params.plane_snap` is off |
 | `detail.voxel_coarsened_by` | how far the block budget (`params.max_blocks`) coarsened the voxel. A walk the budget cannot hold after 12 coarsening attempts is refused (`unavailable`, naming the budget) rather than built over it |
 | `voxel`, `truncation` | in scene units. `truncation` is the band a sample at the scene scale actually got, cap included (manifests written before 2026-09-16 recorded the uncapped request) |
