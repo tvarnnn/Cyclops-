@@ -18,6 +18,7 @@ import zlib
 
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder import appearance_pipeline as AP
+from tower.world_builder import raw_imagery as RAWIMG
 from tower.world_builder.store import WorldStore, WorldStoreError
 
 logger = logging.getLogger(__name__)
@@ -129,13 +130,28 @@ def _servable_manifest(store: WorldStore, world_id: str, session_id: str):
     manifest = AP.read_appearance_manifest(store, contained, session_id)
     if manifest is None:
         raise AppearanceNotServed("no appearance for this session")
-    if not AP.label_matches(store, contained, session_id, manifest):
+    # §6.6, BEFORE the label check, so the reason names the real mismatch: an
+    # artifact built from the original local capture is refused outright by a
+    # Tower serving the product, and a product artifact is refused by a Tower
+    # asked for the research imagery. Neither is "stale".
+    wanted = RAWIMG.imagery_source_from_env()
+    if not AP.imagery_matches(manifest, wanted):
+        raise AppearanceNotServed(AP.imagery_mismatch_detail(manifest, wanted))
+    if not AP.label_matches(store, contained, session_id, manifest,
+                            imagery_source=wanted):
         raise AppearanceNotServed(AP.STALE_LABEL_DETAIL)
     return contained, manifest
 
 
 def _label(manifest: dict) -> str:
-    return str((manifest.get("appearance_provenance") or {}).get("redaction_effective"))
+    value = (manifest.get("appearance_provenance") or {}).get("redaction_effective")
+    # An absent label is not `None`, which reads like a redactor called None.
+    # It is "unknown", and a reader may treat unknown as untrusted.
+    return str(value) if isinstance(value, str) and value else "unknown"
+
+
+def _imagery(manifest: dict) -> str:
+    return AP.imagery_source_of(manifest)
 
 
 def appearance_manifest(store: WorldStore, world_id: str, session_id: str):
@@ -143,7 +159,7 @@ def appearance_manifest(store: WorldStore, world_id: str, session_id: str):
     contained, manifest = _servable_manifest(store, world_id, session_id)
     payload = dict(manifest)
     payload["currency"] = AP.appearance_currency(store, contained, session_id, manifest)
-    return payload, _label(manifest)
+    return payload, _label(manifest), _imagery(manifest)
 
 
 def appearance_file(store: WorldStore, world_id: str, session_id: str, kind: str,
@@ -155,7 +171,7 @@ def appearance_file(store: WorldStore, world_id: str, session_id: str, kind: str
     data = AP.read_appearance_file(store, contained, session_id, kind, digest, manifest)
     if data is None:
         raise AppearanceNotServed("no such appearance file")
-    return data, _label(manifest)
+    return data, _label(manifest), _imagery(manifest)
 
 
 def _not_served_state(store: WorldStore, world_id: str, session_id: str, reason: str) -> str:

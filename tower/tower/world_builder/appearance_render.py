@@ -37,6 +37,7 @@ import logging
 from pathlib import Path
 from urllib.parse import quote
 
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED
 from tower.world_builder.surface_render import js_object_literal
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,15 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "appearance_revision": appearance_revision,
         "build_id": manifest.get("build_id"),
         "quality": manifest.get("quality"),
+        # §6.6. The page's caption used to claim "with faces redacted"
+        # unconditionally, whatever the manifest said, because the config
+        # carried nothing about provenance at all. These three fields are
+        # what makes that sentence true of the artifact actually loaded, and
+        # what puts a visible marker on a research build.
+        "imagery_source": AP.imagery_source_of(manifest),
+        "privacy_safe": AP.imagery_source_of(manifest) == IMAGERY_REDACTED,
+        "redaction_effective": ((manifest.get("appearance_provenance") or {})
+                                .get("redaction_effective")),
         "keyframes_phone": len(phone),
         "keyframes_total": len(manifest.get("keyframes") or []),
         "proxy_faces": int(len(faces)),

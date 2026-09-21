@@ -616,7 +616,9 @@ survived exactly in every encoding measured.
 ### 6.1 The one source
 
 Pixels are read only from the session's keyframe set, only inside
-`appearance.keyframe_source`. Which set is `WorldStore.keyframe_image_set`'s
+`appearance.keyframe_source` — with the single, named, off-by-default
+exception of §6.6, which is not part of the product and cannot be served by a
+Tower that did not ask for it. Which set is `WorldStore.keyframe_image_set`'s
 answer, read once per build with its label: `sessions/<sid>/images/` under
 `session.json`'s `redaction`, or the re-redacted set a session was explicitly
 switched to, under that set's label (§6.5). This stage never opens `solve/<sid>/images`
@@ -682,19 +684,21 @@ those three bytes carry instead is in §4.2a.
 
 | key | meaning |
 |---|---|
-| `session_redaction` | the label of the keyframe set read: `session.json`'s, or the re-redacted set's (§6.5); `null` when absent or unreadable |
+| `imagery_source`, `privacy_safe` | §6.6. `redacted`/`true` is the product, and is what an absent pair means. `raw-local-research`/`false` means every row below describes a build that read the ORIGINAL local capture |
+| `raw_imagery_set`, `raw_imagery_frames_missing` | §6.6: which set of original frames, and how many were not on this machine; `null` under `redacted` |
+| `session_redaction` | the label of the keyframe set read: `session.json`'s, or the re-redacted set's (§6.5); `null` when absent or unreadable | Under §6.6 this still describes the keyframes ON DISK, which the build did not read |
 | `keyframe_image_set` | `null` for `sessions/<sid>/images/`; `images.redacted-<gate>@<set digest>` when the session was switched to a re-redacted set (§6.5) |
-| `redaction_effective` | the label actually applied |
+| `redaction_effective` | the label actually applied; `raw-local-research/no-redaction` under §6.6, which is on no allowlist |
 | `redactor_applied_here` | `FaceRedactor.label` when this build re-redacted, else `null` |
 | `label_trusted` | whether the stored label was on the allowlist |
 | `fill_rule` | the depth stage's `FILL_RULE` the stored masks were required to carry |
-| `unobserved_rule` | `fill2|nearblack6open16|dilate2` |
+| `unobserved_rule` | `fill2\|nearblack6open16\|dilate2`; `none\|raw-local-research` under §6.6, where no privacy mask is applied at all |
 | `redaction_consensus` | §5.3b: `{mode, rule, voxel, grid, voxels_marked, voxels_dilated, regions_propagated, frames_with_fill, frames_masked, mean_fraction, max_fraction, regions_refused: {reason: count}}`. `mode: off` means the build did NOT apply it, whatever else the record says; absent from manifests written before 2026-09-21 |
-| `source` | `session-keyframes` |
+| `source` | `session-keyframes`, or `raw-local-capture` under §6.6 |
 | `frames` | `{used, refused: {reason: count}}` |
 | `per_frame_sha1_digest` | SHA-1 over the sorted `(keyframe id, SHA-1 of the stored JPEG)` pairs |
 | `privacy_tags`, `retains_raw_imagery` | inherited from the session |
-| `note` | "best-effort redaction with measured false negatives; not anonymised" |
+| `note` | "best-effort redaction with measured false negatives; not anonymised"; under §6.6 the research warning instead |
 
 Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 `origin`, `mask_origin` (`stored-fill` or `rerun-difference+guess`, each
@@ -729,7 +733,10 @@ appearance refuse every frame the re-redaction had changed
 (`refused-no-fill-mask`). Now the final stage refits (predictions are still
 reused per frame by image SHA-1). An `align.json` written before the token
 existed is reused only when it recorded using the stored bytes of a label that
-is still on the allowlist (`dense_pipeline.recorded_trust`).
+is still on the allowlist (`dense_pipeline.recorded_trust`). Since §6.6 it is keyed on
+the imagery source too (`|imagery:<source>`, appended only when it is not
+`redacted`, so no key written before is changed), and checked against the
+record's own `imagery_source` as well as the key.
 
 ### 6.5 Re-redaction: an explicit switch to a lighter, current redaction
 
@@ -841,6 +848,81 @@ are first-person imagery (the wearer's hands and legs, screens, room contents)
 and inherit the session's privacy tags. When a world's raw frames are gone the
 step cannot run; a set already written is unaffected.
 
+### 6.6 The research imagery bypass (`params.imagery_source`) — OFF BY DEFAULT
+
+**What it is.** One named parameter, on every stage that reads keyframe pixels,
+whose value is `redacted` — the product — unless a caller asks for
+`raw-local-research`. Under that value the depth stage, the surface stage and
+the appearance stage all read the ORIGINAL local capture frame behind each
+keyframe (`sources.json`, resolved through `global_solve.resolve_source_path`)
+instead of the session's redacted keyframe. The whole bypass lives in
+`tower/world_builder/raw_imagery.py`; §6.1's boundary reaches it through
+exactly one branch, in `appearance.keyframe_source`.
+
+**Why it exists.** The owner asked for it on 2026-09-21, so the fix-it campaign
+could measure what reconstruction quality the original imagery supports, with
+the privacy implementation preserved and re-enablable rather than deleted.
+Measured on the canonical world (b2a75ab4…, 398 keyframes): 182 of them carry a
+solid redaction fill covering 27.5% of those frames on average and 93.8% at the
+worst — 12.6% of all keyframe pixels — and the cross-frame consensus (§5.3b)
+then withdraws from every frame what any one frame hid.
+
+**What it changes, exactly.**
+
+| | `redacted` | `raw-local-research` |
+|---|---|---|
+| pixels | `sessions/<sid>/images/` via `keyframe_image_set` | the capture frame `sources.json` names |
+| re-encode | re-redacted here when the label is untrusted | none; the original bytes |
+| fill mask | `_fill.npy`, dilated; missing is a refusal | none; an empty mask is written |
+| near-black rule | applied (`UNOBSERVED_RULE`) | not applied; dark scene is scene |
+| `redaction_consensus` | `plausible` | forced `off` in `__post_init__` |
+| depth-stage inpaint | TELEA inside the fill | nothing to inpaint |
+| transient hand/phone mask | applied | **applied** — it is quality, not privacy |
+| occluders, exposure, selection, encoding | unchanged | unchanged |
+
+**How it is labelled.** A build under the bypass says so in six places, and a
+reader needs only one of them:
+
+- `manifest.imagery_source` and `manifest.privacy_safe: false` at the top level;
+- `appearance_provenance.imagery_source`, `.privacy_safe`, `.raw_imagery_set`,
+  `.source` = `raw-local-capture`, `.redaction_effective` =
+  `raw-local-research/no-redaction`, `.unobserved_rule` = `none|raw-local-research`,
+  and `.note` = the warning sentence;
+- `params_digest`, through `params.imagery_source`, and the surface and depth
+  cache keys (`digest_fields`, `_depth_cache_key`, `pixel_trust_token`);
+- the served headers `X-World-Imagery` and `X-World-Imagery-Warning`
+  (§9), beside the existing `X-World-Redaction`;
+- the page's headline, its About panel and a marker across the top of the
+  screen that cannot be dismissed;
+- the surface manifest's own `imagery_source` / `privacy_safe`.
+
+**How a reader refuses.** `appearance_pipeline.imagery_matches(manifest,
+expected)` is the rule, and it is symmetric. The serving gate
+(`label_matches`, called from `_servable_manifest`) compares the artifact
+against `TOWER_WORLD_RAW_IMAGERY` for this process: a Tower serving the product
+404s a raw artifact with a reason that names both sides, and a Tower started
+for research 404s a redacted one. Nothing crosses in the caches either: the
+grace-period lend (`servable_size`) compares the imagery source as well as the
+label, `textures_carry_over` refuses to carry textures across it — so the
+`epoch` changes and an open page and the phone's digest-keyed byte cache both
+drop what they hold — and no depth prediction is reused across it
+(`reusable_predictions`), because a frame the redactor found nothing in has an
+identical hash and may still have been inpainted.
+
+**Absent means `redacted`.** Every manifest, align record and surface manifest
+written before this section existed reads as the product, because it was.
+Every cache key written for a redacted build is byte-identical to the key it
+had before: the imagery field is appended only when it is not `redacted`.
+
+**It stays local.** The frames are read from the capture directory on this
+machine and go into the world's own `appearance/<session>/` chunks, served over
+the same local Tower→phone route with the same `no-store` headers. There is no
+new persistence, no new transmission, and no unrelated boundary is relaxed.
+
+**It is not privacy-safe and nothing pretends otherwise.**
+`appearance.label_is_trusted` does not admit the raw label, so no stage can
+read it as "these pixels were redacted", and `label_trusted` is `false`.
+
 ## 7. `manifest.json`
 
 | key | meaning |
@@ -850,6 +932,8 @@ step cannot run; a set already written is unaffected.
 | `build_id` | opaque, unique per publish |
 | `built_at` | epoch seconds |
 | `quality` | `live` or `final` |
+| `imagery_source` | §6.6: `redacted` (the product; also what an absent key means) or `raw-local-research` |
+| `privacy_safe` | §6.6: false exactly when `imagery_source` is not `redacted` |
 | `input_digest` | the solve this was built from |
 | `params_digest` | §6.4 |
 | `params` | every parameter |
@@ -929,8 +1013,13 @@ path, file name or sequence number.
 
 **Headers on every response, 200 or 404:** `Cache-Control: no-store`,
 `Pragma: no-cache`, `X-Content-Type-Options: nosniff`, and no `ETag` or
-`Last-Modified`. A 200 also carries `X-World-Redaction: <redaction_effective>`
-and `Vary: Accept-Encoding`.
+`Last-Modified`. A 200 also carries `X-World-Redaction: <redaction_effective>`,
+`X-World-Imagery: <imagery_source>` (§6.6: `redacted` or `raw-local-research`),
+`X-World-Imagery-Warning` when that is not `redacted`, and
+`Vary: Accept-Encoding`. `X-World-Redaction` is `unknown` when the manifest
+names no effective label -- never the string `None`. The serving gate refuses,
+with a 404 that names both sides, an artifact whose imagery is not this
+Tower's (§6.6).
 
 **Compression** (2026-09-17). A 200 of at least 1 KiB is sent
 `Content-Encoding: gzip` when the request's `Accept-Encoding` accepts gzip

@@ -38,6 +38,7 @@ import numpy as np
 
 from tower.storage import write_bytes_atomic, write_json_atomic
 from tower.world_builder.dense import DenseUnavailable, DepthModelUnavailable
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED, RAW_NOTE, is_raw
 from tower.world_builder.surface import (
     STAGE_DEPTH,
     STAGE_FUSE,
@@ -228,7 +229,8 @@ def _params_digest(params: SurfaceParams, input_digest: str | None) -> str:
 
 def ensure_depth_stage(store, world_id: str, session_id: str, solution,
                        intrinsics, *, gate_rel: float, backend: str | None,
-                       should_stop=None, progress=None) -> tuple[dict, Path]:
+                       should_stop=None, progress=None,
+                       imagery_source: str = IMAGERY_REDACTED) -> tuple[dict, Path]:
     """Return the dense stage's `align.json` and its work directory, running
     the depth stage first if it is absent or was produced from another solve.
 
@@ -243,7 +245,7 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
 
     root = dense_dir(store, world_id, session_id)
     root.mkdir(parents=True, exist_ok=True)
-    dparams = DenseParams(gate_rel=gate_rel,
+    dparams = DenseParams(gate_rel=gate_rel, imagery_source=imagery_source,
                           **({"backend": backend} if backend else {}))
 
     align_path = root / "align.json"
@@ -255,7 +257,7 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
         reusable_predictions,
     )
 
-    trust = depth_trust_now(store, world_id, session_id)
+    trust = depth_trust_now(store, world_id, session_id, imagery_source=imagery_source)
     if align_path.exists():
         try:
             cached = json.loads(align_path.read_text())
@@ -272,7 +274,8 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
                             dparams, root, should_stop=should_stop,
                             progress=progress, prior=None,
                             reuse_predictions=reusable_predictions(
-                                align_path, dparams.backend))
+                                align_path, dparams.backend,
+                                dparams.imagery_source))
     if align.get("stopped_after") is None:
         # Name the solve, in both spellings the two readers of this file use,
         # so neither can mistake it for a cache of another solve.
@@ -331,6 +334,12 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
     # `images/`, which is also what every align.json written before the switch
     # existed reads as.
     if cached.get("keyframe_image_set") != image_set:
+        return False
+    # WHICH IMAGERY IT READ (§6.6). A depth stage run from the original local
+    # capture has no fill masks and its `undist/` frames were never inpainted;
+    # a redacted surface must not be built on them, nor the reverse. Absent
+    # is `redacted`, which every stage before the bypass was.
+    if cached.get("imagery_source", IMAGERY_REDACTED) != dparams.imagery_source:
         return False
     # THE TRUST DECISION IT READ THE PIXELS UNDER (`dense_pipeline.recorded_trust`).
     # A walk's stage re-redacted under `none` and recorded those bytes' SHA-1;
@@ -550,6 +559,13 @@ def surfacify(store, world_id: str, session_id: str, *,
 
         tparams = TransientParams(mode=params.transient_detector)
         pdigest += "|transients:" + tparams.rule_id()
+        if is_raw(params.imagery_source):
+            # §6.6. `_params_digest` already carries it through
+            # `digest_fields`; this is the spelling a human reads in
+            # `manifest.params_digest`, and the log line beside it.
+            pdigest += "|imagery:" + params.imagery_source
+            logger.warning("[Tower][WorldBuilder][surface] %s/%s: %s",
+                           world_id, session_id, RAW_NOTE)
 
         done = _already_built(root, digest, pdigest, force)
         if done is not None:
@@ -567,7 +583,8 @@ def surfacify(store, world_id: str, session_id: str, *,
         align, work = ensure_depth_stage(
             store, world_id, session_id, solution, intrinsics,
             gate_rel=params.gate_rel, backend=backend,
-            should_stop=should_stop, progress=progress)
+            should_stop=should_stop, progress=progress,
+            imagery_source=params.imagery_source)
         seconds[STAGE_DEPTH] = round(time.time() - t, 2)
         if _stopped(should_stop):
             return _stop(root, STAGE_DEPTH, seconds)
@@ -586,7 +603,8 @@ def surfacify(store, world_id: str, session_id: str, *,
         t = time.time()
         frames.transients = _ensure_transients(
             store, world_id, session_id, solution, intrinsics, align, work, frames,
-            tparams, should_stop, progress, transient_backend_factory)
+            tparams, should_stop, progress, transient_backend_factory,
+            imagery_source=params.imagery_source)
         seconds[STAGE_TRANSIENTS] = round(time.time() - t, 2)
         if frames.transients.state == "stopped" or _stopped(should_stop):
             return _stop(root, STAGE_TRANSIENTS, seconds)
@@ -689,20 +707,29 @@ STAGE_TRANSIENTS = "transients"
 
 
 def _ensure_transients(store, world_id, session_id, solution, intrinsics, align, work,
-                       frames, tparams, should_stop, progress, backend_factory):
+                       frames, tparams, should_stop, progress, backend_factory,
+                       imagery_source: str = IMAGERY_REDACTED):
     """`transients.ensure_transient_masks` over the gated frames. Never fails
     the surface: a machine that cannot run the detector fuses without masks and
-    the manifest says `unavailable`."""
+    the manifest says `unavailable`.
+
+    The detector reads its pixels through `appearance.keyframe_source`, so the
+    imagery source travels with it (§6.6): the hand and phone masks of a
+    research build are made from the same frames the research build fuses, and
+    they cache under a key of their own, not the redacted build's."""
+    from tower.world_builder import appearance as A  # noqa: PLC0415
     from tower.world_builder import transients as T  # noqa: PLC0415
 
     records = {int(r["ki"]): r for r in align.get("records", [])
                if isinstance(r, dict) and r.get("ki") is not None}
     try:
+        policy = A.resolve_label_policy(store, world_id, session_id,
+                                        imagery_source=imagery_source)
         return T.ensure_transient_masks(
             store, world_id, session_id, [(ki, frames.kids[ki]) for ki, *_ in frames.items],
             intrinsics=intrinsics, camera=solution.camera, align_records=records,
             depth_dir=work / "depth", params=tparams, backend_factory=backend_factory,
-            should_stop=should_stop, progress=progress)
+            policy=policy, should_stop=should_stop, progress=progress)
     except Exception as exc:  # noqa: BLE001 -- a quality mask never fails the surface
         logger.exception("[Tower][WorldBuilder][surface] %s/%s: transient masks failed",
                          world_id, session_id)
@@ -1253,6 +1280,10 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
         # the session no longer reads is not drawable
         # (`store.built_from_an_inactive_keyframe_set`).
         "keyframe_image_set": keyframe_image_set,
+        # WHICH IMAGERY FUSED THIS GEOMETRY AND COLOURED IT (§6.6). Absent
+        # means `redacted` for every surface built before the bypass existed.
+        "imagery_source": params.imagery_source,
+        "privacy_safe": not is_raw(params.imagery_source),
         "params": {k: (list(v) if isinstance(v, tuple) else v)
                    for k, v in params.__dict__.items()},
         "median_scene_depth": median_depth,

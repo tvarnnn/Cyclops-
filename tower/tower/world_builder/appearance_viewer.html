@@ -90,6 +90,22 @@ button[disabled]{opacity:.4}
 #msg{position:fixed;inset:0;display:none;place-content:center;padding:28px;text-align:center;
   color:var(--dim);background:var(--bg);z-index:5}
 #msg.on{display:grid}
+/* The research marker: top of the screen, above the canvas and the caption,
+   never dismissable, and it does not take pointer events so it cannot get in
+   the way of the one-finger look. Hidden entirely for a product build. */
+#rawmark{position:fixed;top:0;left:0;right:0;z-index:6;pointer-events:none;
+  padding:calc(6px + env(safe-area-inset-top)) 12px 6px;text-align:center;
+  font-size:11px;line-height:1.35;letter-spacing:.04em;text-transform:uppercase;
+  color:#2a0b06;background:#ffb4a2;border-bottom:1px solid #c96a52}
+#rawmark[hidden]{display:none}
+/* Everything else anchored to the top of the screen moves down by the
+   marker's own height, so the marker covers the ROOM and not the caption,
+   the compass or its label -- all three of which are also `top: 0`-ish and
+   would otherwise sit under it. `--rawmark` is the height the script
+   measures once the marker has laid out; 26px is the one-line fallback. */
+body.rawimagery #caption{padding-top:calc(10px + var(--rawmark, 26px) + env(safe-area-inset-top))}
+body.rawimagery #compass{top:calc(8px + var(--rawmark, 26px) + env(safe-area-inset-top))}
+body.rawimagery #clabel{top:calc(66px + var(--rawmark, 26px) + env(safe-area-inset-top))}
 .spacer{flex:1}
 #pos{font-variant-numeric:tabular-nums;color:var(--dim);font-size:12px}
 #hint{position:fixed;left:50%;bottom:calc(104px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:6px 12px;border-radius:14px;
@@ -181,6 +197,12 @@ button[disabled]{opacity:.4}
 <div id="back" aria-hidden="true"></div>
 <div id="hint" aria-live="polite">Not captured beyond here</div>
 <div id="dark" role="status" aria-live="polite"></div>
+<!-- The research marker (contract §6.6). Empty and hidden for the product;
+     a research build fills it and it stays on screen for the life of the
+     page, above everything, because the caption can be collapsed and the
+     one thing a viewer must not have to go looking for is whether the faces
+     in front of them were redacted. -->
+<div id="rawmark" role="status" aria-live="polite" hidden></div>
 <div id="msg"></div>
 <script>
 "use strict";
@@ -194,6 +216,20 @@ button[disabled]{opacity:.4}
    own origin only in the explicit desktop debug mode. Nothing is written
    anywhere: textures live in GPU memory for the life of the page. */
 const CONFIG = __WB_APPEARANCE_CONFIG__;
+/* WHICH IMAGERY THIS PAGE IS SHOWING (contract §6.6).
+
+   `redacted`, or an absent field, is the product: the wearer's redacted
+   keyframes, which is what every build before the research bypass existed
+   was. Anything else is the bypass -- the original local capture, with no
+   redaction -- and the page says so in its headline, in its About panel and
+   in a marker that never goes away, because an unlabelled research build
+   looks exactly like the product.
+
+   The default is deliberately the SAFE-LOOKING one only because the Tower
+   refuses to serve a raw artifact at all unless it was itself started for
+   research (`appearance_pipeline.label_matches`), so an unknown value here
+   cannot be a raw artifact that slipped through. */
+const RAW_IMAGERY = !!CONFIG.imagery_source && CONFIG.imagery_source !== "redacted";
 const T0 = performance.now();
 const S = {                          // what the page reports about itself
   phase: "starting", encoding: null, layers: 0, capacity: 0, keyframesInManifest: 0,
@@ -203,6 +239,24 @@ const S = {                          // what the page reports about itself
 window.__wbAppearance = S;
 
 const $ = id => document.getElementById(id);
+/* The research marker, raised once, before anything can be drawn -- not from
+   `updateCaption`, which runs only after a manifest arrives, and not from the
+   boot sequence, which can fail. If this page is showing unredacted imagery
+   the viewer must be told even if nothing else on it ever works. It survives
+   `fail()`, which hides the caption. */
+(function markImagery(){
+  if (!RAW_IMAGERY) return;
+  const m = $("rawmark");
+  if (!m) return;
+  m.textContent = "Research build — unredacted local capture — not privacy-safe";
+  m.hidden = false;
+  document.body.classList.add("rawimagery");
+  const push = () => document.documentElement.style.setProperty(
+    "--rawmark", Math.round(m.getBoundingClientRect().height) + "px");
+  push();
+  addEventListener("resize", push);
+  document.title = "RESEARCH — " + document.title;
+})();
 function fail(text){
   S.phase = "failed"; S.errors.push(String(text));
   const m = $("msg"); m.textContent = text; m.classList.add("on");
@@ -4065,8 +4119,18 @@ async function main(){
     const cap = $("caption");
     cap.textContent = "";
     const head = document.createElement("b");
-    head.textContent = "Captured images on reconstructed geometry";
+    // WHICH IMAGERY THIS IS, IN THE HEADLINE. The "What you are looking at"
+    // sentence below used to say "with faces redacted" whatever the artifact
+    // was, because the page was never told: `build_appearance_config` carried
+    // thirty rendering constants and no provenance at all. A research build
+    // made from the original local capture now says so in the one line that
+    // is always on screen, not only in the panel behind the About button.
+    head.textContent = RAW_IMAGERY
+      ? "RESEARCH BUILD — unredacted captured images on reconstructed geometry"
+      : "Captured images on reconstructed geometry";
+    if (RAW_IMAGERY) head.style.color = "#ffb4a2";
     const bits = [];
+    if (RAW_IMAGERY) bits.push("original local capture: faces and screens are NOT redacted");
     if (manifest){
       bits.push(S.layers + " of " + S.keyframesInManifest + " keyframes shown");
       if (S.holding) bits.push("finishing the world: these are the walk's images until the final ones arrive");
@@ -4117,7 +4181,11 @@ async function main(){
     // redacted regions, and nothing here alters what the crack fill does.
     const sections = [
       ["What you are looking at",
-       "These are the camera's own frames, with faces redacted, placed on the reconstructed room."
+       (RAW_IMAGERY
+         ? "These are the camera's own frames, UNREDACTED, placed on the reconstructed room."
+           + " This is a research build made from the original capture on this machine: no face"
+           + " redaction was applied to it and it is not safe to share."
+         : "These are the camera's own frames, with faces redacted, placed on the reconstructed room.")
        + " Nothing is painted in or imagined: if the glasses did not see it, it is not here."],
       ["The flat grey patches",
        "A flat grey patch is a place no kept frame saw, or one that was masked as unreliable"

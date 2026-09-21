@@ -40,6 +40,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.global_solve import load_solution  # noqa: E402
+from tower.world_builder.raw_imagery import (  # noqa: E402
+    IMAGERY_REDACTED,
+    IMAGERY_SOURCES,
+    RAW_NOTE,
+    imagery_source_from_env,
+)
 from tower.world_builder.store import WorldStore  # noqa: E402
 from tower.world_builder.surface import (  # noqa: E402
     SurfaceParams,
@@ -62,16 +68,24 @@ def _sessions_with_solves(store, world_id):
             if load_solution(store, world_id, sid) is not None]
 
 
+def _imagery_from_args(args) -> str:
+    """The flag, else the environment, else the product. Never guessed."""
+    return getattr(args, "imagery_source", None) or imagery_source_from_env()
+
+
 def _params_from_args(args) -> SurfaceParams:
+    imagery = _imagery_from_args(args)
+    if imagery != IMAGERY_REDACTED:
+        print(f"  !! {RAW_NOTE}", file=sys.stderr, flush=True)
     if args.live:
-        overrides = {}
+        overrides = {"imagery_source": imagery}
         for name in ("voxel_frac", "min_weight", "smooth_iterations",
                      "min_component_frac", "gate_rel", "transient_detector"):
             value = getattr(args, name, None)
             if value is not None:
                 overrides[name] = value
         return SurfaceParams.live(**overrides)
-    kw = {}
+    kw = {"imagery_source": imagery}
     for name in ("voxel_frac", "trunc_voxels", "trunc_error_multiple",
                  "min_weight", "carve_weight", "max_grazing_deg", "edge_rel",
                  "gate_rel", "min_component_frac", "smooth_iterations",
@@ -88,7 +102,8 @@ def _print_progress(stage, done, total):
     print(f"    {stage}: {done}/{total}", flush=True)
 
 
-def _build_appearance(store, world_id, sid, *, live: bool, transients: str | None = None) -> None:
+def _build_appearance(store, world_id, sid, *, live: bool, transients: str | None = None,
+                      imagery_source: str = IMAGERY_REDACTED) -> None:
     """The appearance on the surface just built, in this process.
 
     In the SAME child as the live surface rather than a second one: it needs
@@ -101,6 +116,9 @@ def _build_appearance(store, world_id, sid, *, live: bool, transients: str | Non
 
     t = time.time()
     overrides = {"transient_detector": transients} if transients else {}
+    # The appearance must be made of the imagery the surface was made of, or
+    # the colours and the geometry are two different rooms (§6.6).
+    overrides["imagery_source"] = imagery_source
     params = AppearanceParams.live(**overrides) if live else AppearanceParams(**overrides)
     result = build_appearance(store, world_id, sid, params=params)
     print(f"  appearance {result.state}: {result.keyframes} keyframes "
@@ -126,6 +144,15 @@ def main() -> int:
     ap.add_argument("--export-obj", help="write the canonical level as a .obj")
     ap.add_argument("--export-level", type=int, default=None)
     ap.add_argument("--backend", help="depth backend for the shared depth stage")
+    ap.add_argument("--imagery-source", dest="imagery_source", choices=IMAGERY_SOURCES,
+                    default=None,
+                    help="which imagery to fuse and colour from. `redacted` is the "
+                         "product and the default. `raw-local-research` is the research "
+                         "bypass: the ORIGINAL local capture, with no redaction fill to "
+                         "measure, inpaint or mask -- NOT privacy-safe, and labelled as "
+                         "such in the surface manifest and in every artifact built on "
+                         "it. Unset, TOWER_WORLD_RAW_IMAGERY decides, and that is "
+                         "`redacted` unless it is set.")
     ap.add_argument("--live", action="store_true",
                     help="the coarse preset the builder runs DURING a walk: "
                          "twice the voxel, one level of detail, a lighter "
@@ -250,7 +277,8 @@ def main() -> int:
               + (f" -- {tr['detail']}" if tr.get("detail") else ""), flush=True)
         if args.appearance:
             _build_appearance(store, world_id, sid, live=args.live,
-                              transients=args.transient_detector)
+                              transients=args.transient_detector,
+                              imagery_source=_imagery_from_args(args))
     if cannot_run_here:
         # Distinct from an ordinary failure, so the builder's live worker can
         # stop relaunching (SURFACE_EXIT_CANNOT_RUN_HERE in world_build_session).

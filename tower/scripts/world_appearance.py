@@ -41,6 +41,12 @@ from tower.world_builder.appearance_pipeline import (  # noqa: E402
     read_appearance_manifest,
 )
 from tower.world_builder.global_solve import load_solution  # noqa: E402
+from tower.world_builder.raw_imagery import (  # noqa: E402
+    IMAGERY_REDACTED,
+    IMAGERY_SOURCES,
+    RAW_NOTE,
+    imagery_source_from_env,
+)
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 DEFAULT_ROOT = Path("data") / "world_builder"
@@ -99,6 +105,15 @@ def main(argv=None) -> int:
                     choices=("union", "oneformer", "off"),
                     help="the transient detector (default: union; oneformer with --live)")
     ap.add_argument("--device", help="torch device for the GPU stages (default: cuda if available)")
+    ap.add_argument("--imagery-source", dest="imagery_source", choices=IMAGERY_SOURCES,
+                    default=None,
+                    help="which imagery to build from. `redacted` is the product and the "
+                         "default. `raw-local-research` is the research bypass: the "
+                         "ORIGINAL local capture, no redaction, no fill mask, no "
+                         "cross-frame consensus -- NOT privacy-safe, labelled as such in "
+                         "the artifact, and refused by a Tower that did not ask for it. "
+                         "Unset, the value of TOWER_WORLD_RAW_IMAGERY decides, and that "
+                         "is `redacted` unless it is set.")
     args = ap.parse_args(argv)
 
     store = WorldStore(Path(args.root))
@@ -118,6 +133,10 @@ def main(argv=None) -> int:
         overrides["phone_budget"] = args.phone_budget
     if args.transient_detector is not None:
         overrides["transient_detector"] = args.transient_detector
+    imagery = args.imagery_source or imagery_source_from_env()
+    overrides["imagery_source"] = imagery
+    if imagery != IMAGERY_REDACTED:
+        print(f"  !! {RAW_NOTE}", file=sys.stderr, flush=True)
     params = AppearanceParams.live(**overrides) if args.live else AppearanceParams(**overrides)
     failures = 0
     for sid in sessions:

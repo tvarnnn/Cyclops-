@@ -51,6 +51,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED
+
 
 def torch_full_like(t, value):
     import torch
@@ -129,6 +131,15 @@ class SurfaceUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class SurfaceParams:
     """Everything the fusion needs, in units of the scene's own median depth."""
+
+    # -- which imagery (WORLD-BUILDER-APPEARANCE.md §6.6) --------------------
+    imagery_source: str = IMAGERY_REDACTED
+    """`redacted`, the product, or `raw-local-research`, the owner-sanctioned
+    bypass that fuses depth and vertex colours from the ORIGINAL local capture
+    instead. It reaches the depth stage through `ensure_depth_stage`, so the
+    geometry and the appearance are made of the same pixels; it is part of the
+    params digest, so neither mode's artifact is ever mistaken for the
+    other's; and it is not privacy-safe."""
 
     # -- resolution ---------------------------------------------------------
     voxel_frac: float = 0.0051
@@ -566,6 +577,11 @@ class SurfaceParams:
         for a parameter they never used.
         """
         base = (
+            # Appended only when it is NOT the product, exactly as the fill
+            # fields are: every digest ever written for a redacted surface is
+            # unchanged, and a raw one can never collide with it.
+            *((("imagery", self.imagery_source),)
+              if self.imagery_source != IMAGERY_REDACTED else ()),
             self.voxel_frac, self.trunc_voxels, self.trunc_error_multiple,
             self.trunc_depth_proportional, self.trunc_max_voxels, "all-corners",
             self.min_weight, self.carve, self.carve_weight,

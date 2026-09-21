@@ -56,6 +56,7 @@ from tower.world_builder.dense import (
     voxel_reduce,
     write_points_bin,
 )
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED, RAW_NOTE, is_raw
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,10 @@ def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None,
     """
     fields = [digest, params.backend, params.component, params.min_sparse_points,
               f"fill{FILL_RULE}"]
+    # §6.6, and only when it is NOT the product, so every key ever written
+    # for a redacted build is unchanged and still matches.
+    if is_raw(params.imagery_source):
+        fields.append(f"imagery:{params.imagery_source}")
     if image_set:
         fields.append(f"set:{image_set}")
     # `trust` is `appearance.pixel_trust_token`: whether the stage used the
@@ -165,12 +170,20 @@ def recorded_trust(align: dict | None) -> str | None:
     return None
 
 
-def depth_trust_now(store, world_id: str, session_id: str, redactor=None) -> str:
+def depth_trust_now(store, world_id: str, session_id: str, redactor=None,
+                    imagery_source: str = IMAGERY_REDACTED) -> str:
     """The token a depth stage run NOW would record: the keyframe set's label
     through the one allowlist, and the current redactor's label when that
-    label is not trusted. `FaceRedactor()` is cheap (its model loads lazily)."""
+    label is not trusted. `FaceRedactor()` is cheap (its model loads lazily).
+
+    Under the bypass (§6.6) the label is irrelevant and no redactor is loaded:
+    the token names the imagery source instead, and shares no spelling with
+    either redacted one."""
     from tower.world_builder.appearance import label_is_trusted, pixel_trust_token  # noqa: PLC0415
 
+    if is_raw(imagery_source):
+        return pixel_trust_token(None, None, imagery_source=imagery_source,
+                                 raw_token=imagery_source)
     label = store.keyframe_image_set(world_id, session_id).redaction
     if label_is_trusted(label):
         return pixel_trust_token(label)
@@ -188,6 +201,11 @@ def depth_cache_matches(cached: dict | None, digest, params: DenseParams,
     parameters, this keyframe set AND this trust decision. A key written before
     the trust token existed matches when its recorded trust equals `trust`."""
     if not isinstance(cached, dict) or recorded_trust(cached) != trust:
+        return False
+    # §6.6, checked on the record itself and not only through the key: a
+    # record written before the bypass existed has no `imagery_source` and is
+    # a redacted one, which is what it was.
+    if cached.get("imagery_source", IMAGERY_REDACTED) != params.imagery_source:
         return False
     return cached.get("cache_key") in (_depth_cache_key(digest, params, image_set, trust),
                                        _depth_cache_key(digest, params, image_set))
@@ -353,6 +371,12 @@ class _DenseLock:
 # when it returned the ORIGINAL bytes because the detector threw.
 from tower.world_builder.redaction import REDACTION_NONE  # noqa: E402
 
+# The research bypass's two outcomes (WORLD-BUILDER-APPEARANCE.md §6.6).
+# Deliberately not spelled like any `world-keyframe` origin: a record carrying
+# one of these cannot be skimmed as a redacted build's.
+ORIGIN_RAW_LOCAL = "raw-local-capture-frame"
+ORIGIN_RAW_MISSING = "refused-raw-frame-missing"
+
 
 class DenseInputsPruned(DenseUnavailable):
     """Asked to run from intermediates that a successful run removed.
@@ -435,6 +459,7 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
                          source_path: str | None, redactor, *,
                          keyframes_are_redacted: bool,
                          image_set=None,
+                         imagery_source: str = IMAGERY_REDACTED,
                          ) -> tuple[bytes | None, str, "np.ndarray | None"]:
     """The pixels the dense stage is allowed to read, and where they came from.
 
@@ -485,6 +510,13 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
     set's own label is on the allowlist. `label != "none"` trusted any string,
     the weak `+plausibility2` gate included, and served one session under two
     trust decisions (review 1, M2; privacy lane L2).
+
+    `imagery_source` is the ONE way past all of the above, and it is
+    `redacted` unless a caller asked otherwise (WORLD-BUILDER-APPEARANCE.md
+    §6.6). Under `raw-local-research` this returns the original local frame
+    itself with an origin that says so and NO fill mask, because there is no
+    fill: the caller must then neither inpaint nor mask, and the records it
+    writes carry the same source, so no redacted build reuses them.
     """
     from tower.world_builder.appearance import label_is_trusted
     from tower.world_builder.global_solve import resolve_source_path
@@ -497,6 +529,10 @@ def keyframe_image_bytes(store, world_id: str, session_id: str, keyframe_id: str
             raw_bytes = resolved.read_bytes()
         except OSError:
             raw_bytes = None
+    if is_raw(imagery_source):
+        if raw_bytes is None:
+            return None, ORIGIN_RAW_MISSING, None
+        return raw_bytes, ORIGIN_RAW_LOCAL, None
     if image_set is None:
         image_set = store.keyframe_image_set(world_id, session_id)
     keyframes_are_redacted = bool(keyframes_are_redacted) and label_is_trusted(image_set.redaction)
@@ -651,19 +687,30 @@ def run_depth_stage(
 
     keyframes_are_redacted = label_is_trusted(session_redaction)
 
-    redactor = FaceRedactor()
+    # §6.6. Under the bypass no redactor is loaded, because none is used: the
+    # frames this stage reads were never redacted and the records say so.
+    raw_imagery = is_raw(params.imagery_source)
+    redactor = None if raw_imagery else FaceRedactor()
     trust = pixel_trust_token(
         session_redaction,
-        None if keyframes_are_redacted
-        else (getattr(redactor, "label", None) if redactor.available else None))
-    if not keyframes_are_redacted:
+        None if keyframes_are_redacted or redactor is None
+        else (getattr(redactor, "label", None) if redactor.available else None),
+        imagery_source=params.imagery_source,
+        raw_token=params.imagery_source)
+    if raw_imagery:
+        logger.warning(
+            "[Tower][WorldBuilder][dense] session %s: building depth from the "
+            "ORIGINAL local capture frames (%s). No redaction fill is measured, "
+            "nothing is inpainted and nothing is masked for privacy.",
+            session_id, RAW_NOTE)
+    if not keyframes_are_redacted and not raw_imagery:
         logger.warning(
             "[Tower][WorldBuilder][dense] session %s records redaction=%r; its "
             "stored keyframes are NOT trusted as redacted and will be redacted "
             "here before any pixel is read",
             session_id, session_redaction,
         )
-    if not redactor.available:
+    if redactor is not None and not redactor.available:
         logger.warning(
             "[Tower][WorldBuilder][dense] face redaction unavailable (%s); frames "
             "whose redacted keyframe image is missing will be REFUSED rather than "
@@ -731,6 +778,7 @@ def run_depth_stage(
                     "camera": cam, "targets": len(targets), "image_origins": origins,
                     "kind": backend.kind, "fill_rule": FILL_RULE,
                     "keyframe_image_set": image_set.cache_token,
+                    "imagery_source": params.imagery_source,
                     "redaction_trust": trust}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
@@ -742,6 +790,7 @@ def run_depth_stage(
         data, origin, exact_fill = keyframe_image_bytes(
             store, world_id, session_id, kid, sources.get(kid), redactor,
             keyframes_are_redacted=keyframes_are_redacted, image_set=image_set,
+            imagery_source=params.imagery_source,
         )
         image_sha1 = hashlib.sha1(data).hexdigest() if data is not None else None
         # A prediction is reused only for the SAME IMAGE, not merely the same
@@ -795,13 +844,19 @@ def run_depth_stage(
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         # The exact mask when the raw frame was available, and only then the
-        # shape-gated guess.
-        fill = (cv2.dilate(exact_fill.astype(np.uint8), np.ones((3, 3), np.uint8),
-                           iterations=3).astype(bool)
-                if exact_fill is not None
-                else redaction_fill_mask(raw, None))
-        fill_u = cv2.remap(fill.astype(np.uint8) * 255, m1, m2,
-                           cv2.INTER_NEAREST)[y0:y0 + rh, x0:x0 + rw] > 0
+        # shape-gated guess. Under the bypass (§6.6) there is nothing to mask:
+        # an EMPTY mask is written rather than none at all, because a missing
+        # `_fill.npy` means "unknown" to three later readers and this one is
+        # known -- these pixels are the camera's, entire.
+        if raw_imagery:
+            fill_u = np.zeros((rh, rw), bool)
+        else:
+            fill = (cv2.dilate(exact_fill.astype(np.uint8), np.ones((3, 3), np.uint8),
+                               iterations=3).astype(bool)
+                    if exact_fill is not None
+                    else redaction_fill_mask(raw, None))
+            fill_u = cv2.remap(fill.astype(np.uint8) * 255, m1, m2,
+                               cv2.INTER_NEAREST)[y0:y0 + rh, x0:x0 + rw] > 0
         np.save(work / "depth" / f"{ki:05d}_fill.npy", fill_u)
         fill_fraction = float(fill_u.mean())
         if params.inpaint_redaction_fill and fill_u.any():
@@ -835,12 +890,14 @@ def run_depth_stage(
                "stopped_after": None,
                "fill_rule": FILL_RULE,
                "keyframe_image_set": image_set.cache_token,
+               "imagery_source": params.imagery_source,
                "redaction_trust": trust,
                "image_origins": origins,
                "redaction": session_redaction,
-               "keyframes_were_redacted_at_capture": keyframes_are_redacted,
+               "keyframes_were_redacted_at_capture": keyframes_are_redacted and not raw_imagery,
                "redactor_applied_here": (
-                   getattr(redactor, "label", None) if redactor.available else None)}
+                   getattr(redactor, "label", None)
+                   if redactor is not None and redactor.available else None)}
     _write_json(root / "align.json", payload)
     return payload
 
@@ -919,16 +976,29 @@ def _fit_record(ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
                     "image_origin": origin}
 
 
-def reusable_predictions(align_path: Path, backend: str) -> dict:
+def reusable_predictions(align_path: Path, backend: str,
+                         imagery_source: str = IMAGERY_REDACTED) -> dict:
     """`{ki: kid}` for every frame an earlier depth stage predicted with this
     backend, read off its `align.json`. Empty when there is none or it cannot
     be read; the depth stage then predicts every frame, which is slower and
-    never wrong."""
+    never wrong.
+
+    THE IMAGE HASH IS NOT ENOUGH ACROSS §6.6. A keyframe the redactor found
+    nothing in has a stored image byte-identical to its original frame, so
+    the hashes match -- but the redacted stage may still have INPAINTED it,
+    because the fill mask is a shape-gated guess with false positives, and
+    the prediction it cached was made on invented pixels. Measured on the
+    canonical world: 215 of 395 frames offered a hash-matching prediction to
+    a raw build. So a prediction crosses modes only when both stages read the
+    same kind of imagery.
+    """
     try:
         cached = json.loads(align_path.read_text())
     except (OSError, ValueError):
         return {}
     if cached.get("backend") != backend:
+        return {}
+    if cached.get("imagery_source", IMAGERY_REDACTED) != imagery_source:
         return {}
     # (kid, image hash): a record written before hashes were recorded offers
     # nothing, and costs one fresh prediction rather than a wrong reuse. Nor
@@ -1498,7 +1568,8 @@ def densify(
                                     params, root, should_stop=should_stop,
                                     progress=progress, prior=prior,
                                     reuse_predictions=reusable_predictions(
-                                        align_path, params.backend))
+                                        align_path, params.backend,
+                                        params.imagery_source))
             if align.get("stopped_after") is None:
                 # Only a COMPLETE stage names its solve. A stopped one written
                 # under the digest was trusted as a finished cache.
