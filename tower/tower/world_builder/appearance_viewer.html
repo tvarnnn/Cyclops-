@@ -27,6 +27,7 @@ canvas{display:block;width:100%;height:100%;touch-action:none;background:var(--b
    moment the app sets `ignoresViewportScaleLimits` (an accessibility
    setting). */
 #bar,#caption,#status,#hint,#msg{touch-action:none}
+#compass,#back{touch-action:manipulation}
 /* Landscape on a notched phone: `viewport-fit=cover` puts the sensor housing
    over the left or right edge, and nothing here reserved for it. */
 #bar{position:fixed;left:0;right:0;bottom:0;
@@ -44,8 +45,9 @@ button[disabled]{opacity:.4}
    that keeps the page honest, so it is the one that must be legible on every
    frame. The head keeps the gradient; the expanded text carries its own
    plate. */
+/* The right gutter is the orientation ring's. */
 #caption{position:fixed;left:0;right:0;top:0;
-  padding:calc(10px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 10px
+  padding:calc(10px + env(safe-area-inset-top)) calc(78px + env(safe-area-inset-right)) 10px
           calc(12px + env(safe-area-inset-left));
   background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,.72) 55%,rgba(11,13,16,0));
   font-size:12px;color:var(--dim);pointer-events:none}
@@ -74,6 +76,34 @@ button[disabled]{opacity:.4}
 #hint{position:fixed;left:50%;bottom:calc(104px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:6px 12px;border-radius:14px;
   background:rgba(11,13,16,.55);color:var(--dim);font-size:12px;pointer-events:none;opacity:0;
   transition:opacity .35s ease}
+/* THE ORIENTATION RING. Turning is free and on this capture more than half of
+   a full turn was never photographed, so the page has to be able to say where
+   the room is while you are pointed away from it -- otherwise five black
+   frames in a row read as a crash rather than as the truth.
+   The ring is a compass of COVERAGE: the lit arc is the directions a
+   photograph exists in, from where you stand; the way you are looking is
+   always at the top. When the lit arc is at the bottom, the room is behind
+   you. It says nothing about whether there is anything worth seeing there. */
+#compass{position:fixed;top:calc(8px + env(safe-area-inset-top));
+  right:calc(10px + env(safe-area-inset-right));width:58px;height:58px;
+  opacity:0;transition:opacity .4s ease;cursor:pointer}
+#compass.on{opacity:.93}
+/* The way back, at the edge of the frame, and only while the view is on
+   nothing: a chevron toward the shorter turn to the nearest covered heading.
+   Tapping it does what the button does. */
+/* Drawn, not typed: a glyph would depend on a font the phone may not have,
+   and a chevron that renders as a box is worse than no cue at all. */
+#back{position:fixed;top:50%;transform:translateY(-50%);width:44px;height:64px;
+  display:grid;place-content:center;color:var(--ink);
+  opacity:0;pointer-events:none;transition:opacity .5s ease;
+  filter:drop-shadow(0 1px 6px rgba(0,0,0,.95));cursor:pointer}
+#back::before{content:"";display:block;width:0;height:0;
+  border-top:13px solid transparent;border-bottom:13px solid transparent}
+#back.right::before{border-left:17px solid currentColor}
+#back.left::before{border-right:17px solid currentColor}
+#back.on{opacity:.72;pointer-events:auto}
+#back.left{left:calc(2px + env(safe-area-inset-left))}
+#back.right{right:calc(2px + env(safe-area-inset-right))}
 </style>
 </head>
 <body>
@@ -86,12 +116,18 @@ button[disabled]{opacity:.4}
        a view FROM the desk. The button goes to the best-supported vantage
        there is, it says so, and it flies there. -->
   <button id="bOverview" aria-label="Fly to the clearest vantage">Best view</button>
+  <!-- Turns, from where you stand, to the nearest heading the glasses actually
+       photographed. It does not move you: that is what Best view does. -->
+  <button id="bBack" aria-label="Turn to the nearest photographed direction">Face the room</button>
   <button id="bPrev" aria-label="Previous recorded view">&#8592;</button>
   <button id="bNext">&#8594;</button>
   <span id="pos"></span>
   <span class="spacer"></span>
   <button id="bReset">Reset</button>
 </div>
+<canvas id="compass" width="58" height="58" role="img"
+  aria-label="Which directions were photographed from here"></canvas>
+<div id="back" aria-hidden="true"></div>
 <div id="hint" aria-live="polite">Not captured beyond here</div>
 <div id="msg"></div>
 <script>
@@ -165,6 +201,14 @@ const OPT = {
   standoff: Math.max(0.2, Math.min(4.0, +(Q.get("sd") ?? CONFIG.standoff ?? 1.0))),
   fog: +(Q.get("fog") ?? CONFIG.void_fog ?? 0.35),
   wide: +(Q.get("wide") ?? CONFIG.void_wide_fade ?? 0.2),
+  // How badly a vertex has to be measured before its photograph is faded back
+  // into the void (the proxy's confidence byte, 0..1). The band is the PHONE
+  // LEVEL's: the channel is not comparable between levels of detail, and the
+  // archive level's own band would fade a fifth of the opening view. Zero
+  // disables the fade; `proxy.confidence.present === false` does too, and that
+  // is NOT the same as "confidence zero".
+  confLo: Math.max(0, Math.min(1, +(Q.get("clo") ?? CONFIG.confidence_lo ?? (24 / 255)))),
+  confHi: Math.max(0, Math.min(1, +(Q.get("chi") ?? CONFIG.confidence_hi ?? (78 / 255)))),
   forceWebp: Q.get("enc") === "webp",
   debugMode: +(Q.get("dbg") || 0),
   preserve: Q.get("preserve") === "1",
@@ -423,6 +467,9 @@ const NAV = (() => {
   // settle exists for a camera the PAGE placed (an opening, a walk step, the
   // Best view) that landed on nothing.
   const C_DRIFT_MAX = 0.30, C_DRIFT_RATE = 0.30, C_SETTLE = 0.60, C_GRAD_EPS = 0.30;
+  // Where the content gradient is flat because there is no content anywhere
+  // near, the settle asks the same question of COVERAGE, over a wider angle.
+  const C_GRAD_WIDE = 0.60;
   // Resistance scales a worsening step by (1 - smooth(B_FREE, 1, b))^2: free
   // over the first part of the band, so a push in a good place is not sluggish.
   // Raised from 0.35: the only bounds left are the tube and the standoff, and
@@ -497,23 +544,31 @@ const NAV = (() => {
      seenOff: Int32Array N+1 and seenIdx: Int32Array (CSR: the sources that saw
      each sample), centres: Float32Array (x,y,z) per source, path}. Built in
      slices (`fieldWork`) so the page stays interactive. */
-  function fieldJob(input){
-    const {path} = input, pad = R_MAX + SPACING;
+  /* `spacing` defaults to SPACING. A COARSER field is the same field on a
+     wider lattice: it costs an eighth of the work at twice the spacing and it
+     answers the same question a little more bluntly, which is the right trade
+     for the second or two before the real one exists (the page cannot say why
+     a direction is dark until some field is built, and widening the tube
+     doubled how long that takes). The page builds a coarse one first, uses it,
+     and swaps in the fine one when it lands. */
+  function fieldJob(input, spacing){
+    const sp = spacing > 0 ? spacing : SPACING;
+    const {path} = input, pad = R_MAX + sp;
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (let i = 0; i < path.n; i++) for (let k = 0; k < 3; k++){
       lo[k] = Math.min(lo[k], path.P[i*3+k] - pad); hi[k] = Math.max(hi[k], path.P[i*3+k] + pad);
     }
-    const dims = [0, 1, 2].map(k => Math.max(1, Math.ceil((hi[k] - lo[k]) / SPACING) + 1));
+    const dims = [0, 1, 2].map(k => Math.max(1, Math.ceil((hi[k] - lo[k]) / sp) + 1));
     const index = new Int32Array(dims[0] * dims[1] * dims[2]).fill(-1);
     const where = [];
     for (let z = 0; z < dims[2]; z++) for (let y = 0; y < dims[1]; y++) for (let x = 0; x < dims[0]; x++){
-      const p = [lo[0] + x * SPACING, lo[1] + y * SPACING, lo[2] + z * SPACING];
-      if (!path.n || pathDist(path, p).e > 1 + SPACING * 1.2) continue;   // a margin for interpolation
+      const p = [lo[0] + x * sp, lo[1] + y * sp, lo[2] + z * sp];
+      if (!path.n || pathDist(path, p).e > 1 + sp * 1.2) continue;   // a margin for interpolation
       index[(z * dims[1] + y) * dims[0] + x] = where.length / 3;
       where.push(p[0], p[1], p[2]);
     }
     const count = where.length / 3;
-    return {input, lo, dims, index, where: Float32Array.from(where), count,
+    return {input, lo, dims, index, spacing: sp, where: Float32Array.from(where), count,
             cov: new Uint8Array(count * CELLS), dist: new Uint8Array(count * CELLS),
             con: new Uint8Array(count * CELLS), near: null,
             next: 0, done: count === 0};
@@ -583,7 +638,7 @@ const NAV = (() => {
       const q = rays[i];
       cells[i] = cellOf(r[0]*q[0] + u[0]*q[1] + f[0], r[1]*q[0] + u[1]*q[1] + f[1], r[2]*q[0] + u[2]*q[1] + f[2]);
     }
-    const g = [0, 1, 2].map(k => (p[k] - F.lo[k]) / SPACING);
+    const g = [0, 1, 2].map(k => (p[k] - F.lo[k]) / (F.spacing || SPACING));
     const g0 = g.map(Math.floor), fr = g.map((v, k) => v - g0[k]);
     let s = 0, dsum = 0, dw = 0, cs2 = 0, cw = 0;
     for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++){
@@ -610,6 +665,43 @@ const NAV = (() => {
   }
   /* How rich a view is, 0 (featureless) .. 1 (the desk), from its content. */
   function richness(c){ return smooth(C_LO, C_HI, c); }
+
+  /* THE ORIENTATION RING: which way the glasses looked, from where you stand.
+     A look is free now, and on a capture like this one a full turn is more than
+     half black -- five consecutive 30-degree steps of nothing at all. That is
+     the truth about the capture, but with nothing on screen it reads as a
+     crash, so the page has to be able to say where the room IS while you are
+     pointed away from it.
+     `ringProfile` is the support of the view at `bins` headings on the horizon
+     from one position -- the same `support` the rest of the page uses, at the
+     same field of view, so the ring reports COVERAGE and only coverage. It
+     never says there is something worth seeing; it says a photograph exists. */
+  function ringProfile(F, p, V, bins){
+    const n = Math.max(4, bins | 0), out = new Float32Array(n);
+    if (!F || !F.done || !F.count) return out;
+    for (let i = 0; i < n; i++)
+      out[i] = support(F, p, V.dir(i * 2 * Math.PI / n, 0), V.up, V.fy, V.aspect).s;
+    return out;
+  }
+  /* The nearest well-covered heading: the best supported one, discounted by how
+     far you would have to turn to reach it, so a direction half a turn away has
+     to be RING_TURN_PENALTY better supported than one at your elbow. The yaw is
+     returned continuous with the one passed in, so a glide turns the short way.
+     Null when nothing from here is covered at all -- there is no way back to
+     offer, and the page must not invent one. */
+  const RING_TURN_PENALTY = 0.25, RING_FLOOR = 0.06;
+  function bestHeading(prof, yaw){
+    const n = prof && prof.length;
+    if (!n) return null;
+    let best = null;
+    for (let i = 0; i < n; i++){
+      let d = i * 2 * Math.PI / n - yaw;
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      const score = prof[i] - RING_TURN_PENALTY * Math.abs(d) / Math.PI;
+      if (!best || score > best.score) best = {yaw: yaw + d, delta: d, support: prof[i], score};
+    }
+    return best && best.support > RING_FLOOR ? best : null;
+  }
 
   /* The distance from p to the nearest proxy sample, and how close that is to
      the limit, 0 (free) .. 1 (at D_MIN). A uniform hash grid over the samples,
@@ -658,6 +750,30 @@ const NAV = (() => {
     const hi = Math.min(T_HI, floor ?? 1), lo = Math.min(T_LO, hi - 0.06);
     return 1 - smooth(lo, hi, s);
   }
+  /* HOW DARK a view is -- whether it is on ANYTHING, which is a different
+     question from whether it is a GOOD view, and the page had been asking the
+     second one and saying the first.
+     Found 2026-09-20 (fix-it orient lane) while wiring the orientation cue:
+     `dark` was `lookBound`, i.e. 1 below T_LO (0.68), and T_LO is the quality
+     band -- the support at which 75% of views are "good" (drawn >= 0.9,
+     blotch <= 2.5%, seam excess <= 8). On the canonical world that made
+     `dark` exactly 1 at EIGHT of nine sampled recorded poses, including ones
+     the page draws 99.4% of, and thirty frames of drag at the opening pose --
+     97% drawn, the first thing anybody sees -- raised *Nothing was
+     photographed this way* five times. A page that says that over a
+     photograph of the room is not being careful, it is crying wolf, and the
+     sentence stops meaning anything by the time it is true.
+     DARK_LO / DARK_HI are the band for the question actually being asked,
+     swept against the page's own `coverage()` over 200 reachable views
+     (ORIENT.md section 2.3). Those 200 separate cleanly: every view that is
+     at least 95% background has support at most 0.088, and every view that
+     draws at least half the frame has support at least 0.183 -- an empty gap
+     the old band sat far above. 0.07-0.25 puts the hint's own 0.9 crossing in
+     the middle of that gap, so over the 200 the sentence is said over none of
+     the 116 views that draw half the frame (the old band said it over 97 of
+     them) and over all 24 that are essentially black. */
+  const DARK_LO = 0.07, DARK_HI = 0.25;
+  function darkness(s){ return 1 - smooth(DARK_LO, DARK_HI, s); }
 
   /* One frame of camera motion. `cam` {p, yaw, pitch, floor, aimed}; `ctl`
      {look: [dyaw, dpitch], move: [right, up, forward] (scene units, camera
@@ -753,9 +869,24 @@ const NAV = (() => {
         // fine difference there is exactly zero and says nothing. It reads the
         // raw content, not its 0..1 richness, which is flat once clamped.
         const e = C_GRAD_EPS, c = (yaw, pitch) => at(out.p, yaw, pitch).c;
-        const gy = c(out.yaw + e, out.pitch) - c(out.yaw - e, out.pitch);
-        const gp = c(out.yaw, clampP(out.pitch + e)) - c(out.yaw, clampP(out.pitch - e));
-        const gl = Math.hypot(gy, gp);
+        let gy = c(out.yaw + e, out.pitch) - c(out.yaw - e, out.pitch);
+        let gp = c(out.yaw, clampP(out.pitch + e)) - c(out.yaw, clampP(out.pitch - e));
+        let gl = Math.hypot(gy, gp);
+        if (gl <= 0.005){
+          // Nothing nearby has any content -- and on a capture that never
+          // looked this way, nothing nearby has any COVERAGE either, so the
+          // content gradient is exactly zero and says nothing. Fall back to
+          // where the capture IS, asked over a wider angle still, so a camera
+          // the page dropped just past the edge of the photographs eases back
+          // over it instead of sitting on black.
+          // This is a nudge at the edge, not a way home: the whole budget is
+          // C_DRIFT_MAX, about 17 degrees, and half a turn of dark is 180. The
+          // way home is the control the page offers (`bestHeading`).
+          const w = C_GRAD_WIDE, s = (yaw, pitch) => at(out.p, yaw, pitch).s;
+          gy = s(out.yaw + w, out.pitch) - s(out.yaw - w, out.pitch);
+          gp = s(out.yaw, clampP(out.pitch + w)) - s(out.yaw, clampP(out.pitch - w));
+          gl = Math.hypot(gy, gp);
+        }
         if (gl > 0.005){
           const rate = Math.min(budget, C_DRIFT_RATE * cb * dt / 1000);
           out.cdrift = (out.cdrift || 0) + rate;
@@ -765,15 +896,15 @@ const NAV = (() => {
     } else {
       out.cdrift = 0;                                      // a finger is down: the look is the person's
     }
-    // What the view it ended on is worth, for the page to SAY (never to
-    // enforce): 0 where the capture covers this direction, 1 where it does not.
-    // Against the FIXED thresholds, not against `out.floor`. The floor exists so
-    // that a weak recorded view is never treated as "beyond" by a LIMIT, and a
-    // look has no limit any more. Left in the reporting it would have narrowed
-    // the one thing it must not: standing at the dimmest recorded pose in the
-    // world -- the darkest place on it -- is where the page would have gone
-    // quiet about the dark.
-    if (ready) out.dark = lookBound(at(out.p, out.yaw, out.pitch).s, 1);
+    // Whether the view it ended on is on ANYTHING, for the page to SAY (never
+    // to enforce): 0 where the capture covers this direction, 1 where nothing
+    // was photographed this way. Against the FIXED thresholds, not against
+    // `out.floor`. The floor exists so that a weak recorded view is never
+    // treated as "beyond" by a LIMIT, and a look has no limit any more. Left in
+    // the reporting it would have narrowed the one thing it must not: standing
+    // at the dimmest recorded pose in the world -- the darkest place on it --
+    // is where the page would have gone quiet about the dark.
+    if (ready) out.dark = darkness(at(out.p, out.yaw, out.pitch).s);
     return out;
   }
 
@@ -849,10 +980,12 @@ const NAV = (() => {
   }
 
   return {smooth, cellOf, angleWeight, makePath, pathDist, fieldJob, fieldWork, support, positionBound,
-          lookBound, step, sampleReachable, glide, glideMs, nearest, closeBound, nextPose,
-          richness, sampleGrid,
+          lookBound, darkness, step, sampleReachable, glide, glideMs, nearest, closeBound, nextPose,
+          richness, sampleGrid, ringProfile, bestHeading,
           R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE,
-          C_LO, C_HI, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, MAX_SKIP};
+          C_LO, C_HI, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, C_GRAD_WIDE,
+          DARK_LO, DARK_HI,
+          RING_TURN_PENALTY, RING_FLOOR, MAX_SKIP};
 })();
 /* ---------- end navigation */
 
@@ -861,9 +994,12 @@ function view(Type, buffer, offset, count){
   if (offset % Type.BYTES_PER_ELEMENT === 0) return new Type(buffer, offset, count);
   return new Type(buffer.slice(offset, offset + count * Type.BYTES_PER_ELEMENT));
 }
-/* wb-surface-mesh/1 (WORLD-BUILDER-SURFACE.md §5); only positions and indices
-   are used -- the proxy's own vertex colours are the rejected product and are
-   never drawn. */
+/* wb-surface-mesh/1 (WORLD-BUILDER-SURFACE.md §5). The vertex COLOURS are the
+   rejected product and are never drawn -- but the appearance proxy reuses that
+   block, which has been all zeros since review 1, to carry one byte a vertex of
+   GEOMETRY CONFIDENCE (WORLD-BUILDER-APPEARANCE.md §3). The manifest's
+   `proxy.confidence` says whether it is there and which channel holds it; the
+   block is returned as it is and the channel is picked when it is uploaded. */
 function decodeMesh(buf){
   if (buf.byteLength < 48) throw new Error("proxy mesh is shorter than its header");
   const dv = new DataView(buf);
@@ -880,12 +1016,14 @@ function decodeMesh(buf){
   const need = off + nV * (6 + 3 + (hasN ? 3 : 0)) + nI * (u16 ? 2 : 4);
   if (buf.byteLength !== need) throw new Error("proxy mesh length mismatch");
   const pos = view(Uint16Array, buf, off, nV * 3);
+  // the colour block (rgb, u8) sits between the positions and the normals
+  const col = view(Uint8Array, buf, off + nV * 6, nV * 3);
   // normals (int8, x127) follow the colours; used only to judge obliquity
   const nrm = hasN ? view(Int8Array, buf, off + nV * 9, nV * 3) : null;
   off += nV * 6 + nV * 3 + (hasN ? nV * 3 : 0);
   const idx = u16 ? view(Uint16Array, buf, off, nI) : view(Uint32Array, buf, off, nI);
   const span = [Math.max(hi[0]-lo[0],1e-9), Math.max(hi[1]-lo[1],1e-9), Math.max(hi[2]-lo[2],1e-9)];
-  return {pos, nrm, idx, lo, hi, span, nV, nI, u32: !u16};
+  return {pos, col, nrm, idx, lo, hi, span, nV, nI, u32: !u16};
 }
 /* WBAPCK01 (WORLD-BUILDER-APPEARANCE.md §4.1). */
 function decodeChunk(buf){
@@ -944,13 +1082,20 @@ const MAXC = 12;
 /* One vertex shader for the depth prepass, the probe and the blend, with an
    invariant position, so the blend's LEQUAL test matches the prepass exactly
    and the expensive fragment shader runs once per visible pixel. */
+/* The attribute locations are FIXED here rather than left to the linker. Three
+   programs share this shader and one of them (the depth prepass) uses neither
+   the normal nor the confidence, so a linker free to renumber could give the
+   same VAO slot two different meanings between passes. */
 const VS_VIEW = `#version 300 es
 precision highp float;
 invariant gl_Position;
-in vec3 aQ; in vec3 aN;
+layout(location = 0) in vec3 aQ;
+layout(location = 1) in vec3 aN;
+layout(location = 2) in float aConf;
 uniform mat4 uMVP; uniform vec3 uLo; uniform vec3 uSpan;
-out vec3 vX; out vec3 vN;
-void main(){ vec3 p = uLo + aQ * uSpan; vX = p; vN = aN; gl_Position = uMVP * vec4(p, 1.0); }`;
+out vec3 vX; out vec3 vN; out float vConf;
+void main(){ vec3 p = uLo + aQ * uSpan; vX = p; vN = aN; vConf = aConf;
+  gl_Position = uMVP * vec4(p, 1.0); }`;
 
 /* What "not captured" looks like: a dark, smooth vignette. Never a texture. */
 const GLSL_BACKGROUND = `
@@ -1185,7 +1330,25 @@ uniform vec2 uVig;
 uniform vec2 uWH; uniform ivec2 uDWH; uniform float uZmax; uniform vec3 uEye;
 uniform float uExposure; uniform float uGamma; uniform int uMode; uniform float uFar;
 uniform float uTemp; uniform float uConsensus; uniform float uBorder; uniform float uKnee;
+uniform float uConfLo; uniform float uConfHi; uniform float uConfOn;
 ${GLSL_BACKGROUND}
+/* THE CONFIDENCE FADE (the geometry-confidence lane's recommendation, §7).
+   The proxy carries one byte a vertex saying how well that vertex was measured
+   -- the fusion's own see-through and disagreement counters, plus the level's
+   own triangle shape. Where it is low the geometry is wrong and the blend tears
+   real photographs over it: the fan-blade cross in the ceiling, the ridge beside
+   it, the ragged third at the door. Those pixels are honest imagery on
+   dishonest geometry, and the honest thing to draw there is what the page
+   already draws where it knows nothing: the void.
+   So the colour is mixed toward the void across a BAND, per fragment. Never a
+   hard cut, and never transparent: the alpha is EVIDENCE, it is untouched, the
+   depth still hides what is behind, and no pixel becomes see-through.
+   uConfOn is 0 when the proxy carries no channel -- "unknown", which is not
+   "confidence zero" -- and the fade does nothing at all. */
+float gConf = 1.0;                 // the fragment's confidence; 1 where unknown
+float confKeep(){
+  return uConfOn > 0.5 ? smoothstep(uConfLo, uConfHi, gConf) : 1.0;
+}
 vec3 tone(vec3 x){
   // Hue-preserving highlight roll-off on the largest channel: linear to the
   // knee, then an exponential shoulder that approaches TONE_CEILING and never
@@ -1345,12 +1508,19 @@ void shade(vec3 P, vec3 N, out vec4 o){
   if (uMode == 4){ o = vec4(observed ? float(int(uLayer[top]) + 1) / 255.0 : 0.0, 0.0, 0.0, 1.0); return; }
   if (uMode == 6){ o = vec4(alpha, 1.0 - dNoTail, 1.0 - dNoVis, 1.0); return; }
   if (uMode == 7){ o = vec4(1.0 - dNoMask, 1.0 - dAll, observed ? 1.0 : 0.0, 1.0); return; }
-  if (uMode == 8){ o = vec4(observed ? pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma)) : vec3(1.0, 0.0, 1.0), 1.0); return; }
+  // 11: what the confidence fade TAKES. R = the drawn area it removes
+  // (alpha x 1 - keep), G = the drawn area, so a measurement reads the faded
+  // share of what is drawn straight off the two sums.
+  if (uMode == 11){ o = vec4(alpha * (1.0 - confKeep()), alpha, gConf, 1.0); return; }
+  if (uMode == 8){ o = vec4(observed ? mix(background(), pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma)), confKeep()) : vec3(1.0, 0.0, 1.0), 1.0); return; }
   // The layer: colour and evidence. Proxy no kept image covers is alpha 0:
   // drawn exactly as "nothing" (the background), while its depth still hides
   // what is behind it.
   if (!observed){ o = vec4(0.0); return; }
   vec3 c = pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma));
+  // where the geometry under the photograph is not trusted, the photograph
+  // gives way to the void -- across the band, never at a step
+  c = mix(background(), c, confKeep());
   // PREMULTIPLIED. The composite divides it straight back out for the pixel's
   // own colour, so nothing about the drawn room changes -- but the layer's MIP
   // CHAIN, which the void fog reads, is then the mean of what is actually
@@ -1367,11 +1537,12 @@ const FS_BLEND = `#version 300 es
 precision highp float; precision highp int;
 precision highp sampler2DArray; precision highp usampler2DArray;
 ${GLSL_SHADE}
-in vec3 vX; in vec3 vN; out vec4 o;
+in vec3 vX; in vec3 vN; in float vConf; out vec4 o;
 void main(){
   // the smooth vertex normal where the proxy carries one, else the facet's
   vec3 N = length(vN) > 0.2 ? normalize(vN) : cross(dFdx(vX), dFdy(vX));
   if (length(N) < 1e-12) N = uEye - vX;
+  gConf = vConf;                 // interpolated across the triangle
   shade(vX, normalize(N), o);
   if (uMode == 10) o = vec4(0.0, 1.0, 0.0, 1.0);
 }`;
@@ -1446,6 +1617,11 @@ void main(){
     // nothing beside it either: facing the eye (it only rates obliquity)
     if (length(N) < 1e-12) N = uEye - P;
   }
+  // gConf stays 1: a crack is a screen-space gap between two parts of one
+  // surface and has no vertex of its own to read a confidence from. It is at
+  // most uFillR (4 CSS px) across, so an unfaded crack inside a faded region
+  // is a few pixels wide; measured at 0.01-0.06% of the drawn area on the
+  // reviewer's views (ORIENT.md section 3).
   shade(P, normalize(N), o);
   if (uMode == 10) o = vec4(1.0, 0.0, 0.0, 1.0);
 }`;
@@ -1473,6 +1649,10 @@ async function main(){
   let ext = null;
   let loseExt = null;           // WEBGL_lose_context: asks a lost context back
   let mesh = null;              // decoded proxy (kept: a restored context rebuilds from it)
+  // The proxy's geometry-confidence channel, from the manifest's
+  // `proxy.confidence`: null means the proxy carries none, which is UNKNOWN and
+  // is drawn at full strength, never as zero.
+  let confChannel = null;       // 0, 1 or 2 -- which colour byte holds it
   let manifest = null;          // the manifest the layers were filled from
   const layers = [];            // per texture layer: {id, digest, slot, ready, depthReady, kf}
   let capacity = 0, encoding = null, KW = 0, KH = 0, DW = 0, DH = 0, zmax = 1;
@@ -1597,10 +1777,24 @@ async function main(){
       gl.bufferData(gl.ARRAY_BUFFER, mesh.nrm, gl.STATIC_DRAW);
       gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.BYTE, true, 0, 0);
     } else { gl.disableVertexAttribArray(1); gl.vertexAttrib3f(1, 0, 0, 0); }
+    // The confidence byte rides the colour block, strided: no copy, no extra
+    // bytes on the wire, and the same buffer whichever channel carries it.
+    // Without a channel the attribute is the constant 1 -- "as well measured as
+    // anything here", i.e. nothing fades -- and `uConfOn` is 0 as well.
+    if (G.cbo){ gl.deleteBuffer(G.cbo); G.cbo = null; }
+    if (confChannel !== null && mesh.col && mesh.col.length >= mesh.nV * 3){
+      G.cbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, G.cbo);
+      gl.bufferData(gl.ARRAY_BUFFER, mesh.col, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 1, gl.UNSIGNED_BYTE, true, 3, confChannel);
+    } else { gl.disableVertexAttribArray(2); gl.vertexAttrib1f(2, 1); }
     G.ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, G.ibo);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
     G.idxType = mesh.u32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
-    S.gpu.proxy = mesh.pos.byteLength + mesh.idx.byteLength + (mesh.nrm ? mesh.nrm.byteLength : 0);
+    S.gpu.proxy = mesh.pos.byteLength + mesh.idx.byteLength + (mesh.nrm ? mesh.nrm.byteLength : 0)
+      + (G.cbo ? mesh.col.byteLength : 0);
+    S.confidence = {present: confChannel !== null, channel: confChannel,
+                    lo: OPT.confLo, hi: OPT.confHi};
     centre = [mesh.lo[0]+mesh.span[0]/2, mesh.lo[1]+mesh.span[1]/2, mesh.lo[2]+mesh.span[2]/2];
     diag = Math.hypot(mesh.span[0], mesh.span[1], mesh.span[2]) || 1;
     zmax = diag * 2;
@@ -1849,6 +2043,13 @@ async function main(){
       const buf = await fetchBytes(R.proxy + man.proxy.digest, "the proxy surface");
       if (generation !== loadGeneration) return;
       mesh = decodeMesh(buf);
+      // Which colour byte, if any, is the geometry confidence. A proxy built
+      // before the channel existed, or with it off, sends three zero bytes:
+      // `present: false` must be read as "nothing is known", never as
+      // "confidence zero", or the page would fade the whole room away.
+      const cfd = man.proxy.confidence;
+      confChannel = (cfd && cfd.present === true && (cfd.version ?? 1) === 1)
+        ? ({r: 0, g: 1, b: 2}[String(cfd.channel || "r").toLowerCase()] ?? null) : null;
       uploadMesh();
       if (first) allocateLayers();
       for (const L of layers) L.depthReady = false;
@@ -2078,6 +2279,9 @@ async function main(){
   let cam = {p: [0, 0, 0], yaw: 0, pitch: 0, floor: 1};
   let glideState = null;        // {from, to, t, ms, index}
   let navPath = null, navField = null, navJob = null, navGeneration = 0, overviewPose = null;
+  // whether the field in hand is the fine one (the Best view's candidates are
+  // its lattice points, and a coarse lattice does not hold enough of them)
+  let navFine = false;
   const ctl = {look: [0, 0], move: [0, 0, 0], held: false};
   const vel = {look: [0, 0], move: [0, 0, 0]};   // inertia, per ms
   const keys = new Set();
@@ -2201,6 +2405,145 @@ async function main(){
     S.lastHint = h.textContent;
     clearTimeout(hintTimer);
     hintTimer = setTimeout(() => { h.style.opacity = "0"; }, 1100);
+  }
+  /* -------- the orientation ring, and the way back ----------------------- */
+  /* The profile is the support of the view at RING_BINS headings on the
+     horizon FROM ONE POSITION, so it is recomputed only when the camera has
+     actually moved (turning on the spot does not change it -- the ring just
+     rotates). One profile is RING_BINS calls to `support`, about 1 ms on
+     SwiftShader, which is why it is not per frame.
+
+     Everything here reads the pose that is DRAWN, not `cam`: a verification
+     hook can pin an exact camera (`S.setView`), and a compass that keeps
+     pointing where `cam` happens to be while the screen shows somewhere else
+     is worse than no compass. On a phone `override` is always null and the
+     two are the same object. */
+  const RING_BINS = 36, RING_MOVE = 0.22;
+  let ringProf = null, ringAt = null, ringFor = null;
+  function shownPose(){
+    if (!override) return cam;
+    const d = norm3([override.target[0] - override.eye[0], override.target[1] - override.eye[1],
+                     override.target[2] - override.eye[2]]);
+    const yp = yawPitchOf(d);
+    return {p: override.eye.slice(), yaw: yp.yaw, pitch: yp.pitch};
+  }
+  function updateRing(force){
+    if (!navField || !navField.done){ ringProf = null; ringAt = null; ringFor = null; return; }
+    const at = shownPose().p;
+    if (!force && ringProf && ringFor === navField && ringAt
+        && Math.hypot(at[0]-ringAt[0], at[1]-ringAt[1], at[2]-ringAt[2]) < RING_MOVE) return;
+    const t = performance.now();
+    ringProf = NAV.ringProfile(navField, at, navView(), RING_BINS);
+    ringAt = at.slice(); ringFor = navField;
+    // "covered" is bins the page would not call dark, which is the question
+    // the ring answers. T_LO is the QUALITY band and on some worlds -- this
+    // one -- no heading anywhere reaches it, which would have reported a room
+    // with no covered directions at all.
+    S.ring = {bins: RING_BINS, ms: +(performance.now() - t).toFixed(1),
+              covered: Array.from(ringProf).filter(s => s >= NAV.DARK_HI).length,
+              max: +Math.max(...ringProf).toFixed(3),
+              mean: +(Array.from(ringProf).reduce((a, b) => a + b, 0) / RING_BINS).toFixed(3)};
+  }
+  /* Which way round the ring a rising yaw goes on the screen. Derived rather
+     than assumed: `dirFrom`'s sense depends on the world's vertical, and a
+     compass that turns the wrong way is worse than no compass. */
+  function yawSign(){
+    const y0 = shownPose().yaw;
+    const f = dirFrom(y0, 0), g = dirFrom(y0 + 0.05, 0), r = norm3(cross3(f, UP));
+    return dot3([g[0]-f[0], g[1]-f[1], g[2]-f[2]], r) >= 0 ? 1 : -1;
+  }
+  const RING_R = 21, RING_SIZE = 58;
+  function drawCompass(){
+    const el = $("compass");
+    if (!ringProf){ el.classList.remove("on"); return; }
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const n = Math.round(RING_SIZE * dpr);
+    if (el.width !== n){ el.width = n; el.height = n; }
+    const g = el.getContext("2d");
+    if (!g) return;
+    el.classList.add("on");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, RING_SIZE, RING_SIZE);
+    const c = RING_SIZE / 2, sgn = yawSign(), step = 2 * Math.PI / RING_BINS;
+    const yaw = shownPose().yaw;
+    g.beginPath(); g.arc(c, c, 26, 0, 2 * Math.PI);
+    g.fillStyle = "rgba(8,10,13,.58)"; g.fill();
+    // the coverage, arc by arc. Canvas angles run clockwise from +x with y
+    // down, which is also how a heading to the right of the view reads, so
+    // "straight ahead" is -pi/2 and the offset is the signed yaw difference.
+    g.lineWidth = 5.5; g.lineCap = "butt";
+    for (let i = 0; i < RING_BINS; i++){
+      const k = NAV.smooth(0.08, NAV.T_HI, ringProf[i]);
+      const a = -Math.PI / 2 + sgn * (i * step - yaw);
+      g.beginPath(); g.arc(c, c, RING_R, a - step * 0.52, a + step * 0.52);
+      g.strokeStyle = k <= 0.01 ? "rgba(154,160,168,.14)"
+        : "rgba(" + Math.round(120 - 20 * k) + "," + Math.round(180 + 30 * k) + ","
+          + Math.round(200 + 55 * k) + "," + (0.2 + 0.7 * k).toFixed(3) + ")";
+      g.stroke();
+    }
+    // what is in frame right now: the view's own horizontal spread, at the top
+    const cm = currentCamera();
+    const half = Math.atan(Math.tan(cm.fy / 2) * cm.aspect);
+    g.beginPath(); g.moveTo(c, c);
+    g.arc(c, c, RING_R - 4.5, -Math.PI / 2 - half, -Math.PI / 2 + half);
+    g.closePath(); g.fillStyle = "rgba(255,255,255,.10)"; g.fill();
+    g.beginPath(); g.moveTo(c, c - 26.5); g.lineTo(c - 3.4, c - 31.5); g.lineTo(c + 3.4, c - 31.5);
+    g.closePath(); g.fillStyle = "rgba(232,233,236,.9)"; g.fill();
+  }
+  /* The way back. It turns you; it never moves you, and it never runs while a
+     finger is down -- it is a glide, and `pointerdown` cancels a glide. */
+  function faceTheRoom(){
+    if (!navField || !navField.done) return false;
+    updateRing();
+    const here = shownPose();
+    const b = NAV.bestHeading(ringProf, here.yaw);
+    if (!b) return false;
+    const V = navView();
+    let bestPitch = 0, bestS = -1;
+    for (const pitch of [-0.35, -0.18, 0, 0.18]){
+      const s = NAV.support(navField, here.p, dirFrom(b.yaw, pitch), UP, V.fy, V.aspect).s;
+      if (s > bestS){ bestS = s; bestPitch = pitch; }
+    }
+    S.faced = (S.faced || 0) + 1;
+    S.lastFace = {delta: +b.delta.toFixed(4), support: +b.support.toFixed(3), pitch: bestPitch};
+    glideTo({p: here.p.slice(), yaw: b.yaw, pitch: bestPitch}, null);
+    return true;
+  }
+  /* The edge chevron: shown only while the view really is on nothing, with a
+     gap between the two thresholds so it does not blink on the boundary. */
+  /* How far off the capture the view in front of you is, 0..1, computed once
+     per distinct camera (a still frame costs nothing). */
+  let darkFor = null;
+  function currentDark(){
+    if (!navField || !navField.done) return 0;
+    const q = shownPose();
+    const key = q.p.map(v => v.toFixed(3)).join(",") + "|" + q.yaw.toFixed(3) + "|" + q.pitch.toFixed(3);
+    if (darkFor && darkFor.key === key) return darkFor.v;
+    const V = navView();
+    const s = NAV.support(navField, q.p, dirFrom(q.yaw, q.pitch), UP, V.fy, V.aspect).s;
+    darkFor = {key, v: NAV.darkness(s)};
+    return darkFor.v;
+  }
+  /* BACK_OFF is well below BACK_ON, not merely below it: over a full turn at
+     the opening the step at 270 degrees is 89% background, but its `dark` is
+     0.36, because a torn fragment of covered surface is still in frame. At
+     0.40 the arrow let go there and an 89%-black frame carried no cue; at
+     0.25 it holds until the room is really back (stats\shots_cue.json). */
+  const BACK_ON = 0.60, BACK_OFF = 0.25, BACK_MIN_TURN = 0.35;
+  let backOn = false;
+  function updateBack(dark){
+    const el = $("back");
+    const b = ringProf ? NAV.bestHeading(ringProf, shownPose().yaw) : null;
+    const want = !!b && Math.abs(b.delta) > BACK_MIN_TURN
+      && (backOn ? dark > BACK_OFF : dark > BACK_ON);
+    if (want){
+      const right = yawSign() * b.delta > 0;
+      el.className = "on " + (right ? "right" : "left");
+    } else if (backOn){
+      el.className = "";
+    }
+    backOn = want;
+    S.backArrow = want ? (el.classList.contains("right") ? "right" : "left") : null;
   }
   const KEY_SPEED = 1.1 / 1000;          // scene units per ms
   /* Advance the camera by dt ms: a glide, or input + inertia through NAV.step.
@@ -2415,6 +2758,16 @@ async function main(){
       return false;
     };
   }
+  /* The coarse pass. The window the page spends unable to explain itself is
+     the field's, and widening the tube (the interaction lane) nearly doubled
+     it: 3,851 voxels instead of 2,031, about 2.1 s from `ready` to a field.
+     Most of that is the field work, which scales with the cube of the
+     spacing, so a first pass at NAV_COARSE x the spacing costs about an
+     eighth. The page uses it -- the dark hint, the ring, the Best view all
+     work off it -- and the fine field replaces it silently when it lands.
+     The input pass (the 6,000-sample projection) is shared and is NOT halved:
+     it is the floor on this window. */
+  const NAV_COARSE = 2;
   function buildNav(){
     const gen = ++navGeneration;
     // The one thing the page cannot do until this finishes is EXPLAIN itself.
@@ -2426,7 +2779,42 @@ async function main(){
     // finished surface that quietly knows less than it looks like it does.
     status(PREPARING);
     const steps = navInputSteps();
-    let input = null, job = null, spent = 0, inputMs = 0;
+    let input = null, job = null, spent = 0, inputMs = 0, coarse = true;
+    const startJob = (spacing) => {
+      const tJob = performance.now();
+      job = NAV.fieldJob(input, spacing);
+      navJob = job;
+      const key = coarse ? "coarse" : "fine";
+      S.nav = S.nav || {};
+      Object.assign(S.nav, {phase: "building " + key, samples: NAV_SAMPLES,
+                            sources: input.centres.length / 3, seen: input.seenIdx.length,
+                            inputMs: Math.round(inputMs)});
+      S.nav[key] = {voxels: job.count, spacing, bytes: job.cov.byteLength * 3,
+                    jobMs: Math.round(performance.now() - tJob)};
+      spent += performance.now() - tJob;
+    };
+    const land = () => {
+      // The coarse field lands exactly like the fine one: it is a real field,
+      // it answers every question the page asks of one, and it is replaced
+      // rather than corrected. Nothing here is said twice.
+      navField = job; navJob = null; overviewPose = null; navFine = !coarse;
+      ringProf = null; ringFor = null; darkFor = null;
+      S.nav.phase = coarse ? "coarse" : "ready";
+      S.nav.voxels = job.count; S.nav.spacing = job.spacing;
+      S.nav.bytes = job.cov.byteLength * 3;
+      S.nav[coarse ? "coarseMs" : "ms"] = Math.round(spent);
+      if (!glideState && cams.length) cam.floor = floorAt(poseOf(ci));
+      // What the coarse field is enough for: saying which way the capture is,
+      // and turning you back to it. What it is NOT enough for is the Best
+      // view, whose candidates are the field's own lattice points -- on a
+      // coarse lattice inside a 1.5-unit tube there may be none at all, and a
+      // button that does nothing is worse than a button that is not ready yet.
+      $("bBack").disabled = false;
+      $("bOverview").disabled = coarse;
+      S.nav.fine = navFine;
+      if ($("status").textContent === PREPARING) status("");
+      requestDraw();
+    };
     const slice = () => {
       if (gen !== navGeneration) return;
       const t = performance.now();
@@ -2439,33 +2827,28 @@ async function main(){
         if (!r.done){ setTimeout(slice, 0); return; }
         input = r.value;
         if (!input) return;             // nothing ready to build an envelope from
-        const tJob = performance.now();
-        job = NAV.fieldJob(input);
-        const jobMs = performance.now() - tJob;
-        spent += jobMs;
-        navJob = job;
-        S.nav = {phase: "building", voxels: job.count, samples: NAV_SAMPLES,
-                 sources: input.centres.length / 3, seen: input.seenIdx.length,
-                 bytes: job.cov.byteLength * 3, inputMs: Math.round(inputMs),
-                 jobMs: Math.round(jobMs)};
+        startJob(NAV.SPACING * NAV_COARSE);
         setTimeout(slice, 0);
         return;
       }
       while (!NAV.fieldWork(job, 24) && performance.now() - t < 14){ /* a frame's worth */ }
       spent += performance.now() - t;
       if (!job.done){ setTimeout(slice, 0); return; }
-      navField = job; navJob = null; overviewPose = null;
-      S.nav.phase = "ready"; S.nav.ms = Math.round(spent);
+      land();
+      if (coarse){
+        // Usable now; exact in a moment. The pose scoring is deliberately NOT
+        // started here: it is a few hundred small renders, it does not use the
+        // field at all, and run beside the fine pass it pushed the fine field
+        // (and so the Best view) from 1.0 s to 3.7-4.7 s. Measured both ways.
+        coarse = false;
+        startJob(NAV.SPACING);
+        setTimeout(slice, 0);
+        return;
+      }
+      scorePoses();
       S.nav.holeSamples = Array.from(input.sampleQ).filter(q => q < 128).length;
       S.nav.contentMean = +(Array.from(input.sampleC).reduce((a, b) => a + b, 0) / 255 / NAV_SAMPLES).toFixed(4);
       S.nav.featurelessSamples = Array.from(input.sampleC).filter(c => c / 255 < NAV.C_LO).length;
-      // the floor comes from the recorded pose the camera is at, never from
-      // wherever it happens to be (review 2026-09-17, item 5)
-      if (!glideState && cams.length) cam.floor = floorAt(poseOf(ci));
-      scorePoses();
-      $("bOverview").disabled = false;
-      if ($("status").textContent === PREPARING) status("");
-      requestDraw();
     };
     setTimeout(slice, 0);
   }
@@ -2484,6 +2867,28 @@ async function main(){
      candidates and the rendered DETAIL decides between them, and the depth
      floor is raised so a wall a metre away cannot be an overview. */
   const OVERVIEW_AWAY = 1.2, OVERVIEW_DEPTH = 0.8, OVERVIEW_CONTENT = 0.19, OVERVIEW_RANGE = 1.0;
+  /* HOW SOUND the geometry a candidate looks at is. Re-swept 2026-09-20 (the
+     orient lane) after the interaction lane widened the tube: the candidate
+     set went from 205 to 406, the winner moved half a unit back, and the new
+     winner is 88.7% drawn with a shredded corner where the old one was 99.8%
+     drawn and a monitor close-up. The score was calibrated against the 1.0
+     tube and nobody chose that.
+     Everything the old score measures is about what is IN the frame -- how
+     much of it is drawn, how deep, how much detail, how much range. None of
+     it can tell a photograph of the room from a photograph smeared over
+     geometry that is wrong, because both are drawn and both have detail. The
+     confidence channel can, and the page now draws that difference (the fade),
+     so the score can read it off the same render: `faded` is the share of the
+     drawn area the fade takes. A frame the fade eats is a frame the page
+     should not be recommending.
+     OVERVIEW_FADED_REF is where the penalty saturates and OVERVIEW_SOUND_FLOOR
+     is how far it can push a candidate down. Both chosen by sweeping the 12
+     candidates' measured table (ORIENT.md section 4). */
+  const OVERVIEW_FADED_REF = 0.05, OVERVIEW_SOUND_FLOOR = 0.45;
+  function soundTerm(faded){
+    return OVERVIEW_SOUND_FLOOR + (1 - OVERVIEW_SOUND_FLOOR)
+      * (1 - Math.min(1, (faded || 0) / OVERVIEW_FADED_REF));
+  }
   function findOverview(){
     if (!navField || !navField.done) return null;
     const t0 = performance.now(), V = navView(), F = navField;
@@ -2535,9 +2940,9 @@ async function main(){
     let best = null;
     for (const f of top){
       cam = {p: f.p, yaw: f.yaw, pitch: f.pitch, floor: 1};
-      const r = drawnFraction(currentCamera(aspect), w, h, true);
+      const r = drawnFraction(currentCamera(aspect), w, h, true, true);
       f.drawn = r.drawn; f.distance = r.distance; f.spread = r.spread; f.detail = r.detail;
-      f.depthSpread = r.depthSpread;
+      f.depthSpread = r.depthSpread; f.faded = r.faded || 0;
       // Drawn, toward what the walk looked at, with something in it -- the
       // DETAIL of the real render, not its colour spread, since a bright door
       // beside a dark wall has all the colour spread in the world and nothing
@@ -2564,7 +2969,8 @@ async function main(){
       // been re-swept against the bigger envelope, and should be.
       f.rendered = r.drawn * (0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref)))
         * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.15 + 0.85 * detailTerm(r.detail || 0))
-        * (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)));
+        * (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)))
+        * soundTerm(r.faded);
       if (!best || f.rendered > best.rendered) best = f;
     }
     cam = save; override = saveOverride;
@@ -2574,15 +2980,18 @@ async function main(){
                   minContent, relaxed,
                   top: top.map(f => ({support: +f.s.toFixed(3), content: +f.c.toFixed(3), drawn: +f.drawn.toFixed(3),
                                       detail: +(f.detail || 0).toFixed(4), range: +(f.depthSpread || 0).toFixed(2),
-                                      score: +f.rendered.toFixed(3)})),
+                                      faded: +(f.faded || 0).toFixed(4), sound: +soundTerm(f.faded).toFixed(3),
+                                      toward: +f.toward.toFixed(3), distance: +(f.distance || 0).toFixed(3),
+                                      ref: +ref.toFixed(3), score: +f.rendered.toFixed(3)})),
                   topPoses: top.map(f => ({p: f.p, yaw: f.yaw, pitch: f.pitch})),
                   chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn,
                                    detail: +(best.detail || 0).toFixed(4),
+                                   faded: +(best.faded || 0).toFixed(4),
                                    range: +(best.depthSpread || 0).toFixed(2)}};
     return best && {p: best.p.slice(), yaw: best.yaw, pitch: best.pitch};
   }
   function overview(){
-    if (!navField || !navField.done) return false;
+    if (!navField || !navField.done || !navFine) return false;
     if (!overviewPose) overviewPose = findOverview();
     if (!overviewPose) return false;
     glideTo(overviewPose, null);
@@ -2784,6 +3193,11 @@ async function main(){
     gl.uniform1f(P.u.uTemp, OPT.temp); gl.uniform1f(P.u.uConsensus, OPT.consensus);
     gl.uniform1f(P.u.uBorder, OPT.border);
     gl.uniform1f(P.u.uKnee, OPT.knee);
+    // The confidence fade: off unless the proxy really carries the channel and
+    // the band is a band. `uConfLo < uConfHi` is what makes it a fade.
+    const confOn = confChannel !== null && OPT.confHi > OPT.confLo;
+    gl.uniform1f(P.u.uConfOn, confOn ? 1 : 0);
+    gl.uniform1f(P.u.uConfLo, OPT.confLo); gl.uniform1f(P.u.uConfHi, OPT.confHi);
     gl.uniform1fv(P.u.uLayer, U1); gl.uniformMatrix3fv(P.u.uR, false, U9);
     gl.uniform3fv(P.u.uT, U3a); gl.uniform3fv(P.u.uC, U3b); gl.uniform3fv(P.u.uGain, U3c);
     gl.uniform4fv(P.u.uIntr, U4); gl.uniform1fv(P.u.uQ, UQ);
@@ -2906,6 +3320,14 @@ async function main(){
     const fading = updatePresence(tick);
     drawBlend(cam, MVP, bound());
     if ((fading || navMoving) && !sync) requestDraw();
+    // The orientation cue, after the camera for this frame is final. The ring
+    // itself is recomputed only when the camera has MOVED; what happens every
+    // frame is one `support` for the view in front of you and a 58 px 2D draw.
+    updateRing();
+    const dk = currentDark();
+    S.dark = dk;
+    updateBack(dk);
+    drawCompass();
     S.choice = chosen.map(L => L.kf && L.kf.ki);
     S.bound = bound().map(({L, p}) => [L.kf && L.kf.ki, +p.toFixed(3)]);
     $("pos").textContent = !override && cams.length ? (ci + 1) + " / " + cams.length : "";
@@ -2915,7 +3337,7 @@ async function main(){
   /* How much of a small render of `cam`, at the canvas's own aspect, is DRAWN:
      the mean of the evidence alpha, and the
      mean viewing distance of what is drawn. */
-  function drawnFraction(cam, w, h, content){
+  function drawnFraction(cam, w, h, content, wantFaded){
     const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
     const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
@@ -2960,6 +3382,20 @@ async function main(){
       }
       detail = dn ? ds / dn : 0;
     }
+    // How much of what this view draws the confidence fade takes: mode 11
+    // writes the removed area in R and the drawn area in G, so the share is
+    // the ratio of the two sums -- the same "alpha-weighted area actually
+    // removed" the confidence lane predicted, measured on the real render.
+    let faded = 0;
+    if (wantFaded){
+      drawBlend(cam, MVP, picks, 11, {fb, w, h});
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      const fp = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, fp);
+      let took = 0, all = 0;
+      for (let i = 0; i < fp.length; i += 4){ took += fp[i]; all += fp[i+1]; }
+      faded = all > 0 ? took / all : 0;
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb);
     let drawn = 0, dsum = 0;
@@ -2980,7 +3416,8 @@ async function main(){
       dists.sort((a, b) => a - b);
       depthSpread = dists[Math.floor(dists.length * 0.9)] - dists[Math.floor(dists.length * 0.1)];
     }
-    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread, detail, depthSpread};
+    return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread, detail,
+            depthSpread, faded};
   }
   /* The opening view: the recorded pose whose rendered frame is most DRAWN and
      has the most IN it. Drawn alone opened the page on poses that were 100%
@@ -3258,10 +3695,15 @@ async function main(){
     glideTo(poseOf(i), i); ci = i;
   }
   $("bOverview").onclick = () => overview();
+  $("bBack").onclick = () => faceTheRoom();
+  // the ring and the edge chevron are the same control, where the eye already is
+  $("compass").onclick = () => faceTheRoom();
+  $("back").onclick = () => faceTheRoom();
   $("bPrev").onclick = () => step(-1);
   $("bNext").onclick = () => step(1);
   $("bReset").onclick = reset;
   $("bOverview").disabled = true;
+  $("bBack").disabled = true;
   if (!cams.length){ $("bPrev").disabled = true; $("bNext").disabled = true; }
   /* A rotation changes which poses render well. `drawnFraction` is explicitly
      aspect-dependent, and the arrows, the opening and the Overview all rank on
@@ -3333,6 +3775,12 @@ async function main(){
       + " never looked you will find the room simply dark rather than a wall you cannot turn past."
       + " Moving is not free -- the camera stays near the path that was actually walked, and a push"
       + " that slows to nothing has reached the edge of it."
+      + " The ring at the top right is a compass of what was photographed from where you stand: the"
+      + " lit part of it is the directions a frame exists in, the way you are looking is always at"
+      + " the top, and when the lit part is behind you so is the room. It says a photograph exists,"
+      + " not that there is anything worth seeing."
+      + " “Face the room” turns you -- without moving you -- to the nearest direction that was"
+      + " photographed, and the arrow at the edge of the frame does the same thing."
       + " “Best view” flies to the best-supported vantage in that path; on this capture the wearer"
       + " never stood back from the desk, so it is a view from the desk and not a view of the whole room.";
     if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
@@ -3384,6 +3832,21 @@ async function main(){
     return {observed: obs / (w*h), unobserved: un / (w*h), background: 1 - (obs + un) / (w*h),
             drawn: drawn / 255 / (w*h)};
   };
+  /* What the confidence fade costs this view, at the canvas's own size: the
+     share of the DRAWN area it removes and the share of the whole frame, which
+     are the two columns the confidence lane predicted (CONFIDENCE.md §7). */
+  S.fadeCost = () => {
+    const c = currentCamera(), MVP = matrices(c), w = canvas.width, h = canvas.height;
+    drawBlend(c, MVP, bound(), 11);
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let took = 0, all = 0;
+    for (let i = 0; i < px.length; i += 4){ took += px[i]; all += px[i+1]; }
+    drawBlend(c, MVP, bound());
+    return {ofDrawn: all > 0 ? took / all : 0, ofFrame: took / 255 / (w * h),
+            drawn: all / 255 / (w * h), on: !!(S.confidence && S.confidence.present),
+            lo: OPT.confLo, hi: OPT.confHi};
+  };
   // Verification only: the camera as drawn, one debug mode as an image, and a
   // fixed frame clock so a captured sequence shows the crossfades a phone would.
   S.camera = () => { const c = currentCamera(); return {eye: c.eye, at: c.at, up: c.up || UP, fy: c.fy,
@@ -3411,11 +3874,13 @@ async function main(){
     C_DRIFT_MAX: NAV.C_DRIFT_MAX, C_SETTLE: NAV.C_SETTLE, B_FREE: NAV.B_FREE,
     R_MAX: NAV.R_MAX, R_SOFT: NAV.R_SOFT, V_MAX: NAV.V_MAX, PITCH_MAX: NAV.PITCH_MAX,
     MAX_SKIP: NAV.MAX_SKIP, POSE_MIN, POSE_CONTENT, DETAIL_REF,
+    DARK_LO: NAV.DARK_LO, DARK_HI: NAV.DARK_HI, RING_BINS,
+    CONF_LO: OPT.confLo, CONF_HI: OPT.confHi,
     T_LO: NAV.T_LO, T_HI: NAV.T_HI});
   S.poseContent = () => poseC.slice();
   S.detailOf = (w = 96) => { const aspect = canvas.width / Math.max(1, canvas.height);
     const hh = Math.max(24, Math.round(w / aspect));
-    return drawnFraction(currentCamera(aspect), w, hh, true); };
+    return drawnFraction(currentCamera(aspect), w, hh, true, true); };
   // `minSupport` 0 (the default) is what a person can now reach: every
   // direction, from every position in the tube. Pass NAV.T_LO for the
   // support-filtered set the old envelope allowed, so the two are comparable.
@@ -3435,6 +3900,13 @@ async function main(){
   S.step = (d) => { step(d); return ci; };
   S.poseQuality = () => poseQ.slice();
   S.overview = () => overview();
+  // the orientation cue, for verification: the coverage profile the ring draws,
+  // where it says the room is, and the control itself
+  S.ring = null;
+  S.ringProfile = () => { updateRing(true); return ringProf ? Array.from(ringProf) : null; };
+  S.heading = () => { updateRing(); const b = ringProf && NAV.bestHeading(ringProf, shownPose().yaw);
+    return b ? {yaw: b.yaw, delta: b.delta, support: b.support} : null; };
+  S.faceTheRoom = () => faceTheRoom();
   S.frame = () => { frame(true); return S.pose(); };
 
   /* Choose where the page opens, put the camera there, draw, and start the

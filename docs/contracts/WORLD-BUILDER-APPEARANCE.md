@@ -190,8 +190,18 @@ page must not reuse a number quoted for level 0
 equivalent of the validated 0.20–0.30 band is bytes **40–62**, and fading
 across it costs 0.9–1.3% of the drawn area at the walk poses, 3.5% at a novel
 view and 7.1% at a grazing one. The measurement and the offline renders are in
-`Glasses-scratch/wb-final-recon/fixit/confidence/CONFIDENCE.md`. This lane
-recommends the rule; it does not implement it.
+`Glasses-scratch/wb-final-recon/fixit/confidence/CONFIDENCE.md`.
+
+**Implemented 2026-09-20** (fix-it orient lane) in the appearance viewer, as
+`WORLD-BUILDER-WORLDS.md` §4 describes it, at a band of **24–78**. Rendered
+through the page's own blend, the recommended 40–62 band reproduced the
+predicted cost almost exactly view by view (1.02 / 0.87 / 1.28 / 1.59 / 5.95 /
+1.48 / 3.72 / 3.69 / 1.36% of the drawn area against a predicted 1.05 / 0.86 /
+1.27 / 1.74 / 5.85 / 1.50 / 3.50 / 7.07 / 1.35%; only the grazing N3 differs,
+because the page draws less of it than the offline rasteriser does). It was
+widened because 22 bytes is narrow enough that a scatter of bad triangles
+among good ones fades as hard-edged confetti rather than as a fade; 24–78
+costs the same (2.39% mean against 2.34%) and grades over 54 bytes.
 
 ### 4.2 Texel convention
 

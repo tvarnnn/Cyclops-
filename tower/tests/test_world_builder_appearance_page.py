@@ -964,7 +964,7 @@ assert.ok(cam.p[1] > 0.3, "but it did move: " + cam.p[1]);
         assert 'const PREPARING = "Preparing the view…";' in text
         build = _section(text, "  function buildNav(){", "  /* Overview:")
         assert "status(PREPARING);" in build, "it says so while the field builds"
-        assert build.index("status(PREPARING);") < build.index('$("bOverview").disabled = false;')
+        assert build.index("status(PREPARING);") < build.index('$("bBack").disabled = false;')
         assert 'if ($("status").textContent === PREPARING) status("");' in build, \
             "and stops saying it, without wiping a message someone else put there"
 
@@ -1543,7 +1543,30 @@ assert.ok(d1 >= Math.min(NAV.D_MIN, d0) - 1e-9, "the drift never went inside the
         step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* A uniformly random reachable view")
         # the edge the hint is for is the tube and the standoff, and nothing else
         assert "const bAt = p => Math.max(posB(p), ready ? closeBound(F, p) : 0);" in step
-        assert "out.dark = lookBound(" in step
+        # and the dark one is about whether the view is on ANYTHING, not about
+        # whether it is a good view: `lookBound` is the QUALITY band (T_LO, the
+        # support at which three views in four render well), and asking it here
+        # made `dark` exactly 1 at eight of nine sampled recorded poses on the
+        # canonical world, including ones the page draws 99.4% of -- so thirty
+        # frames of drag at the opening raised "Nothing was photographed this
+        # way" five times, over a photograph of the room (2026-09-20, fix-it
+        # orient lane; ORIENT.md §2.3).
+        assert "out.dark = darkness(" in step
+        assert "lookBound" not in step, "the quality band is not the darkness band"
+        _run_nav(r"""
+// the two bands, and the gap between them that the bug lived in
+assert.ok(NAV.DARK_HI < NAV.T_LO / 2, "darkness is asked far below the quality band");
+assert.strictEqual(NAV.darkness(0), 1);
+assert.strictEqual(NAV.darkness(NAV.DARK_HI), 0);
+assert.strictEqual(NAV.lookBound(0.65, 1), 1, "0.65 support is a poor view...");
+assert.strictEqual(NAV.darkness(0.65), 0, "...and it is not a view of nothing");
+let prev = -1;
+for (let s = 0; s <= 1; s += 0.01){
+  const d = NAV.darkness(s);
+  assert.ok(d >= 0 && d <= 1 && (prev < 0 || d <= prev + 1e-12));
+  prev = d;
+}
+""")
         _run_nav(r"""
 // a look never raises `resisted`, so the edge hint can never fire for one
 let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
@@ -1611,7 +1634,7 @@ assert.strictEqual(NAV.support(F, away.p, dir(away.yaw, 0), up, V.fy, V.aspect).
         assert "Turning is free" in cap and "Moving is not free" in cap
         assert "never stood back from the desk" in cap
         over = _section(text, "const OVERVIEW_AWAY", "function overview(){")
-        assert "* (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)));" in over
+        assert "* (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)))" in over
         score = over[over.index("f.rendered ="):]
         assert "aspect" not in score[:score.index(";")], \
             "the score does not depend on the orientation"
@@ -1637,6 +1660,308 @@ assert.ok(ms > 2000 && ms <= 2600, "the Best view is flown, not jumped: " + ms +
         st = _section(text, "#status{position:fixed", "#msg{position:fixed")
         assert "background:rgba(8,10,13,.82)" in st and "text-shadow" in st
         assert "#status:empty{display:none}" in st, "and shows nothing when it has nothing to say"
+
+
+# ---------------------------------------------------------------------------
+# fix-it orient lane: the orientation cue, the confidence fade, the Best view's
+# re-swept score, and the cold-open window
+# ---------------------------------------------------------------------------
+
+
+class TestKnowingWhichWayTheRoomIs:
+    """A look is free now, and on this capture more than half of a full turn
+    was never photographed: five consecutive 30-degree steps of pure black
+    (INTERACTION.md §3.1). Truthful, and with nothing on screen it reads as a
+    crash. The page carries a compass of COVERAGE and a way back."""
+
+    def test_the_ring_is_the_capture_seen_from_where_you_stand(self):
+        _run_nav(r"""
+const prof = NAV.ringProfile(F, at, V, 36);
+assert.strictEqual(prof.length, 36);
+// the synthetic room is one wall at z = 3 that every recorded camera saw
+const facing = Math.round(0 / (2 * Math.PI / 36));
+assert.ok(prof[facing] > 0.95, "the bin that faces the wall is covered: " + prof[facing]);
+assert.strictEqual(prof[18], 0, "the bin that faces away from it is not");
+// and it is the SAME quantity the rest of the page calls support, at the same
+// field of view -- it reports coverage, never content
+for (const i of [0, 4, 9, 18, 27]){
+  const s = NAV.support(F, at, dir(i * 2 * Math.PI / 36, 0), up, V.fy, V.aspect).s;
+  assert.ok(Math.abs(prof[i] - s) < 1e-6, "bin " + i + ": " + prof[i] + " vs " + s);
+}
+// nowhere near the capture there is nothing to report, and nothing invented
+const far = NAV.ringProfile(F, [2.5, 0, -9], V, 36);
+assert.ok(Array.from(far).every(s => s === 0));
+""")
+
+    def test_the_way_back_is_the_nearest_covered_heading(self):
+        _run_nav(r"""
+const prof = NAV.ringProfile(F, at, V, 36);
+// standing with your back to the only wall in the world
+const b = NAV.bestHeading(prof, Math.PI);
+assert.ok(b, "there is a way back and the page can say so");
+assert.ok(Math.abs(b.delta) > 2.5, "and it turns you most of the way round: " + b.delta);
+assert.ok(b.support > 0.9, "to a heading that really is covered: " + b.support);
+// the yaw is continuous with the one given, so a glide turns the SHORT way
+assert.ok(Math.abs(b.yaw - Math.PI) <= Math.PI + 1e-9);
+assert.ok(Math.abs(Math.cos(b.yaw) - 1) < 0.1, "and it faces the wall: " + b.yaw);
+// facing the wall already, it barely asks you to move
+const b0 = NAV.bestHeading(prof, 0);
+assert.ok(Math.abs(b0.delta) < 0.2, "already facing it: " + b0.delta);
+
+// NEAREST, not best: a slightly worse heading at your elbow beats a slightly
+// better one behind you, and a much better one behind you still wins.
+const n = 36, mk = (i, v) => { const p = new Float32Array(n); p[i] = v; return p; };
+const near = mk(1, 0.70), farBin = mk(18, 0.80);
+const both = new Float32Array(n); both[1] = 0.70; both[18] = 0.80;
+assert.strictEqual(NAV.bestHeading(both, 0).delta, NAV.bestHeading(near, 0).delta,
+                   "0.80 half a turn away does not beat 0.70 at your elbow");
+const both2 = new Float32Array(n); both2[1] = 0.70; both2[18] = 0.99;
+assert.strictEqual(NAV.bestHeading(both2, 0).delta, NAV.bestHeading(farBin, 0).delta,
+                   "0.99 half a turn away does");
+assert.ok(NAV.RING_TURN_PENALTY > 0 && NAV.RING_TURN_PENALTY < 1);
+// and where NOTHING is covered there is no way back, and the page says nothing
+assert.strictEqual(NAV.bestHeading(new Float32Array(n), 0), null);
+assert.strictEqual(NAV.bestHeading(mk(3, NAV.RING_FLOOR * 0.5), 0), null);
+""")
+
+    def test_a_camera_the_page_placed_eases_back_toward_the_capture(self):
+        """The settle used to ask only for CONTENT, and where the glasses
+        never looked there is no content anywhere near, so its gradient was
+        exactly zero and a page-placed camera on nothing sat on nothing. It
+        now falls back to where the capture IS. It is a nudge at the edge and
+        not a way home -- the whole budget is C_DRIFT_MAX -- and it still
+        never touches a look the person made."""
+        _run_nav(r"""
+const away = 1.6;                                  // sideways: covered one way, not the other
+const run = (cam0, held) => {
+  let cam = Object.assign({p: at.slice(), pitch: 0, floor: 1, cdrift: 0}, cam0);
+  for (let i = 0; i < 400; i++)
+    cam = NAV.step(F, path, cam, {look: [0, 0], move: [0, 0, 0], held}, 16, V);
+  return cam;
+};
+const placed = run({yaw: away, aimed: false}, false);
+assert.ok(placed.yaw < away - 0.05, "a camera the page placed eases toward the capture: "
+          + away + " -> " + placed.yaw);
+assert.ok(away - placed.yaw <= NAV.C_DRIFT_MAX + 1e-6, "and no further than the budget: "
+          + (away - placed.yaw));
+assert.ok(sup(at, placed.yaw) > sup(at, away), "toward, not away");
+const aimed = run({yaw: away, aimed: true}, false);
+assert.strictEqual(aimed.yaw, away, "a look of the person's own is never moved");
+const held = run({yaw: away, aimed: false}, true);
+assert.strictEqual(held.yaw, away, "and nothing drifts while a finger is down");
+// the wide probe is a fallback, not a replacement: the content gradient is
+// still asked first
+assert.ok(NAV.C_GRAD_WIDE > NAV.C_GRAD_EPS);
+""")
+
+    def test_the_page_carries_the_cue_and_the_control(self):
+        text = _template()
+        assert 'id="compass"' in text and 'id="back"' in text
+        assert ">Face the room</button>" in text
+        # it is a compass of coverage, and the page says so where a person reads
+        cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert "compass of what was photographed" in cap
+        assert "not that there is anything worth seeing" in cap
+        assert "turns you -- without moving you" in cap
+        cue = _section(text, "/* -------- the orientation ring", "const KEY_SPEED")
+        # the ring is recomputed only when the camera has MOVED, and the profile
+        # comes from the page's own support, not from anything invented
+        assert "NAV.ringProfile(navField, at, navView(), RING_BINS)" in cue
+        assert "RING_MOVE" in cue
+        # and everything the cue reads is the pose that is DRAWN, so a
+        # verification hook pinning an exact camera does not leave the ring
+        # pointing at wherever `cam` happens to be
+        assert "function shownPose()" in cue
+        for line in ("const at = shownPose().p;", "const yaw = shownPose().yaw;",
+                     "const q = shownPose();", "const here = shownPose();",
+                     "NAV.bestHeading(ringProf, shownPose().yaw)"):
+            assert line in cue, line
+        # the cue is drawn in world yaw with the sense DERIVED, not assumed
+        assert "function yawSign()" in cue and "-Math.PI / 2 + sgn * (i * step - yaw)" in cue
+        # the way back turns and never translates
+        face = cue[cue.index("function faceTheRoom("):]
+        assert "glideTo({p: here.p.slice(), yaw: b.yaw, pitch: bestPitch}, null)" in face
+        # a glide, so a real finger cancels it: `pointerdown` calls `interrupt`
+        assert "if (glideState) interrupt();" in _section(text, 'canvas.addEventListener("pointerdown"',
+                                                          'canvas.addEventListener("pointermove"')
+        # the edge arrow appears only on a view that really is on nothing, with
+        # a gap between the two thresholds so it cannot blink on the boundary
+        assert "BACK_ON = 0.60, BACK_OFF = 0.25" in cue
+        assert "backOn ? dark > BACK_OFF : dark > BACK_ON" in cue
+        # and it is drawn, not typed: a glyph could render as a box
+        style = _section(text, "#back{position:fixed", "#back.on{")
+        assert "border-left:17px solid currentColor" in style
+        assert "textContent" not in cue[cue.index("function updateBack("):]
+
+    def test_the_ring_and_the_control_are_the_same_control(self):
+        text = _template()
+        wiring = _section(text, '$("bOverview").onclick', '$("bReset").onclick')
+        for el in ("bBack", "compass", "back"):
+            assert f'$("{el}").onclick = () => faceTheRoom();' in wiring, el
+
+
+class TestTheConfidenceFade:
+    """The proxy carries one byte a vertex saying how well that vertex was
+    measured (the geometry-confidence lane). Where it is low the blend tears
+    real photographs over wrong geometry, and the honest thing to draw is what
+    the page already draws where it knows nothing."""
+
+    def test_the_band_is_a_band_and_it_is_the_phone_level_s(self, built):
+        from tower.world_builder import appearance_render as R
+
+        assert 0 < R.CONFIDENCE_LO < R.CONFIDENCE_HI < 1
+        # the phone level, not the archive level: the validated level-0 band
+        # (0.30-0.50) fades 19% of the opening view on the decimated proxy
+        # the lane validated 0.30-0.50 on the ARCHIVE level; on the decimated
+        # proxy the fade has to be finished well before that band even starts
+        assert R.CONFIDENCE_HI < 0.40, "a level-0 threshold here would delete the room"
+        config = R.build_appearance_config(built.store, WORLD, SESSION)
+        assert config["confidence_lo"] == R.CONFIDENCE_LO
+        assert config["confidence_hi"] == R.CONFIDENCE_HI
+        # and the page's own fallback agrees with what is served
+        text = _template()
+        assert f"CONFIG.confidence_lo ?? ({int(round(R.CONFIDENCE_LO * 255))} / 255)" in text
+        assert f"CONFIG.confidence_hi ?? ({int(round(R.CONFIDENCE_HI * 255))} / 255)" in text
+
+    def test_it_fades_to_the_void_and_never_to_transparent(self):
+        shade = _section(_template(), "const GLSL_SHADE", "const FS_BLEND")
+        assert "float k = smoothstep" not in shade, "one rule, one place"
+        assert "smoothstep(uConfLo, uConfHi, gConf) : 1.0" in shade, "a band, never a cut"
+        assert "c = mix(background(), c, confKeep());" in shade, \
+            "toward the colour the page already uses for unobserved space"
+        # the EVIDENCE is untouched: alpha is what says anyone saw the place,
+        # the depth still hides what is behind, and no pixel goes see-through
+        assert "o = vec4(c * alpha, alpha);" in shade
+        for bad in ("alpha *= confKeep", "alpha = alpha * confKeep", "alpha *= k"):
+            assert bad not in shade, bad
+        # unknown is not zero
+        assert "uConfOn > 0.5" in shade
+        assert "float gConf = 1.0;" in shade, "1 where nothing is known"
+
+    def test_a_proxy_without_the_channel_is_drawn_at_full_strength(self):
+        text = _template()
+        apply = _section(text, "async function applyManifest(", "  let loadGeneration")
+        assert "cfd.present === true" in apply, "present: false is UNKNOWN, not zero"
+        upload = _section(text, "  function uploadMesh(){", "  function meshUniforms(")
+        assert "gl.disableVertexAttribArray(2); gl.vertexAttrib1f(2, 1);" in upload
+        # the channel rides the colour block already on the wire: no copy, no bytes
+        assert "gl.vertexAttribPointer(2, 1, gl.UNSIGNED_BYTE, true, 3, confChannel)" in upload
+        shade = _section(text, "  function shadeUniforms(", "  function blendPass(")
+        assert "confChannel !== null && OPT.confHi > OPT.confLo" in shade
+
+    def test_the_attribute_slots_are_fixed_so_three_programs_agree(self):
+        vs = _section(_template(), "const VS_VIEW = ", "/* What \"not captured\" looks like")
+        assert "layout(location = 0) in vec3 aQ;" in vs
+        assert "layout(location = 1) in vec3 aN;" in vs
+        assert "layout(location = 2) in float aConf;" in vs
+
+    def test_what_the_fade_takes_can_be_measured(self):
+        text = _template()
+        assert "if (uMode == 11){ o = vec4(alpha * (1.0 - confKeep()), alpha, gConf, 1.0); return; }" \
+            in text, "the removed area and the drawn area, so the share is one ratio"
+        assert "S.fadeCost = () => {" in text
+        assert "ofDrawn:" in text and "ofFrame:" in text
+
+
+class TestTheBestViewWasReSweptAgainstTheWiderTube:
+    """The interaction lane widened the tube from 1.0 to 1.5 and the candidate
+    set went from 205 to 406. Nobody chose what that did to the Best view: the
+    winner moved half a unit back, from 99.8% drawn to 88.7% with a shredded
+    corner. The score could not see the difference, because everything it
+    measured -- drawn, deep, detailed, with range -- is as true of a photograph
+    smeared over wrong geometry as of a photograph of the room. The confidence
+    channel can see it, and the page now draws it, so the score reads it off
+    the same render."""
+
+    def test_the_score_will_not_recommend_geometry_the_fade_eats(self):
+        over = _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
+        assert "* soundTerm(r.faded);" in over
+        assert "OVERVIEW_FADED_REF" in over and "OVERVIEW_SOUND_FLOOR" in over
+        # the term itself, run: bounded, monotone, and flat once a frame is wrecked
+        src = over[over.index("const OVERVIEW_FADED_REF"):over.index("function findOverview")]
+        _run_plain(src + r"""
+assert.strictEqual(soundTerm(0), 1);
+assert.ok(Math.abs(soundTerm(OVERVIEW_FADED_REF) - OVERVIEW_SOUND_FLOOR) < 1e-12);
+assert.ok(Math.abs(soundTerm(1) - OVERVIEW_SOUND_FLOOR) < 1e-12, "and it saturates, never below");
+let prev = 2;
+for (let f = 0; f <= 0.2; f += 0.002){
+  const s = soundTerm(f);
+  assert.ok(s <= prev + 1e-12 && s >= OVERVIEW_SOUND_FLOOR - 1e-12);
+  prev = s;
+}
+""")
+
+    def test_on_the_measured_candidates_it_flips_the_winner_back(self):
+        """The two decisive rows of the 12-candidate table this lane measured
+        on the canonical world (ORIENT.md §4). c03 is the vantage the wider
+        tube handed the old score -- pulled back, 88.7% drawn, and 3.07% of
+        what it draws is geometry the fade removes. c11 is the vantage the
+        score chose on the 1.0-unit tube, 99.8% drawn and 0.27% faded. Without
+        the confidence term c03 wins by 1.4%; with it c11 wins by 4.6%."""
+        over = _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
+        src = over[over.index("const OVERVIEW_FADED_REF"):over.index("function findOverview")]
+        _run_plain(src + r"""
+const ref = 4.106, DETAIL_REF = 0.12;
+const dterm = d => Math.max(0, Math.min(1, d / DETAIL_REF));
+const base = t => t.drawn * (0.4 + 0.6 * Math.min(1, t.distance / (1.5 * ref)))
+  * (0.5 + 0.5 * Math.max(0, t.toward)) * (0.15 + 0.85 * dterm(t.detail))
+  * (0.5 + 0.5 * Math.min(1, t.range / ref));
+const c03 = {drawn: 0.887, detail: 0.1617, range: 4.92, toward: 0.941, distance: 6.933, faded: 0.0307};
+const c11 = {drawn: 0.998, detail: 0.1878, range: 3.69, toward: 0.891, distance: 5.617, faded: 0.0027};
+assert.ok(base(c03) > base(c11), "the old score prefers the wrecked frame");
+assert.ok(base(c11) * soundTerm(c11.faded) > base(c03) * soundTerm(c03.faded),
+          "and the confidence term puts it back");
+""")
+
+
+class TestTheColdOpenWindow:
+    """`Preparing the view…` is how long the page cannot yet say why a
+    direction is dark. Widening the tube nearly doubled it, because the field
+    it waits on nearly doubled. A coarse field answers the same question."""
+
+    def test_the_field_is_usable_before_it_is_exact(self):
+        build = _section(_template(), "  function buildNav(){", "  /* Overview:")
+        assert "startJob(NAV.SPACING * NAV_COARSE);" in build, "coarse first"
+        assert "startJob(NAV.SPACING);" in build, "then the real one"
+        assert build.index("startJob(NAV.SPACING * NAV_COARSE);") < build.index("startJob(NAV.SPACING);")
+        # what the coarse field is enough for, and what it is not
+        assert '$("bBack").disabled = false;' in build
+        assert '$("bOverview").disabled = coarse;' in build
+        assert "scorePoses();" in build
+        over = _section(_template(), "  function overview(){", "  /* -------- source choice")
+        assert "!navFine" in over, "and the hook refuses too, not only the button"
+
+    def test_a_coarser_field_answers_the_same_question_for_an_eighth(self):
+        _run_nav(r"""
+const C = NAV.fieldJob(F.input, NAV.SPACING * 2);
+let slicesC = 0;
+while (!NAV.fieldWork(C, 50)) slicesC++;
+assert.strictEqual(C.spacing, NAV.SPACING * 2);
+assert.strictEqual(F.spacing, NAV.SPACING);
+// a third here, where the synthetic tube is short enough for its ends to
+// dominate; 866 against 3,851 on the canonical world
+assert.ok(C.count * 3 < F.count, "far fewer voxels: " + C.count + " of " + F.count);
+const supC = (p, yaw) => NAV.support(C, p, dir(yaw, 0), up, V.fy, V.aspect).s;
+let worst = 0;
+for (let i = 0; i < 24; i++){
+  const yaw = i * Math.PI / 12;
+  worst = Math.max(worst, Math.abs(supC(at, yaw) - sup(at, yaw)));
+  // and the two agree about which way the capture IS, which is all the cue
+  // and the dark hint ask of it
+  assert.strictEqual(supC(at, yaw) > 0.5, sup(at, yaw) > 0.5, "yaw " + yaw);
+}
+assert.ok(worst < 0.2, "and nowhere far apart: " + worst);
+assert.strictEqual(supC([2.5, 0, -9], 0), 0, "outside the tube it is still nothing");
+""")
+
+
+def _run_plain(script):
+    """A fragment of the page, lifted and run under node with `assert`."""
+    import subprocess
+
+    program = "const assert = require('assert');\n" + script + "\nconsole.log('plain ok');\n"
+    r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "plain ok" in r.stdout, (r.stdout + r.stderr)[-3000:]
 
 
 def _encoding_source():

@@ -323,7 +323,8 @@ enforced).
     support as the floor (`S.pose().floor`). The floor exists to stop a *limit*
     pushing a weak recorded view away, so with no limit left on a look it now
     constrains nothing, and in particular it does **not** enter what the page
-    *says*: `dark` is measured against the fixed T_LO/T_HI, so the dimmest
+    *says*: `dark` is measured against a fixed band (DARK_LO/DARK_HI, below),
+    so the dimmest
     recorded pose in a world reports its view exactly as the brightest one does.
     Reading it through the floor would have made the darkest place on a world
     the one place the page went quiet about the dark.
@@ -340,11 +341,29 @@ enforced).
     is honest but coarse: its correlation with the rendered drawn fraction is
     0.71 over all views and 0.41 within the recorded pitch range.
     **Since 2026-09-18 support resists nothing.** T_HI (0.80) and T_LO (0.68)
-    are what the page *says*, not what it enforces: a look that ends on a view
-    below T_LO shows *Nothing was photographed this way* — once, quietly, at
-    most every four seconds — and the turn happens in full either way. Support
-    still filters the Best view's candidates and is still reported by
-    `S.support`.
+    are what the page *says*, not what it enforces, and the turn happens in
+    full either way. Support still filters the Best view's candidates and is
+    still reported by `S.support`.
+    **The darkness the page reports is a different band** (2026-09-20, fix-it
+    orient lane). *Nothing was photographed this way* is a claim about whether
+    a view is on **anything**, and it was being read off T_LO, which is the
+    band at which three views in four render *well*. On the canonical world
+    that made `dark` exactly 1 at eight of nine sampled recorded poses —
+    including poses the page draws 99.4% of — so thirty frames of drag at the
+    opening, over 97% drawn, raised the sentence five times. A page that says
+    *nothing was photographed this way* over a photograph of the room is
+    crying wolf, and the sentence has stopped meaning anything by the time it
+    is true. `dark` is now `1 − smoothstep(DARK_LO, DARK_HI, support)` with
+    **DARK_LO = 0.07, DARK_HI = 0.25**, swept against the page's own
+    `coverage()` over 200 reachable views (`fixit\orient\ORIENT.md` §2.3).
+    Those 200 separate cleanly — every view that is at least 95% background
+    has support ≤ 0.088, every view that draws at least half the frame has
+    support ≥ 0.183 — and the band puts the hint's own 0.9 crossing in the
+    middle of that empty gap: over the 200 the sentence is now said over
+    **none** of the 116 views that draw half the frame (the old band said it
+    over **97** of them) and over **all 24** that are essentially black. The
+    hint still fires on `dark > 0.9`. Both bands are reported by
+    `S.navConst()`.
   - **Content, not only quality** (added 2026-09-17, fix-it framing lane). A
     view can be 100% drawn, clean, and hold nothing — a plain wall, a plain
     ceiling, a blank door panel — and support rated it exactly as highly as the
@@ -420,13 +439,71 @@ enforced).
     never of wherever it is.
   - **The envelope only limits the camera; it paints nothing.** Dark places
     inside it stay dark.
+  - **Where the room is, while you are pointed away from it** (added
+    2026-09-20, fix-it orient lane). Free looking is only honest if the page
+    can say what the darkness means: on the canonical capture a full turn at
+    the opening is 60% black, five consecutive 30° steps are over 95% black,
+    and with nothing on screen that reads as a crash rather than as the truth.
+    Three things, all of them reporting **coverage** and none of them implying
+    content:
+    - an **orientation ring** at the top right, always on once the field
+      exists: `RING_BINS` = 36 headings on the horizon from where the camera
+      stands, each one the same `support` the rest of the page uses at the
+      same field of view, drawn as an arc that is lit where a frame exists and
+      dim where none does, rotated so the current heading is always at the top
+      (so the room being behind you *looks* like the room being behind you).
+      The view's own horizontal spread is shaded inside it. The profile is
+      recomputed only when the camera has moved more than 0.22 units — turning
+      on the spot only rotates it — and costs 0.5–1.1 ms on SwiftShader; the
+      per-frame cost is one `support` for the view in front of you and a 58 px
+      2D draw. The sense of rotation is derived from `dirFrom` and the world's
+      vertical, never assumed.
+    - an **edge arrow** toward the shorter turn to the nearest covered
+      heading, shown only while the view really is on nothing (`dark` > 0.60,
+      released again below 0.25 — well below, because a frame that is 89%
+      background can still hold a torn fragment and read 0.36 — and never for
+      a turn under 0.35 rad), drawn with CSS borders rather than a glyph.
+    - **Face the room** — a button, and the ring and the arrow are the same
+      control. It turns the camera, from where it stands, to the heading
+      `NAV.bestHeading` names: the best-supported one discounted by how far
+      you would have to turn (`RING_TURN_PENALTY` = 0.25 over half a turn), at
+      the best of four pitches, as a **glide**, so a `pointerdown` cancels it
+      like any other. It never translates — that is what Best view does — and
+      when nothing at all is covered from where you stand it returns null and
+      offers nothing rather than inventing a direction.
+
+    The **settle** gained one fallback for the same reason: where the glasses
+    never looked there is no content anywhere near, so the content gradient is
+    exactly zero and a camera *the page placed* on nothing sat on nothing. It
+    now falls back to the **coverage** gradient over a wider 0.60 rad. It is a
+    nudge at the edge of the capture and not a way home — the whole budget is
+    still `C_DRIFT_MAX`, about 17°, and half a turn of dark is 180° — and it
+    is still refused for a look of the person's own and while a finger is
+    down.
+  - **Confidence fades appearance toward the void** (added 2026-09-20, fix-it
+    orient lane; `WORLD-BUILDER-APPEARANCE.md` §4.2a). The proxy's R colour
+    byte is the surface's per-vertex geometry confidence. Per fragment,
+    `k = smoothstep(CONFIG.confidence_lo, CONFIG.confidence_hi, conf)` and the
+    colour is `mix(background(), colour, k)`: below the band the photograph
+    gives way entirely to the same vignette the page draws where it knows
+    nothing, above it nothing changes, and between them it crosses over
+    smoothly. Never a hard cut. **The alpha is not touched**: alpha is the
+    evidence that a frame saw the place, the depth still hides what is behind,
+    and no pixel becomes see-through. `proxy.confidence.present === false` is
+    *unknown*, not zero, and disables the fade entirely (the attribute is then
+    the constant 1). The band is a **phone-level** band and is served as
+    `confidence_lo` / `confidence_hi` (24/255 and 78/255); reusing a level-0
+    number here fades 19% of the opening view. The thin cracks `FS_FILL`
+    closes are not faded — they have no vertex to read a confidence from —
+    which is at most 4 CSS px anywhere. Debug mode 11 renders what the fade
+    removes (R) over what is drawn (G), which is what `S.fadeCost()` reads.
   - **Controls.** Touch: one finger drags the look (the room follows the
     finger), two fingers drag to move sideways and up/down, pinch moves forward
     and back (log of the spread × 2 units). Desktop (debug): left drag looks,
     right or shift drag moves, the wheel moves forward/back, W A S D Q E fly,
     ←/→ step the walk, O is the Best view. Motion coasts after a flick (220 ms
-    time constant). Buttons: **Best view**, **←**, **→** (the recorded walk),
-    **Reset** (the opening).
+    time constant). Buttons: **Best view**, **Face the room**, **←**, **→**
+    (the recorded walk), **Reset** (the opening).
   - **Stepping the walk glides**: eased position and the short way round in
     yaw, 400–2600 ms by distance and turn, instead of jumping (the walkthrough's
     worst flicker steps were path jumps). Any touch interrupts a glide. The cap
@@ -466,13 +543,28 @@ enforced).
     arrived at: it now says *Best view*, the About text says what that is and
     why there is no overview to give, and the crossing from the opening —
     5.3 units — takes **2394 ms** instead of being clipped to 1600.
-    **The destination did move, because the envelope did.** A wider tube and a
-    smaller standoff take the candidate set from 205 to 406, and the winner is
-    a vantage about half a unit further back: more of the room in frame (depth
-    range 4.92 against 3.69) and **88.7 % drawn against 99.8 %**, with a torn
-    region in the lower right. This score has **not** been re-swept against the
-    larger envelope and should be
-    (`fixit\interaction\INTERACTION.md` §7, `fig\sheet_bestview_ba.png`).
+    **The destination moved when the envelope did, and it has been re-swept**
+    (2026-09-20, fix-it orient lane). A wider tube and a smaller standoff took
+    the candidate set from 205 to 406 and handed the score a vantage half a
+    unit further back: more of the room in frame (depth range 4.92 against
+    3.69) and **88.7% drawn against 99.8%**, with a shredded region in the
+    lower right. Nothing the score measured could see the difference, because
+    *drawn, deep, detailed and with range* is as true of a photograph smeared
+    over wrong geometry as of a photograph of the room — and on this candidate
+    set the **detail** term is saturated for all twelve and decides nothing.
+    The confidence channel can see it, and the page now draws it, so the score
+    reads it off the same render: one more factor,
+    `soundTerm(faded) = 0.45 + 0.55 × (1 − min(1, faded / 0.05))`, where
+    `faded` is the share of the drawn area the confidence fade removes.
+    Measured on the twelve candidates, `faded` splits them cleanly — ten at
+    0.16–0.93%, two at 2.34% and 3.07%, and those two are exactly the two
+    shredded frames. Every rule that reads the channel (a graded penalty, the
+    range-dominant variant, or a hard veto at 2%) then picks the same
+    candidate: the 99.8%-drawn vantage the score chose on the 1.0-unit tube,
+    by 4.6% where the old rule preferred the shredded one by 1.4%. **The
+    button is still not an overview** and the About text still says so: the
+    re-sweep buys a frame that is not wrecked, not a view of the room.
+    (`fixit\orient\ORIENT.md` §4, `fig\sheet_ov_candidates.png`.)
   - **Prev/next skip poses that render badly, and poses with nothing in them**:
     once the field is built every recorded pose is rendered in the background at
     the opening's 64-px size, and ←/→ step to the next pose whose drawn fraction
@@ -492,6 +584,19 @@ enforced).
     photographed — so without the line the page would answer the finger with a
     black screen and no account of it. The line is cleared the moment the field
     completes, and only if nothing else has since written to the status.
+    **The field is built twice** (2026-09-20, fix-it orient lane): a coarse
+    pass at twice the spacing, which is an eighth of the work and answers the
+    same question — over 24 headings the two fields never disagree about
+    whether a direction is covered, and nowhere by more than 0.2 of support —
+    and then the real one, which replaces it silently. The ring, the dark
+    hint, *Face the room* and `S.navReady()` land with the coarse pass; **Best
+    view** waits for the fine one, because its candidates are the field's own
+    lattice points and a coarse lattice may hold too few. On the canonical
+    world, quiet: the *Preparing the view…* window falls from 1007 to 787 ms
+    and the Best view arrives at 1.87 s instead of 1.01 s. Under six-way
+    contention, where the field work dominates: 2964–3629 ms → 1316–2312 ms
+    for the window, and 3.0–3.6 s → 5.4–7.6 s for the button. The coarse pass
+    costs 136 ms of extra work (935 against 799 ms in total).
 
   It opens at the recorded pose whose **rendered frame is most drawn and has the
   most in it** (drawn × (0.85 + 0.15 × wide) × (0.35 + 0.65 × rendered detail),
@@ -508,7 +613,8 @@ enforced).
   areas mean, that the arrows pass over poses that render badly or show
   nothing (at most 4 in a row, so the walk shown is shorter than the one
   recorded but never misses a stretch of it), **that turning is free and
-  moving is not, and what the Best view is**, open on tap (the four-line
+  moving is not, what the ring at the top right is and what *Face the room*
+  does, and what the Best view is**, open on tap (the four-line
   disclaimer covered 11–13% of the frame). The expanded text carries its own
   dark plate rather than relying on the caption's gradient scrim: the scrim
   fades out over the top of the frame and the paragraph is longer than it, so

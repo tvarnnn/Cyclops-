@@ -133,6 +133,36 @@ CRACK_FILL_PX = 4
 VOID_FOG = 0.35
 VOID_WIDE_FADE = 0.2
 
+# THE GEOMETRY-CONFIDENCE FADE (the fix-it confidence lane, CONFIDENCE.md §7,
+# and the orient lane that implemented it).
+#
+# The appearance proxy carries one byte a vertex saying how well that vertex was
+# measured. Below CONFIDENCE_LO the photograph gives way entirely to the void
+# treatment; above CONFIDENCE_HI it is drawn as it always was; between them it
+# crosses over smoothly. Never a hard cut, and the alpha -- the evidence that
+# anyone saw the place -- is never touched, so nothing becomes see-through.
+#
+# THE BAND IS THE PHONE LEVEL'S AND IS NOT TRANSFERABLE. The channel's geometry
+# half is recomputed on each level's own triangles, so the decimated level the
+# page reads sits far below the archive level the confidence lane validated on
+# (median 0.34 against 0.71). Reusing the validated level-0 band (0.30-0.50)
+# here fades 19% of the opening view, including every shelf edge and candle
+# silhouette.
+#
+# The confidence lane recommended 40/255 to 62/255, its area-matched
+# carry-across of the validated level-0 0.20-0.30 point. Rendered, that band is
+# 22 bytes wide and the low-confidence geometry is a SCATTER of bad triangles
+# among good ones, so the fade came out as hard-edged confetti: it read as a
+# cut-out mask rather than as a fade (fig/crop_band_fan4x.png, panel 40_62).
+# Widened to 24-78, measured over the reviewer's nine viewpoints in one session
+# with everything else held fixed (ORIENT.md §3): the mean drawn-area cost is
+# unchanged (2.34% -> 2.39%), the FULLY faded set is smaller and better
+# validated than the recommendation's (below level-0 ~0.15 rather than ~0.20),
+# and the transition grades over 54 bytes instead of 22. 16-96 was also
+# measured: it looks no better and costs 35% more (3.22%).
+CONFIDENCE_LO = 24 / 255
+CONFIDENCE_HI = 78 / 255
+
 
 class AppearanceViewerUnavailable(Exception):
     """No appearance page can be composed, with a reason a person can read."""
@@ -234,6 +264,8 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "crack_fill_px": CRACK_FILL_PX,
         "void_fog": VOID_FOG,
         "void_wide_fade": VOID_WIDE_FADE,
+        "confidence_lo": CONFIDENCE_LO,
+        "confidence_hi": CONFIDENCE_HI,
     }
 
 
