@@ -154,6 +154,32 @@ def _imagery(manifest: dict) -> str:
     return AP.imagery_source_of(manifest)
 
 
+# The imagery vocabulary, for the transport.
+#
+# `tower/routes/geometry.py` has to put `X-World-Imagery` and, for a research
+# build, `X-World-Imagery-Warning` on an appearance 200. Reading those two
+# strings out of `tower.world_builder.raw_imagery` made the HTTP layer know a
+# cartridge's vocabulary, which is what
+# `test_shared_code_does_not_import_a_cartridge` forbids and why it failed:
+# the next cartridge's route would inherit World Builder's idea of what
+# "imagery" means. This adapter is named after the cartridge and is allowed to
+# know it, so the two strings are published from here and the route copies
+# what it is handed.
+
+#: What `imagery` is when nothing says otherwise: the redacted product path.
+DEFAULT_IMAGERY = RAWIMG.IMAGERY_REDACTED
+
+
+def imagery_warning(imagery: str) -> str | None:
+    """The sentence to serve beside `imagery`, or None when there is none.
+
+    Only the research bypass gets one, and it is the same sentence the
+    manifest, the provenance and the page carry, so a reader cannot be told
+    one thing by the header and another by the body.
+    """
+    return None if imagery == RAWIMG.IMAGERY_REDACTED else RAWIMG.RAW_NOTE
+
+
 def appearance_manifest(store: WorldStore, world_id: str, session_id: str):
     """(payload, effective label). The manifest as built, plus `currency`."""
     contained, manifest = _servable_manifest(store, world_id, session_id)

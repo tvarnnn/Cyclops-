@@ -17,11 +17,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from tower.results.envelope import json_safe
 from tower.results.world_builder_appearance import (
+    DEFAULT_IMAGERY,
     NO_STORE_HEADERS,
     AppearanceNotServed,
     appearance_file,
     appearance_manifest,
     encode_body,
+    imagery_warning,
 )
 from tower.results.world_builder_geometry import (
     build_manifest,
@@ -36,7 +38,6 @@ from tower.results.world_builder_render import (
     build_world_render,
     render_content_security_policy,
 )
-from tower.world_builder.raw_imagery import IMAGERY_REDACTED, RAW_NOTE
 
 router = APIRouter()
 
@@ -108,7 +109,7 @@ def _appearance_store(request: Request):
     return store_from_root(root)
 
 
-def _appearance_headers(label: str, imagery: str = IMAGERY_REDACTED) -> dict:
+def _appearance_headers(label: str, imagery: str = DEFAULT_IMAGERY) -> dict:
     """The provenance headers on every appearance 200.
 
     `X-World-Redaction` is the effective redaction label. `X-World-Imagery`
@@ -117,16 +118,21 @@ def _appearance_headers(label: str, imagery: str = IMAGERY_REDACTED) -> dict:
     label beside it is not a redaction label and the body is not privacy-safe.
     Two headers rather than one because a reader that knows nothing of the
     bypass must not have to parse the label to find out.
+
+    Both the default and the warning sentence come from the appearance
+    adapter, not from the cartridge: this file is transport and must not know
+    a cartridge's vocabulary (`test_shared_code_does_not_import_a_cartridge`).
     """
     headers = {**NO_STORE_HEADERS, "X-World-Redaction": label,
                "X-World-Imagery": imagery}
-    if imagery != IMAGERY_REDACTED:
-        headers["X-World-Imagery-Warning"] = RAW_NOTE
+    warning = imagery_warning(imagery)
+    if warning is not None:
+        headers["X-World-Imagery-Warning"] = warning
     return headers
 
 
 def _appearance_response(request: Request, data: bytes, media_type: str, label: str,
-                         imagery: str = IMAGERY_REDACTED) -> Response:
+                         imagery: str = DEFAULT_IMAGERY) -> Response:
     """A 200 of appearance bytes, gzip/deflate when the client accepts it.
 
     The privacy headers are the same either way (`no-store`, `nosniff`, no

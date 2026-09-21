@@ -16,7 +16,9 @@ record, header and page says so.
 
 from __future__ import annotations
 
+import ast
 import builtins
+import importlib.util
 import io
 import json
 import pathlib
@@ -319,6 +321,51 @@ def test_the_served_headers_name_the_imagery(world, monkeypatch):
     assert research["X-World-Imagery"] == RAW
     assert research["X-World-Imagery-Warning"] == RAWIMG.RAW_NOTE
     assert research["Cache-Control"] == "no-store"
+
+
+def test_the_transport_gets_the_imagery_vocabulary_from_the_adapter():
+    """The HTTP layer must not import this cartridge to serve its headers.
+
+    `tower/routes/geometry.py` is transport: it is shared with every other
+    cartridge, and `test_shared_code_does_not_import_a_cartridge` exists
+    because the moment it learns one cartridge's vocabulary the next
+    cartridge's route inherits it. That rule went red when this feature
+    landed, because the route read `IMAGERY_REDACTED` and `RAW_NOTE` straight
+    out of `tower.world_builder.raw_imagery`. Both strings are now published
+    by the appearance ADAPTER -- which is named after the cartridge and is
+    allowed to know it -- and the route copies what it is handed.
+
+    Three assertions, because only all three together are the boundary: the
+    adapter answers, the route asks it, and the route imports nothing from
+    the cartridge.
+    """
+    from tower.results import world_builder_appearance as ADP
+
+    # 1. the adapter answers, with the same strings the manifest, the
+    #    provenance and the page label themselves with
+    assert ADP.DEFAULT_IMAGERY == RAWIMG.IMAGERY_REDACTED
+    assert ADP.imagery_warning(RAWIMG.IMAGERY_REDACTED) is None
+    assert ADP.imagery_warning(RAW) == RAWIMG.RAW_NOTE
+
+    # 2. the route asks it: the default a caller gets is the adapter's
+    from tower.routes.geometry import _appearance_headers
+
+    assert _appearance_headers(TRUSTED)["X-World-Imagery"] == ADP.DEFAULT_IMAGERY
+
+    # 3. and the route's source imports nothing from the cartridge. Read the
+    #    file rather than the module: an import the route never executes is
+    #    still a dependency, and this is the predicate
+    #    test_architecture_boundaries uses.
+    route = pathlib.Path(
+        importlib.util.find_spec("tower.routes.geometry").origin
+    ).read_text(encoding="utf-8")
+    imported: list[str] = []
+    for node in ast.walk(ast.parse(route)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+        elif isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+    assert [n for n in imported if n.startswith("tower.world_builder")] == []
 
 
 def test_textures_never_carry_over_between_the_two_modes():
