@@ -813,6 +813,164 @@ def test_a_transient_one_frame_saw_is_transparent_in_that_frame_only(world):
         assert next(k for k in man["keyframes"] if k["ki"] == other)["transient_fraction"] < 0.02
 
 
+# ---------------------------------------------------------------------------
+# the cross-frame redaction consensus (contract §5.3b)
+# ---------------------------------------------------------------------------
+
+SIGNATURE = np.array([250, 60, 10], np.uint8)   # "the face", by colour
+WALL_Z = 3.0                                    # the box face every camera sees
+
+
+def _wall_patch(half, n=41):
+    """A square of the far wall, as world points."""
+    g = np.linspace(-half, half, n)
+    x, y = np.meshgrid(g, g)
+    return np.stack([x.ravel(), y.ravel(), np.full(x.size, WALL_Z)], -1)
+
+
+def _project_patch(world, i, pts, shape):
+    """That square, as a boolean mask in keyframe `i`."""
+    R, t = world.pose(i)
+    pc = np.asarray(pts, float) @ R.T + t
+    u = FX * pc[:, 0] / pc[:, 2] + SW / 2
+    v = FX * pc[:, 1] / pc[:, 2] + SH / 2
+    m = np.zeros(shape, bool)
+    ui = np.round(u).astype(int)
+    vi = np.round(v).astype(int)
+    ok = (ui >= 0) & (vi >= 0) & (ui < shape[1]) & (vi < shape[0])
+    assert ok.mean() > 0.99, f"the patch leaves keyframe {i}"
+    m[vi[ok], ui[ok]] = True
+    return cv2.dilate(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+
+
+def _a_face_on_the_wall(world, hidden_in=(3,), half=0.10, fill_half=0.15):
+    """Paint one patch of the wall in every keyframe, and fill it -- as the
+    redactor would -- in `hidden_in` only. That is the leak exactly: a face the
+    detector found in one frame and missed in the others."""
+    sig = _wall_patch(half)
+    box = _wall_patch(fill_half)
+    for i in range(N_FRAMES):
+        img = world.render(i)
+        img[_project_patch(world, i, sig, (SH, SW))] = SIGNATURE
+        world.set_image(i, img)
+    for i in hidden_in:
+        img = cv2.imdecode(np.frombuffer(
+            (world.images / f"{world.kids[i].rsplit(':', 1)[-1]}.jpg").read_bytes(),
+            np.uint8), cv2.IMREAD_COLOR)[..., ::-1].copy()
+        img[_project_patch(world, i, box, (SH, SW))] = 0
+        world.set_image(i, img)
+        world.set_fill(i, _project_patch(world, i, box, (H, W)))
+    world.write_align()
+    return sig
+
+
+def _signature_texels(world, man):
+    """Where the published appearance still shows the painted face."""
+    out = {}
+    for entry in man["keyframes"]:
+        rgba = world.decoded(entry["ki"])
+        hit = _near_colour(rgba[..., :3], SIGNATURE, tol=60) & _opaque(rgba)
+        out[entry["ki"]] = int(hit.sum())
+    return out
+
+
+def test_without_the_consensus_a_face_one_frame_hid_is_published_by_the_others(world):
+    """The leak, as measured on the canonical world: the control for the tests
+    below. Every keyframe but one publishes what that one redacted."""
+    _a_face_on_the_wall(world)
+    result = world.build(redactor_factory=_never_redact,
+                         params=A.AppearanceParams(selection_samples=4000,
+                                                   redaction_consensus=A.CONSENSUS_OFF))
+    assert result.state == AP.STATE_OK, result.detail
+    man = world.manifest()
+    assert man["appearance_provenance"]["redaction_consensus"]["mode"] == A.CONSENSUS_OFF
+    seen = _signature_texels(world, man)
+    assert seen[3] == 0, "the frame that hid it must not publish it"
+    assert sum(1 for ki, n in seen.items() if ki != 3 and n > 100) >= 5, seen
+
+
+def test_a_surface_one_keyframe_redacted_is_published_by_no_keyframe(world):
+    """§5.3b: the fill is projected onto the proxy and read back in every
+    keyframe, so a face one detector pass found is unobserved for all of them.
+    Fails with `redaction_consensus=off` (the test above)."""
+    _a_face_on_the_wall(world)
+    result = world.build(redactor_factory=_never_redact)
+    assert result.state == AP.STATE_OK, result.detail
+    man = world.manifest()
+    seen = _signature_texels(world, man)
+    assert max(seen.values()) == 0, seen
+    rec = man["appearance_provenance"]["redaction_consensus"]
+    assert rec["mode"] == A.CONSENSUS_PLAUSIBLE
+    assert rec["voxels_dilated"] >= rec["voxels_marked"] > 0
+    assert rec["frames_masked"] >= N_FRAMES - 1
+    entry = next(k for k in man["keyframes"] if k["ki"] == 4)
+    assert entry["consensus_fraction"] > 0
+
+
+def test_the_consensus_covers_that_surface_and_not_the_room(world):
+    """The cost side: it takes the patch and its tolerance, not the wall. The
+    tolerance is about two voxels -- one dilation cell and the quantisation --
+    or 12 px at the median proxy depth, so the mask is roughly twice the
+    eroded fill across."""
+    _a_face_on_the_wall(world)
+    world.build(redactor_factory=_never_redact)
+    man = world.manifest()
+    for entry in man["keyframes"]:
+        assert (entry["consensus_fraction"] or 0.0) < 0.20, entry["ki"]
+        # and the published alpha carries the 7 px ring every mask carries
+        assert _opaque(world.decoded(entry["ki"])).mean() > 0.70, entry["ki"]
+
+
+def test_plausible_leaves_a_wall_sized_false_positive_to_the_other_frames(world):
+    """What `plausible` does NOT do, in code: a fill region too large to be a
+    face is not propagated, so the room is still drawn from the frames that saw
+    it. `union` propagates it and the room goes dark -- the trade PRIVLEAK.md
+    measures at 93% of the canonical world's published texels."""
+    big = np.zeros((H, W), bool)
+    big[10:100, 10:140] = True          # 61% of the frame
+    world.set_fill(3, big)
+    world.write_align()
+
+    world.build(redactor_factory=_never_redact)
+    plausible = world.manifest()
+    assert (plausible["appearance_provenance"]["redaction_consensus"]
+            ["regions_refused"]) == {"larger than a face": 1}
+    assert all((k["consensus_fraction"] or 0.0) == 0.0 for k in plausible["keyframes"])
+
+    world.build(redactor_factory=_never_redact, force=True,
+                params=A.AppearanceParams(selection_samples=4000,
+                                          redaction_consensus=A.CONSENSUS_UNION))
+    union = world.manifest()
+    assert max(k["consensus_fraction"] or 0.0 for k in union["keyframes"]) > 0.3
+
+
+def test_the_consensus_rule_is_in_the_cache_key_and_the_epoch(world):
+    """A change to the rule rebuilds, and an open page drops what it drew under
+    the old one: those textures may hold what the new rule hides."""
+    _a_face_on_the_wall(world)
+    assert world.build(redactor_factory=_never_redact).state == AP.STATE_OK
+    man = world.manifest()
+    assert world.build(redactor_factory=_never_redact).detail == AP.ALREADY_BUILT
+
+    params = A.AppearanceParams(selection_samples=4000, consensus_erode=0.05)
+    assert world.build(redactor_factory=_never_redact, params=params).detail != AP.ALREADY_BUILT
+    third = world.manifest()
+    assert third["params_digest"] != man["params_digest"]
+    assert third["epoch"] != man["epoch"]
+
+    prov = man["appearance_provenance"]
+    assert not AP.textures_carry_over(prov, third["appearance_provenance"])
+    assert AP.textures_carry_over(prov, prov)
+    # the revision route asks the question without naming a rule (§9)
+    assert AP.textures_carry_over(prov, {k: prov[k] for k in (
+        "session_redaction", "keyframe_image_set", "label_trusted")})
+
+
+def test_an_unknown_consensus_mode_is_refused():
+    with pytest.raises(ValueError):
+        A.AppearanceParams(redaction_consensus="sometimes")
+
+
 def test_exposure_gains_recover_a_frame_shot_darker(tmp_path):
     w = World(tmp_path)
     w.gain[6] = 0.6

@@ -2,7 +2,7 @@
 
 Contract identifier: `wb-appearance-keyframes/1`.
 
-**Living document.** Added 2026-09-17 (fix-it campaign, appearance stage). §6.5 (re-redaction) added 2026-09-17.
+**Living document.** Added 2026-09-17 (fix-it campaign, appearance stage). §6.5 (re-redaction) added 2026-09-17. §5.3b (the cross-frame redaction consensus) added 2026-09-21.
 
 | | |
 |---|---|
@@ -57,6 +57,12 @@ alpha (0 = no weight). The Tower does not render; it prepares.
    no keyframe saw through a non-transparent texel has no appearance; the
    renderer shows it as unobserved (dark, hatched, or absent), never as a
    colour taken from somewhere else.
+6. **A redaction is a decision about a SURFACE, not about one frame** — under
+   `redaction_consensus` (§5.3b, `plausible` by default). A face-sized region
+   one keyframe's detector filled is unobserved in every keyframe that sees the
+   same surface point, so what one frame hid no other frame publishes. The
+   claim is exactly as wide as §5.3b's gate, which names five things it does
+   not protect; in particular it is **not** a claim that no face is published.
 3. **Poses and intrinsics are the solve's, verbatim.** `rotation` and
    `translation` are `solve/<sid>/solution.json`'s, world-to-camera,
    `x_cam = R·X + t`, OpenCV axes (y down). The camera is `solution.camera`,
@@ -91,7 +97,11 @@ alpha (0 = no weight). The Tower does not render; it prepares.
   false negatives (§6). This artifact is first-person imagery of a private
   space and inherits the session's `privacy_tags` (`raw-imagery`,
   `first-person`). Screens, documents and bodies other than faces are **not**
-  redacted.
+  redacted. Nor does §5.3b make it anonymised: it stops a detection being
+  undone by the blend, it does not add detections. Measured on the canonical
+  world, the shipped redactor found a face composited into 102 keyframes in 15
+  of them; the other 87 are what §5.3b covers, and a face found in none of
+  them is covered by nothing.
 - **Not a texture atlas, not a baked colour.** Appearance is view-dependent by
   construction; two keyframes may legitimately disagree about a point.
 - **Not metric.** Scale is inherited from the solve; the artifact adds no scale
@@ -247,6 +257,11 @@ undistorted camera, where
 
 Rule string in the manifest: `fill2|nearblack6open16|dilate2`.
 
+This is the mask of ONE keyframe, from its own pixels. What the other
+keyframes' fill adds to it is §5.3b, and it is kept apart in the record
+(`unobserved_fraction` against `consensus_fraction`) because they are answers
+to different questions: what this frame hid, and what the session hid there.
+
 ### 5.3 Occluders: the wearer's hands and phone
 
 Two tests. A pixel that fails either is an occluder in that keyframe: RGB
@@ -366,6 +381,90 @@ the vote partly removes. Refusing would leave an offline Tower's first walk
 with no appearance at all, to prevent a defect that is visible, labelled, and
 fixed by the next build with the detector (the digest includes the mask state,
 so that build is not "already built").
+
+### 5.3b The cross-frame redaction consensus (`params.redaction_consensus`)
+
+Added 2026-09-21, fix-it cross-frame lane
+(`Glasses-scratch/wb-final-recon/fixit/privleak/PRIVLEAK.md`).
+
+**Why.** Redaction is decided per FRAME. A face the detector finds in keyframe
+A and misses in keyframe B is filled in A and published by B — and this artifact
+is blended by view, so the page draws B's pixels at the pose where A hid them.
+The wearer sees, at his own pose, the face his own photograph blacked out.
+
+This is not hypothetical and not rare. Measured on the canonical world:
+
+- 99.4% of the surface that some keyframe's fill covered (159,865 of 160,752
+  voxels at 6 px) is published, opaque, by another keyframe;
+- the one real face in that capture, a printed portrait on the bedroom wall,
+  is detected and filled in 17 keyframes and published by **86** others, and
+  the page draws it, recognisably, at the wearer's own pose `ki 85`;
+- a real face composited onto a flat surface of that room in the 102 keyframes
+  that see it is found by the shipped redactor in **15** of them and missed in
+  87. At all 15 poses where it WAS filled the page drew it, and the same
+  detector run on the render found a face in 10 of the 15.
+
+**The rule.** Every frame's privacy mask (§5.2) is split into connected
+regions. Each region the gate below admits is eroded by `consensus_erode` of
+its shorter side (the redactor dilates a face box by 1.6 about its centre, so
+the detection is inside 62.5% of the fill), trimmed to its own depth
+(`consensus_depth_tol`; a fill box straddles depth steps, and only the surface
+at the region's own depth is the surface the hidden thing was on), and
+back-projected along the proxy depth into a voxel grid. The grid is dilated by
+`consensus_dilate_cells` and then read back in EVERY keyframe: a pixel whose
+proxy surface point is marked is unobserved, exactly as fill is — RGB zeroed,
+alpha 0, the same ring (§5.6), no weight anywhere.
+
+A voxel is `consensus_voxel_px` pixels wide at the median proxy depth
+(`selection.z_ref`), so the tolerance is stated in pixels: about two voxels,
+quantisation and dilation together. The grid is held as sorted voxel keys, not
+an array, so the tolerance can be finer than a dense grid of a room would fit.
+
+**The gate**, `params.redaction_consensus`:
+
+| mode | which fill regions propagate | measured cost on the canonical world |
+|---|---|---|
+| `union` | every one | **the room is gone**: published texels −79.6%, proxy coverage `seen1` 0.977 → 0.419, mean drawn area at the review's viewpoints 0.81 → 0.20 |
+| `plausible` (default) | only a region that could be a face: at most `consensus_area_max` (0.10) of its frame, and not more than `consensus_hand_overlap` (0.5) inside the transient detector's hand/arm/phone mask | published texels −14.6%, `seen1` 0.977 → 0.863, mean drawn area 0.81 → 0.61 |
+| `off` | none — per-frame redaction only, what a build did before this mask existed | — |
+
+`plausible` is the default because `union` is not a product. The area gate is
+measured, not guessed: all 20 of the redaction lane's eye-labelled printed-face
+regions are at most 9.95% of their frame, while the regions that make the union
+unaffordable are 56–84% (the wall-sized false positives REDACTION.md measured
+at 8.3% precision).
+
+**What `plausible` therefore does NOT protect**, stated here because a reader
+must not infer more than it gives:
+
+1. **A face that fills more than a tenth of a frame** — a close face, a face at
+   the frame edge — is not propagated from that frame. Another frame that
+   redacted the same face smaller still protects it; a face only ever redacted
+   large is not protected at all.
+2. **A subject that MOVED between the frame that hid it and the frame that did
+   not.** This rule is anchored to the surface behind the subject. It protects
+   a face that stays put — a portrait, a photograph, a screen, a person sitting
+   still — and it does not protect a person walking through the room. `union`
+   does not protect that either.
+3. **A fill with no proxy surface behind it** marks nothing: there is no point
+   to mark. Such a texel is also never drawn, because the page's visibility
+   test needs the source's own depth — but a frame that saw the same face
+   against a different, modelled surface is not covered by this.
+4. **A face no frame's detector ever found.** This mask propagates detections;
+   it does not make them. Redaction stays best-effort with measured false
+   negatives (§6.2, and the claim in §3).
+5. It is **not** a claim that the published imagery contains no face.
+
+**Failure and absence.** The mask is computed from the fill masks and the proxy
+alone, both of which the build already requires, so there is nothing to be
+unavailable: unlike the detector mask (§5.3a) it cannot degrade quietly. A
+build with `redaction_consensus: off` records `mode: off` and makes no claim.
+
+The manifest records the rule, the grid, the voxels marked before and after
+dilation, how many regions propagated, how many keyframes carry a mask, its
+mean and maximum fraction, and why regions were refused (§6.3); each keyframe
+records its `consensus_fraction`. The rule is in the cache key (§6.4) and in
+the epoch (§9): a page may not keep textures drawn under a weaker rule.
 
 ### 5.4 Exposure: the photometric model
 
@@ -548,6 +647,7 @@ those three bytes carry instead is in §4.2a.
 | `label_trusted` | whether the stored label was on the allowlist |
 | `fill_rule` | the depth stage's `FILL_RULE` the stored masks were required to carry |
 | `unobserved_rule` | `fill2|nearblack6open16|dilate2` |
+| `redaction_consensus` | §5.3b: `{mode, rule, voxel, grid, voxels_marked, voxels_dilated, regions_propagated, frames_with_fill, frames_masked, mean_fraction, max_fraction, regions_refused: {reason: count}}`. `mode: off` means the build did NOT apply it, whatever else the record says; absent from manifests written before 2026-09-21 |
 | `source` | `session-keyframes` |
 | `frames` | `{used, refused: {reason: count}}` |
 | `per_frame_sha1_digest` | SHA-1 over the sorted `(keyframe id, SHA-1 of the stored JPEG)` pairs |
@@ -556,7 +656,7 @@ those three bytes carry instead is in §4.2a.
 
 Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 `origin`, `mask_origin` (`stored-fill` or `rerun-difference+guess`, each
-`+nearblack`), unobserved and occluder fractions.
+`+nearblack`), unobserved, consensus and occluder fractions.
 
 ### 6.4 Cache key
 
@@ -564,7 +664,8 @@ Per keyframe: `source_sha1`, `image_sha1` (of the bytes the pixels came from),
 `input_digest`, the proxy's SHA-256 (of the colourless proxy) and its source
 surface build, the depth stage's `cache_key`, `session_redaction`, `keyframe_image_set`,
 `redactor_applied_here`,
-`fill_rule`, `unobserved_rule`, `per_frame_sha1_digest`, the transient
+`fill_rule`, `unobserved_rule`, the §5.3b `consensus_rule`,
+`per_frame_sha1_digest`, the transient
 detector's `{rule, state, partial, frames_digest}` (`rule` is the rule the masks
 were actually made under, §10; SHA-1 over every keyframe's
 component cache keys: a rule change, a new model revision, or masks that
@@ -742,6 +843,7 @@ Per keyframe:
 | `quality` | the selection weight `q` |
 | `sharpness` | variance of the Laplacian over opaque pixels |
 | `unobserved_fraction`, `occluder_fraction`, `near_fraction`, `transient_fraction` | of the frame, before the alpha ring |
+| `consensus_fraction` | §5.3b: the fraction of the frame another keyframe's redaction took, or `null` when none did |
 | `transparent_fraction` | alpha 0, ring included |
 | `detector_fraction` | the detector mask's fraction of the frame, or `null` when the keyframe has none |
 | `transient_mask` | `{mode, rule}` of the detector mask applied, or `null`: **not detector-masked** |
@@ -842,9 +944,14 @@ else; the page deleted its textures and stopped polling for good, and the final
 build came back under the same page revision, so nothing ever replaced it.
 
 **Epochs.** Textures **carry over** from one build to the next when the keyframe
-set is the same and either the earlier build used the stored bytes under the
-same trusted label, or it re-redacted every frame with a redactor whose label is
-on the allowlist (`appearance_pipeline.textures_carry_over`, the one rule). Each
+set is the same, the §5.3b consensus rule is the same, and either the earlier
+build used the stored bytes under the same trusted label, or it re-redacted
+every frame with a redactor whose label is on the allowlist
+(`appearance_pipeline.textures_carry_over`, the one rule). The consensus rule is
+compared only when the caller states one, so the revision route's question --
+"would a build now trust these pixels?" -- is unchanged; a build-to-build
+comparison always states it, and textures made under a weaker rule, or under
+none, never stay on screen while a stronger build loads. Each
 manifest records `epoch`: the previous manifest's when textures carry over, else
 its own `build_id` (unique, so an epoch never returns). `appearance.epoch` is the
 served manifest's; the page compares it before applying a new build and drops
@@ -893,6 +1000,13 @@ closes** (`WORLD-BUILDER-IOS.md` §10).
   re-registration is visible there first, and the child launches on the newest
   solve whenever it finishes, so a slower child skips solves rather than queueing
   them. Revisit with a phone-side measurement of how often a wearer notices.
+- **The redaction consensus, live and final.** `AppearanceParams.live` does
+  NOT relax §5.3b: being late is worse than being coarse, but a relaxed privacy
+  rule is not coarse, it is wrong. Measured on the canonical world (382
+  keyframes, 359x639): the consensus stage costs **9.3 s** in `plausible` and
+  84.8 s in `union`, against a 51.8 s / 322.5 s whole build. It also makes the
+  later stages cheaper, because a masked texel is one fewer observation: the
+  whole `plausible` build is 51.8 s against 59.5 s with the mask off.
 - **Detector, live and final.** The live presets use `mode: oneformer`; the
   final build after Stop uses `union`. Measured on the canonical world, RTX 5070
   shared with another lane (73–88% utilisation), models already cached on disk:
