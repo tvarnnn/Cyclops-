@@ -374,6 +374,45 @@ class SurfaceParams:
     removes the marching-cubes staircase without the volume loss plain
     Laplacian smoothing causes."""
 
+    smooth_boundary_curve: bool = True
+    """Smooth a RIM along the rim, not across the surface (`taubin_smooth`).
+
+    WHY. A surface that stops where the evidence stops is mostly boundary --
+    on the canonical capture 48% of the phone level's faces touch a rim -- and
+    the umbrella that removes the marching-cubes staircase from the interior
+    does the wrong thing to a rim twice over. A boundary vertex's neighbours
+    all lie on ONE side of it, so the average pulls it across the surface,
+    away from where the evidence ended; and none of those neighbours is on the
+    rim, so the staircase ALONG the rim is never touched. That staircase is
+    what the visual review called ragged black rims along the shelf boards,
+    torn silhouettes at grazing angles, and stair-stepped edges where surface
+    meets void.
+
+    On: a boundary vertex with exactly two boundary neighbours takes the same
+    lambda/mu passes over its own boundary POLYLINE instead; a junction (any
+    other count of boundary neighbours) is held still; every interior vertex
+    keeps the surface umbrella unchanged. No face and no vertex is added or
+    removed, and no interior vertex moves except through its own rim
+    neighbours -- 63% of them do not move at all, p99 0.13 voxels.
+
+    Measured on the canonical capture (`Glasses-scratch/wb-final-recon/fixit/
+    rims/RIMS.md`), level 0: rim roughness -- a boundary vertex's distance from
+    the midpoint of its two boundary neighbours -- falls from 0.31 to 0.17
+    voxels (p90 0.71 to 0.32), total boundary length from 192,064 to 157,481
+    voxels, and the rim's drift across the surface from -0.29 to -0.18 voxels,
+    so the surface keeps 2.8% more area. At the phone level, which is what a
+    viewer sees: 8,045 boundary loops become 4,203, 7,167 pinholes become
+    3,574, and the staircase index of the drawn/void border -- its length over
+    the length of the same mask opened and closed by a 3x3 disc -- falls from
+    2.44 to 2.09 at the walk poses and 1.87 to 1.53 in the look-arounds.
+    No-surface pixels fall with it (walk 7.44 to 7.23%, novel views 33.71 to
+    33.26%). Against 10% of keyframes held out of fusion, the pixels it gains
+    and the pixels it loses agree with the held-out depth equally often (45.2%
+    against 44.1%) and it gains 17x more than it loses; the whole surface's
+    agreement is unchanged at 75.7 / 6.9 / 17.4%.
+
+    Off restores one umbrella for every vertex."""
+
     # -- enclosed-hole fill (OPT-IN, default off) ----------------------------
     fill_gap_frac: float = 0.0
     """Widest gap the enclosed-hole fill may close, as a fraction of median
@@ -614,6 +653,10 @@ class SurfaceParams:
             # any frame at all saw through.
             ("low-weight-through", self.low_weight_through_frac,
              self.low_weight_through_min_support),
+            # A surface built before it existed smoothed its rims ACROSS the
+            # surface instead of along them, so every vertex near a rim is in
+            # a different place; see `smooth_boundary_curve`.
+            ("smooth-boundary", self.smooth_boundary_curve),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
@@ -2060,12 +2103,62 @@ def drop_small_components(V, F, C, min_frac: float, *, return_index: bool = Fals
     return out + ((keep,) if return_index else ())
 
 
-def taubin_smooth(V, F, iterations: int, lam: float, mu: float):
+def boundary_edges(F):
+    """The mesh's boundary: edges used by exactly one face, as sorted vertex
+    pairs. Every pixel of void the viewer sees beside drawn surface is bounded
+    by one of these."""
+    F = np.asarray(F, np.int64)
+    if not len(F):
+        return np.zeros((0, 2), np.int64)
+    e = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+    key = e[:, 0] * (int(F.max()) + 1) + e[:, 1]
+    order = np.argsort(key, kind="stable")
+    key, e = key[order], e[order]
+    first = np.nonzero(np.r_[True, key[1:] != key[:-1]])[0]
+    once = np.diff(np.r_[first, len(key)]) == 1
+    return e[first[once]]
+
+
+def boundary_curve(F, n_vertices: int):
+    """Split the boundary into the vertices a rim can be smoothed ALONG and the
+    ones it cannot.
+
+    Returns (mid, left, right, junction): `mid` are the boundary vertices with
+    exactly two boundary neighbours, `left`/`right` are those neighbours, and
+    `junction` is a mask over all vertices marking every other boundary vertex
+    -- a corner where rims meet, or a vertex the weld left with one or three
+    boundary edges. A junction belongs to no single rim, so it is held still
+    rather than averaged along an arbitrary pair.
+    """
+    E = boundary_edges(F)
+    junction = np.zeros(n_vertices, bool)
+    if not len(E):
+        return (np.zeros(0, np.int64),) * 3 + (junction,)
+    v = np.concatenate([E[:, 0], E[:, 1]])
+    w = np.concatenate([E[:, 1], E[:, 0]])
+    order = np.argsort(v, kind="stable")
+    v, w = v[order], w[order]
+    uniq, start, count = np.unique(v, return_index=True, return_counts=True)
+    two = count == 2
+    mid = uniq[two]
+    left = w[start[two]]
+    right = w[start[two] + 1]
+    junction[uniq[~two]] = True
+    return mid, left, right, junction
+
+
+def taubin_smooth(V, F, iterations: int, lam: float, mu: float, *,
+                  boundary_curve_smoothing: bool = False):
     """Taubin lambda/mu smoothing.
 
     A Laplacian pass shrinks the model; Taubin follows each shrinking pass
     with a slightly larger expanding one, so the marching-cubes staircase goes
     without the whole room quietly getting smaller.
+
+    `boundary_curve_smoothing` gives a RIM the same two passes over its own
+    boundary polyline instead of over the surface umbrella, and holds a
+    junction still; see `SurfaceParams.smooth_boundary_curve`. Interior
+    vertices take the surface umbrella either way.
     """
     if not len(F) or iterations <= 0:
         return V, 0.0
@@ -2079,11 +2172,26 @@ def taubin_smooth(V, F, iterations: int, lam: float, mu: float):
     deg = np.asarray(A.sum(axis=1)).ravel()
     deg[deg == 0] = 1.0
 
+    mid = left = right = None
+    held = None
+    if boundary_curve_smoothing:
+        mid, left, right, junction = boundary_curve(F, n)
+        held = junction.copy()
+        held[mid] = True          # every boundary vertex leaves the umbrella
+
     P = V.astype(np.float64).copy()
     start = P.copy()
     for i in range(iterations * 2):
         step = lam if i % 2 == 0 else mu
-        P = P + step * ((A @ P) / deg[:, None] - P)
+        L = (A @ P) / deg[:, None] - P
+        if held is not None:
+            # A junction stays where it is; a rim vertex follows its own
+            # polyline, whose two neighbours lie on either side of it, so the
+            # pass straightens the rim instead of dragging it inward.
+            L[held] = 0.0
+            if len(mid):
+                L[mid] = 0.5 * (P[left] + P[right]) - P[mid]
+        P = P + step * L
     moved = float(np.median(np.linalg.norm(P - start, axis=1)))
     return P.astype(np.float32), moved
 

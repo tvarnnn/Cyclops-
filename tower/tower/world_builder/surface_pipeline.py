@@ -1076,7 +1076,9 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             V, F, C, params.min_component_frac, return_index=True)
         face_evidence = face_evidence[comp_keep]
     V, moved = taubin_smooth(V, F, params.smooth_iterations,
-                             params.smooth_lambda, params.smooth_mu)
+                             params.smooth_lambda, params.smooth_mu,
+                             boundary_curve_smoothing=params.smooth_boundary_curve)
+    rim_stats = _rim_summary(V, F, voxel, params)
     seconds[STAGE_MESH] = round(time.time() - t, 2)
     snap_stats = None
     if params.plane_snap and len(F):
@@ -1167,6 +1169,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                            "confidence": _confidence_summary(vertex_evidence, root,
                                                              conf_files),
                            "median_vertex_move_voxels": round(moved / voxel, 3),
+                           "rims": rim_stats,
                            "weld": weld_stats,
                            "voxel_coarsened_by": round(coarsened, 4),
                            "truncation_floor": band_floor(voxel),
@@ -1177,6 +1180,39 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                            "plane_snap": _snap_summary(snap_stats),
                            **({"enclosed_fill": fill_stats} if fill_stats else {})}),
     )
+
+
+def _rim_summary(V, F, voxel, params) -> dict:
+    """How much rim the level-0 surface owns, and how ragged it is.
+
+    `roughness` is the median distance of a boundary vertex from the midpoint
+    of its two boundary neighbours, in voxels: a marching-cubes staircase
+    smoothed only across the surface measures about 0.3, a rim smoothed along
+    itself about half that. It is the number `SurfaceParams.
+    smooth_boundary_curve` exists to move, and the one to watch when a rim
+    looks torn.
+
+    Measured straight after the smoothing and BEFORE the plane snap, which
+    moves vertices again -- on the canonical capture it lengthens the boundary
+    by about 2% -- so this records what the smoothing itself left.
+    """
+    from tower.world_builder.surface import boundary_curve, boundary_edges  # noqa: PLC0415
+
+    E = boundary_edges(F)
+    rec = {"smoothing": "curve" if params.smooth_boundary_curve else "umbrella",
+           "boundary_edges": int(len(E)), "roughness_voxels": None,
+           "length_voxels": 0.0, "junction_vertices": 0}
+    if not len(E):
+        return rec
+    rec["length_voxels"] = round(
+        float(np.linalg.norm(V[E[:, 0]] - V[E[:, 1]], axis=1).sum() / voxel), 1)
+    mid, left, right, junction = boundary_curve(F, len(V))
+    rec["junction_vertices"] = int(junction.sum())
+    if len(mid):
+        dev = np.linalg.norm(V[mid] - 0.5 * (V[left] + V[right]), axis=1) / voxel
+        rec["roughness_voxels"] = round(float(np.median(dev)), 4)
+        rec["roughness_voxels_p90"] = round(float(np.percentile(dev, 90)), 4)
+    return rec
 
 
 def _confidence_summary(vertex_evidence, root, conf_files):
