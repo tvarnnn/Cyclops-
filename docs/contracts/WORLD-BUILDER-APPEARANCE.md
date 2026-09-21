@@ -213,6 +213,48 @@ widened because 22 bytes is narrow enough that a scatter of bad triangles
 among good ones fades as hard-edged confetti rather than as a fade; 24–78
 costs the same (2.39% mean against 2.34%) and grades over 54 bytes.
 
+**The band did not move again; what it fades TOWARD did** (2026-09-21, fix-it
+ux lane, `fixit\ux\UX.md` §9). An independent review A/B'd the shipped band
+against `?clo=0&chi=0` over nineteen poses and could not tell the pairs apart:
+the fade changed a median **0.22 of an 8-bit level** over the frame, and only
+0.60% of the frame by more than eight levels. The reason is that it faded dark
+geometry toward a near-black background, so wherever it acted hardest there
+was least to see. It now fades toward the same **flat haze** the page draws
+where no kept frame saw (§4.2b), and the same A/B measures **1.56%** of the
+frame changing by ~20 levels — the same mask and the same 0.74% of the drawn
+area removed, in a mark a person can read. Raising the band instead was
+measured and rejected: at 110/255 the cost triples (2.53% of drawn) for no
+visible gain, and at 140/255 (6.85% of drawn, 16.5% at worst) it begins
+fogging real photographs of the shelf and the laptop.
+
+### 4.2b A place nobody photographed
+
+A proxy fragment that **no kept frame saw** carries no imagery, and the page
+must not pretend otherwise. Until 2026-09-21 it wrote alpha 0 and came out as
+the background vignette, which the last independent review measured at
+luminance **10–18** against a background of **11–28**: in the opening view the
+"grey haze" the caption promised was *darker than the emptiness it is supposed
+to be distinguishable from*, and at +90° **13.4%** of the frame was real
+geometry nobody ever photographed, indistinguishable from nothing at all.
+
+Such a fragment now writes **one flat colour** — display RGB 0.160 / 0.168 /
+0.190 at alpha `unseen_haze` (0.9) — with no texture, no hue of its own and no
+detail at any scale. It is the only thing the page paints rather than
+photographs, and that is exactly the statement it makes: *there is a surface
+here and there is no picture of it*. It cannot be mistaken for imagery, it
+extends and inpaints nothing, and its depth still hides what is behind it.
+
+**No measurement may see it.** The observed/unobserved mask (debug mode 2),
+the drawn fraction the opening pose and the Best view are scored on (mode 3)
+and the fade's own cost (mode 11) all return before the haze is drawn, and the
+uniform is zero for every mode but the display one — so the page's own
+`coverage()`, `detailOf()` and `fadeCost()` report exactly what they did
+before. `unseen_haze: 0` restores the previous behaviour bit for bit.
+
+Measured over the review's nineteen poses: the haze reads **27–42** against a
+background of 11–28; it is darker than the background in **1 of 19** views
+(14 of 19 before); the median separation is **+18.9** where it was **−1.8**.
+
 ### 4.2 Texel convention
 
 A texel `(i, j)` covers `[i, i+1) × [j, j+1)` in pixel units and its centre is

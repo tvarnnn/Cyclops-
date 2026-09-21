@@ -163,6 +163,29 @@ VOID_WIDE_FADE = 0.2
 CONFIDENCE_LO = 24 / 255
 CONFIDENCE_HI = 78 / 255
 
+# THE HAZE: how strongly a place NO KEPT FRAME SAW is marked (the fix-it ux
+# lane, UX.md). The caption has always promised "a grey haze is a place no
+# kept frame saw"; until 2026-09-21 proxy with no evidence wrote alpha 0 and
+# came out as the background, which the last independent review measured at
+# luminance 10-18 against a background of 11-28 -- in the opening view the
+# "haze" was DARKER than the emptiness it was supposed to be distinguishable
+# from, and at +90 degrees 13.4% of the frame was real geometry nobody
+# photographed, indistinguishable from nothing at all.
+#
+# It is now drawn as one flat colour with no texture, no hue and no detail at
+# any scale: plainly above the void, plainly below the room, and plainly not a
+# photograph, so it can never be mistaken for imagery of a place nobody saw.
+# The confidence fade mixes toward the same colour rather than toward the
+# background, which is what makes that fade visible at all -- the review's A/B
+# at `clo=0&chi=0` measured a median difference of 0.22 of an 8-bit level over
+# the whole frame, "a feature that does nothing".
+#
+# 0 restores the previous behaviour exactly. No measurement reads it: the
+# observed/unobserved mask (mode 2), the drawn fraction the opening and the
+# Best view are scored on (mode 3) and the fade's own cost (mode 11) all
+# return before the haze is drawn.
+UNSEEN_HAZE = 0.9
+
 
 class AppearanceViewerUnavailable(Exception):
     """No appearance page can be composed, with a reason a person can read."""
@@ -266,6 +289,7 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
         "void_wide_fade": VOID_WIDE_FADE,
         "confidence_lo": CONFIDENCE_LO,
         "confidence_hi": CONFIDENCE_HI,
+        "unseen_haze": UNSEEN_HAZE,
     }
 
 
