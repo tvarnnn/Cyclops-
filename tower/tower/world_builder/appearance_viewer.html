@@ -26,8 +26,19 @@ canvas{display:block;width:100%;height:100%;touch-action:none;background:var(--b
    the viewport meta carries `user-scalable=no`, and that stops being true the
    moment the app sets `ignoresViewportScaleLimits` (an accessibility
    setting). */
-#bar,#caption,#status,#hint,#msg{touch-action:none}
+#bar,#caption,#status,#hint,#dark,#msg{touch-action:none}
 #compass,#back{touch-action:manipulation}
+/* THE CHROME DOES NOT ARRIVE BEFORE THE PICTURE.
+   Measured 2026-09-21 (fix-it ux lane) against the last independent review:
+   the finished caption and the whole button bar sat on screen over a pure
+   black canvas for 2.8-3.1 s of every cold open with the status line cleared
+   -- a page wearing a finished page's clothes and showing nothing, which
+   reads as "it did not load" rather than as "it is loading". The bar is in
+   the markup from the first byte because the buttons must exist before
+   anything can enable them; `booting` only hides it, and it comes off at the
+   FIRST DRAWN FRAME, so the room and the controls arrive together. */
+body.booting #caption,body.booting #bar{opacity:0;pointer-events:none}
+#caption,#bar{transition:opacity .25s ease}
 /* Landscape on a notched phone: `viewport-fit=cover` puts the sensor housing
    over the left or right edge, and nothing here reserved for it. */
 #bar{position:fixed;left:0;right:0;bottom:0;
@@ -53,10 +64,18 @@ button[disabled]{opacity:.4}
   font-size:12px;color:var(--dim);pointer-events:none}
 #caption b{color:var(--ink);font-weight:600;text-shadow:0 1px 3px rgba(0,0,0,.9)}
 #caption button{pointer-events:auto;min-height:24px;padding:1px 8px;margin-left:6px;font-size:11px;border-radius:10px;vertical-align:baseline}
-#caption .more{display:block;margin-top:6px;padding:8px 10px;border-radius:8px;
+#caption .more{display:block;margin-top:6px;padding:9px 11px 10px;border-radius:8px;
   background:rgba(8,10,13,.88);color:#d3d7dd;border:1px solid rgba(255,255,255,.08);
-  text-shadow:0 1px 2px rgba(0,0,0,.85)}
+  text-shadow:0 1px 2px rgba(0,0,0,.85);max-height:44vh;overflow-y:auto;
+  pointer-events:auto;touch-action:pan-y;overscroll-behavior:contain}
 #caption .more[hidden]{display:none}
+/* Short sections with a title each, instead of one 335-word block. */
+#caption .more em{display:block;margin:9px 0 2px;font-style:normal;font-weight:600;
+  font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:#8b939d}
+#caption .more em:first-child{margin-top:0}
+#caption .more i{display:block;font-style:normal;color:#aab1ba}
+#caption .more span{display:block}
+#caption .more .tail{margin-top:8px;color:#8b939d}
 /* The status line sits over the frame with no scrim of its own, which was
    fine while it only ever said "Loading the images…" over a black screen.
    It now says "Preparing the view…" over the opening, which is a photograph,
@@ -76,6 +95,24 @@ button[disabled]{opacity:.4}
 #hint{position:fixed;left:50%;bottom:calc(104px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:6px 12px;border-radius:14px;
   background:rgba(11,13,16,.55);color:var(--dim);font-size:12px;pointer-events:none;opacity:0;
   transition:opacity .35s ease}
+/* THE DARK STATE, which is not a toast.
+   The dark sentence used to be `hint()`: 1,100 ms of life and one showing per
+   4,000 ms. Measured over a 24-step turn from the opening it was visible at
+   three steps of twenty-four and at NONE of the six steps that render a 100%
+   black frame -- so the deepest black was the least explained. A state that
+   is true for as long as you keep looking that way has to be SAID for as long
+   as it is true. This is that: permanent while the view is on nothing, calm,
+   out of the way, and gone the moment the room is back. It is also a control:
+   tapping it turns you to the nearest photographed direction, like the ring
+   and the edge chevron. */
+#dark{position:fixed;left:50%;bottom:calc(104px + env(safe-area-inset-bottom));transform:translateX(-50%);
+  max-width:min(84vw,360px);padding:7px 13px;border-radius:15px;text-align:center;
+  background:rgba(8,10,13,.62);border:1px solid rgba(255,255,255,.07);
+  color:var(--dim);font-size:12px;line-height:1.35;opacity:0;pointer-events:none;
+  transition:opacity .4s ease;cursor:pointer}
+#dark.on{opacity:.88;pointer-events:auto}
+#dark b{display:block;color:#c9ced6;font-weight:600}
+#dark span{color:#7f868f;font-size:11px}
 /* THE ORIENTATION RING. Turning is free and on this capture more than half of
    a full turn was never photographed, so the page has to be able to say where
    the room is while you are pointed away from it -- otherwise five black
@@ -84,10 +121,23 @@ button[disabled]{opacity:.4}
    photograph exists in, from where you stand; the way you are looking is
    always at the top. When the lit arc is at the bottom, the room is behind
    you. It says nothing about whether there is anything worth seeing there. */
+/* It is LEGIBLE AT REST and it is LABELLED. It used to ramp its opacity in
+   only once the support field existed, which on a cold open is a second or
+   two after the first frame -- exactly the moment a first-time viewer looks
+   at it -- and it carried no words at all, so its meaning lived only in the
+   About panel. The ring is now drawn from the first frame (its arcs blank
+   until the field can fill them, which is the truth) and it says what it is
+   underneath. */
 #compass{position:fixed;top:calc(8px + env(safe-area-inset-top));
   right:calc(10px + env(safe-area-inset-right));width:58px;height:58px;
   opacity:0;transition:opacity .4s ease;cursor:pointer}
 #compass.on{opacity:.93}
+#clabel{position:fixed;top:calc(66px + env(safe-area-inset-top));
+  right:calc(8px + env(safe-area-inset-right));width:62px;text-align:center;
+  font-size:9px;line-height:1.2;letter-spacing:.02em;color:var(--dim);
+  text-shadow:0 1px 3px rgba(0,0,0,.95);opacity:0;transition:opacity .4s ease;
+  pointer-events:none}
+#clabel.on{opacity:.8}
 /* The way back, at the edge of the frame, and only while the view is on
    nothing: a chevron toward the shorter turn to the nearest covered heading.
    Tapping it does what the button does. */
@@ -106,7 +156,7 @@ button[disabled]{opacity:.4}
 #back.right{right:calc(2px + env(safe-area-inset-right))}
 </style>
 </head>
-<body>
+<body class="booting">
 <div id="wrap"><canvas id="c"></canvas></div>
 <div id="caption"></div>
 <div id="status"></div>
@@ -127,8 +177,10 @@ button[disabled]{opacity:.4}
 </div>
 <canvas id="compass" width="58" height="58" role="img"
   aria-label="Which directions were photographed from here"></canvas>
+<div id="clabel" aria-hidden="true">photographed<br>from here</div>
 <div id="back" aria-hidden="true"></div>
 <div id="hint" aria-live="polite">Not captured beyond here</div>
+<div id="dark" role="status" aria-live="polite"></div>
 <div id="msg"></div>
 <script>
 "use strict";
@@ -162,6 +214,17 @@ function status(text){ $("status").textContent = text || ""; }
    You can already look and walk; what the page cannot do yet is tell you why
    a direction is dark, or which vantage is best. It says so. */
 const PREPARING = "Preparing the view…";
+/* The scan for the opening pose: thirty-odd small renders, about two seconds
+   on a phone-class renderer, and until 2026-09-21 the one stretch of the boot
+   that said nothing at all. */
+const CHOOSING = "Choosing where to open…";
+/* A finger on the glass before there is anything on the glass. The page does
+   not bank the drag and spend it at handover -- doing that is what put the
+   last reviewer at yaw 2.90 in the empty half of the room, from a thumb that
+   was only resting there -- and it does not silently ignore it either. You
+   cannot aim at a picture you have not seen; the page says so, and the moment
+   the picture is there the finger drives it. */
+const TOUCHED_EARLY = "One moment — you can look around as soon as it draws";
 
 const DEBUG = CONFIG.transport === "tower";
 const Q = DEBUG ? new URLSearchParams(location.search) : new URLSearchParams("");
@@ -209,6 +272,10 @@ const OPT = {
   // is NOT the same as "confidence zero".
   confLo: Math.max(0, Math.min(1, +(Q.get("clo") ?? CONFIG.confidence_lo ?? (24 / 255)))),
   confHi: Math.max(0, Math.min(1, +(Q.get("chi") ?? CONFIG.confidence_hi ?? (78 / 255)))),
+  // How strongly a place NO KEPT FRAME SAW, and a place the confidence band
+  // will not vouch for, are marked with the flat grey haze the caption
+  // promises. 0 restores the previous behaviour (both drawn as the void).
+  haze: Math.max(0, Math.min(1, +(Q.get("haze") ?? CONFIG.unseen_haze ?? 0.9))),
   forceWebp: Q.get("enc") === "webp",
   debugMode: +(Q.get("dbg") || 0),
   preserve: Q.get("preserve") === "1",
@@ -418,7 +485,27 @@ const NAV = (() => {
      wearer actually took, and how close a 360x640 frame may be magnified. */
   // The tube: widened from 1.0 x 0.6 (soft from 0.55 of it), which made the
   // first half of every sideways push resisted.
-  const R_SOFT = 0.75, R_MAX = 1.5, V_MAX = 0.8;      // scene units (median scene depth ~4.7)
+  //
+  // WIDENED AGAIN 2026-09-21 (fix-it ux lane), from 1.5 x 0.8, because the
+  // last review measured what a finger actually gets: forward 100% and right
+  // 100% of what it asks -- those run ALONG the walk, where the tube does not
+  // bind -- against backward 31% and up and down 16% each, and said, fairly,
+  // that four of six directions were closed and that the eight up frames and
+  // the eight down frames were the same picture.
+  // The limit was never measured against the imagery, only asserted. It is
+  // now: the opening view was rendered at 0.25-unit steps along the world
+  // vertical out to +/-3 and at 0.5-unit steps straight back out to 5
+  // (`fixit\ux\stats\shots_base_outside.json`, through `setPose`, which the
+  // envelope does not bound). The frame stays 97-99% drawn and 0.3-1.7%
+  // black at every one of them, with the same detail as the opening; nothing
+  // falls apart until well past anywhere a person would stop. The tube was
+  // three times tighter than the pictures require.
+  // 2.2 across and 1.4 along the vertical is where this stops: on a scene
+  // whose median depth is 4.7, that is a real step back and a real stand-up
+  // or crouch, and it is still unmistakably "near the path that was walked".
+  // The price is the support field's volume, and it is paid by SPACING: the
+  // lattice is 0.6 rather than 0.5, which is measured below.
+  const R_SOFT = 1.1, R_MAX = 2.2, V_MAX = 1.4;       // scene units (median scene depth ~4.7)
   // View support: how well the capture covers what a view looks at. It rates
   // QUALITY, not only coverage -- each source's incidence, one source or
   // several, and whether the point sits beside a large hole in the proxy -- at
@@ -475,7 +562,15 @@ const NAV = (() => {
   // Raised from 0.35: the only bounds left are the tube and the standoff, and
   // both are real edges, so there is no reason to be sluggish before one.
   const B_FREE = 0.55;
-  const SPACING = 0.5, FACE = 8, CELLS = 6 * FACE * FACE;
+  // The field's lattice. 0.5 over the 1.5 x 0.8 tube was 3,851 voxels; the
+  // same spacing over the 2.2 x 1.4 tube would be about 2.6 times as many and
+  // the fine field is what *Best view* waits for, which the same review timed
+  // at 7.8-8.0 s from the tap. 0.7 holds the voxel count near the 3,851 that
+  // the 0.5 lattice cost over the OLD tube, so the wider envelope is paid for
+  // in resolution rather than in waiting -- and the page already ships a
+  // COARSER field still and uses it for the first second. 0.6 was measured
+  // too: 5,914 voxels and 1,272 ms of field work against 940 ms before.
+  const SPACING = 0.7, FACE = 8, CELLS = 6 * FACE * FACE;
   const JUMP = 2.0;                                   // a longer gap in the recorded path is not a corridor
   // Pitch is limited by the NECK, not by the capture: 80 degrees each way,
   // eased over the last PITCH_SOFT so the limit is a stop and not a wall. It
@@ -1331,7 +1426,27 @@ uniform vec2 uWH; uniform ivec2 uDWH; uniform float uZmax; uniform vec3 uEye;
 uniform float uExposure; uniform float uGamma; uniform int uMode; uniform float uFar;
 uniform float uTemp; uniform float uConsensus; uniform float uBorder; uniform float uKnee;
 uniform float uConfLo; uniform float uConfHi; uniform float uConfOn;
+uniform float uHaze;
 ${GLSL_BACKGROUND}
+/* THE HAZE: what a place NOBODY PHOTOGRAPHED looks like.
+   The caption has always promised "a grey haze is a place no kept frame saw".
+   It was not grey and it was not a haze: proxy with no evidence wrote alpha 0
+   and came out as the background, and the independent review measured it at
+   luminance 10-18 against a background of 11-28 -- in the opening view the
+   "haze" was ten levels DARKER than the emptiness it is supposed to be
+   distinguishable from, and at +90 degrees 13.4% of the frame was real
+   geometry nobody ever saw, indistinguishable from nothing at all.
+   So it is drawn: one flat colour, no texture, no hue of its own, no detail
+   at any scale, visibly above the void and below the room. It is the only
+   thing on this page that is painted rather than photographed, and that is
+   exactly what it says: there is a surface here and there is no picture of
+   it. It never invents anything -- a flat patch cannot be mistaken for a
+   photograph, and the page's own observed/unobserved mode (2) and its drawn
+   fraction (3) both still report it as unobserved, so no measurement and no
+   score is flattered by it.
+   uHaze is its alpha; 0 restores the old behaviour exactly. */
+const vec3 HAZE_RGB = vec3(0.160, 0.168, 0.190);
+vec3 haze(){ return HAZE_RGB; }
 /* THE CONFIDENCE FADE (the geometry-confidence lane's recommendation, §7).
    The proxy carries one byte a vertex saying how well that vertex was measured
    -- the fusion's own see-through and disagreement counters, plus the level's
@@ -1513,14 +1628,24 @@ void shade(vec3 P, vec3 N, out vec4 o){
   // share of what is drawn straight off the two sums.
   if (uMode == 11){ o = vec4(alpha * (1.0 - confKeep()), alpha, gConf, 1.0); return; }
   if (uMode == 8){ o = vec4(observed ? mix(background(), pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma)), confKeep()) : vec3(1.0, 0.0, 1.0), 1.0); return; }
-  // The layer: colour and evidence. Proxy no kept image covers is alpha 0:
-  // drawn exactly as "nothing" (the background), while its depth still hides
-  // what is behind it.
-  if (!observed){ o = vec4(0.0); return; }
+  // The layer: colour and evidence. Proxy no kept image covers carries no
+  // photograph, so it is drawn as the HAZE -- a flat, textureless grey that
+  // is neither the room nor the void -- while its depth still hides what is
+  // behind it. At uHaze 0 it is alpha 0, drawn exactly as "nothing", which
+  // is what this page did before.
+  if (!observed){
+    if (uHaze <= 0.0){ o = vec4(0.0); return; }
+    o = vec4(haze() * uHaze, uHaze); return;
+  }
   vec3 c = pow(tone(max(acc / ws, 0.0) * uExposure), vec3(1.0 / uGamma));
-  // where the geometry under the photograph is not trusted, the photograph
-  // gives way to the void -- across the band, never at a step
-  c = mix(background(), c, confKeep());
+  // Where the geometry under the photograph is not trusted, the photograph
+  // gives way -- across the band, never at a step. It gives way TO THE HAZE,
+  // not to the background: "this is a surface the page will not vouch for" is
+  // the same statement as "no kept frame saw this", it deserves the same
+  // mark, and against the background the fade was a 0.2-5.4% change nobody
+  // could see (the review's A/B at clo=0&chi=0 measured a median difference
+  // of 0.22 of an 8-bit level over the whole frame).
+  c = mix(uHaze > 0.0 ? haze() : background(), c, confKeep());
   // PREMULTIPLIED. The composite divides it straight back out for the pixel's
   // own colour, so nothing about the drawn room changes -- but the layer's MIP
   // CHAIN, which the void fog reads, is then the mean of what is actually
@@ -2119,7 +2244,13 @@ async function main(){
     S.buildId = man.build_id; S.layers = layers.filter(x => x.ready).length;
     if (S.phase === "ready" || S.phase === "withdrawn") buildNav();
     gpuTotal();
-    status("");
+    // THE PAGE NEVER FALLS SILENT WHILE IT IS STILL WORKING. This used to
+    // clear the status here, and the next thing to say anything was
+    // `buildNav`, which does not run until the opening has been chosen -- a
+    // scan measured at 2.1 s of its own. Between the two the reader had a
+    // black canvas, no message, and (until the change above) a finished
+    // caption and button bar on top of it.
+    status(shownAt === null ? CHOOSING : "");
     updateCaption();
     requestDraw();
   }
@@ -2375,16 +2506,29 @@ async function main(){
     const s = supportOf(pose);
     return s && s.s < NAV.T_HI ? Math.max(0.05, s.s) : 1;
   }
+  /* Placing the camera clears the INPUT as well as the inertia. It cleared
+     only `vel`, and `ctl` is where a flick's coast is accumulated one frame
+     before it is spent -- so a press of *Reset* that landed between the two
+     put the camera at the opening and then immediately moved it again by
+     whatever was still in hand. The one control whose whole job is "put it
+     back" has to put it back. */
   function setPose(pose){
     override = null; glideState = null;
-    cam = {p: pose.p.slice(), yaw: pose.yaw, pitch: pose.pitch, floor: 1};
+    // Yaw is free through a full turn and ACCUMULATES while you spin, which
+    // is what `glide` wants and what makes a long turn take the short way.
+    // A placement is the natural moment to bring it back into (-pi, pi], so
+    // that nothing reports a camera "at 25.36 rad" after a burst of input.
+    cam = {p: pose.p.slice(), yaw: Math.atan2(Math.sin(pose.yaw), Math.cos(pose.yaw)),
+           pitch: pose.pitch, floor: 1};
     cam.floor = floorAt(cam);
+    ctl.look = [0, 0]; ctl.move = [0, 0, 0];
     vel.look = [0, 0]; vel.move = [0, 0, 0];
   }
   function glideTo(pose, index){
     override = null;
     const from = {p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch};
     glideState = {from, to: pose, t: 0, ms: NAV.glideMs(from, pose), index};
+    ctl.look = [0, 0]; ctl.move = [0, 0, 0];
     vel.look = [0, 0]; vel.move = [0, 0, 0];
     requestDraw();
   }
@@ -2395,7 +2539,7 @@ async function main(){
      happened, and this only says why the room went dark. */
   const HINT_EDGE = "Not captured beyond here";
   const HINT_DARK = "Nothing was photographed this way";
-  let hintTimer = null, hintSaid = 0;
+  let hintTimer = null;
   function hint(level, text){
     if (level < 0.35) return;
     const h = $("hint");
@@ -2453,18 +2597,25 @@ async function main(){
     return dot3([g[0]-f[0], g[1]-f[1], g[2]-f[2]], r) >= 0 ? 1 : -1;
   }
   const RING_R = 21, RING_SIZE = 58;
+  /* IT IS THERE FROM THE FIRST FRAME. It used to appear only once the support
+     field had been built, which on a cold open is a second or more after the
+     first picture -- so at the exact moment a first-time viewer looks at the
+     corner of the screen, the one thing that would tell them what is around
+     them was invisible. The ring, the "you" marker and the frame wedge need
+     no field at all; only the coverage arcs do, and until the field lands
+     they are drawn blank, which is the truth: the page does not know yet. */
   function drawCompass(){
-    const el = $("compass");
-    if (!ringProf){ el.classList.remove("on"); return; }
+    const el = $("compass"), lab = $("clabel");
+    if (shownAt === null){ el.classList.remove("on"); lab.classList.remove("on"); return; }
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const n = Math.round(RING_SIZE * dpr);
     if (el.width !== n){ el.width = n; el.height = n; }
     const g = el.getContext("2d");
     if (!g) return;
-    el.classList.add("on");
+    el.classList.add("on"); lab.classList.add("on");
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, RING_SIZE, RING_SIZE);
-    const c = RING_SIZE / 2, sgn = yawSign(), step = 2 * Math.PI / RING_BINS;
+    const c = RING_SIZE / 2, sgn = ringProf ? yawSign() : 1, step = 2 * Math.PI / RING_BINS;
     const yaw = shownPose().yaw;
     g.beginPath(); g.arc(c, c, 26, 0, 2 * Math.PI);
     g.fillStyle = "rgba(8,10,13,.58)"; g.fill();
@@ -2473,7 +2624,7 @@ async function main(){
     // "straight ahead" is -pi/2 and the offset is the signed yaw difference.
     g.lineWidth = 5.5; g.lineCap = "butt";
     for (let i = 0; i < RING_BINS; i++){
-      const k = NAV.smooth(0.08, NAV.T_HI, ringProf[i]);
+      const k = ringProf ? NAV.smooth(0.08, NAV.T_HI, ringProf[i]) : 0;
       const a = -Math.PI / 2 + sgn * (i * step - yaw);
       g.beginPath(); g.arc(c, c, RING_R, a - step * 0.52, a + step * 0.52);
       g.strokeStyle = k <= 0.01 ? "rgba(154,160,168,.14)"
@@ -2489,6 +2640,12 @@ async function main(){
     g.closePath(); g.fillStyle = "rgba(255,255,255,.10)"; g.fill();
     g.beginPath(); g.moveTo(c, c - 26.5); g.lineTo(c - 3.4, c - 31.5); g.lineTo(c + 3.4, c - 31.5);
     g.closePath(); g.fillStyle = "rgba(232,233,236,.9)"; g.fill();
+    // "you", at the top, so the marker is not the only thing saying which way
+    // is which: two words under the ring carry the rest (#clabel).
+    g.font = "600 7px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
+    g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillStyle = "rgba(232,233,236,.62)";
+    g.fillText("YOU", c, c);
   }
   /* The way back. It turns you; it never moves you, and it never runs while a
      finger is down -- it is a glide, and `pointerdown` cancels a glide. */
@@ -2530,7 +2687,20 @@ async function main(){
      0.40 the arrow let go there and an 89%-black frame carried no cue; at
      0.25 it holds until the room is really back (stats\shots_cue.json). */
   const BACK_ON = 0.60, BACK_OFF = 0.25, BACK_MIN_TURN = 0.35;
-  let backOn = false;
+  let backOn = false, backSide = null;
+  /* WHICH SIDE, AND IT DOES NOT CHATTER. The shorter way home flips sides as
+     you cross the point where the room is exactly behind you, and right
+     there the two turns differ by nothing a person could act on -- so the
+     side is kept until the other way is clearly shorter (BACK_FLIP). A cue
+     that changes its mind at the antipode is a cue that tells you to turn
+     both ways.
+     (The "two contradictory arrows drawn at once" in VISUAL-REVIEW-3 §8 is
+     not a defect of this page: its `crop.py` tiles crops from different
+     frames edge to edge with no gutter, so one frame's right-edge chevron
+     abuts the next frame's left-edge one. Every raw frame in that lane's own
+     `raw_seq4` carries exactly one. Measured in `fixit\ux\tools\arrowside.py`
+     -- and the flip that IS real is fixed here.) */
+  const BACK_FLIP = 0.35;                             // radians of clear advantage
   function updateBack(dark){
     const el = $("back");
     const b = ringProf ? NAV.bestHeading(ringProf, shownPose().yaw) : null;
@@ -2538,12 +2708,49 @@ async function main(){
       && (backOn ? dark > BACK_OFF : dark > BACK_ON);
     if (want){
       const right = yawSign() * b.delta > 0;
-      el.className = "on " + (right ? "right" : "left");
+      const side = right ? "right" : "left";
+      // near the crossover the two ways home are the same length: hold.
+      const ambiguous = Math.PI - Math.abs(b.delta) < BACK_FLIP;
+      if (!backSide || !ambiguous) backSide = side;
+      el.className = "on " + backSide;
     } else if (backOn){
       el.className = "";
+      backSide = null;
     }
     backOn = want;
-    S.backArrow = want ? (el.classList.contains("right") ? "right" : "left") : null;
+    S.backArrow = want ? backSide : null;
+  }
+  /* THE DARK STATE: permanent while it is true, and never while it is not.
+     `DARK_SAY_ON` / `DARK_SAY_OFF` are a hysteresis on the same `dark` the
+     edge chevron reads, and `DARK_SAY_MS` is how long the view has to stay
+     on nothing before the page says anything -- so sweeping through a dark
+     patch on the way somewhere does not flash a message, and stopping in one
+     always explains it. */
+  const DARK_SAY_ON = 0.90, DARK_SAY_OFF = 0.45, DARK_SAY_MS = 320;
+  let darkSince = 0, darkShown = false;
+  function updateDark(dark){
+    const el = $("dark"), now = performance.now();
+    const on = darkShown ? dark > DARK_SAY_OFF : dark > DARK_SAY_ON;
+    if (!on){ darkSince = 0; }
+    else if (!darkSince){ darkSince = now; }
+    const want = on && (darkShown || now - darkSince >= DARK_SAY_MS);
+    if (want && !darkShown){
+      el.textContent = "";
+      const b = document.createElement("b");
+      b.textContent = HINT_DARK;
+      const s = document.createElement("span");
+      s.textContent = "the glasses never looked this way — tap to turn back";
+      el.append(b, s);
+      el.classList.add("on");
+    } else if (!want && darkShown){
+      el.classList.remove("on");
+    }
+    // while it is up it is still a countdown for nothing: keep the page
+    // redrawing until the delay has passed, or a still frame would never
+    // reach the moment the sentence is due
+    if (on && !want) requestDraw();
+    darkShown = want;
+    S.darkSaid = want;
   }
   const KEY_SPEED = 1.1 / 1000;          // scene units per ms
   /* Advance the camera by dt ms: a glide, or input + inertia through NAV.step.
@@ -2557,6 +2764,8 @@ async function main(){
       cam = {p: g.p, yaw: g.yaw, pitch: g.pitch, floor: 1};
       if (t >= 1){
         if (glideState.index !== undefined && glideState.index !== null) ci = glideState.index;
+        // the flight is over: the same view, said in (-pi, pi] (see setPose)
+        cam.yaw = Math.atan2(Math.sin(cam.yaw), Math.cos(cam.yaw));
         glideState = null; cam.floor = floorAt(cam);
         return false;
       }
@@ -2588,14 +2797,13 @@ async function main(){
       // the resisted share of a flick is spent, not stored
       if (next.resisted > 0.6){ vel.look = [0, 0]; vel.move = [0, 0, 0]; }
     }
-    // A look that has turned off the capture is not stopped; it is explained,
-    // and only now and then (the finger is turning, the room is dark, one line
-    // is enough).
-    if (looking && next.dark > 0.9 && performance.now() - hintSaid > 4000){
-      hintSaid = performance.now();
-      hint(0.45, HINT_DARK);
-      S.darkLooks = (S.darkLooks || 0) + 1;
-    }
+    // A look that has turned off the capture is not stopped and it is not
+    // announced HERE any more: it is a STATE, not an event, and `updateDark`
+    // in `frame()` holds it for as long as it is true. What used to happen
+    // here was a 1,100 ms toast throttled to one per 4,000 ms, which over a
+    // 24-step turn from the opening was visible at three steps and at none of
+    // the six that render a 100% black frame.
+    if (looking && next.dark > 0.9) S.darkLooks = (S.darkLooks || 0) + 1;
     S.resisted = next.resisted; S.resistedHard = next.hard || 0; S.dark = next.dark || 0;
     cam = {p: next.p, yaw: next.yaw, pitch: next.pitch, floor: next.floor,
            cdrift: next.cdrift, aimed: next.aimed};
@@ -2897,12 +3105,21 @@ async function main(){
     // what the walk looked at most: the mean of the recorded look targets
     const focus = [0, 0, 0];
     for (const c of cams) for (let k = 0; k < 3; k++) focus[k] += (c[k] + c[k + 3] * ref) / cams.length;
+    // INSIDE THE FREE PART OF THE TUBE, not merely inside the tube.
+    // Measured 2026-09-21 (fix-it ux lane): the destination this chose sat at
+    // envelope 0.52-0.78, which is past R_SOFT -- reachable, but inside the
+    // band a RELEASED camera drifts back out of, so the page could fly you
+    // somewhere it would then quietly pull you away from. The free zone is
+    // where the drift is exactly zero. It is a PREFERENCE, not a rule: like
+    // the content filter below, it is relaxed rather than allowed to leave
+    // the button dead, and it never goes past the tube itself.
+    let maxE = NAV.R_SOFT / NAV.R_MAX;
     const search = () => {
     found = [];
     for (let a = 0; a < F.count; a++){
       const p = [F.where[a*3], F.where[a*3+1], F.where[a*3+2]];
       const pd = NAV.pathDist(navPath, p);
-      if (pd.e > 0.85 || !pd.closest) continue;
+      if (pd.e > maxE || !pd.closest) continue;
       const rise = dot3([p[0]-pd.closest[0], p[1]-pd.closest[1], p[2]-pd.closest[2]], UP);
       if (rise < 0.15) continue;
       // a vantage visibly different from where the page opened
@@ -2921,10 +3138,12 @@ async function main(){
       }
     }
     };
-    // The content filter must never leave the button dead: a world whose whole
-    // envelope is featureless still gets its best vantage.
+    // Neither filter must ever leave the button dead: a world whose whole
+    // envelope is featureless still gets its best vantage, and so does one
+    // whose only raised vantages are out in the soft band.
     search();
     while (!found.length && minContent > 0){ minContent = Math.max(0, minContent - 0.07); relaxed++; search(); }
+    while (!found.length && maxE < 1){ maxE = Math.min(1, maxE + 0.15); relaxed++; search(); }
     found.sort((x, y) => y.score - x.score);
     const top = [];
     for (const f of found){
@@ -2977,7 +3196,7 @@ async function main(){
     // NOT S.overview: that is the verification hook, and assigning the
     // statistics over it made the second press a TypeError
     S.overviewStats = {ms: Math.round(performance.now() - t0), considered: found.length,
-                  minContent, relaxed,
+                  minContent, relaxed, maxE: +maxE.toFixed(3),
                   top: top.map(f => ({support: +f.s.toFixed(3), content: +f.c.toFixed(3), drawn: +f.drawn.toFixed(3),
                                       detail: +(f.detail || 0).toFixed(4), range: +(f.depthSpread || 0).toFixed(2),
                                       faded: +(f.faded || 0).toFixed(4), sound: +soundTerm(f.faded).toFixed(3),
@@ -3198,6 +3417,11 @@ async function main(){
     const confOn = confChannel !== null && OPT.confHi > OPT.confLo;
     gl.uniform1f(P.u.uConfOn, confOn ? 1 : 0);
     gl.uniform1f(P.u.uConfLo, OPT.confLo); gl.uniform1f(P.u.uConfHi, OPT.confHi);
+    // The haze. Only the ordinary display path uses it: every measurement mode
+    // returns before the haze is drawn, so mode 2 (observed / unobserved),
+    // mode 3 (the drawn fraction the opening and the Best view are scored on)
+    // and mode 11 (what the fade takes) read exactly what they always did.
+    gl.uniform1f(P.u.uHaze, mode ? 0 : OPT.haze);
     gl.uniform1fv(P.u.uLayer, U1); gl.uniformMatrix3fv(P.u.uR, false, U9);
     gl.uniform3fv(P.u.uT, U3a); gl.uniform3fv(P.u.uC, U3b); gl.uniform3fv(P.u.uGain, U3c);
     gl.uniform4fv(P.u.uIntr, U4); gl.uniform1fv(P.u.uQ, UQ);
@@ -3327,6 +3551,7 @@ async function main(){
     const dk = currentDark();
     S.dark = dk;
     updateBack(dk);
+    updateDark(dk);
     drawCompass();
     S.choice = chosen.map(L => L.kf && L.kf.ki);
     S.bound = bound().map(({L, p}) => [L.kf && L.kf.ki, +p.toFixed(3)]);
@@ -3442,19 +3667,29 @@ async function main(){
   /* Sliced for the same reason as `renderSourceDepth` (review 2, P-3): each
      `score` is a small render plus a synchronous readback, and the thirty-odd
      of them measured 2.9 s of unbroken main thread on SwiftShader -- the
-     single largest block in the whole boot. Nothing is drawn while it runs
-     (`frame` returns before `drawBlend` until `shownAt` is set), so yielding
-     costs nothing and cannot show the reader the scoring camera. */
+     single largest block in the whole boot.
+
+     It used to be safe to yield in the middle of it only because NOTHING WAS
+     DRAWN until the whole scan finished, and that is precisely the defect the
+     last review measured: 2.8-3.1 s of black between the last status message
+     and the first lit frame. The scan now hands a PROVISIONAL POSE back after
+     PROVISIONAL_AFTER candidates and the page draws it, so the scoring camera
+     must never be the camera a yield leaves behind. It is not: `cam` is saved
+     and restored around each render with no `await` between, so an animation
+     frame that lands mid-scan always draws the placed camera. */
   const OPENING_SLICE_MS = 12;
-  async function chooseOpening(){
+  // Enough candidates that the provisional is a considered view of the room
+  // rather than "whatever pose 0 happens to be", and few enough that it costs
+  // a fraction of the full scan: six 64-px renders against thirty-odd.
+  const PROVISIONAL_AFTER = 6;
+  async function chooseOpening(onProvisional){
     if (!cams.length) return -1;
     const t = performance.now();
     const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
     const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
     const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
     const step = Math.max(1, Math.ceil(cams.length / 32));
-    const saveCam = cam, saveOverride = override;
-    override = null;
+    const saveOverride = override;
     const seen = new Map();
     let sliceStart = performance.now();
     const score = async i => {
@@ -3463,19 +3698,48 @@ async function main(){
           await new Promise(res => setTimeout(res, 0));
           sliceStart = performance.now();
         }
+        const keepCam = cam, keepOverride = override;
+        override = null;
         const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
         const r = drawnFraction(currentCamera(aspect), w, h, true);
+        cam = keepCam; override = keepOverride;      // before any yield
         seen.set(i, {score: openingScore(r), drawn: r.drawn, distance: r.distance, detail: r.detail});
       }
       return seen.get(i).score;
     };
-    let best = -1, bestScore = -1;
-    for (let i = 0; i < cams.length; i += step){ const s = await score(i); if (s > bestScore){ bestScore = s; best = i; } }
+    // THE ORDER THE COARSE SCAN RUNS IN. It is a maximum over the same set
+    // however it is ordered, so the answer does not change -- but the
+    // PROVISIONAL is the best of the first few, and "the first few" in index
+    // order is the start of the walk, which on this capture is one corner. Bit-reversed, the first six candidates are spread over the whole
+    // recorded walk, so the view the page opens on is already close to the one
+    // it settles on and the correction at the end is usually nothing at all.
+    const coarse = [];
+    for (let i = 0; i < cams.length; i += step) coarse.push(i);
+    const order = [];
+    for (let b = 1; order.length < coarse.length; b *= 2){
+      for (let k = 0; k < b && order.length < coarse.length; k++){
+        const j = Math.round((k + 0.5) * coarse.length / b);
+        if (j < coarse.length && !order.includes(coarse[j])) order.push(coarse[j]);
+      }
+    }
+    for (const i of coarse) if (!order.includes(i)) order.push(i);
+    let best = -1, bestScore = -1, placed = false;
+    for (const i of order){
+      const s = await score(i);
+      if (s > bestScore){ bestScore = s; best = i; }
+      if (!placed && onProvisional && seen.size >= PROVISIONAL_AFTER && best >= 0){
+        placed = true;
+        S.timing.provisionalMs = performance.now() - t;
+        S.provisional = {index: best, tested: seen.size, score: +bestScore.toFixed(4)};
+        onProvisional(best);
+      }
+    }
     const fine = Math.max(1, Math.round(step / 3));
     for (let i = Math.max(0, best - step + fine); i <= Math.min(cams.length - 1, best + step - fine); i += fine){
       const s = await score(i); if (s > bestScore){ bestScore = s; best = i; }
     }
-    cam = saveCam; override = saveOverride;
+    if (!placed && onProvisional && best >= 0){ S.provisional = {index: best, tested: seen.size, late: true}; onProvisional(best); }
+    override = saveOverride;
     S.timing.openingMs = performance.now() - t;
     const b = seen.get(best) || {};
     if (poseQ.length !== cams.length){ poseQ = new Array(cams.length).fill(-1); poseC = new Array(cams.length).fill(-1); }
@@ -3580,7 +3844,32 @@ async function main(){
     return {d: Math.hypot(v[0].x-v[1].x, v[0].y-v[1].y), x:(v[0].x+v[1].x)/2, y:(v[0].y+v[1].y)/2}; }
   const MOVE_PER_PX = 0.004, PINCH_UNITS = 2.0;
   function lookPerPx(){ return currentCamera().fy / Math.max(1, canvas.clientHeight); }
+  /* INPUT BEFORE THERE IS A PICTURE.
+     `frame()` draws nothing until the opening is placed, so anything pushed
+     into `ctl` before that just accumulated -- and then ran, all of it, in
+     the first frame after the handover. That is how the last reviewer's
+     thumb, resting on the glass through a five-second load, left the camera
+     at yaw 2.90 rad facing the empty half of the room, and it never came
+     back because a look the person made is deliberately never taken back.
+     The page cannot honour a drag aimed at nothing, and it must not pretend
+     to. It says the view is still loading, drops the drag, and answers the
+     finger from the first drawn frame onward -- which, with the provisional
+     opening above, is now a fraction of a second after the images land. */
+  let touched = false;            // the reader has aimed this camera themselves
+  function deferInput(){
+    if (shownAt !== null) return false;
+    S.deferredInputs = (S.deferredInputs || 0) + 1;
+    // Said in the hint, not the status: the status is busy saying what is
+    // still loading, and both are true at once. The hint re-arms on every
+    // further touch, so it stays up for as long as the finger is working.
+    hint(0.6, TOUCHED_EARLY);
+    ctl.look = [0, 0]; ctl.move = [0, 0, 0];
+    vel.look = [0, 0]; vel.move = [0, 0, 0];
+    return true;
+  }
   function feel(look, move, now){
+    if (deferInput()) return;
+    touched = true;
     // input this frame, and a running estimate of its velocity for the coast
     const ms = Math.max(8, Math.min(60, now - lastMoveT)); lastMoveT = now;
     for (let i = 0; i < 2; i++){ ctl.look[i] += look[i]; vel.look[i] = 0.5 * vel.look[i] + 0.5 * look[i] / ms; }
@@ -3595,6 +3884,7 @@ async function main(){
     ctl.held = true; vel.look = [0, 0]; vel.move = [0, 0, 0]; lastMoveT = performance.now();
     if (glideState) interrupt();
     override = null;
+    if (shownAt === null) deferInput();
     e.preventDefault();
   }, {passive: false});
   canvas.addEventListener("pointermove", e => {
@@ -3634,14 +3924,18 @@ async function main(){
   canvas.addEventListener("wheel", e => {
     if (glideState) interrupt();
     override = null;
-    ctl.move[2] += -e.deltaY * 0.0025;
+    if (!deferInput()){ touched = true; ctl.move[2] += -e.deltaY * 0.0025; }
     requestDraw(); e.preventDefault();
   }, {passive: false});
   addEventListener("keydown", e => {
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
     if (k === "ArrowRight") step(1); else if (k === "ArrowLeft") step(-1);
     else if (k === "o") overview();
-    else if ("wasdqe".includes(k) && k.length === 1){ if (glideState) interrupt(); override = null; keys.add(k); requestDraw(); }
+    else if ("wasdqe".includes(k) && k.length === 1){
+      if (deferInput()) return;
+      touched = true;
+      if (glideState) interrupt(); override = null; keys.add(k); requestDraw();
+    }
   });
   addEventListener("keyup", e => { keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key); });
   addEventListener("blur", () => { keys.clear(); ctl.held = false; pts.clear(); });
@@ -3653,12 +3947,49 @@ async function main(){
      drawn) and there is something in it (POSE_CONTENT of a room view's detail).
      Skipping is capped at NAV.MAX_SKIP in one press -- see NAV.nextPose. */
   const POSE_MIN = 0.8, POSE_CONTENT = EMPTY_DETAIL;
+  /* A PRESS HAS TO COVER GROUND. The walk was recorded at whatever rate the
+     wearer moved, and on this capture that is 0.049 scene units a pose:
+     fifteen presses of the arrow advanced the index by fourteen and the
+     camera by 0.73 units in total, which on a room whose median depth is 4.7
+     is not stepping through a walk, it is watching yourself sit at a desk in
+     five-centimetre increments. A press now advances until it has actually
+     GONE somewhere -- STEP_UNITS of path -- or until it has passed
+     STEP_MAX_POSES, whichever comes first, and the quality rule then decides
+     where inside that run it lands. Skipping is still bounded and the About
+     text still says the walk you are shown is shorter than the one recorded.
+     STEP_UNITS is a fifteenth of the scene's median depth: far enough that
+     one press visibly moves you, short enough that the 198-pose walk is
+     still tens of presses rather than four. */
+  const STEP_MAX_POSES = 12;
+  function stepUnits(){ return 0.32 * ((CONFIG.median_scene_depth || 4.7) / 4.7); }
+  function walkTarget(from, d){
+    if (!cams.length) return from;
+    const want = stepUnits();
+    let i = from, gone = 0;
+    for (let k = 0; k < STEP_MAX_POSES; k++){
+      const j = i + d;
+      if (j < 0 || j >= cams.length) break;
+      gone += Math.hypot(cams[j][0] - cams[i][0], cams[j][1] - cams[i][1], cams[j][2] - cams[i][2]);
+      i = j;
+      if (gone >= want) break;
+    }
+    return i;
+  }
   function step(d){
     if (!cams.length) return;
-    const r = NAV.nextPose(poseQ, ci, d, POSE_MIN, poseC, POSE_CONTENT);
-    if (r.index === ci){ hint(0.6); return; }
-    S.lastStep = {from: ci, to: r.index, skipped: r.skipped, capped: r.capped};
-    glideTo(poseOf(r.index), r.index); ci = r.index;
+    // how far to aim, then the nearest pose from there that is worth
+    // arriving at (`nextPose` looks onward, so it is asked from one short of
+    // the target and may still cap its own skipping)
+    const aim = walkTarget(ci, d);
+    const from = aim === ci ? ci : aim - d;
+    const r = NAV.nextPose(poseQ, from, d, POSE_MIN, poseC, POSE_CONTENT);
+    const to = r.index === from ? aim : r.index;
+    if (to === ci){ hint(0.6); return; }
+    const a = cams[ci], b = cams[to];
+    S.lastStep = {from: ci, to, skipped: r.skipped, capped: r.capped,
+                  poses: Math.abs(to - ci),
+                  units: +Math.hypot(b[0]-a[0], b[1]-a[1], b[2]-a[2]).toFixed(3)};
+    glideTo(poseOf(to), to); ci = to;
   }
   let poseQ = [], poseC = [], poseJob = 0, scoredAspect = null;
   function scorePoses(){
@@ -3696,14 +4027,22 @@ async function main(){
   }
   $("bOverview").onclick = () => overview();
   $("bBack").onclick = () => faceTheRoom();
-  // the ring and the edge chevron are the same control, where the eye already is
+  // the ring, the edge chevron and the dark line are the same control, where
+  // the eye already is
   $("compass").onclick = () => faceTheRoom();
   $("back").onclick = () => faceTheRoom();
+  $("dark").onclick = () => faceTheRoom();
   $("bPrev").onclick = () => step(-1);
   $("bNext").onclick = () => step(1);
   $("bReset").onclick = reset;
   $("bOverview").disabled = true;
   $("bBack").disabled = true;
+  /* THE RESCUE IS READY WHEN THE CAMERA IS. *Best view* needs the fine field
+     and the review timed it at 7.8-8.0 s from the tap, which is a long time
+     to be lost with the obvious button greyed out. *Reset* needs nothing but
+     an opening pose, and there is one from the first drawn frame, so it is
+     enabled there and disabled -- honestly -- until then. */
+  $("bReset").disabled = true;
   if (!cams.length){ $("bPrev").disabled = true; $("bNext").disabled = true; }
   /* A rotation changes which poses render well. `drawnFraction` is explicitly
      aspect-dependent, and the arrows, the opening and the Overview all rank on
@@ -3754,39 +4093,78 @@ async function main(){
     // One short line by default; what it is and what the grey areas mean on
     // tap (the review: four lines covered 11-13% of the frame).
     //
-    // The old sentence ended "...nothing there is filled
-    // in", which was true until the crack fill and the void
-    // fog landed, and the sentence was not revisited (review 2, M-5). What
-    // replaces it is bounded rather than absolute, and it is the bound a
-    // wearer can act on: a grey haze is a place to distrust, a seam a few
-    // pixels wide may have been closed from its neighbours.
-    let note = "These are the camera's own frames, with faces redacted, placed on the reconstructed room. "
-      + "A grey haze is a place no kept frame saw, or that was masked as unreliable (redaction, hands, "
-      + "views that disagreed) -- it is always darker than the room around it and it is never an image "
-      + "of anything. Cracks a few pixels wide between two parts of one surface are closed from the "
-      + "frames on either side; nothing wider is. Where the geometry underneath is wrong, "
-      + "images smear or double.";
-    note += " The arrows step through the recorded walk and pass over poses that render badly or show"
-      + " nothing, at most " + NAV.MAX_SKIP + " in a row -- so the walk you are shown is shorter than the one"
-      + " that was recorded, but never skips a whole stretch of it.";
-    // What the controls will and will not do, said plainly, because the
-    // difference between them is the whole shape of this thing.
-    note += " Turning is free: you can look all the way round and straight up, and where the glasses"
-      + " never looked you will find the room simply dark rather than a wall you cannot turn past."
-      + " Moving is not free -- the camera stays near the path that was actually walked, and a push"
-      + " that slows to nothing has reached the edge of it."
-      + " The ring at the top right is a compass of what was photographed from where you stand: the"
-      + " lit part of it is the directions a frame exists in, the way you are looking is always at"
-      + " the top, and when the lit part is behind you so is the room. It says a photograph exists,"
-      + " not that there is anything worth seeing."
-      + " “Face the room” turns you -- without moving you -- to the nearest direction that was"
-      + " photographed, and the arrow at the edge of the frame does the same thing."
-      + " “Best view” flies to the best-supported vantage in that path; on this capture the wearer"
-      + " never stood back from the desk, so it is a view from the desk and not a view of the whole room.";
-    if ((CONFIG.scale_state || "unknown") === "unknown") note += " Scale is unknown, so distances are relative.";
+    // IT IS NO LONGER ONE PARAGRAPH. Every word of it was judged correct and
+    // well written by the last review, and unreadable: 340 words of 12 px
+    // type in a single block filling a quarter of a phone screen, with no
+    // headings and nowhere for the eye to rest. The words are almost
+    // unchanged; they are now four short sections with a title each, so
+    // someone who only wants to know what the grey patches are can find that
+    // line and stop.
+    //
+    // The old sentence denied that anything at all was filled, which stopped
+    // being true when the crack fill and the void fog landed and was not
+    // revisited (review 2, M-5). What replaced it is bounded rather than
+    // absolute: it says how wide a gap may be closed.
+    // ONE MORE CORRECTION, 2026-09-21: it promised the haze was "always
+    // darker than the room around it", and the review measured the opposite
+    // -- luminance 10-18 against a background of 11-28, darker than the
+    // emptiness it was supposed to be distinguishable from. The page now
+    // draws it as a flat grey that is plainly neither (see the shader's
+    // `haze`), and the sentence says the thing a reader can actually check:
+    // it is flat, and it is never a picture.
+    // The "cracks a few pixels wide" sentence is UNCHANGED and deliberately
+    // so: a parallel lane is checking that claim against multi-view fill of
+    // redacted regions, and nothing here alters what the crack fill does.
+    const sections = [
+      ["What you are looking at",
+       "These are the camera's own frames, with faces redacted, placed on the reconstructed room."
+       + " Nothing is painted in or imagined: if the glasses did not see it, it is not here."],
+      ["The flat grey patches",
+       "A flat grey patch is a place no kept frame saw, or one that was masked as unreliable"
+       + " (redaction, hands, views that disagreed). It has no texture and no detail at any scale,"
+       + " and it is never an image of anything: it is there so that “nobody photographed"
+       + " this” does not look like “there is nothing here”."
+       + " Cracks a few pixels wide between two parts of one surface are closed from the frames on"
+       + " either side; nothing wider is. Where the geometry underneath is wrong, images smear or"
+       + " double."],
+      ["Looking and moving",
+       "Turning is free: all the way round, and straight up. Where the glasses never looked the room"
+       + " is simply dark, and the page says so while you are pointed that way. Moving is not free:"
+       + " the camera stays near the path that was walked, so you can step back, stand and crouch a"
+       + " little, and a push that slows to nothing has reached the edge of it."],
+      ["Finding your way",
+       "The ring at the top right is a compass of what was photographed from where you stand: the lit"
+       + " part is the directions a frame exists in, and you are always at the top. It says a"
+       + " photograph exists, not that there is anything worth seeing."
+       + " “Face the room” turns you — without moving you — to the nearest"
+       + " photographed direction; the ring, the edge arrow and the dark line do the same."],
+      ["The walk",
+       "“Best view” flies to the best-supported vantage near the path; this wearer"
+       + " never stood back from the desk, so it is a view from the desk, not of the whole room."
+       + " The arrows step along the recorded walk, far enough each press to get somewhere, passing"
+       + " over poses that render badly or show nothing (at most " + NAV.MAX_SKIP + " in a row)."
+       + " “Reset” puts you back where the page opened."],
+    ];
     const more = document.createElement("span");
     more.className = "more";
-    more.textContent = (bits.length ? bits.join(" · ") + ". " : "") + note;
+    if (bits.length){
+      const b0 = document.createElement("i");
+      b0.textContent = bits.join(" · ") + ".";
+      more.append(b0);
+    }
+    for (const [title, body] of sections){
+      const h = document.createElement("em");
+      h.textContent = title;
+      const p = document.createElement("span");
+      p.textContent = body;
+      more.append(h, p);
+    }
+    if ((CONFIG.scale_state || "unknown") === "unknown"){
+      const p = document.createElement("span");
+      p.className = "tail";
+      p.textContent = "Scale is unknown, so distances are relative.";
+      more.append(p);
+    }
     more.hidden = !captionOpen;
     const toggle = document.createElement("button");
     toggle.id = "bInfo"; toggle.textContent = captionOpen ? "Less" : "About";
@@ -3875,8 +4253,24 @@ async function main(){
     R_MAX: NAV.R_MAX, R_SOFT: NAV.R_SOFT, V_MAX: NAV.V_MAX, PITCH_MAX: NAV.PITCH_MAX,
     MAX_SKIP: NAV.MAX_SKIP, POSE_MIN, POSE_CONTENT, DETAIL_REF,
     DARK_LO: NAV.DARK_LO, DARK_HI: NAV.DARK_HI, RING_BINS,
-    CONF_LO: OPT.confLo, CONF_HI: OPT.confHi,
+    CONF_LO: OPT.confLo, CONF_HI: OPT.confHi, HAZE: OPT.haze,
+    SPACING: NAV.SPACING, STEP_UNITS: +stepUnits().toFixed(3), STEP_MAX_POSES,
+    DARK_SAY_ON, DARK_SAY_OFF, DARK_SAY_MS,
     T_LO: NAV.T_LO, T_HI: NAV.T_HI});
+  /* What the reader can SEE of the page's own furniture, so the cold open can
+     be measured for what it shows rather than for what exists in the DOM. */
+  S.chrome = () => {
+    const vis = id => { const e = $(id); if (!e) return null;
+      const s = getComputedStyle(e);
+      return {opacity: +s.opacity, shown: s.display !== "none" && +s.opacity > 0.05,
+              text: (e.innerText || "").slice(0, 80)}; };
+    return {drawn: shownAt !== null, phase: S.phase,
+            caption: vis("caption"), bar: vis("bar"), status: vis("status"),
+            dark: vis("dark"), compass: vis("compass"), label: vis("clabel"),
+            booting: document.body.classList.contains("booting"),
+            buttons: {best: !$("bOverview").disabled, face: !$("bBack").disabled,
+                      reset: !$("bReset").disabled}};
+  };
   S.poseContent = () => poseC.slice();
   S.detailOf = (w = 96) => { const aspect = canvas.width / Math.max(1, canvas.height);
     const hh = Math.max(24, Math.round(w / aspect));
@@ -3891,11 +4285,18 @@ async function main(){
       if (r) out.push(r);
     }
     return out; };
+  /* The same path a finger takes, including the rule about a finger that
+     arrives before the picture: a verification that drives this while
+     `shownAt === null` is told the input was deferred, exactly as a thumb is.
+     `held` is still recorded, because holding is not aiming. */
   S.input = (c) => { override = null;
+    if (c.held !== undefined) ctl.held = !!c.held;
+    const aiming = !!(c.look || c.move || c.vel);
+    if (aiming && deferInput()) return false;
+    if (aiming) touched = true;
     if (c.look){ ctl.look[0] += c.look[0]; ctl.look[1] += c.look[1]; }
     if (c.move){ for (let i = 0; i < 3; i++) ctl.move[i] += c.move[i]; }
     if (c.vel){ vel.look = (c.vel.look || [0, 0]).slice(); vel.move = (c.vel.move || [0, 0, 0]).slice(); }
-    if (c.held !== undefined) ctl.held = !!c.held;
     return true; };
   S.step = (d) => { step(d); return ci; };
   S.poseQuality = () => poseQ.slice();
@@ -3914,19 +4315,65 @@ async function main(){
      with nothing placed (M-0) reaches this LATER, when a build it can draw is
      finally served -- and without it that recovery would have textures, no
      opening pose and `shownAt === null`, which draws nothing at all. */
-  async function finishOpening(){
-    resize();
-    opening = await chooseOpening();
-    ci = opening >= 0 ? opening : 0;
-    setPose(poseOf(ci));
+  /* THE FIRST DRAWN FRAME. Everything the reader can see arrives here at
+     once: the picture, the caption, the button bar and the compass. Before
+     it there is a status line and nothing else; after it there is a room.
+     Whatever was banked in `ctl` while nothing was on screen is dropped
+     here, deliberately -- see `deferInput`. */
+  function showFirst(){
+    if (shownAt !== null) return;
     updateCaption();
+    ctl.look = [0, 0]; ctl.move = [0, 0, 0];
+    vel.look = [0, 0]; vel.move = [0, 0, 0];
     // verification captures want the settled picture; a person sees a fade
     shownAt = DEBUG && OPT.preserve ? -1e9 : performance.now();
+    document.body.classList.remove("booting");
+    $("bReset").disabled = false;
+    S.timing.firstShownMs = performance.now() - T0;
     frame(true);
+    status(PREPARING);
+    // The field starts HERE, beside the rest of the opening scan, rather than
+    // after it. Both are sliced on a 12-14 ms budget, so they interleave
+    // instead of queueing, and the two things that wait on the field -- *Face
+    // the room* on the coarse pass and *Best view* on the fine one -- arrive
+    // that much sooner. (What must NOT run beside the fine pass is
+    // `scorePoses`, 198 renders, which pushed it from 1.0 s to 3.7-4.7 s when
+    // it was tried; it still runs only when the fine field has landed.)
+    startNav();
+  }
+  let navStarted = false;
+  function startNav(){ if (navStarted) return; navStarted = true; buildNav(); }
+  async function finishOpening(){
+    resize();
+    // The provisional: the best of the first few candidates, placed and drawn
+    // while the rest of the scan runs. This is what takes the cold open's
+    // unexplained black stretch from seconds to a fraction of one.
+    let shownIndex = -1;
+    opening = await chooseOpening(i => {
+      shownIndex = i; ci = i; setPose(poseOf(i)); showFirst();
+    });
+    ci = opening >= 0 ? opening : 0;
+    if (shownAt === null){ setPose(poseOf(ci)); showFirst(); }
+    else if (opening >= 0 && opening !== shownIndex && !touched){
+      // The scan found a better opening and the reader has not asked for
+      // anything: correct to it. A CUT, not a glide -- a glide would leave
+      // the page moving under a reader who has not touched it yet, and would
+      // leave `phase: ready` describing a camera still in flight.
+      setPose(poseOf(opening));
+      S.openingKept = "corrected from the provisional";
+      requestDraw();
+    } else {
+      // If they HAVE touched the glass the view is theirs and the page leaves
+      // it alone: the whole point of placing a camera early is that what they
+      // do to it is not thrown away at the handover.
+      S.openingKept = touched ? "the reader's own view" : "the provisional";
+      if (touched && navPath && navPath.n) ci = NAV.pathDist(navPath, cam.p).index;
+    }
+    updateCaption();
     S.phase = "ready";
     S.timing.bootMs = performance.now() - T0;
     gpuTotal();
-    buildNav();
+    startNav();
   }
 
   /* -------- start ------------------------------------------------------------ */

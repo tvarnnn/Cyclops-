@@ -304,7 +304,15 @@ class TestThePage:
         # page had been filling thin cracks and painting voids with fog since
         # `21d6f1a`. What replaces it is a BOUND rather than a denial: the
         # wearer is told what is filled and how wide it can be.
-        assert "A grey haze is a place no kept frame saw" in html
+        # And it no longer promises a "grey haze ... always darker than the room
+        # around it": the last review measured that unobserved geometry rendered
+        # at luminance 10-18 against a background of 11-28, so in the opening
+        # view the haze was darker than the emptiness it was supposed to be
+        # distinguishable from. The page draws a flat grey patch now (the
+        # shader's `haze`) and the sentence says what a reader can check.
+        assert "A flat grey patch is a place no kept frame saw" in html
+        assert "no texture and no detail at any scale" in html
+        assert "always darker than the room around it" not in html
         assert "Cracks a few pixels wide between two parts of one surface are closed" in html
         assert "nothing there is filled in" not in html
         assert "Scale is unknown" in html
@@ -517,7 +525,13 @@ class TestTheBlend:
         """
         text = _template()
         blend = _section(text, "const GLSL_SHADE", "/* ---------- main")
-        assert "if (!observed){ o = vec4(0.0); return; }" in blend      # no tint, no fog
+        # Until 2026-09-21 this wrote `vec4(0.0)` -- the background, which the
+        # review measured as DARKER than the void beside it. It now writes the
+        # flat haze, with `uHaze = 0` restoring the old behaviour exactly, and
+        # it still writes a pixel rather than discarding.
+        assert "if (uHaze <= 0.0){ o = vec4(0.0); return; }" in blend
+        assert "o = vec4(haze() * uHaze, uHaze); return;" in blend
+        assert "uFogLift" not in text and "uGhost" not in text
         assert "uFogLift" not in text and "uGhost" not in text
         fs_blend = _section(text, "const FS_BLEND", "const FS_FILL")
         assert "discard" not in fs_blend, "a discarded fragment would stop occluding"
@@ -1204,8 +1218,13 @@ class TestTheCapturesOwnLook:
         # `finishOpening` since review 2 (M-0): a page that boots with nothing
         # placed reaches this later, when a build it can draw is served, and
         # without it that recovery would have textures and no opening pose.
-        start = _section(text, "async function finishOpening(", "/* -------- start ---")
-        assert start.index("setPose(poseOf(ci));") < start.index("shownAt =") < start.index("frame(true);")
+        start = _section(text, "  function showFirst(){", "  async function finishOpening(")
+        assert start.index("shownAt =") < start.index("frame(true);")
+        # and the opening scan hands a pose back early, so the reader is not
+        # looking at a black canvas for the two seconds it takes
+        fin = _section(text, "async function finishOpening(", "/* -------- start ---")
+        assert "opening = await chooseOpening(i => {" in fin
+        assert "shownIndex = i; ci = i; setPose(poseOf(i)); showFirst();" in fin
         assert "uShow" in _section(text, "const FS_COMPOSITE", "}`;")
 
 
@@ -1282,7 +1301,8 @@ assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8).index, 0);
 """)
         text = _template()
         step = _section(text, "  function step(d){", "  let poseQ")
-        assert "NAV.nextPose(poseQ, ci, d, POSE_MIN, poseC, POSE_CONTENT)" in step
+        assert "NAV.nextPose(poseQ, from, d, POSE_MIN, poseC, POSE_CONTENT)" in step
+        assert "const aim = walkTarget(ci, d);" in step, "a press covers ground first"
         assert "scorePoses();" in _section(text, "function buildNav(){", "/* Overview:")
 
     def test_overview_is_a_distinct_vantage(self):
@@ -1356,7 +1376,12 @@ class TestTheFrameAndWhatIsInIt:
 // the same wall, equally well covered from both halves
 assert.ok(Math.abs(supC(at, 0.6) - supC(at, -0.6)) < 0.08, "coverage does not tell them apart");
 assert.ok(con(at, 0.6) > 0.7, "the textured half: " + con(at, 0.6));
-assert.ok(con(at, -0.6) < 0.15, "the blank half: " + con(at, -0.6));
+// The blank half's ABSOLUTE reading depends on how the lattice falls across
+// the texture's edge (measured over this room: 0.106 at spacing 0.5, 0.233 at
+// 0.6, 0.186 at 0.7, 0.242 at 0.8 -- not monotone). What the page uses is the
+// separation, and it is three-to-one or better at every spacing.
+assert.ok(con(at, -0.6) < 0.3, "the blank half: " + con(at, -0.6));
+assert.ok(con(at, 0.6) > 3 * con(at, -0.6), "and the two are plainly different");
 // richness is the 0..1 reading of it, and monotone between the thresholds
 assert.strictEqual(NAV.richness(NAV.C_LO), 0);
 assert.strictEqual(NAV.richness(NAV.C_HI), 1);
@@ -1383,7 +1408,7 @@ assert.ok(cam.yaw <= -0.7, "the look reached the blank wall: " + cam.yaw);
 assert.ok(worst > 1 - 1e-12, "and every step of the way arrived whole: " + worst);
 assert.strictEqual(steps, 130, "exactly what was asked, no more and no less: " + steps);
 // content still measures the room; it just does not touch the controls
-assert.ok(con(at, 0.6) > 0.7 && con(at, -0.6) < 0.15);
+assert.ok(con(at, 0.6) > 0.7 && con(at, -0.6) < 0.3);
 """)
 
     def test_a_camera_the_page_placed_settles_and_a_look_of_the_persons_own_never_does(self):
@@ -1418,7 +1443,8 @@ assert.strictEqual(aimed.aimed, true, "the page knows the person aimed it");
 const put = aimed.yaw;
 for (let i = 0; i < 600; i++) aimed = NAV.step(FC, path, aimed, {look: [0, 0], move: [0, 0, 0], held: false}, 16, V);
 assert.strictEqual(aimed.yaw, put, "a deliberate look stays where it was put: " + put + " -> " + aimed.yaw);
-assert.ok(NAV.richness(NAV.support(FC, aimed.p, dir(aimed.yaw, 0), up, V.fy, V.aspect).c) < 0.2,
+assert.ok(NAV.richness(NAV.support(FC, aimed.p, dir(aimed.yaw, 0), up, V.fy, V.aspect).c)
+          < NAV.richness(NAV.support(FC, aimed.p, dir(0.6, 0), up, V.fy, V.aspect).c) - 0.4,
           "and it is still on the blank wall, which is where it was pointed");
 // and a look of the person's own gives the budget back
 const after = NAV.step(FC, path, cam, {look: [-0.05, 0], move: [0, 0, 0], held: true}, 16, V);
@@ -1537,7 +1563,14 @@ assert.ok(d1 >= Math.min(NAV.D_MIN, d0) - 1e-9, "the drift never went inside the
         text = _template()
         update = _section(text, "function navUpdate(", "function mulberry(")
         assert "hint(next.hard || 0, HINT_EDGE);" in update
-        assert "hint(0.45, HINT_DARK);" in update
+        # The dark one is no longer said HERE at all. It was `hint(0.45,
+        # HINT_DARK)` throttled to one showing per 4,000 ms, and over a
+        # 24-step turn from the opening the last review saw it at three steps
+        # and at NONE of the six that render a 100% black frame. It is now a
+        # state the page HOLDS for as long as the view is on nothing
+        # (`updateDark`), so the deepest black is the best explained.
+        assert "hint(0.45, HINT_DARK);" not in update
+        assert "if (looking && next.dark > 0.9) S.darkLooks" in update
         assert 'const HINT_EDGE = "Not captured beyond here";' in text
         assert 'const HINT_DARK = "Nothing was photographed this way";' in text
         step = _section(text, "  function step(F, path, cam, ctl, dt, V){", "  /* A uniformly random reachable view")
@@ -1762,7 +1795,7 @@ assert.ok(NAV.C_GRAD_WIDE > NAV.C_GRAD_EPS);
         cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
         assert "compass of what was photographed" in cap
         assert "not that there is anything worth seeing" in cap
-        assert "turns you -- without moving you" in cap
+        assert "turns you \u2014 without moving you \u2014 to the nearest" in cap
         cue = _section(text, "/* -------- the orientation ring", "const KEY_SPEED")
         # the ring is recomputed only when the camera has MOVED, and the profile
         # comes from the page's own support, not from anything invented
@@ -1791,7 +1824,8 @@ assert.ok(NAV.C_GRAD_WIDE > NAV.C_GRAD_EPS);
         # and it is drawn, not typed: a glyph could render as a box
         style = _section(text, "#back{position:fixed", "#back.on{")
         assert "border-left:17px solid currentColor" in style
-        assert "textContent" not in cue[cue.index("function updateBack("):]
+        back = cue[cue.index("function updateBack("):cue.index("/* THE DARK STATE")]
+        assert "textContent" not in back
 
     def test_the_ring_and_the_control_are_the_same_control(self):
         text = _template()
@@ -1827,7 +1861,7 @@ class TestTheConfidenceFade:
         shade = _section(_template(), "const GLSL_SHADE", "const FS_BLEND")
         assert "float k = smoothstep" not in shade, "one rule, one place"
         assert "smoothstep(uConfLo, uConfHi, gConf) : 1.0" in shade, "a band, never a cut"
-        assert "c = mix(background(), c, confKeep());" in shade, \
+        assert "c = mix(uHaze > 0.0 ? haze() : background(), c, confKeep());" in shade, \
             "toward the colour the page already uses for unobserved space"
         # the EVIDENCE is untouched: alpha is what says anyone saw the place,
         # the depth still hides what is behind, and no pixel goes see-through
@@ -2079,8 +2113,8 @@ class TestBootingWithNothingPlaced:
         poll = _section(text, "async function pollOnce(", "async function follow(")
         assert "if (shownAt === null) await finishOpening();" in poll
         opening = _section(text, "async function finishOpening(", "/* -------- start ---")
-        for step in ("opening = await chooseOpening();", "setPose(poseOf(ci));",
-                     "shownAt =", 'S.phase = "ready";', "buildNav();"):
+        for step in ("opening = await chooseOpening(", "setPose(poseOf(ci));",
+                     'S.phase = "ready";', "startNav();"):
             assert step in opening, step
 
 
@@ -2111,7 +2145,7 @@ class TestNothingBlocksTheMainThreadUnbounded:
         opening = _section(text, "async function chooseOpening(", "/* -------- context loss")
         assert "if (performance.now() - sliceStart > OPENING_SLICE_MS){" in opening
         assert "const s = await score(i);" in opening
-        assert "opening = await chooseOpening();" in text
+        assert "opening = await chooseOpening(" in text
 
     def test_the_navigation_input_is_a_stepper_driven_by_the_same_budget(self):
         text = _template()
@@ -2123,3 +2157,323 @@ class TestNothingBlocksTheMainThreadUnbounded:
         assert "do { r = steps.next(); } while (!r.done && performance.now() - t < 14);" in build, (
             "the input gets the same 14 ms budget the field work already had")
         assert "navInput()" not in text, "nothing calls the old unsliced form"
+
+
+# ---------------------------------------------------------------------------
+# fix-it ux lane: the cold open, the finger that arrives first, the dark that
+# is a state rather than a toast, what a body can reach, and the haze the
+# caption has always promised.
+# Measured in `Glasses-scratch/wb-final-recon/fixit/ux/` (UX.md), against
+# VISUAL-REVIEW-3 at 947525f.
+# ---------------------------------------------------------------------------
+
+
+class TestTheColdOpenIsLegibleFromTheFirstPaint:
+    """VISUAL-REVIEW-3 §1, BLOCKING. Every cold open showed the finished
+    caption and the whole button bar over a pure black canvas, with the status
+    line cleared, for 1.45-1.71 s on the reviewer's machine and 2.8-3.1 s on
+    this one. Three things had to be true and now are: the chrome does not
+    arrive before the picture, the page never falls silent while it is still
+    working, and the picture itself arrives far sooner."""
+
+    def test_the_chrome_is_held_until_there_is_something_to_see(self):
+        text = _template()
+        assert '<body class="booting">' in text
+        assert "body.booting #caption,body.booting #bar{opacity:0;pointer-events:none}" in text
+        first = _section(text, "  function showFirst(){", "  let navStarted = false;")
+        assert 'document.body.classList.remove("booting");' in first
+        assert first.index("shownAt =") < first.index('classList.remove("booting")')
+        # and it is the FIRST DRAWN FRAME that takes it off, not a timer
+        assert "frame(true);" in first
+
+    def test_the_page_never_falls_silent_while_it_is_still_working(self):
+        text = _template()
+        assert 'const CHOOSING = "Choosing where to open…";' in text
+        apply_ = _section(text, "async function applyManifest(", "let loadGeneration = 0;")
+        assert 'status(shownAt === null ? CHOOSING : "");' in apply_, \
+            "the manifest landing does not clear the status while nothing is drawn"
+        assert 'status("");' not in apply_.split("manifest = man;")[1], "and nothing else clears it"
+        first = _section(text, "  function showFirst(){", "  let navStarted = false;")
+        assert "status(PREPARING);" in first
+
+    def test_the_opening_is_placed_and_drawn_long_before_the_scan_finishes(self):
+        text = _template()
+        op = _section(text, "async function chooseOpening(", "/* -------- context loss")
+        assert "const PROVISIONAL_AFTER = 6;" in text
+        assert "if (!placed && onProvisional && seen.size >= PROVISIONAL_AFTER" in op
+        # the first few candidates are spread over the WHOLE walk, so what the
+        # page opens on is already close to what it settles on
+        assert "const order = [];" in op and "bit-reversed" in op.lower().replace("-", "-")
+        # and the scoring camera is restored with NO yield in between, because
+        # the page is drawing now and an animation frame must never catch it
+        sc = op[op.index("const score = async i =>"):op.index("let best = -1")]
+        assert sc.index("await new Promise") < sc.index("const keepCam = cam")
+        assert "cam = keepCam; override = keepOverride;" in sc
+        assert "await" not in sc[sc.index("const keepCam = cam"):]
+
+    def test_the_rescue_is_ready_when_the_camera_is(self):
+        """*Best view* needs the fine field and the review timed it at 7.8-8.0 s
+        from the tap. *Reset* needs only an opening pose, so it is enabled at
+        the first drawn frame -- and honestly disabled before it."""
+        text = _template()
+        assert '$("bReset").disabled = true;' in text
+        first = _section(text, "  function showFirst(){", "  let navStarted = false;")
+        assert '$("bReset").disabled = false;' in first
+        # the field starts beside the rest of the scan rather than after it
+        assert "function startNav(){ if (navStarted) return; navStarted = true; buildNav(); }" in text
+        assert "startNav();" in first
+
+
+class TestAFingerThatArrivesBeforeThePicture:
+    """VISUAL-REVIEW-3 §2, BLOCKING. Input during `loading` went into `ctl`,
+    where nothing consumed it because `frame()` draws nothing before the
+    opening is placed -- and then ALL of it ran in the first frame after the
+    handover. A thumb resting on the glass through the load left the camera at
+    yaw 2.90 rad in the empty half of the room, and a look the person made is
+    deliberately never taken back, so it stayed there."""
+
+    def test_input_before_the_first_frame_is_deferred_and_never_banked(self):
+        text = _template()
+        assert 'const TOUCHED_EARLY = "One moment — you can look around as soon as it draws";' in text
+        d = _section(text, "  function deferInput(){", "  function feel(")
+        assert "if (shownAt !== null) return false;" in d
+        assert "hint(0.6, TOUCHED_EARLY);" in d, "it is said, not silently dropped"
+        assert "ctl.look = [0, 0]; ctl.move = [0, 0, 0];" in d and "vel.look = [0, 0];" in d
+        # every way in goes through it
+        for fn, start, end in (
+            ("feel", "  function feel(look, move, now){", "  function interrupt("),
+            ("wheel", 'canvas.addEventListener("wheel"', "addEventListener(\"keydown\""),
+            ("keys", 'addEventListener("keydown"', 'addEventListener("keyup"'),
+            ("S.input", "  S.input = (c) => {", "  S.step = (d) =>"),
+        ):
+            assert "deferInput()" in _section(text, start, end), fn
+        down = _section(text, 'canvas.addEventListener("pointerdown"',
+                        'canvas.addEventListener("pointermove"')
+        assert "if (shownAt === null) deferInput();" in down
+
+    def test_a_view_the_reader_aimed_survives_the_handover(self):
+        text = _template()
+        fin = _section(text, "async function finishOpening(", "/* -------- start ---")
+        assert "&& !touched){" in fin, "the correction only happens if nobody has aimed it"
+        assert 'S.openingKept = touched ? "the reader\'s own view" : "the provisional";' in fin
+        assert "let touched = false;" in text
+        assert "touched = true;" in _section(text, "  function feel(look, move, now){",
+                                             "  function interrupt(")
+
+
+class TestTheDarkIsSaidForAsLongAsItIsTrue:
+    """VISUAL-REVIEW-3 §3, BLOCKING. `hint()` showed the dark sentence for
+    1,100 ms and `hintSaid` throttled it to once per 4,000 ms, so over a
+    24-step turn from the opening it was visible at three steps and at NONE of
+    the six that render a 100% black frame. Measured again here after the
+    change: visible at 10 of 24 and at 6 of 6 (UX.md §3)."""
+
+    def test_the_dark_state_is_permanent_while_true_and_silent_when_not(self):
+        text = _template()
+        assert '<div id="dark" role="status" aria-live="polite"></div>' in text
+        assert "#dark.on{opacity:.88;pointer-events:auto}" in text
+        d = _section(text, "  const DARK_SAY_ON = 0.90", "  const KEY_SPEED")
+        assert "const DARK_SAY_ON = 0.90, DARK_SAY_OFF = 0.45, DARK_SAY_MS = 320;" in d
+        # hysteresis, so it cannot blink on the boundary
+        assert "const on = darkShown ? dark > DARK_SAY_OFF : dark > DARK_SAY_ON;" in d
+        # and a delay, so sweeping through a dark patch does not flash it
+        assert "now - darkSince >= DARK_SAY_MS" in d
+        # it is up to date on every drawn frame
+        frame = _section(text, "function frame(sync){", "function drawnFraction(")
+        assert "updateDark(dk);" in frame
+        # the throttle is gone entirely
+        assert "hintSaid" not in text
+
+    def test_the_dark_line_is_also_a_way_out(self):
+        text = _template()
+        assert '$("dark").onclick = () => faceTheRoom();' in text
+
+
+class TestWhatABodyCanReach:
+    """VISUAL-REVIEW-3 §6, MAJOR. A finger got forward 100% and right 100% of
+    what it asked -- those run ALONG the walk, where the tube does not bind --
+    against backward 31% and up and down 16%. The tube was never measured
+    against the imagery; it is now (UX.md §4), and the imagery holds well past
+    where it stopped you."""
+
+    def test_the_tube_is_wide_enough_that_every_direction_answers(self):
+        _run_nav(r"""
+const push = (d, n) => {
+  let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1}, worst = 0;
+  for (let i = 0; i < n; i++){
+    cam = NAV.step(F, path, cam, {look: [0, 0], move: d, held: true}, 16, V);
+    worst = Math.max(worst, cam.resisted);
+  }
+  return {gone: dist(cam.p, at), resisted: worst, p: cam.p};
+};
+const up_ = push([0, 0.1, 0], 40), dn = push([0, -0.1, 0], 40);
+const bk = push([0, 0, -0.1], 40), lf = push([-0.1, 0, 0], 40), rt = push([0.1, 0, 0], 40);
+// every direction MOVES, and by something a body would notice
+for (const [n, r] of [["up", up_], ["down", dn], ["back", bk]])
+  assert.ok(r.gone > 1.0, n + " went nowhere: " + r.gone);
+// up and down are the same limit, not two different ones
+assert.ok(Math.abs(up_.gone - dn.gone) < 0.05, "up and down are symmetric: " + up_.gone + " " + dn.gone);
+// and each of them STOPS, visibly: the resistance the edge hint is raised on
+for (const [n, r] of [["up", up_], ["down", dn], ["back", bk]])
+  assert.ok(r.resisted > 0.8, n + " stopped without saying so: " + r.resisted);
+// along the walk nothing binds at all, which is why forward and right were
+// already 100% and the complaint was about the other four
+assert.ok(rt.gone > 3.5 && rt.gone > 1.5 * bk.gone,
+          "along the walk is far freer than across it: " + rt.gone + " vs " + bk.gone);
+// the vertical limit is the one that moved, and it is a real fraction of the
+// scene rather than a tenth of it
+assert.ok(NAV.V_MAX >= 1.4 && NAV.R_MAX >= 2.2, "the tube: " + NAV.R_MAX + " x " + NAV.V_MAX);
+assert.ok(NAV.R_SOFT / NAV.R_MAX <= 0.51, "half the tube is still free of resistance");
+""")
+
+    def test_the_lattice_pays_for_the_wider_tube(self):
+        """The field's volume grew with the tube; the fine pass is what *Best
+        view* waits for, so the spacing is what pays rather than the wait.
+        Measured on the canonical world: 3,851 voxels at 0.5 over the old tube,
+        5,914 at 0.6 and 4,259 at 0.7 over the new one."""
+        nav = _nav_source()
+        assert "const SPACING = 0.7," in nav
+
+
+class TestTheBestViewStaysWhereItPutsYou:
+    """VISUAL-REVIEW-3 §6, MAJOR ("the page leaves its own tube"). It never
+    did leave the tube -- the destination measured at envelope 0.52-0.78 of 1
+    -- but 0.5 is where a RELEASED camera starts drifting back, so the page
+    could fly you somewhere it would then pull you out of."""
+
+    def test_the_destination_is_inside_the_part_of_the_tube_that_does_not_drift(self):
+        text = _template()
+        over = _section(text, "const OVERVIEW_AWAY", "function overview(){")
+        assert "let maxE = NAV.R_SOFT / NAV.R_MAX;" in over
+        assert "if (pd.e > maxE || !pd.closest) continue;" in over
+        # and it is a preference, never a dead button
+        assert "while (!found.length && maxE < 1){" in over
+        _run_nav(r"""
+// at the free edge the drift is exactly nothing, which is the property the
+// filter is buying
+assert.strictEqual(NAV.positionBound(NAV.R_SOFT / NAV.R_MAX), 0);
+assert.ok(NAV.positionBound(0.8) > 0.3, "and past it there really is a drift");
+""")
+
+
+class TestTheCompassIsLegibleAtRest:
+    """VISUAL-REVIEW-3 §12, MINOR. It had no label, no legend, and its opacity
+    ramped in only once the support field existed -- a second or more after
+    the first picture, which is exactly when a first-time viewer looks at it."""
+
+    def test_it_is_drawn_from_the_first_frame_and_it_says_what_it_is(self):
+        text = _template()
+        assert '<div id="clabel" aria-hidden="true">photographed<br>from here</div>' in text
+        cue = _section(text, "  const RING_R = 21, RING_SIZE = 58;", "  /* The way back.")
+        assert "if (shownAt === null){ el.classList.remove(\"on\"); lab.classList.remove(\"on\"); return; }" in cue
+        # without a field the arcs are blank, which is the truth, not hidden
+        assert "const k = ringProf ? NAV.smooth(0.08, NAV.T_HI, ringProf[i]) : 0;" in cue
+        assert 'g.fillText("YOU", c, c);' in cue
+
+    def test_the_way_home_does_not_change_its_mind_at_the_antipode(self):
+        text = _template()
+        cue = _section(text, "  const BACK_ON = 0.60", "  /* THE DARK STATE")
+        assert "const BACK_FLIP = 0.35;" in cue
+        assert "const ambiguous = Math.PI - Math.abs(b.delta) < BACK_FLIP;" in cue
+        assert "if (!backSide || !ambiguous) backSide = side;" in cue
+
+
+class TestTheSmallerComplaints:
+    """VISUAL-REVIEW-3 §7, §12, §13."""
+
+    def test_placing_the_camera_clears_the_input_as_well_as_the_inertia(self):
+        text = _template()
+        for fn, start, end in (("setPose", "  function setPose(pose){", "  function glideTo("),
+                               ("glideTo", "  function glideTo(pose, index){", "  /* The hint:")):
+            s = _section(text, start, end)
+            assert "ctl.look = [0, 0]; ctl.move = [0, 0, 0];" in s, fn
+            assert "vel.look = [0, 0]; vel.move = [0, 0, 0];" in s, fn
+
+    def test_a_placed_camera_reports_a_yaw_a_person_could_read(self):
+        text = _template()
+        setp = _section(text, "  function setPose(pose){", "  function glideTo(")
+        assert "Math.atan2(Math.sin(pose.yaw), Math.cos(pose.yaw))" in setp
+        nav = _section(text, "  function navUpdate(dt){", "  /* The envelope's support field")
+        assert "cam.yaw = Math.atan2(Math.sin(cam.yaw), Math.cos(cam.yaw));" in nav
+
+    def test_a_press_of_the_arrow_covers_ground(self):
+        """0.049 scene units a press is not stepping through a walk. A press
+        now advances until it has gone STEP_UNITS of path or passed
+        STEP_MAX_POSES, and the quality rule decides where in that run it
+        lands. Measured on the canonical world from the review's own starting
+        index: 0.165 units a press before, 0.308 after (UX.md §7)."""
+        text = _template()
+        assert "const STEP_MAX_POSES = 12;" in text
+        assert "function stepUnits(){ return 0.32 * ((CONFIG.median_scene_depth || 4.7) / 4.7); }" in text
+        wt = _section(text, "  function walkTarget(from, d){", "  function step(d){")
+        assert "if (j < 0 || j >= cams.length) break;" in wt, "both ends of the walk stay inert"
+        assert "if (gone >= want) break;" in wt
+        st = _section(text, "  function step(d){", "  let poseQ")
+        assert "if (to === ci){ hint(0.6); return; }" in st
+
+    def test_the_about_panel_is_sections_not_a_wall(self):
+        """335 words in one block, half the height of a phone screen. The words
+        are nearly the same; the shape is not."""
+        text = _template()
+        cap = _section(text, "function updateCaption(", "/* -------- verification hooks")
+        assert "const sections = [" in cap
+        assert cap.count('document.createElement("em")') == 1 and "for (const [title, body] of sections)" in cap
+        titles = ["What you are looking at", "The flat grey patches", "Looking and moving",
+                  "Finding your way", "The walk"]
+        for title in titles:
+            assert '["' + title + '"' in cap, title
+        assert "#caption .more em{display:block" in text
+        assert "max-height:44vh;overflow-y:auto" in text
+
+
+class TestTheHazeAndWhatTheFadeIsFor:
+    """VISUAL-REVIEW-3 §9 and §10. The caption promised a grey haze; the page
+    drew the background, which the reviewer measured at luminance 10-18
+    against a background of 11-28 -- darker than the emptiness it was supposed
+    to be distinguished from. And the confidence fade, A/B'd at `clo=0&chi=0`,
+    changed a median 0.22 of an 8-bit level over the whole frame: invisible,
+    because it faded toward the same near-black. One change answers both."""
+
+    def test_the_haze_is_flat_and_plainly_between_the_room_and_the_void(self):
+        text = _template()
+        shade = _section(text, "const GLSL_SHADE", "const FS_BLEND")
+        assert "const vec3 HAZE_RGB = vec3(0.160, 0.168, 0.190);" in shade
+        assert "vec3 haze(){ return HAZE_RGB; }" in shade
+        # brighter than the brightest point of the background it sits on
+        bg = _section(text, "const GLSL_BACKGROUND", "`;")
+        assert "vec3(0.078, 0.084, 0.094)" in bg
+        assert min(0.160, 0.168, 0.190) > max(0.078, 0.084, 0.094)
+        # flat: one constant, no texture fetch, no screen-space term
+        assert "gl_FragCoord" not in shade.split("const vec3 HAZE_RGB")[1].split("}")[0]
+
+    def test_no_measurement_and_no_score_can_see_the_haze(self):
+        """The opening and the Best view are scored on the drawn fraction, the
+        honesty check reads the observed/unobserved mask, and the fade's cost
+        is read through mode 11. All three return before the haze is drawn,
+        and the uniform is zero for every mode but the display one."""
+        text = _template()
+        shade = _section(text, "const GLSL_SHADE", "const FS_BLEND")
+        haze_at = shade.index("if (uHaze <= 0.0)")
+        for mode in ("uMode == 2", "uMode == 3", "uMode == 11"):
+            assert shade.index(mode) < haze_at, mode
+        uni = _section(text, "function shadeUniforms(", "function blendPass(")
+        assert "gl.uniform1f(P.u.uHaze, mode ? 0 : OPT.haze);" in uni
+
+    def test_the_fade_gives_way_to_the_haze_so_that_it_can_be_seen(self):
+        text = _template()
+        shade = _section(text, "const GLSL_SHADE", "const FS_BLEND")
+        assert "c = mix(uHaze > 0.0 ? haze() : background(), c, confKeep());" in shade
+        # the band itself is UNCHANGED: raising it was measured in this lane
+        # and rejected (2.53% of drawn at 110/255 for no visible gain, 6.85% at
+        # 140/255, where it starts fogging real photographs)
+        from tower.world_builder.appearance_render import CONFIDENCE_HI, CONFIDENCE_LO
+        assert (CONFIDENCE_LO, CONFIDENCE_HI) == (24 / 255, 78 / 255)
+        # and it is still evidence-preserving
+        assert "o = vec4(c * alpha, alpha);" in shade
+
+    def test_the_haze_can_be_turned_off_and_is_configured_from_one_place(self):
+        from tower.world_builder.appearance_render import UNSEEN_HAZE
+
+        text = _template()
+        assert "haze: Math.max(0, Math.min(1, +(Q.get(\"haze\") ?? CONFIG.unseen_haze ?? 0.9)))" in text
+        assert 0 < UNSEEN_HAZE <= 1

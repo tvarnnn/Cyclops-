@@ -289,16 +289,39 @@ enforced).
   designed escape from the edge (`lookAcross`) fired **zero times** in ten
   60-frame sweeps. Roughly 100 of 147 frames of a portrait interaction sequence
   were static under continuous input.
-  - **Where.** A tube around the recorded walk: **1.5** scene units across,
-    **0.8** along the vertical, soft from **0.75** of it (it was 1.0 × 0.6,
-    soft from 0.55, which left the first half of every sideways push resisted).
+  - **Where.** A tube around the recorded walk: **2.2** scene units across,
+    **1.4** along the vertical, soft from **half** of it (it was 1.0 × 0.6,
+    soft from 0.55, which left the first half of every sideways push resisted;
+    then 1.5 × 0.8, soft from 0.75).
     Consecutive recorded poses more than 2.0 apart are not joined (a jump in the
     record is not a corridor).
+    **Widened again 2026-09-21** (fix-it ux lane, `fixit\ux\UX.md` §4). An
+    independent review measured what a finger reaches: forward 100% and right
+    100% of what it asks — those run ALONG the walk, where the tube does not
+    bind — against **backward 31%** and **up and down 16% each**, with the
+    eight up frames and the eight down frames indistinguishable from one
+    another. The limit had never been measured against the imagery, only
+    asserted. It has been now: the opening view rendered at 0.25-unit steps
+    along the world vertical out to ±3 and at 0.5-unit steps straight back out
+    to 5 (through `S.setPose`, which the envelope does not bound) stays
+    **97–99% drawn and 0.3–1.7% black at every one of them**, with the same
+    detail as the opening. The tube was three times tighter than the pictures
+    require. At 2.2 × 1.4 a finger reaches **back 2.10, up 1.25, down 1.25** of
+    a 4.48-unit push (from 1.41 / 0.71 / 0.70), and each of those directions
+    still stops, visibly, with *Not captured beyond here*. The price is the
+    support field's volume, and it is paid in **lattice spacing** (below), not
+    in waiting.
   - **Which way.** A **support field** over position and look direction, built
     on the page after the images land (and again for a new build), in slices so
     the page stays interactive: 6,000 area-weighted points on the proxy; a point
     is *seen* by a bound phone-tier keyframe when it is in its frame and visible
-    in its depth (the CPU copy above); on a grid 0.5 apart inside the tube (2,033
+    in its depth (the CPU copy above); on a grid **0.7** apart inside the tube
+    (0.5 until 2026-09-21, when the tube grew: at 0.5 the new tube is 2.6× the
+    voxels, at 0.6 it is 5,914 and 1,272 ms of field work, at 0.7 it is 4,259
+    and 974 ms — the 3,851 / 940 ms the 0.5 lattice cost over the old tube. The
+    fine pass is what *Best view* waits for, so the wider envelope is paid for
+    in resolution rather than in waiting; the page already ships a coarser
+    field still and uses it for the first second) (2,033
     points on the canonical world, 1.56 MB) each of 384 cube-map directions keeps
     how well its nearest proxy point is coloured from there — 1 when a keyframe
     that saw it is within 60° of that ray, ½ at 80°, 0 past 85° (the blend's
@@ -361,9 +384,22 @@ enforced).
     support ≥ 0.183 — and the band puts the hint's own 0.9 crossing in the
     middle of that empty gap: over the 200 the sentence is now said over
     **none** of the 116 views that draw half the frame (the old band said it
-    over **97** of them) and over **all 24** that are essentially black. The
-    hint still fires on `dark > 0.9`. Both bands are reported by
-    `S.navConst()`.
+    over **97** of them) and over **all 24** that are essentially black.
+    Both bands are reported by `S.navConst()`.
+    **It is a STATE, not a toast** (2026-09-21, fix-it ux lane, `UX.md` §3).
+    It used to be `hint()`: 1,100 ms of life, throttled to one showing per
+    4,000 ms. Measured over a 24-step turn from the opening it was visible at
+    **3 of 24 steps and at NONE of the six that render a 100% black frame** —
+    the deepest black was the least explained, which is the one thing the
+    sentence exists for. A page cannot explain a condition that persists with
+    an event that does not. `#dark` is now held for as long as the view is on
+    nothing: it appears when `dark > 0.90` has held for **320 ms** and goes
+    when `dark < 0.45`, so sweeping through a dark patch on the way somewhere
+    does not flash it and stopping in one always explains it. It reads
+    *Nothing was photographed this way / the glasses never looked this way —
+    tap to turn back*, and tapping it does what *Face the room* does. Measured
+    again over the same 24 steps: visible at **10 of 24 and at 6 of 6** of the
+    100%-background steps, and at none of the 14 that show the room.
   - **Content, not only quality** (added 2026-09-17, fix-it framing lane). A
     view can be 100% drawn, clean, and hold nothing — a plain wall, a plain
     ceiling, a blank door panel — and support rated it exactly as highly as the
@@ -446,8 +482,14 @@ enforced).
     and with nothing on screen that reads as a crash rather than as the truth.
     Three things, all of them reporting **coverage** and none of them implying
     content:
-    - an **orientation ring** at the top right, always on once the field
-      exists: `RING_BINS` = 36 headings on the horizon from where the camera
+    - an **orientation ring** at the top right, on from the **first drawn
+      frame** and labelled *photographed / from here* underneath, with **YOU**
+      at its centre (2026-09-21, fix-it ux lane: it used to ramp its opacity
+      in only once the field existed, a second or more after the first
+      picture — exactly when a first-time viewer looks at it — and it carried
+      no words at all, so its meaning lived only in the About panel. Without
+      a field the arcs are drawn blank, which is the truth: the page does not
+      know yet). `RING_BINS` = 36 headings on the horizon from where the camera
       stands, each one the same `support` the rest of the page uses at the
       same field of view, drawn as an arc that is lit where a frame exists and
       dim where none does, rotated so the current heading is always at the top
@@ -463,8 +505,20 @@ enforced).
       released again below 0.25 — well below, because a frame that is 89%
       background can still hold a torn fragment and read 0.36 — and never for
       a turn under 0.35 rad), drawn with CSS borders rather than a glyph.
-    - **Face the room** — a button, and the ring and the arrow are the same
-      control. It turns the camera, from where it stands, to the heading
+      **It does not change its mind at the antipode**: within `BACK_FLIP` =
+      0.35 rad of the point where the room is exactly behind you the two ways
+      home are the same length, so the side it already shows is kept
+      (2026-09-21). (VISUAL-REVIEW-3 §8 reported "two contradictory arrows at
+      once"; that is an artifact of that lane's own `crop.py`, which tiles
+      crops from different frames edge to edge with no gutter, so one frame's
+      right-edge chevron abuts the next frame's left-edge one. Every raw frame
+      in its `raw_seq4` carries exactly one arrow — checked in
+      `fixit\ux\tools\arrowside.py`. The flip that IS real is the one fixed
+      here.)
+    - a **dark line** above the bar, held for as long as the view is on
+      nothing (see the darkness band above), which is also a control.
+    - **Face the room** — a button, and the ring, the arrow and the dark line
+      are the same control. It turns the camera, from where it stands, to the heading
       `NAV.bestHeading` names: the best-supported one discounted by how far
       you would have to turn (`RING_TURN_PENALTY` = 0.25 over half a turn), at
       the best of four pitches, as a **glide**, so a `pointerdown` cancels it
@@ -480,14 +534,49 @@ enforced).
     still `C_DRIFT_MAX`, about 17°, and half a turn of dark is 180° — and it
     is still refused for a look of the person's own and while a finger is
     down.
-  - **Confidence fades appearance toward the void** (added 2026-09-20, fix-it
+  - **A place nobody photographed is drawn as a flat grey haze** (added
+    2026-09-21, fix-it ux lane, `UX.md` §8; `WORLD-BUILDER-APPEARANCE.md`
+    §4.2b). Proxy geometry that no kept frame saw used to write alpha 0 and
+    come out as the background. The caption had always called that *a grey
+    haze … always darker than the room around it*, and the last independent
+    review measured it: in the shipped render the "haze" is luminance
+    **10–18** against a background of **11–28**, so in the opening view it was
+    **darker than the emptiness it is supposed to be distinguishable from**,
+    and at +90° **13.4%** of the frame was real geometry nobody ever
+    photographed, indistinguishable from nothing at all. Those fragments now
+    write **one flat colour** (display RGB 0.160 / 0.168 / 0.190, alpha
+    `CONFIG.unseen_haze` = 0.9) with no texture, no hue of its own and no
+    detail at any scale. It is the only thing on the page that is painted
+    rather than photographed, and that is exactly what it says: *there is a
+    surface here and there is no picture of it*. It invents nothing — a flat
+    patch cannot be mistaken for imagery — and **no measurement sees it**: the
+    observed/unobserved mask (mode 2), the drawn fraction the opening and the
+    Best view are scored on (mode 3) and the fade's own cost (mode 11) all
+    return before it is drawn, and the uniform is zero for every mode but the
+    display one. `unseen_haze: 0` restores the previous behaviour exactly.
+    Measured over the review's nineteen poses: the haze reads **27–42**
+    against a background of 11–28, it is darker than the background in **1 of
+    19** views (14 of 19 before), and the median separation is **+18.9** where
+    it was −1.8.
+  - **Confidence fades appearance toward the haze** (added 2026-09-20, fix-it
     orient lane; `WORLD-BUILDER-APPEARANCE.md` §4.2a). The proxy's R colour
     byte is the surface's per-vertex geometry confidence. Per fragment,
     `k = smoothstep(CONFIG.confidence_lo, CONFIG.confidence_hi, conf)` and the
-    colour is `mix(background(), colour, k)`: below the band the photograph
-    gives way entirely to the same vignette the page draws where it knows
+    colour is `mix(haze(), colour, k)`: below the band the photograph
+    gives way entirely to the mark the page draws where it knows
     nothing, above it nothing changes, and between them it crosses over
-    smoothly. Never a hard cut. **The alpha is not touched**: alpha is the
+    smoothly. Never a hard cut.
+    **It faded toward the background until 2026-09-21, and that is why nobody
+    could see it** (fix-it ux lane, `UX.md` §9). A/B'd at `?clo=0&chi=0` over
+    nineteen poses, the fade changed a median **0.22 of an 8-bit level** over
+    the whole frame and 0.60% of the frame visibly — because it faded dark
+    geometry toward a near-black background, so where it acted hardest there
+    was least to see. Against the haze it changes **1.56%** of the frame
+    (median) by ~20 levels, in exactly the places the page will not vouch for.
+    **The band itself did not move**, and raising it was measured and
+    rejected: 110/255 doubles the cost (2.53% of drawn against 0.74%) for no
+    visible gain, and 140/255 (6.85% of drawn) begins fogging real
+    photographs. **The alpha is not touched**: alpha is the
     evidence that a frame saw the place, the depth still hides what is behind,
     and no pixel becomes see-through. `proxy.confidence.present === false` is
     *unknown*, not zero, and disables the fade entirely (the attribute is then
@@ -516,7 +605,12 @@ enforced).
     it; the button is now named for what it does, says so in the About text, and
     flies rather than jumps). A **raised** vantage in the envelope that
     looks at the room. The field proposes (points at least 0.15 above the walk,
-    within 0.85 of the tube and at least 1.2 from the opening pose, 12 yaws × 2
+    within **half** of the tube — the part a released camera does not drift
+    out of; 0.85 until 2026-09-21, which let the destination land at envelope
+    0.52–0.78, reachable but inside the drift band, so the page could fly you
+    somewhere it would then quietly pull you away from. It is a preference,
+    relaxed in 0.15 steps rather than allowed to leave the button dead
+    (`S.overviewStats.maxE` says which) — and at least 1.2 from the opening pose, 12 yaws × 2
     downward pitches, support ≥ 0.68 and mean supported distance ≥ 0.5 × the
     scene's median depth), scored support × (0.5 + 0.5 × distance) × (0.5 + 0.5
     × facing what the walk looked at, the mean of the recorded look targets);
@@ -575,6 +669,17 @@ enforced).
     whole, so the walk that is shown is shorter than the one recorded but never
     misses a stretch of it. The caption says so. On the canonical world 18 of
     198 poses are skipped (17 for drawn, 7 for detail).
+    **A press covers ground first** (2026-09-21, fix-it ux lane, `UX.md` §7).
+    The walk was recorded at whatever rate the wearer moved, and on this
+    capture that is as little as **0.049 scene units a pose** through the desk
+    stretch — fifteen presses moved the camera 0.73 units, which is not
+    stepping through a walk but watching yourself sit at a desk. A press now
+    advances along the path until it has gone `STEP_UNITS` (0.32 × the scene's
+    median depth ÷ 4.7, so 0.28 here) or has passed `STEP_MAX_POSES` = 12,
+    whichever comes first, and the quality rule above then decides where in
+    that run it lands. Both ends of the walk stay inert. Measured from the
+    review's own starting index: **0.165 units a press before, 0.308 after**
+    (index 4 → 19 against 4 → 25 over fifteen presses).
   - Before the field is built (a second or so after the images land) the look
     and the walk work, the status line reads **“Preparing the view…”**, and
     **Best view** is disabled. Both of the things the field is needed for are
@@ -597,6 +702,59 @@ enforced).
     contention, where the field work dominates: 2964–3629 ms → 1316–2312 ms
     for the window, and 3.0–3.6 s → 5.4–7.6 s for the button. The coarse pass
     costs 136 ms of extra work (935 against 799 ms in total).
+    **The field starts at the first drawn frame, beside the rest of the
+    opening scan** (2026-09-21, fix-it ux lane), not after it: both are sliced
+    on a 12–14 ms budget, so they interleave instead of queueing. What must
+    NOT run beside the fine pass is `scorePoses` (198 renders), which pushed
+    it from 1.0 s to 3.7–4.7 s when that was tried; it still waits.
+
+  **The cold open shows its state before it shows its chrome** (2026-09-21,
+  fix-it ux lane, `UX.md` §1–2). Until then, every cold open put the finished
+  caption and the whole button bar on screen over a pure black canvas with
+  the status line cleared: 1.45–1.71 s on the reviewer's machine and
+  **2.8–3.1 s** on the lane's, ending in a first lit frame at 6.1–6.5 s. The
+  natural reading of those frames is that the page is broken. Three rules now
+  hold, and each is a unit:
+
+  - **The chrome does not arrive before the picture.** `<body class="booting">`
+    hides `#caption` and `#bar`; the class comes off at the first drawn frame,
+    so the room and the controls arrive together. The buttons exist in the
+    markup from the first byte — something has to enable them — they are just
+    not shown.
+  - **The page never falls silent while it is still working.** The status runs
+    *Loading the images…* → *Loading the room's surface…* → *Placing images
+    n / N* → **“Choosing where to open…”** (the opening scan, about two
+    seconds of its own, which said nothing at all before) → *Preparing the
+    view…* → nothing.
+  - **A pose is placed and drawn long before the scan finishes.** The coarse
+    scan runs in a bit-reversed order, so its first six candidates are spread
+    over the whole recorded walk rather than over its first few poses, and the
+    best of those six is placed and drawn (`S.provisional`). When the scan
+    finishes the page corrects to the real opening — a cut, not a glide, so
+    `phase: ready` never describes a camera in flight — **unless the reader has
+    touched the glass, in which case the view is theirs and the page leaves it
+    alone** (`S.openingKept`).
+
+  Measured on the lane's machine, three quiet loads each, polling only: the
+  longest stretch that is black with nothing said falls from **2.83–3.13 s to
+  0.00 s**; the first lit frame from **5.65–6.04 s to 4.20–4.30 s**; *Reset*
+  becomes usable at the first drawn frame (it was never disabled and never
+  useful before it). *Best view* moves the other way, **7.84 s → 8.73 s**,
+  which is the cost of drawing the room 1.45 s sooner on a renderer where one
+  frame is ~400 ms rather than a phone's ~16.
+
+  **Input before the first drawn frame is refused out loud, never banked.**
+  `frame()` draws nothing until the opening is placed, so anything pushed into
+  `ctl` before that just accumulated — and then ran, all of it, in the first
+  frame after the handover. An independent review put a thumb on the glass
+  from the first instant and landed at **yaw 2.90 rad** in the empty half of
+  the room, where it stayed for the nineteen seconds they watched, because a
+  look the person made is deliberately never taken back. You cannot aim at a
+  picture you have not seen: `deferInput` clears `ctl` and `vel`, says *One
+  moment — you can look around as soon as it draws*, counts the event in
+  `S.deferredInputs`, and every way in goes through it (the pointer handlers,
+  the wheel, the fly keys and `S.input`). Re-run: **0 of 44 sampled frames
+  after the handover are dark**, against 41 of 41.
 
   It opens at the recorded pose whose **rendered frame is most drawn and has the
   most in it** (drawn × (0.85 + 0.15 × wide) × (0.35 + 0.65 × rendered detail),
@@ -668,22 +826,31 @@ enforced).
   device was offered" and not "of what the Tower keeps" — (· *still building as
   you walk*, · the currency reason when behind, · a reduced set and **which
   side** lacks compressed textures: this device, or a Tower that built none),
-  then: *These are the camera's own frames, with faces redacted, placed on the
-  reconstructed room. A grey haze is a place no kept frame saw, or that was
-  masked as unreliable (redaction, hands, views that disagreed) — it is always
-  darker than the room around it and it is never an image of anything. Cracks a
-  few pixels wide between two parts of one surface are closed from the frames on
-  either side; nothing wider is. Where the geometry underneath is wrong, images
-  smear or double.* then the pose-skipping sentence, then (added 2026-09-18)
-  *Turning is free: you can look all the way round and straight up, and where
-  the glasses never looked you will find the room simply dark rather than a
-  wall you cannot turn past. Moving is not free — the camera stays near the
-  path that was actually walked, and a push that slows to nothing has reached
-  the edge of it. "Best view" flies to the best-supported vantage in that path;
-  on this capture the wearer never stood back from the desk, so it is a view
-  from the desk and not a view of the whole room.* — then *Scale is unknown, so
-  distances are relative.*
-  It said *"Dark areas … nothing there is filled in"* until 2026-09-17: written
+  then **five short titled sections**, not one paragraph (2026-09-21, fix-it
+  ux lane): *What you are looking at*, *The flat grey patches*, *Looking and
+  moving*, *Finding your way*, *The walk*, and finally *Scale is unknown, so
+  distances are relative.* The panel scrolls at `max-height: 44vh`.
+  The words are all but unchanged; the shape is not. The last review called
+  the text "correct, honest and well written — and one 250-word paragraph in
+  small type filling 28% of a phone screen, with no headings and no breaks".
+  Measured: **335 words in a single block, 50.3% of the frame's height**;
+  after, 357 words in five sections whose longest block is **89 words**, at
+  **44%** and scrollable.
+  Two sentences changed, both because a measurement contradicted them:
+  - *A grey haze … it is always darker than the room around it* became **“A
+    flat grey patch is a place no kept frame saw, or one that was masked as
+    unreliable (redaction, hands, views that disagreed). It has no texture and
+    no detail at any scale, and it is never an image of anything: it is there
+    so that ‘nobody photographed this’ does not look like ‘there is nothing
+    here’.”** The old claim was false as written — the haze measured luminance
+    10–18 against a background of 11–28 — and the page now draws a patch that
+    makes the new one true and checkable.
+  - *Moving is not free* gained **“so you can step back, stand and crouch a
+    little”**, which is what the widened tube bought.
+  The *Cracks a few pixels wide …* sentence is **unchanged, deliberately**: a
+  parallel lane is checking that claim against multi-view fill of redacted
+  regions, and nothing in this lane alters what the crack fill does.
+  It said *"Dark areas … nothing is filled in there"* until 2026-09-17: written
   before the crack fill and the void fog and not revisited, so the page's own
   caption denied two things the page does (review 2, M-5). The replacement
   states the BOUND rather than a denial, which is the part a wearer can act on.
