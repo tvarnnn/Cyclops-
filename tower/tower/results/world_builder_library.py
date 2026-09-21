@@ -129,6 +129,7 @@ def _appearance_summary(store: WorldStore, world_id: str, session_id: str, world
     routes of §4b, and only for a session the Tower serves.
     """
     from tower.world_builder import appearance_pipeline as AP  # noqa: PLC0415
+    from tower.world_builder import raw_imagery as RAWIMG  # noqa: PLC0415
 
     manifest = AP.read_appearance_manifest(store, world_id, session_id)
     if not manifest:
@@ -148,13 +149,20 @@ def _appearance_summary(store: WorldStore, world_id: str, session_id: str, world
         "keyframes": len(keyframes),
         "keyframes_phone": sum(1 for k in keyframes if k.get("tier") == "phone"),
         "bytes": sum(AP.named_files(manifest).values()),
+        # §6.6, first and at the top level: the listing must never present a
+        # research build as the product. `imagery` below describes redacted
+        # imagery, so it is replaced outright rather than qualified.
+        "imagery_source": AP.imagery_source_of(manifest),
+        "privacy_safe": AP.imagery_source_of(manifest) == RAWIMG.IMAGERY_REDACTED,
         "redaction": prov.get("session_redaction"),
         "redaction_effective": prov.get("redaction_effective"),
         "label_trusted": prov.get("label_trusted"),
         "keyframe_image_set": prov.get("keyframe_image_set"),
         "privacy_tags": list(prov.get("privacy_tags") or []),
         "retains_raw_imagery": prov.get("retains_raw_imagery"),
-        "imagery": APPEARANCE_IMAGERY_NOTE,
+        "imagery": (RAWIMG.RAW_NOTE
+                    if AP.imagery_source_of(manifest) != RAWIMG.IMAGERY_REDACTED
+                    else APPEARANCE_IMAGERY_NOTE),
         "retention": APPEARANCE_RETENTION_NOTE,
     }
 

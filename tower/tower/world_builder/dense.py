@@ -75,6 +75,8 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED
+
 logger = logging.getLogger(__name__)
 
 # The artifact format identifier. A reader that does not recognise this string
@@ -103,6 +105,19 @@ class DenseParams:
     `docs/world-builder-dense/03-DECISIONS.md` for what each was compared
     against.
     """
+
+    # -- which imagery (WORLD-BUILDER-APPEARANCE.md §6.6) ------------------
+    # `redacted` is the product and the default: the depth stage reads the
+    # redacted keyframes, measures the redaction fill, inpaints it so a solid
+    # rectangle cannot drag the network's estimate for the whole frame, and
+    # masks it out of the reconstruction afterwards.
+    #
+    # `raw-local-research` is the owner-sanctioned bypass: the ORIGINAL local
+    # capture frame, which has no fill to measure, nothing to inpaint and
+    # nothing to mask -- so the geometry and the appearance are made of the
+    # same pixels, which is the only way the two agree. Not privacy-safe;
+    # every record it writes says so, and no cache crosses between the two.
+    imagery_source: str = IMAGERY_REDACTED
 
     # -- depth ------------------------------------------------------------
     # MoGe-2 ViT-L (MIT). Chosen from a 24-model bake-off on identical frames,

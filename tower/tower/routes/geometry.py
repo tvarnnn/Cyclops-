@@ -36,6 +36,7 @@ from tower.results.world_builder_render import (
     build_world_render,
     render_content_security_policy,
 )
+from tower.world_builder.raw_imagery import IMAGERY_REDACTED, RAW_NOTE
 
 router = APIRouter()
 
@@ -107,11 +108,25 @@ def _appearance_store(request: Request):
     return store_from_root(root)
 
 
-def _appearance_headers(label: str) -> dict:
-    return {**NO_STORE_HEADERS, "X-World-Redaction": label}
+def _appearance_headers(label: str, imagery: str = IMAGERY_REDACTED) -> dict:
+    """The provenance headers on every appearance 200.
+
+    `X-World-Redaction` is the effective redaction label. `X-World-Imagery`
+    says which imagery the artifact is made of (§6.6): `redacted`, the
+    product, or `raw-local-research`, the research bypass -- in which case the
+    label beside it is not a redaction label and the body is not privacy-safe.
+    Two headers rather than one because a reader that knows nothing of the
+    bypass must not have to parse the label to find out.
+    """
+    headers = {**NO_STORE_HEADERS, "X-World-Redaction": label,
+               "X-World-Imagery": imagery}
+    if imagery != IMAGERY_REDACTED:
+        headers["X-World-Imagery-Warning"] = RAW_NOTE
+    return headers
 
 
-def _appearance_response(request: Request, data: bytes, media_type: str, label: str) -> Response:
+def _appearance_response(request: Request, data: bytes, media_type: str, label: str,
+                         imagery: str = IMAGERY_REDACTED) -> Response:
     """A 200 of appearance bytes, gzip/deflate when the client accepts it.
 
     The privacy headers are the same either way (`no-store`, `nosniff`, no
@@ -120,7 +135,7 @@ def _appearance_response(request: Request, data: bytes, media_type: str, label: 
     """
     body, encoding = encode_body(data, request.headers.get("accept-encoding"))
     return Response(content=body, media_type=media_type,
-                    headers={**_appearance_headers(label), **encoding})
+                    headers={**_appearance_headers(label, imagery), **encoding})
 
 
 @router.get("/worlds/{world_id}/appearance/{session_id}/manifest")
@@ -132,25 +147,26 @@ def appearance_manifest_route(world_id: str, session_id: str, request: Request) 
     session answers 404 rather than its old textures.
     """
     try:
-        payload, label = appearance_manifest(_appearance_store(request), world_id, session_id)
+        payload, label, imagery = appearance_manifest(_appearance_store(request),
+                                                      world_id, session_id)
     except AppearanceNotServed as exc:
         raise HTTPException(status_code=404, detail=exc.reason,
                             headers=NO_STORE_HEADERS) from None
     # Rendered exactly as JSONResponse would, then encoded like the bytes routes:
     # the manifest is ~0.4 MB of JSON for a 374-keyframe walk.
     data = JSONResponse(json_safe(payload)).body
-    return _appearance_response(request, data, "application/json", label)
+    return _appearance_response(request, data, "application/json", label, imagery)
 
 
 def _appearance_bytes(request: Request, world_id: str, session_id: str, kind: str,
                       digest: str) -> Response:
     try:
-        data, label = appearance_file(_appearance_store(request), world_id, session_id,
-                                      kind, digest)
+        data, label, imagery = appearance_file(_appearance_store(request), world_id,
+                                               session_id, kind, digest)
     except AppearanceNotServed as exc:
         raise HTTPException(status_code=404, detail=exc.reason,
                             headers=NO_STORE_HEADERS) from None
-    return _appearance_response(request, data, "application/octet-stream", label)
+    return _appearance_response(request, data, "application/octet-stream", label, imagery)
 
 
 @router.get("/worlds/{world_id}/appearance/{session_id}/chunk/{digest}")

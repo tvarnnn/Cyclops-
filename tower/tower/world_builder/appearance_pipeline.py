@@ -13,6 +13,17 @@ at a time per session under a lock; every file written atomically under its
 content name; the manifest last; superseded files pruned after a grace; a
 stop between stages leaves the previous artifact standing and nothing that
 looks finished.
+
+THE RESEARCH BYPASS (contract §6.6). `params.imagery_source` is `redacted`
+unless a caller asks for `raw-local-research`, in which case every pixel comes
+from the original local capture instead and the artifact is labelled as such
+in four places at once: `imagery_source` and `appearance_provenance` in the
+manifest, the params digest (so no redacted build is ever mistaken for
+already-built and no cached file crosses over), the epoch (so an open page
+drops its textures rather than mixing them), and the serving gate, which
+refuses to hand a raw artifact to a Tower that did not ask for one and a
+redacted artifact to a Tower that did. Nothing about the redacted path
+changes, and nothing leaves the world's own directories.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ import numpy as np
 
 from tower.storage import write_bytes_atomic, write_json_atomic
 from tower.world_builder import appearance as A
+from tower.world_builder import raw_imagery as RAWIMG
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +248,12 @@ def build_appearance(store, world_id: str, session_id: str, *,
         lock.release()
 
 
+def _unobserved_rule(policy) -> str:
+    """What produced each frame's unobserved mask. Under the bypass: nothing,
+    and the record says so rather than naming a rule that did not run."""
+    return RAWIMG.RAW_UNOBSERVED_RULE if policy.raw else A.UNOBSERVED_RULE
+
+
 def _build(store, world_id, session_id, root, params, should_stop, progress, force,
            redactor_factory, device, transient_backend_factory=None) -> AppearanceResult:
     from tower.world_builder import transients as T  # noqa: PLC0415
@@ -299,7 +317,13 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
                if isinstance(r, dict) and r.get("ki") is not None}
     kind = align.get("kind", "disparity")
 
-    policy = A.resolve_label_policy(store, world_id, session_id, redactor_factory)
+    policy = A.resolve_label_policy(store, world_id, session_id, redactor_factory,
+                                    imagery_source=params.imagery_source)
+    if policy.raw:
+        logger.warning("[Tower][WorldBuilder][appearance] %s/%s: %s -- building from "
+                       "%d original local frames, %d not found",
+                       world_id, session_id, RAWIMG.RAW_NOTE,
+                       len(policy.raw_images.paths), len(policy.raw_images.missing))
     cam = solution.camera
     K = np.array([[cam["fx"], 0, cam["cx"]], [0, cam["fy"], cam["cy"]], [0, 0, 1.0]])
     W, H = int(cam["width"]), int(cam["height"])
@@ -351,9 +375,14 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "depth_cache_key": align.get("cache_key"),
         "session_redaction": policy.session_redaction,
         "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
+        # The bypass, named twice: once as the mode, once as the exact set of
+        # original frames it read. Either changing rebuilds rather than
+        # reusing, in both directions.
+        "imagery_source": params.imagery_source,
+        "raw_imagery_set": (policy.raw_images.cache_token if policy.raw else None),
         "redactor_applied_here": policy.redactor_label,
         "fill_rule": FILL_RULE,
-        "unobserved_rule": A.UNOBSERVED_RULE,
+        "unobserved_rule": _unobserved_rule(policy),
         "consensus_rule": A.consensus_rule_id(params),
         "alpha_ring_px": A.ALPHA_RING_PX,
         "per_frame_sha1_digest": frame_digest,
@@ -646,6 +675,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
     provenance = {
         "session_redaction": policy.session_redaction,
         "keyframe_image_set": getattr(policy.image_set, "cache_token", None),
+        "imagery_source": params.imagery_source,
+        "raw_imagery_set": (policy.raw_images.cache_token if policy.raw else None),
         "redactor_applied_here": policy.redactor_label,
         "label_trusted": policy.trusted,
         "redaction_consensus": consensus_record,
@@ -657,6 +688,12 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         "build_id": build_id,
         "built_at": time.time(),
         "quality": params.quality,
+        # AT THE TOP LEVEL, NOT ONLY INSIDE THE PROVENANCE BLOCK. A reader
+        # that skims a manifest reads this key first, and a reader that does
+        # not know the key at all reads a manifest with no `imagery_source`,
+        # which is `redacted` and always was.
+        "imagery_source": params.imagery_source,
+        "privacy_safe": not policy.raw,
         "input_digest": solution.input_digest,
         "params_digest": pdigest,
         "params": params.as_dict(),
@@ -665,6 +702,15 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         # under the previous one must be dropped first.
         "epoch": epoch,
         "appearance_provenance": {
+            # §6.6, first, because it decides how to read everything under it.
+            # `redacted` (or absent) is the product. `raw-local-research` means
+            # the pixels below are the ORIGINAL local capture: no redaction,
+            # no fill mask, no cross-frame consensus, not privacy-safe.
+            "imagery_source": params.imagery_source,
+            "privacy_safe": not policy.raw,
+            "raw_imagery_set": (policy.raw_images.cache_token if policy.raw else None),
+            "raw_imagery_frames_missing": (len(policy.raw_images.missing)
+                                           if policy.raw else None),
             "session_redaction": policy.session_redaction,
             # The re-redacted keyframe set these pixels came from (contract
             # section 6.5); null for the capture's own keyframes.
@@ -673,19 +719,21 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
             "redactor_applied_here": policy.redactor_label,
             "label_trusted": policy.trusted,
             "fill_rule": FILL_RULE,
-            "unobserved_rule": A.UNOBSERVED_RULE,
+            "unobserved_rule": _unobserved_rule(policy),
             # §5.3b: what one keyframe hid is unobserved in every keyframe.
             # `mode: off` means this build did NOT apply it, whatever else it
             # says: a reader must not infer the guarantee from the key's
             # presence.
             "redaction_consensus": consensus_record,
             "alpha_ring_px": A.ALPHA_RING_PX,
-            "source": A.SOURCE_SESSION_KEYFRAMES,
+            "source": (RAWIMG.SOURCE_RAW_LOCAL if policy.raw
+                       else A.SOURCE_SESSION_KEYFRAMES),
             "frames": {"used": len(frames), "refused": refused},
             "per_frame_sha1_digest": frame_digest,
             "privacy_tags": list(getattr(session, "privacy_tags", ()) or ()),
             "retains_raw_imagery": bool(getattr(session, "retains_raw_imagery", True)),
-            "note": ("best-effort face redaction with measured false negatives; not "
+            "note": (RAWIMG.RAW_NOTE if policy.raw else
+                     "best-effort face redaction with measured false negatives; not "
                      "anonymised; screens, documents and bodies are not redacted"),
         },
         "camera": {"fx": float(cam["fx"]), "fy": float(cam["fy"]), "cx": float(cam["cx"]),
@@ -768,6 +816,42 @@ def consensus_rule_of(provenance: dict | None) -> str | None:
     return rec if isinstance(rec, str) else None
 
 
+def imagery_source_of(record: dict | None) -> str:
+    """Which imagery a manifest, or an appearance provenance block, is made of.
+
+    ABSENT MEANS `redacted`, and that is not a guess: every build written
+    before the bypass existed read the redacted keyframes, and the bypass
+    always writes the key. So an old manifest keeps working, and a raw one is
+    never mistaken for an old one.
+    """
+    if not isinstance(record, dict):
+        return RAWIMG.IMAGERY_REDACTED
+    value = record.get("imagery_source")
+    if not isinstance(value, str) or not value:
+        prov = record.get("appearance_provenance")
+        value = prov.get("imagery_source") if isinstance(prov, dict) else None
+    if not isinstance(value, str) or value not in RAWIMG.IMAGERY_SOURCES:
+        return RAWIMG.IMAGERY_REDACTED
+    return value
+
+
+def imagery_matches(manifest: dict | None, expected: str) -> bool:
+    """Whether this artifact is made of the imagery the reader asked for.
+
+    Both directions, deliberately. A Tower serving the product refuses a raw
+    research artifact -- the obvious one. A Tower running the bypass refuses a
+    redacted artifact too, because a page that loaded one manifest's chunks
+    and then the other's would hold both in one texture cache, keyed only by
+    content digest, and nothing downstream could tell them apart.
+    """
+    return imagery_source_of(manifest) == RAWIMG.normalise(expected)
+
+
+def imagery_mismatch_detail(manifest: dict | None, expected: str) -> str:
+    return (f"this appearance was built from {imagery_source_of(manifest)!r} imagery "
+            f"and this reader serves {RAWIMG.normalise(expected)!r}")
+
+
 def _region_reasons(frames) -> dict:
     """Why each fill region did not propagate, counted (contract §5.3b)."""
     out: dict = {}
@@ -800,8 +884,15 @@ def textures_carry_over(previous: dict | None, current: dict | None) -> bool:
       -- may not stay on screen while a stronger build loads. Compared only
       when the caller states the rule, so the revision route's "what would a
       build now trust" question is unchanged.
+    - the imagery source (§6.6) must be the same. A raw research build and a
+      redacted build of one session are different pictures of the room under
+      different rules; neither may stay on screen while the other loads, and
+      an absent key is `redacted`, which is what every build before the
+      bypass existed was.
     """
     if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    if imagery_source_of(previous) != imagery_source_of(current):
         return False
     if previous.get("keyframe_image_set") != current.get("keyframe_image_set"):
         return False
@@ -928,6 +1019,7 @@ def _mark_superseded(root: Path, keep: set) -> None:
         entries.append({"at": now, "build_id": previous.get("build_id"),
                         "session_redaction": prov.get("session_redaction"),
                         "keyframe_image_set": prov.get("keyframe_image_set"),
+                        "imagery_source": imagery_source_of(previous),
                         "files": gone})
     try:
         write_json_atomic(root / SUPERSEDED_NAME, {"schema_version": 1, "entries": entries})
@@ -1022,7 +1114,12 @@ def servable_size(root: Path, name: str, manifest: dict, now: float | None = Non
         if now - entry["at"] >= PRUNE_GRACE_S:
             continue
         if (entry.get("session_redaction") != prov.get("session_redaction")
-                or entry.get("keyframe_image_set") != prov.get("keyframe_image_set")):
+                or entry.get("keyframe_image_set") != prov.get("keyframe_image_set")
+                # §6.6: a raw research build never lends a file to a redacted
+                # one, nor the other way round. The names are content digests,
+                # so without this the two builds share one namespace.
+                or entry.get("imagery_source", RAWIMG.IMAGERY_REDACTED)
+                != imagery_source_of(manifest)):
             continue
         size = entry["files"].get(name)
         if isinstance(size, int):
@@ -1061,12 +1158,26 @@ def withdrawal_state(store, world_id: str, session_id: str, manifest: dict | Non
         return ABSENT
     label, image_set = A.keyframe_set_identity(store, world_id, session_id)
     now = {"session_redaction": label, "keyframe_image_set": image_set,
-           "label_trusted": A.label_is_trusted(label)}
+           "label_trusted": A.label_is_trusted(label),
+           "imagery_source": imagery_source_of(manifest)}
     prov = manifest.get("appearance_provenance") or {}
     return REBUILDING if textures_carry_over(prov, now) else WITHDRAWN
 
 
-def label_matches(store, world_id: str, session_id: str, manifest: dict) -> bool:
+def label_matches(store, world_id: str, session_id: str, manifest: dict,
+                  imagery_source: str | None = None) -> bool:
+    """Whether the routes may serve this manifest.
+
+    The keyframe set and its label, as before -- and, since §6.6, the imagery
+    the reader is serving. `imagery_source` defaults to this process's setting
+    (`TOWER_WORLD_RAW_IMAGERY`, which is the product unless it is set), so a
+    Tower that was not asked for raw research imagery will not hand any out,
+    and one that was will not quietly mix it with redacted chunks.
+    """
+    if imagery_source is None:
+        imagery_source = RAWIMG.imagery_source_from_env()
+    if not imagery_matches(manifest, imagery_source):
+        return False
     prov = manifest.get("appearance_provenance") or {}
     label, image_set = A.keyframe_set_identity(store, world_id, session_id)
     return (prov.get("session_redaction") == label

@@ -16,6 +16,18 @@ enforced by a static test over this module and the pipeline, not only by this
 paragraph: an earlier dense stage asserted the same boundary in a docstring and
 then read around it.
 
+THE ONE EXCEPTION IS NAMED, OFF BY DEFAULT, AND LABELLED. `AppearanceParams.
+imagery_source` is `redacted` unless a caller asks for `raw-local-research`:
+the owner-sanctioned research bypass (2026-09-21) that builds from the
+ORIGINAL local capture frames, so the campaign can measure what reconstruction
+quality that imagery supports. Everything that bypass needs -- where the
+original frames are, what the artifact is then called, and why it is not
+privacy-safe -- lives in `raw_imagery.py`, not here. This module reaches it
+through exactly one branch, in the provenance function, and a build that does
+not ask for it behaves as it did before. An artifact built that way says so in
+its manifest, its params digest, its served header and the page's caption, and
+a reader that wants redacted appearance refuses it.
+
 Measured on the canonical capture by the fix-it privacy lane
 (`Glasses-scratch/wb-final-recon/fixit/privacy/PRIVACY.md`): the solve's images
 are the raw frames (177 of 181 filled frames non-black inside the fill), the
@@ -31,6 +43,15 @@ import struct
 from dataclasses import dataclass, field
 
 import numpy as np
+
+from tower.world_builder.raw_imagery import (
+    IMAGERY_RAW,
+    IMAGERY_REDACTED,
+    IMAGERY_SOURCES,
+    RAW_LABEL,
+    RAW_UNOBSERVED_RULE,
+    is_raw,
+)
 
 APPEARANCE_FORMAT = "wb-appearance-keyframes/1"
 APPEARANCE_SCHEMA_VERSION = 1
@@ -58,12 +79,18 @@ RERUN_REDACTION_LABELS = {
 SOURCE_SESSION_KEYFRAMES = "session-keyframes"
 ORIGIN_STORED = "session-keyframe"
 ORIGIN_REDACTED_HERE = "session-keyframe-redacted-here"
+# The research bypass's origin. Deliberately not a `session-keyframe` spelling:
+# a reader grepping for what these pixels are cannot mistake it for one.
+ORIGIN_RAW_LOCAL = "raw-local-capture-frame"
 MASK_STORED = "stored-fill"
 MASK_RERUN = "rerun-difference+guess"
+# No privacy mask at all, because there is no redaction to mask.
+MASK_RAW_NONE = "none-raw-local-research"
 
 REFUSED_IMAGE_MISSING = "refused-keyframe-image-missing"
 REFUSED_UNDECODABLE = "refused-image-undecodable"
 REFUSED_NO_FILL_MASK = "refused-no-fill-mask"
+REFUSED_NO_RAW_FRAME = "refused-raw-frame-missing"
 REFUSED_REDACTION_FAILED = "refused-redaction-failed"
 REFUSED_CAMERA_MISMATCH = "refused-camera-mismatch"
 
@@ -126,6 +153,16 @@ class AppearanceUnavailable(RuntimeError):
 @dataclass(frozen=True)
 class AppearanceParams:
     quality: str = "final"
+    # WHICH IMAGERY THIS BUILD IS MADE OF (contract §6.6).
+    #   `redacted`             the wearer's redacted keyframes. The product,
+    #                          and the default everywhere: nothing reads the
+    #                          environment to decide this for you.
+    #   `raw-local-research`   the ORIGINAL local capture frames, no redaction
+    #                          fill, no re-encode, no cross-frame consensus.
+    #                          The owner-sanctioned research bypass; NOT
+    #                          privacy-safe, labelled as such end to end, and
+    #                          refused by a reader that wants the product.
+    imagery_source: str = IMAGERY_REDACTED
     # occluders (contract §5.3)
     occluder_ratio_max: float = 0.6
     occluder_ratio_min: float = 0.3
@@ -225,6 +262,16 @@ class AppearanceParams:
         if self.redaction_consensus not in CONSENSUS_MODES:
             raise ValueError(f"unknown redaction consensus mode "
                              f"{self.redaction_consensus!r}; one of {CONSENSUS_MODES}")
+        if self.imagery_source not in IMAGERY_SOURCES:
+            raise ValueError(f"unknown imagery source {self.imagery_source!r}; "
+                             f"one of {IMAGERY_SOURCES}")
+        if is_raw(self.imagery_source):
+            # THE CONSENSUS IS A REDACTION RULE AND THERE IS NO REDACTION.
+            # Left as the caller passed it, the params digest and the manifest
+            # would both claim a cross-frame privacy guarantee this build did
+            # not apply and could not apply. Forced here, once, so every
+            # record downstream reads `off` because it IS off.
+            object.__setattr__(self, "redaction_consensus", CONSENSUS_OFF)
 
     @classmethod
     def live(cls, **overrides) -> "AppearanceParams":
@@ -261,9 +308,26 @@ class LabelPolicy:
     # `store.keyframe_image_set(...)`, read once with the label: which keyframes
     # this build reads. None (a policy built by hand) reads it at the frame.
     image_set: object | None = None
+    # The research bypass (`raw_imagery.py`). `redacted` is the product; the
+    # other value means every field above describes a keyframe set this build
+    # is NOT reading, and is kept only because it is still true of the stored
+    # keyframes and a later re-enable will need it.
+    imagery_source: str = IMAGERY_REDACTED
+    # `raw_imagery.RawKeyframeImages` when, and only when, the bypass is on.
+    raw_images: object | None = None
+
+    @property
+    def raw(self) -> bool:
+        return is_raw(self.imagery_source)
 
     @property
     def effective(self) -> str:
+        if self.raw:
+            # NOT a redaction label, and not on any allowlist. Whatever reads
+            # this -- the manifest, the served `X-World-Redaction` header, the
+            # page's caption -- gets one string that cannot be misread as a
+            # redaction having happened.
+            return RAW_LABEL
         if self.trusted:
             return str(self.session_redaction)
         return f"{self.session_redaction if self.session_redaction else 'none'}&{self.redactor_label}"
@@ -298,26 +362,51 @@ def label_is_trusted(label: str | None) -> bool:
     return isinstance(label, str) and label in TRUSTED_REDACTION_LABELS
 
 
-def pixel_trust_token(label: str | None, redactor_label: str | None = None) -> str:
+def pixel_trust_token(label: str | None, redactor_label: str | None = None,
+                      imagery_source: str = IMAGERY_REDACTED,
+                      raw_token: str | None = None) -> str:
     """What a stage that read keyframe pixels did about the label, as one
     string for its cache keys and records: `trusted:<label>` when the stored
     bytes were used, `rerun:<label or none>&<redactor label>` when they were
     redacted again first. Two stages with equal tokens read equal pixels from
     equal stored bytes; a label change at Stop (`none` -> the real label)
     changes the token, so nothing cached under one is reused under the other
-    (review 1, M3)."""
+    (review 1, M3).
+
+    The research bypass gets a token of its own shape, naming the exact set of
+    original frames. It shares no prefix with either redacted spelling, so a
+    depth stage, a transient mask or an appearance build made under it can
+    never be reused for a redacted build, or the other way round."""
+    if is_raw(imagery_source):
+        return f"{IMAGERY_RAW}:{raw_token}"
     if label_is_trusted(label):
         return f"trusted:{label}"
     return f"rerun:{label if isinstance(label, str) and label else 'none'}&{redactor_label}"
 
 
 def resolve_label_policy(store, world_id: str, session_id: str,
-                         redactor_factory=None) -> LabelPolicy:
+                         redactor_factory=None,
+                         imagery_source: str = IMAGERY_REDACTED) -> LabelPolicy:
     """Read the label ONCE and decide. Refuses the whole build when the label
     needs a re-redaction and no redactor can run: a layer silently missing
-    most of the room is worse than a clear refusal."""
+    most of the room is worse than a clear refusal.
+
+    Under the research bypass no redactor is needed or wanted: the build reads
+    the original frames, so it never asks whether the stored ones may be
+    trusted. It still records what the stored label says, because that
+    statement stays true of the keyframe set on disk and the artifact's
+    provenance reports both."""
     image_set = store.keyframe_image_set(world_id, session_id)
     label = image_set.redaction if isinstance(image_set.redaction, str) and image_set.redaction else None
+    if is_raw(imagery_source):
+        from tower.world_builder.raw_imagery import resolve_raw_keyframes  # noqa: PLC0415
+
+        try:
+            raw_images = resolve_raw_keyframes(store, world_id, session_id)
+        except Exception as exc:  # noqa: BLE001 -- a refusal, with the reason
+            raise AppearanceUnavailable(str(exc)) from None
+        return LabelPolicy(session_redaction=label, trusted=False, image_set=image_set,
+                           imagery_source=IMAGERY_RAW, raw_images=raw_images)
     if label_is_trusted(label):
         return LabelPolicy(session_redaction=label, trusted=True, image_set=image_set)
     if redactor_factory is None:
@@ -401,6 +490,49 @@ def dilate(mask: np.ndarray, px: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)).astype(bool)
 
 
+def _raw_keyframe_source(out: "FrameSource", policy: LabelPolicy, keyframe_id: str,
+                         undistorter: Undistorter, hash_only: bool) -> "FrameSource":
+    """The research bypass's half of the provenance function (contract §6.6).
+
+    Reached only from `keyframe_source`, only when the caller asked for
+    `raw-local-research`. It reads the ORIGINAL local frame this keyframe came
+    from, undistorts it with the very same maps the redacted path uses -- so
+    the two builds differ in their pixels and in nothing else -- and applies
+    NO privacy mask, because there is no redaction here to mask and a
+    near-black rule would blank the room's genuinely dark corners.
+
+    The transient detector's hand and phone mask is NOT touched by this: it is
+    a quality mask, it is applied later by `PreparedFrame.transparent_core`,
+    and it stays on.
+    """
+    import cv2  # noqa: PLC0415
+
+    data = policy.raw_images.read(keyframe_id) if policy.raw_images is not None else None
+    if data is None:
+        out.refused = REFUSED_NO_RAW_FRAME
+        return out
+    out.source_sha1 = hashlib.sha1(data).hexdigest()
+    if hash_only:
+        return out
+    out.image_sha1 = out.source_sha1  # nothing re-encodes these bytes
+    bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if bgr is None:
+        out.refused = REFUSED_UNDECODABLE
+        return out
+    maps = undistorter.maps(bgr.shape[1], bgr.shape[0])
+    if maps is None:
+        out.refused = REFUSED_CAMERA_MISMATCH
+        return out
+    rgb = cv2.cvtColor(undistorter.remap(bgr, maps), cv2.COLOR_BGR2RGB)
+    out.image_bytes = data
+    out.origin = ORIGIN_RAW_LOCAL
+    out.redaction_effective = policy.effective
+    out.rgb = rgb
+    out.unobserved = np.zeros(rgb.shape[:2], bool)
+    out.mask_origin = MASK_RAW_NONE
+    return out
+
+
 def keyframe_source(store, world_id: str, session_id: str, keyframe_id: str, ki: int, *,
                     policy: LabelPolicy, align_record: dict | None, depth_dir,
                     undistorter: Undistorter, hash_only: bool = False) -> FrameSource:
@@ -409,6 +541,10 @@ def keyframe_source(store, world_id: str, session_id: str, keyframe_id: str, ki:
     Returns the bytes the pixels came from, the effective redaction label, the
     unobserved mask in the solve camera, and where that mask came from -- or a
     refusal. Contract §6.
+
+    One branch, and one only, leaves the redacted path: the research bypass
+    (§6.6, `raw_imagery.py`), which a build reaches by asking for it in its
+    params. `policy.raw` is false for every build that did not.
     """
     import cv2  # noqa: PLC0415
 
@@ -418,6 +554,8 @@ def keyframe_source(store, world_id: str, session_id: str, keyframe_id: str, ki:
     )
 
     out = FrameSource(ki=int(ki), keyframe_id=keyframe_id)
+    if policy.raw:
+        return _raw_keyframe_source(out, policy, keyframe_id, undistorter, hash_only)
     seq = keyframe_id.rsplit(":", 1)[-1]
     image_set = policy.image_set or store.keyframe_image_set(world_id, session_id)
     path = image_set.directory / f"{seq}.jpg"
