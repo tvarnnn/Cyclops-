@@ -892,9 +892,11 @@ def test_without_the_consensus_a_face_one_frame_hid_is_published_by_the_others(w
 def test_a_surface_one_keyframe_redacted_is_published_by_no_keyframe(world):
     """§5.3b: the fill is projected onto the proxy and read back in every
     keyframe, so a face one detector pass found is unobserved for all of them.
-    Fails with `redaction_consensus=off` (the test above)."""
+    Fails with `redaction_consensus=off`, which is the default since the
+    campaign deferred privacy preprocessing (the test above)."""
     _a_face_on_the_wall(world)
-    result = world.build(redactor_factory=_never_redact)
+    result = world.build(redactor_factory=_never_redact, params=A.AppearanceParams(selection_samples=4000,
+                                          redaction_consensus=A.CONSENSUS_PLAUSIBLE))
     assert result.state == AP.STATE_OK, result.detail
     man = world.manifest()
     seen = _signature_texels(world, man)
@@ -913,7 +915,8 @@ def test_the_consensus_covers_that_surface_and_not_the_room(world):
     or 12 px at the median proxy depth, so the mask is roughly twice the
     eroded fill across."""
     _a_face_on_the_wall(world)
-    world.build(redactor_factory=_never_redact)
+    world.build(redactor_factory=_never_redact, params=A.AppearanceParams(selection_samples=4000,
+                                          redaction_consensus=A.CONSENSUS_PLAUSIBLE))
     man = world.manifest()
     for entry in man["keyframes"]:
         assert (entry["consensus_fraction"] or 0.0) < 0.20, entry["ki"]
@@ -931,7 +934,8 @@ def test_plausible_leaves_a_wall_sized_false_positive_to_the_other_frames(world)
     world.set_fill(3, big)
     world.write_align()
 
-    world.build(redactor_factory=_never_redact)
+    world.build(redactor_factory=_never_redact, params=A.AppearanceParams(selection_samples=4000,
+                                          redaction_consensus=A.CONSENSUS_PLAUSIBLE))
     plausible = world.manifest()
     assert (plausible["appearance_provenance"]["redaction_consensus"]
             ["regions_refused"]) == {"larger than a face": 1}
@@ -948,11 +952,16 @@ def test_the_consensus_rule_is_in_the_cache_key_and_the_epoch(world):
     """A change to the rule rebuilds, and an open page drops what it drew under
     the old one: those textures may hold what the new rule hides."""
     _a_face_on_the_wall(world)
-    assert world.build(redactor_factory=_never_redact).state == AP.STATE_OK
+    # Explicitly under the rule: `off` is the default while privacy
+    # preprocessing is deferred, and `off` ignores the rule's own parameters.
+    on = A.AppearanceParams(selection_samples=4000,
+                            redaction_consensus=A.CONSENSUS_PLAUSIBLE)
+    assert world.build(redactor_factory=_never_redact, params=on).state == AP.STATE_OK
     man = world.manifest()
-    assert world.build(redactor_factory=_never_redact).detail == AP.ALREADY_BUILT
+    assert world.build(redactor_factory=_never_redact, params=on).detail == AP.ALREADY_BUILT
 
-    params = A.AppearanceParams(selection_samples=4000, consensus_erode=0.05)
+    params = A.AppearanceParams(selection_samples=4000, consensus_erode=0.05,
+                                redaction_consensus=A.CONSENSUS_PLAUSIBLE)
     assert world.build(redactor_factory=_never_redact, params=params).detail != AP.ALREADY_BUILT
     third = world.manifest()
     assert third["params_digest"] != man["params_digest"]

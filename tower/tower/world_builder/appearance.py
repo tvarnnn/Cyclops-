@@ -196,8 +196,17 @@ class AppearanceParams:
     #                20 eye-labelled printed-face regions pass; the 56-84%
     #                false positives do not. 14% of the published texels.
     #   `off`        per-frame redaction only -- what a build did before this
-    #                mask existed. Never a default.
-    redaction_consensus: str = CONSENSUS_PLAUSIBLE
+    #                mask existed.
+    #
+    # DEFAULT `off` since 2026-09-21, by the owner's instruction to defer privacy
+    # preprocessing until the reconstruction itself is convincing. The rule works
+    # (it closed a measured leak: a face redacted in one frame was published by 86
+    # others) but on this capture it costs a third of the shelf, the posters and
+    # the bed: appearance `seen>=1` 97.69% -> 86.32%, walk-view haze 0.55% ->
+    # 20.57%, because 8.3% redaction precision means 11 of 12 propagated regions
+    # are wall. Nothing here is deleted; `plausible` is one value away, and the
+    # cost is to be re-measured against a precise detector before it comes back.
+    redaction_consensus: str = CONSENSUS_OFF
     consensus_area_max: float = 0.10
     # A fill box straddles depth steps; only the surface at the region's own
     # depth is the surface the hidden thing was on.
