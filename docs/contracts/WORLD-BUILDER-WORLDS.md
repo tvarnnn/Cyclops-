@@ -592,8 +592,8 @@ enforced).
     hint, *Face the room* and `S.navReady()` land with the coarse pass; **Best
     view** waits for the fine one, because its candidates are the field's own
     lattice points and a coarse lattice may hold too few. On the canonical
-    world, quiet: the *Preparing the view…* window falls from 1007 to 787 ms
-    and the Best view arrives at 1.87 s instead of 1.01 s. Under six-way
+    world, quiet: the *Preparing the view…* window falls from 1007 to 790 ms
+    and the Best view arrives at 1.86 s instead of 1.01 s. Under six-way
     contention, where the field work dominates: 2964–3629 ms → 1316–2312 ms
     for the window, and 3.0–3.6 s → 5.4–7.6 s for the button. The coarse pass
     costs 136 ms of extra work (935 against 799 ms in total).
