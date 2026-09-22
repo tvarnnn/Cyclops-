@@ -545,6 +545,55 @@ FINALIZATION_STATES = (
     FINALIZATION_INTERRUPTED,
 )
 
+# The stages that run AFTER finalization, and how each one went.
+#
+# `finalization` answers "did the builder finish?". It was answering yes
+# several minutes before the world the wearer walked for existed: the builder
+# marks finalization `complete` and releases the world lock in its `finally`,
+# and only THEN runs the surface, the appearance and the dense stages, which
+# take six to eleven minutes on a real walk. The release is deliberate -- the
+# phone reads the world while they build -- but until 2026-09-22 their outcome
+# lived only in a report dict on the child's stdout that nobody persists. A
+# `surfacify()` that raised left a world that was sparse forever, beside a
+# record proudly saying `complete`, with no way for an operator or a client to
+# tell "never attempted" from "failed" from "not applicable".
+#
+# So the stages get their own record. It does NOT move a single call: the
+# sequencing is right, the record was not.
+STAGE_SURFACE = "surface"
+STAGE_APPEARANCE = "appearance"
+STAGE_DENSE = "dense"
+POST_FINALIZATION_STAGES = (STAGE_SURFACE, STAGE_APPEARANCE, STAGE_DENSE)
+
+# The five words a stage outcome can be. NOT A NEW VOCABULARY: these are the
+# ones `surface_pipeline.py` already writes into every `status.json`, which
+# `dense_pipeline` and `appearance_pipeline` already share, moved here so
+# there is one definition rather than two sets of five strings that agree on
+# the day they were written and drift afterwards -- the same reasoning this
+# module's docstring gives for importing `Confidence` instead of redefining
+# it. `surface_pipeline` re-exports them under its own names, so every
+# existing importer is untouched.
+#
+# The definition lives HERE rather than there because this module is the
+# light one: `records` is imported by the store, the engine and the result
+# channel, and `surface_pipeline` pulls in the whole reconstruction stack.
+#
+# The practical payoff is that a `SurfaceResult.state`, an `AppearanceResult
+# .state` and a `DenseResult.state` can be recorded verbatim, with no
+# translation table to fall out of step with its sources.
+STAGE_STATE_OK = "ok"
+STAGE_STATE_RUNNING = "running"
+STAGE_STATE_FAILED = "failed"
+STAGE_STATE_STOPPED = "stopped"
+STAGE_STATE_UNAVAILABLE = "unavailable"
+STAGE_STATES = (
+    STAGE_STATE_OK,
+    STAGE_STATE_RUNNING,
+    STAGE_STATE_FAILED,
+    STAGE_STATE_STOPPED,
+    STAGE_STATE_UNAVAILABLE,
+)
+
 # What became of the final global solve inside that finalization.
 FINAL_SOLVE_PENDING = "pending"
 FINAL_SOLVE_SOLVED = "solved"
@@ -599,6 +648,22 @@ class Session:
     #    "final_solve": pending|solved|skipped|failed|unavailable|null,
     #    "started_at": float, "updated_at": float, "detail": str|null}
     finalization: dict | None = None
+    # What became of the stages that run AFTER finalization (see
+    # POST_FINALIZATION_STAGES), or None on a record that predates this or a
+    # builder that never reached them. Additive and optional in exactly the
+    # way `finalization` is: the schema version does not move, and a reader
+    # that finds no key reads None -- "never recorded", which is a different
+    # fact from any state in the vocabulary.
+    #
+    #   {"surface"|"appearance"|"dense":
+    #      {"attempted": bool,
+    #       "state": ok|running|failed|stopped|unavailable,
+    #       "started_at": float, "updated_at": float, "detail": str|null}}
+    #
+    # `running` left behind by a process that is gone is not a bug in the
+    # record; it is the only honest thing to say about a builder the Job
+    # Object killed thirty seconds into a six-minute surface.
+    stages: dict | None = None
 
     def to_json_dict(self) -> dict:
         return {
@@ -626,6 +691,15 @@ class Session:
             "redaction": self.redaction,
             "finalization": (
                 dict(self.finalization) if self.finalization is not None else None
+            ),
+            # Copied one level DEEPER than `finalization` needs to be,
+            # because this one is a dict of dicts: a shallow copy would hand
+            # every caller a live reference to the per-stage blocks of a
+            # frozen record.
+            "stages": (
+                {stage: dict(entry) for stage, entry in self.stages.items()}
+                if self.stages is not None
+                else None
             ),
         }
 
@@ -659,6 +733,19 @@ def session_from_json_dict(data: dict) -> Session:
         finalization=(
             dict(data["finalization"])
             if isinstance(data.get("finalization"), dict)
+            else None
+        ),
+        # `.get` and an isinstance check, for the same reason: every record
+        # written before 2026-09-22 lacks the key, and those are still valid
+        # sessions. Absent -- or any shape that is not an object -- reads
+        # None, never a state.
+        stages=(
+            {
+                stage: dict(entry)
+                for stage, entry in data["stages"].items()
+                if isinstance(entry, dict)
+            }
+            if isinstance(data.get("stages"), dict)
             else None
         ),
     )

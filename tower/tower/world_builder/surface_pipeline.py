@@ -82,11 +82,23 @@ from tower.world_builder.surface import (
 
 logger = logging.getLogger(__name__)
 
-STATE_OK = "ok"
-STATE_RUNNING = "running"
-STATE_FAILED = "failed"
-STATE_STOPPED = "stopped"
-STATE_UNAVAILABLE = "unavailable"
+# The status.json vocabulary, re-exported under the names this module and its
+# importers (`dense_pipeline`, `appearance_pipeline`, the CLIs) have always
+# used. The strings themselves now have ONE definition, in
+# `world_builder/records.py`, because the session record stores them too: a
+# stage outcome on `session.json` is a `SurfaceResult.state` recorded
+# verbatim, and two sets of five strings maintained apart is exactly the
+# silent divergence `records.py` already refuses for `Confidence`. The
+# definition lives there rather than here because that module is the light
+# one -- the store, the engine and the result channel import it, and this
+# module pulls in the reconstruction stack.
+from tower.world_builder.records import (  # noqa: E402
+    STAGE_STATE_FAILED as STATE_FAILED,
+    STAGE_STATE_OK as STATE_OK,
+    STAGE_STATE_RUNNING as STATE_RUNNING,
+    STAGE_STATE_STOPPED as STATE_STOPPED,
+    STAGE_STATE_UNAVAILABLE as STATE_UNAVAILABLE,
+)
 
 
 def surface_dir(store, world_id: str, session_id: str) -> Path:

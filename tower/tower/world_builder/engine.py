@@ -43,6 +43,8 @@ from tower.world_builder.records import (
     FINAL_SOLVE_PENDING,
     FINALIZATION_PENDING,
     FINALIZATION_STATES,
+    POST_FINALIZATION_STAGES,
+    STAGE_STATES,
     CameraIntrinsics,
     Keyframe,
     KeyframeEdge,
@@ -648,6 +650,65 @@ class WorldBuilderEngine:
                 },
             )
         )
+
+    def mark_stage(
+        self,
+        world_id: str,
+        session_id: str,
+        stage: str,
+        *,
+        state: str,
+        detail: str | None = None,
+        attempted: bool = True,
+    ) -> None:
+        """Record what became of one POST-finalization stage, and nothing else.
+
+        The surface, the appearance and the dense stages run AFTER
+        `mark_finalization(complete)` and AFTER `release_world()`, and they
+        take six to eleven minutes on a real walk. That order is deliberate:
+        the lock is dropped so the phone can read the world while they build
+        (`results/world_builder_render.py`). What was missing is the record.
+        A world could sit at `finalization: {state: complete}` with no
+        photographic representation, no surface, and nothing on disk saying
+        whether one was attempted, skipped, or raised -- the report dict the
+        builder prints is not persisted anywhere.
+
+        So this writes beside `finalization` rather than into it. Callers are
+        expected to mark a stage `running` BEFORE starting it: this process
+        can be killed by the Job Object on a thirty-second grace, and a stage
+        left saying `running` by a pid that is gone is the honest record of
+        exactly that.
+
+        Like `mark_finalization`, the record is re-read from disk and only
+        the one stage moves; `started_at` is preserved from the `running`
+        write so "how long did the surface take" is answerable from the
+        record alone. Unlike `mark_finalization`, this is called with the
+        world lock already RELEASED, which is why it must stay a
+        read-modify-write of a single small file published atomically.
+        """
+        if stage not in POST_FINALIZATION_STAGES:
+            raise ValueError(
+                f"unknown post-finalization stage {stage!r}; the set is "
+                f"closed because consumers switch on it: "
+                f"{POST_FINALIZATION_STAGES}"
+            )
+        if state not in STAGE_STATES:
+            raise ValueError(
+                f"unknown stage state {state!r}; the vocabulary is the one "
+                f"every status.json already uses: {STAGE_STATES}"
+            )
+        session = self._store.read_session(world_id, session_id)
+        now = self._clock()
+        stages = dict(session.stages or {})
+        previous = stages.get(stage) or {}
+        stages[stage] = {
+            "attempted": attempted,
+            "state": state,
+            "started_at": previous.get("started_at", now),
+            "updated_at": now,
+            "detail": detail,
+        }
+        self._store.write_session(replace(session, stages=stages))
 
     # -- build ---------------------------------------------------------
 

@@ -104,6 +104,13 @@ from tower.world_builder.records import (  # noqa: E402
     FINAL_SOLVE_UNAVAILABLE,
     FINALIZATION_COMPLETE,
     FINALIZATION_INTERRUPTED,
+    STAGE_APPEARANCE,
+    STAGE_DENSE,
+    STAGE_STATE_FAILED,
+    STAGE_STATE_RUNNING,
+    STAGE_STATE_STOPPED,
+    STAGE_STATE_UNAVAILABLE,
+    STAGE_SURFACE,
     CameraIntrinsics,
     camera_intrinsics_from_json_dict,
 )
@@ -1368,9 +1375,21 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     }
 
 
+def _record_raise(record, stage: str) -> None:
+    """Name the exception currently being handled on the session record.
+
+    `sys.exc_info()` rather than a bound `as exc`, so the call sites stay
+    `except BaseException:` -- there is nothing to do with the exception here
+    except write down what it was and let it keep going.
+    """
+    exc = sys.exc_info()[1]
+    record(stage, state=STAGE_STATE_FAILED, detail=f"{type(exc).__name__}: {exc}")
+
+
 def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                          solved: bool, appearance: bool, prune_depth_work: bool,
-                         should_stop, stop_source=lambda: None) -> dict:
+                         should_stop, stop_source=lambda: None,
+                         record=None) -> dict:
     """The finished world's surface stages, after Stop, in THIS process.
 
     Returns the report entries (`surface`, and `appearance` when asked). In order,
@@ -1392,49 +1411,85 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
     the same order with the live presets (OneFormer only, fewer outer iterations)
     and is terminated before this starts. Extracted from `main` so the order,
     the parameters and the stop behaviour are tested by running it.
+
+    `record(stage, state=, detail=, attempted=)` -- the builder passes
+    `engine.mark_stage` -- persists each outcome on the session record. It is
+    optional and defaults to a no-op, so callers that only want the report
+    are unchanged. It exists because the report this returns is printed and
+    then discarded: by the time these stages run the record already says
+    `finalization: complete`, and without this a `surfacify()` that raised
+    left a world sparse forever with nothing on disk to say so. Every stage
+    is marked `running` before it starts and terminal afterwards -- including
+    when it RAISES, which is re-raised unchanged once recorded.
     """
     report: dict = {}
+    record = record or (lambda *a, **kw: None)
+
+    def _skip(reason: str, state: str) -> dict:
+        """Neither stage ran. Both say why, rather than the appearance being
+        absent and indistinguishable from a Tower that never recorded it."""
+        record(STAGE_SURFACE, state=state, attempted=False, detail=reason)
+        if appearance:
+            record(STAGE_APPEARANCE, state=state, attempted=False, detail=reason)
+        return {"surface": {"attempted": False, "reason": reason}}
+
     if should_stop():
-        report["surface"] = {
-            "attempted": False,
-            "reason": f"hard stop ({stop_source()}) during finalization",
-        }
-        return report
+        return _skip(f"hard stop ({stop_source()}) during finalization",
+                     STAGE_STATE_STOPPED)
     if not solved:
-        report["surface"] = {
-            "attempted": False,
-            "reason": "a surface needs a global solve; there is none",
-        }
-        return report
+        return _skip("a surface needs a global solve; there is none",
+                     STAGE_STATE_UNAVAILABLE)
     from tower.world_builder.surface import SurfaceParams  # noqa: PLC0415
     from tower.world_builder.surface_pipeline import surfacify  # noqa: PLC0415
 
-    surface_result = surfacify(
-        store, world_id, session_id,
-        # The final preset, named rather than defaulted, so the union detector
-        # and the final consistency iterations are what this line says.
-        params=SurfaceParams(),
-        # `force`, because the live stage has almost certainly left a
-        # COARSE artifact for this same solve behind. Without it the
-        # "already built from this solve" short-circuit would see a
-        # matching digest and keep the walk-time reconstruction as the
-        # finished world -- the exact failure the final stage exists
-        # to prevent. The parameters differ, so the params digest
-        # differs too and the short-circuit would not in fact fire;
-        # this is belt and braces on the thing that would be worst to
-        # get wrong.
-        force=True,
-        should_stop=should_stop,
-    )
+    # `running` BEFORE the call, terminal after it, on every path including
+    # the one that raises. The Job Object kills this tree on a thirty-second
+    # grace and a six-minute surface will not get to say anything afterwards;
+    # a stage left saying `running` by a pid that is gone is the truth.
+    record(STAGE_SURFACE, state=STAGE_STATE_RUNNING)
+    try:
+        surface_result = surfacify(
+            store, world_id, session_id,
+            # The final preset, named rather than defaulted, so the union detector
+            # and the final consistency iterations are what this line says.
+            params=SurfaceParams(),
+            # `force`, because the live stage has almost certainly left a
+            # COARSE artifact for this same solve behind. Without it the
+            # "already built from this solve" short-circuit would see a
+            # matching digest and keep the walk-time reconstruction as the
+            # finished world -- the exact failure the final stage exists
+            # to prevent. The parameters differ, so the params digest
+            # differs too and the short-circuit would not in fact fire;
+            # this is belt and braces on the thing that would be worst to
+            # get wrong.
+            force=True,
+            should_stop=should_stop,
+        )
+    except BaseException:
+        # RECORDED, THEN RE-RAISED UNCHANGED. The exception is how the
+        # supervisor and the exit code learn; the record is how anyone learns
+        # afterwards, and before today there was no afterwards -- the world
+        # stayed sparse forever beside a session saying `complete`.
+        _record_raise(record, STAGE_SURFACE)
+        if appearance:
+            record(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+                   detail="the surface stage raised; there was nothing to shade")
+        raise
+    record(STAGE_SURFACE, state=surface_result.state, detail=surface_result.detail)
     report["surface"] = {"attempted": True, **surface_result.as_dict()}
     appearance_interrupted = False
     appearance_built = not appearance
+    if appearance and surface_result.state != "ok":
+        record(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+               detail=f"the surface is {surface_result.state!r}, not 'ok'")
     # The final appearance, on the final surface, BEFORE the depth work
     # is pruned below: it reads each frame's fill mask and raw depth
     # prediction from that work. Skipped on a hard stop like the rest.
     if appearance and surface_result.state == "ok":
         if should_stop():
             appearance_interrupted = True
+            record(STAGE_APPEARANCE, state=STAGE_STATE_STOPPED, attempted=False,
+                   detail=f"hard stop ({stop_source()}) during finalization")
             report["appearance"] = {
                 "attempted": False,
                 "reason": f"hard stop ({stop_source()}) during finalization",
@@ -1445,10 +1500,17 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                 build_appearance,
             )
 
-            appearance_result = build_appearance(
-                store, world_id, session_id, params=AppearanceParams(),
-                should_stop=should_stop,
-            )
+            record(STAGE_APPEARANCE, state=STAGE_STATE_RUNNING)
+            try:
+                appearance_result = build_appearance(
+                    store, world_id, session_id, params=AppearanceParams(),
+                    should_stop=should_stop,
+                )
+            except BaseException:
+                _record_raise(record, STAGE_APPEARANCE)
+                raise
+            record(STAGE_APPEARANCE, state=appearance_result.state,
+                   detail=appearance_result.detail)
             report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
             appearance_interrupted = appearance_result.state == "stopped"
             appearance_built = appearance_result.state == "ok"
@@ -2267,6 +2329,33 @@ def main(argv=None) -> int:
             }
         )
 
+    # EVERYTHING BELOW RUNS AFTER THE RECORD ALREADY SAYS `complete` AND THE
+    # WORLD LOCK IS ALREADY RELEASED, and both of those are deliberate: the
+    # lock is dropped so the phone can read the world while the surface
+    # builds (`results/world_builder_render.py`), which is six to eleven
+    # minutes on a real walk. What was NOT deliberate is that the outcome of
+    # these stages existed only in `report` below -- printed once, persisted
+    # nowhere. A `surfacify()` that raised left a world sparse forever with a
+    # session record proudly saying `complete`, and no operator or client
+    # could tell that from a world that was never asked for a surface.
+    #
+    # `record_stage` writes the second record, beside `finalization` and
+    # never into it. It moves nothing: not one call below changed position,
+    # the lock stays released, and `finalization` still says exactly what it
+    # said before.
+    def record_stage(stage, *, state, detail=None, attempted=True):
+        try:
+            engine.mark_stage(
+                world_id, session_id, stage,
+                state=state, detail=detail, attempted=attempted,
+            )
+        except Exception:  # noqa: BLE001
+            # A record that cannot be written must not take the artifact
+            # down with it: by here the world itself is already on disk.
+            logger.exception(
+                "[Tower][WorldBuilder] could not record the %s stage", stage
+            )
+
     # The final surface, after everything load-bearing is on disk. It runs
     # BEFORE the dense stage, and the order is not cosmetic: the dense stage
     # prunes the per-frame depth work when it finishes, so a surface built
@@ -2286,7 +2375,20 @@ def main(argv=None) -> int:
             prune_depth_work=not args.densify,
             should_stop=stop_request.hard_asked_for,
             stop_source=lambda: stop_request.source,
+            record=record_stage,
         ))
+    else:
+        # NOT REQUESTED IS A FACT, AND IT IS NOT THE SAME FACT AS SILENCE.
+        # An absent key means "a Tower that never recorded this"; this means
+        # "nobody asked for a photographic world", which is why a sparse
+        # world here is not a failure.
+        for stage in (STAGE_SURFACE, STAGE_APPEARANCE):
+            record_stage(stage, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+                         detail="not requested (--surface was not passed)")
+    if args.surface and not args.appearance:
+        record_stage(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE,
+                     attempted=False,
+                     detail="not requested (--appearance was not passed)")
 
     # Dense reconstruction last (after the surface, which shares its depth
     # stage), because it is the most expensive thing here
@@ -2298,23 +2400,33 @@ def main(argv=None) -> int:
     # restarting.
     if args.densify:
         if stop_request.hard_asked_for():
-            report["dense"] = {
-                "attempted": False,
-                "reason": f"hard stop ({stop_request.source}) during finalization",
-            }
+            reason = f"hard stop ({stop_request.source}) during finalization"
+            record_stage(STAGE_DENSE, state=STAGE_STATE_STOPPED, attempted=False,
+                         detail=reason)
+            report["dense"] = {"attempted": False, "reason": reason}
         elif not (solve_report or {}).get("solved"):
-            report["dense"] = {
-                "attempted": False,
-                "reason": "dense reconstruction needs a global solve; there is none",
-            }
+            reason = "dense reconstruction needs a global solve; there is none"
+            record_stage(STAGE_DENSE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+                         detail=reason)
+            report["dense"] = {"attempted": False, "reason": reason}
         else:
             from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
 
-            dense_result = densify(
-                store, world_id, session_id,
-                should_stop=stop_request.hard_asked_for,
-            )
+            record_stage(STAGE_DENSE, state=STAGE_STATE_RUNNING)
+            try:
+                dense_result = densify(
+                    store, world_id, session_id,
+                    should_stop=stop_request.hard_asked_for,
+                )
+            except BaseException:
+                _record_raise(record_stage, STAGE_DENSE)
+                raise
+            record_stage(STAGE_DENSE, state=dense_result.state,
+                         detail=dense_result.detail)
             report["dense"] = {"attempted": True, **dense_result.as_dict()}
+    else:
+        record_stage(STAGE_DENSE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+                     detail="not requested (--densify was not passed)")
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

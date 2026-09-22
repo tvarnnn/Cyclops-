@@ -1760,8 +1760,18 @@ class TestTheFinalChain:
         from scripts.world_build_session import final_surface_stages
         from tower.world_builder.store import WorldStore
 
+        # The recorder the builder hands in is `engine.mark_stage`; here it is
+        # a list, so what reaches the session record can be asserted without a
+        # store. `record` is optional and defaults to a no-op, so every caller
+        # that predates it -- including `world_finalize.py` -- is unchanged.
+        log.setdefault("recorded", [])
+
+        def record(stage, *, state, detail=None, attempted=True):
+            log["recorded"].append((stage, state, attempted, detail))
+
         args = dict(solved=True, appearance=True, prune_depth_work=True,
-                    should_stop=lambda: log["stop"], stop_source=lambda: "stdin")
+                    should_stop=lambda: log["stop"], stop_source=lambda: "stdin",
+                    record=record)
         args.update(kw)
         return final_surface_stages(WorldStore(tmp_path), WORLD, SESSION, **args)
 
@@ -1844,6 +1854,112 @@ class TestTheFinalChain:
         calls["order"].clear()
         self._run(tmp_path, calls, prune_depth_work=False)
         assert calls["order"] == ["surface", "appearance"]
+
+    # -- what the session record is told ------------------------------
+    #
+    # The builder marks finalization `complete` and releases the world lock in
+    # its `finally`, which is BEFORE any of this runs, and that is deliberate:
+    # the phone reads the world while the surface builds. What was not
+    # deliberate is that nothing on disk then said whether the photographic
+    # stages ran, were skipped, or raised -- their only record was a report
+    # dict on the child stdout that nobody persists. These pin the second
+    # record. They do not move a single call.
+
+    def test_each_stage_is_recorded_running_and_then_with_its_outcome(
+            self, tmp_path, calls):
+        self._run(tmp_path, calls)
+        assert calls["recorded"] == [
+            ("surface", "running", True, None),
+            ("surface", "ok", True, None),
+            ("appearance", "running", True, None),
+            ("appearance", "ok", True, None),
+        ]
+
+    def test_a_surface_that_raises_is_recorded_as_failed_and_still_raises(
+            self, tmp_path, calls, monkeypatch):
+        """THE DEFECT THIS EXISTS FOR. `surfacify` raising left a world that
+        was sparse forever beside a record saying `complete`, with the reason
+        only in a traceback on a stdout nobody keeps. The exception must still
+        leave -- the exit code is how the supervisor learns -- but
+        the failure is on the record first."""
+        from tower.world_builder import surface_pipeline
+
+        def boom(*a, **kw):
+            calls["order"].append("surface")
+            raise RuntimeError("the depth network fell over")
+
+        monkeypatch.setattr(surface_pipeline, "surfacify", boom)
+        with pytest.raises(RuntimeError, match="depth network"):
+            self._run(tmp_path, calls)
+        assert calls["recorded"][0] == ("surface", "running", True, None)
+        stage, state, attempted, detail = calls["recorded"][1]
+        assert (stage, state, attempted) == ("surface", "failed", True)
+        assert detail == "RuntimeError: the depth network fell over"
+        # And the appearance that never got its turn says why, rather than
+        # being absent and indistinguishable from an older Tower.
+        assert calls["recorded"][2][:3] == ("appearance", "unavailable", False)
+
+    def test_an_appearance_that_raises_is_recorded_as_failed_and_still_raises(
+            self, tmp_path, calls, monkeypatch):
+        from tower.world_builder import appearance_pipeline
+
+        def boom(*a, **kw):
+            raise ValueError("no redactor")
+
+        monkeypatch.setattr(appearance_pipeline, "build_appearance", boom)
+        with pytest.raises(ValueError, match="no redactor"):
+            self._run(tmp_path, calls)
+        assert calls["recorded"][1] == ("surface", "ok", True, None)
+        assert calls["recorded"][3] == (
+            "appearance", "failed", True, "ValueError: no redactor")
+
+    def test_a_surface_that_did_not_build_records_why_the_appearance_did_not(
+            self, tmp_path, calls):
+        calls["surface_state"] = "failed"
+        self._run(tmp_path, calls)
+        assert calls["recorded"][1][:3] == ("surface", "failed", True)
+        assert calls["recorded"][2][:3] == ("appearance", "unavailable", False)
+
+    def test_a_hard_stop_records_both_stages_as_stopped_and_unattempted(
+            self, tmp_path, calls):
+        calls["stop"] = True
+        self._run(tmp_path, calls)
+        assert [r[:3] for r in calls["recorded"]] == [
+            ("surface", "stopped", False), ("appearance", "stopped", False)]
+        assert all("hard stop (stdin)" in r[3] for r in calls["recorded"])
+
+    def test_no_solve_records_both_stages_as_unavailable(self, tmp_path, calls):
+        self._run(tmp_path, calls, solved=False)
+        assert [r[:3] for r in calls["recorded"]] == [
+            ("surface", "unavailable", False), ("appearance", "unavailable", False)]
+
+    def test_an_unwanted_appearance_is_not_recorded_at_all(self, tmp_path, calls):
+        """`--appearance` off: `main` records that separately, once, rather
+        than this function claiming an outcome for a stage it was not given."""
+        self._run(tmp_path, calls, appearance=False)
+        assert [r[0] for r in calls["recorded"]] == ["surface", "surface"]
+
+    def test_the_recorder_is_optional(self, tmp_path, calls):
+        """Every existing caller passes no recorder and must be unchanged."""
+        report = self._run(tmp_path, calls, record=None)
+        assert calls["order"] == ["surface", "appearance", "prune"]
+        assert report["appearance"]["state"] == "ok"
+
+    def test_main_records_the_stages_through_the_engine(self):
+        """The builder wires `engine.mark_stage` in, records the dense stage
+        itself, and records the stages it was never asked for -- so "never
+        attempted" is on disk rather than inferred from an absent key."""
+        import inspect
+
+        import scripts.world_build_session as B
+
+        src = inspect.getsource(B.main)
+        assert "engine.mark_stage(" in src
+        assert "record=record_stage" in src
+        # After the finally block that releases the lock, never inside it.
+        assert src.index("engine.release_world(") < src.index("record=record_stage")
+        for stage in ("STAGE_SURFACE", "STAGE_APPEARANCE", "STAGE_DENSE"):
+            assert stage in src
 
     def test_main_runs_it_after_the_final_solve_and_before_the_dense_stage(self):
         import inspect

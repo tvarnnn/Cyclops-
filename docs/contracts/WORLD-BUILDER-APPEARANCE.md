@@ -1185,3 +1185,33 @@ closes** (`WORLD-BUILDER-IOS.md` §10).
 
 **States.** `status.json` `state` is `running`, `ok`, `stopped`, `failed` or
 `unavailable` (with `detail`), like the surface stage.
+
+**What the session record says about them** (additive, 2026-09-22; on disk
+only, nothing on the wire moved, and no contract identifier changed).
+`session.json` gains a `stages` object beside `finalization`:
+
+```
+"stages": {
+  "surface"|"appearance"|"dense": {
+    "attempted": bool,
+    "state": "ok"|"running"|"failed"|"stopped"|"unavailable",
+    "started_at": float, "updated_at": float, "detail": string|null }}
+```
+
+The vocabulary is `status.json`'s, unchanged, so a `SurfaceResult.state` is
+recorded verbatim. `stages` absent — every record written before this date —
+means **never recorded**, exactly as an absent `finalization` does; a stage
+absent from a present `stages` means the same for that one stage.
+
+This exists because `finalization.state == "complete"` is written, and the
+world lock released, in the builder's `finally` — **before** these stages run,
+which on a real walk is six to eleven minutes before the photographic world
+exists. That ordering is deliberate (the phone reads the world while the
+surface builds, `WORLD-BUILDER-WORLDS.md` §10.6) and has not changed. What
+changed is that the outcome is now on disk instead of only in a report dict
+printed to a stdout nobody keeps: a `surfacify()` that raised used to leave a
+world sparse forever beside a record saying `complete`, indistinguishable from
+a world nobody asked for a surface. A stage the builder was never asked for
+records `unavailable` / `attempted: false` with a `not requested` detail, and
+a stage still `running` under a process that is gone is the honest record of a
+builder the Job Object killed mid-stage.
