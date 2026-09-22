@@ -340,11 +340,16 @@ enum WorldPersistenceState: Equatable, Sendable {
     /// A saved world is being loaded back.
     case reloading
 
+    /// Never the word "Saved". That is the stage word for a FINISHED world
+    /// (`WorldStage.saved`), and the Storage row is drawn in every stage -- so
+    /// "Improving" and its note "it is worth waiting for Saved" sat directly
+    /// above a row reading "Saved" for the whole of the photographic build.
+    /// This row says where the Tower keeps the world, not whether it is done.
     var displayName: String {
         switch self {
         case .unknown: return "Not reported"
         case .session: return "This session only"
-        case .saved: return "Saved"
+        case .saved: return "Stored on the Tower"
         case .reloading: return "Loading…"
         }
     }

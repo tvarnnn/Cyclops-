@@ -833,11 +833,18 @@ enum WorldReconstruction: Equatable {
             // byte-identical from second 3 to second 179), so the phone
             // cannot show a bar, and the button is deliberately not
             // disabled — a wearer who wants to look is entitled to.
+            //
+            // "A few minutes" was true of the final solve alone. Since
+            // 2026-09-22 this stage also covers the photographic surface and
+            // appearance stages, measured at 459 s for a 385-keyframe walk and
+            // 756 s for 690 keyframes, after the final solve -- and a wearer
+            // told "a few minutes" is the wearer who shut the Tower down in
+            // the middle of one. The sentence gives the long walk's figure.
             return .partial(
                 target,
-                note: "This world is still being finished. It usually takes a "
-                    + "few minutes, and the finished world is very different "
-                    + "from this one — it is worth waiting for Saved."
+                note: "This world is still being finished. After a long walk, "
+                    + "finishing can take twenty minutes or more, and the finished "
+                    + "world is very different from this one — it is worth waiting for Saved."
             )
         case .finalizing:
             // SPLIT FROM `.improving`, AND THE DIFFERENCE IS WHETHER

@@ -732,9 +732,16 @@ final class WorldRenderViewerModel: ObservableObject {
     private var handledRevision: String?
 
     /// Revisions whose page could not be drawn on this phone. Never offered or
-    /// swapped in again by the follower; only the reader's own "Try again"
-    /// (`newerPictureRefused`, then `load()`) can fetch one.
+    /// swapped in again by the follower -- except once, for a revision refused
+    /// while its build was live that the Tower then reports finished
+    /// (`refusedWhileLive`) -- and forgotten by the reader's own "Try again"
+    /// (`newerPictureRefused`, then `load()`).
     private var refusedRevisions: Set<String> = []
+
+    /// The subset of `refusedRevisions` refused while the Tower said the build
+    /// was live, each owed one try when the same revision is reported finished.
+    /// See `followRevisions`.
+    private var refusedWhileLive: Set<String> = []
 
     /// How many refreshes to each rung failed to draw, and the rungs that have
     /// failed twice. A rung too large for this phone used to be refused per
@@ -768,8 +775,10 @@ final class WorldRenderViewerModel: ObservableObject {
     /// the revision it carried, kept until the replacement reports drawn. A
     /// refresh that cannot be drawn -- watchdog, `didFail`, or the content
     /// process running out of memory, which is exactly what a larger rung does
-    /// -- returns to it instead of to a failure.
-    private var fallback: (html: String, revision: String?)?
+    /// -- returns to it instead of to a failure. `wasLive` is whether the
+    /// Tower said the build being swapped IN was live, so a refusal can be
+    /// told apart from one of a finished build (`refusedWhileLive`).
+    private var fallback: (html: String, revision: String?, wasLive: Bool)?
 
     /// A newer build of the SAME rung, waiting for the reader to ask for it.
     ///
@@ -867,6 +876,29 @@ final class WorldRenderViewerModel: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let latest else { return }
+            // A revision refused while its build was LIVE gets one more try
+            // when the Tower reports that same revision FINISHED -- the
+            // per-revision form of `finishedBuildRetried`, and for the same
+            // reason: the finished world is the picture the walk was for, and
+            // the capture that was competing for memory has stopped.
+            //
+            // It matters for the appearance, whose page revision
+            // (`<session>/appearance:1@<epoch>`) survives the ordinary Stop.
+            // Without it, one walk-time appearance page that could not be drawn
+            // refused the FINISHED world's page too: the Stop gap's surface
+            // then drew, took the "Try again" button away with it, and the
+            // photographic world that followed under the same revision was
+            // never tried, never offered and never mentioned -- the bare
+            // surface stayed on screen over it. Found at the 2026-09-22 Mac
+            // validation of 83534e2.
+            //
+            // A revision refused when it was already finished is not retried,
+            // and this one retry is spent once taken, so a page too large for
+            // this phone is still fetched a bounded number of times.
+            if latest.live == false, refusedWhileLive.remove(latest.revision) != nil {
+                refusedRevisions.remove(latest.revision)
+                if handledRevision == latest.revision { handledRevision = nil }
+            }
             if state.representation == .appearance {
                 let pageRecovered = appearanceWithdrawnAt.map { withdrawnAt in
                     (assets.servedAppearanceToPageAt ?? .distantPast) > withdrawnAt
@@ -902,7 +934,8 @@ final class WorldRenderViewerModel: ObservableObject {
                         // until they closed it. On a pre-epoch world (review 2,
                         // A-1) the page revision never changes, so that flag is
                         // the ONLY path back.
-                        if await refresh(to: latest.revision, evenIfUnchanged: true) {
+                        if await refresh(to: latest.revision, evenIfUnchanged: true,
+                                         live: latest.live == true) {
                             forgetTheWithdrawal()
                         }
                         continue
@@ -953,7 +986,7 @@ final class WorldRenderViewerModel: ObservableObject {
                 || WorldRenderRepresentation.session(of: latest.revision)
                     == WorldRenderRepresentation.session(of: shownRevision)
             if Self.swapsBySelf(shown: state.representation, latest: latest, sameWalk: sameWalk) {
-                await refresh(to: latest.revision)
+                await refresh(to: latest.revision, live: latest.live == true)
             } else {
                 handledRevision = latest.revision
                 pendingRevision = latest.revision
@@ -1054,7 +1087,8 @@ final class WorldRenderViewerModel: ObservableObject {
         guard let revision = pendingRevision, case .ready = state else { return }
         pendingRevision = nil
         newerPictureAvailable = false
-        await refresh(to: revision)
+        // A tap is not the follower's live swap; its failure is not owed a retry.
+        await refresh(to: revision, live: false)
     }
 
     /// Fetch the newer page and put it on screen, or leave the old one.
@@ -1069,7 +1103,9 @@ final class WorldRenderViewerModel: ObservableObject {
     /// Returns whether a page was actually put on screen to be drawn — which is
     /// what tells a withdrawal-recovery that it worked (`WorldAppearanceFollow`).
     @discardableResult
-    private func refresh(to revision: String, evenIfUnchanged: Bool = false) async -> Bool {
+    private func refresh(
+        to revision: String, evenIfUnchanged: Bool = false, live: Bool = false
+    ) async -> Bool {
         let html: String
         do {
             html = try await client.page(for: target)
@@ -1090,7 +1126,7 @@ final class WorldRenderViewerModel: ObservableObject {
             // revert to and took a world off the screen that had been drawing a
             // moment earlier. Reverting to the same string is not a no-op: it
             // reloads it with a fresh kill budget and offers "Try again".
-            fallback = (html: current, revision: shownRevision)
+            fallback = (html: current, revision: shownRevision, wasLive: live)
             shownRevision = stamped
             // The identity changes so an identical string is loaded again; the
             // BUDGET token does not, because nobody asked for a fresh
@@ -1120,7 +1156,7 @@ final class WorldRenderViewerModel: ObservableObject {
         pendingRevision = nil
         newerPictureAvailable = false
         renderWatchdog?.cancel()
-        fallback = (html: current, revision: shownRevision)
+        fallback = (html: current, revision: shownRevision, wasLive: live)
         shownRevision = stamped
         state = .rendering(html: html)
         startRenderWatchdog()
@@ -1138,6 +1174,10 @@ final class WorldRenderViewerModel: ObservableObject {
         fallback = nil
         if let refused = shownRevision { refusedRevisions.insert(refused) }
         if let handled = handledRevision { refusedRevisions.insert(handled) }
+        if previous.wasLive {
+            if let refused = shownRevision { refusedWhileLive.insert(refused) }
+            if let handled = handledRevision { refusedWhileLive.insert(handled) }
+        }
         if let rung = state.representation,
            rung != WorldRenderRepresentation.declared(in: previous.html) {
             let failures = rungDrawFailures[rung, default: 0] + 1
@@ -1175,6 +1215,19 @@ final class WorldRenderViewerModel: ObservableObject {
         rungDrawFailures = [:]
         refusedRungs = []
         finishedBuildRetried = []
+        // The refused REVISIONS too, as `WORLD-BUILDER-IOS.md` §10 and the
+        // property's own comment always said. They were the one refusal this
+        // kept, and for the appearance rung that is not a detail: its page
+        // revision (`<session>/appearance:1@<epoch>`) does not change between
+        // the builds of one epoch, and the ordinary Stop keeps the epoch. So
+        // one walk-time appearance page that failed to draw refused the
+        // FINISHED world's page as well, for the life of the screen -- and a
+        // "Try again" tapped while the Tower served the surface in the Stop
+        // gap cleared the button without clearing the refusal, leaving the
+        // bare surface on screen over a photographic world with nothing
+        // saying so. Found at the 2026-09-22 Mac validation of 83534e2.
+        refusedRevisions = []
+        refusedWhileLive = []
         newerPictureRefused = false
         state = .fetching
         do {

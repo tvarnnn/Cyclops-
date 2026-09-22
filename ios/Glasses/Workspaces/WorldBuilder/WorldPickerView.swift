@@ -111,16 +111,65 @@ struct WorldPickerView: View {
     }
 
     /// What the pushed screen says about the world under its caption, or `nil`.
+    /// See `note(forOpened:target:pinnedStage:pinnedReconstruction:)`.
     ///
-    /// From the **listing's** finalization record, not from a status report:
-    /// the pin's first report has usually not arrived when this screen appears,
-    /// and `WorldListingSession.finalization` is already in hand. It is only
-    /// ever a sentence about a final pass the Tower said did not happen —
-    /// silence stays silent, per `WorldFinalSolve.notReported`.
+    /// The pin's own report is consulted only once it describes THIS world:
+    /// `open()` sets `renderTarget` at the tap, but the status channel's answer
+    /// reaches the view model a main-queue hop later, so for a moment the
+    /// presentation is still the world the workspace was showing before.
     private var openedNote: String? {
-        guard let session = openedSession else { return nil }
+        guard let opened, let session = openedSession else { return nil }
+        let pinned = world.renderTarget == opened
+            && world.state.snapshot?.worldID == opened.worldID
+        return Self.note(
+            forOpened: session, target: opened,
+            pinnedStage: pinned ? world.presentation.stage : nil,
+            pinnedReconstruction: pinned ? world.presentation.reconstruction : nil
+        )
+    }
+
+    /// The note for a session pushed from this list.
+    ///
+    /// **A settled row** says only what it always said: from the **listing's**
+    /// finalization record, a sentence about a final pass the Tower said did
+    /// not happen, and otherwise nothing — silence stays silent, per
+    /// `WorldFinalSolve.notReported`.
+    ///
+    /// **A row the Tower lists as still changing** (`finalizing`, `receiving`)
+    /// used to get the same treatment, which for a `finalizing` row is nothing
+    /// at all. That is the photographic build: Stop, open Saved Worlds, tap the
+    /// "Finishing" row, and the screen showed the sparse points with no word
+    /// that the picture the walk was for is still being made — while the
+    /// workspace's own route into the same viewer said "it is worth waiting for
+    /// Saved". The same misreading as the 2026-09-22 incident, on the other
+    /// screen (found by the Windows lane's review round 2, left for a Mac).
+    ///
+    /// So such a row gets the ladder's note: the pin's own live one once its
+    /// report has arrived — so the sentence leaves when the build lands, rather
+    /// than when this list is next refreshed — and until then the note for the
+    /// stage the row's word stands for. `finalizing` in the listing is always a
+    /// live process's evidence (a held lock, or a photographic stage running),
+    /// which is exactly what `.improving` claims.
+    static func note(
+        forOpened session: WorldListingSession,
+        target: WorldRenderTarget,
+        pinnedStage: WorldStage?,
+        pinnedReconstruction: WorldReconstruction?
+    ) -> String? {
         let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
-        return solve.deniesAFinishedWorld ? solve.sentence : nil
+        let settled = solve.deniesAFinishedWorld ? solve.sentence : nil
+        guard session.state == .finalizing || session.state == .receiving else { return settled }
+        if pinnedStage != nil, let pinnedReconstruction {
+            if case .partial(_, let note) = pinnedReconstruction { return note }
+            return settled
+        }
+        let listed: WorldStage = session.state == .receiving ? .mapping : .improving
+        if case .partial(_, let note) = WorldReconstruction.ladder(
+            target: target, stage: listed, finalSolve: .notReported, evidence: nil
+        ) {
+            return note
+        }
+        return settled
     }
 
     private var openedEntry: WorldListingEntry? {

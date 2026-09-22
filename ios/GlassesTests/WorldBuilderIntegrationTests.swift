@@ -5244,6 +5244,95 @@ final class WorldRenderRevisionTests: XCTestCase {
         XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 5)
     }
 
+    /// 2026-09-22 Mac validation of 83534e2. The appearance page's revision is
+    /// `<session>/appearance:1@<epoch>` and does NOT change between the builds of
+    /// one epoch -- the ordinary Stop keeps it -- so a refused appearance
+    /// REVISION is also the finished world's revision. "Try again" (`load()`)
+    /// must forget it, as `WORLD-BUILDER-IOS.md` §10 says; otherwise a Try
+    /// again tapped while the Tower serves the surface in the Stop gap leaves
+    /// the bare surface on screen, with no offer, over the photographic world.
+    func testTryAgainForgetsARefusedAppearanceSoTheFinishedOneReplacesTheSurface() async {
+        let surface = page("surface", "s1/surface:1")
+        let appearance = page("appearance", "s1/appearance:1@e1")
+        let model = await readyModel(page: surface, revision: revisionBody("appearance", "s1/appearance:1@e1"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, appearance))
+        let follow = Task { await model.followRevisions() }
+
+        // A walk-time appearance lands, is swapped in, and cannot be drawn.
+        let tried = await waitUntil { model.state == .rendering(html: appearance) }
+        XCTAssertTrue(tried, "fixture: the walk-time appearance was never tried")
+        model.pageEvent(.gaveUpAfterTerminations(3))
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: surface))
+        XCTAssertTrue(model.newerPictureRefused)
+        await stop(follow)
+
+        // Stop: the textures are rebuilding, the Tower serves the surface, and
+        // the reader taps Try again.
+        let stopGap = page("surface", "s1/surface:2")
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, stopGap))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:2")))
+        await model.load()
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: stopGap))
+        XCTAssertFalse(model.newerPictureRefused, "Try again cleared the offer")
+
+        // The appearance comes back under the SAME page revision. Reported
+        // `live` on purpose: a finished (`live: false`) report would be let
+        // through by the one-retry rule of the next test even if `load()` kept
+        // its refusals, and this test is about `load()`.
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, appearance))
+        StubbedGeometryProtocol.set(
+            route: Self.revisionPath, to: (200, revisionBody("appearance", "s1/appearance:1@e1", live: true)))
+        let refollow = Task { await model.followRevisions() }
+        let swapped = await waitUntil { model.state == .rendering(html: appearance) }
+        await stop(refollow)
+        XCTAssertTrue(swapped, "the finished photographic world never replaced the surface after Try again")
+    }
+
+    /// The same stranding with no tap at all (review of the fix above). The
+    /// Stop gap's surface swaps in by itself and draws, which takes the "Try
+    /// again" button away; the finished appearance then arrives under the
+    /// refused revision. It must be tried, because the Tower offered something
+    /// else in between -- a refusal is of what the Tower is offering NOW.
+    func testTheFinishedAppearanceIsTriedAfterTheStopGapEvenWithNoTryAgain() async {
+        let surface = page("surface", "s1/surface:1")
+        let appearance = page("appearance", "s1/appearance:1@e1")
+        let model = await readyModel(page: surface, revision: revisionBody("appearance", "s1/appearance:1@e1"))
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, appearance))
+        let follow = Task { await model.followRevisions() }
+
+        let tried = await waitUntil { model.state == .rendering(html: appearance) }
+        XCTAssertTrue(tried, "fixture: the walk-time appearance was never tried")
+        model.pageEvent(.gaveUpAfterTerminations(3))
+        model.pageEvent(.rendered)
+        XCTAssertEqual(model.state, .ready(html: surface))
+
+        // While the Tower keeps offering the refused revision it is left alone.
+        let polled = StubbedGeometryProtocol.requestCount(for: Self.revisionPath)
+        let pollsLater = await waitUntil { StubbedGeometryProtocol.requestCount(for: Self.revisionPath) >= polled + 3 }
+        XCTAssertTrue(pollsLater)
+        XCTAssertEqual(model.state, .ready(html: surface), "a refused page was fetched again while still refused")
+        XCTAssertEqual(StubbedGeometryProtocol.requestCount(for: Self.pagePath), 2, "load() and the one refused try")
+
+        // Stop gap: the Tower serves a finished surface, which swaps in and draws.
+        let stopGap = page("surface", "s1/surface:2")
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, stopGap))
+        StubbedGeometryProtocol.set(route: Self.revisionPath, to: (200, revisionBody("surface", "s1/surface:2", live: false)))
+        let gapDrawn = await waitUntil { model.state == .rendering(html: stopGap) }
+        XCTAssertTrue(gapDrawn, "fixture: the Stop gap's surface did not swap in")
+        model.pageEvent(.rendered)
+        XCTAssertFalse(model.newerPictureRefused, "the surface drew, so the Try again button is gone")
+
+        // The finished appearance, under the revision refused during the walk.
+        StubbedGeometryProtocol.set(route: Self.pagePath, to: (200, appearance))
+        StubbedGeometryProtocol.set(
+            route: Self.revisionPath, to: (200, revisionBody("appearance", "s1/appearance:1@e1", live: false)))
+        let swapped = await waitUntil { model.state == .rendering(html: appearance) }
+        await stop(follow)
+        XCTAssertTrue(swapped, "the bare surface stayed on screen over the finished photographic world")
+    }
+
     /// Review 3, iOS MINOR-2. The offer was made while the Tower served a
     /// surface; by the tap it serves points. The page decides, not the offer.
     func testTappingAnOfferNeverSwapsInAWorseRung() async {

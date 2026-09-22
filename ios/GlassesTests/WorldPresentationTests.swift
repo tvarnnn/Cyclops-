@@ -1232,3 +1232,88 @@ final class WorldRenderRepresentationTests: XCTestCase {
         XCTAssertNil(WorldRenderViewerState.fetching.representation)
     }
 }
+
+// MARK: - What a world opened from Saved Worlds says while it is still built
+
+/// 2026-09-22 Mac validation of 83534e2. A "Finishing" row opened onto the
+/// sparse points with no word that the photographic world was still being
+/// made, while the workspace's own route into the same viewer said "it is
+/// worth waiting for Saved"; and the Storage row said "Saved" under
+/// "Improving" for the whole of the build.
+@MainActor
+final class WorldPickerOpenedNoteTests: XCTestCase {
+
+    private let target = WorldRenderTarget(worldID: "w1", sessionID: "s1")
+
+    private func session(state: String?, finalSolve: String? = "solved") throws -> WorldListingSession {
+        var json: [String: Any] = [
+            "session_id": "s1", "started_at": 1790059063.0, "ended_at": 1790059162.0,
+            "end_reason": "stop", "frame_source": "live-capture", "has_geometry": true,
+            "finalization": ["state": "complete", "final_solve": finalSolve as Any],
+        ]
+        if let state { json["state"] = state }
+        return try XCTUnwrap(WorldListingSession(json: json))
+    }
+
+    private var improvingNote: String? {
+        guard case .partial(_, let note) = WorldReconstruction.ladder(
+            target: target, stage: .improving, finalSolve: .solved, evidence: nil
+        ) else { return nil }
+        return note
+    }
+
+    func testAFinishingRowSaysTheWorldIsStillBeingFinishedBeforeThePinReports() throws {
+        let note = WorldPickerView.note(
+            forOpened: try session(state: "finalizing"), target: target,
+            pinnedStage: nil, pinnedReconstruction: nil)
+        XCTAssertEqual(note, improvingNote)
+        XCTAssertTrue(note?.contains("worth waiting for Saved") == true)
+    }
+
+    func testTheNoteFollowsThePinOnceItReports() throws {
+        let finishing = try session(state: "finalizing")
+        let stillImproving = WorldPickerView.note(
+            forOpened: finishing, target: target, pinnedStage: .improving,
+            pinnedReconstruction: WorldReconstruction.ladder(
+                target: target, stage: .improving, finalSolve: .solved, evidence: nil))
+        XCTAssertEqual(stillImproving, improvingNote)
+
+        // The build landed while the screen was open: the sentence leaves with
+        // it, rather than when the list is next refreshed.
+        let landed = WorldPickerView.note(
+            forOpened: finishing, target: target, pinnedStage: .saved,
+            pinnedReconstruction: .final(target))
+        XCTAssertNil(landed, "a finished world must not keep saying it is still being finished")
+    }
+
+    func testAReceivingRowSaysItIsStillBeingBuilt() throws {
+        let note = WorldPickerView.note(
+            forOpened: try session(state: "receiving"), target: target,
+            pinnedStage: nil, pinnedReconstruction: nil)
+        XCTAssertEqual(note, "This world is still being built, so it will change.")
+    }
+
+    /// Unchanged: a settled row says only what its final-pass record denies.
+    func testASettledRowSaysWhatItAlwaysSaid() throws {
+        XCTAssertNil(WorldPickerView.note(
+            forOpened: try session(state: "complete"), target: target,
+            pinnedStage: .improving, pinnedReconstruction: nil))
+        let skipped = try session(state: "complete", finalSolve: "skipped")
+        XCTAssertEqual(
+            WorldPickerView.note(forOpened: skipped, target: target, pinnedStage: nil, pinnedReconstruction: nil),
+            WorldFinalSolve(word: "skipped").sentence)
+        XCTAssertNil(WorldPickerView.note(
+            forOpened: try session(state: nil), target: target, pinnedStage: nil, pinnedReconstruction: nil))
+    }
+
+    func testTheImprovingNoteDoesNotPromiseAFewMinutes() {
+        XCTAssertFalse(improvingNote?.contains("few minutes") ?? true,
+                       "the photographic stages take 8-13 minutes measured, twenty planned")
+    }
+
+    func testTheStorageRowNeverSaysTheStageWordForAFinishedWorld() {
+        let storage = WorldPersistenceState.saved(revision: "r1").displayName
+        XCTAssertNotEqual(storage, WorldStage.saved.label)
+        XCTAssertFalse(storage.localizedCaseInsensitiveContains("saved"), storage)
+    }
+}
