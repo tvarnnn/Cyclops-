@@ -956,3 +956,84 @@ It also exposed one blemish, now fixed: the stage record was copying the
 surface pipeline's whole ten-kilobyte report into `session.json` on
 SUCCESS, in a file the world listing parses on every poll.
 
+## Regression: the whole Tower, not just this cartridge
+
+```
+$ python -m pytest tests/ -q          (the entire suite, from the lane worktree)
+4066 passed, 77 skipped, 1 xfailed, 0 failed in 928.00s
+```
+
+Against the pre-change World Builder baseline of 1715 passed / 18 skipped,
+the `-k world` selection now stands at 1813 passed / 18 skipped — about a
+hundred new tests and no failures. CV Lab, Object Memory, Document Memory,
+Scene Understanding, the transport, the capture workers, the result channel
+and the architecture-boundary guards all pass unchanged, and the
+five-cartridge lifecycle soak reports STABLE with nothing leaked.
+
+## Adversarial review round 3 — and it found things that matter
+
+The third reviewer measured rather than argued, and confirmed a great deal:
+the healthy-world byte-identical rebuild, the 8-of-11 store survey, gauge
+freedom (scaling a synthetic solve by 1000× and by 1e-6 gates the identical
+pose set — no absolute distance threshold survives anywhere), the digest
+change being correct and harmless (the serving path keys on `input_digest`,
+never `params_digest`, so a stale surface cannot 404 where it used to 200),
+the finisher's two funnels being real and tested, and a 260 ms boot cost.
+
+It also found three HIGH defects, all of which are being repaired.
+
+**The pose gate deletes real poses on dwell-heavy captures.** The claim that
+"a walk is not an outlier because the median radius grows with the corridor"
+holds only for a *uniformly sampled* corridor — which is exactly what its
+test builds. Real captures dwell. Measured:
+
+| scene | gated |
+|---|---:|
+| uniform corridor, L = 10 / 50 / 200 / 1000 | 0% |
+| L-shaped 3-room apartment, dwell 60/25/15 | 0% |
+| 80% dwelling in one spot, then a 40-unit walk | **17.3%** |
+| two rooms, 30% of frames in room B at D=30 | **30%** (all of room B) |
+| two components, exactly 50/50 | 0% |
+| two components, **55/45** | **45%** (the whole smaller one) |
+
+The 50/50 safety is a knife-edge artefact of `np.median` averaging the two
+middle values and landing *between* the clusters; nothing physical
+privileges an even split. And because the gate runs in `_Frames.__init__`,
+a gated pose is dropped from depth, consistency, transients, fusion **and
+the appearance** — it deletes the wearer's own photographs. The capture
+guidance in this very handoff asks for a walk that dwells and then moves,
+so this would have fired on the physical test.
+
+The remedy is a **detachment** test rather than a bare multiple, and the
+evidence for its shape is in the reviewer's own comparison: on healthy
+solves the threshold sits 3–20× above the entire distribution, while on the
+diverged `9a68430a` it sits *below* that world's own 95th-percentile radius
+— it is cutting into the body of the distribution rather than clipping a
+separated tail.
+
+**The finisher is a no-op, and the one world it was written for is the
+world it skips.** Measured against the real root: 70 sessions seen, 0 owed.
+Only three sessions reach `finalization: complete`, and all three are
+excluded by the `no-stage-record` clause — including world `2f447162…`,
+whose `surface/<sid>/status.json` reads `{"state": "stopped", "stage":
+"depth"}` written 82 seconds after finalization, i.e. the 02:37 incident
+itself. A `status.json` saying `stopped` cannot be produced by a Tower that
+never ran a photographic stage, so it is a safe second signal that
+discovers no historical backlog.
+
+**Boot, then walk, three times, and the world is retired for ever.** The
+attempt is counted before the work; a capture opening kills the finisher
+inside its 5-second grace while it is in a GPU pass; `failed` is terminal.
+"Boot the Tower and go for a walk" is the expected event on every boot, and
+three of them would permanently strand a world. Masked today by the no-op;
+live the moment it is fixed.
+
+Also being repaired: an uncapped key-range coarsening that could publish a
+collapsed room as `ok` where the code used to refuse honestly (the wrong
+direction for a project whose last READY was rejected for a bad-looking
+mesh); outlier tripwires that never fire because `_outlier_record` runs
+only on the success path; a concurrent-stop race with a measured 5.01 s
+window in which a builder can start while the finisher still holds the GPU;
+and a supported configuration (`TOWER_WORLD_ROOT` set, `TOWER_CAPTURE_ROOT`
+unset) in which neither stop funnel fires at all.
+
