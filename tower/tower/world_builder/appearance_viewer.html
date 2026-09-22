@@ -81,8 +81,10 @@ button[disabled]{opacity:.4}
    It now says "Preparing the view…" over the opening, which is a photograph,
    so it carries the same plate the About text does -- and nothing at all when
    it has nothing to say. */
+/* `--barh`: the bar's measured height (`barHeight()`). It wraps to two rows
+   on a narrow phone, where a fixed 64px put this over the buttons. */
 #status{position:fixed;left:calc(12px + env(safe-area-inset-left));
-  bottom:calc(64px + env(safe-area-inset-bottom));font-size:12px;
+  bottom:calc(var(--barh, 56px) + 8px);font-size:12px;
   padding:3px 8px;border-radius:8px;background:rgba(8,10,13,.82);
   text-shadow:0 1px 2px rgba(0,0,0,.85);
   color:var(--dim);pointer-events:none;font-variant-numeric:tabular-nums}
@@ -263,7 +265,25 @@ function fail(text){
   $("wrap").style.display = "none"; $("bar").style.display = "none";
   $("caption").style.display = "none"; $("status").textContent = "";
 }
-function status(text){ $("status").textContent = text || ""; }
+/* THE STATUS LINE SITS ABOVE THE BUTTON BAR, WHATEVER HEIGHT THE BAR IS.
+   `#status` was pinned at 64px, right for a bar on one row. At 390x844
+   `Reset` wraps, the bar is ~96px, and for the first 0.75s of every cold open
+   "Preparing the view…" was printed over the "Best view" button
+   (VISUAL-REVIEW-4 #4). The bar measures itself here -- so the first thing
+   the page says is already clear of it -- and on every resize. Its own
+   padding carries `env(safe-area-inset-bottom)`; `--barh` must not add it
+   again. */
+let lastBarH = -1;
+function barHeight(){
+  const bar = $("bar");
+  if (!bar) return;
+  const h = bar.offsetHeight;
+  if (h && h !== lastBarH){
+    lastBarH = h;
+    document.documentElement.style.setProperty("--barh", h + "px");
+  }
+}
+function status(text){ barHeight(); $("status").textContent = text || ""; }
 /* The second or so after the images land, while the support field is built.
    You can already look and walk; what the page cannot do yet is tell you why
    a direction is dark, or which vantage is best. It says so. */
@@ -825,11 +845,18 @@ const NAV = (() => {
      from one position -- the same `support` the rest of the page uses, at the
      same field of view, so the ring reports COVERAGE and only coverage. It
      never says there is something worth seeing; it says a photograph exists. */
+  /* It also carries the CONTENT of each heading, on the array itself so that
+     every existing reader of the profile -- the ring drawing, the edge arrow,
+     the verification hook -- is untouched and still sees coverage and only
+     coverage. `bestHeading` is the one thing that reads it: see below. */
   function ringProfile(F, p, V, bins){
-    const n = Math.max(4, bins | 0), out = new Float32Array(n);
+    const n = Math.max(4, bins | 0), out = new Float32Array(n), con = new Float32Array(n);
+    out.content = con;
     if (!F || !F.done || !F.count) return out;
-    for (let i = 0; i < n; i++)
-      out[i] = support(F, p, V.dir(i * 2 * Math.PI / n, 0), V.up, V.fy, V.aspect).s;
+    for (let i = 0; i < n; i++){
+      const r = support(F, p, V.dir(i * 2 * Math.PI / n, 0), V.up, V.fy, V.aspect);
+      out[i] = r.s; con[i] = r.c;
+    }
     return out;
   }
   /* The nearest well-covered heading: the best supported one, discounted by how
@@ -838,16 +865,33 @@ const NAV = (() => {
      returned continuous with the one passed in, so a glide turns the short way.
      Null when nothing from here is covered at all -- there is no way back to
      offer, and the page must not invent one. */
-  const RING_TURN_PENALTY = 0.25, RING_FLOOR = 0.06;
+  /* ... AND IT PREFERS A HEADING WITH SOMETHING IN IT. *Face the room* is a
+     rescue, and coverage alone let it land on a blank cream door leaf filling
+     the whole frame and hold it (VISUAL-REVIEW-4 #6): perfectly photographed,
+     perfectly supported, and nothing to see. The field already carries each
+     direction's CONTENT beside its coverage and the page already has
+     `richness`; this reads it off the same profile. It is a discount and not
+     a filter -- RING_RICH_FLOOR of the support survives however featureless
+     the heading is -- because the button's promise is "the nearest direction
+     a photograph exists in", and a world where every heading is a blank wall
+     must still get its best one rather than a null. */
+  const RING_TURN_PENALTY = 0.25, RING_FLOOR = 0.06, RING_RICH_FLOOR = 0.55;
   function bestHeading(prof, yaw){
     const n = prof && prof.length;
     if (!n) return null;
+    // "no content channel" is not "content zero" -- the same rule the fade
+    // follows. A profile with nothing in its content array is weighted 1.
+    let con = prof.content;
+    if (con){ let any = 0; for (let i = 0; i < n; i++) any = Math.max(any, con[i]); if (!any) con = null; }
     let best = null;
     for (let i = 0; i < n; i++){
       let d = i * 2 * Math.PI / n - yaw;
       d = Math.atan2(Math.sin(d), Math.cos(d));
-      const score = prof[i] - RING_TURN_PENALTY * Math.abs(d) / Math.PI;
-      if (!best || score > best.score) best = {yaw: yaw + d, delta: d, support: prof[i], score};
+      const rich = con ? RING_RICH_FLOOR + (1 - RING_RICH_FLOOR) * richness(con[i]) : 1;
+      const score = prof[i] * rich - RING_TURN_PENALTY * Math.abs(d) / Math.PI;
+      if (!best || score > best.score)
+        best = {yaw: yaw + d, delta: d, support: prof[i],
+                content: con ? con[i] : null, rich, score};
     }
     return best && best.support > RING_FLOOR ? best : null;
   }
@@ -1003,6 +1047,40 @@ const NAV = (() => {
         // recorded walk itself passes within 0.3 of the proxy in places).
         if (nearest(F, to) >= Math.min(D_MIN, nearest(F, out.p))) out.p = to;
       }
+      /* AND BACK OUT OF THE GEOMETRY, IF THE PUSH GOT INSIDE IT.
+         The tube has had a drift since the interaction lane; the STANDOFF
+         never did, and the standoff is the bound a forward push actually
+         meets. `resistOnce` lets a step through whenever it does not make the
+         bound WORSE, which is right at an edge and wrong inside one: inside
+         the door jamb `closeBound` is 1 everywhere, so nothing resists and
+         nothing pushes back, and three seconds of forward from walk 60 stays
+         in a brown-black soup of grazing texels and yellow crack-fill shards
+         for 80 of 150 frames (VISUAL-REVIEW-4 #3). Escapable four ways, and a
+         reader who uses none of them is left inside a wall.
+         So: let go and the camera eases out to the standoff, the way it eases
+         back into the tube. It targets D_MIN, the hard limit, not D_SOFT, so
+         it cannot move a camera that is merely close -- over all 198 recorded
+         poses the nearest any comes to the proxy is 0.886, outside D_SOFT
+         itself, so no pose the wearer stood at is touched. */
+      const d0 = nearest(F, out.p);
+      if (d0 < D_MIN && d0 > 0 && isFinite(d0)){
+        // the way out is the direction `nearest` grows fastest in
+        const e = 0.05, g = [0, 1, 2].map(i => {
+          const a = out.p.slice(), b = out.p.slice();
+          a[i] -= e; b[i] += e;
+          return nearest(F, b) - nearest(F, a);
+        });
+        const gl = Math.hypot(g[0], g[1], g[2]);
+        if (gl > 1e-6){
+          const k = (1 - Math.exp(-dt / 450)) * (D_MIN - d0);
+          const to = [0, 1, 2].map(i => out.p[i] + g[i] / gl * k);
+          // never out of the tube to get out of the wall
+          if (!path || !path.n || pathDist(path, to).e <= Math.max(1, pathDist(path, out.p).e)){
+            out.p = to;
+            out.pushed = D_MIN - d0;
+          }
+        }
+      }
       // THE SETTLE, and the one rule that keeps it honest: it never touches a
       // look the person made. `aimed` is set by any look input and cleared
       // only when the PAGE places the camera (the opening, a walk step, the
@@ -1134,7 +1212,7 @@ const NAV = (() => {
           R_SOFT, R_MAX, V_MAX, T_LO, T_HI, SPACING, CELLS, JUMP, PITCH_MAX, PITCH_SOFT, D_MIN, D_SOFT, B_FREE,
           C_LO, C_HI, C_DRIFT_MAX, C_DRIFT_RATE, C_SETTLE, C_GRAD_EPS, C_GRAD_WIDE,
           DARK_LO, DARK_HI,
-          RING_TURN_PENALTY, RING_FLOOR, MAX_SKIP};
+          RING_TURN_PENALTY, RING_FLOOR, RING_RICH_FLOOR, MAX_SKIP};
 })();
 /* ---------- end navigation */
 
@@ -1500,7 +1578,32 @@ ${GLSL_BACKGROUND}
    score is flattered by it.
    uHaze is its alpha; 0 restores the old behaviour exactly. */
 const vec3 HAZE_RGB = vec3(0.160, 0.168, 0.190);
-vec3 haze(){ return HAZE_RGB; }
+/* ... AND IT IS NOT A CARD. Flat was the point and flat was also the problem:
+   close to the surface it read as "a large, smooth, hard-edged rounded
+   rectangle floating in front of the carpet ... like a UI panel that failed
+   to paint" (VISUAL-REVIEW-4 #5). An object, not an absence. What tells a
+   surface from a panel at a glance is that a surface has GRAIN, so the fill
+   gets some: a deterministic screen-space hash, +/- 2 of 255 at pixel scale
+   and the same again over about 24 px, zero mean.
+   It is two levels. It cannot be mistaken for detail, it adds no hue, it
+   invents nothing -- and it is confined to the DISPLAY path: modes 2, 3, 4, 8
+   and 11 all return above, so every coverage, drawn-fraction, detail and
+   fade measurement reads exactly what it read before. (That matters: at this
+   amplitude a Laplacian detail measure would have moved by a fifth of
+   DETAIL_REF, which is the opening's and the Best view's own scale.)
+   What is NOT changed is the EDGE. Softening the boundary toward the
+   photograph beside it would invent evidence; softening it toward the void
+   is a brightness change that review 3 asked for in the other direction; and
+   ramping on the blend weight would change what "observed" means and with it
+   every coverage number in the campaign. BESTVIEW.md section 6. */
+float hazeHash(vec2 v){
+  return fract(sin(dot(v, vec2(12.9898, 78.233))) * 43758.5453);
+}
+vec3 haze(){
+  float n = hazeHash(floor(gl_FragCoord.xy)) - 0.5
+          + hazeHash(floor(gl_FragCoord.xy / 24.0) + 37.0) - 0.5;
+  return HAZE_RGB + vec3(n * (2.0 / 255.0));
+}
 /* THE CONFIDENCE FADE (the geometry-confidence lane's recommendation, §7).
    The proxy carries one byte a vertex saying how well that vertex was measured
    -- the fusion's own see-through and disagreement counters, plus the level's
@@ -3129,6 +3232,13 @@ async function main(){
      candidates and the rendered DETAIL decides between them, and the depth
      floor is raised so a wall a metre away cannot be an overview. */
   const OVERVIEW_AWAY = 1.2, OVERVIEW_DEPTH = 0.8, OVERVIEW_CONTENT = 0.19, OVERVIEW_RANGE = 1.0;
+  /* The size the shortlist is rendered at to be judged. 64 px was enough for
+     "how much of this is drawn", not for "is what is drawn in one piece".
+     Swept at 64 / 96 / 128 / 192: the press costs 993 / 1563 / 1833 / 4235 ms
+     on SwiftShader, `torn` still moves between 64 and 128 and has settled by
+     128, and 192 trebles the wait for no change of answer. `ovp` overrides it
+     in the debug transport; the phone never sets it. */
+  const OVERVIEW_PROBE = Math.max(32, Math.min(384, +(Q.get("ovp") || 128)));
   /* HOW SOUND the geometry a candidate looks at is. Re-swept 2026-09-20 (the
      orient lane) after the interaction lane widened the tube: the candidate
      set went from 205 to 406, the winner moved half a unit back, and the new
@@ -3151,8 +3261,63 @@ async function main(){
     return OVERVIEW_SOUND_FLOOR + (1 - OVERVIEW_SOUND_FLOOR)
       * (1 - Math.min(1, (faded || 0) / OVERVIEW_FADED_REF));
   }
+  /* HOW CLEAN the frame is, from the same render. The confidence term catches
+     a candidate whose geometry the fade EATS. It did not catch the one this
+     lane was sent after: `faded` 0.40%, 98.8% drawn, detail above the
+     reference, the widest depth range in the set -- and a stair-stepped black
+     shape with a column of bright cream fragments down its right quarter.
+     What separates it is not how much is missing but how BROKEN UP what is
+     missing is. `torn` (see `drawnFraction`) is the length of the boundary
+     between picture and void per frame pixel, and over both builds' twelve
+     candidates it splits them the way looking at them does: 0.0022-0.0088 for
+     the frames with nothing shredded in them, 0.0107-0.0231 for the torn
+     ones. The reference sits at the top of that gap; the floor is the
+     confidence term's. Every reference from 0.010 to 0.030 at every floor
+     from 0.15 to 0.45 picks the same candidate on both builds, by 8-42%.
+     NOT IN THE TERM: `speck` (the campaign's speckle rule with a box mean for
+     the median) is measured, reported and unscored -- at this probe it calls
+     the rejected frame better than average where the 900x700 measure calls it
+     the worst in the set, and scoring it picks a frame that measures cleaner
+     and looks worse. Nor is blotch: on this world it counts the dark desk, so
+     the cleanest frame in the shortlist has the highest blotch of all.
+     BESTVIEW.md section 4. */
+  const OVERVIEW_TORN_REF = 0.02, OVERVIEW_CLEAN_FLOOR = 0.45;
+  function cleanTerm(torn){
+    return OVERVIEW_CLEAN_FLOOR + (1 - OVERVIEW_CLEAN_FLOOR)
+      * (1 - Math.min(1, (torn || 0) / OVERVIEW_TORN_REF));
+  }
+  /* The order the shortlist is ranked in, written down. `a.rendered >
+     b.rendered` alone leaves an exact tie to whatever order the lattice
+     happened to be walked in, and before this lane touched the score the
+     winner beat the runner-up by 0.6% on one build and 0.8% on the other --
+     close enough that a tie is not a fantasy. Ties break
+     on the candidate's own yaw and then on its own position, so the answer
+     does not depend on the field's iteration order. */
+  function betterView(a, b){
+    if (!b) return !!a;
+    if (!a) return false;
+    if (a.rendered !== b.rendered) return a.rendered > b.rendered;
+    if (a.yaw !== b.yaw) return a.yaw < b.yaw;
+    for (let k = 0; k < 3; k++) if (a.p[k] !== b.p[k]) return a.p[k] < b.p[k];
+    return false;
+  }
   function findOverview(){
     if (!navField || !navField.done) return null;
+    /* THE BUTTON LANDS IN THE SAME PLACE EVERY TIME IT IS PRESSED.
+       It was never random: forty cold boots, twenty of each of two builds,
+       gave one destination each and an identical twelve-row table. What it
+       WAS sensitive to is the camera the reader left behind, because
+       `navView()` reports the VERIFICATION OVERRIDE's field of view whenever
+       one is set -- 97 candidates after a `setView` at 70 degrees where a
+       fresh page has 126, and a different winner; the orbit hook's 54 degrees
+       gave a third. That is why two lanes measured the same two builds and
+       disagreed (RIMS.md against CANDIDATE.md section 8 #1). Cleared FIRST
+       and restored at every exit, so the destination depends on the field,
+       the walk, the opening and the canvas, and on nothing the reader did
+       first. BESTVIEW.md section 3. */
+    const save = cam, saveOverride = override;
+    override = null;
+    const restore = () => { cam = save; override = saveOverride; };
     const t0 = performance.now(), V = navView(), F = navField;
     const ref = CONFIG.median_scene_depth || diag * 0.25;
     let found = [], minContent = OVERVIEW_CONTENT, relaxed = 0;
@@ -3204,18 +3369,18 @@ async function main(){
       if (top.every(o => Math.hypot(o.p[0]-f.p[0], o.p[1]-f.p[1], o.p[2]-f.p[2]) > 1.0 || Math.abs(o.yaw - f.yaw) > 0.6)) top.push(f);
       if (top.length >= 12) break;
     }
-    if (!top.length) return null;
+    if (!top.length){ restore(); return null; }
     const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
-    const w = aspect >= 1 ? 64 : Math.max(24, Math.round(64 * aspect));
-    const h = aspect >= 1 ? Math.max(24, Math.round(64 / aspect)) : 64;
-    const save = cam, saveOverride = override;
-    override = null;
-    let best = null;
+    const P = OVERVIEW_PROBE;
+    const w = aspect >= 1 ? P : Math.max(24, Math.round(P * aspect));
+    const h = aspect >= 1 ? Math.max(24, Math.round(P / aspect)) : P;
+    let best = null, second = null;
     for (const f of top){
       cam = {p: f.p, yaw: f.yaw, pitch: f.pitch, floor: 1};
-      const r = drawnFraction(currentCamera(aspect), w, h, true, true);
+      const r = drawnFraction(currentCamera(aspect), w, h, true, true, true);
       f.drawn = r.drawn; f.distance = r.distance; f.spread = r.spread; f.detail = r.detail;
       f.depthSpread = r.depthSpread; f.faded = r.faded || 0;
+      f.torn = r.torn || 0; f.speck = r.speck || 0;
       // Drawn, toward what the walk looked at, with something in it -- the
       // DETAIL of the real render, not its colour spread, since a bright door
       // beside a dark wall has all the colour spread in the world and nothing
@@ -3238,15 +3403,19 @@ async function main(){
       // winner is now a vantage 0.5 units further back: more room in frame
       // (range 4.92 against 3.69) and 88.7% drawn against 99.8%, with a
       // shredded region in the lower right. That is a real side effect of the
-      // movement fix and it is in INTERACTION.md section 7; this score has not
-      // been re-swept against the bigger envelope, and should be.
+      // movement fix and it is in INTERACTION.md section 7. It HAS since been
+      // re-swept, twice: once against the confidence channel (ORIENT.md
+      // section 4) and once against how torn the frame is (BESTVIEW.md
+      // section 4), which is the `cleanTerm` factor below.
       f.rendered = r.drawn * (0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref)))
         * (0.5 + 0.5 * Math.max(0, f.toward)) * (0.15 + 0.85 * detailTerm(r.detail || 0))
         * (0.5 + 0.5 * Math.min(1, (r.depthSpread || 0) / (OVERVIEW_RANGE * ref)))
-        * soundTerm(r.faded);
-      if (!best || f.rendered > best.rendered) best = f;
+        * soundTerm(r.faded)
+        * cleanTerm(r.torn);
+      if (betterView(f, best)){ second = best; best = f; }
+      else if (betterView(f, second)) second = f;
     }
-    cam = save; override = saveOverride;
+    restore();
     // NOT S.overview: that is the verification hook, and assigning the
     // statistics over it made the second press a TypeError
     S.overviewStats = {ms: Math.round(performance.now() - t0), considered: found.length,
@@ -3254,12 +3423,22 @@ async function main(){
                   top: top.map(f => ({support: +f.s.toFixed(3), content: +f.c.toFixed(3), drawn: +f.drawn.toFixed(3),
                                       detail: +(f.detail || 0).toFixed(4), range: +(f.depthSpread || 0).toFixed(2),
                                       faded: +(f.faded || 0).toFixed(4), sound: +soundTerm(f.faded).toFixed(3),
+                                      torn: +(f.torn || 0).toFixed(5), speck: +(f.speck || 0).toFixed(5),
+                                      clean: +cleanTerm(f.torn).toFixed(3),
                                       toward: +f.toward.toFixed(3), distance: +(f.distance || 0).toFixed(3),
                                       ref: +ref.toFixed(3), score: +f.rendered.toFixed(3)})),
                   topPoses: top.map(f => ({p: f.p, yaw: f.yaw, pitch: f.pitch})),
+                  probe: [w, h],
+                  chosenIndex: best ? top.indexOf(best) : -1,
+                  runnerUpIndex: second ? top.indexOf(second) : -1,
+                  runnerUpPose: second && {p: second.p, yaw: second.yaw, pitch: second.pitch},
+                  // why the winner won, in one number the report can quote
+                  margin: best && second ? +(best.rendered - second.rendered).toFixed(4) : null,
                   chosen: best && {p: best.p, yaw: best.yaw, pitch: best.pitch, drawn: best.drawn,
                                    detail: +(best.detail || 0).toFixed(4),
                                    faded: +(best.faded || 0).toFixed(4),
+                                   torn: +(best.torn || 0).toFixed(5),
+                                   speck: +(best.speck || 0).toFixed(5),
                                    range: +(best.depthSpread || 0).toFixed(2)}};
     return best && {p: best.p.slice(), yaw: best.yaw, pitch: best.pitch};
   }
@@ -3383,6 +3562,7 @@ async function main(){
     const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
     const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
     if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+    barHeight();
   }
   function matrices(cam){
     const V = M.look(cam.eye, cam.at, cam.up || UP);
@@ -3611,12 +3791,18 @@ async function main(){
     S.bound = bound().map(({L, p}) => [L.kf && L.kf.ki, +p.toFixed(3)]);
     $("pos").textContent = !override && cams.length ? (ci + 1) + " / " + cams.length : "";
     if (S.timing.firstFrameMs === undefined && S.layers > 0) S.timing.firstFrameMs = performance.now() - T0;
+    savePose();                      // where he is, for a reload of this tab
   }
 
+  /* The campaign's speckle rule, as this page can afford it: a pixel is a
+     speck when its luma is under half the mean of the drawn pixels around it
+     and that surround is not itself dark. The two numbers are the campaign's
+     (`fixit\candidate\tf2\speckle.py`). */
+  const SPECK_FLOOR = 30 / 255, SPECK_RATIO = 0.5;
   /* How much of a small render of `cam`, at the canvas's own aspect, is DRAWN:
      the mean of the evidence alpha, and the
      mean viewing distance of what is drawn. */
-  function drawnFraction(cam, w, h, content, wantFaded){
+  function drawnFraction(cam, w, h, content, wantFaded, wantClean){
     const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
     const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
@@ -3635,7 +3821,7 @@ async function main(){
     // the review's own measure (FINAL2 §5) at this small size. Spread cannot
     // tell a bright door beside a dark wall (high spread, nothing in it) from
     // the desk; the Laplacian can, so the scores below use `detail`.
-    let spread = 0, detail = 0;
+    let spread = 0, detail = 0, torn = 0, speck = 0;
     if (content){
       drawBlend(cam, MVP, picks, 8, {fb, w, h});
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
@@ -3660,6 +3846,58 @@ async function main(){
         dn++;
       }
       detail = dn ? ds / dn : 0;
+      /* HOW UGLY the frame is, in two ways the score could not see. Both come
+         out of the buffers already read, so they cost no extra render.
+         `torn`: the LENGTH of the boundary between what is drawn and what is
+         not, per frame pixel. `drawn` cannot tell one clean black rectangle
+         from a thousand slivers of the same area; this can, and unlike
+         `detail` -- which REWARDS the same gradients -- it only counts
+         gradient that sits against the void.
+         `speck`: the campaign's speckle rule (luma below half a local median
+         over a surround of at least 30/255) with a box mean for the median,
+         which a summed-area table makes constant time a pixel. */
+      if (wantClean){
+        let tpx = 0;
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++){
+          const k = y * w + x, a = px[k * 4] >= 128;
+          if (x + 1 < w && a !== (px[(k + 1) * 4] >= 128)) tpx++;
+          if (y + 1 < h && a !== (px[(k + w) * 4] >= 128)) tpx++;
+        }
+        torn = tpx / (w * h);
+        const W1 = w + 1, SY = new Float64Array(W1 * (h + 1)), SN = new Float64Array(W1 * (h + 1));
+        for (let y = 0; y < h; y++){
+          let ry = 0, rn = 0;
+          for (let x = 0; x < w; x++){
+            const k = y * w + x, d = px[k * 4] >= 128 ? 1 : 0;
+            if (d){ ry += Y[k]; rn++; }
+            SY[(y + 1) * W1 + x + 1] = SY[y * W1 + x + 1] + ry;
+            SN[(y + 1) * W1 + x + 1] = SN[y * W1 + x + 1] + rn;
+          }
+        }
+        const box = (S, x0, y0, x1, y1) =>
+          S[y1 * W1 + x1] - S[y0 * W1 + x1] - S[y1 * W1 + x0] + S[y0 * W1 + x0];
+        // The campaign's blotch rule is a 41x41 median on a 700-tall frame:
+        // a radius of one thirty-fifth of the height. Scaling the radius with
+        // the probe rather than fixing it in pixels is what keeps the two
+        // measuring the same thing. Swept over the twenty-four candidates of
+        // both builds (`tools\bv_radius.py`): at one eighth the measure is
+        // reading shadows (Spearman 0.42 against the 900x700 blotch) and at
+        // one thirty-fifth it is reading blotch (0.82).
+        const rad = Math.max(2, Math.round(Math.min(w, h) / 35));
+        let sp = 0, sn = 0;
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++){
+          const k = y * w + x;
+          if (px[k * 4] < 128) continue;
+          sn++;
+          const x0 = Math.max(0, x - rad), y0 = Math.max(0, y - rad);
+          const x1 = Math.min(w, x + rad + 1), y1 = Math.min(h, y + rad + 1);
+          const cnt = box(SN, x0, y0, x1, y1);
+          if (cnt < 4) continue;
+          const mean = box(SY, x0, y0, x1, y1) / cnt;
+          if (mean >= SPECK_FLOOR && Y[k] < SPECK_RATIO * mean) sp++;
+        }
+        speck = sn ? sp / sn : 0;
+      }
     }
     // How much of what this view draws the confidence fade takes: mode 11
     // writes the removed area in R and the drawn area in G, so the share is
@@ -3696,7 +3934,7 @@ async function main(){
       depthSpread = dists[Math.floor(dists.length * 0.9)] - dists[Math.floor(dists.length * 0.1)];
     }
     return {drawn: drawn / (w * h), distance: drawn > 0 ? dsum / drawn : 0, spread, detail,
-            depthSpread, faded};
+            depthSpread, faded, torn, speck};
   }
   /* The opening view: the recorded pose whose rendered frame is most DRAWN and
      has the most IN it. Drawn alone opened the page on poses that were 100%
@@ -3713,10 +3951,84 @@ async function main(){
      "nothing" to "the desk" rather than saturating at the first pose. */
   const EMPTY_DETAIL = 0.0574, DETAIL_REF = 0.12;
   function detailTerm(d){ return Math.max(0, Math.min(1, d / DETAIL_REF)); }
-  function openingScore(r){
+  /* WHAT IS BEHIND YOU WHEN THE PAGE OPENS (VISUAL-REVIEW-4 #1).
+     Everything above is about the frame in FRONT of the camera, and a
+     reader's first move is to look round. From the pose the scan chose there
+     is 150 degrees of horizon with nothing in it, where poses 120 and 180 on
+     the same walk have none; over all 198 recorded poses the opening ranked
+     160th by mean horizon support.
+     The 36-bin ring would answer this exactly and cannot be used: the ring
+     needs the support field, and the field is started BY the opening scan
+     (`showFirst` calls `startNav`). What the page has from its first frame is
+     the recorded cameras. SURROUND is the share of the horizon that any
+     recorded camera WITHIN THE TUBE of this pose pointed at -- the directions
+     the wearer photographed from somewhere you could walk to. O(cams) a pose,
+     and against the ring the same ordering: Spearman 0.81 against the size of
+     the dead sector, which is the complaint. It puts the old opening at 175th
+     of 198 and pose 120 at 22nd.
+     A FACTOR, not a filter, with a high floor: a good frame with a poor
+     surround still beats a poor frame with a good one. `osur` overrides the
+     floor in the debug transport.
+     THE FLOOR IS 0.80 BECAUSE 0.55 BOUGHT THE HORIZON WITH THE PICTURE.
+     At 0.55 this shipped an opening that measured better and looked worse, on
+     both viewports, and the numbers said so only if you did not look: at
+     900x700 `drawn` went 98.96 to 98.99 per cent and black 0.86 to 0.29 while
+     the frame went from the shelf, the lit monitor, the keyboard and the door
+     to a top-down close-up of the desk with its underside filling the lower
+     two thirds. At 390x844 -- the size the reviewer actually held -- it went
+     to a dark corner with half the frame in shadow.
+     Swept on the page's own scan tables (`S.opening.scanned` carries every
+     tested pose's score and surround, so the base score is recoverable and the
+     winner re-derivable at any floor: `tools\bv_surfloor.py`, both viewports,
+     21 floors each). The term is BISTABLE on this world: at every floor below
+     0.75 it takes the high-surround pose and pays 8.2 per cent of the opening
+     score for it at 900x700 and 8.6 per cent at 390x844, and at every floor
+     from 0.75 up it takes the best frame and changes nothing. There is no
+     floor at which it both bites and keeps the picture, because on this walk
+     no pose has both -- the best-looking vantage is one the wearer only
+     looked one way from, and every well-surrounded spot is a desk close-up.
+     0.80 keeps it as what the paragraph above always claimed it was: it can
+     separate frames within about six per cent of each other and it cannot buy
+     a materially worse one. On THIS world that means it does not move the
+     opening, and review-4 #1 is therefore NOT fixed here; BESTVIEW.md section
+     6.1 says what would. The mechanism is kept, measured and unit-tested
+     because a world whose walk does stand back will have the tie to break. */
+  const OPENING_SURROUND_FLOOR = Math.max(0, Math.min(1, +(Q.get("osur") ?? 0.80)));
+  let surroundCache = null;
+  function surroundOf(i){
+    if (!cams.length) return 1;
+    if (!surroundCache || surroundCache.length !== cams.length){
+      const n = cams.length, bins = RING_BINS, out = new Float32Array(n);
+      const aspect = canvas.width / Math.max(1, canvas.height) || 390 / 844;
+      // half the DISPLAY frame's horizontal angle: what one look takes in
+      const half = Math.atan(Math.tan(viewFovY(aspect) / 2) * aspect);
+      const span = half * bins / (2 * Math.PI);
+      const yaws = new Float64Array(n);
+      for (let k = 0; k < n; k++) yaws[k] = yawPitchOf([cams[k][3], cams[k][4], cams[k][5]]).yaw;
+      const R2 = NAV.R_MAX * NAV.R_MAX, hit = new Uint8Array(bins);
+      for (let a = 0; a < n; a++){
+        hit.fill(0);
+        for (let b = 0; b < n; b++){
+          const dx = cams[b][0] - cams[a][0], dy = cams[b][1] - cams[a][1], dz = cams[b][2] - cams[a][2];
+          if (dx*dx + dy*dy + dz*dz > R2) continue;
+          const c = yaws[b] * bins / (2 * Math.PI);
+          for (let q = Math.floor(c - span); q <= Math.ceil(c + span); q++)
+            hit[((q % bins) + bins) % bins] = 1;
+        }
+        let s = 0;
+        for (let q = 0; q < bins; q++) s += hit[q];
+        out[a] = s / bins;
+      }
+      surroundCache = out;
+    }
+    return surroundCache[i] ?? 1;
+  }
+  function openingScore(r, i){
     const ref = CONFIG.median_scene_depth || diag * 0.25;
     const wide = Math.max(0, Math.min(1, r.distance / (2.5 * ref)));
-    return r.drawn * (0.85 + 0.15 * wide) * (0.35 + 0.65 * detailTerm(r.detail || 0));
+    const sur = i === undefined ? 1
+      : OPENING_SURROUND_FLOOR + (1 - OPENING_SURROUND_FLOOR) * surroundOf(i);
+    return r.drawn * (0.85 + 0.15 * wide) * (0.35 + 0.65 * detailTerm(r.detail || 0)) * sur;
   }
   /* Sliced for the same reason as `renderSourceDepth` (review 2, P-3): each
      `score` is a small render plus a synchronous readback, and the thirty-odd
@@ -3757,7 +4069,8 @@ async function main(){
         const q = poseOf(i); cam = {p: q.p, yaw: q.yaw, pitch: q.pitch, floor: 1};
         const r = drawnFraction(currentCamera(aspect), w, h, true);
         cam = keepCam; override = keepOverride;      // before any yield
-        seen.set(i, {score: openingScore(r), drawn: r.drawn, distance: r.distance, detail: r.detail});
+        seen.set(i, {score: openingScore(r, i), drawn: r.drawn, distance: r.distance,
+                     detail: r.detail, surround: +surroundOf(i).toFixed(3)});
       }
       return seen.get(i).score;
     };
@@ -3799,7 +4112,9 @@ async function main(){
     if (poseQ.length !== cams.length){ poseQ = new Array(cams.length).fill(-1); poseC = new Array(cams.length).fill(-1); }
     for (const [k, v] of seen){ poseQ[k] = v.drawn; poseC[k] = v.detail || 0; }
     S.opening = {index: best, step, fine, tested: seen.size, score: bestScore,
-                 drawn: b.drawn, distance: b.distance, detail: b.detail, size: [w, h]};
+                 drawn: b.drawn, distance: b.distance, detail: b.detail, size: [w, h],
+                 surround: b.surround, surroundFloor: OPENING_SURROUND_FLOOR,
+                 scanned: Array.from(seen, ([k, v]) => [k, +v.score.toFixed(4), v.surround])};
     return best;
   }
 
@@ -4107,6 +4422,7 @@ async function main(){
   let rescoreTimer = null;
   addEventListener("resize", () => {
     requestDraw();
+    barHeight();                       // the bar wraps; the status line follows it
     const aspect = canvas.width / Math.max(1, canvas.height) || 1;
     if (!scoredAspect || Math.abs(Math.log(aspect / scoredAspect)) < 0.15) return;
     clearTimeout(rescoreTimer);
@@ -4207,7 +4523,8 @@ async function main(){
        + " “Face the room” turns you — without moving you — to the nearest"
        + " photographed direction; the ring, the edge arrow and the dark line do the same."],
       ["The walk",
-       "“Best view” flies to the best-supported vantage near the path; this wearer"
+       "“Best view” flies to the best-supported vantage near the path — the one whose picture is"
+       + " most nearly whole, rather than the one that takes in the most; this wearer"
        + " never stood back from the desk, so it is a view from the desk, not of the whole room."
        + " The arrows step along the recorded walk, far enough each press to get somewhere, passing"
        + " over poses that render badly or show nothing (at most " + NAV.MAX_SKIP + " in a row)."
@@ -4342,7 +4659,7 @@ async function main(){
   S.poseContent = () => poseC.slice();
   S.detailOf = (w = 96) => { const aspect = canvas.width / Math.max(1, canvas.height);
     const hh = Math.max(24, Math.round(w / aspect));
-    return drawnFraction(currentCamera(aspect), w, hh, true, true); };
+    return drawnFraction(currentCamera(aspect), w, hh, true, true, true); };
   // `minSupport` 0 (the default) is what a person can now reach: every
   // direction, from every position in the tube. Pass NAV.T_LO for the
   // support-filtered set the old envelope allowed, so the two are comparable.
@@ -4411,18 +4728,65 @@ async function main(){
   }
   let navStarted = false;
   function startNav(){ if (navStarted) return; navStarted = true; buildNav(); }
+  /* WHERE HE WAS, ACROSS A RELOAD (VISUAL-REVIEW-4 #7). A refresh, or the
+     page's own watchdog after a lost graphics context, put the camera back at
+     the opening and threw away where the reader had walked to. The camera
+     goes in `sessionStorage`, which is the right scope: it survives a reload
+     of THIS tab and reaches no other tab, device or session, and it holds
+     three numbers and a key. Off under `preserve=1` -- the flag that already
+     means "give a verification the settled picture" -- so no capture is
+     answered from a previous capture's camera. Every access is wrapped: a
+     private window, blocked site data or a quota can each throw, and where
+     the reader was is a convenience, not a promise. */
+  const POSE_KEY = "wb-appearance-pose";
+  function poseStoreKey(){
+    return location.pathname + "|" + (CONFIG.appearance_revision || "");
+  }
+  function savedPose(){
+    if (DEBUG && OPT.preserve) return null;
+    try {
+      const v = JSON.parse(sessionStorage.getItem(POSE_KEY) || "null");
+      if (!v || v.k !== poseStoreKey()) return null;
+      if (!Array.isArray(v.p) || v.p.length !== 3 || !v.p.every(Number.isFinite)) return null;
+      if (!Number.isFinite(v.yaw) || !Number.isFinite(v.pitch)) return null;
+      return {p: v.p.slice(), yaw: v.yaw, pitch: v.pitch, floor: 1};
+    } catch (e){ return null; }
+  }
+  let poseSavedAt = -1e9;
+  function savePose(){
+    if (DEBUG && OPT.preserve) return;
+    if (shownAt === null || glideState) return;
+    const now = performance.now();
+    if (now - poseSavedAt < 700) return;
+    poseSavedAt = now;
+    try {
+      sessionStorage.setItem(POSE_KEY, JSON.stringify(
+        {k: poseStoreKey(), p: cam.p.slice(), yaw: cam.yaw, pitch: cam.pitch}));
+    } catch (e){ /* private mode, blocked storage, quota: nothing is owed here */ }
+  }
+  addEventListener("pagehide", savePose);
+
   async function finishOpening(){
     resize();
     // The provisional: the best of the first few candidates, placed and drawn
     // while the rest of the scan runs. This is what takes the cold open's
     // unexplained black stretch from seconds to a fraction of one.
+    const restored = savedPose();
     let shownIndex = -1;
     opening = await chooseOpening(i => {
-      shownIndex = i; ci = i; setPose(poseOf(i)); showFirst();
+      shownIndex = i; ci = i; setPose(restored || poseOf(i)); showFirst();
     });
     ci = opening >= 0 ? opening : 0;
-    if (shownAt === null){ setPose(poseOf(ci)); showFirst(); }
-    else if (opening >= 0 && opening !== shownIndex && !touched){
+    if (shownAt === null){ setPose(restored || poseOf(ci)); showFirst(); }
+    if (restored && !touched){
+      // A reload, and the reader has not asked for anything else: put them
+      // back. `Reset` still goes to the opening, which is why the scan is
+      // still run and `opening` is still set.
+      setPose(restored);
+      if (navPath && navPath.n) ci = NAV.pathDist(navPath, restored.p).index;
+      S.openingKept = "the view this tab was left on";
+      requestDraw();
+    } else if (shownIndex >= 0 && opening >= 0 && opening !== shownIndex && !touched){
       // The scan found a better opening and the reader has not asked for
       // anything: correct to it. A CUT, not a glide -- a glide would leave
       // the page moving under a reader who has not touched it yet, and would
