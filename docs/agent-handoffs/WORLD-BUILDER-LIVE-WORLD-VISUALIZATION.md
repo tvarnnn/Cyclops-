@@ -753,3 +753,93 @@ a dense import failure silently disabling the whole probe, an overclaimed
 test name, and two tests that pass with the fix reverted — all handed back
 for repair.
 
+## Adversarial review round 2 — saved-world API and iOS integration
+
+A second independent reviewer, working from a different angle, reached the
+picker defect by its own route and measured it on a copy of the real world:
+
+```
+status lifecycle : state=finalizing   build_in_progress=True
+GET /worlds row  : state="complete"   live=false   has_geometry=true
+```
+
+`session_state()` in `results/world_builder_library.py` still answers from
+`finalization.state` and the writer lock and knows nothing about the
+stages. The installed app draws that row as **"Complete"**, and
+`WorldPickerView.openedNote` is nil unless the *final solve* denies a
+finished world — so the viewer pushed from that row carries no sentence
+about a build at all. The wearer presses Stop, opens Saved Worlds at +90 s,
+reads "Complete", sees dots, and concludes the walk failed. The same
+misreading as the 02:37 incident, on the other screen.
+
+The remedy is small and needs no iOS build, because the installed binary
+already has the state and the word: `WorldListingSessionState.finalizing`
+exists, `WorldListingPresentation.swift:96` already renders it as
+**"Finishing"**, the row stays tappable because openability keys off
+`has_geometry`, and the picker's own caption already promises the
+transition — *"a 'Finishing' row can become 'Complete' without closing and
+reopening the sheet"*.
+
+Two further findings, both now in repair:
+
+- **`_most_relevant` is also lock-only**, so one payload contradicts itself:
+  `selection: latest` ("nothing is live") beside `lifecycle: finalizing`,
+  `build_in_progress: true`. On iOS `isHistoryOfferedAsLive` then presents
+  the report as **"No world yet"** unless `followedWalk` still names the
+  world — and `followedWalk` stops being refreshed the moment the selection
+  turns `latest`. So an app relaunch during the 8-16 minute build drops the
+  live screen to "No world yet" while the Tower says a build is running.
+- **Both liveness probes fail closed, silently, at DEBUG level**, leaving
+  `build_in_progress_unavailable_reason` — the field that exists to carry
+  exactly this — set to `None`. The reviewer hit it for real: another lane's
+  in-flight edit briefly made `surface.py` raise `NameError` at import, and
+  the Tower would have gone on serving `ready` with nothing saying why. The
+  fix's failure mode is the bug it fixes, which is the worst shape a failure
+  mode can have.
+
+### What round 2 could not break
+
+- **`stages` reaches no served payload — proved, not inferred.** A synthetic
+  `stages` block was written into `session.json` and all four payloads
+  dumped: absent from the status channel pinned and unpinned, from
+  `/worlds`, and from `/render/revision`. No iOS decoder can see it.
+- **A strict transcription of the iOS decoders run against the canonical
+  166-world root: 0 failures.** Contract string, every required world and
+  session field. Listing builds in 0.4 s.
+- All three contract identifiers unchanged; `cross-stack-constants-check.py`
+  passes; the page's four fetch routes match the scheme handler's whitelist
+  byte for byte, and all 31 digests are exactly 32 lower-hex.
+- `refusedRungs` is recoverable and unlikely here: demotion needs an
+  *automatic* upgrade to fail to draw twice, a successful draw clears it, a
+  finished build gets an extra try, and the button that retries forgets
+  every refusal.
+- The revision poller stays at its 10 s floor for the whole build, because
+  `live` comes from the same probe — so the swap lands within ~10 s of each
+  stage publishing.
+
+### Correction to a figure recorded earlier
+
+This handoff earlier stated the phone payload as 6.87 MB (WebP) or 17.75 MB
+(ASTC). Measured properly from the manifest, the phone tier is:
+
+| | measured |
+|---|---|
+| phone ASTC, 8 chunks | **12.54 MiB** |
+| phone WebP, 8 chunks | 2.16 MiB |
+| proxy | 4.39 MiB |
+| page | 282,029 B |
+
+The phone takes **ASTC** (Apple GPUs carry the extension), so resident in
+`WorldAssetMemory` is chunks + proxy = **16.93 MiB against the 64 MiB cap**,
+over 10 requests. The earlier figure had folded in tower-tier chunks the
+phone never fetches. Not a memory risk. The case to watch is a device
+*without* ASTC, where `rgba8_layer_cap = 48` means only 48 of 128 keyframes
+draw.
+
+### Operational warning
+
+The lane worktree was being edited by three agents concurrently during
+these reviews, and `surface.py` was briefly un-importable. **Run the
+physical test from a clean checkout of the merged commit, never from a
+worktree with work in flight.**
+
