@@ -1320,3 +1320,178 @@ remaining fix is the surface stage on flat walls and hanging fabric — not
 more keyframes, and not turning redaction off. The imagery is already there
 for 97–99% of every frame the page draws.
 
+---
+
+# FINAL HANDOFF
+
+Lane `world-builder/live-world-visualization-v1`, 26 commits, merged
+fast-forward into canonical `main` at `46914a0`. Whole Tower suite:
+**4109 passed, 77 skipped, 1 xfailed, 0 failed.**
+
+## 1. What was actually broken
+
+Two things, in sequence, and the second only became visible once the first
+was ruled out.
+
+**The 01:33 walk ran on a Tower that had no photographic code in it.** The
+canonical checkout sat on `869d715` from 2026-09-16 00:51 until 2026-09-22
+01:48:09; the walk ran 01:33-01:40 inside that window, and that tree
+contains no surface, appearance or dense module at all. The merge that
+brought them to `main` landed at 01:48:38 — **eight minutes after the world
+finished**.
+
+**The 02:37 walk ran on the merged code and still showed dots, for a
+different reason: the Tower told you it was finished when it was not.**
+`mark_finalization(COMPLETE)` and `release_world()` run in a `finally`
+block *before* the `--surface` stage. `_lifecycle` decided "a build is in
+progress" from the writer lock alone — and the lock is exactly what that
+ordering gives up. So ninety seconds after Stop the phone said **"Saved"**
+while the photographic build had barely started, you reasonably shut the
+Tower down, and the work died with it. Nothing on disk recorded that it had
+ever been attempted, and nothing would ever have retried it.
+
+## 2. Why the phone kept showing sparse points
+
+Because sparse was the only rung with an artifact, and the ladder is honest.
+Everything above it was already correct and already shipped: the
+appearance / surface / dense / sparse ladder, the `viewer=appearance-1`
+capability iOS already sends on all three request paths, the
+`glasses-world:` scheme handler, the rung captions, the upgrade poller.
+Zero of 165 worlds had ever carried a surface, so the ladder fell to its
+floor every time and captioned it truthfully.
+
+## 3. What changed
+
+| | |
+|---|---|
+| **The lock is not the only evidence a world is building.** `_lifecycle`, `session_state` and `_most_relevant` now all ask the stages, not just the lock, so the status panel, the Saved Worlds row and the revision poll agree. Your installed app already draws **"Improving"** and the note *"it is worth waiting for Saved"* for that state — it was never being triggered. | `44e950f`, `0e0320e` |
+| **The photographic stages leave a record.** `session.json` gains `stages`, so a failed stage is no longer indistinguishable from one never attempted. | `2e38c70`, `aa69144` |
+| **A solve with wild poses builds its room.** Two frames anchored at 1.6e6 units made the block grid unkeyable and the surface refused outright, taking the appearance with it — one failure in two replays of the same walk. Now gated, with a detachment test so a dwelling walk is never mistaken for a diverged solve, and a cap so a collapsed room is refused honestly rather than published as `ok`. | `fd2314d`, `a91fddb` |
+| **Interrupted work is finished, not lost.** A new `world_finish_pending.py`, spawned once at Tower start, completes owed photographic work. It selects by the `status.json` that only `surface_pipeline` writes, so it cannot discover a historical backlog. | `3030e6a`, `c2fc4fa` |
+| **A build the Tower can see is not a timeout.** The appearance page held your images for 20 minutes and then threw them away — inside, not outside, a healthy long build. Now it holds while the Tower says a stage is running. | `64b8319` |
+| **The app stops claiming a lock that was released.** One Swift string plus two comments; structure and cross-stack checks pass. | `85028d3` |
+
+## 4. What you will see
+
+Saved Worlds, then the newest world, then the **appearance** rung: your own
+keyframes blended over the reconstructed room, captioned *"The camera's own
+images, faces redacted, placed on the reconstructed room."* One finger
+orbits, two pinch and pan.
+
+Measured on the closest thing to your next walk (690 keyframes, redacted,
+product path): **about 23 of 40 free-orbit views read as a navigable
+room**, and at your own camera poses the render matches your own
+photographs almost exactly — 41.9% picture-class pixels against 41.3%.
+
+## 5. What happens after you press Stop
+
+Final solve, sparse derived tree, finalization recorded, then **surface
+(~10 min) and appearance (~2.5 min)** — both after the lock is released so
+the phone can read the world meanwhile. Measured: 459 s at 385 keyframes,
+**756 s at 690**. Plan for **twenty minutes**.
+
+Throughout, the phone says **"Improving"**. Wait for **"Saved"**.
+
+## 6. How Saved Worlds chooses the representation
+
+Your phone sends `viewer=appearance-1`; the Tower walks the ladder and
+serves the best rung that session actually has and that your client can
+draw. Verified end to end on a real live world: `representation:
+appearance`, `state: served`, the rung stamped in the page's `meta` tag
+inside the 4096-byte window iOS scans, and the manifest served with
+`X-World-Imagery: redacted`. If you open the world while it is still
+building you get sparse, and it **swaps itself up** as each rung lands —
+sparse to surface to appearance, with no tap. **The view jumps on each
+swap**: the page reloads and the camera resets.
+
+## 7. Tests and replays that passed
+
+- Whole Tower suite **4109 passed / 0 failed** (the `world` selection went
+  from 1715 to 1856).
+- Five-cartridge lifecycle soak: **STABLE, nothing leaked**.
+- The live builder path, twice on a real capture: one run caught the
+  outlier defect, the other produced surface and appearance unaided.
+- **Scale: 690 keyframes** — 1.75x the largest build in this project's
+  history — surface `ok` (2.8M faces, 222,657 on the phone level),
+  appearance `ok`, 12.6 minutes.
+- The finisher, twice, on genuinely interrupted worlds, by both selection
+  paths: 7m56s and 8m23s, unattended, both `ok`.
+- Three worlds rendered through the real routes in headless Chrome and
+  judged on free orbit.
+
+## 8. What independent validators found
+
+Four adversarial reviewers, none of whom wrote the code. They confirmed the
+central results by re-measuring them — including running the lifecycle
+probe against deployed `main` and this branch side by side — and they found
+**seven HIGH defects, all fixed**: the lifecycle fix covered only
+`end_reason: stop` when the ordinary path is `interrupted`; the finisher
+selected 0 of 70 sessions including the very world it was written for;
+booting the Tower and going for a walk would have retired a world
+permanently on the third try; the pose gate deleted 15-45% of real poses on
+dwelling walks; uncapped coarsening could publish a collapsed room as `ok`;
+a 20-minute page constant would have discarded your images mid-build; and
+the app printed a sentence the Tower had deliberately refused to write.
+
+They also corrected **this document** twice: the wait (I said eight
+minutes; it is twenty) and the upgrade behaviour (I said it keeps your
+camera; it does not).
+
+## 9. What remains uncertain
+
+- **One wall did not reconstruct.** On the best world a 30-60 degree arc is
+  97% *no geometry* — missing surface, not missing photographs. The closet
+  rail and an art wall also failed. Flat painted walls and hanging fabric
+  are the surface stage's weakest subjects, and that is the next campaign.
+- **Landscape is a worse product than portrait.** Four of twelve landscape
+  turn views are wall eaten by black blotches.
+- **Page boot took 30 s** on a software renderer for a 222k-face proxy.
+  **Never measured on a phone.** This is the largest untested risk.
+- **The Tower-side spawn of the finisher has never executed live** — no
+  test drives ASGI lifespan. The script itself is verified twice.
+- Quality is judged on three worlds, two rooms, one wearer.
+
+## 10. Exactly what to do
+
+1. The merge is **done** — canonical `main` is at `46914a0`. Confirm with
+   `git -C C:\Users\tvllo\Projects\Glasses log --oneline -1`.
+2. **Restart the Tower** (`tower\scripts\start_tower.ps1`). The editable
+   install points at this checkout, so a running Tower keeps the old
+   modules until it is restarted. On this start it will also
+   **automatically finish your 02:37 world** — it is the one session the
+   finisher selects.
+3. Pre-flight: `python scripts\world_builder_env_check.py`, ten `[OK ]`.
+   Green as of 06:02.
+4. Phone: a **DEBUG** build from `5da13c8` or later. A Release build has no
+   camera and sends no frame.
+5. **Walk three to five minutes.** Move sideways, not just turn — rotation
+   gives the solver no parallax. Stand a couple of metres back from each
+   wall. Face each wall deliberately and sweep slowly. Cross the room and
+   look at things a second time from another angle.
+6. Press Stop. **Wait about twenty minutes.** The phone says "Improving";
+   wait for "Saved". Do not shut the Tower down — and if you do, it now
+   recovers on the next start.
+7. Open Saved Worlds, then the newest world.
+
+## 11. Confidence
+
+**That the pipeline executes and produces a photographic world you can
+open: about 90%.** It has now done so four times on real capture data —
+twice through the real builder unaided, twice through the finisher —
+including once at 1.75x the largest scale ever built here. The two defects
+that could have stopped it are fixed and regression-tested, the deployment
+is done rather than described, and the failure modes that remain are
+recoverable rather than terminal.
+
+**That you look at it and say "that is my bedroom": about 60%.** You will
+recognise your bed, your laptop, your desk and monitor, your keyboard, your
+trainers, the crutches. You will also find a wall that is not there and a
+missing closet. An independent validator put this at 45% and I am one step
+above it, because the scale world it did not see is the best result this
+project has produced and the guidance is now supported by three data points
+rather than two.
+
+**The honest sentence:** *from where you walked it is your room and it is
+your photographs; there is one wall the reconstruction did not get.*
+
+Put the glasses on.
