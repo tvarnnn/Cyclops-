@@ -423,9 +423,26 @@ async function fetchJSON(route, what){
      then draw it (m7: a label change and a rebuild inside one poll). */
 const FOLLOW = (() => {
   const BASE_MS = 10000, CEILING_MS = 120000;
-  // How long the walk's images are kept on screen waiting for the final build.
-  // The final stages run minutes after Stop; past this the page degrades.
-  const HOLD_MAX_MS = 20 * 60 * 1000;
+  // How long the walk's images are kept on screen waiting for the final build,
+  // WHEN NOTHING IS KNOWN TO BE BUILDING. The final stages run minutes after
+  // Stop; past this, with no evidence of work, the page degrades.
+  //
+  // Revised 2026-09-22. This was 20 minutes and it was a wall clock, which is
+  // the wrong instrument: it measured how long the wearer had waited, not
+  // whether the Tower was still working. Measured on this machine, the
+  // photographic stages cost 459 s for a 385-keyframe walk, and the capture
+  // guidance asks for a three-to-five minute walk -- two to three times that
+  // many keyframes, so twenty to thirty minutes of building. The page would
+  // have thrown the wearer's images away in the middle of a healthy build and
+  // told them to close and reopen the world.
+  //
+  // So the hold now expires only when the Tower is NOT saying a build is live.
+  // `body.live` is the same `session_build_running` predicate the status panel
+  // and the picker now answer with, so the page, the panel and the row agree
+  // about the same world. The ceiling stays as the backstop for the case it
+  // was always for -- nothing is building and nothing ever will -- and is
+  // raised to sit above a long walk's honest build rather than inside it.
+  const HOLD_MAX_MS = 45 * 60 * 1000;
   const GONE = /^(no world |world .* has no session )/;
   function decide(poll, page){
     page = page || {};
@@ -445,7 +462,12 @@ const FOLLOW = (() => {
     }
     if (a.state === "rebuilding"){
       const since = page.holdingSince;
-      if (since !== null && since !== undefined && (page.now - since) > HOLD_MAX_MS)
+      // `live === true` means the Tower can SEE a stage running for this
+      // session -- a status file written by a process that is still alive.
+      // Never discard the wearer's images while that is true, however long it
+      // has taken: a long build is the expected shape of a long walk.
+      if (live !== true
+          && since !== null && since !== undefined && (page.now - since) > HOLD_MAX_MS)
         return {action: "drop", live,
                 reason: "The finished world's images did not arrive, so the walk's images were removed. "
                   + "Close and reopen the world to see what it has now."};

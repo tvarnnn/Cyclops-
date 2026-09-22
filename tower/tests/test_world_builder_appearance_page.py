@@ -774,6 +774,30 @@ const gap = {appearance: {revision: null, state: "rebuilding"}};
 assert.strictEqual(FOLLOW.decide({ok: gap}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS}).action, "hold");
 const r = FOLLOW.decide({ok: gap}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS + 1});
 assert.strictEqual(r.action, "drop");
+
+// A BUILD THE TOWER CAN SEE IS NOT A TIMEOUT.
+// The ceiling used to be a wall clock, and it measured how long the wearer
+// had waited rather than whether anything was working. The photographic
+// stages cost 459 s on a 385-keyframe walk and the capture guidance asks for
+// two to three times that many keyframes, so a healthy build can outlast any
+// fixed ceiling. While `live` is true the images stay, however long it takes.
+const building = {live: true, appearance: {revision: null, state: "rebuilding"}};
+assert.strictEqual(
+  FOLLOW.decide({ok: building}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS + 1}).action,
+  "hold", "a live build holds past the ceiling");
+assert.strictEqual(
+  FOLLOW.decide({ok: building}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS * 10}).action,
+  "hold", "and keeps holding, because the ceiling is not the question");
+
+// `live: false` is the case the ceiling is FOR: nothing is building, and
+// nothing is going to.
+const stalled = {live: false, appearance: {revision: null, state: "rebuilding"}};
+assert.strictEqual(
+  FOLLOW.decide({ok: stalled}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS + 1}).action,
+  "drop", "a stalled rebuild still degrades once the ceiling passes");
+assert.strictEqual(
+  FOLLOW.decide({ok: stalled}, {revision: "x", holdingSince: 0, now: FOLLOW.HOLD_MAX_MS}).action,
+  "hold", "but not before it");
 """
 
 FAILED_POLL_SCRIPT = r"""
