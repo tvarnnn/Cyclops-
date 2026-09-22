@@ -463,3 +463,60 @@ now demonstrated on data from a real walk, with one exception: the wearer
 has not yet seen it on the phone, because the build finishes about eight
 minutes after Stop and nothing told them to wait.
 
+## The defect the replay caught, which nothing else would have
+
+`world_replay.py --surface --appearance` — the flag this lane added — was
+pointed at the 02:37 walk's capture and run through the whole builder. It
+failed where the offline build of the same walk had succeeded:
+
+```
+surface: state "unavailable", permanent false, frames_used 0, faces 0
+detail:  "the scene's block coordinates fall outside the keyable range; the
+          SfM gauge is arbitrary and this world's is too large for the
+          chosen voxel fraction"
+```
+
+and because the surface was not `ok`, the appearance never ran.
+
+### Same walk, two solves, two different worlds
+
+| | full point extent | p5–p95 | camera-centre extent | surface |
+|---|---:|---:|---:|---|
+| replay solve | **1,219,893** | 12.91 | **48,905** | **failed** |
+| offline solve | 25.0 | 7.45 | 18.05 | ok |
+
+The global solve is not deterministic, and one run scattered a handful of
+points and poses about 10⁶ units from a room whose robust core is thirteen
+units across. `_scene_scale` is robust — it is a median of sparse
+observation depths — so the voxel stays room-sized; the block grid is then
+asked to key an extent a hundred thousand times too large, and
+`surface.block_key` raises rather than alias two cells together (which it is
+right to do: the dense stage learned that the hard way).
+
+There is already an auto-coarsening path for the `max_blocks` memory limit.
+There is none for the key-range limit. That asymmetry is the bug.
+
+### The outliers are a separable minority
+
+| | within 10× median radius | outliers |
+|---|---:|---:|
+| points (15,832) | **98.11%** | 227 beyond 100 units |
+| cameras (379) | **97.63%** | 9 beyond 100 units (worst 53,027) |
+
+So the reconstruction is 98% sound. Rejecting nine bad poses and a couple
+of hundred stray points recovers the whole bedroom.
+
+### How often this happens
+
+Across all eleven solved sessions in the canonical store, the ratio of full
+extent to robust (p5–p95) extent: nine sit between 2.0× and 7.3×, one at
+19.1×, one at 126.2×. Only an extreme case overruns the key range, and the
+replay produced one from the same capture that had solved cleanly minutes
+earlier. **A mild inflation is normal and must keep working unchanged; the
+fix must be robust without being aggressive.**
+
+This is the finding that most threatens the next physical test, and it was
+invisible to every other instrument: the offline build succeeded, the tests
+passed, the serving contract verified. Only replaying the real walk through
+the real builder exposed it.
+
