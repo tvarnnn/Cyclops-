@@ -57,6 +57,96 @@ Per session:
 | `keyframes_journaled` | int | Lines in the keyframe journal. On a record that never stopped `keyframes_accepted` is still the zero written at start; this is what actually landed (467 on the 09-06 walk against a recorded 0). Show this when the two disagree. Additive (2026-09-06) |
 | `finalization` | object \| null | The builder's own record of what happened after the session stopped: `{state: pending\|complete\|interrupted, final_solve: pending\|solved\|skipped\|failed\|unavailable\|null, started_at, updated_at, detail}`. `null` on records written before 2026-09-06 and on sessions that never stopped. Additive (2026-09-06) |
 | `appearance` | object \| null | **The appearance artifact, reported as the imagery it is** (additive, 2026-09-17, review 1 m6): `{format, state: served\|rebuilding\|withdrawn, quality, keyframes, keyframes_phone, bytes, redaction, redaction_effective, label_trusted, keyframe_image_set, privacy_tags, retains_raw_imagery, imagery, retention}`. `state` is `APPEARANCE.md` §9's: whether the routes serve it now. `redaction` is the label it was built under and `redaction_effective` what was applied; `imagery` says *first-person keyframe imagery of a private space; best-effort face redaction with measured false negatives; not anonymised*; `retention` says it is kept with the world until rebuilt or purged. No URL, id or path: the page reaches it through §4b only. `null` when the session has none |
+| `photographic` | object | **Where this session's photographic representation — the image-based room, which is the final user-facing output — has got to** (additive, 2026-09-22): `{state, stage: "surface"\|"appearance"\|null, detail}`. `state` is one word from a closed vocabulary: `complete`, `running`, `owed`, `failed`, `unattempted`, `never_recorded`, `unobservable`. The same block the status payload carries (`CARTRIDGE-RESULTS.md`, `lifecycle.photographic`), computed from the same helper, so a phone that reads the row and then opens the panel reads one fact and not two. §2a says what each word means, which of them move `state` and which do not, and why `failed` does not. **Always present on this listing**, unlike the status channel's `lifecycle.photographic`, which is null when the lifecycle was computed from the record alone: a row is built for every session, and a row with no answer is a row that keeps saying `complete`, which is the failure being fixed. A probe that cannot answer yields the `unobservable` WORD, never a missing block |
+
+## 2a. `photographic` — whether the room the wearer walked actually exists
+
+Added 2026-09-22. `state` (above) is a word about the **session**: what
+happened to the capture and the solve. It cannot hold what happened
+**after** them, and the picker used to decide that from a present-tense
+probe — *is a photographic stage running this millisecond*. The Mac/iOS
+validation of 2026-09-22 caught that being the wrong question (finding T3):
+a stage that **failed** is not running, a stage that is **owed** is not
+running, and a probe that **broke** reported not running, so all three read
+`complete` in the picker. The one thing that knew better, `session.stages`,
+was read by `scripts/world_finish_pending.py` — the tool that builds the
+missing work — and by nothing on the wire. The picker is the surface a
+person chooses a walk from and then shuts the Tower down.
+
+This block answers the settled question instead: *does this world still owe
+a photographic room*. It is computed from the session's own stage record
+first and the stages' own artifacts second — the same two signals, in the
+same order, that `world_finish_pending.assess()` uses — so the tool that
+BUILDS the missing work and the channel that REPORTS it cannot disagree
+about which worlds are missing it, and so the answer is true across the gaps
+between stages rather than false in them.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | one of the seven words below | never null when the block is present |
+| `stage` | `"surface"`, `"appearance"`, or null | the stage the word is about |
+| `detail` | string | prose; safe to show, names no path |
+
+| `state` | Meaning | the session's `state` |
+|---|---|---|
+| `complete` | the appearance stage finished; the photographic room exists | unchanged (`complete` on an ordinary walk) |
+| `running` | a stage is running under a live process | `finalizing` |
+| `owed` | unfinished, nothing working on it; the Tower finishes owed work at its next start | `finalizing` |
+| `failed` | a stage ran and failed. **Terminal** — nothing more is coming | unchanged (`complete`): the world is saved, at whatever rung it reached |
+| `unattempted` | the stages declined (no global solve, or the Tower's appearance setting is off) | unchanged |
+| `never_recorded` | a world from before the photographic stages existed | unchanged |
+| `unobservable` | the probe could not answer | `finalizing` |
+
+**Why three of these change the row's word and four do not.** The three that
+do (`running`, `owed`, `unobservable`) all mean "this world is not finished
+being made", and a world in any of them must never be reported finished —
+that was the false **Saved** the 2026-09-22 validation found at the stage
+boundaries (T2), over a failed build (T3), and after a broken probe (T4).
+The four that do not are settled: `complete` is finished, `failed` is
+finished badly, and `unattempted` / `never_recorded` are worlds that were
+never going to have one. Reporting a settled world as `finalizing` would be
+the opposite failure — a wearer left waiting forever for a build that is not
+coming.
+
+**Why `failed` keeps `complete`, which is the one judgement call here.** The
+world **is** saved and opens at whatever rung it reached: `finalization.state`
+is `complete`, `final_solve` is `solved`, the derived tree is on disk and the
+render route (§4) serves it. What failed is the photographic room on top of
+it. `finalizing` would tell the wearer to wait, and waiting does not fix a
+stage that ran and raised — `world_finish_pending.py` picks up the
+INTERRUPTED stages at the next Tower start, not the failed ones.
+`interrupted` was the other tempting answer and it is worse: it is defined
+above as a claim about the CAPTURE and the SOLVE, both of which succeeded
+here, so it would tell the wearer their walk was lost. The word never claims
+photographic success, because the word was never about the photographic
+room. This block is, and it says `failed`, with `detail` carrying the reason.
+
+**`never_recorded` is load-bearing for compatibility.** 165 of the 166
+worlds on the development Tower were built by a Tower with no photographic
+stages at all. They are finished, they are owed nothing, and their rows are
+unchanged. It is reached only when there is NO stage record AND no stage
+artifact on disk, and it is decided **without** consulting the liveness
+probe — so a probe that breaks cannot relabel all of them at once. The
+distinction is sound in both directions because `world_build_session.py`
+records the surface stage BEFORE it releases the world lock: absent means
+old, not "new and early".
+
+**The row and the panel are one answer to one question.** Both are computed
+from `tower/tower/world_builder/photographic.py`, and
+`test_the_row_and_the_panel_agree_about_every_photographic_state` pins that
+for every word in the vocabulary. A row saying `interrupted` over a panel
+saying `ready` is exactly the picker/panel disagreement that test exists to
+stop, and it is the second reason `failed` falls through to the settled arms.
+
+**Additive, and the contract identifier deliberately does not move.** iOS
+reads these rows key by key out of a `[String: Any]`, so a key it does not
+know is a key it never looks at — but it equality-tests `contract`, and a
+bump would empty the gallery (see `state` above). An app that ignores this
+block still behaves correctly; it simply hears `finalizing` where it used to
+hear a false `complete`. What the block adds is the ability to be specific,
+and the one case worth new copy is `failed`: *Saved — the photographic
+version could not be built*. `WORLD-BUILDER-IOS.md` §3a is the phone's side
+of the same block.
 
 ## 3. Rules
 

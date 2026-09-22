@@ -63,6 +63,16 @@ from tower.world_builder.store import (
 
 logger = logging.getLogger(__name__)
 
+# The settled photographic vocabulary, imported at module scope because it
+# is a tuple of strings: `tower.world_builder.photographic` pulls in nothing
+# heavy at import time, and the two probes it uses are themselves imported
+# lazily inside it.
+from tower.world_builder.photographic import (  # noqa: E402
+    PHOTOGRAPHIC_OWED,
+    PHOTOGRAPHIC_UNOBSERVABLE,
+    is_unsettled,
+)
+
 # Lifecycle, named for the evidence rather than for an intention. Tower
 # cannot see a process's intent; it can see a lock, a journal and a
 # manifest.
@@ -1472,8 +1482,45 @@ def _photographic_build_evidence(store, world_id, session_id):
     return None, None
 
 
+def _photographic_state_or_none(store, world_id, session_id, session):
+    """`photographic_state`, wrapped so the status channel cannot be broken by it.
+
+    Imported and called at request time, like every other probe in this
+    module, and every failure becomes the `unobservable` WORD rather than an
+    exception. This function is on the 2 Hz status path: a traceback here
+    would take out the whole payload, and the payload is how the wearer
+    learns anything at all.
+    """
+    if store is None or world_id is None or session_id is None:
+        # THE SAME GUARD `_photographic_build_evidence` MAKES, and for the
+        # same reason: `_lifecycle` takes these three as optional, and a
+        # caller that asked only about the record gets only the record. An
+        # absent store is not a broken probe -- turning it into
+        # `unobservable` would make every such caller report "Improving",
+        # which is the second of the two failures this fix has to avoid.
+        return None
+    try:
+        from tower.world_builder.photographic import (  # noqa: PLC0415
+            photographic_state,
+        )
+
+        return photographic_state(store, world_id, session_id, session)
+    except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+        detail = client_safe_reason(exc)
+        _warn_probe_failure(
+            f"[Tower][WorldBuilder] the photographic state could not be "
+            f"computed ({detail}); this world will not be reported finished"
+        )
+        return {
+            "state": PHOTOGRAPHIC_UNOBSERVABLE,
+            "stage": None,
+            "detail": f"the photographic state could not be computed: {detail}",
+        }
+
+
 def _still_building(base: dict, building: str | None,
-                    unobservable: str | None = None) -> dict:
+                    unobservable: str | None = None,
+                    photographic: dict | None = None) -> dict:
     """The settled answer, corrected by the one present-tense fact it cannot see.
 
     A SETTLED WORD AND A PRESENT-TENSE CLAIM ARE DIFFERENT QUESTIONS, and
@@ -1513,17 +1560,66 @@ def _still_building(base: dict, building: str | None,
     record of the final SOLVE, and the photographic stages are a different
     fact.
     """
+    photographic = photographic or {}
+    photo_state = photographic.get("state")
+    # THE BLOCK TRAVELS ON EVERY ANSWER, settled or not. T3 was not that the
+    # Tower computed the wrong photographic state -- it never computed one at
+    # all, and `session.stages` was read by `world_finish_pending.py` and by
+    # nothing on the wire. A phone cannot tell "the photographic build
+    # failed" from "the photographic room is ready" unless somebody sends it
+    # the difference.
+    base = {**base, "photographic": photographic} if photographic else base
+
     if building is None:
-        if unobservable is None:
-            return base
-        # THE PROBE BROKE, AND A BROKEN PROBE IS NOT AN ANSWER. `False` here
-        # would be the pre-fix claim -- "no build is running" -- asserted on
-        # no evidence, which is how this fix would quietly become the bug it
-        # fixes. `None` plus a reason is what those two fields are for.
+        # T2 AND T4, AND THEY ARE THE SAME FIX. `building` is a present-tense
+        # fact about a PROCESS and it is false in both of the gaps between
+        # the photographic stages; `photo_state` is a settled fact about the
+        # WORLD and it is true across them. A world that still owes a
+        # photographic room is not "Saved" merely because no process happens
+        # to be mid-stage in the instant this poll arrived.
+        if not is_unsettled(photo_state):
+            if unobservable is None:
+                return base
+            # A probe broke but the record is settled enough to answer
+            # without it (`complete`, `failed`, `never_recorded`). Carry the
+            # caveat and keep the settled word: promoting THIS to Improving
+            # is how a broken probe would park 165 historical worlds on
+            # "Improving" forever, which the brief forbids as plainly as it
+            # forbids the false "Saved".
+            return {
+                **base,
+                "build_in_progress": None,
+                "build_in_progress_unavailable_reason": unobservable,
+            }
+        owed_reason = photographic.get("detail") or "the photographic build is unfinished"
         return {
             **base,
-            "build_in_progress": None,
-            "build_in_progress_unavailable_reason": unobservable,
+            # NOT merely `build_in_progress`. iOS reaches "Improving" from
+            # `finalizing`; `finalized` with the boolean set still renders
+            # "Saved", so flipping the boolean alone would fix nothing a
+            # wearer can see. The same note the `building` arm below makes.
+            "state": LIFECYCLE_FINALIZING,
+            "evidence": f"{base['evidence']}, and {owed_reason}",
+            "reason": (
+                "this world does not have the photographic representation it "
+                "is owed yet: " + owed_reason + ". The Tower finishes owed "
+                "photographic work at its next start"
+                if photo_state == PHOTOGRAPHIC_OWED else
+                "whether the photographic build for this world is still "
+                "running could not be determined, so this world is not "
+                "reported as finished: " + owed_reason
+            ),
+            # `False` for OWED (nothing IS in progress, and saying otherwise
+            # would be a second lie), `None` for UNOBSERVABLE (not known).
+            "build_in_progress": (
+                None if photo_state == PHOTOGRAPHIC_UNOBSERVABLE else False
+            ),
+            "build_in_progress_unavailable_reason": (
+                unobservable or (
+                    owed_reason
+                    if photo_state == PHOTOGRAPHIC_UNOBSERVABLE else None
+                )
+            ),
         }
     settled = base.get("reason")
     return {
@@ -1591,7 +1687,16 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
     building, unobservable = _photographic_build_evidence(
         store, world_id, session_id
     )
-    return _still_building(base, building, unobservable)
+    # The settled half of the same question. `_photographic_build_evidence`
+    # answers "is a process working right now" and names the pid, which is
+    # the better sentence when one IS; `photographic_state` answers "does
+    # this world still owe a photographic room", which is the question the
+    # wearer is actually asking and the one that survives the gaps between
+    # stages. Both, because each says something the other cannot.
+    photographic = _photographic_state_or_none(
+        store, world_id, session_id, session
+    )
+    return _still_building(base, building, unobservable, photographic)
 
 
 def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,

@@ -701,6 +701,57 @@ record written before 2026-09-06 or a session that never stopped.
 > It is `false` while `receiving` and in every `interrupted` state, where
 > the lock's holder is known to be gone.
 
+**`lifecycle.photographic`** — added `2026-09-22`; **`null`** when the
+lifecycle was computed from the record alone (no world store in hand), and
+on the arms that read a live writer lock.
+
+Where the world's PHOTOGRAPHIC representation -- the image-based room, which
+is the final user-facing output -- has got to. `build_in_progress` answers
+"is a process working this millisecond"; this answers "does this world still
+owe a photographic room", which is the question the wearer is asking and the
+one that survives the gaps between stages.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | one of the seven words below | never null when the block is present |
+| `stage` | `"surface"`, `"appearance"`, or null | the stage the word is about |
+| `detail` | string | prose; safe to show, names no path |
+
+| `state` | Meaning | `lifecycle.state` |
+|---|---|---|
+| `complete` | the appearance stage finished; the photographic room exists | unchanged (`ready` on an ordinary walk) |
+| `running` | a stage is running under a live process | `finalizing` |
+| `owed` | unfinished, nothing working on it; the Tower finishes owed work at its next start | `finalizing` |
+| `failed` | a stage ran and failed. **Terminal** -- nothing more is coming | unchanged (`ready`): the world is saved, at whatever rung it reached |
+| `unattempted` | the stages declined (no global solve, or the Tower's appearance setting is off) | unchanged |
+| `never_recorded` | a world from before the photographic stages existed | unchanged |
+| `unobservable` | the probe could not answer | `finalizing`, with `build_in_progress: null` |
+
+> **Why three of these change `lifecycle.state` and four do not.** The three
+> that do (`running`, `owed`, `unobservable`) all mean "this world is not
+> finished being made", and a world in any of them must never read `ready` --
+> that was the false **Saved** the 2026-09-22 Mac/iOS validation found at the
+> stage boundaries (T2), over a failed build (T3), and after a broken probe
+> (T4). The four that do not are settled: `complete` is finished, `failed` is
+> finished badly, and `unattempted` / `never_recorded` are worlds that were
+> never going to have one. Reporting a settled world as `finalizing` would be
+> the opposite failure -- a wearer left waiting forever for a build that is
+> not coming -- so `failed` keeps its `ready` and tells the truth in this
+> block instead.
+
+> **`never_recorded` is load-bearing for compatibility.** 165 of the 166
+> worlds on the machine this was written for were built by a Tower with no
+> photographic stages at all. They are finished, they are owed nothing, and
+> they keep reading `ready`/`finalized` exactly as before. It is reached only
+> when there is NO stage record AND no stage artifact on disk, and it is
+> decided **without** consulting the liveness probe -- so a probe that breaks
+> cannot relabel all of them at once.
+
+> **Additive.** iOS decodes this payload with `JSONSerialization`
+> dictionaries and ignores unknown keys, so a client that does not read
+> `photographic` behaves exactly as it did before -- except that it now hears
+> `finalizing` where it used to hear a false `finalized`.
+
 **`progress`** — or `null` with no session.
 
 | Field | Type | Notes |

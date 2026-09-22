@@ -196,17 +196,41 @@ def test_every_photographic_stage_counts(finalized_world, stage):
 
 
 def test_a_status_left_behind_by_a_dead_process_is_not_a_build(finalized_world):
-    """`status_is_stale` exists for this. A Tower killed mid-surface leaves
-    `running` on disk forever, and a permanent "Improving" is the same lie
-    pointing the other way."""
+    """A dead process is not a BUILD -- and the world is still OWED one.
+
+    THIS ASSERTION CHANGED ON 2026-09-22, deliberately, and the reason is
+    that the premise underneath it stopped being true.
+
+    When it was written there was nothing in the Tower that retried an
+    interrupted photographic stage, so `running` left behind by a killed
+    Tower really did mean "forever", and `ready` was the lesser of two
+    lies. `scripts/world_finish_pending.py` now finishes exactly this
+    signature at the next Tower start, and the attempt ledger retires it to
+    `failed` if three starts cannot -- so the state is recoverable and
+    bounded, not permanent.
+
+    What it must NOT read as is Saved. This is the exact on-disk shape of
+    world `2f44716237544569b5f2faf782d9f877`, the interrupted 02:37 walk,
+    and the Mac/iOS validation judged "Improving" the honest word for it
+    while sparse points were on screen (§3, "Case B honest"). Saying
+    `ready` here is T2 and T3 together: a world that owes a photographic
+    room reported as one that has it.
+
+    `build_in_progress` stays False, because nothing IS in progress -- the
+    distinction the `photographic` block carries and the boolean cannot.
+    """
     store, world_id, session_id = finalized_world
     _write_status(store, world_id, session_id, "surface",
                   state="running", pid=_dead_pid(), updated_at=time.time())
 
     lifecycle, payload = _lifecycle_of(store, world_id, session_id)
-    assert lifecycle["state"] == LIFECYCLE_READY
+    assert lifecycle["state"] == LIFECYCLE_FINALIZING
+    # Owed, not running: no process is working on it this instant, and the
+    # Tower must not imply one is.
     assert lifecycle["build_in_progress"] is False
-    assert payload["model_state"] == MODEL_STATE_FINALIZED
+    assert lifecycle["photographic"]["state"] == "owed"
+    assert lifecycle["photographic"]["stage"] == "surface"
+    assert payload["model_state"] == MODEL_STATE_FINALIZING
 
 
 def test_a_stage_that_has_already_published_its_manifest_is_not_a_build(
@@ -550,14 +574,47 @@ def test_the_saved_worlds_row_agrees_with_the_panel(derived_world, end_reason):
     )
 
 
-def test_the_saved_worlds_row_is_unchanged_when_nothing_is_running(
+def test_the_saved_worlds_row_follows_the_panel_onto_an_owed_world(
     finalized_world,
 ):
+    """The listing moved with the panel on 2026-09-22, and had to.
+
+    The third of this file's assertions to change with the interrupted-stage
+    rule (see `test_a_status_left_behind_by_a_dead_process_is_not_a_build`
+    for the full reasoning). A `running` status under a DEAD pid on a session
+    with no stage record is the exact on-disk shape of world
+    `2f44716237544569b5f2faf782d9f877` -- an interrupted photographic stage
+    that `scripts/world_finish_pending.py` recovers at the next Tower start.
+
+    The row said `complete` for it, which is the Saved Worlds half of T3.
+    What makes this safe rather than a relabelling of the 165 historical
+    worlds is that those have no stage artifact at all: a
+    `surface/<session>/status.json` is written by the pipelines and by
+    nothing else, so it cannot appear on a Tower that never ran the stage.
+
+    Before the row moves, and after, the two surfaces AGREE -- which is the
+    property `test_the_picker_and_the_panel_agree_about_every_session`
+    exists to defend, and the reason this test asserts both.
+    """
     store, world_id, session_id = finalized_world
+    # Nothing on disk about a photographic stage: the historical shape, and
+    # it still reads complete.
     assert _row(store, world_id, session_id)["state"] == "complete"
+    assert _lifecycle_of(store, world_id, session_id)[0]["state"] == (
+        LIFECYCLE_READY
+    )
+
     _write_status(store, world_id, session_id, "surface",
                   state="running", pid=_dead_pid(), updated_at=time.time())
-    assert _row(store, world_id, session_id)["state"] == "complete"
+
+    row = _row(store, world_id, session_id)
+    lifecycle, _ = _lifecycle_of(store, world_id, session_id)
+    assert row["state"] == "finalizing"
+    assert lifecycle["state"] == LIFECYCLE_FINALIZING, (
+        "the picker row and the panel disagree about the same session"
+    )
+    assert row["photographic"]["state"] == "owed"
+    assert lifecycle["photographic"] == row["photographic"]
 
 
 def test_the_saved_worlds_row_still_says_receiving_while_the_lock_is_held(
@@ -670,13 +727,31 @@ def test_the_selection_does_not_call_a_building_world_history(finalized_world):
     assert "photographic" in payload["selection"]["reason"]
 
 
-def test_the_selection_is_unchanged_when_nothing_is_running(finalized_world):
+def test_an_owed_world_is_selected_and_says_so(finalized_world):
+    """The companion to the test above, and it changed for the same reason.
+
+    The SELECTION word is deliberately unchanged. `finalizing` as a
+    selection mode means "a live builder holds this world's lock", and none
+    does here -- the stage was interrupted and nothing has picked it up
+    yet. The world is still the one offered, because it is the newest;
+    `latest` is the honest reason for that and `finalizing` would not be.
+
+    What DID change is the lifecycle beside it: the world is unfinished, it
+    owes a photographic room, and it no longer reports `ready`. The two
+    answering different questions is the point -- `WORLD-BUILDER-WORLDS.md`
+    already records that the selection and the lifecycle may disagree.
+    """
     store, world_id, session_id = finalized_world
     _write_status(store, world_id, session_id, "surface",
                   state="running", pid=_dead_pid(), updated_at=time.time())
     payload = _unpinned(store)
     assert payload["selection"]["mode"] == SELECTION_LATEST
-    assert payload["lifecycle"]["state"] == LIFECYCLE_READY
+    assert payload["lifecycle"]["state"] == LIFECYCLE_FINALIZING
+    assert payload["lifecycle"]["build_in_progress"] is False
+    assert payload["lifecycle"]["photographic"]["state"] == "owed"
+    assert "a live builder holds" not in payload["selection"]["reason"], (
+        payload["selection"]["reason"]
+    )
 
 
 # -- a broken probe must say so, not quietly answer "Saved" -----------------

@@ -156,6 +156,7 @@ cannot carry:
 | keyframe images | **The Tower does not send them, on any channel.** `retains_raw_imagery` stays true Tower-side; no byte of imagery crosses to iOS, redacted or not |
 | `progress.frames_observed` | Null while live and genuinely unknowable — an ordinary rejected frame writes no journal event |
 | `lifecycle.build_in_progress` | `null` in every stopped state, and null means **unobservable**, not `false` |
+| `lifecycle.photographic` | Added `2026-09-22`. **Optional to read, and the app is correct without it** — the states that matter already move `lifecycle.state`. Read it to say *why* a world is still Improving, or to distinguish a Saved world whose photographic build FAILED from one that has the room. §3a |
 | `artifacts.*`, `session.retains_raw_imagery` | Real and honest, but no iOS surface asks the question yet. See §6 |
 
 ---
@@ -213,6 +214,49 @@ of this session"* on top of 1,347 points and 4 camera poses.
 A client that switches on `model_state` needs no change. A client that
 switches on `lifecycle.state` and assumes the old projection should read
 `geometry.element_count` and `trajectory.pose_count` beside it.
+
+
+---
+
+## 3a. `photographic` — whether the room the wearer walked actually exists
+
+`lifecycle.photographic` (added `2026-09-22`, full table in
+[`CARTRIDGE-RESULTS.md`](CARTRIDGE-RESULTS.md)) answers a different question
+from `build_in_progress`. The boolean is present tense — *is a process
+working this millisecond* — and it is **false in the gaps between the
+photographic stages**, which is how a wearer could be told **Saved** twice: once
+at the surface/appearance boundary, and once for good at the end.
+`photographic.state` is settled: *does this world still owe a photographic
+room*.
+
+The rule the Tower now applies, so the phone does not have to:
+
+- `running`, `owed`, `unobservable` → `lifecycle.state` is **`finalizing`**.
+  The world is not finished being made. `model_state` is `finalizing`, and
+  the existing Improving copy is correct for all three.
+- `complete`, `failed`, `unattempted`, `never_recorded` → `lifecycle.state`
+  is whatever it always was. These are settled; a world in one of them is
+  not waiting for anything.
+
+**So an app that ignores this block still behaves correctly** — it simply
+hears `finalizing` where it used to hear a false `finalized`. What the block
+adds is the ability to be specific:
+
+- `owed` — "still to be finished; the Tower will pick it up" rather than a
+  spinner implying work is happening right now (`build_in_progress` is
+  `false`, honestly, in this state).
+- `failed` — the one case worth new copy. The world **is** saved and opens at
+  whatever rung it reached, but the photographic room will not arrive.
+  Presenting it as plain "Saved" is the T3 defect; presenting it as
+  "Improving" would strand the wearer waiting forever. Something like
+  "Saved — the photographic version could not be built" is the honest
+  middle, and `detail` carries the reason.
+- `never_recorded` — a world from before the photographic stages existed.
+  **Must keep rendering exactly as today**: 165 of the 166 worlds on the
+  development Tower are these, they are finished, and nothing about them
+  changed.
+
+`stage` names `surface` or `appearance` when the word is about one.
 
 ## 3.1 `selection`: whose world is on the wire
 

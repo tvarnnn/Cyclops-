@@ -21,6 +21,15 @@ import math
 import os
 
 from tower.world_builder.records import FINAL_SOLVE_SOLVED, FINALIZATION_COMPLETE
+# The settled photographic vocabulary, at module scope for the same reason
+# `results/world_builder.py` imports it at module scope: `photographic`
+# pulls in nothing but `records`, which this module already imports on the
+# line above, so it costs no import graph. The PROBES inside it are the
+# expensive part and they are imported at call time, there.
+from tower.world_builder.photographic import (
+    PHOTOGRAPHIC_UNOBSERVABLE,
+    is_unsettled,
+)
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
@@ -224,25 +233,72 @@ def _photographic_build_running(store: WorldStore, world_id: str,
             store, world_id, session_id
         )
         if unobservable is not None:
-            # The probe reports its own failure and warns once; a listing row
-            # is one word with nowhere to carry a caveat, so it keeps the
-            # settled word. The status payload carries the caveat, in
-            # `build_in_progress_unavailable_reason`.
             logger.debug("[Tower][Worlds] %s/%s: %s", world_id, session_id,
                          unobservable)
         return evidence is not None
     except Exception:  # noqa: BLE001 -- a liveness probe must not 500 a listing
-        logger.warning(
-            "[Tower][Worlds] photographic build probe raised for %s/%s; this "
-            "row keeps its settled word and may say 'complete' over a world "
-            "that is still being built",
+        # FAILING OPEN IS SAFE HERE NOW, AND IT WAS NOT BEFORE. This used to
+        # be the row's only source of "something is still working on it", so
+        # `False` was a row saying `complete` over a world mid-build -- the
+        # warning that stood here said exactly that about itself. The row's
+        # authority is now `_photographic_state_for_row`, which answers from
+        # the RECORD and turns its own probe failures into the
+        # `unobservable` WORD rather than into silence. So a raise here only
+        # loses the sharper present-tense sentence, never the correction.
+        logger.debug(
+            "[Tower][Worlds] photographic build probe raised for %s/%s; the "
+            "row's word comes from the settled photographic state instead",
             world_id, session_id, exc_info=True,
         )
         return False
 
 
+def _photographic_state_for_row(store: WorldStore, world_id: str,
+                                session_id: str, session) -> dict:
+    """Where this session's photographic room has got to -- THE ROW'S AUTHORITY.
+
+    `tower.world_builder.photographic.photographic_state`, wrapped exactly
+    as `results/world_builder._photographic_state_or_none` wraps it, and for
+    the same reason: one module answers the question, two surfaces ask it,
+    and neither may be taken down by it.
+
+    WHY THIS REPLACED THE PRESENT-TENSE PROBE AS THE AUTHORITY. The row used
+    to be decided by `_photographic_build_running` alone -- "is a stage
+    running this millisecond" -- and the Mac/iOS validation of 2026-09-22
+    (§7, T3) caught all three ways that is the wrong question, on THIS
+    surface: a stage that FAILED is not running, a stage that is OWED is not
+    running, and a probe that BROKE reported not running. All three read
+    `complete` in the picker, which is the surface a person chooses a walk
+    from and then shuts the Tower down. `photographic_state` answers the
+    settled question instead, from the session's own stage record first, so
+    it is true across the gaps between stages and it cannot be flipped by a
+    broken probe.
+
+    Never raises, and never returns None: a row with no answer is a row that
+    keeps saying `complete`, which is the failure being fixed.
+    """
+    try:
+        from tower.world_builder.photographic import (  # noqa: PLC0415
+            photographic_state,
+        )
+
+        return photographic_state(store, world_id, session_id, session)
+    except Exception:  # noqa: BLE001 -- reported, never swallowed
+        logger.warning(
+            "[Tower][Worlds] the photographic state could not be computed "
+            "for %s/%s; this row will not be reported finished",
+            world_id, session_id, exc_info=True,
+        )
+        return {
+            "state": PHOTOGRAPHIC_UNOBSERVABLE,
+            "stage": None,
+            "detail": "the photographic state could not be computed",
+        }
+
+
 def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
-                  still_building: bool = False) -> str:
+                  still_building: bool = False,
+                  photographic: dict | None = None) -> str:
     """One word for what a session IS, from the record, the lock and the tree.
 
     Mirrors `_lifecycle` in the status producer for the facts a listing
@@ -257,6 +313,22 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
     as `live` and `has_geometry` are, so this stays a pure function of what
     it is told and the direct callers in `test_world_builder_finalize_cli`
     keep working unchanged.
+
+    `photographic` is the SETTLED half of the same question, and it is the
+    authority -- `still_building` is kept beside it, not replaced by it, for
+    exactly the reason `_still_building` in the status producer keeps both:
+    "is a process working right now" and "does this world still owe a
+    photographic room" are different facts, and each says something the
+    other cannot. `still_building` is true in the middle of a stage and
+    false in the gaps between them; `is_unsettled(photographic["state"])` is
+    true across the whole of it, including the gaps, including a stage that
+    was abandoned, and including a probe that broke. Either one means
+    `finalizing`.
+
+    Both are `None`/`False`-able so this stays a pure function of its
+    arguments; an absent `photographic` means "nobody asked", which is what
+    the direct callers in `test_world_builder_finalize_cli` do, and is NOT
+    the same as `never_recorded`.
 
     `manifest` is the fact that made the sentence above true. Without it
     the last line read `complete if has_geometry else unbuilt`, and
@@ -288,8 +360,52 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
     # "stopped, and something is still finishing it", which is exactly true
     # here -- the lock arm above says the same thing about the same session a
     # few minutes earlier, when the lock was still held.
-    if still_building:
+    photo_state = (photographic or {}).get("state")
+    if still_building or is_unsettled(photo_state):
+        # `is_unsettled` BESIDE the present-tense probe, and above every
+        # settled arm, exactly where `_still_building` puts the same test in
+        # the status producer. `running`, `owed` and `unobservable` are the
+        # three words in it and none of them is a world a wearer can be told
+        # is finished: one has a process on it now, one is waiting for the
+        # Tower's next start to finish it, and one is a question nobody
+        # could answer. Before this, all three read `complete` here.
         return SESSION_FINALIZING
+    # `failed` DELIBERATELY FALLS THROUGH TO THE SETTLED ARMS, and this is
+    # the one judgement call in the change, so it is written down.
+    #
+    # It is NOT `finalizing`. `finalizing` tells the wearer to wait, and a
+    # stage that ran and raised is not going to be fixed by waiting --
+    # `world_finish_pending.py` picks up the INTERRUPTED stages at the next
+    # Tower start, not the failed ones. Parking a failed build on "Improving"
+    # forever is the same lie as "Saved", told in the other direction.
+    #
+    # It is NOT `interrupted` either, although that was the tempting answer.
+    # `interrupted` is contract-defined (WORLD-BUILDER-WORLDS.md §2) as
+    # "killed mid-walk, killed mid-finalization, stopped by a request or an
+    # error, or a session whose manifest records real figures and whose
+    # derived tree is gone" -- all claims about the CAPTURE and the SOLVE.
+    # Here both of those succeeded: `finalization.state == complete`,
+    # `final_solve == solved`, the derived tree is on disk and the render
+    # route serves it. The world IS saved; what failed is the photographic
+    # room on top of it. Saying `interrupted` would tell the wearer their
+    # walk was lost, which is false and is the more alarming of the two
+    # wrong answers.
+    #
+    # AND IT WOULD BREAK THE AGREEMENT THIS MODULE EXISTS TO KEEP. The
+    # status producer's `_still_building` tests `is_unsettled(photo_state)`
+    # and `failed` is not in `UNSETTLED_STATES`, so the panel keeps its
+    # settled word (`ready`) for a failed photographic build. A row reading
+    # `interrupted` over a panel reading `ready` is the picker/panel
+    # disagreement that `test_the_picker_and_the_panel_agree_about_every_
+    # session` was written to stop.
+    #
+    # So the row keeps `complete` -- which is a claim about the SESSION --
+    # and the failure is told where it is true and where nothing else can
+    # say it: the `photographic` block on the row, `{"state": "failed",
+    # "stage": ..., "detail": ...}`, which is the same block the status
+    # payload carries. The word never claims photographic success, because
+    # the word was never about the photographic room; the block is, and it
+    # says `failed`.
     if (
         finalization is not None
         and finalization.get("state") == FINALIZATION_COMPLETE
@@ -518,6 +634,15 @@ def build_world_listing(store: WorldStore) -> dict:
                 store, world_id, session_id, purpose="figures"
             )
             has_geometry = _has_geometry(store, world_id, session_id, manifest)
+            # ASKED FOR EVERY ROW, unlike the present-tense probe below.
+            # It is record-first -- `session.stages` is already in hand --
+            # and it only touches the disk for a session that has no stage
+            # record at all, where it is two `stat`s beside the journal scan
+            # `_keyframes_journaled` already does for this same row. The
+            # probe below is a pid lookup and stays gated.
+            photographic = _photographic_state_for_row(
+                store, world_id, session_id, session
+            )
             sessions.append({
                 "session_id": session.session_id,
                 "started_at": session.started_at,
@@ -559,7 +684,23 @@ def build_world_listing(store: WorldStore) -> dict:
                             store, world_id, session_id
                         )
                     ),
+                    photographic=photographic,
                 ),
+                # ADDITIVE, and the contract identifier deliberately does
+                # not move, for the reason `_dense_summary` gives above:
+                # iOS reads these rows key by key out of a
+                # `[String: Any]`, so a key it does not know is a key it
+                # never looks at, but it equality-tests `contract` and
+                # would empty the gallery on a bump.
+                #
+                # THE SAME BLOCK THE STATUS PAYLOAD CARRIES, so a phone
+                # that reads one and then the other reads one fact. The
+                # word above cannot hold this: `failed` and `complete`
+                # both render as a saved world, and the difference between
+                # "the photographic room is ready" and "the photographic
+                # build failed" is the whole of T3. Nothing but this block
+                # is sending it.
+                "photographic": photographic,
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.
                 "finalization": session.finalization,
