@@ -2662,3 +2662,168 @@ for (const other of [b01, b02])
   assert.ok(base(b05) * cleanTerm(b05.torn) > base(other) * cleanTerm(other.torn),
             "and it still does");
 """)
+
+
+class TestThePageOpensSomewhereWorthLookingRoundFrom:
+    """The opening scan scored the frame in FRONT of the camera and had no
+    opinion about what happens when the reader looks round, which is their
+    first move. At the pose it chose there was 150 degrees of horizon with
+    nothing in it, where two other poses on the same walk have none; over all
+    198 recorded poses it ranked 160th by mean horizon support
+    (VISUAL-REVIEW-4 #1, BESTVIEW.md 6.1).
+
+    The 36-bin ring would answer this exactly and cannot be used here: the
+    ring needs the support field, and the field is started BY the opening
+    scan. What the page has from its first frame is the recorded cameras, so
+    SURROUND is the share of the horizon that any recorded camera within the
+    tube of a pose pointed at."""
+
+    SRC = ("const EMPTY_DETAIL", "/* Sliced for the same reason")
+
+    # A synthetic walk in two clusters further apart than the tube. Every
+    # camera in the first looks one way; the second is the same spot looked at
+    # from eight evenly spaced directions.
+    ROOM = r"""
+const Q = new Map();                       // no ?osur=, so the shipping floor
+const RING_BINS = 36, NAV = {R_MAX: 2.2};
+const canvas = {width: 900, height: 700};
+const CONFIG = {}, diag = 10;
+const viewFovY = () => 1.12;
+const yawPitchOf = d => ({yaw: Math.atan2(d[0], d[2]),
+                          pitch: Math.asin(Math.max(-1, Math.min(1, d[1])))});
+const cams = [];
+const BLINKERED = [], ALLROUND = [];
+for (let k = 0; k < 8; k++){                      // all looking +z
+  BLINKERED.push(cams.length); cams.push([k * 0.1, 0, 0, 0, 0, 1]);
+}
+for (let k = 0; k < 8; k++){                      // looking eight ways
+  const a = k * Math.PI / 4;
+  ALLROUND.push(cams.length); cams.push([10 + k * 0.1, 0, 0, Math.sin(a), 0, Math.cos(a)]);
+}
+"""
+
+    def test_the_surround_is_the_share_of_the_horizon_the_walk_pointed_at(self):
+        src = _section(_template(), *self.SRC)
+        _run_plain(self.ROOM + src + r"""
+const blink = surroundOf(BLINKERED[3]), round = surroundOf(ALLROUND[3]);
+// the two clusters are 10 units apart and the tube is 2.2, so neither sees
+// the other: each pose is judged on the cameras a reader could walk to
+assert.ok(round > 0.98, "eight evenly spaced looks cover the horizon: " + round);
+assert.ok(blink < 0.4, "eight looks the same way cover one frame's worth: " + blink);
+assert.ok(round > blink * 2, "and the ordering is the complaint's: " + blink + " " + round);
+for (let i = 0; i < cams.length; i++){
+  const s = surroundOf(i);
+  assert.ok(s >= 0 && s <= 1, "a share of the horizon: " + i + " " + s);
+}
+""")
+
+    def test_it_is_a_factor_with_a_high_floor_and_not_a_filter(self):
+        """A good frame with a poor surround still beats a poor frame with a
+        good one. The button's promise is still the best VIEW; the surround
+        decides between views that are otherwise close."""
+        src = _section(_template(), *self.SRC)
+        _run_plain(self.ROOM + src + r"""
+assert.ok(Math.abs(OPENING_SURROUND_FLOOR - 0.55) < 1e-12, "the shipping floor");
+// the term itself is bounded by the floor below and 1 above, whatever the pose
+const term = i => OPENING_SURROUND_FLOOR + (1 - OPENING_SURROUND_FLOOR) * surroundOf(i);
+for (let i = 0; i < cams.length; i++){
+  const t = term(i);
+  assert.ok(t >= OPENING_SURROUND_FLOOR - 1e-12 && t <= 1 + 1e-12, "bounded: " + t);
+}
+// a frame with nothing in it does not win on its surround
+const good = {drawn: 0.99, distance: 6, detail: 0.13};   // a photograph
+const poor = {drawn: 0.30, distance: 6, detail: 0.02};   // mostly void
+assert.ok(openingScore(good, BLINKERED[3]) > openingScore(poor, ALLROUND[3]),
+          "a factor, not a filter");
+// between two frames that are the same, the surround decides -- which is the
+// whole of what this term was added to do
+assert.ok(openingScore(good, ALLROUND[3]) > openingScore(good, BLINKERED[3]),
+          "and it does decide when the frames are level");
+// and a caller that passes no index is scored exactly as before
+assert.strictEqual(openingScore(good), openingScore(good, undefined));
+assert.ok(openingScore(good) > openingScore(good, ALLROUND[3]) - 1e-12,
+          "no index means no discount at all");
+""")
+
+    def test_the_scan_scores_every_pose_with_its_own_surround_and_reports_it(self):
+        text = _template()
+        choose = _section(text, "async function chooseOpening(", "function scorePoses(")
+        assert "openingScore(r, i)" in choose, "the pose's own index, not the frame alone"
+        assert "surround: +surroundOf(i).toFixed(3)" in choose
+        # and the whole scanned table is published, so a review can check the
+        # choice against its own measure rather than taking the page's word
+        opening = _section(text, "  S.opening = {index: best", "return best;")
+        for key in ("surround:", "surroundFloor:", "scanned:"):
+            assert key in opening, key
+
+
+class TestACameraInsideTheGeometryDoesNotStayThere:
+    """`resistOnce` lets a step through whenever it does not make the bound
+    WORSE. That is right at an edge and wrong inside one: inside the geometry
+    `closeBound` is 1 everywhere, so nothing resists and nothing pushes back.
+    The tube has had a release drift since the interaction lane; the standoff
+    -- the bound a forward push actually meets -- had none.
+
+    On the canonical world a grid scan of the tube finds a reachable point
+    0.013 from the proxy, and on the unmodified page a camera released there
+    is still 0.013 from it 150 frames later (BESTVIEW.md 6.6). This is that
+    guard. It is NOT the fix for VISUAL-REVIEW-4 #3, whose camera is 3.84
+    units from any proxy sample and outside the captured envelope."""
+
+    def test_the_guard_targets_the_hard_limit_and_will_not_leave_the_tube(self):
+        step = _section(_template(), "  function step(F, path, cam, ctl, dt, V){",
+                        "  /* A uniformly random reachable view")
+        assert "const d0 = nearest(F, out.p);" in step
+        assert "if (d0 < D_MIN && d0 > 0 && isFinite(d0)){" in step, \
+            "only inside the standoff, and never on a camera with no geometry near it"
+        # D_MIN, not D_SOFT: it cannot move a camera that is merely close, and
+        # over all 198 recorded poses the nearest any comes to the proxy is
+        # 0.886 -- outside D_SOFT itself, so no pose the wearer stood at moves
+        assert "(1 - Math.exp(-dt / 450)) * (D_MIN - d0)" in step
+        assert "D_SOFT - d0" not in step
+        # and it will never trade one violated bound for another
+        assert "pathDist(path, to).e <= Math.max(1, pathDist(path, out.p).e)" in step
+
+    def test_a_camera_inside_the_standoff_eases_out_to_it_and_stops(self):
+        _run_nav(r"""
+// one proxy sample right beside the walk, so a camera ON the path is inside
+// the standoff -- which is the shape of the canonical world's worst point
+const near = Float32Array.from([...F.input.samples, 2.5, 0, 0.4]);
+const F4 = Object.assign({}, F, {input: Object.assign({}, F.input, {samples: near})});
+const released = {look: [0, 0], move: [0, 0, 0], held: false};
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+const d0 = NAV.nearest(F4, cam.p);
+assert.ok(d0 > 0 && d0 < NAV.D_MIN, "it starts inside the standoff: " + d0);
+const trace = [];
+let prev = d0, maxE = 0;
+for (let i = 0; i < 400; i++){
+  cam = NAV.step(F4, path, cam, released, 16, V);
+  const d = NAV.nearest(F4, cam.p);
+  assert.ok(d >= prev - 1e-9, "it only ever eases outward: " + prev + " -> " + d);
+  assert.ok(d <= NAV.D_MIN + 1e-6, "and never overshoots the limit: " + d);
+  maxE = Math.max(maxE, NAV.pathDist(path, cam.p).e);
+  prev = d;
+  if (i % 50 === 0) trace.push(+d.toFixed(3));
+}
+assert.ok(prev > NAV.D_MIN - 0.02,
+          "it reaches the standoff, it does not crawl: " + d0 + " -> " + prev + " " + trace);
+assert.ok(maxE <= 1 + 1e-9, "and it never left the tube to do it: " + maxE);
+""")
+
+    def test_a_camera_that_is_merely_close_is_left_exactly_where_it_is(self):
+        """The guard must not be a second envelope. It fires inside D_MIN and
+        nowhere else, so a reader standing near the desk -- or a recorded pose
+        the wearer actually stood at -- is not quietly pushed off it."""
+        _run_nav(r"""
+// 0.75 away: inside D_SOFT (0.9), outside D_MIN (0.6). Nothing should move.
+const near = Float32Array.from([...F.input.samples, 2.5, 0, 0.75]);
+const F4 = Object.assign({}, F, {input: Object.assign({}, F.input, {samples: near})});
+const released = {look: [0, 0], move: [0, 0, 0], held: false};
+let cam = {p: at.slice(), yaw: 0, pitch: 0, floor: 1};
+const d0 = NAV.nearest(F4, cam.p);
+assert.ok(d0 > NAV.D_MIN && d0 < NAV.D_SOFT, "merely close: " + d0);
+const p0 = cam.p.slice();
+for (let i = 0; i < 400; i++) cam = NAV.step(F4, path, cam, released, 16, V);
+assert.ok(dist(cam.p, p0) < 1e-9,
+          "a camera outside the standoff is not moved by it: " + dist(cam.p, p0));
+""")
