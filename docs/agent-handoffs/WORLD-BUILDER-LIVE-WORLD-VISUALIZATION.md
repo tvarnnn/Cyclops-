@@ -661,20 +661,31 @@ as the depth-consistency gate keeping 74% of frames instead of 95%.
 
 **Wait. Do not shut the Tower down.**
 
-The photographic build starts after the final solve and takes **about eight
-minutes for a 385-keyframe walk on this GPU** (measured: surface 373.9 s +
-appearance 85.3 s), and longer for a longer one. During it the phone now
-shows **"Improving"**, with its own note: *"This world is still being
-finished… the finished world is very different from this one — it is worth
-waiting for Saved."*
+**Expect twenty-five to thirty minutes, not eight.** The measured figure —
+459 s, surface 373.9 s plus appearance 85.3 s — is for a *385-keyframe*
+walk. The walk asked for above is two to three times that many keyframes,
+and the per-frame stages (depth, transients, consistency, appearance) scale
+with keyframe count while only fuse/mesh/pack stay roughly fixed with the
+room. Add a final GLOMAP solve that is superlinear in images. An earlier
+draft of this procedure said "about eight minutes"; that was the small
+walk's number quoted against the big walk's instruction, and a wearer told
+eight minutes will shut the Tower down at twelve.
+
+During the build the phone shows **"Improving"**, with its own note: *"This
+world is still being finished… the finished world is very different from
+this one — it is worth waiting for Saved."*
 
 That sentence is the whole fix. Before it, the phone said **"Saved"**
 ninety seconds after Stop and the build was still seven minutes away.
 
 - Wait for the stage word to become **"Saved"**.
 - You may open the world while it builds. It will show sparse points, then
-  swap itself up to the photographic view when that lands — the viewer
-  polls and upgrades on its own, keeping your camera.
+  swap itself up — sparse to surface to photographic — as each lands. The
+  viewer polls and upgrades on its own, with no tap.
+  **The view will jump when it upgrades.** An earlier draft of this
+  procedure claimed the swap keeps your camera. It does not, and the iOS
+  source says so in its own words: *"a swap reloads the page and resets the
+  reader's camera mid-look."* Expect it twice, and expect to re-aim.
 - If you do stop the Tower early, the work is no longer lost: the owed
   stages are finished automatically on the next start.
 
@@ -1036,4 +1047,76 @@ only on the success path; a concurrent-stop race with a measured 5.01 s
 window in which a builder can start while the finisher still holds the GPU;
 and a supported configuration (`TOWER_WORLD_ROOT` set, `TOWER_CAPTURE_ROOT`
 unset) in which neither stop funnel fires at all.
+
+## Final integration review — and where it says this campaign is wrong
+
+The final validator audited the claim sheet rather than accepting it, and
+confirmed the central results by re-measuring them: the serving path
+(`representation: appearance` / `state: served` to the phone's exact request
+shape, the rung meta inside the 4096-byte window), the automatic stage
+execution, the contract identifiers unchanged, `stages` absent from the
+listing, and the whole suite green. Most valuably, it ran the lifecycle
+probe against a copy of the real live world **twice — once with the
+canonical deployed `main` and once with this branch**:
+
+| state | canonical `main` (what runs if this is not merged) | this branch |
+|---|---|---|
+| surface running, `end_reason: stop` | `ready`, `build_in_progress: False`, `/worlds`: **complete** | `finalizing`, **True**, **finalizing** |
+| surface running, `end_reason: interrupted` — *the ordinary path* | the same lie | **fixed** |
+| appearance running | the same lie | **fixed** |
+| `running` under a dead pid | correctly `ready` | correctly `ready` |
+| `running` but two hours stale | correctly `ready` | correctly `ready` |
+
+That is the strongest single result of the campaign, independently
+reproduced, and it holds.
+
+It also found three things this handoff had got wrong, all now corrected:
+
+1. **The wait was understated by about 2×.** 459 s is the *385-keyframe*
+   figure; the walk this document asks for is two to three times that, so
+   twenty-five to thirty minutes. Telling the wearer "about eight minutes"
+   would have had them shut the Tower down at twelve — the exact 02:37
+   incident, caused by the procedure rather than the code.
+2. **The claim that the viewer upgrades "keeping your camera" was false**,
+   and `WorldRenderViewer.swift` says the opposite in its own comment: *"a
+   swap reloads the page and resets the reader's camera mid-look."*
+3. **`HOLD_MAX_MS = 20 minutes` in `appearance_viewer.html`** — a constant
+   nobody in this campaign had looked at — would have thrown the wearer's
+   images away in the middle of a healthy long build. Fixed by making the
+   hold expire on *evidence* (`live`) rather than on a wall clock.
+
+### Its two substantive disagreements, which stand
+
+**The at-poses comparison is the most flattering test that exists, and the
+product does not offer it.** The viewer offers free orbit. The 40-view
+contact sheet — what the wearer actually does — is much worse than the
+ten-pose A/B: a field of torn planes and black voids with occasional
+legible fragments. The favourable coverage statistic this handoff led with
+("330° of horizon draws something, 0° dead") measures *how much of the
+frame is painted*, not *whether it reads as a room*, and on this evidence
+it flatters the result.
+
+**The reference world is not the counter-example it was used as.** Eight of
+its sixteen turn views are pure black, and all ten of its at-poses samples
+land on the one desk corner it covers well. So "the reference proves the
+pipeline works" is true; "the reference proves a recognisable *room*" is
+not. **The best result this project has ever produced is a photographic
+desk corner, not a bedroom.**
+
+It also weakened one piece of the capture guidance: *avoid soft clutter* is
+the least supported item, because the reference world reconstructs a
+crumpled blanket perfectly well. What separates the cases is view count and
+standoff, not softness. The guidance keeps it, demoted.
+
+### Nothing in this project has ever been built above ~395 frames
+
+Every surface manifest in the entire evidence corpus used between 261 and
+375 frames. The recommended walk is 2.5–3× that, and the block-budget
+coarsening loop, the host-RAM depth stack and a 1200-image GLOMAP solve are
+all unmeasured there. A surface that comes back `unavailable` means the
+appearance never runs at all.
+
+This is being measured rather than assumed: a 690-keyframe walk — 1.75× the
+largest build in the project's history — is being replayed through the full
+builder path.
 
