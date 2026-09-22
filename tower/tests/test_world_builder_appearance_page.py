@@ -2157,6 +2157,262 @@ class TestBootingWithNothingPlaced:
             assert step in opening, step
 
 
+def _code_only(section):
+    """`section` with its comments removed.
+
+    The page is commented far more heavily than it is coded, and the comments
+    quote the very names the assertions below look for (`fail()`,
+    `dropAppearance(...)`). Counting call sites has to count CODE.
+    """
+    out, in_block = [], False
+    for line in section.splitlines():
+        stripped = line.strip()
+        if in_block:
+            in_block = "*/" not in stripped
+            continue
+        if stripped.startswith("/*"):
+            in_block = "*/" not in stripped
+            continue
+        if stripped.startswith("//"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+# A boot whose FIRST manifest fetch 404s, as the routes actually word it. The
+# page has just called `dropAppearance`, so it holds no revision and nothing
+# is being held on screen.
+BOOT_GAP_SCRIPT = r"""
+const page = {revision: null, holdingSince: null, now: 0};
+// The gap, in the manifest route's own sentences (`AppearanceNotServed`).
+// WORLD-BUILDER-WORLDS.md 4a rule 5: a 404 carrying one of 4's own sentences
+// MAY BE TRANSIENT -- keep the picture and ask again at the next interval.
+for (const detail of ["appearance is stale against the session's redaction record",
+                      "no appearance for this session",
+                      "session 's1' of world 'w1' has no geometry yet"]){
+  const r = FOLLOW.decide({absent: detail}, page);
+  assert.strictEqual(r.action, "none", "a transient 404 is not terminal: " + detail);
+  const d = FOLLOW.nextDelay(r, FOLLOW.BASE_MS);
+  assert.ok(d >= FOLLOW.BASE_MS && d <= FOLLOW.CEILING_MS, "slower, never silent: " + d);
+}
+// The revision route, meanwhile, says the final build is running.
+const gap = {live: true, appearance: {revision: null, current: false, state: "rebuilding", epoch: null}};
+assert.strictEqual(FOLLOW.decide({ok: gap}, page).action, "hold");
+// Then the artifact appears, and the page that booted into nothing upgrades.
+const served = {live: false, appearance: {revision: "s1/appearance:b2", current: true,
+                                          state: "served", epoch: "b2"}};
+const r = FOLLOW.decide({ok: served}, page);
+assert.strictEqual(r.action, "load", "the boot-404 page loads the build when it is served");
+assert.strictEqual(r.revision, "s1/appearance:b2");
+assert.strictEqual(FOLLOW.nextDelay(r, FOLLOW.CEILING_MS), FOLLOW.BASE_MS, "back to the base rate");
+assert.strictEqual(FOLLOW.mustReplace(null, {epoch: "b2"}), false, "nothing on screen to replace");
+"""
+
+# The other half of that rule, unchanged by the boot recovery.
+GONE_SCRIPT = r"""
+const page = {revision: null, holdingSince: null, now: 0};
+for (const detail of ["no world 'w1'", "world 'w1' has no session 's1'"]){
+  const r = FOLLOW.decide({absent: detail}, page);
+  assert.strictEqual(r.action, "drop", "a world or session that is GONE still drops: " + detail);
+  assert.ok(/no longer on the Tower/.test(r.reason), r.reason);
+}
+// and it is never confused with the sentences a boot 404 recovers from
+for (const detail of ["appearance is stale against the session's redaction record",
+                      "no appearance for this session",
+                      "the render revision is not served"]){
+  assert.strictEqual(FOLLOW.decide({absent: detail}, page).action, "none", detail);
+}
+// A page with imagery in hand is dropped on GONE whatever it was holding.
+assert.strictEqual(FOLLOW.decide({absent: "no world 'w1'"},
+                                 {revision: "s1/appearance:b1", holdingSince: 0, now: 0}).action,
+                   "drop");
+"""
+
+
+class TestBootingIntoTheRebuildingGap:
+    """Mac validation, T5: the page died permanently if its FIRST manifest fetch
+    404ed. `fetchBytes` tags a 404 `e.absent`, `loadRevision` guards only
+    `applyManifest`, so the boot `catch` called `fail()` -- which hides the
+    page, sets `phase: failed`, and returns ABOVE both `follow()` call sites.
+    `follow()` is the only revision poll there is, so the page could never
+    discover the imagery when it appeared. A boot 404 is the ordinary case:
+    Stop flips the session label and the manifest route raises until the
+    rebuild lands (WORLD-BUILDER-APPEARANCE.md 9, "Nothing is SERVED during
+    `rebuilding`"; WORLD-BUILDER-WORLDS.md 4a rule 5: a 404 with one of 4's
+    own sentences may be transient -- keep asking). The `webglcontextrestored`
+    handler had answered `e.absent` this way all along; the boot was the only
+    path that treated it as terminal."""
+
+    def test_a_boot_404_drops_and_keeps_asking_instead_of_failing(self):
+        text = _template()
+        start = _section(text, "/* -------- start ---", "main().catch(")
+        code = _code_only(start)
+        # The boot's first manifest fetch is guarded, and only an ABSENCE is
+        # recovered -- a real fault still falls through to the boot catch.
+        boot = code[code.index('status("Loading the images'):code.index("if (!S.layers){")]
+        assert "await serial(() => loadRevision(CONFIG.appearance_revision || null));" in boot
+        assert "} catch (e){" in boot and "if (!(e && e.absent)) throw e;" in boot
+        assert "waitForTheTowerToServeTheImages();" in boot and "return;" in boot
+        # The recovery itself: the withdrawal's mechanism, not its wording.
+        wait = _section(text, "function waitForTheTowerToServeTheImages(){", "  try {")
+        assert "dropAppearance(" in wait, "the same not-terminal path a withdrawal takes"
+        assert "follow();" in wait, "and the page's existing poll, so it recovers on its own"
+        assert "fail(" not in wait
+        assert "no longer served" not in wait, "the common cause is 'not finished yet'"
+        assert "it may still be being " in wait and '+ "finished.' in wait
+        # NO `e.absent` PATH REACHES `fail(`: one call site is left in the boot,
+        # the last resort in the catch, and the absence is routed out above it.
+        assert code.count("fail(") == 1, "one last resort, for what cannot be followed"
+        assert code.count("waitForTheTowerToServeTheImages();") == 2, "both absent paths"
+        catch = code[code.rindex("} catch (e){"):]
+        assert catch.index("if (e && e.absent){") < catch.index("fail("), (
+            "an absence is routed to the recovery before `fail` is ever considered")
+        assert "waitForTheTowerToServeTheImages(); return;" in catch
+        # And no second timer: the recovery reuses `follow()`, nothing else.
+        assert "setInterval(" not in code
+
+    def test_the_recovered_boot_finishes_its_opening_when_a_build_arrives(self):
+        """The boot 404 lands in exactly the state review 2's M-0 boot lands in
+        -- `phase: withdrawn`, `shownAt === null` -- so `pollOnce`'s load branch
+        is what finishes the boot for it too."""
+        text = _template()
+        poll = _section(text, "async function pollOnce(", "async function follow(")
+        assert 'if (S.layers && (S.phase === "withdrawn" || bootFailed)){' in poll
+        assert "if (shownAt === null) await finishOpening();" in poll
+        drop = _section(text, "function dropAppearance(", "/* -------- following")
+        assert 'S.phase = "withdrawn";' in drop and "S.revision = null;" in drop
+        assert "holdingSince = null;" in drop
+        follow = _section(text, "async function follow(", "S.refresh =")
+        assert 'if (S.phase === "failed" && !bootFailed) return;' in follow, (
+            "`failed` still ends the follower, except for the boot failure that "
+            "is waiting for exactly the answer this loop asks for")
+
+    def test_a_page_that_booted_into_the_gap_loads_the_build_when_it_is_served(self):
+        """The upgrade itself, under node: the transient 404s change nothing,
+        the gap holds, and the first served revision is a `load`."""
+        _run_follower(BOOT_GAP_SCRIPT)
+
+    def test_a_gone_shaped_404_is_still_terminal_for_the_imagery(self):
+        """No regression on the other half of that rule. Note what "terminal"
+        means here: `decide` returns `drop`, the textures go and the page says
+        the world is no longer on the Tower. The poll loop itself does NOT
+        stop -- every drop keeps asking, backing off -- and the boot recovery
+        leaves that unchanged."""
+        _run_follower(GONE_SCRIPT)
+
+
+# A boot that failed for a fault that is NOT an absence: the page holds no
+# revision (nothing was ever placed) and `fail()` has run.
+BOOT_FAULT_SCRIPT = r"""
+const page = {revision: null, holdingSince: null, now: 0};
+// A transport error, a 500, three exhausted retries: `pollOnce` turns all of
+// them into `{error: ...}`. WORLD-BUILDER-IOS.md's following table: "any other
+// 404, another status, or a transport error: keeps the picture and asks again
+// next interval."
+let delay = FOLLOW.BASE_MS;
+for (const message of ["Failed to fetch",
+                       "the appearance manifest: HTTP 500",
+                       "could not fetch the appearance manifest: no answer in 45 s"]){
+  const r = FOLLOW.decide({error: message}, page);
+  assert.strictEqual(r.action, "none", "a fault is not an answer: " + message);
+  delay = FOLLOW.nextDelay(r, delay);
+  assert.ok(delay >= FOLLOW.BASE_MS && delay <= FOLLOW.CEILING_MS, "backoff, never silent: " + delay);
+}
+assert.strictEqual(FOLLOW.nextDelay({action: "none", live: null}, FOLLOW.CEILING_MS),
+                   FOLLOW.CEILING_MS, "the existing 120 s ceiling still applies");
+// Then the Tower serves a build, and the page that failed to boot loads it.
+const served = {live: false, appearance: {revision: "s1/appearance:b2", current: true,
+                                          state: "served", epoch: "b2"}};
+const r = FOLLOW.decide({ok: served}, page);
+assert.strictEqual(r.action, "load", "a failed boot still upgrades when a build is served");
+assert.strictEqual(r.revision, "s1/appearance:b2");
+assert.strictEqual(FOLLOW.nextDelay(r, FOLLOW.CEILING_MS), FOLLOW.BASE_MS);
+assert.strictEqual(FOLLOW.mustReplace(null, {epoch: "b2"}), false, "nothing on screen to replace");
+"""
+
+
+class TestABootFaultThatIsNotAnAbsence:
+    """Mac validation, 2026-09-22 (follow-up). The 404 recovery above does not
+    cover a transport error, a 500 or three exhausted retries: those still
+    reach the boot `catch`, still call `fail()`, and `follow()` returns on
+    `phase: failed`, so the page is again left with no poll of any kind. The
+    app cannot rescue it -- a page that called `fail()` reports `didFinish`, so
+    the screen is `.ready` and the "Try again" control is not shown -- and
+    WORLD-BUILDER-IOS.md's own following table answers this class of fault the
+    other way: "any other 404, another status, or a transport error: keeps the
+    picture and asks again next interval". So `fail()` still runs, the message
+    still stands, and the follower is started anyway."""
+
+    def test_a_boot_fault_still_fails_loudly_but_leaves_a_live_follower(self):
+        text = _template()
+        start = _section(text, "/* -------- start ---", "main().catch(")
+        code = _code_only(start)
+        catch = code[code.rindex("} catch (e){"):]
+        # the absence is still routed out first, and `fail` still runs after it
+        assert catch.index("if (e && e.absent){") < catch.index("fail(")
+        assert 'fail("The images could not be placed: "' in catch, (
+            "this is about recovery, not about hiding the error")
+        assert 'if (S.phase === "failed") return;' in catch, "never fail twice"
+        # and the follower is started for it
+        assert "if (glReady){ bootFailed = true; follow(); }" in catch
+        assert catch.index("fail(") < catch.index("bootFailed = true"), (
+            "the honest message is on screen before anything else happens")
+
+    def test_only_a_page_that_could_draw_gets_a_follower(self):
+        """Constraint: a genuinely un-followable fault must not spin a poller.
+        `glReady` is the witness, and it is raised only once the GL programs,
+        the basis and the recorded walk are all in hand."""
+        text = _template()
+        start = _section(text, "/* -------- start ---", "main().catch(")
+        code = _code_only(start)
+        assert "let glReady = false;" in code
+        preamble = code[code.index("buildGL();"):code.index("glReady = true;")]
+        for step in ("buildGL();", "basis();", "recordedPitch();"):
+            assert step in preamble, step
+        assert code.index("glReady = true;") < code.index('S.phase = "loading";')
+        assert code.count("glReady = true;") == 1, "one witness, one place"
+        assert code.count("bootFailed = true") == 1, "one flag, one place"
+        # and the follower is started ONLY behind that witness
+        catch = code[code.rindex("} catch (e){"):]
+        assert "if (glReady){ bootFailed = true; follow(); }" in catch
+        assert catch.count("follow();") == 1, "no ungated start"
+        # no WebGL 2 at all never reaches this block: it fails and returns
+        # above, where neither `glReady` nor `follow` exists yet
+        gl = _section(text, 'let gl = canvas.getContext("webgl2", attrs);', "const cams =")
+        assert "needs WebGL 2" in gl and "return;" in gl
+        assert "follow" not in gl and "bootFailed" not in gl
+        # and a fault outside `main`'s own try is still terminal
+        tail = text[text.index("main().catch("):]
+        assert "fail(" in tail and "follow(" not in tail
+
+    def test_the_flag_cannot_outlive_the_boot_it_was_set_for(self):
+        """The one way a flag like this goes wrong is by keeping a page alive
+        that was later failed for a reason nothing can follow. It is cleared by
+        the first build that opens, so from then on the ordinary rules hold --
+        a restore that cannot replace the imagery still ends the page."""
+        text = _template()
+        reopen = _section(text, "function reopenAfterBootFailure(){", "async function pollOnce(")
+        assert "bootFailed = false;" in reopen
+        # it undoes exactly what `fail()` hid, and nothing else
+        hid = _section(text, "function fail(text){", "/* THE STATUS LINE SITS ABOVE")
+        for el in ("wrap", "bar", "caption"):
+            assert f'$("{el}").style.display = "none";' in hid or f'$("{el}").style.display = "none"' in hid, el
+            assert f'$("{el}").style.display = "";' in reopen, el
+        poll = _section(text, "async function pollOnce(", "async function follow(")
+        assert 'if (S.layers && (S.phase === "withdrawn" || bootFailed)){' in poll, (
+            "only with layers in hand: it can never un-hide an empty page")
+        assert "if (bootFailed) reopenAfterBootFailure();" in poll
+        assert poll.index("reopenAfterBootFailure();") < poll.index("await finishOpening();")
+        # the context-restore failure is NOT a boot failure and stays terminal
+        restored = _section(text, 'canvas.addEventListener("webglcontextrestored"', "/* -------- input")
+        assert "fail(" in restored and "bootFailed" not in restored
+
+    def test_a_failed_boot_keeps_asking_and_loads_the_build_when_it_comes(self):
+        """Under node: the faults change nothing and back off to the existing
+        ceiling, and the first served revision is a `load`."""
+        _run_follower(BOOT_FAULT_SCRIPT)
+
+
 class TestNothingBlocksTheMainThreadUnbounded:
     """Review 2, P-3 and P-4. Measured before and after in headless Chrome
     (`Glasses-scratch/wb-final-recon/fixit/fix-ios2/stats/boot_*.json`): the

@@ -2527,6 +2527,36 @@ async function main(){
   /* -------- following new appearance builds (no reload, no camera reset) - */
   let pollDelay = FOLLOW.BASE_MS;
   let holdingSince = null;       // when `rebuilding` was first seen, while it lasts
+  /* A BOOT THAT FAILED FOR A REASON THE NEXT POLL COULD ANSWER.
+     The 404 case above recovers through `dropAppearance`, because a 404 is a
+     statement about the artifact. A transport error, a 500, or three exhausted
+     retries is a statement about the MOMENT, and `WORLD-BUILDER-IOS.md`'s own
+     following table answers it the same way for the app's poll -- "any other
+     404, another status, or a transport error: keeps the picture and asks
+     again next interval". The boot was the one place this page did the
+     opposite: `fail()` set `phase: failed`, and `follow()` returns on exactly
+     that, so the only revision poll there is never started and never would.
+     The app cannot rescue it either -- a page that called `fail()` still
+     reports `didFinish`, so the screen is `.ready` and its "Try again" control
+     is not shown; the wearer's only escape was noticing the toolbar Reload.
+
+     So the error stays on screen, `fail()` still runs, and the follower is
+     started anyway with this flag set. It is set at EXACTLY ONE PLACE (the
+     boot catch, and only once `glReady` says the page could draw at all) and
+     cleared the instant a build opens, so it cannot keep a page alive that
+     fails LATER for a reason nothing can follow: a lost context that would not
+     come back still ends the page, as before. */
+  let bootFailed = false;
+  /* Undo what `fail()` did to the DOM, so a build that arrives after a failed
+     boot can actually be shown: `fail` hides the canvas, the bar and the
+     caption, and that -- not the phase -- is what would otherwise leave the
+     reader looking at an error over a build that had already loaded. Only ever
+     reached with layers in hand, so it can never un-hide an empty page. */
+  function reopenAfterBootFailure(){
+    bootFailed = false;
+    S.recovered = (S.recovered || 0) + 1;
+    $("wrap").style.display = ""; $("bar").style.display = ""; $("caption").style.display = "";
+  }
   async function pollOnce(){
     if (!G) return {action: "none", live: null};      // a lost context restores first
     let poll;
@@ -2551,7 +2581,8 @@ async function main(){
       const before = S.revision;
       await loadRevision(r.revision);
       if (S.revision !== before) S.appends++;
-      if (S.layers && S.phase === "withdrawn"){
+      if (S.layers && (S.phase === "withdrawn" || bootFailed)){
+        if (bootFailed) reopenAfterBootFailure();
         $("msg").classList.remove("on");
         // A page that never had an opening pose (the M-0 boot) finishes
         // booting here; one that had its textures taken away and given back
@@ -2569,7 +2600,9 @@ async function main(){
   async function follow(){
     for (;;){
       await new Promise(res => setTimeout(res, pollDelay));
-      if (S.phase === "failed") return;
+      // `failed` still ends the follower -- unless this is the boot failure
+      // above, which is waiting for exactly the answer this loop asks for.
+      if (S.phase === "failed" && !bootFailed) return;
       let r;
       try { r = await serial(pollOnce); } catch (e){ S.errors.push(String(e && e.message || e)); r = {action: "none", live: null}; }
       pollDelay = FOLLOW.nextDelay(r, pollDelay);
@@ -4831,14 +4864,71 @@ async function main(){
   }
 
   /* -------- start ------------------------------------------------------------ */
+  /* A BOOT 404 IS NOT A FAILURE (Mac validation, T5). `fetchBytes` turns a 404
+     into a throw tagged `e.absent`, `loadRevision` only guards `applyManifest`
+     with its own `try`, and so the very first manifest fetch used to throw
+     straight past this block into the boot `catch` below -- where `fail()` set
+     `phase: failed`, hid the page, and, worse, returned before `follow()` had
+     ever been started. `follow()` is the page's ONLY revision poll, and both
+     of its call sites sit AFTER the manifest has loaded, so a page that opened
+     one second too early could never discover the imagery when it appeared.
+     `follow()` also self-terminates on `phase: failed`, so even a later start
+     would have stopped. A transient gap became permanent.
+
+     And the gap is transient in the ordinary case: pressing Stop flips the
+     session label, and the manifest route raises until the rebuild lands.
+     WORLD-BUILDER-APPEARANCE.md §9 says it outright -- "Nothing is SERVED
+     during `rebuilding`: a page that opens or restores in the gap gets the
+     surface." -- and in every one of those rows the open page KEEPS ASKING.
+     WORLD-BUILDER-WORLDS.md §4a rule 5 puts the same duty on this end: a 404
+     whose `detail` is FastAPI's `Not Found` means nothing to follow, but "a
+     404 with one of §4's own sentences may be transient ... keep the picture
+     and ask again at the next interval."
+
+     The page already knew how to do this in one place: the
+     `webglcontextrestored` handler has always answered `e.absent` with
+     `dropAppearance(...)` rather than `fail(...)`. The boot was the only path
+     that treated a 404 as terminal. It now takes the same path -- with
+     DIFFERENT WORDS, deliberately. The restore handler says the images are "no
+     longer served", which reads as a withdrawal, a privacy event; the common
+     cause of a boot 404 is an artifact that is still being finished, and
+     telling the wearer their imagery was withdrawn would be a lie in the
+     direction that frightens (the same reasoning as `unavailable` in §9).
+
+     No new timer: this hands the question to the EXISTING `follow()` loop, at
+     its existing interval and backoff. Honest terminal absence still works,
+     because `FOLLOW.decide`'s GONE rule is unchanged -- a 404 naming a world
+     or a session that is gone still drops and says so. `fail()` is left for
+     faults nothing can follow out of: no WebGL, a corrupt template. */
+  function waitForTheTowerToServeTheImages(){
+    dropAppearance("This world's images are not being served just now — it may still be being "
+                   + "finished. This view will show them as soon as the Tower serves them.");
+    follow();
+  }
+  /* WHAT CANNOT BE FOLLOWED OUT OF. Everything above this line is the page's
+     ability to draw at all: no WebGL 2 (which returned long before this block),
+     a shader that would not compile or link, a `CONFIG` this build cannot read.
+     No revision poll fixes any of them, and `pollOnce` returns on `!G` without
+     asking, so a follower started for one would be a timer that can never do
+     anything. They stay terminal. Everything BELOW it is the data path -- the
+     manifest, the chunks, the opening -- and every fault there is one the next
+     build can answer. */
+  let glReady = false;
   try {
     buildGL();
     basis();
     navPath = cams.length ? NAV.makePath(cams, UP) : null;
     recordedPitch();
+    glReady = true;
     S.phase = "loading";
     status("Loading the images…");
-    await serial(() => loadRevision(CONFIG.appearance_revision || null));
+    try {
+      await serial(() => loadRevision(CONFIG.appearance_revision || null));
+    } catch (e){
+      if (!(e && e.absent)) throw e;      // a real fault still falls to the boot catch
+      waitForTheTowerToServeTheImages();
+      return;
+    }
     if (S.phase === "failed") return;
     if (!S.layers){
       // **Not a dead end** (review 2, M-0). `fail()` hides the page, stops the
@@ -4860,7 +4950,20 @@ async function main(){
     await finishOpening();
     follow();
   } catch (e){
-    if (S.phase !== "failed") fail("The images could not be placed: " + (e && e.message ? e.message : e));
+    // Belt and braces. Any other absence that reaches here -- a chunk 404 that
+    // outlived `loadRevision`'s one refetch, a manifest withdrawn between the
+    // boot fetch and the opening -- is the same transient, followable thing,
+    // and ending the page on it would again mean never asking again. Only what
+    // is genuinely un-followable reaches `fail()`.
+    if (e && e.absent){ waitForTheTowerToServeTheImages(); return; }
+    if (S.phase === "failed") return;
+    fail("The images could not be placed: " + (e && e.message ? e.message : e)
+         + (glReady ? " This view will try again on its own." : ""));
+    // The honest message stays and the page stays hidden. What changes is that
+    // the page is no longer DEAD: a fault in the data path leaves the poller
+    // running, at its own interval and its existing backoff, so a build that
+    // is served afterwards still opens the world (Mac validation, 2026-09-22).
+    if (glReady){ bootFailed = true; follow(); }
   }
 }
 
