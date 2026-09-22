@@ -579,3 +579,109 @@ code produced the reference world. Capture guidance is explicitly a later
 phase, so the response here is to say plainly what the next walk should do
 rather than to redesign the reconstruction.
 
+## Lifecycle and environment, verified with the fixes in
+
+**Five cartridges, one Tower, two full cycles** — `all_cartridge_switch_soak.py`
+walks CV Lab → World Builder (session start, stream, Stop, finalize, session
+stop) → Object Memory → Document Memory → Scene Understanding → CV Lab again,
+asserting the Tower survives every switch:
+
+```
+workers left: 0  strays: 0
+locks: dead_locks [] live_locks [] open_sessions [] interrupted [] complete 2
+VERDICT: STABLE -- every cycle held, nothing leaked
+```
+
+So the lifecycle fix does not regress the other four cartridges, and the
+Tower stays alive across repeated captures.
+
+**Pre-flight** (`world_builder_env_check.py`), all ten verdicts OK:
+GPU visible (RTX 5070), torch 2.13.0+cu132 → sm_120, pycolmap 4.2.0,
+vocabulary tree cached, 360×640 calibrated (last capture `a808611c…`),
+no world claiming to be building, OpenCV geometry and self-calibration
+complete.
+
+One deployment fact it reports matters for the physical test:
+
+> `tower_package_is_this_checkout  the editable install points at
+> C:\Users\tvllo\Projects\Glasses\tower`
+
+**The Tower runs from the CANONICAL checkout, not from this lane's
+worktree.** These fixes must be on the canonical checkout before the
+physical test, or the walk will run the old code — which is precisely the
+version skew that produced the 01:33 world.
+
+## The physical validation procedure
+
+### Before the walk
+
+1. **Merge this lane to the canonical checkout.** The Tower runs from
+   `C:\Users\tvllo\Projects\Glasses\tower` (the editable install points
+   there). A walk against an unmerged fix is the version skew that produced
+   the 01:33 world. Verify after merging:
+   `git -C C:\Users\tvllo\Projects\Glasses log --oneline -1`
+2. **Start the Tower fresh**, so it picks up the merged code:
+   `tower\scripts\start_tower.ps1`
+3. **Pre-flight:** `python scripts\world_builder_env_check.py` — every
+   verdict should read `[OK ]`. It was green on this machine at 03:21.
+4. **The phone must run a DEBUG build** from `5da13c8` or later. A Release
+   build has no camera and sends no frame: the whole frame path is inside
+   `#if DEBUG` (`ios/Glasses/GlassesConnection.swift`, and
+   `sendStreamStart`/`sendStreamStop` with it). An older build also does not
+   send `viewer=appearance-1`, and would be served the surface rung instead
+   of the photographic one.
+
+### The walk — this part decides the picture quality
+
+The reconstruction is only as good as the sweep. The 02:37 walk was 100
+seconds and produced a world where only three of ten viewpoints read as the
+room; the reference walk was about four minutes and produced one where
+nearly all of them did. Measured, the difference is not lighting (the short
+walk was *brighter*) — it is time and parallax per surface, and it shows up
+as the depth-consistency gate keeping 74% of frames instead of 95%.
+
+- **Walk for three to five minutes.** Not one.
+- **Move sideways, not just turn.** Rotation gives the solver no parallax;
+  translation is what builds geometry. This corpus is chronically short of
+  it: an audit of 109 captures found "camera *translation* — the one thing
+  dense reconstruction is entirely built on — is rare and brief."
+- **Stand back.** Give each wall and large object a couple of metres. The
+  short walk's worst frames are all close-up over clutter.
+- **Face each wall deliberately** and sweep it slowly. Anything never
+  looked at is honestly black in the result — by contract, nothing is
+  invented to fill it.
+- **Revisit.** Cross the room and look at the same things again from a
+  second angle; two views of a surface is the threshold the evidence filter
+  uses.
+- **Avoid dwelling on soft clutter.** Laundry, crumpled bedding and wire
+  hangers are close to the worst case for monocular depth fused into a
+  TSDF, and they are where this capture's surface failed.
+
+### After Stop — the part that went wrong last time
+
+**Wait. Do not shut the Tower down.**
+
+The photographic build starts after the final solve and takes **about eight
+minutes for a 385-keyframe walk on this GPU** (measured: surface 373.9 s +
+appearance 85.3 s), and longer for a longer one. During it the phone now
+shows **"Improving"**, with its own note: *"This world is still being
+finished… the finished world is very different from this one — it is worth
+waiting for Saved."*
+
+That sentence is the whole fix. Before it, the phone said **"Saved"**
+ninety seconds after Stop and the build was still seven minutes away.
+
+- Wait for the stage word to become **"Saved"**.
+- You may open the world while it builds. It will show sparse points, then
+  swap itself up to the photographic view when that lands — the viewer
+  polls and upgrades on its own, keeping your camera.
+- If you do stop the Tower early, the work is no longer lost: the owed
+  stages are finished automatically on the next start.
+
+### What you should see
+
+Open Saved Worlds → the newest world. The caption reads *"The camera's own
+images, faces redacted, placed on the reconstructed room."* One finger
+orbits, two pinch and pan. Grey haze is where no kept image looked; black is
+where no geometry was measured. Both are honest — nothing is invented.
+
