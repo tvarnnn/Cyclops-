@@ -923,3 +923,36 @@ the same room as a good solve.**
   `frames_clipped_by_bound` and `frames_emptied_by_bound` are in every
   manifest as the tripwire; on healthy worlds they read 0, and they do.
 
+## The durability fix, verified end to end on a real interrupted world
+
+The engineer who built the finisher flagged, honestly, that its happy path
+was unverified: every test replaced `final_surface_stages`, and no genuinely
+interrupted world existed on this machine to try it against. So one was
+constructed — the real live world, copied to its own root, its photographic
+artifacts removed, and a `stages` record written saying the surface was
+`running` when its process vanished. That is exactly the state a Tower
+shutdown leaves behind.
+
+```
+DRY RUN   sessions seen 1
+          owed: "the surface stage is 'running' and nothing is building it"
+
+REAL RUN  surface     ok   1,198,535 verts / 2,265,728 faces, 282/379 frames
+          appearance  ok   352 keyframes, 128 phone, 30 chunks, 23.8 MB
+          stages recorded ok/ok, 481 MB of depth work pruned
+          7m56s, exit 0
+```
+
+**The interrupted world finished itself, unattended, and is now a
+photographic world.** That is the last link in the durability chain.
+
+The same run is also an independent check on the robustness fix, because
+this world is healthy: `poses_gated: 0`, `frames_clipped_by_bound: 0`,
+`frames_emptied_by_bound: 0`, `voxel_coarsened_for_key_range: 1.0`, and a
+mesh identical to the build made before the fix existed. The new rules are
+inert on healthy data, which is the property that matters most about them.
+
+It also exposed one blemish, now fixed: the stage record was copying the
+surface pipeline's whole ten-kilobyte report into `session.json` on
+SUCCESS, in a file the world listing parses on every poll.
+
