@@ -520,3 +520,62 @@ invisible to every other instrument: the offline build succeeded, the tests
 passed, the serving contract verified. Only replaying the real walk through
 the real builder exposed it.
 
+## Visual quality of the live world, judged honestly
+
+The finished product-path world was rendered through the real routes and
+compared with the wearer's own keyframes at ten of his solved camera poses
+(`viz/out/live2/atposes/ab_sidebyside.png`). Both an independent reviewer
+and the lead engineer looked at the images.
+
+**It is not as good as the reference world, and it should not be claimed to
+be.** Of the ten poses, three are clearly his room — the closet rail with
+shirts on hangers, the shoes and bench below it, and the panel door with
+the desk, monitor and crutches beside it. Three more are recognisable but
+badly torn. Four are voids or wreckage: a grey void over the floor, a
+near-black smear, and two frames of yellow-tinted torn geometry.
+
+Measured, where it draws, against his own photographs at the same cameras:
+
+| | this world (redacted) | reference world (raw) |
+|---|---:|---:|
+| median luminance correlation | 0.62 (8 drawn) / 0.40 (all 10) | **0.88** |
+| median PSNR | 14.1 dB | **17.5 dB** |
+| picture-class pixels, render | **46.8%** | 42.0% |
+| picture-class pixels, his photos | 44.4% | 45.2% |
+| horizon drawing ≥50% of a frame | **330°** | 120° |
+| dead sector (<10% drawn) | **0°** | 150° |
+
+So it is a **better-covered, worse-built** world: he can turn a full circle
+and find something everywhere, which the reference could not, but where it
+draws it draws on a poorer surface.
+
+### What is NOT the cause
+
+- **Not redaction.** Measured with the page's own observed/unobserved
+  classifier over all forty standard views, the median UNOBSERVED share is
+  **0.9%**, worst single view 8.6%, against 0.0%/1.0% for a build with no
+  redaction at all. The stored keyframes really do carry 7.8% filled pixels,
+  but multi-keyframe blending covers it and there are no black rectangles in
+  the render. Ship the redacted default.
+- **Not white balance.** Render-minus-capture colour balance over the drawn
+  pairs is (−0.002, −0.007, +0.009), statistically identical to the
+  reference's. The yellow is lamp-lit wall texture stretched over broken
+  geometry.
+- **Not lighting.** The obvious hypothesis was that this was a darker
+  capture. Measured, it is the opposite: mean luma 85.1 against the
+  reference walk's 67.0, and only 3.1% of frames below luma 40.
+
+### What is the cause
+
+The surface, over a short sweep of soft, cluttered geometry. The walk was
+**100 seconds and 385 keyframes**, against the reference's ~4 minutes and
+395, and the depth-consistency gate kept only **282 of 379 frames (74%)**
+against the reference's 352 of 395 (89%). Laundry on a floor, a crumpled
+blanket and thin wire hangers are close to the worst case for monocular
+depth fused into a TSDF, and the wearer never stood back from them.
+
+This is a capture-quality finding, not a pipeline defect: the identical
+code produced the reference world. Capture guidance is explicitly a later
+phase, so the response here is to say plainly what the next walk should do
+rather than to redesign the reconstruction.
+
