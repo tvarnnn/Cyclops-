@@ -85,7 +85,7 @@ _YUNET = "faces-detected-and-filled/yunet-2023mar@0.30"
 # `redaction.py` moves to another gate this no longer matches
 # `FaceRedactor().label` and the step refuses until someone adds the new gate
 # deliberately, with its measurement.
-TARGET_LABEL = f"{_YUNET}+plausibility3"
+TARGET_LABEL = f"{_YUNET}+plausibility4"
 
 # Older rules of the same detector, threshold, upscale and dilation (none of
 # which has changed in git), keyed to whether the rule's fill is a SUPERSET of
@@ -95,6 +95,11 @@ REREDACTABLE_LABELS = {
     _YUNET: True,                       # ungated: every gate only removes boxes
     f"{_YUNET}+plausibility1": False,   # above 25%: facelike OR native; p3 also takes 1/2, 1/4
     f"{_YUNET}+plausibility2": False,   # p3 adds the edge exception, so p2 fills less
+    # p4 IS p3 followed by a test that can only drop a box, so p3's fill on a
+    # frame always contains p4's. A frame kept for any reason still meets the
+    # target label. (fixit/precision/PRECISION.md; 140 -> 104 boxes on the
+    # canonical capture, every one of them a box p3 also filled.)
+    f"{_YUNET}+plausibility3": True,
 }
 
 # -- raw verification (REREDACT.md section 1: 398/398 true pairs, 0/397
@@ -414,9 +419,15 @@ def _check_redactor(redactor) -> str:
             f"({getattr(redactor, 'unavailable_reason', None)}); nothing was switched")
     label = getattr(redactor, "label", None)
     if label != TARGET_LABEL:
+        extra = ""
+        if getattr(redactor, "verifies", True) is False:
+            extra = (" The face verifier is not loaded on this Tower, so the "
+                     "redactor is running the previous gate; see "
+                     "redaction.FaceVerifier.unavailable_reason.")
         raise ReredactionRefused(
             f"the redactor's label is {label!r}, but this step only writes sets under "
-            f"{TARGET_LABEL!r}; add the new gate to reredaction.py deliberately")
+            f"{TARGET_LABEL!r}; add the new gate to reredaction.py deliberately."
+            + extra)
     return label
 
 

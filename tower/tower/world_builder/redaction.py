@@ -289,7 +289,68 @@ CORROBORATION_IOU = 0.30
 #                box must be found again at native, 1/2 or 1/4 resolution.
 # plausibility3: the same, except that a box over 25% within EDGE_MARGIN of the
 #                frame edge is filled on facelike landmarks OR being found again.
-PLAUSIBILITY_ID = "plausibility3"
+# plausibility4: the same, plus the VERIFIER below on every surviving box small
+#                enough to judge. Only ever removes a box.
+PLAUSIBILITY_ID = "plausibility4"
+
+# The gate this reduces to when the verifier is not on this Tower. The label
+# records which of the two actually ran, because they fill different pixels.
+PLAUSIBILITY_WITHOUT_VERIFIER = "plausibility3"
+
+# 4. AND THEN SOMETHING THAT IS NOT YUNET HAS TO AGREE IT IS A FACE.
+# -----------------------------------------------------------------
+# Everything above is YuNet arguing with itself: its own landmarks, its own
+# output at another resolution. After all of it, precision on the canonical
+# capture is 24 boxes of 140 -- 17.1% counting the wall portrait and the second
+# print, 14.3% counting the portrait alone. Eleven of every twelve regions the
+# product blacks out are a wall, a cup logo, a desk, a hand or a pile of
+# laundry. That is affordable as pixels; it stops being affordable the moment
+# anything PROPAGATES a fill region (`appearance.RedactionConsensus`), because
+# then every false positive removes a piece of the room from every frame.
+#
+# So the last test asks a model that has never heard of YuNet. The candidate's
+# neighbourhood is cut out, put on a scale a general vision model has actually
+# seen, embedded by DINOv2-base, and scored by a logistic probe. Measured
+# (`Glasses-scratch/wb-final-recon/fixit/precision/PRECISION.md`):
+#
+#     rule                          boxes kept   faces kept   precision
+#     plausibility3                     140         24/24        17.1%
+#     plausibility4 (this)              104         24/24        23.1%
+#     ... among regions <=10% of the frame, which are the ones a consensus
+#         propagates:                    67 -> 49  24/24   27.6% -> 37.6%
+#
+# WHAT IT IS FITTED ON, AND WHAT IT IS NOT. Five banks, none of them from the
+# capture it is measured on: 284 eye-labelled detections from twelve other
+# captures (53 of them real live faces), 1,500 more from 87 further captures,
+# and three synthetic banks pasted into other captures' frames -- frontal
+# faces, faces as dim warped PRINTS on a wall, and close faces cut by the frame
+# edge. The canonical capture's own 140 boxes were only ever a test set.
+#
+# WHERE IT IS ALLOWED TO JUDGE. Only a box at most VERIFY_BELOW_AREA of the
+# frame. Above that the crop is mostly padding and the face is partial, and the
+# measurement says so plainly: at a 25% cut the same threshold loses 79 of
+# 2,210 off-frame composites; at 12%, six; at 8%, none. A close bystander lives
+# above that line and keeps plausibility3's own evidence untouched.
+#
+# THE THRESHOLD. The lowest score any in-scope box carrying a real or
+# composited face received, over every recall set, is 0.464. 0.44 is that with
+# a margin. It is chosen from POSITIVES only; the 116 labelled non-faces it is
+# measured against never entered the choice. Calibrated instead only on
+# off-capture held-out faces it would be 0.32, and precision 17.5% -- the gap
+# is what this capture's own portrait contributes, and is stated rather than
+# hidden.
+#
+# FAILS TOWARDS FILLING, LOUDLY. No coefficients, no torch, no weights, a load
+# that throws, a crop that cannot be cut, a forward pass that raises: every box
+# is kept and the label says `plausibility3`, because a session that filled
+# plausibility3's pixels must not claim plausibility4's.
+VERIFIER_ID = "dinov2b-logreg-v1"
+VERIFIER_BACKBONE = "facebook/dinov2-base"
+VERIFY_BELOW_AREA = 0.08
+VERIFY_THRESHOLD = 0.44
+VERIFIER_CONTEXT = 2.5
+VERIFIER_SIZE = 224
+VERIFIER_FILENAME = "face_verifier_dinov2b_v1.json"
 
 MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 
@@ -314,6 +375,12 @@ _CWD_MODEL_PATH = Path("models") / MODEL_FILENAME
 
 # Kept as the name other modules and tests import.
 DEFAULT_MODEL_PATH = _PACKAGE_MODEL_PATH
+
+_PACKAGE_VERIFIER_PATH = (
+    Path(__file__).resolve().parents[2] / "models" / VERIFIER_FILENAME
+)
+_CWD_VERIFIER_PATH = Path("models") / VERIFIER_FILENAME
+DEFAULT_VERIFIER_PATH = _PACKAGE_VERIFIER_PATH
 
 
 def landmark_geometry(box, landmarks) -> dict:
@@ -429,6 +496,189 @@ def box_near_frame_edge(box, frame_shape, margin: float = None) -> bool:
             or x + w >= width - slack or y + h >= height - slack)
 
 
+def verifier_crop(image, box, context: float = None, size: int = None):
+    """The square neighbourhood the verifier looks at, or None.
+
+    `context` times the box's longer side, about its centre, replicate-padded
+    where it leaves the frame, resized to `size`, and then stretched between
+    its own 1st and 99th percentile.
+
+    The stretch is not cosmetic. This capture is a dark room, and its real
+    faces are its LOWEST-contrast detections (REDACTION.md section 3): a raw
+    crop of one is nearly black, and a backbone trained on ordinary
+    photographs has never seen anything like it. Measured, the stretch takes
+    set-A ranking from AUC 0.911 to 0.925 on its own.
+    """
+    import cv2
+    import numpy as np
+
+    context = VERIFIER_CONTEXT if context is None else context
+    size = VERIFIER_SIZE if size is None else size
+    height, width = image.shape[:2]
+    x, y, w, h = (float(v) for v in box)
+    if not (w > 0 and h > 0):
+        return None
+    cx, cy = x + w / 2.0, y + h / 2.0
+    side = max(w, h) * context
+    x0, y0 = int(round(cx - side / 2.0)), int(round(cy - side / 2.0))
+    x1, y1 = int(round(cx + side / 2.0)), int(round(cy + side / 2.0))
+    left, top = max(0, -x0), max(0, -y0)
+    right, bottom = max(0, x1 - width), max(0, y1 - height)
+    cx0, cy0 = max(0, x0), max(0, y0)
+    cx1, cy1 = min(width, x1), min(height, y1)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return None
+    patch = image[cy0:cy1, cx0:cx1]
+    if left or top or right or bottom:
+        patch = cv2.copyMakeBorder(patch, top, bottom, left, right,
+                                   cv2.BORDER_REPLICATE)
+    if patch.size == 0:
+        return None
+    patch = cv2.resize(
+        patch, (size, size),
+        interpolation=cv2.INTER_CUBIC if patch.shape[0] < size else cv2.INTER_AREA,
+    )
+    values = patch.astype(np.float32)
+    low = float(np.percentile(values, 1.0))
+    high = float(np.percentile(values, 99.0))
+    if high - low < 4.0:
+        # A flat patch has nothing to stretch, and stretching it would amplify
+        # sensor noise into structure the probe was never shown.
+        return patch
+    return np.clip((values - low) * (255.0 / (high - low)), 0, 255).astype("uint8")
+
+
+def verifier_path() -> Path | None:
+    """Where the probe coefficients are, or None.
+
+    `TOWER_FACE_VERIFIER` overrides, and the single word `off` disables the
+    stage deliberately -- which is a supported configuration, not a failure:
+    the gate is then `plausibility3` and the label says so.
+    """
+    override = os.environ.get("TOWER_FACE_VERIFIER")
+    if override:
+        if override.strip().lower() == "off":
+            return None
+        candidate = Path(override.strip())
+        return candidate if candidate.exists() else None
+    for candidate in (_PACKAGE_VERIFIER_PATH, _CWD_VERIFIER_PATH):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+class FaceVerifier:
+    """Does a general vision model agree that this box is a face?
+
+    One instance per process (`shared_verifier`), because the backbone is
+    350 MB and `FaceRedactor` is constructed per session and per test.
+
+    Every failure path leads to the same place: `available` is False, and the
+    caller keeps every box. There is no path on which this class causes a box
+    NOT to be filled because something went wrong.
+    """
+
+    def __init__(self, path=None) -> None:
+        self._weights = None
+        self._bias = 0.0
+        self.threshold = VERIFY_THRESHOLD
+        self.below_area = VERIFY_BELOW_AREA
+        self.identifier = VERIFIER_ID
+        self._model = None
+        self._processor = None
+        self._failed_reason: str | None = None
+
+        candidate = Path(path) if path is not None else verifier_path()
+        if candidate is None or not candidate.exists():
+            self._failed_reason = (
+                "no face-verifier coefficients on this Tower; set "
+                f"TOWER_FACE_VERIFIER or vendor {VERIFIER_FILENAME}"
+            )
+            return
+        try:
+            import json
+
+            import numpy as np
+
+            doc = json.loads(Path(candidate).read_text())
+            self._weights = np.asarray(doc["weights"], dtype=np.float32)
+            self._bias = float(doc["bias"])
+            self.threshold = float(doc.get("threshold", VERIFY_THRESHOLD))
+            self.below_area = float(
+                doc.get("apply_below_area_fraction", VERIFY_BELOW_AREA)
+            )
+            self.identifier = str(doc.get("id", VERIFIER_ID))
+            backbone = os.environ.get("TOWER_FACE_VERIFIER_BACKBONE") or str(
+                doc.get("backbone", VERIFIER_BACKBONE)
+            )
+            import torch
+            from transformers import AutoImageProcessor, AutoModel
+
+            self._torch = torch
+            self._processor = AutoImageProcessor.from_pretrained(backbone)
+            model = AutoModel.from_pretrained(backbone)
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._model = model.to(self._device).eval()
+        except Exception as exc:  # noqa: BLE001
+            self._model = None
+            self._failed_reason = (
+                f"the face verifier could not be loaded ({type(exc).__name__}: "
+                f"{exc}); every detection will be filled"
+            )
+            logger.warning("[Tower][Redaction] %s", self._failed_reason)
+
+    @property
+    def available(self) -> bool:
+        return self._failed_reason is None and self._model is not None
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return self._failed_reason
+
+    def scores(self, image, boxes) -> list:
+        """P(face) per box. Raises rather than guessing; the caller fills."""
+        import cv2
+        import numpy as np
+
+        crops = [verifier_crop(image, b) for b in boxes]
+        out = [None] * len(boxes)
+        usable = [i for i, c in enumerate(crops) if c is not None]
+        if not usable:
+            return out
+        torch = self._torch
+        images = [cv2.cvtColor(crops[i], cv2.COLOR_BGR2RGB) for i in usable]
+        with torch.no_grad():
+            batch = self._processor(images=images, return_tensors="pt")
+            pixel_values = batch["pixel_values"].to(self._device)
+            result = self._model(pixel_values=pixel_values)
+            features = torch.cat(
+                [result.pooler_output, result.last_hidden_state.mean(dim=1)],
+                dim=-1,
+            )
+            features = features / features.norm(dim=-1, keepdim=True)
+        matrix = features.float().cpu().numpy()
+        if matrix.shape[1] != self._weights.shape[0]:
+            raise ValueError(
+                f"verifier coefficients are {self._weights.shape[0]}-d and the "
+                f"backbone produced {matrix.shape[1]}-d features"
+            )
+        logits = matrix @ self._weights + self._bias
+        for slot, value in zip(usable, 1.0 / (1.0 + np.exp(-logits))):
+            out[slot] = float(value)
+        return out
+
+
+_SHARED_VERIFIER = None
+
+
+def shared_verifier() -> FaceVerifier:
+    """The process's one verifier. Loaded on first ask, then reused."""
+    global _SHARED_VERIFIER
+    if _SHARED_VERIFIER is None:
+        _SHARED_VERIFIER = FaceVerifier()
+    return _SHARED_VERIFIER
+
+
 def _iou(a, b) -> float:
     ax0, ay0, ax1, ay1 = a[0], a[1], a[0] + a[2], a[1] + a[3]
     bx0, by0, bx1, by1 = b[0], b[1], b[0] + b[2], b[1] + b[3]
@@ -478,7 +728,7 @@ class FaceRedactor:
     can change resolution mid-stream.
     """
 
-    def __init__(self, path=None) -> None:
+    def __init__(self, path=None, verifier=None) -> None:
         # An explicitly supplied path is checked too, not just the
         # default. Trusting it produced a redactor that reported itself
         # AVAILABLE and then failed on every frame -- so a session would
@@ -490,6 +740,15 @@ class FaceRedactor:
         self._path = candidate
         self._detector = None
         self._size = None
+        # Decided ONCE, here, so a session's label cannot change halfway
+        # through it. `verifier=False` is the explicit "do not verify".
+        if verifier is False:
+            self._verifier = None
+        elif verifier is not None:
+            self._verifier = verifier if verifier.available else None
+        else:
+            shared = shared_verifier()
+            self._verifier = shared if shared.available else None
         self._failed_reason: str | None = None
         if self._path is None:
             self._failed_reason = (
@@ -521,10 +780,17 @@ class FaceRedactor:
         """
         if not self.available:
             return REDACTION_NONE
+        gate = (PLAUSIBILITY_ID if self._verifier is not None
+                else PLAUSIBILITY_WITHOUT_VERIFIER)
         return (
             f"faces-detected-and-filled/{DETECTOR_ID}@{CONFIDENCE:.2f}"
-            f"+{PLAUSIBILITY_ID}"
+            f"+{gate}"
         )
+
+    @property
+    def verifies(self) -> bool:
+        """Whether the fourth test -- the one that is not YuNet -- is running."""
+        return self._verifier is not None
 
     def redact(self, image_bytes: bytes) -> RedactionResult:
         """Fill every detected face. Returns the ORIGINAL bytes on failure.
@@ -678,7 +944,7 @@ class FaceRedactor:
         if not candidates:
             return []
 
-        kept = self._corroborate(image, candidates)
+        kept = self._verify(image, self._corroborate(image, candidates))
 
         boxes = []
         import math
@@ -737,3 +1003,38 @@ class FaceRedactor:
             if not scales or any(found_at(box, s) for s in scales):
                 survivors.append(box)
         return survivors
+
+    def _verify(self, image, boxes: list) -> list:
+        """Drop a small box a general vision model says is not a face.
+
+        Runs on the RAW boxes, before the head dilation, like every other
+        test, and only on boxes at most `below_area` of the frame.
+
+        FAILS TOWARDS FILLING, in every direction: no verifier, a box too big
+        to judge, a crop that cannot be cut, a score that is not a number, a
+        forward pass that raises. Each of those keeps the box. The only way a
+        box is dropped here is a finite score below the threshold.
+        """
+        import math
+
+        if self._verifier is None or not boxes:
+            return boxes
+        judged = [i for i, b in enumerate(boxes)
+                  if box_area_fraction(b, image.shape) <= self._verifier.below_area]
+        if not judged:
+            return boxes
+        try:
+            scores = self._verifier.scores(image, [boxes[i] for i in judged])
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Tower][Redaction] the face verifier failed on this frame; "
+                "keeping every detection"
+            )
+            return boxes
+        drop = set()
+        for slot, score in zip(judged, scores):
+            if score is None or not math.isfinite(float(score)):
+                continue
+            if float(score) < self._verifier.threshold:
+                drop.add(slot)
+        return [b for i, b in enumerate(boxes) if i not in drop]

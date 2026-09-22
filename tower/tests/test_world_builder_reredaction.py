@@ -36,6 +36,7 @@ W, S = "w1", "s1"
 UNGATED = "faces-detected-and-filled/yunet-2023mar@0.30"
 P1 = UNGATED + "+plausibility1"
 P2 = UNGATED + "+plausibility2"
+P3 = UNGATED + "+plausibility3"
 CURRENT = RR.TARGET_LABEL
 H_, W_ = 120, 160
 BOX_A = (10, 50, 10, 60)      # y0, y1, x0, x1: filled by the old rule only
@@ -177,9 +178,9 @@ def cap(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("label", [UNGATED, P1, P2])
+@pytest.mark.parametrize("label", [UNGATED, P1, P2, P3])
 def test_reredact_from_raw_only_for_older_same_family_labels(tmp_path, label):
-    """1: the three older gates of the family re-redact from raw."""
+    """1: the four older gates of the family re-redact from raw."""
     c = Capture(tmp_path, label=label)
     plan = c.plan()
     assert plan.counts == {RR.ORIGIN_REREDACTED: N}
@@ -269,7 +270,7 @@ def test_reredact_refuses_whole_when_the_redactor_is_unavailable_or_another_rule
     with pytest.raises(RR.ReredactionRefused, match="no face redactor is available"):
         cap.plan(Unavailable())
     with pytest.raises(RR.ReredactionRefused, match="only writes sets under"):
-        cap.plan(Rule(label=UNGATED + "+plausibility4"))
+        cap.plan(Rule(label=UNGATED + "+plausibility9"))
     assert cap.store.keyframe_image_set(W, S).name == "images"
     assert not list(cap.images.parent.glob("images.redacted-*"))
     assert cap.stored_hashes() == before
@@ -571,7 +572,7 @@ def test_record_and_pointer_name_origins_hashes_and_labels(cap):
     before = cap.stored_hashes()
     plan, done = cap.apply()
     image_set = cap.store.keyframe_image_set(W, S)
-    assert image_set.name == "images.redacted-plausibility3" == done["set"]
+    assert image_set.name == "images.redacted-plausibility4" == done["set"]
     assert image_set.redaction == CURRENT and image_set.stored_redaction == UNGATED
     assert image_set.cache_token == f"{image_set.name}@{done['set_digest']}"
     pointer = cap.store.read_redaction_set_pointer(W, S)
@@ -615,7 +616,7 @@ def test_the_pointer_is_written_last_and_a_failure_before_it_switches_nothing(ca
     monkeypatch.setattr(cap.store, "write_redaction_set_pointer", at_switch)
     cap.apply()
     assert seen == {"complete": True, "reader_before": "images"}
-    assert cap.store.keyframe_image_set(W, S).name == "images.redacted-plausibility3"
+    assert cap.store.keyframe_image_set(W, S).name == "images.redacted-plausibility4"
 
 
 def test_a_failure_while_writing_the_set_leaves_readers_on_images(tmp_path, monkeypatch):
@@ -809,7 +810,7 @@ def test_appearance_follows_the_switch_and_its_served_label(tmp_path):
     url = f"/worlds/{WORLD}/appearance/{SESSION}/manifest"
     assert client.get(url).status_code == 200
 
-    name = "images.redacted-plausibility3"
+    name = "images.redacted-plausibility4"
     set_dir = w.store.session_dir(WORLD, SESSION) / name
     set_dir.mkdir()
     for i in range(len(w.kids)):
@@ -868,7 +869,7 @@ def test_a_revert_takes_the_sets_surface_off_every_rung_until_it_is_rebuilt(tmp_
     from tests.test_world_builder_appearance import SESSION, WORLD, World
 
     w = World(tmp_path, label=UNGATED)
-    name = "images.redacted-plausibility3"
+    name = "images.redacted-plausibility4"
     (w.store.session_dir(WORLD, SESSION) / name).mkdir()
     pointer = {"active": name, "redaction": CURRENT, "stored_redaction": UNGATED,
                "set_digest": "abc"}

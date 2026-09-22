@@ -49,6 +49,12 @@ TRUSTED_REDACTION_LABELS = {
     _YUNET: "ungated; fills a superset of every later gate",
     f"{_YUNET}+plausibility1": "0 of 3,232 held-out close faces lost",
     f"{_YUNET}+plausibility3": "1 of 3,232 held-out close faces lost",
+    # p4 is p3 followed by a verifier that can only DROP a box, admitted on
+    # the condition that it drops none of those 3,232 held-out composites,
+    # none of the 65 close ones and none of the canonical capture's 24
+    # labelled face boxes (fixit/precision/PRECISION.md). Its recall claim is
+    # therefore exactly p3's, measured on the same sets.
+    f"{_YUNET}+plausibility4": "1 of 3,232 held-out close faces lost, as p3",
 }
 # Known, and re-redacted rather than trusted: weak at the frame edge.
 RERUN_REDACTION_LABELS = {

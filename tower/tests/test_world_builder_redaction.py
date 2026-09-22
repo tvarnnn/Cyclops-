@@ -979,3 +979,210 @@ def test_a_session_with_no_failures_keeps_its_redaction_label(tmp_path):
     engine.stop_session()
 
     assert store.read_session(world_id, session_id).redaction == FaceRedactor().label
+
+
+# -- the fourth test: something that is not YuNet has to agree -----------
+#
+# Everything above is the detector arguing with itself. After all of it,
+# precision on the canonical capture is 24 boxes of 140. These pin the stage
+# that takes it to 24 of 104, and -- far more important -- pin every way it
+# can go wrong to FILLING.
+
+
+def _scripted_verifier(scores, *, available=True, raises=False,
+                       below_area=0.08, threshold=0.44):
+    """A verifier that answers from a list, in the order it is asked."""
+
+    class _V:
+        def __init__(self):
+            self.asked = []
+            self.available = available
+            self.unavailable_reason = None if available else "scripted"
+            self.below_area = below_area
+            self.threshold = threshold
+
+        def scores(self, image, boxes):
+            self.asked.append(list(boxes))
+            if raises:
+                raise RuntimeError("the verifier fell over")
+            return list(scores)[: len(boxes)]
+
+    return _V()
+
+
+def _detect_with(verifier, boxes_and_landmarks, image=None):
+    redactor = FaceRedactor(verifier=verifier)
+    redactor._raw_detect = lambda img, upscale: list(boxes_and_landmarks)
+    return redactor, redactor._detect(_room() if image is None else image)
+
+
+def test_the_verifier_drops_a_small_box_it_scores_below_the_threshold():
+    box = _box_of_area(0.03)
+    verifier = _scripted_verifier([0.10])
+    redactor, boxes = _detect_with(verifier, [(box, _facelike_landmarks(box))])
+    assert redactor.verifies
+    assert verifier.asked == [[box]]
+    assert boxes == []
+
+
+def test_the_verifier_keeps_a_small_box_it_scores_above_the_threshold():
+    box = _box_of_area(0.03)
+    verifier = _scripted_verifier([0.90])
+    _redactor, boxes = _detect_with(verifier, [(box, _facelike_landmarks(box))])
+    assert len(boxes) == 1
+
+
+def test_a_box_too_large_to_judge_is_never_offered_to_the_verifier():
+    """Above the scope the crop is mostly padding and the face is partial. At
+    a 25% cut the same threshold loses 79 of 2,210 held-out off-frame
+    composites; at 12%, six; at 8%, none (PRECISION.md). So the verifier is
+    not asked, and plausibility3's own evidence decides alone.
+    """
+    box = _box_of_area(0.20)
+    verifier = _scripted_verifier([0.0])
+    _redactor, boxes = _detect_with(verifier, [(box, _facelike_landmarks(box))])
+    assert verifier.asked == []
+    assert len(boxes) == 1
+
+
+@pytest.mark.parametrize("kind", ["absent", "unloadable", "throws",
+                                  "no-crop", "not-a-number"])
+def test_every_way_the_verifier_can_fail_keeps_the_fill(kind):
+    """A verifier that cannot judge must never be the reason a face is not
+    filled. Each of these would have to DROP the box to be a privacy bug.
+    """
+    verifier = {
+        "absent": False,
+        "unloadable": _scripted_verifier([0.0], available=False),
+        "throws": _scripted_verifier([0.0], raises=True),
+        "no-crop": _scripted_verifier([None]),
+        "not-a-number": _scripted_verifier([float("nan")]),
+    }[kind]
+    box = _box_of_area(0.03)
+    redactor = FaceRedactor(verifier=verifier)
+    redactor._raw_detect = lambda img, upscale: [(box, _facelike_landmarks(box))]
+    assert len(redactor._detect(_room())) == 1
+
+
+def test_the_label_names_the_gate_that_actually_ran():
+    """A session that filled plausibility3's pixels must not claim
+    plausibility4's. The suffix is the one thing a later reader has."""
+    from tower.world_builder.redaction import (
+        PLAUSIBILITY_ID,
+        PLAUSIBILITY_WITHOUT_VERIFIER,
+    )
+
+    assert PLAUSIBILITY_ID == "plausibility4"
+    with_verifier = FaceRedactor(verifier=_scripted_verifier([1.0]))
+    without = FaceRedactor(verifier=False)
+    assert with_verifier.verifies
+    assert with_verifier.label.endswith("+" + PLAUSIBILITY_ID)
+    assert not without.verifies
+    assert without.label.endswith("+" + PLAUSIBILITY_WITHOUT_VERIFIER)
+    assert with_verifier.label != without.label
+
+
+def test_the_reredaction_step_writes_the_gate_that_ran():
+    """The re-redacted set's name and label, and the allowlist the appearance
+    build reads, all move together with the gate -- otherwise a p4 set is
+    written under p3's name, or a p4 session is not trusted at all."""
+    from tower.world_builder import appearance as A
+    from tower.world_builder import reredaction as RR
+    from tower.world_builder.redaction import PLAUSIBILITY_ID
+
+    assert RR.TARGET_LABEL.endswith("+" + PLAUSIBILITY_ID)
+    assert RR.set_name() == "images.redacted-" + PLAUSIBILITY_ID
+    # p3 is now an OLDER gate, and its fill contains p4's on the same frame,
+    # so a frame kept for any reason still meets the target label.
+    assert RR.REREDACTABLE_LABELS[
+        "faces-detected-and-filled/yunet-2023mar@0.30+plausibility3"] is True
+    assert RR.TARGET_LABEL in A.TRUSTED_REDACTION_LABELS
+
+
+def test_an_unloadable_verifier_is_reported_rather_than_assumed(tmp_path,
+                                                                monkeypatch):
+    from tower.world_builder.redaction import FaceVerifier
+
+    monkeypatch.setenv("TOWER_FACE_VERIFIER", str(tmp_path / "nothing.json"))
+    absent = FaceVerifier()
+    assert not absent.available
+    assert "TOWER_FACE_VERIFIER" in absent.unavailable_reason
+
+    monkeypatch.setenv("TOWER_FACE_VERIFIER", "off")
+    assert not FaceVerifier().available
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    monkeypatch.setenv("TOWER_FACE_VERIFIER", str(broken))
+    bad = FaceVerifier()
+    assert not bad.available
+    assert "could not be loaded" in bad.unavailable_reason
+
+
+def test_the_crop_is_the_neighbourhood_padded_and_stretched():
+    """The crop recipe is part of the rule: a probe fitted on 2.5x stretched
+    crops means nothing if the product hands it something else."""
+    from tower.world_builder.redaction import (
+        VERIFIER_CONTEXT,
+        VERIFIER_SIZE,
+        verifier_crop,
+    )
+
+    frame = _room()
+    inside = verifier_crop(frame, (300.0, 150.0, 40.0, 40.0))
+    assert inside.shape == (VERIFIER_SIZE, VERIFIER_SIZE, 3)
+    # a box at the very corner still yields a crop rather than raising
+    corner = verifier_crop(frame, (-20.0, -20.0, 60.0, 60.0))
+    assert corner is not None and corner.shape[0] == VERIFIER_SIZE
+    assert VERIFIER_CONTEXT > 1.0
+    # a dark, low-contrast patch comes back using the whole range
+    dark = np.zeros((360, 640, 3), np.uint8)
+    ramp = np.linspace(8, 26, 100).astype(np.uint8)
+    dark[100:200, 100:200] = ramp[:, None, None]
+    stretched = verifier_crop(dark, (120.0, 120.0, 40.0, 40.0))
+    assert int(stretched.max()) - int(stretched.min()) > 200
+    # a box with no area is refused rather than guessed at
+    assert verifier_crop(frame, (10.0, 10.0, 0.0, 10.0)) is None
+
+
+def test_the_verifier_ranks_a_real_face_above_the_room_it_is_in():
+    """Recall and precision, on fixtures: a real photograph of a face, at
+    three sizes, against six real non-face textures and the bare room, all
+    composited into the same rendered room.
+
+    A synthetic scene's absolute scores are not the canonical capture's --
+    everything here scores high, which is the safe direction -- so what is
+    pinned is the recall and the SEPARATION: every face is accepted, and
+    every face outscores every non-face.
+    """
+    from tower.world_builder.redaction import shared_verifier
+
+    verifier = shared_verifier()
+    if not verifier.available:
+        pytest.skip(f"no face verifier here: {verifier.unavailable_reason}")
+    room = _room()
+
+    def _with(patch, size=90, at=(200, 80)):
+        frame = room.copy()
+        resized = cv2.resize(patch, (size, size), interpolation=cv2.INTER_AREA)
+        frame[at[1]:at[1] + size, at[0]:at[0] + size] = resized
+        return frame, (float(at[0]), float(at[1]), float(size), float(size))
+
+    faces = []
+    for size in (60, 90, 140):
+        frame, box = _with(_face_patch(size), size)
+        faces.append(verifier.scores(frame, [box])[0])
+
+    others = {"room": verifier.scores(room, [(200.0, 80.0, 90.0, 90.0)])[0]}
+    for name in ("brick", "grass", "gravel", "coffee", "coins", "text"):
+        texture = getattr(skimage_data, name)()
+        texture = (cv2.cvtColor(texture, cv2.COLOR_GRAY2BGR)
+                   if texture.ndim == 2
+                   else cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+        frame, box = _with(texture)
+        others[name] = verifier.scores(frame, [box])[0]
+
+    assert min(faces) >= verifier.threshold, (
+        f"a real face was rejected: {faces} against {verifier.threshold}")
+    assert min(faces) > max(others.values()) + 0.03, (
+        f"faces {faces} did not separate from {others}")
