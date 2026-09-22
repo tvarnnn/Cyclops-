@@ -2,9 +2,9 @@
 """Finish the photographic work a world was promised and never got.
 
     python scripts/world_finish_pending.py --root <world root>
-        [--max-worlds 1] [--max-attempts 3] [--no-appearance]
-        [--keep-depth-work] [--dry-run] [--stop-on-stdin-close]
-        [--format json|text]
+        [--max-worlds 1] [--max-attempts 3] [--max-forgiven 5]
+        [--no-appearance] [--keep-depth-work] [--dry-run]
+        [--stop-on-stdin-close] [--format json|text]
 
 WHY THIS EXISTS, AND WHAT IT COST NOT TO HAVE IT.
 
@@ -57,6 +57,16 @@ process -- so counting it would retire a perfectly recoverable world to
 given back, from the stop watcher's own thread, in the five seconds before
 `terminate_tree` arrives. See `forgive_attempt`.
 
+AND FORGIVENESS IS ITSELF BOUNDED, because unconditional it made the attempt
+bound unreachable in the one case that bound exists for. On 2026-09-22 this
+tool deadlocked in the native loader, did nothing at all, was killed by the
+stop grace and was forgiven -- at every Tower start, leaving `{"attempts": 0,
+"detail": "attempt given back: stopped (stdin-closed)"}` on disk after all of
+them. The world would have said "Improving" across unlimited restarts. After
+`--max-forgiven` stops the attempts count anyway, the retry bound is reached,
+and the world reports honestly as a photographic build that failed. See
+`DEFAULT_MAX_FORGIVEN`.
+
 IT NEVER INVENTS WORK, AND IT IS NOT A NO-OP EITHER. Those two failures pull
 in opposite directions and `assess` has to hold both.
 
@@ -97,6 +107,7 @@ from scripts.world_build_session import (  # noqa: E402
     final_surface_stages,
 )
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
+from tower.native_prewarm import prewarm_world_builder  # noqa: E402
 from tower.results.world_builder_render import session_build_running  # noqa: E402
 from tower.storage import read_json_closed, write_json_atomic  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
@@ -137,6 +148,60 @@ INTERRUPTED_STATES = (STAGE_STATE_RUNNING, STAGE_STATE_STOPPED)
 # wearer went for a walk", and counting that would retire a perfectly
 # recoverable world to `failed` in three ordinary days.
 DEFAULT_MAX_ATTEMPTS = 3
+
+# HOW MANY TIMES FORGIVENESS ITSELF MAY BE GRANTED, AND WHY THE BOUND ABOVE
+# WAS WORTH NOTHING WITHOUT THIS ONE.
+#
+# `forgive_attempt` gives the attempt back whenever a stop was REQUESTED, and
+# that is right for the event it was written for. It is also unconditional,
+# and on 2026-09-22 that made the attempt bound unreachable IN THE ONE CASE IT
+# EXISTS FOR. The finisher deadlocked on a Windows loader lock -- `surfacify`
+# pulling OpenBLAS in through moge -> scipy.linalg while the stdin watcher sat
+# in a blocking `ReadFile` -- and sat at 0% CPU making no progress whatever.
+# Every Tower start ran it again, every start ended in a stop, and every stop
+# handed the attempt back. The ledger on disk read, after all of them:
+#
+#     {"attempts": 0, "detail": "attempt given back: stopped (stdin-closed)"}
+#
+# Zero. The counter that was the only mechanism able to retire that world
+# never passed zero, so the world would have reported "Improving" across
+# unlimited restarts, for ever, with nothing on disk saying why. The root
+# cause is fixed (see `tower/native_prewarm.py` and the prewarm call in
+# `main`); this is the containment, so that the NEXT thing that hangs or gets
+# killed instantly cannot imply progress for ever either.
+#
+# FIVE, AGAINST THE REAL NUMBERS. The event being forgiven is "boot the Tower,
+# then go for a walk", which ends this process on an ordinary start; a busy
+# day is a handful of Tower starts, not fifty. Five free passes means a
+# genuinely recoverable world survives a whole day of ordinary use -- and
+# several such days, because ONE start that is left alone long enough to
+# finish clears the world out of the owed set entirely and the counters stop
+# mattering. Past five, the attempts accumulate normally and the three above
+# apply, so a world that is truly unfinishable is retired to `failed` after
+# nine starts: roughly two to three ordinary days, rather than never.
+#
+# WHY A COUNTER AND NOT A PROGRESS TEST. The obvious better rule is "forgive
+# only an attempt that actually got somewhere", and the material is nearly
+# there: `surface_pipeline._status` stamps `updated_at` into
+# `<world>/<stage>/<session>/status.json` at each step, so the finisher could
+# sample it before the stage and again from the stop watcher's thread. It is
+# the wrong rule anyway, and would have been wrong here in BOTH directions.
+# The hang produced no status file at all, but neither does an honest stop
+# forty seconds into a start -- the wearer pressed Start before `surfacify`
+# reached its first write -- and treating that as a spent attempt puts back
+# exactly the "three ordinary days retire a recoverable world" failure
+# `forgive_attempt` exists to prevent. In the other direction a status file
+# proves only that the process wrote one line before it wedged, which the
+# deadlock would eventually have managed too. Progress is also not a fact the
+# watcher thread can establish cheaply under a five-second `terminate_tree`
+# grace: it would be a second read of a file another thread may be mid-write
+# on. So the bound is on the number of forgiven attempts -- a fact this tool
+# owns, writes itself, and can always read back.
+#
+# DELIBERATELY NOT A WALL CLOCK. Nothing here times a running build. A long
+# walk is a long build, sixteen minutes and more, and a timer around work that
+# is going fine would kill the very thing this tool was written to finish.
+DEFAULT_MAX_FORGIVEN = 5
 
 # One world per run. Not a throughput knob: the machine belongs to whoever
 # picks the glasses up next, and six to sixteen minutes is already a long
@@ -222,13 +287,45 @@ def _read_ledger(store: WorldStore, world_id: str) -> tuple[dict, bool]:
     return data["sessions"], False
 
 
+def _counter(entry: dict, field: str) -> int:
+    """One counter out of a ledger entry, treating anything else as zero.
+
+    ABSENT IS ZERO, AND THAT IS WHAT KEEPS OLD LEDGERS READABLE. `forgiven`
+    was added on 2026-09-22 to a file that already exists beside every world
+    this tool has ever touched, and those entries have `attempts` and
+    `detail` and nothing else. They are not corrupt and they are not a
+    special case: a session nobody has forgiven yet has been forgiven zero
+    times, which is exactly what the new field would have said. `bool` is
+    excluded because `True` is an `int` in Python and a counter of `True` is
+    a bug, not a count.
+    """
+    value = entry.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def read_attempts(store: WorldStore, world_id: str, session_id: str) -> int | None:
     """How often this tool has started this session, or None if it cannot say."""
     sessions, unreadable = _read_ledger(store, world_id)
     if unreadable:
         return None
-    count = (sessions.get(session_id) or {}).get("attempts")
-    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+    return _counter(sessions.get(session_id) or {}, "attempts")
+
+
+def read_forgiven(store: WorldStore, world_id: str, session_id: str) -> int | None:
+    """How often an attempt on this session has been given back, or None.
+
+    Reported separately from `attempts` rather than folded into it because
+    the two answer different questions. `attempts` is "how many times was
+    this tool left alone and still did not finish", which is what the retry
+    bound is about. `forgiven` is "how many times did this tool run and end
+    in a stop", which is what tells a hung finisher apart from a wearer who
+    keeps going for walks -- the distinction the incident of 2026-09-22 had
+    no way to make, because every one of those runs left `attempts` at zero.
+    """
+    sessions, unreadable = _read_ledger(store, world_id)
+    if unreadable:
+        return None
+    return _counter(sessions.get(session_id) or {}, "forgiven")
 
 
 # One writer at a time WITHIN this process. Between processes the world's
@@ -264,17 +361,30 @@ def record_attempt(
     with _LEDGER_LOCK:
         sessions, _ = _read_ledger(store, world_id)
         sessions = dict(sessions)
-        count = (sessions.get(session_id) or {}).get("attempts")
-        count = (
-            count if isinstance(count, int) and not isinstance(count, bool) else 0
-        ) + 1
-        sessions[session_id] = {"attempts": count, "detail": detail}
+        # THE ENTRY IS EDITED, NOT REPLACED. It used to be rewritten whole,
+        # which was harmless while `attempts` was the only number in it and
+        # fatal the moment it was not: `forgiven` is written by the stop
+        # watcher on the way out of one run and read by the next one, so a
+        # `record_attempt` that dropped it would reset the forgiveness bound
+        # to zero at the start of every attempt -- restoring, exactly, the
+        # unreachable bound of 2026-09-22 through a different door.
+        entry = dict(sessions.get(session_id) or {})
+        count = _counter(entry, "attempts") + 1
+        entry["attempts"] = count
+        entry["forgiven"] = _counter(entry, "forgiven")
+        entry["detail"] = detail
+        sessions[session_id] = entry
         _write_ledger(store, world_id, sessions)
     return count
 
 
 def forgive_attempt(
-    store: WorldStore, world_id: str, session_id: str, *, detail: str
+    store: WorldStore,
+    world_id: str,
+    session_id: str,
+    *,
+    detail: str,
+    max_forgiven: int = DEFAULT_MAX_FORGIVEN,
 ) -> None:
     """Give an attempt back, because this run was ASKED to stop.
 
@@ -291,6 +401,26 @@ def forgive_attempt(
     no stop request behind, which is precisely what makes them the failure
     the bound was written for.
 
+    AND FORGIVENESS IS ITSELF BOUNDED, because unconditional it made the
+    retry bound unreachable in the one case that bound exists for. On
+    2026-09-22 a finisher deadlocked in the native loader, did nothing at
+    all, was killed by the stop grace, and was forgiven -- at every single
+    Tower start, leaving `{"attempts": 0, "detail": "attempt given back:
+    stopped (stdin-closed)"}` on disk however many times it ran. A stop
+    request is evidence that THIS run was interrupted; it is not evidence
+    that the run would ever have finished, and after `max_forgiven` of them
+    this tool stops accepting it as such. The attempt then stands, the
+    attempts accumulate, `assess` reaches the retry bound and `_retire`
+    writes `failed` -- so the world reports honestly as a photographic build
+    that did not happen, instead of "Improving" for ever. See
+    `DEFAULT_MAX_FORGIVEN` for the number and the arithmetic behind it.
+
+    THE COUNT IS KEPT EVEN WHEN THE FORGIVENESS IS REFUSED, and it has to be:
+    it is the only durable trace that this run existed at all. A run that is
+    always killed before it writes anything else is exactly the shape being
+    bounded, so the increment happens on both branches and the ledger's
+    `detail` says which one was taken.
+
     CALLED FROM THE STOP WATCHER'S THREAD, milliseconds after the pipe
     closes, and that is the whole design. The grace ends in `terminate_tree`,
     so anything this process would have done after the stage returned does
@@ -304,12 +434,24 @@ def forgive_attempt(
             if unreadable:
                 return
             sessions = dict(sessions)
-            count = (sessions.get(session_id) or {}).get("attempts")
-            count = count if isinstance(count, int) and not isinstance(count, bool) else 0
-            sessions[session_id] = {
-                "attempts": max(0, count - 1),
-                "detail": f"attempt given back: {detail}",
-            }
+            entry = dict(sessions.get(session_id) or {})
+            count = _counter(entry, "attempts")
+            forgiven = _counter(entry, "forgiven")
+            entry["forgiven"] = forgiven + 1
+            if forgiven >= max_forgiven:
+                # Refused. `attempts` is left exactly as `record_attempt`
+                # wrote it, which is the whole containment: from here on the
+                # retry bound advances by one at every start.
+                entry["detail"] = (
+                    f"attempt kept: {detail}; this session has already been "
+                    f"forgiven {forgiven} times (the bound is {max_forgiven}), "
+                    "so a stop is no longer taken as evidence that it would "
+                    "have finished"
+                )
+            else:
+                entry["attempts"] = max(0, count - 1)
+                entry["detail"] = f"attempt given back: {detail}"
+            sessions[session_id] = entry
             _write_ledger(store, world_id, sessions)
     except Exception:  # noqa: BLE001 -- see the docstring
         logger.warning(
@@ -674,6 +816,7 @@ def finish(
     appearance: bool,
     prune_depth_work: bool,
     stop_request,
+    max_forgiven: int = DEFAULT_MAX_FORGIVEN,
 ) -> dict:
     """One owed session, finished under the world's writer lock.
 
@@ -729,6 +872,7 @@ def finish(
             lambda source: forgive_attempt(
                 store, verdict.world_id, verdict.session_id,
                 detail=f"stopped ({source})",
+                max_forgiven=max_forgiven,
             ),
         )
         report["stages"] = final_surface_stages(
@@ -767,6 +911,7 @@ def finish(
                 forgive_attempt(
                     store, verdict.world_id, verdict.session_id,
                     detail=f"stopped ({stop_request.source})",
+                    max_forgiven=max_forgiven,
                 )
         engine.release_world(verdict.world_id)
     return report
@@ -811,6 +956,13 @@ def main(argv=None, *, stop_request=None) -> int:
              "gives up and records that it did",
     )
     parser.add_argument(
+        "--max-forgiven", type=int, default=DEFAULT_MAX_FORGIVEN,
+        help="how many times a stop request may give an attempt back before "
+             "the attempts start counting anyway; without this bound a "
+             "finisher that hangs and is killed at every boot is forgiven at "
+             "every boot and --max-attempts is never reached",
+    )
+    parser.add_argument(
         "--appearance", action=argparse.BooleanOptionalAction, default=True,
         help="shade the surface with the wearer's redacted keyframes, as the "
              "builder does; pass --no-appearance when the Tower's "
@@ -834,6 +986,15 @@ def main(argv=None, *, stop_request=None) -> int:
     args = parser.parse_args(argv)
 
     if stop_request is None:
+        # BEFORE the watcher is armed, and that order is load-bearing on
+        # Windows. This process ran for over 95 minutes at 0% CPU on
+        # 2026-09-22 because `surfacify` loaded OpenBLAS (via moge ->
+        # scipy.linalg) while the stop watcher below was parked in a
+        # blocking `ReadFile` on the stdin pipe. Warming the native stack
+        # here, with no reader parked behind the loader, is what prevents
+        # it. See `tower/native_prewarm.py`.
+        prewarm_world_builder()
+
         stop_request = StopRequest()
         # Armed BEFORE the survey, so a Tower that starts and immediately
         # begins a walk is obeyed at the first opportunity rather than at the
@@ -891,6 +1052,7 @@ def main(argv=None, *, stop_request=None) -> int:
             appearance=args.appearance,
             prune_depth_work=not args.keep_depth_work,
             stop_request=stop_request,
+            max_forgiven=args.max_forgiven,
         )
         report["finished"].append(outcome)
         done += 1

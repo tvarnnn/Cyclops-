@@ -617,6 +617,199 @@ def test_an_attempt_that_cannot_be_counted_is_never_started(tmp_path, monkeypatc
     assert ran == []
 
 
+# -- the bound on forgiveness -----------------------------------------
+#
+# WHY THE SECTION ABOVE WAS NOT ENOUGH. Every test above bounds the RETRIES.
+# None of them bounds the FORGIVENESS, and on 2026-09-22 that was the whole
+# defect: the finisher deadlocked in the Windows native loader, sat at 0% CPU
+# making no progress at all, was killed by the stop grace -- and was forgiven,
+# because a stop had been requested. At every Tower start. The ledger on disk
+# said, after all of them:
+#
+#     {"attempts": 0, "detail": "attempt given back: stopped (stdin-closed)"}
+#
+# Zero. The counter that is the ONLY mechanism able to retire an unfinishable
+# world never passed zero, so the world reported "Improving" across unlimited
+# restarts with nothing on disk explaining it. The root cause is fixed
+# elsewhere (`tower/native_prewarm.py`, and the prewarm call before the stop
+# watcher is armed); these tests are the containment, so that the next thing
+# that hangs or is killed instantly cannot imply progress for ever either.
+#
+# WHAT MUST NOT BREAK IS THE LEGITIMATE CASE. "Boot the Tower, then go for a
+# walk" ends this process on an ordinary start, and counting those would
+# retire a perfectly recoverable world in three ordinary days. So the first
+# test below is the one holding the other end of the rope.
+
+
+def _a_stopped_run(tmp_path, monkeypatch, *argv, source="stdin-closed"):
+    """One whole Tower start that is interrupted, end to end.
+
+    The finisher begins the surface, the wearer presses Start, the pipe
+    closes, and `terminate_tree` arrives before the stage reaches a
+    `should_stop` checkpoint. Verbatim what the watcher thread does -- a
+    fresh `StopRequest` each time, because a real one belongs to a real
+    process and each of these is a different boot.
+    """
+    stop = StopRequest()
+
+    def stopped_mid_surface(store_, world_id, session_id, **kwargs):
+        stop.request(StopRequest.SOFT, source)
+        raise KeyboardInterrupt("terminate_tree got here first")
+
+    monkeypatch.setattr(wfp, "final_surface_stages", stopped_mid_surface)
+    with pytest.raises(KeyboardInterrupt):
+        wfp.main(["--root", str(tmp_path), *argv], stop_request=stop)
+
+
+def _ledger_entry(store, world_id="w1", session_id="s1") -> dict:
+    path = store.world_dir(world_id) / wfp.ATTEMPTS_FILENAME
+    return json.loads(path.read_text(encoding="utf-8"))["sessions"][session_id]
+
+
+def test_one_ordinary_stop_during_a_start_still_forgives(tmp_path, monkeypatch):
+    """THE ORDINARY CASE IS UNHARMED, and it is checked first on purpose.
+
+    A bound on forgiveness that costs the common event its free pass has
+    not fixed anything, it has only moved the harm: "boot the Tower, then go
+    for a walk" is what the product EXPECTS, and three of them must not
+    retire a recoverable world. One stop, one attempt given back, and the
+    forgiveness recorded so the NEXT one can be counted.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    _a_stopped_run(tmp_path, monkeypatch)
+
+    assert wfp.read_attempts(store, "w1", "s1") == 0
+    assert wfp.read_forgiven(store, "w1", "s1") == 1
+    assert "given back" in _ledger_entry(store)["detail"]
+    assert _verdict(store).owed is True
+
+
+def test_a_session_forgiven_up_to_the_bound_is_still_recoverable(
+    tmp_path, monkeypatch
+):
+    """Five ordinary days of walks cost this world nothing.
+
+    The bound is FIVE (`DEFAULT_MAX_FORGIVEN`) because the event it forgives
+    is a Tower start followed by a walk, and a busy day is a handful of
+    those, not fifty. Up to the bound the attempts must stay at zero and the
+    world must stay owed -- one start that is left alone long enough to
+    finish clears it out of the owed set entirely and none of this matters
+    again.
+    """
+    # THE NUMBER ITSELF IS LOAD-BEARING and is pinned here rather than only
+    # read: a bound below a day's ordinary Tower starts makes the free pass
+    # not free, and the loop below would sail through a bound of zero without
+    # noticing.
+    assert wfp.DEFAULT_MAX_FORGIVEN >= 3
+
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    for _ in range(wfp.DEFAULT_MAX_FORGIVEN):
+        _a_stopped_run(tmp_path, monkeypatch)
+
+    assert wfp.read_attempts(store, "w1", "s1") == 0
+    assert wfp.read_forgiven(store, "w1", "s1") == wfp.DEFAULT_MAX_FORGIVEN
+    assert _verdict(store).owed is True
+
+
+def test_past_the_bound_forgiveness_stops_and_the_attempts_accumulate(
+    tmp_path, monkeypatch
+):
+    """The defect itself: a stop is no longer taken as proof of progress.
+
+    Past the bound a stop request still ends the run, but it no longer hands
+    the attempt back -- so `attempts` climbs by one at every start, which is
+    the thing that could never happen on 2026-09-22. Three more starts and
+    `--max-attempts` is reached.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    for _ in range(wfp.DEFAULT_MAX_FORGIVEN):
+        _a_stopped_run(tmp_path, monkeypatch)
+    assert wfp.read_attempts(store, "w1", "s1") == 0
+
+    seen = []
+    for _ in range(wfp.DEFAULT_MAX_ATTEMPTS):
+        _a_stopped_run(tmp_path, monkeypatch)
+        seen.append(wfp.read_attempts(store, "w1", "s1"))
+
+    assert seen == [1, 2, 3]
+    assert "forgiven" in _ledger_entry(store)["detail"]
+    # Nine starts in all, which at a handful of Tower starts a day is two to
+    # three ordinary days -- not never.
+    verdict = _verdict(store)
+    assert verdict.owed is False
+    assert verdict.exhausted is True
+
+
+def test_a_finisher_that_is_always_killed_is_finally_retired(
+    tmp_path, monkeypatch
+):
+    """And the world says so, instead of "Improving" for ever.
+
+    The point of reaching the bound at all is `_retire`: the stage recorded
+    `failed`, with the same explanatory detail and the same way back by hand
+    that an ordinary exhausted session gets. A photographic build that did
+    not happen is an honest thing for a world to report; a perpetual
+    "Improving" that nothing will ever advance is not.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    argv = ("--max-forgiven", "1", "--max-attempts", "2")
+    for _ in range(3):
+        _a_stopped_run(tmp_path, monkeypatch, *argv)
+    assert wfp.read_attempts(store, "w1", "s1") == 2
+
+    # A start that is left alone: nothing is owed any more, so the only work
+    # is writing down why.
+    assert wfp.main(["--root", str(tmp_path), *argv]) == 0
+    surface = store.read_session("w1", "s1").stages[STAGE_SURFACE]
+    assert surface["state"] == STAGE_STATE_FAILED
+    assert "world_surface.py" in (surface["detail"] or "")
+    assert _verdict(store).owed is False
+
+
+def test_a_ledger_written_before_forgiveness_was_bounded_still_parses(
+    tmp_path, monkeypatch
+):
+    """OLD LEDGERS ARE NOT A SPECIAL CASE, they are a zero.
+
+    `forgiven` was added to a file that already sits beside every world this
+    tool has touched, and those entries carry `attempts` and `detail` and
+    nothing else. A session nobody has forgiven yet has been forgiven zero
+    times, which is what the missing field would have said -- so the old
+    entry parses, its attempt count survives, and the first stop after the
+    upgrade behaves exactly as it would have on a new ledger.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    path = store.world_dir("w1") / wfp.ATTEMPTS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"schema": 1, "sessions": {
+            "s1": {"attempts": 1, "detail": "finishing the surface stage"},
+            # A second old entry, forgiven DIRECTLY below. In the ordinary
+            # flow `record_attempt` runs first and normalises the entry, so
+            # the stop watcher never meets a missing field -- and
+            # `forgive_attempt` may not raise, so if it ever did meet one the
+            # cost would be a forgiveness silently not written rather than a
+            # traceback. Asked of it here where the swallow cannot hide it.
+            "s0": {"attempts": 2, "detail": "finishing the surface stage"},
+        }}),
+        encoding="utf-8",
+    )
+
+    assert wfp.read_attempts(store, "w1", "s1") == 1
+    assert wfp.read_forgiven(store, "w1", "s1") == 0
+    assert _verdict(store).owed is True
+
+    wfp.forgive_attempt(store, "w1", "s0", detail="stopped (stdin-closed)")
+    assert wfp.read_attempts(store, "w1", "s0") == 1
+    assert wfp.read_forgiven(store, "w1", "s0") == 1
+
+    _a_stopped_run(tmp_path, monkeypatch)
+    # The attempt this run counted was given back, and the old count is
+    # untouched underneath it.
+    assert wfp.read_attempts(store, "w1", "s1") == 1
+    assert wfp.read_forgiven(store, "w1", "s1") == 1
+
+
 # -- the CLI ----------------------------------------------------------
 
 

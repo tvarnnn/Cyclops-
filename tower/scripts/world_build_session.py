@@ -84,6 +84,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
+from tower.native_prewarm import prewarm_world_builder  # noqa: E402
 from tower.capture import (  # noqa: E402
     END_REASON_DISCONNECT as END_REASON_CAPTURE_DISCONNECT,
     END_REASON_BOUNDED_LIMIT as END_REASON_CAPTURE_BOUNDED,
@@ -1729,6 +1730,14 @@ def main(argv=None) -> int:
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
 
+    # BEFORE the watcher is armed, for the reason `tower/native_prewarm.py`
+    # gives at length: this process runs `final_surface_stages` after Stop,
+    # which loads the same OpenBLAS-backed stack that deadlocked the
+    # recovery finisher against its own parked stdin reader on 2026-09-22.
+    # The builder is the other process that runs those stages, so it is the
+    # other process that has to be warmed.
+    prewarm_world_builder()
+
     # Installed before the follower is built and before the first frame is
     # read, because the poll loop it arms is the thing being armed.
     stop_request = StopRequest()
@@ -2282,6 +2291,52 @@ def main(argv=None) -> int:
             )
         except Exception:  # noqa: BLE001
             logger.exception("[Tower][WorldBuilder] could not record the finalization")
+
+        # THE OWED WORK IS WRITTEN DOWN BEFORE THE LOCK IS DROPPED, and the
+        # order is the whole point.
+        #
+        # Releasing the lock here is correct and stays: the phone must be
+        # able to read the world while the photographic stages build it. But
+        # between this release and `final_surface_stages`' own first record,
+        # a hundred lines below, there used to be NOTHING ON DISK saying a
+        # photographic room was coming. The status channel read that window
+        # as a finished world and the phone said **Saved**, then went back to
+        # Improving when the surface finally wrote its first `running`
+        # status. That is the first half of the Mac validation's T2, and it
+        # is the half the record could not cover because the record did not
+        # exist yet.
+        #
+        # `running` rather than a new word, and it is not a lie: this process
+        # IS working on this session, in this function, microseconds from
+        # calling the stage. It is also the right thing to find afterwards --
+        # a builder that dies in this window leaves `running` under a dead
+        # pid, which is precisely the signature
+        # `scripts/world_finish_pending.py` selects on and recovers, where
+        # before it left nothing at all and the work was lost silently.
+        #
+        # Guarded on `args.surface` because a Tower with the stages switched
+        # off owes nothing and must not be made to look as though it does --
+        # and on the SOLVE, because `final_surface_stages` refuses without
+        # one and `world_finish_pending.assess()` will not pick such a
+        # session up either (`no-final-solve`). A record nothing will ever
+        # act on is a world that reads "Improving" forever.
+        if (
+            args.surface
+            and finalization_state == FINALIZATION_COMPLETE
+            and final_solve_state == FINAL_SOLVE_SOLVED
+        ):
+            try:
+                engine.mark_stage(
+                    world_id, session_id, STAGE_SURFACE,
+                    state=STAGE_STATE_RUNNING,
+                    detail="the photographic stages are about to run",
+                )
+            except Exception:  # noqa: BLE001 -- a record is not worth the walk
+                logger.exception(
+                    "[Tower][WorldBuilder] could not record that the "
+                    "photographic stages are owed"
+                )
+
         engine.release_world(world_id)
 
     if result is None or summary is None:

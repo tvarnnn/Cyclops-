@@ -85,6 +85,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import CaptureFollower, FRAMES_FILENAME  # noqa: E402
+from tower.native_prewarm import prewarm_object_memory  # noqa: E402
 from tower.capture_workers import (  # noqa: E402
     ATTACH_MODE_FROM_NOW,
     ATTACH_MODE_FROM_START,
@@ -515,17 +516,12 @@ def _prewarm_native_libraries() -> None:
     fails here is a warning, never a refusal to start -- warming a library
     must not be the thing that stops a wearer's session from beginning.
     """
-    try:
-        import scipy.linalg  # noqa: F401
-    except Exception as exc:  # noqa: BLE001
-        print(
-            "[Tower][ObjectMemory] could not pre-warm the native numerical "
-            f"stack ({exc.__class__.__name__}: {exc}); continuing. If a "
-            "verifier is configured and this host is Windows, watch for a "
-            "worker that loads its model and never observes a frame.",
-            file=sys.stderr,
-            flush=True,
-        )
+    # The body moved to `tower/native_prewarm.py` on 2026-09-22, when the
+    # SAME deadlock was found in World Builder's recovery finisher. The fix
+    # had been written here, where the first bug was, so the second
+    # subsystem inherited the bug instead of the fix. This function stays as
+    # the name the tests and the call site below already use.
+    prewarm_object_memory()
 
 
 def main(argv=None) -> int:
