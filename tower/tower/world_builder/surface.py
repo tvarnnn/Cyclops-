@@ -121,6 +121,220 @@ class SurfaceUnavailable(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.key_overshoot: float | None = None
+        """Set only by `key_range_refusal`: how many times too wide the block
+        grid was. The caller then coarsens by exactly that, instead of
+        guessing a factor and asking again."""
+
+
+KEY_RANGE_REASON = (
+    "the scene's block coordinates fall outside the keyable range; "
+    "the SfM gauge is arbitrary and this world's is too large for the "
+    "chosen voxel fraction")
+"""Unchanged wording, deliberately: it is what `status.json` has said since
+the guard existed and what `WORLD-BUILDER-LIVE-WORLD-VISUALIZATION.md` quotes
+verbatim. What is new is the overshoot that rides beside it."""
+
+
+def key_range_refusal(overshoot: float) -> SurfaceUnavailable:
+    """The refusal `block_key` raises, carrying how far outside it landed."""
+    exc = SurfaceUnavailable(KEY_RANGE_REASON)
+    exc.key_overshoot = float(overshoot)
+    return exc
+
+
+# ---------------------------------------------------------------------------
+# the solver's own outliers
+# ---------------------------------------------------------------------------
+
+OUTLIER_RADIUS_MULTIPLE = 10.0
+"""Default for `SurfaceParams.outlier_radius_multiple`; see it for the
+measurements behind the number."""
+
+FUSION_BOUND_MULTIPLE = 2.0
+"""Default for `SurfaceParams.fusion_bound_multiple`."""
+
+MIN_ROBUST_POSES = 8
+"""Below this many poses a median radius describes nothing, and the rule
+stands down rather than guess. Eight is where a ring of cameras still has a
+meaningful middle; a session with fewer frames than this has no surface worth
+arguing about anyway."""
+
+MIN_ROBUST_POINTS = 16
+"""The same idea for the sparse cloud. The envelope only ever grows when the
+filter stands down, so standing down is the safe direction."""
+
+OUTLIER_VERSION = 1
+"""Bumped when the rules below change what geometry is fused, so a surface
+built under the old ones rebuilds rather than claiming to be current."""
+
+
+@dataclass(frozen=True)
+class PoseOutlierReport:
+    """Which poses of one solve are radius outliers among its own poses."""
+
+    outlier: "np.ndarray"
+    radius: "np.ndarray"
+    median_radius: float
+    multiple: float
+    detail: str
+
+    @property
+    def gated(self) -> int:
+        return int(self.outlier.sum())
+
+    def record(self) -> dict:
+        """What the manifest says about the gate. Always present, even when
+        nothing was gated: "no pose was dropped" is a fact about a build and
+        a reader must not have to infer it from silence."""
+        rad = np.asarray(self.radius, float)
+        return {
+            "poses_offered": int(rad.size),
+            "poses_gated": self.gated,
+            "pose_radius_multiple": float(self.multiple),
+            "pose_radius_median": float(self.median_radius),
+            "pose_radius_gated_max": (float(rad[self.outlier].max())
+                                      if self.gated else 0.0),
+            "pose_detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class FusionBound:
+    """The axis-aligned box outside which depth is not fused."""
+
+    lo: "np.ndarray"
+    hi: "np.ndarray"
+    multiple: float
+    detail: str
+
+    def record(self) -> dict:
+        return {
+            "fusion_bound_lo": [float(v) for v in self.lo],
+            "fusion_bound_hi": [float(v) for v in self.hi],
+            "fusion_bound_multiple": float(self.multiple),
+            "fusion_bound_detail": self.detail,
+        }
+
+
+def robust_pose_outliers(centres, *, multiple: float = OUTLIER_RADIUS_MULTIPLE,
+                         min_poses: int = MIN_ROBUST_POSES) -> PoseOutlierReport:
+    """The poses a solve placed nowhere near the rest of its own poses.
+
+    THE CRITERION IS A MULTIPLE OF THE SOLVE'S OWN MEDIAN RADIUS, measured
+    from the element-wise median camera centre. Both halves matter:
+
+      * the median centre, not the mean, because eleven outlying centres --
+        the worst 53,026 units out -- drag the mean of 379 off the room;
+      * the median radius as the unit, because the gauge is arbitrary -- 2.33
+        units in one replay of a walk and 2.62 in the other, for the same
+        bedroom -- so a fixed distance means nothing.
+
+    A WALK IS NOT AN OUTLIER. A straight corridor spreads its centres along
+    one axis, and every one of them is a legitimate pose; the median radius
+    grows with the corridor, so the rule stays quiet. What it catches is a
+    centre an order of magnitude outside a distribution that is otherwise
+    compact -- run A's worst was 53,026 units against a median of 2.33.
+    """
+    C = np.asarray(centres, np.float64).reshape(-1, 3)
+    n = len(C)
+    off = np.zeros(n, bool)
+    if multiple <= 0:
+        return PoseOutlierReport(off, np.zeros(n), 0.0, float(multiple),
+                                 "off: outlier_radius_multiple is 0")
+    if n < min_poses:
+        return PoseOutlierReport(off, np.zeros(n), 0.0, float(multiple),
+                                 f"stood down: {n} poses is too few to be "
+                                 f"robust (needs {min_poses})")
+    radius = np.linalg.norm(C - np.median(C, axis=0), axis=1)
+    med = float(np.median(radius))
+    if not med > 0:
+        return PoseOutlierReport(off, radius, med, float(multiple),
+                                 "stood down: every pose is in the same place")
+    outlier = radius > multiple * med
+    return PoseOutlierReport(
+        outlier, radius, med, float(multiple),
+        f"{int(outlier.sum())} of {n} poses lie beyond {multiple:g} x the "
+        f"median pose radius of {med:.4g}")
+
+
+def robust_fusion_bound(points, centres, *, reach: float,
+                        radius_multiple: float = OUTLIER_RADIUS_MULTIPLE,
+                        bound_multiple: float = FUSION_BOUND_MULTIPLE,
+                        min_points: int = MIN_ROBUST_POINTS) -> FusionBound | None:
+    """The box the fusion is confined to, or None when the rule is off.
+
+    Built from what was OBSERVED, not from the solve's bounding box:
+
+      * the sparse points that are not radius outliers of their own cloud;
+      * every kept camera centre grown by `reach`, the scene-relative far
+        bound. This term is what keeps the box honest -- a frame may measure
+        farther than any sparse point it was fitted to (the healthy replay's
+        depth reaches 30.7 units while its inlier cloud stops at 18.4), and
+        clipping that would delete measured surface, not noise;
+
+    then scaled about its own centre by `bound_multiple`, isotropically, so
+    no axis is squeezed by a cloud that happens to be thin along it.
+
+    Measured with `bound_multiple = 2.0`: 0 of 3,916,092 sampled depth points
+    of the healthy replay fall outside, and 0.91% of the failing one's do.
+    """
+    C = np.asarray(centres, np.float64).reshape(-1, 3)
+    if bound_multiple <= 0 or not len(C):
+        return None
+    P = np.asarray(points, np.float64).reshape(-1, 3) if points is not None \
+        else np.zeros((0, 3))
+    P = P[np.isfinite(P).all(axis=1)]
+    note = "envelope of the kept camera centres grown by the far bound"
+    if len(P) >= min_points and radius_multiple > 0:
+        rad = np.linalg.norm(P - np.median(P, axis=0), axis=1)
+        med = float(np.median(rad))
+        if med > 0:
+            keep = rad <= radius_multiple * med
+            note = (f"{int(keep.sum())} of {len(P)} sparse points within "
+                    f"{radius_multiple:g} x their median radius, with the kept "
+                    "camera centres grown by the far bound")
+            P = P[keep]
+    reach = max(float(reach), 0.0)
+    lo = C.min(0) - reach
+    hi = C.max(0) + reach
+    if len(P):
+        lo = np.minimum(lo, P.min(0))
+        hi = np.maximum(hi, P.max(0))
+    ctr = (lo + hi) / 2.0
+    half = float(((hi - lo) / 2.0).max()) * float(bound_multiple)
+    if not (half > 0):
+        return None
+    return FusionBound(ctr - half, ctr + half, float(bound_multiple),
+                       f"{note}, scaled x{bound_multiple:g} about its centre")
+
+
+def depth_within_bound(depth, K, R, t, lo, hi):
+    """Which pixels of one posed depth image land inside the fusion bound.
+
+    `R`, `t` are world-to-camera, the convention the solution uses, so the
+    world point of a pixel is `R^T (X_cam - t)` -- the same arithmetic
+    `SurfaceVolume.blocks_for_depth` does, and it must stay the same or the
+    bound would exclude pixels the allocation still keys.
+    """
+    import torch
+
+    dev = depth.device
+    H, W = depth.shape
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    uu = torch.arange(W, device=dev, dtype=torch.float32).view(1, W).expand(H, W)
+    vv = torch.arange(H, device=dev, dtype=torch.float32).view(H, 1).expand(H, W)
+    z = depth.to(torch.float32)
+    Xc = torch.stack([(uu - cx) / fx * z, (vv - cy) / fy * z, z], -1)
+    Rt = (R if isinstance(R, torch.Tensor)
+          else torch.as_tensor(np.asarray(R, np.float32), device=dev)).to(dev).float()
+    tt = (t if isinstance(t, torch.Tensor)
+          else torch.as_tensor(np.asarray(t, np.float32), device=dev)).to(dev).float()
+    Xw = (Xc - tt) @ Rt
+    lo_t = torch.as_tensor(np.asarray(lo, np.float32), device=dev)
+    hi_t = torch.as_tensor(np.asarray(hi, np.float32), device=dev)
+    return ((Xw >= lo_t) & (Xw <= hi_t)).all(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +460,41 @@ class SurfaceParams:
 
     frame_weight_floor: float = 0.25
     """The worst frame that still passes the gate contributes this much."""
+
+    # -- the solver's own outliers (see `robust_pose_outliers`) -------------
+    outlier_radius_multiple: float = OUTLIER_RADIUS_MULTIPLE
+    """A pose or a sparse point farther than this MULTIPLE OF THE SOLVE'S OWN
+    MEDIAN RADIUS from the middle of the solve is treated as solver noise:
+    the pose is not fused, and the point does not widen the fusion envelope.
+    0 switches both off.
+
+    Measured on the two replays of one 385-keyframe bedroom walk. Both solves
+    reported ~15,800 points, 379 images, one component and 0.89 px mean
+    reprojection error, and their robust cores were the same room. One of
+    them also put 299 points and 11 camera centres up to 53,026 units from a
+    thirteen-unit bedroom, and the surface stage refused it outright. At 10 x
+    the median radius that solve loses 4 of its 271 gated frames (1.48%) and
+    builds; the other loses none, and neither does the reference world, nor
+    eight of the eleven solved sessions in the store. Of the remaining three,
+    the two mildly inflated ones lose 1.31% and 0.15% of their poses.
+
+    Relative and never absolute, because `global_solve` does not normalise:
+    the same room has solved to a ten-unit extent and a three-hundred-unit
+    one, so a threshold in units would be this very bug in a new place."""
+
+    fusion_bound_multiple: float = FUSION_BOUND_MULTIPLE
+    """How much wider than the robust envelope of the observed scene the
+    fusion volume may be. Depth outside it is not fused. 0 switches it off.
+
+    The envelope is built from what was actually seen -- the inlier sparse
+    points, and every kept camera centre grown by the scene-relative far
+    bound, so a frame that measured farther than any point it was fitted to
+    is still inside -- and then scaled about its own centre by this. At 2.0
+    it excluded exactly 0 of 3,916,092 sampled depth points of the healthy
+    replay and 0.91% of the failing one's, pulling that one's fused extent
+    from 519 units down to 107. It is a bound on solver noise, NOT a crop:
+    excluding a point at 10^6 is not inventing geometry, and nothing here
+    fills what it excludes (`WORLD-BUILDER-SURFACE.md` section 3)."""
 
     depth_falloff: bool = True
     """Weight falls as 1/z^2: a far pixel's depth is less certain and covers
@@ -657,6 +906,13 @@ class SurfaceParams:
             # surface instead of along them, so every vertex near a rim is in
             # a different place; see `smooth_boundary_curve`.
             ("smooth-boundary", self.smooth_boundary_curve),
+            # Always present too. A surface built before these existed fused
+            # every pose the solver produced, however far outside its own
+            # scene, inside no envelope at all -- which on one real solve was
+            # the difference between a bedroom and nothing. That is not what
+            # these parameters build, so it rebuilds.
+            ("solver-outliers", self.outlier_radius_multiple,
+             self.fusion_bound_multiple, OUTLIER_VERSION),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
@@ -702,6 +958,12 @@ class SurfaceResult:
     network is not installed -- as opposed to cannot run on this session yet.
     The live worker stops relaunching on it rather than failing every solve."""
 
+    outliers: dict = field(default_factory=dict)
+    """What the build did about the solve's own outliers: how many poses it
+    would not fuse, the envelope it fused inside, and whether the voxel had
+    to be coarsened to key the grid. Empty on a build that never got that
+    far. See `surface_pipeline._outlier_record`."""
+
     def as_dict(self) -> dict:
         return {
             "state": self.state, "detail": self.detail,
@@ -709,7 +971,7 @@ class SurfaceResult:
             "vertices": self.vertices, "faces": self.faces, "blocks": self.blocks,
             "voxel": self.voxel, "trunc": self.trunc, "levels": self.levels,
             "seconds": self.seconds, "stopped_after": self.stopped_after,
-            "permanent": self.permanent,
+            "permanent": self.permanent, "outliers": self.outliers,
         }
 
 
@@ -725,15 +987,22 @@ def block_key(bc, *, offset: int = _KEY_OFFSET, span: int = _KEY_SPAN):
     this the hard way: outside the keyable range two different cells share a
     key and the reduction silently MERGES them, averaging points from opposite
     ends of a scene into one.
+
+    THE RAISE IS A CORRECTNESS GUARD AND STAYS. It is not, however, an answer
+    to a scene that is merely wide: the caller's answers to that are upstream
+    (drop the poses the solver misplaced, fuse inside a robust envelope of the
+    observed scene) and, failing those, a coarser voxel. The refusal carries
+    the overshoot so the caller can take that last step in one attempt.
     """
     import torch
 
     q = bc + offset
-    if int(q.min()) < 0 or int(q.max()) >= span:
-        raise SurfaceUnavailable(
-            "the scene's block coordinates fall outside the keyable range; "
-            "the SfM gauge is arbitrary and this world's is too large for the "
-            "chosen voxel fraction")
+    qmin, qmax = int(q.min()), int(q.max())
+    if qmin < 0 or qmax >= span:
+        # A block coordinate is keyable in [-offset, span - offset); the
+        # overshoot is how many times past that edge the worst one reached.
+        reach = max(qmax - offset, offset - qmin, 1)
+        raise key_range_refusal(reach / float(span - offset))
     if isinstance(q, torch.Tensor):
         return (q[:, 0] * span + q[:, 1]) * span + q[:, 2]
     return (q[:, 0] * span + q[:, 1]) * span + q[:, 2]

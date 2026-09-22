@@ -59,6 +59,9 @@ from tower.world_builder.surface import (
     decimate,
     depth_bound,
     depth_validity,
+    depth_within_bound,
+    robust_fusion_bound,
+    robust_pose_outliers,
     drop_small_components,
     evidence_filter,
     hidden_low_weight,
@@ -445,6 +448,48 @@ class _Frames:
                                r.get("z_sparse_max")))
         self.median_held_out = float(np.median(held)) if held else None
         self.offered = len(align.get("records", []))
+        # The fusion bound, attached by `surfacify` once the scene scale is
+        # known. None means "no bound", which is what every build did before
+        # `robust_fusion_bound` existed.
+        self.bound = None
+        self.clipped_by_bound = 0
+        self.emptied_by_bound = 0
+        # Poses the solver placed nowhere near the rest of its own poses are
+        # dropped HERE, before anything reads `items`, so the scene scale, the
+        # consistency field, the transient masks and the fusion all see the
+        # same frames. A wild pose is not merely unfusable: its depth frustum
+        # lands nowhere useful, and it would otherwise pay for a depth pass
+        # and a detector pass on the way to contributing nothing.
+        self.pose_gate = self._drop_wild_poses(params)
+
+    def _drop_wild_poses(self, params: SurfaceParams) -> dict:
+        """Drop the radius outliers among this solve's own camera centres.
+
+        Run A of the bedroom replay: 4 of 271 gated frames (1.48%), two of
+        them 53,026 and 1.6e6 units out. Run B of the SAME walk: none. The
+        rule is `surface.robust_pose_outliers`; the numbers behind it are on
+        `SurfaceParams.outlier_radius_multiple`.
+        """
+        if not self.items:
+            return robust_pose_outliers(np.zeros((0, 3)),
+                                        multiple=params.outlier_radius_multiple).record()
+        centres = np.array([-R.T @ t for _ki, _a, _b, R, t, _ho, _z in self.items])
+        report = robust_pose_outliers(centres,
+                                      multiple=params.outlier_radius_multiple)
+        if report.gated:
+            kept = []
+            for item, wild in zip(self.items, report.outlier):
+                if wild:
+                    self.kids.pop(item[0], None)
+                    self.image_sha1.pop(item[0], None)
+                else:
+                    kept.append(item)
+            logger.warning(
+                "[Tower][WorldBuilder][surface] %s; they are not fused "
+                "(worst %.4g, median %.4g)", report.detail,
+                float(report.radius[report.outlier].max()), report.median_radius)
+            self.items = kept
+        return report.record()
 
     def __len__(self):
         return len(self.items)
@@ -499,6 +544,21 @@ class _Frames:
             if det is not None and det.shape == tuple(ok.shape):
                 ok &= ~torch.as_tensor(det, device=device)
                 self.masked += 1
+            # Outside the robust envelope of the observed scene, depth is not
+            # measurement but the solver's noise carried through the affine
+            # fit. Applied HERE, to the one validity mask, so allocation and
+            # integration bound the volume identically -- `blocks_for_depth`
+            # and `integrate` are both handed this `ok`, and a bound applied
+            # to only one of them would key blocks nothing ever writes into.
+            if self.bound is not None and bool(ok.any()):
+                inside = depth_within_bound(zt, self.K, R, t,
+                                            self.bound.lo, self.bound.hi)
+                clipped = ok & ~inside
+                if bool(clipped.any()):
+                    self.clipped_by_bound += 1
+                    ok = ok & inside
+                    if not bool(ok.any()):
+                        self.emptied_by_bound += 1
             if not bool(ok.any()):
                 continue
             fw = float(np.clip((params.gate_rel - ho) / max(params.gate_rel, 1e-9),
@@ -626,6 +686,10 @@ def surfacify(store, world_id: str, session_id: str, *,
             return _unavailable(root, "the solve has no usable scene depth")
         voxel = params.voxel_frac * median_depth
         trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
+        # The volume the fusion is confined to. Decided AFTER the scene scale,
+        # because the camera-reach term is a multiple of it, and before the
+        # depth is prepared, because `_Frames.prepared` is what applies it.
+        frames.bound = _fusion_bound(frames, solution, params, median_depth)
 
         if params.depth_consistency:
             t = time.time()
@@ -749,6 +813,34 @@ def _ensure_transients(store, world_id, session_id, solution, intrinsics, align,
                                  detail=f"{type(exc).__name__}: {exc}")
 
 
+def _outlier_record(frames: "_Frames", voxel: float, coarsened: float,
+                    key_coarsened: float) -> dict:
+    """What this build did about the solve's outliers, for the manifest.
+
+    Always written, whether or not anything was dropped. A build that fused
+    fewer frames than the solve offered has to say which and why, or the
+    coverage it reports is a claim nobody can check; and "nothing was
+    dropped" is equally a fact about the build, not something a reader should
+    have to infer from an absent key.
+    """
+    record = dict(frames.pose_gate)
+    record.update({
+        "frames_clipped_by_bound": int(frames.clipped_by_bound),
+        "frames_emptied_by_bound": int(frames.emptied_by_bound),
+        "voxel_coarsened_for_key_range": round(float(key_coarsened), 4),
+        "voxel_coarsened_for_block_budget": round(
+            float(coarsened) / float(key_coarsened or 1.0), 4),
+        "voxel": float(voxel),
+    })
+    if frames.bound is not None:
+        record.update(frames.bound.record())
+    else:
+        record.update({"fusion_bound_lo": None, "fusion_bound_hi": None,
+                       "fusion_bound_multiple": 0.0,
+                       "fusion_bound_detail": "off: no bound was applied"})
+    return record
+
+
 def _unavailable(root: Path, detail: str) -> SurfaceResult:
     _status(root, state=STATE_UNAVAILABLE, detail=detail)
     return SurfaceResult(state=STATE_UNAVAILABLE, detail=detail)
@@ -760,6 +852,32 @@ def _stop(root: Path, stage: str, seconds: dict) -> SurfaceResult:
 
 
 MIN_SCALE_OBSERVATIONS = 64
+
+
+def _fusion_bound(frames: "_Frames", solution, params: SurfaceParams,
+                  median_depth: float):
+    """The box this session's depth is fused inside, or None.
+
+    The reach handed to `robust_fusion_bound` is the scene-relative far
+    bound, `max_depth_frac x median scene depth` -- deliberately the
+    GENEROUS fallback and not each frame's own `z_sparse_max x
+    anchor_depth_multiple`. A frame's own far bound is exactly what a stray
+    sparse anchor inflates (run A had a frame fitted to an anchor 1.6e6 units
+    out), so using it here would let the noise set the bound it is supposed
+    to be bounded by. The scene-relative number cannot be moved that way.
+    """
+    if not len(frames):
+        return None
+    centres = np.array([-R.T @ t for _ki, _a, _b, R, t, _ho, _z in frames.items])
+    bound = robust_fusion_bound(
+        getattr(solution, "xyz", None), centres,
+        reach=params.max_depth_frac * float(median_depth),
+        radius_multiple=params.outlier_radius_multiple,
+        bound_multiple=params.fusion_bound_multiple)
+    if bound is not None:
+        logger.info("[Tower][WorldBuilder][surface] fusing inside %s -- %s",
+                    np.round(bound.hi - bound.lo, 3).tolist(), bound.detail)
+    return bound
 
 
 def _scene_scale(frames: "_Frames", solution) -> tuple[float, str]:
@@ -908,13 +1026,50 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # surface AREA, so by the square root of the overshoot -- and ask again.
     # Allocation is about a second since key-space expansion, so a second pass
     # is cheap, and it happens before a byte of field exists.
+    #
+    # THE SAME LOOP ANSWERS THE KEY RANGE. `block_key` refuses a grid whose
+    # block coordinates it cannot key without aliasing two cells together,
+    # and that refusal used to end the build -- the wearer of the bedroom
+    # walk whose solve put eleven of its 379 camera centres up to 53,026
+    # units out got nothing at all, and no appearance either, because the
+    # surface was not `ok`. The refusal is
+    # correct and stays; what was missing is that a scene too wide for the
+    # keys at THIS voxel may be perfectly keyable at a coarser one, exactly
+    # as a scene too big for the block budget is. Refusing is the last
+    # resort now, not the first response, and the coarsening is recorded.
     coarsened = 1.0
+    key_coarsened = 1.0
     attempts = 12
     for attempt in range(attempts):
-        keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt, frames.K)
-                for z, ok, _img, R, tt, _w in cached]
-        allk = torch.unique(torch.cat(keys))
-        del keys
+        try:
+            keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt,
+                                         frames.K)
+                    for z, ok, _img, R, tt, _w in cached]
+            allk = torch.unique(torch.cat(keys))
+            del keys
+        except SurfaceUnavailable as exc:
+            over = exc.key_overshoot
+            if over is None or attempt == attempts - 1:
+                reason = exc.reason + (
+                    f"; coarsening the voxel x{key_coarsened:.2f} over "
+                    f"{attempt + 1} attempts did not bring it inside"
+                    if over is not None else "")
+                logger.warning("[Tower][WorldBuilder][surface] %s", reason)
+                return _unavailable(root, reason)
+            # Block coordinates scale as 1/voxel, so the overshoot IS the
+            # factor; 5% over it covers the truncation shell the allocation
+            # adds around each block.
+            factor = max(1.1, float(over) * 1.05)
+            coarsened *= factor
+            key_coarsened *= factor
+            voxel *= factor
+            trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
+            logger.warning("[Tower][WorldBuilder][surface] the block grid is "
+                           "x%.2f too wide to key; voxel coarsened x%.2f to %.5f",
+                           float(over), coarsened, voxel)
+            vol = SurfaceVolume(voxel, band_floor(voxel), device=device, trunc_rel=trel,
+                                trunc_max=params.trunc_max_voxels * voxel)
+            continue
         # The keys just computed always belong to `vol`'s voxel: the loop only
         # coarsens when it will go round again, so it never reserves keys from
         # the previous voxel size on its last pass.
@@ -1177,6 +1332,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         state=STATE_OK, frames_used=used, frames_offered=frames.offered,
         vertices=int(len(V)), faces=int(len(F)), blocks=n_blocks,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
+        outliers=_outlier_record(frames, voxel, coarsened, key_coarsened),
         detail=json.dumps({"components": comp_stats,
                            "confidence": _confidence_summary(vertex_evidence, root,
                                                              conf_files),
@@ -1350,6 +1506,13 @@ def _write_manifest(root, result, params, digest, pdigest, median_depth, scale,
         # WORLD-BUILDER-SURFACE.md §2: whether the wearer's hands were masked
         # out of fusion. `state` other than `ok` means they were NOT.
         "transients": transients or {"state": "off", "detail": "not recorded"},
+        # WHAT THIS BUILD DID ABOUT THE SOLVE'S OWN OUTLIERS. A surface built
+        # from fewer frames than the solve offered says here which it would
+        # not fuse and by what rule, what envelope it fused inside, and
+        # whether the voxel had to be coarsened to key the grid. Absent on
+        # every surface built before the rules existed, which fused whatever
+        # the solver produced.
+        "outliers": result.outliers or None,
         "closure": (
             ("enclosed-fill: unobserved voxels bracketed by observed field in "
              f"at least {params.fill_enclose_dirs} of 26 directions within "
