@@ -120,6 +120,21 @@ CAMERA_COLOUR = (20, 20, 20)
 # The page states the count instead.
 NEUTRAL_POINT_COLOUR = (138, 138, 138)
 
+# WHICH POINT COLOURS MAY BE DRAWN AT ALL (privacy lane L1, 2026-09-17).
+#
+# The global solver's `rgb` is pycolmap's mean over the observing pixels of the
+# images COLMAP was given, and those are the RAW capture frames, undistorted
+# (`global_solve.prepare_images` prefers the raw frame; measured: 177 of 181
+# filled frames are non-black inside the redaction fill). On the canonical
+# capture 536 of 14,415 points take their colour ONLY from pixels the face
+# redactor removed. Drawing that colour put unredacted imagery on the page.
+#
+# So a colour is drawn only when its row names a source on this list, and no
+# producer writes one today: every point is drawn neutral until something
+# recolours the cloud from redacted keyframes and says so. Unknown never means
+# drawable.
+DRAWABLE_RGB_SOURCES = frozenset({"redacted-keyframes"})
+
 # Photometric colour is quantised to 5 bits per channel before it reaches
 # the page. Two reasons, both measured on world 52ed8e0a's re-solve:
 #
@@ -316,7 +331,8 @@ def load_segments(store: WorldStore, world_id: str, session_id: str) -> dict:
         colour = row.get("rgb")
         known = (isinstance(colour, (list, tuple)) and len(colour) == 3
                  and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                         for v in colour))
+                         for v in colour)
+                 and row.get("rgb_source") in DRAWABLE_RGB_SOURCES)
         colours_by_segment.setdefault(index, []).append(
             ([int(v) for v in colour], True) if known
             else (list(NEUTRAL_POINT_COLOUR), False)
@@ -581,8 +597,15 @@ CAPTION_BEHIND = ("This picture is BEHIND the newest keyframes: the Tower has "
 # zooms. Touch (added 2026-09-06 for the phone): one finger orbits, two
 # fingers pinch to zoom and drag to pan. `touch-action: none` keeps the
 # page from scrolling or zooming underneath the canvas.
+#
+# The CSP meta tag repeats the route's response header INSIDE the page, and
+# it is the copy that matters on the phone: iOS drops the response headers
+# and calls `loadHTMLString(_:baseURL: nil)`, and WebKit enforces a meta CSP
+# in that document but never saw the header. It sits right after
+# `<meta charset>`; `wb-representation` must stay inside the first 4096
+# characters, where the phone reads the rung.
 _CANVAS_VIEWER = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>__TITLE__</title>
+<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><meta name="wb-representation" content="sparse"><title>__TITLE__</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
 :root{--bg:__PRODUCT_BG__;--fg:#1c1b19;--bar:#e9e7e2;--sub:#55524d;--edge:#d2cec7;--warn:#a4400a}
@@ -859,16 +882,16 @@ def _frame_summary(descriptor: dict, *, other_shared: int, unregistered_rows: li
         parts = [f"{_count(points, 'point')} from one segment that could not be "
                  "placed with any other, drawn in its own frame at its own scale."]
     if points and uncoloured == points:
-        parts.append("None of them carry a measured colour, so every point is "
-                     "drawn neutral grey.")
+        parts.append("None of them carry a colour measured from redacted imagery, "
+                     "so every point is drawn neutral grey.")
     elif uncoloured:
-        parts.append(f"{_count(uncoloured, 'point')} carry no measured colour and "
-                     "are drawn neutral grey.")
+        parts.append(f"{_count(uncoloured, 'point')} carry no colour measured from "
+                     "redacted imagery and are drawn neutral grey.")
     elif points:
         # Stated positively rather than left out. "How much of this is a
         # measurement and how much is a placeholder" is the question this
         # line exists to answer, and silence answers it either way.
-        parts.append("Every point carries a measured colour.")
+        parts.append("Every point carries a colour measured from redacted imagery.")
     if sampling and sampling.get("subsampled"):
         parts.append("Thinned for drawing from "
                      f"{_count(int(sampling['points_total']), 'point')}.")

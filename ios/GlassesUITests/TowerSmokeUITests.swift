@@ -209,8 +209,12 @@ final class TowerSmokeUITests: XCTestCase {
         XCTAssertTrue(reveal(complete))
 
         // The 3D world opens from the tap itself. No second control.
+        //
+        // Pinned on "not to scale", the one phrase every rung's caption
+        // shares: the caption now follows the page, and a surface is not "Not
+        // a surface". What must hold on every rung is that no size is claimed.
         let caption = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+            NSPredicate(format: "label CONTAINS[c] %@", "not to scale")
         ).firstMatch
         XCTAssertTrue(tap(complete, until: caption.exists),
                       "tapping a session opens its 3D world, with no further tap")
@@ -221,7 +225,40 @@ final class TowerSmokeUITests: XCTestCase {
         // would pin a page that is being rewritten on the other side.
         let webView = app.webViews.firstMatch
         XCTAssertTrue(webView.waitForExistence(timeout: 30), "the Tower's page rendered inside the WKWebView")
+
+        // The caption above proves the push, not the page: its "not to scale"
+        // predicate also matches the caption shown while the page is still
+        // being fetched. The rung caption is only on screen once the app has
+        // read `wb-representation` out of the Tower's page, which is the one
+        // thing only a real Tower can prove. The prefixes are the first words
+        // of `WorldRenderRepresentation.caption(for:)` for **every** rung it
+        // can return: appearance, surface, dense and sparse, in that order.
+        //
+        // The appearance prefix was missing and this assertion was a certain
+        // failure on the happy path (review 2, M-9). `WorldRenderClient.url`
+        // sends `viewer=appearance-1` unconditionally, so a Tower that has an
+        // appearance artifact — which the canonical validation world has — is
+        // asked for and serves the appearance page, whose caption begins with
+        // none of the three rungs this predicate used to list.
+        let rungCaption = app.staticTexts.containing(NSPredicate(
+            format: "label BEGINSWITH %@ OR label BEGINSWITH %@ OR label BEGINSWITH %@"
+                + " OR label BEGINSWITH %@",
+            "The camera's own images", "Surfaces the Tower reconstructed",
+            "Points the Tower measured densely", "Points the Tower measured from the walk"
+        )).firstMatch
+        XCTAssertTrue(rungCaption.waitForExistence(timeout: 30), "the caption read the page's rung")
         attach("3d-world")
+
+        // There is always a way to ask for the world again, whatever the page
+        // is showing (review 2, M-0): a page that boots with no imagery reports
+        // `didFinish` like any other, so the screen is ready and the failure
+        // view's "Try again" is not on it. Queried by identifier, because the
+        // word in the toolbar is the app's to change.
+        XCTAssertTrue(
+            app.descendants(matching: .any).matching(identifier: "world-render-reload")
+                .firstMatch.waitForExistence(timeout: 10),
+            "the 3D world always offers a way to fetch it again"
+        )
 
         // The canvas takes a gesture without the screen moving under it.
         webView.swipeLeft()
@@ -347,7 +384,7 @@ final class TowerSmokeUITests: XCTestCase {
         // And tapping it leads nowhere: no 3D screen, so no caption from one.
         noGeometry.tap()
         let caption = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS %@", "Not a surface")
+            NSPredicate(format: "label CONTAINS[c] %@", "not to scale")
         ).firstMatch
         XCTAssertFalse(caption.waitForExistence(timeout: 3),
                        "a session with nothing to draw must not push a 3D screen")

@@ -31,6 +31,64 @@ dependencies = [
 sfm = [
     "pycolmap==4.2.0",
 ]
+
+# The World Builder's dense stage (tower/world_builder/dense.py). Optional in
+# exactly the same way `sfm` is: without it a world simply has no dense
+# reconstruction and says so, and the sparse viewer is served unchanged.
+#
+# LICENCES, because this was the deciding factor and not an afterthought:
+#   moge                 MIT        -- the default backend, moge2-vitl
+#   depth-anything-3     Apache-2.0 (code)
+#
+# The permissively licensed checkpoints are the ONLY ones the registry offers.
+# Depth Anything V2 Base and Large, every DA3 GIANT/NESTED variant, and DA3's
+# own DEFAULT_MODEL are CC-BY-NC and are deliberately unreachable.
+#
+# `moge` declares `numpy<2`; it runs correctly against the numpy 2.5.2 this
+# project pins, so install it with --no-deps under a constraints file rather
+# than letting it downgrade numpy for everything else.
+dense = [
+    "moge>=3.0",
+    "torch>=2.4",
+    "transformers>=4.44",
+]
+# The appearance stage (tower/world_builder/appearance.py,
+# docs/contracts/WORLD-BUILDER-APPEARANCE.md). Needs `dense` (torch, the depth
+# work) as well.
+#   astc-encoder-py  MIT wrapper of ARM astcenc (Apache-2.0); a cp37-abi3 wheel,
+#                    depends on archspec only. The phone's ASTC 6x6 chunks.
+#                    Chosen over etcpak/ETC2 on measurement: 43.8 dB vs 39.5 dB
+#                    at 102,720 vs 230,400 bytes a keyframe. Without it the
+#                    stage still publishes the WebP fallback and says so.
+#   open3d           the proxy ray caster (Embree). Already imported by
+#                    `surface.decimate`; declared here because this stage
+#                    cannot run without it.
+appearance = [
+    "astc-encoder-py==0.1.12",
+    "open3d>=0.19",
+]
+# The transient detector (tower/world_builder/transients.py,
+# WORLD-BUILDER-APPEARANCE.md §5.3a): the wearer's hands, arms and held phone,
+# masked out of appearance and surface fusion. Needs `dense` (torch) as well.
+# NOTHING NEW WAS INSTALLED for it: every package below was already in the
+# Tower venv (transformers 5.16.1, huggingface_hub 1.29.0, tokenizers 0.23.1,
+# safetensors 0.8.0, scipy 1.18.1, pillow 12.3.0). Declared so a fresh venv
+# gets them. Without them the stages record `transients: unavailable` and
+# build anyway.
+#   Weights (fetched on first use, pinned revisions, ~2.14 GB into the
+#   Hugging Face cache): Grounding DINO-base (Apache-2.0), SAM 2.1 hiera
+#   base-plus (Apache-2.0), OneFormer Swin-L COCO (MIT). Not used: EgoHOS
+#   (weights unobtainable), SAM 3 (gated, custom licence), YOLO11-seg (AGPL).
+#   transformers >= 5 for Sam2Model; scipy for OneFormer's panoptic
+#   post-processing.
+transients = [
+    "transformers>=5.0",
+    "huggingface_hub>=1.0",
+    "tokenizers>=0.22",
+    "safetensors>=0.4",
+    "scipy>=1.11",
+    "pillow>=10",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a

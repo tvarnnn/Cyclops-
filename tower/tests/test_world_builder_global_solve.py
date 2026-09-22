@@ -176,7 +176,10 @@ def test_placement_maps_segment_frame_back_onto_the_world_point(scene):
     expected_in_ref = r_ref.T @ (np.array([7.0, 2.0, 3.0]) - np.array(c_ref))
     composed = p1.scale * quaternion_wxyz_to_rotation(p1.rotation_wxyz) @ local + np.array(p1.translation)
     np.testing.assert_allclose(composed, expected_in_ref, atol=1e-5)
-    assert seg1_points[0]["rgb"] == [128, 128, 128]
+    # The solver's colour (128 here) is never persisted: it is the mean of RAW
+    # frame pixels (privacy L1, review 1 m5). The field stays, neutral.
+    assert seg1_points[0]["rgb"] == [138, 138, 138]
+    assert all(r.get("rgb", [138, 138, 138]) == [138, 138, 138] for r in result.point_rows)
 
 
 def test_a_segment_the_solve_did_not_pose_keeps_its_local_rows_and_is_refused(scene):

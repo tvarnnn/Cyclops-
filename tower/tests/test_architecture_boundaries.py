@@ -145,6 +145,10 @@ _RESULT_CHANNEL_ADAPTERS = frozenset(
         # the same shape again -- an adapter over the store, named after
         # the cartridge, serving HTML where the others serve JSON.
         TOWER / "results" / "world_builder_render.py",
+        # Added 2026-09-17: the appearance artifact (GET /worlds/{id}/appearance/
+        # {session}/...), an adapter over the store named after the cartridge,
+        # serving the redacted keyframe bundles the phone blends.
+        TOWER / "results" / "world_builder_appearance.py",
         TOWER / "results" / "__init__.py",
         # Added 2026-08-27 with the Scene Understanding and Document
         # Memory wire paths. Same shape, same rule: one adapter per

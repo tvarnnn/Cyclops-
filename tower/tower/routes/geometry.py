@@ -13,9 +13,18 @@ and the hash off the event loop with no executor of our own.
 """
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from tower.results.envelope import json_safe
+from tower.results.world_builder_appearance import (
+    DEFAULT_IMAGERY,
+    NO_STORE_HEADERS,
+    AppearanceNotServed,
+    appearance_file,
+    appearance_manifest,
+    encode_body,
+    imagery_warning,
+)
 from tower.results.world_builder_geometry import (
     build_manifest,
     build_segment,
@@ -25,7 +34,9 @@ from tower.results.world_builder_library import build_world_listing
 from tower.results.world_builder_render import (
     MAX_POINTS_CEILING,
     WorldRenderUnavailable,
+    build_render_revision,
     build_world_render,
+    render_content_security_policy,
 )
 
 router = APIRouter()
@@ -90,6 +101,116 @@ def geometry_segment(
     return chunk
 
 
+def _appearance_store(request: Request):
+    root = getattr(request.app.state, "world_root", None)
+    if root is None:
+        raise HTTPException(status_code=404, detail="no world root is configured",
+                            headers=NO_STORE_HEADERS)
+    return store_from_root(root)
+
+
+def _appearance_headers(label: str, imagery: str = DEFAULT_IMAGERY) -> dict:
+    """The provenance headers on every appearance 200.
+
+    `X-World-Redaction` is the effective redaction label. `X-World-Imagery`
+    says which imagery the artifact is made of (§6.6): `redacted`, the
+    product, or `raw-local-research`, the research bypass -- in which case the
+    label beside it is not a redaction label and the body is not privacy-safe.
+    Two headers rather than one because a reader that knows nothing of the
+    bypass must not have to parse the label to find out.
+
+    Both the default and the warning sentence come from the appearance
+    adapter, not from the cartridge: this file is transport and must not know
+    a cartridge's vocabulary (`test_shared_code_does_not_import_a_cartridge`).
+    """
+    headers = {**NO_STORE_HEADERS, "X-World-Redaction": label,
+               "X-World-Imagery": imagery}
+    warning = imagery_warning(imagery)
+    if warning is not None:
+        headers["X-World-Imagery-Warning"] = warning
+    return headers
+
+
+def _appearance_response(request: Request, data: bytes, media_type: str, label: str,
+                         imagery: str = DEFAULT_IMAGERY) -> Response:
+    """A 200 of appearance bytes, gzip/deflate when the client accepts it.
+
+    The privacy headers are the same either way (`no-store`, `nosniff`, no
+    validators); only `Content-Encoding` and `Vary` are added. 404s are not
+    compressed: they are a sentence.
+    """
+    body, encoding = encode_body(data, request.headers.get("accept-encoding"))
+    return Response(content=body, media_type=media_type,
+                    headers={**_appearance_headers(label, imagery), **encoding})
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/manifest")
+def appearance_manifest_route(world_id: str, session_id: str, request: Request) -> Response:
+    """The appearance artifact's manifest (`WORLD-BUILDER-APPEARANCE.md` §9).
+
+    Imagery metadata of a private space: `no-store`, no validators, and the
+    session's redaction label re-checked on every request -- a relabelled
+    session answers 404 rather than its old textures.
+    """
+    try:
+        payload, label, imagery = appearance_manifest(_appearance_store(request),
+                                                      world_id, session_id)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    # Rendered exactly as JSONResponse would, then encoded like the bytes routes:
+    # the manifest is ~0.4 MB of JSON for a 374-keyframe walk.
+    data = JSONResponse(json_safe(payload)).body
+    return _appearance_response(request, data, "application/json", label, imagery)
+
+
+def _appearance_bytes(request: Request, world_id: str, session_id: str, kind: str,
+                      digest: str) -> Response:
+    try:
+        data, label, imagery = appearance_file(_appearance_store(request), world_id,
+                                               session_id, kind, digest)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    return _appearance_response(request, data, "application/octet-stream", label, imagery)
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/chunk/{digest}")
+def appearance_chunk_route(world_id: str, session_id: str, digest: str,
+                           request: Request) -> Response:
+    """One keyframe bundle, by the content digest the manifest names."""
+    return _appearance_bytes(request, world_id, session_id, "chunk", digest)
+
+
+@router.get("/worlds/{world_id}/appearance/{session_id}/proxy/{digest}")
+def appearance_proxy_route(world_id: str, session_id: str, digest: str,
+                           request: Request) -> Response:
+    """The proxy mesh the appearance was built against (`WBSURF01`)."""
+    return _appearance_bytes(request, world_id, session_id, "proxy", digest)
+
+
+@router.get("/worlds/{world_id}/render/revision")
+def world_render_revision(
+    world_id: str, request: Request,
+    session_id: str | None = Query(default=None),
+    view: str | None = Query(default=None),
+    viewer: str | None = Query(default=None),
+) -> JSONResponse:
+    """Which picture `GET /worlds/{id}/render` would serve now, as a revision.
+
+    Contract `WORLD-BUILDER-WORLDS.md` §4a. A few hundred bytes, so the phone
+    can keep a picture open during a walk and learn that a better one has been
+    built without re-downloading megabytes to find out. The revision it is
+    compared with is stamped into the page it already has.
+    """
+    try:
+        payload = build_render_revision(_store(request), world_id, session_id, view=view,
+                                        viewer=viewer)
+    except WorldRenderUnavailable as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from None
+    return JSONResponse(json_safe(payload), headers={"Cache-Control": "no-store"})
+
+
 @router.get("/worlds/{world_id}/render", response_class=HTMLResponse)
 def world_render(
     world_id: str, request: Request,
@@ -117,6 +238,27 @@ def world_render(
     # web process knows a world builder only through the adapter below.
     # The adapter owns what "no view asked for" means.
     view: str | None = Query(default=None),
+    # Which reconstruction to serve. "auto" is the product default and means
+    # the best one this session actually has -- appearance (only for a client
+    # declaring `viewer=appearance-1`), surface, then dense points, then
+    # sparse. The named values exist so a developer, a test, or the
+    # diagnostics screen can pin one and compare; naming a representation
+    # the session does not have falls back rather than failing, because the
+    # caller asking for a better picture should never get no picture.
+    representation: str = Query(
+        default="auto", pattern="^(auto|sparse|dense|surface|appearance)$"),
+    # Where the APPEARANCE page fetches its imagery from (WORLD-BUILDER-WORLDS.md
+    # §4). `app`, the default and the phone's only mode: the app's private
+    # `glasses-world:` scheme, whose native handler whitelists this world's
+    # routes. `tower`: a desktop debug mode, only when named, fetching from this
+    # origin. Every other page fetches nothing and ignores it.
+    transport: str = Query(default="app", pattern="^(app|tower)$"),
+    # What the client can draw (WORLD-BUILDER-WORLDS.md §4). `auto` offers the
+    # appearance page only to a client declaring `appearance-1`: an iOS build
+    # older than that page has no scheme handler to fetch its imagery through,
+    # and was served a page that could fetch nothing. Comma-separated tokens;
+    # unknown ones are ignored, never a 422.
+    viewer: str | None = Query(default=None),
 ) -> HTMLResponse:
     """The interactive viewer of one saved world, as a self-contained page.
 
@@ -133,7 +275,8 @@ def world_render(
     try:
         html = build_world_render(
             _store(request), world_id, session_id, max_points=max_points,
-            view=view,
+            view=view, representation=representation, transport=transport,
+            viewer=viewer,
         )
     except WorldRenderUnavailable as exc:
         raise HTTPException(status_code=404, detail=exc.reason) from None
@@ -144,9 +287,11 @@ def world_render(
     # The policy states what the contract promises -- a page that loads
     # nothing from anywhere -- so a browser enforces it too: its own inline
     # script and style, and no other resource of any kind.
+    #
+    # The appearance page is the one exception: it fetches its imagery, and its
+    # policy allows exactly that transport (`connect-src glasses-world:`, or
+    # `'self'` in the named desktop debug mode) and nothing else.
     return HTMLResponse(html, headers={
         "Cache-Control": "no-store",
-        "Content-Security-Policy": (
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
-        ),
+        "Content-Security-Policy": render_content_security_policy(html, transport),
     })

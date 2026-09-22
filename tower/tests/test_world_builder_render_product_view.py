@@ -89,10 +89,15 @@ def _write_world(root, *, points, placements, poses=None):
     return WorldStore(root)
 
 
-def _point(index, xyz, rgb=None):
+def _point(index, xyz, rgb=None, rgb_source="redacted-keyframes"):
+    """A point row. A colour is tagged as measured from redacted keyframes
+    unless a test says otherwise: these tests are about how a DRAWABLE colour
+    is drawn; which colours are drawable is tested at the bottom of the file."""
     row = {"segment_index": index, "xyz": list(xyz)}
     if rgb is not None:
         row["rgb"] = list(rgb)
+        if rgb_source is not None:
+            row["rgb_source"] = rgb_source
     return row
 
 
@@ -184,8 +189,8 @@ def test_a_point_with_no_measured_colour_is_neutral_and_counted(coloured):
     assert sum(1 for index in drawn.values() if index == 0) == 1
     assert world["uncoloured"] == 1
     # The page says so in the served HTML, not only in the payload.
-    assert "1 point carry no measured colour and are drawn neutral grey." \
-        in world["summary"]
+    assert ("1 point carry no colour measured from redacted imagery and are drawn "
+            "neutral grey.") in world["summary"]
     assert world["summary"] in html
 
 
@@ -199,7 +204,7 @@ def test_a_fully_coloured_frame_says_so_rather_than_saying_nothing(tmp_path):
     )
     html = render_html(store, WORLD, SESSION)
     assert _frames(html)[0]["uncoloured"] == 0
-    assert "Every point carries a measured colour." in html
+    assert "Every point carries a colour measured from redacted imagery." in html
 
 
 def test_the_neutral_grey_is_never_a_segment_colour():
@@ -221,8 +226,8 @@ def test_a_world_with_no_photometry_is_all_neutral_and_says_so(tmp_path):
     world = _frames(html)[0]
     assert {index for _xyz, index in _drawn_colours(world)} == {0}
     assert world["uncoloured"] == world["points"] == 5
-    assert "None of them carry a measured colour" in world["summary"]
-    assert "None of them carry a measured colour" in html
+    assert "None of them carry a colour measured from redacted imagery" in world["summary"]
+    assert "None of them carry a colour measured from redacted imagery" in html
 
 
 def test_colour_survives_subsampling_aligned_with_its_point(tmp_path):
@@ -478,3 +483,31 @@ def test_the_view_value_cannot_reach_the_page_as_script(tmp_path):
     html = render_html(store, WORLD, SESSION, view="'; alert(1); //")
     assert "alert(1)" not in html
     assert "let mode = 'world';" in html
+
+
+# -- privacy lane L1: the solver's colours are not drawn --------------------
+
+
+def test_the_solvers_point_colour_is_never_drawn(tmp_path):
+    """The solver's `rgb` is averaged from the RAW frames COLMAP was given, so
+    on a real capture some points are coloured only by pixels the face
+    redactor removed. A colour row without a drawable source -- which is every
+    row the solver writes -- is drawn neutral, and the sentinel colour appears
+    nowhere in the served page."""
+    sentinel = (13, 201, 77)
+    store = _write_world(
+        tmp_path / "data",
+        points=([_point(0, (float(i), 0.0, 0.0), sentinel, rgb_source=None) for i in range(6)]
+                + [_point(0, (float(i), 1.0, 0.0), sentinel, rgb_source="global-solve")
+                   for i in range(6)]),
+        placements=[_registered(0)],
+    )
+    html = render_html(store, WORLD, SESSION)
+    palette, _unreg, _stats = _pal(html)
+    world = _frames(html)[0]
+    assert world["uncoloured"] == 12
+    assert all(index == 0 for _xyz, index in _drawn_colours(world))
+    assert not any(_near(entry, sentinel, tolerance=8) for entry in palette)
+    assert "#%02x%02x%02x" % sentinel not in html
+    assert "None of them carry a colour measured from redacted imagery" in world["summary"]
+

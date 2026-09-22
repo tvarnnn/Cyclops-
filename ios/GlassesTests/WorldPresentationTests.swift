@@ -571,18 +571,20 @@ final class WorldRenderViewAddressTests: XCTestCase {
 
     private static let host = URL(string: "http://stub.invalid")!
 
-    /// The product view's URL is byte-for-byte the one this app has always
-    /// asked for. A Tower that has never heard of `view` is never sent it.
+    /// The product view sends no `view`: a Tower that has never heard of it is
+    /// never sent it. It does declare `viewer=appearance-1` (§4), which such a
+    /// Tower ignores.
     func testTheProductViewSendsNoViewParameterAtAll() {
         let url = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: "s1"), baseURL: Self.host
         )
-        XCTAssertEqual(url?.absoluteString, "http://stub.invalid/worlds/w1/render?session_id=s1")
+        XCTAssertEqual(url?.absoluteString,
+                       "http://stub.invalid/worlds/w1/render?session_id=s1&viewer=appearance-1")
 
         let unpinned = WorldRenderClient.url(
             for: WorldRenderTarget(worldID: "w1", sessionID: nil), baseURL: Self.host
         )
-        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render")
+        XCTAssertEqual(unpinned?.absoluteString, "http://stub.invalid/worlds/w1/render?viewer=appearance-1")
     }
 
     func testTheDiagnosticsViewAsksForItByName() {
@@ -592,7 +594,7 @@ final class WorldRenderViewAddressTests: XCTestCase {
         )
         XCTAssertEqual(
             url?.absoluteString,
-            "http://stub.invalid/worlds/w1/render?session_id=s1&view=diagnostics"
+            "http://stub.invalid/worlds/w1/render?session_id=s1&view=diagnostics&viewer=appearance-1"
         )
     }
 
@@ -1151,5 +1153,82 @@ final class WorldStageMacGateTests: XCTestCase {
             XCTAssertNotEqual(note, solve.sentence, "\(solve)")
             XCTAssertFalse(note.isEmpty)
         }
+    }
+}
+
+
+/// The caption under the viewer follows the rung the Tower served.
+///
+/// It used to say "Not a surface" unconditionally. Once the Tower serves a
+/// surface that sentence denies what is on screen, which is as wrong as a
+/// caption that overclaims.
+@MainActor
+final class WorldRenderRepresentationTests: XCTestCase {
+    private func page(_ rung: String) -> String {
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+            + "<meta name=\"wb-representation\" content=\"\(rung)\">"
+            + "<title>x</title></head><body></body></html>"
+    }
+
+    func testEachRungIsReadFromThePage() {
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("surface")), .surface)
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("dense")), .dense)
+        XCTAssertEqual(WorldRenderRepresentation.declared(in: page("sparse")), .sparse)
+    }
+
+    func testAPageFromAnOlderTowerDeclaresNothing() {
+        XCTAssertNil(WorldRenderRepresentation.declared(in: "<html><head></head></html>"))
+    }
+
+    func testAnUnknownRungIsNotGuessed() {
+        XCTAssertNil(WorldRenderRepresentation.declared(in: page("splat")))
+    }
+
+    func testTheTagIsOnlyLookedForInTheHead() {
+        let late = String(repeating: " ", count: 5000) + page("surface")
+        XCTAssertNil(WorldRenderRepresentation.declared(in: late))
+    }
+
+    func testTheSurfaceCaptionDoesNotDenyTheSurface() {
+        let text = WorldRenderRepresentation.caption(for: .surface)
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("not a surface"))
+    }
+
+    /// Review 2, S1. The page and the contract retracted "gaps are places
+    /// nothing looked"; this caption sits directly above the page and kept
+    /// saying it. A hole is also where the views disagreed.
+    func testTheSurfaceCaptionDoesNotPresentAGapAsProofNobodyLooked() {
+        let text = WorldRenderRepresentation.caption(for: .surface)
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("nothing looked"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("gaps are places"))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("not proof"))
+        XCTAssertTrue(text.hasPrefix("Surfaces the Tower reconstructed"),
+                      "TowerSmokeUITests finds the surface rung by this prefix")
+    }
+
+    func testThePointCaptionsStillRefuseToCallPointsASurface() {
+        for rung in [WorldRenderRepresentation.dense, .sparse] {
+            XCTAssertTrue(WorldRenderRepresentation.caption(for: rung).contains("Not a surface"))
+        }
+    }
+
+    func testNoCaptionClaimsAScale() {
+        // `.appearance` was missing from this list, which is how the one rung
+        // whose pixels look like a photograph — and so the one a wearer is
+        // likeliest to measure off — was the one rung not held to the rule
+        // (review 2).
+        let rungs: [WorldRenderRepresentation?] = [.appearance, .surface, .dense, .sparse, nil]
+        for rung in rungs {
+            XCTAssertTrue(
+                WorldRenderRepresentation.caption(for: rung).localizedCaseInsensitiveContains("not to scale"),
+                "caption for \(String(describing: rung)) must not imply a size"
+            )
+        }
+    }
+
+    func testTheStateReadsTheRungOffItsPage() {
+        XCTAssertEqual(WorldRenderViewerState.ready(html: page("surface")).representation, .surface)
+        XCTAssertEqual(WorldRenderViewerState.rendering(html: page("dense")).representation, .dense)
+        XCTAssertNil(WorldRenderViewerState.fetching.representation)
     }
 }

@@ -845,6 +845,7 @@ is absent.
 
 ```json
 {"keyframe_images": {"present": true, "count": 4, "redaction": "none",
+                     "reredacted_set": null,
                      "fetchable": false, "reason": "..."},
  "images_purged_declared": false,
  "images_purged_verified": null,
@@ -854,11 +855,24 @@ is absent.
 **No imagery is offered, and none will be under this contract.** Since
 2026-08-23 keyframes are **face-redacted before they are written**, and
 `redaction` reports what the session recorded — e.g.
-`faces-detected-and-filled/yunet-2023mar@0.30`, naming the detector and
-its threshold. That is a **process** claim ("this detector's hits were
+`faces-detected-and-filled/yunet-2023mar@0.30+plausibility3`, naming the
+detector, its threshold, and the version of the plausibility gate its
+detections pass before being filled (older sessions record `+plausibility2`,
+`+plausibility1`, or no suffix at all; `docs/contracts/WORLD-BUILDER-IOS.md`
+describes each gate). That is a **process** claim ("this detector's hits were
 filled"), never an outcome claim: the detector has measured false
 negatives on heavily occluded and ~90°-rotated faces. Sessions captured
 before that date keep `none` forever.
+
+`reredacted_set` is `null` unless the session was explicitly re-redacted
+(`scripts/world_reredact.py --apply`,
+`docs/contracts/WORLD-BUILDER-APPEARANCE.md` §6.5): then it is
+`{"redaction": <the set's label>, "count": <images in it>}`, and builds read
+that set. `redaction` and `count` still describe the stored `images/`, which
+is never modified. Only an older label of the same family (the ungated rule,
+`+plausibility1`, `+plausibility2`) can be re-redacted, only from verified raw
+frames, and only so that fill is removed, never moved; `none` never is. It is
+the same kind of process claim, and it does not make the imagery fetchable.
 
 They stay unfetchable regardless. A best-effort filter is not grounds to
 start shipping first-person imagery. `IOS-to-Tower.md` §5 requires an image whose treatment is not

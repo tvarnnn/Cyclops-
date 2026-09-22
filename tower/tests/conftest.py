@@ -21,6 +21,16 @@ os.environ.pop("TOWER_CV_DEVICE", None)
 
 
 @pytest.fixture(autouse=True)
+def _no_transient_detector_models(monkeypatch):
+    """The World Builder's transient detector (tower/world_builder/transients.py)
+    would load -- and on a machine without them, DOWNLOAD -- three checkpoints
+    (~2 GB) the first time a surface or appearance build asks. No test may do
+    that. Off by environment, so a CLI subprocess inherits it too; tests of the
+    detector's behaviour pass a stub backend explicitly."""
+    monkeypatch.setenv("TOWER_WORLD_TRANSIENTS", "off")
+
+
+@pytest.fixture(autouse=True)
 def _clear_cv_experiment_env(monkeypatch):
     monkeypatch.delenv("TOWER_CV_EXPERIMENT", raising=False)
     monkeypatch.delenv("TOWER_CV_DEVICE", raising=False)

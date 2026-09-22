@@ -181,6 +181,26 @@ def main(argv=None) -> int:
         help="run the global solver during and after the replay (see world_build_session.py --solve)",
     )
     parser.add_argument("--solve-every", type=int, default=None)
+    parser.add_argument(
+        "--surface",
+        action="store_true",
+        help=(
+            "reconstruct a surface as the builder does (passes "
+            "world_build_session.py --surface): a coarse one whenever a "
+            "background solve lands during the replay, and the full one "
+            "after Stop. Needs --solve."
+        ),
+    )
+    parser.add_argument(
+        "--densify",
+        action="store_true",
+        help=(
+            "run the dense reconstruction after the final build (see "
+            "world_build_session.py --densify). Needs --solve: dense "
+            "reconstruction is anchored to the global solution's cameras and "
+            "sparse points, and there is nothing to anchor to without one."
+        ),
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args(argv)
 
@@ -219,6 +239,17 @@ def main(argv=None) -> int:
         argv_build.append("--solve")
         if args.solve_every is not None:
             argv_build += ["--solve-every", str(args.solve_every)]
+    if args.densify:
+        if not args.solve:
+            parser.error("--densify needs --solve: the dense stage is anchored "
+                         "to the global solution's cameras and sparse points")
+        argv_build.append("--densify")
+    if args.surface:
+        if not args.solve:
+            parser.error("--surface needs --solve: a surface is fused from the "
+                         "poses the global solve places, and there is nothing "
+                         "trustworthy to fuse without one")
+        argv_build.append("--surface")
 
     started = time.perf_counter()
     completed = subprocess.run(

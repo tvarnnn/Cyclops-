@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="wb-representation" content="surface">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>World</title>
+<style>
+:root{
+  --bg:#0b0d10; --ink:#e8e9ec; --dim:#9aa0a8; --line:#23262c; --accent:#64d2ff;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  overscroll-behavior:none}
+/* The page must not scroll or rubber-band under the canvas on a phone. */
+body{overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none}
+canvas{display:block;width:100%;height:100%;touch-action:none;background:var(--bg)}
+#wrap{position:fixed;inset:0}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:10px 12px calc(10px + env(safe-area-inset-bottom));
+  background:linear-gradient(to top,rgba(11,13,16,.96),rgba(11,13,16,0));
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{appearance:none;-webkit-appearance:none;border:1px solid var(--line);background:#14171c;color:var(--ink);
+  border-radius:8px;padding:8px 11px;font:inherit;font-size:13px;min-height:38px;touch-action:manipulation}
+button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+button[disabled]{opacity:.4}
+#caption{position:fixed;left:0;right:0;top:0;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;
+  background:linear-gradient(to bottom,rgba(11,13,16,.96),rgba(11,13,16,0));
+  font-size:12px;color:var(--dim);pointer-events:none}
+#caption b{color:var(--ink);font-weight:600}
+#msg{position:fixed;inset:0;display:none;place-content:center;padding:28px;text-align:center;
+  color:var(--dim);background:var(--bg);z-index:5}
+#msg.on{display:grid}
+.spacer{flex:1}
+#pos{font-variant-numeric:tabular-nums;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="caption"></div>
+<div id="bar">
+  <button id="bOrbit" aria-pressed="false">Orbit</button>
+  <button id="bWalk" aria-pressed="false">Walk</button>
+  <button id="bPrev">&#8592;</button>
+  <button id="bNext">&#8594;</button>
+  <span id="pos"></span>
+  <span class="spacer"></span>
+  <button id="bReset">Reset</button>
+</div>
+<div id="msg"></div>
+<!-- The mesh rides as text in a non-executing script element, NOT as a string
+     literal in the program below. A literal is part of the script's source,
+     and the engine keeps a script's source alive for the life of the page;
+     this element is removed the moment it has been decoded. -->
+<script id="wb-mesh" type="application/octet-stream">__WB_SURFACE_MESH__</script>
+<script>
+"use strict";
+const CONFIG = __WB_SURFACE_CONFIG__;
+const T0 = performance.now();
+const timing = {};
+window.__wbSurface = {timing};
+
+function fail(text){
+  const m = document.getElementById("msg");
+  m.textContent = text; m.classList.add("on");
+  document.getElementById("wrap").style.display = "none";
+  document.getElementById("bar").style.display = "none";
+  document.getElementById("caption").style.display = "none";
+}
+
+/* ---------- decode wb-surface-mesh/1 ----------------------------------
+   Header (little-endian, 48 bytes): "WBSURF01", u32 nV, u32 nI, u32 flags,
+   u32 version, f32 lo[3], f32 hi[3]. Then u16 pos[3], u8 rgb[3],
+   (flags&1) i8 normal[3], per vertex; then u16 (flags&2) or u32 indices.
+
+   Nothing is dequantised on the CPU. The quantised arrays ARE the vertex
+   attributes -- normalised integer attributes, rescaled by the vertex
+   shader -- so decoding is a handful of typed-array views, not a loop over
+   every vertex, and the GPU holds 12 bytes a vertex instead of 36. */
+function b64bytes(s){
+  if (typeof Uint8Array.fromBase64 === "function"){
+    try { return Uint8Array.fromBase64(s); } catch (e) { /* fall through */ }
+  }
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+/* A typed view where the offset is aligned, a copy where it is not: a u32
+   index block that starts at an odd byte (a mesh with no normals and an odd
+   vertex count) cannot be viewed in place and would throw a RangeError. */
+function view(Type, buffer, offset, count){
+  if (offset % Type.BYTES_PER_ELEMENT === 0) return new Type(buffer, offset, count);
+  return new Type(buffer.slice(offset, offset + count * Type.BYTES_PER_ELEMENT));
+}
+function decodeMesh(bytes){
+  if (bytes.byteLength < 48) throw new Error("surface mesh is shorter than its header");
+  // Own the buffer from offset 0 so buffer offsets equal file offsets.
+  if (bytes.byteOffset !== 0) bytes = bytes.slice();
+  const buf = bytes.buffer;
+  const dv = new DataView(buf, 0, bytes.byteLength);
+  let magic = "";
+  for (let i = 0; i < 8; i++) magic += String.fromCharCode(dv.getUint8(i));
+  if (magic !== "WBSURF01") throw new Error("not a surface mesh");
+  const nV = dv.getUint32(8, true), nI = dv.getUint32(12, true);
+  const flags = dv.getUint32(16, true), version = dv.getUint32(20, true);
+  if (version !== 1) throw new Error("surface mesh schema " + version + ", expected 1");
+  const lo = [dv.getFloat32(24,true), dv.getFloat32(28,true), dv.getFloat32(32,true)];
+  const hi = [dv.getFloat32(36,true), dv.getFloat32(40,true), dv.getFloat32(44,true)];
+  const hasN = (flags & 1) !== 0, u16 = (flags & 2) !== 0;
+  if (nI % 3 !== 0) throw new Error("surface mesh index count is not a multiple of 3");
+  let off = 48;
+  const need = off + nV * (6 + 3 + (hasN ? 3 : 0)) + nI * (u16 ? 2 : 4);
+  if (bytes.byteLength !== need) throw new Error("surface mesh length mismatch");
+
+  const pos = view(Uint16Array, buf, off, nV * 3); off += nV * 6;
+  const col = new Uint8Array(buf, off, nV * 3);    off += nV * 3;
+  let nrm = null;
+  if (hasN){ nrm = new Int8Array(buf, off, nV * 3); off += nV * 3; }
+  const idx = u16 ? view(Uint16Array, buf, off, nI) : view(Uint32Array, buf, off, nI);
+  const span = [Math.max(hi[0]-lo[0], 1e-9), Math.max(hi[1]-lo[1], 1e-9), Math.max(hi[2]-lo[2], 1e-9)];
+  return {pos, col, nrm, idx, lo, hi, span, nV, nI, u32: !u16};
+}
+
+/* ---------- small maths ------------------------------------------------ */
+const M = {
+  mul(a,b){const o=new Float32Array(16);
+    for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;},
+  persp(fy,asp,n,f){const t=1/Math.tan(fy/2),o=new Float32Array(16);
+    o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f);return o;},
+  look(eye,at,up){
+    let z=[eye[0]-at[0],eye[1]-at[1],eye[2]-at[2]];let l=Math.hypot(...z)||1;z=z.map(v=>v/l);
+    let x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]];
+    l=Math.hypot(...x);
+    if (l < 1e-6){ x=[1,0,0]; } else { x=x.map(v=>v/l); }
+    const y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]];
+    const o=new Float32Array(16);
+    o[0]=x[0];o[4]=x[1];o[8]=x[2];o[1]=y[0];o[5]=y[1];o[9]=y[2];o[2]=z[0];o[6]=z[1];o[10]=z[2];
+    o[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]);
+    o[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]);
+    o[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]);
+    o[15]=1;return o;}
+};
+const norm3 = v => { const l = Math.hypot(v[0],v[1],v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
+const cross3 = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const dot3 = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+
+/* World up. The capture frame is OpenCV-style (camera +Y down), so up is
+   ROUGHLY -Y -- on the canonical world the wearer's mean camera-up is 14
+   degrees away from it, which is a visibly tilted horizon. A server-sent
+   `CONFIG.up` is exact and wins. Otherwise: a wearer mostly looks
+   horizontally, so the look directions lie near a plane whose normal is up --
+   the smallest-eigenvalue eigenvector of their scatter (9 degrees off on the
+   same world), signed towards -Y. */
+function worldUp(cams){
+  if (Array.isArray(CONFIG.up) && CONFIG.up.length === 3) return norm3(CONFIG.up);
+  const fallback = [0,-1,0];
+  if (cams.length < 12) return fallback;
+  const S = [[0,0,0],[0,0,0],[0,0,0]];
+  for (const c of cams){
+    const f = norm3([c[3],c[4],c[5]]);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) S[i][j] += f[i]*f[j];
+  }
+  // Jacobi eigen-decomposition of a symmetric 3x3.
+  const A = S.map(r => r.slice()), V = [[1,0,0],[0,1,0],[0,0,1]];
+  for (let sweep = 0; sweep < 24; sweep++){
+    for (const [p,q] of [[0,1],[0,2],[1,2]]){
+      if (Math.abs(A[p][q]) < 1e-12) continue;
+      const th = 0.5 * Math.atan2(2*A[p][q], A[q][q]-A[p][p]);
+      const c = Math.cos(th), s = Math.sin(th);
+      for (let k = 0; k < 3; k++){ const akp=A[k][p], akq=A[k][q]; A[k][p]=c*akp-s*akq; A[k][q]=s*akp+c*akq; }
+      for (let k = 0; k < 3; k++){ const apk=A[p][k], aqk=A[q][k]; A[p][k]=c*apk-s*aqk; A[q][k]=s*apk+c*aqk; }
+      for (let k = 0; k < 3; k++){ const vkp=V[k][p], vkq=V[k][q]; V[k][p]=c*vkp-s*vkq; V[k][q]=s*vkp+c*vkq; }
+    }
+  }
+  const ev = [A[0][0], A[1][1], A[2][2]];
+  let m = 0; if (ev[1] < ev[m]) m = 1; if (ev[2] < ev[m]) m = 2;
+  const mid = ev.slice().sort((a,b)=>a-b)[1];
+  // A walk that looked everywhere has no plane; say so by not guessing.
+  if (!(ev[m] < 0.6 * mid)) return fallback;
+  let up = norm3([V[0][m], V[1][m], V[2][m]]);
+  if (dot3(up, fallback) < 0) up = [-up[0], -up[1], -up[2]];
+  // An estimate further than 35 degrees from the convention is not trusted.
+  return dot3(up, fallback) > Math.cos(35 * Math.PI / 180) ? up : fallback;
+}
+
+/* The opening camera: the recorded pose whose view takes in the MOST OF THE
+   RECONSTRUCTION, by surface area, among poses standing inside the surface's
+   box. Nothing else is scored.
+
+   It used to prefer the pose seeing the most surface "at a comfortable
+   distance" (a Gaussian around the median scene depth), which on the
+   canonical world opened at pose 14 of 198 looking down at the desk: the one
+   direction in which the reconstruction was good. A viewer that opens on its
+   best angle is flattering the reconstruction to the person who has to judge
+   it. The rule now counts area, not vertices, because decimation spends
+   vertices on detail (a keyboard) rather than on extent (a wall). There is
+   no occlusion test, so area behind a wall counts; that errs towards views
+   that show more of the room, including its holes. */
+function chooseOpening(mesh, cams){
+  if (!cams.length) return -1;
+  const nF = mesh.nI / 3;
+  const fstep = Math.max(1, Math.floor(nF / 6000));
+  const P = [], A = [];
+  const vtx = i => [mesh.lo[0] + mesh.pos[i*3]   / 65535 * mesh.span[0],
+                    mesh.lo[1] + mesh.pos[i*3+1] / 65535 * mesh.span[1],
+                    mesh.lo[2] + mesh.pos[i*3+2] / 65535 * mesh.span[2]];
+  let total = 0;
+  for (let f = 0; f < nF; f += fstep){
+    const a = vtx(mesh.idx[f*3]), b = vtx(mesh.idx[f*3+1]), c = vtx(mesh.idx[f*3+2]);
+    const u = [b[0]-a[0], b[1]-a[1], b[2]-a[2]], v = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    const area = 0.5 * Math.hypot(u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]);
+    P.push([(a[0]+b[0]+c[0])/3, (a[1]+b[1]+c[1])/3, (a[2]+b[2]+c[2])/3]);
+    A.push(area); total += area;
+  }
+  const pad = 0.02;
+  let best = Math.floor(cams.length / 2), bestScore = -1;
+  for (let ci = 0; ci < cams.length; ci++){
+    const c = cams[ci];
+    let inside = true;
+    for (let k = 0; k < 3; k++){
+      const t = (c[k] - mesh.lo[k]) / mesh.span[k];
+      if (t < pad || t > 1 - pad) inside = false;
+    }
+    if (!inside) continue;
+    const f = norm3([c[3],c[4],c[5]]);
+    let seen = 0;
+    for (let i = 0; i < P.length; i++){
+      const p = P[i];
+      const d = [p[0]-c[0], p[1]-c[1], p[2]-c[2]];
+      const r = Math.hypot(d[0],d[1],d[2]);
+      if (r < 1e-6) continue;
+      if (dot3(d, f) / r > 0.6) seen += A[i];
+    }
+    const score = total > 0 ? seen / total : 0;
+    if (score > bestScore){ bestScore = score; best = ci; }
+  }
+  return best;
+}
+
+/* ---------- shaders ------------------------------------------------------ */
+const VS = `#version 300 es
+precision highp float;
+in vec3 aQ;       // u16, normalised to 0..1
+in vec3 aCol;     // u8,  normalised to 0..1
+in vec3 aNrm;     // i8,  normalised to -1..1
+uniform mat4 uMVP; uniform mat4 uMV;
+uniform vec3 uLo; uniform vec3 uSpan;
+out vec3 vN; out vec3 vC; out vec3 vP;
+void main(){
+  vec3 p = uLo + aQ * uSpan;
+  vN = mat3(uMV) * aNrm;
+  vC = aCol;
+  vP = (uMV * vec4(p, 1.0)).xyz;
+  gl_Position = uMVP * vec4(p, 1.0);
+}`;
+
+/* The capture is a dim room, so a shader that just multiplies by vertex
+   colour renders mud; the first version fixed that with a fixed 2.2x gain
+   and a clamp, which clips ~10% of this world's vertices to white and shifts
+   their hue as one channel saturates before the others. This one works in
+   linear light with an exposure measured from the mesh's own colours, and
+   rolls highlights off with a tone curve instead of a clamp. Exposure and
+   tone mapping are display controls: they move no vertex and invent no
+   surface. Lighting is two-sided (a room is seen from inside, and half its
+   normals face away) and camera-relative, so orbiting never walks into dark. */
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+in vec3 vN; in vec3 vC; in vec3 vP;
+uniform float uExposure; uniform int uHasN; uniform vec3 uUpView;
+out vec4 frag;
+vec3 toLinear(vec3 c){ return c * (c * (c * 0.305306011 + 0.682171111) + 0.012522878); }
+vec3 tone(vec3 x){ const float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0); }
+void main(){
+  vec3 flatN = normalize(cross(dFdx(vP), dFdy(vP)));
+  vec3 n = (uHasN == 1 && dot(vN, vN) > 1e-6) ? normalize(vN) : flatN;
+  vec3 v = normalize(-vP);
+  if (dot(n, v) < 0.0) n = -n;
+  float head = max(dot(n, v), 0.0);
+  float key  = max(dot(n, normalize(vec3(-0.45, 0.55, 1.0))), 0.0);
+  float hemi = 0.5 + 0.5 * dot(n, uUpView);
+  // Lift very dark colours by LUMINANCE, not per channel. A per-channel
+  // floor turned every dark vertex -- a third of this capture -- into the
+  // same neutral grey and threw away its hue: a navy chair and a shadowed
+  // beige carpet came out identical.
+  vec3 lin = toLinear(vC);
+  float lum = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  vec3 albedo = lin * (max(lum, 0.012) / max(lum, 1e-4));
+  vec3 lit = albedo * (0.30 + 0.25 * hemi + 0.45 * head + 0.25 * key);
+  frag = vec4(pow(tone(lit * uExposure), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+/* Stops that put the 95th percentile of linear vertex luminance at 0.45. */
+function measureExposure(mesh){
+  const n = mesh.nV, step = Math.max(1, Math.floor(n / 20000)), L = [];
+  for (let i = 0; i < n; i += step){
+    const r = mesh.col[i*3]/255, g = mesh.col[i*3+1]/255, b = mesh.col[i*3+2]/255;
+    L.push(Math.pow(Math.max(0.2126*r + 0.7152*g + 0.0722*b, 1e-3), 2.2));
+  }
+  if (!L.length) return 1;
+  L.sort((a,b)=>a-b);
+  const p95 = L[Math.min(L.length-1, Math.floor(L.length*0.95))];
+  const stops = Math.max(-1, Math.min(2.5, Math.log2(0.45 / Math.max(p95, 1e-5))));
+  return Math.pow(2, stops);
+}
+
+function compile(gl, type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function main(){
+  /* Decode before asking for a context: an unreadable mesh should say so
+     rather than blaming the device's graphics. */
+  const node = document.getElementById("wb-mesh");
+  let mesh;
+  try {
+    let t = performance.now();
+    let text = node.textContent.trim();
+    timing.b64Chars = text.length;
+    const bytes = b64bytes(text);
+    timing.b64Ms = performance.now() - t;
+    // Gone the moment it is decoded: tens of megabytes of text the page will
+    // never read again, on the one device that gets killed for holding it.
+    text = null; node.textContent = ""; node.remove();
+    t = performance.now();
+    mesh = decodeMesh(bytes);
+    timing.decodeMs = performance.now() - t;
+    timing.bytes = bytes.byteLength;
+  } catch (e){ fail("The surface could not be read: " + e.message); return; }
+  if (mesh.nI === 0){ fail("Nothing was reconstructed for this session yet."); return; }
+
+  const canvas = document.getElementById("c");
+  const dpr0 = window.devicePixelRatio || 1;
+  // MSAA only below DPR 2. At DPR 3 the panel already supersamples and the
+  // multisample buffers are a large, avoidable slice of a phone's memory.
+  const attrs = {antialias: dpr0 < 2, depth: true, alpha: false,
+                 preserveDrawingBuffer: false, powerPreference: "high-performance"};
+  let gl = canvas.getContext("webgl2", attrs);
+  if (!gl){
+    fail("This world is a 3-D surface and needs WebGL 2, which this viewer "
+       + "could not start. The sparse diagnostic view still works.");
+    return;
+  }
+
+  const cams = CONFIG.cameras || [];
+  const UP = worldUp(cams);
+  const exposure = measureExposure(mesh);
+  const centre = [mesh.lo[0]+mesh.span[0]/2, mesh.lo[1]+mesh.span[1]/2, mesh.lo[2]+mesh.span[2]/2];
+  const diag = Math.hypot(mesh.span[0], mesh.span[1], mesh.span[2]) || 1;
+  const opening = chooseOpening(mesh, cams);
+  timing.up = UP; timing.exposure = exposure; timing.opening = opening;
+
+  /* ---------- GL resources, rebuildable after a context loss ------------ */
+  let res = null;
+  function build(){
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    function attr(data, name, size, type){
+      const loc = gl.getAttribLocation(prog, name);
+      if (loc < 0) return;
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, size, type, true, 0, 0);
+    }
+    const t = performance.now();
+    attr(mesh.pos, "aQ", 3, gl.UNSIGNED_SHORT);
+    attr(mesh.col, "aCol", 3, gl.UNSIGNED_BYTE);
+    if (mesh.nrm) attr(mesh.nrm, "aNrm", 3, gl.BYTE);
+    else { const l = gl.getAttribLocation(prog, "aNrm"); if (l >= 0) gl.vertexAttrib3f(l, 0, 0, 0); }
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
+    timing.uploadMs = performance.now() - t;
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.clearColor(0.043, 0.051, 0.063, 1);
+    const u = n => gl.getUniformLocation(prog, n);
+    gl.uniform3f(u("uLo"), mesh.lo[0], mesh.lo[1], mesh.lo[2]);
+    gl.uniform3f(u("uSpan"), mesh.span[0], mesh.span[1], mesh.span[2]);
+    gl.uniform1f(u("uExposure"), exposure);
+    gl.uniform1i(u("uHasN"), mesh.nrm ? 1 : 0);
+    res = {uMVP: u("uMVP"), uMV: u("uMV"), uUpView: u("uUpView"),
+           idxType: mesh.u32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT};
+  }
+
+  /* The quantised buffer is kept -- it is the page's only copy of the world,
+     about as large as the level's own file -- because WebKit drops WebGL
+     contexts under memory pressure and on backgrounding, and a page with no
+     origin cannot reload itself (the app's navigation policy refuses it). */
+  canvas.addEventListener("webglcontextlost", e => {
+    e.preventDefault();               // without this, no restore is ever offered
+    res = null;
+    const m = document.getElementById("msg");
+    m.textContent = "The graphics context was taken away (usually memory pressure). Restoring…";
+    m.classList.add("on");
+  }, false);
+  canvas.addEventListener("webglcontextrestored", () => {
+    try { build(); document.getElementById("msg").classList.remove("on"); requestDraw(); }
+    catch (e){ fail("The graphics context came back but the world could not be redrawn: " + e.message); }
+  }, false);
+
+  try { build(); }
+  catch (e){ fail("The world viewer failed to start: " + e.message); return; }
+
+  /* ---------- camera ----------------------------------------------------- */
+  let mode = cams.length ? "walk" : "orbit";
+  let ci = opening >= 0 ? opening : 0;
+  const look = {yaw: 0, pitch: 0};        // walk-mode look-around, on top of the recorded pose
+  const view = {yaw: 0.6, pitch: -0.35, dist: diag * 0.9, target: centre.slice()};
+  let fovScale = 1;
+
+  function basis(){
+    // Right-handed frame with UP; `fwd0` is an arbitrary horizontal reference.
+    let ref = Math.abs(UP[0]) < 0.9 ? [1,0,0] : [0,0,1];
+    const e1 = norm3(cross3(UP, ref)), e2 = cross3(e1, UP);
+    return {e1, e2};
+  }
+  const B = basis();
+  function dirFrom(yaw, pitch){
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    return norm3([cp*(Math.cos(yaw)*B.e1[0] + Math.sin(yaw)*B.e2[0]) + sp*UP[0],
+                  cp*(Math.cos(yaw)*B.e1[1] + Math.sin(yaw)*B.e2[1]) + sp*UP[1],
+                  cp*(Math.cos(yaw)*B.e1[2] + Math.sin(yaw)*B.e2[2]) + sp*UP[2]]);
+  }
+  function yawPitchOf(d){
+    d = norm3(d);
+    const pitch = Math.asin(Math.max(-1, Math.min(1, dot3(d, UP))));
+    const yaw = Math.atan2(dot3(d, B.e2), dot3(d, B.e1));
+    return {yaw, pitch};
+  }
+
+  function resetOrbitToCamera(){
+    // Orbit opens around what the opening camera was looking at, from where
+    // it stood -- not around the box centre from outside the room.
+    if (cams.length){
+      const c = cams[ci], f = norm3([c[3],c[4],c[5]]);
+      const d = CONFIG.median_scene_depth || diag * 0.2;
+      view.target = [c[0]+f[0]*d, c[1]+f[1]*d, c[2]+f[2]*d];
+      const yp = yawPitchOf(f);
+      view.yaw = yp.yaw; view.pitch = yp.pitch; view.dist = d;
+    } else {
+      view.yaw = 0.6; view.pitch = 0.35; view.dist = diag * 0.9; view.target = centre.slice();
+    }
+  }
+  resetOrbitToCamera();
+
+  function reset(){
+    ci = opening >= 0 ? opening : 0;
+    look.yaw = 0; look.pitch = 0;
+    resetOrbitToCamera();
+    requestDraw();
+  }
+
+  function eyeAt(){
+    if (mode === "walk" && cams.length){
+      // The eye sits exactly where the wearer's camera was: that point is
+      // known to be free space. Backing off along the view ray -- what the
+      // first version did, by 6% of the diagonal -- can put it behind a wall.
+      const c = cams[Math.max(0, Math.min(cams.length-1, ci))];
+      const yp = yawPitchOf([c[3],c[4],c[5]]);
+      const d = dirFrom(yp.yaw + look.yaw,
+                        Math.max(-1.45, Math.min(1.45, yp.pitch + look.pitch)));
+      const eye = [c[0], c[1], c[2]];
+      return [eye, [eye[0]+d[0], eye[1]+d[1], eye[2]+d[2]]];
+    }
+    const d = dirFrom(view.yaw, view.pitch);
+    const t = view.target;
+    return [[t[0]-d[0]*view.dist, t[1]-d[1]*view.dist, t[2]-d[2]*view.dist], t.slice()];
+  }
+
+  let dpr = 1;
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  function draw(){
+    if (!res || gl.isContextLost()) return;
+    resize();
+    const [eye, at] = eyeAt();
+    const V = M.look(eye, at, UP);
+    const aspect = canvas.width / Math.max(1, canvas.height);
+    // A fixed vertical field of view on a portrait phone is a keyhole: at
+    // 390x844 the first version's 72-degree walk view was 36 degrees wide.
+    // Keep at least ~64 degrees horizontally, up to a 100-degree vertical.
+    let fy = (mode === "walk" ? 1.25 : 0.95) * fovScale;
+    const minH = 1.12;
+    const fyForH = 2 * Math.atan(Math.tan(minH / 2) / aspect);
+    fy = Math.min(1.75, Math.max(fy, fyForH));
+    const near = mode === "walk" ? diag * 0.0015 : Math.max(diag * 0.0015, view.dist * 0.01);
+    const P = M.persp(fy, aspect, near, diag * 12);
+    gl.uniformMatrix4fv(res.uMV, false, V);
+    gl.uniformMatrix4fv(res.uMVP, false, M.mul(P, V));
+    // Up, in view space, for the hemisphere term.
+    gl.uniform3f(res.uUpView, V[0]*UP[0]+V[4]*UP[1]+V[8]*UP[2],
+                              V[1]*UP[0]+V[5]*UP[1]+V[9]*UP[2],
+                              V[2]*UP[0]+V[6]*UP[1]+V[10]*UP[2]);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.drawElements(gl.TRIANGLES, mesh.nI, res.idxType, 0);
+    document.getElementById("pos").textContent =
+      mode === "walk" && cams.length ? (ci + 1) + " / " + cams.length : "";
+    if (timing.firstFrameMs === undefined) timing.firstFrameMs = performance.now() - T0;
+  }
+  /* Coalesced to the display: pointer events can arrive several times per
+     frame (120 Hz panels, coalesced touches), and drawing on each one queues
+     whole-mesh draws the compositor will never show. */
+  let pending = false;
+  function requestDraw(){
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; draw(); });
+  }
+  window.__wbSurface.redraw = draw;
+
+  /* ---------- input: Pointer Events only --------------------------------
+     The first version handled BOTH pointer events and touch events for the
+     same fingers. WebKit delivers both, so every touch ran two handlers, and
+     after a pinch the remaining finger could not orbit until it was lifted
+     (the touch handler had nulled the pointer handler's drag state). One
+     event family, one map of active pointers. */
+  const pts = new Map();
+  let gesture = null, walkSwipe = 0;
+  function two(){ const v = [...pts.values()];
+    return {d: Math.hypot(v[0].x-v[1].x, v[0].y-v[1].y), x:(v[0].x+v[1].x)/2, y:(v[0].y+v[1].y)/2}; }
+
+  canvas.addEventListener("pointerdown", e => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* synthetic or already gone */ }
+    pts.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    gesture = pts.size >= 2 ? two() : null;
+    walkSwipe = 0;
+    e.preventDefault();
+  }, {passive: false});
+
+  canvas.addEventListener("pointermove", e => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size === 1){
+      if (mode === "walk"){
+        look.yaw -= dx * 0.005;
+        look.pitch = Math.max(-1.3, Math.min(1.3, look.pitch - dy * 0.005));
+      } else {
+        view.yaw -= dx * 0.008;
+        view.pitch = Math.max(-1.45, Math.min(1.45, view.pitch - dy * 0.008));
+      }
+    } else if (pts.size >= 2 && gesture){
+      const g = two();
+      if (mode === "orbit"){
+        view.dist = Math.max(diag*0.01, Math.min(diag*6, view.dist * (gesture.d / Math.max(1, g.d))));
+        // Pan in the camera's own screen plane, so a drag moves the world
+        // with the fingers whatever the orbit angle.
+        const [eye, at] = eyeAt();
+        const f = norm3([at[0]-eye[0], at[1]-eye[1], at[2]-eye[2]]);
+        const r = norm3(cross3(f, UP)), u = cross3(r, f);
+        const k = view.dist * 0.0022, mx = g.x - gesture.x, my = g.y - gesture.y;
+        for (let i = 0; i < 3; i++) view.target[i] += (-r[i]*mx + u[i]*my) * k;
+      } else {
+        fovScale = Math.max(0.5, Math.min(1.4, fovScale * (gesture.d / Math.max(1, g.d))));
+        // A two-finger horizontal swipe walks the path, 70 px a step.
+        walkSwipe += g.x - gesture.x;
+        while (Math.abs(walkSwipe) >= 70){
+          step(walkSwipe < 0 ? 1 : -1);
+          walkSwipe -= Math.sign(walkSwipe) * 70;
+        }
+      }
+      gesture = g;
+    }
+    requestDraw();
+    e.preventDefault();
+  }, {passive: false});
+
+  function up(e){
+    pts.delete(e.pointerId);
+    gesture = pts.size >= 2 ? two() : null;
+  }
+  canvas.addEventListener("pointerup", up);
+  canvas.addEventListener("pointercancel", up);
+  canvas.addEventListener("lostpointercapture", up);
+  // Belt and braces for WebKit: a non-passive touchmove that refuses the
+  // default, and Safari's own pinch events, which zoom the page, not the world.
+  canvas.addEventListener("touchmove", e => e.preventDefault(), {passive: false});
+  for (const n of ["gesturestart", "gesturechange", "gestureend"])
+    document.addEventListener(n, e => e.preventDefault(), {passive: false});
+  canvas.addEventListener("wheel", e => {
+    if (mode === "orbit"){
+      view.dist = Math.max(diag*0.01, Math.min(diag*6, view.dist * Math.exp(e.deltaY * 0.0012)));
+      requestDraw();
+    }
+    e.preventDefault();
+  }, {passive: false});
+
+  function step(d){
+    if (!cams.length) return;
+    ci = Math.max(0, Math.min(cams.length-1, ci + d));
+    look.yaw = 0; look.pitch = 0;
+    requestDraw();
+  }
+  function setMode(m){
+    mode = m;
+    document.getElementById("bOrbit").setAttribute("aria-pressed", String(m === "orbit"));
+    document.getElementById("bWalk").setAttribute("aria-pressed", String(m === "walk"));
+    if (m === "orbit") resetOrbitToCamera();
+    look.yaw = 0; look.pitch = 0; fovScale = 1;
+    requestDraw();
+  }
+  document.getElementById("bOrbit").onclick = () => setMode("orbit");
+  document.getElementById("bWalk").onclick = () => { if (cams.length) setMode("walk"); };
+  document.getElementById("bPrev").onclick = () => { if (mode === "walk") step(-1); };
+  document.getElementById("bNext").onclick = () => { if (mode === "walk") step(1); };
+  document.getElementById("bReset").onclick = reset;
+  if (!cams.length){ document.getElementById("bWalk").disabled = true;
+                     document.getElementById("bPrev").disabled = true;
+                     document.getElementById("bNext").disabled = true; }
+  addEventListener("resize", requestDraw);
+
+  /* ---------- the caption says exactly what this is ---------------------
+     Built from text nodes. `currency_reason` is a server string; it goes in
+     as text, never as markup. */
+  const used = CONFIG.frames_used, offered = CONFIG.frames_offered;
+  const bits = [];
+  bits.push(Number(CONFIG.faces || mesh.nI / 3).toLocaleString() + " triangles");
+  if (CONFIG.quality === "live") bits.push("still building as you walk");
+  if (used && offered) bits.push(used + " of " + offered + " keyframes");
+  if (!CONFIG.current && CONFIG.currency_reason) bits.push(String(CONFIG.currency_reason));
+  // What a gap means, as measured on the canonical capture (surface-r2):
+  // of the depth the cameras measured with no surface near it, about half
+  // was outvoted by other views that saw past it, a quarter lacked the
+  // evidence of two agreeing views, and a quarter was removed as a
+  // contradicted or back-facing fold. Almost none was "nobody looked".
+  // The two-view sentence only for an artifact whose manifest says the
+  // per-face evidence filter ran; a surface built before it existed is
+  // described by what it did do.
+  let note = (CONFIG.evidence_filter
+              ? "Surfaces appear only where at least two camera views measured "
+                + "them and did not contradict each other. "
+              : "Surfaces appear only where the cameras' fused measurements "
+                + "reached the evidence threshold. ")
+           + "A gap is either a place nothing looked or a place the views "
+           + "disagreed about, so a gap is not proof that nothing is there.";
+  if ((CONFIG.scale_state || "unknown") === "unknown")
+    note += " Scale is unknown, so distances here are relative.";
+  const cap = document.getElementById("caption");
+  const head = document.createElement("b");
+  head.textContent = "Reconstructed surface";
+  cap.append(head, " · " + bits.join(" · "), document.createElement("br"), note);
+
+  setMode(mode);
+  timing.bootMs = performance.now() - T0;
+}
+
+try { main(); }
+catch (e){ fail("The world viewer failed to start: " + (e && e.message ? e.message : e)); }
+</script>
+</body>
+</html>

@@ -519,6 +519,41 @@ class Settings:
     # solver produced a solution.
     world_solve: bool = True
 
+    # Dense reconstruction after Stop. OFF, and the default is the decision.
+    #
+    # The stage turns the sparse solve into a per-pixel point cloud and is what
+    # makes a saved world recognisable rather than a scatter of feature points.
+    # It is also the most expensive thing this Tower can be asked to do: about
+    # 2.4 GB of VRAM and two to four minutes of GPU per world, on a card four
+    # other cartridges share. That runs AFTER the world lock is released, so it
+    # blocks no capture -- but it does compete for the GPU with whatever the
+    # wearer does next.
+    #
+    # Until this existed the only way to get a dense artifact was to run
+    # scripts/world_densify.py by hand, which is not a supported product path.
+    # Now it is one setting, and it is off so that turning it on is somebody's
+    # decision rather than a surprise.
+    world_densify: bool = False
+
+    # Surface reconstruction: ON, and that default is also the decision.
+    #
+    # The saved world IS the reconstruction. A coarse surface is rebuilt during
+    # the walk whenever a background solve lands, and the full one after Stop,
+    # so the wearer watches the room assemble and Saved Worlds opens a surface
+    # rather than a cloud of feature points. It shares the depth stage with
+    # `world_densify` when both are on. It needs the solve, and degrades to the
+    # sparse picture -- never to no picture -- when the depth network is not
+    # installed.
+    world_surface: bool = True
+
+    # The appearance stage (docs/contracts/WORLD-BUILDER-APPEARANCE.md): the
+    # wearer's redacted keyframes prepared for view-dependent blending over the
+    # surface on the phone. ON with the surface, because the surface alone is
+    # geometry and the saved world's appearance comes from what the glasses
+    # saw. It runs after each surface build in the same child, needs the
+    # surface, and costs about 40 s of mostly-CPU work on a 400-keyframe walk.
+    world_appearance: bool = True
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -565,6 +600,9 @@ def get_settings() -> Settings:
         ),
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
+        world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
+        world_surface=_flag("TOWER_WORLD_SURFACE", default=True),
+        world_appearance=_flag("TOWER_WORLD_APPEARANCE", default=True),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),

@@ -564,6 +564,178 @@ def child_environment() -> dict:
     return interpreter_environment()
 
 
+# `scripts/world_surface.py` exits with this when the stage cannot run on
+# this machine at all, as opposed to cannot run on this session yet.
+SURFACE_EXIT_CANNOT_RUN_HERE = 4
+
+
+class BackgroundSurface:
+    """The live surface reconstruction, as a CHILD this builder owns.
+
+    Why it is driven by the SOLVE and not by keyframes. During a walk the only
+    geometry worth reconstructing from is the global solution: the per-segment
+    chain fragments -- 34 segments on a measured walk, the largest holding 13.6%
+    -- and a field built from it would place the same wall in several places at
+    several scales. GLOMAP puts nearly every keyframe in one component. So a
+    live surface job is launched when a background solve LANDS, and at no other
+    time. Between solves the surface is honestly unchanged rather than
+    dishonestly growing.
+
+    Why a child process rather than a thread. The builder observes frames on one
+    thread and a GPU job in that thread would stall ingestion. The child also
+    gives a stop something to kill: `close()` from the builder's `finally`
+    leaves nothing behind, which is the lesson `BackgroundSolver` was written
+    for after an orphaned solve ran on for 32 s past its parent.
+
+    One at a time. NOT held back while a solve runs: an earlier version was,
+    on the theory that the two share the GPU, and on a real-time replay of the
+    canonical walk it built ONE surface in 140 s -- every time a solve landed
+    the next solve was already due and launched first, so the surface never
+    got its turn. The theory was also wrong on this machine: pycolmap has no
+    CUDA build on Windows, so the solve is CPU work and the surface is GPU
+    work. What they do share is CPU, so the surface child runs at below-normal
+    priority and the solve, and frame ingestion, win it.
+
+    A solve that lands while a surface is still building is not dropped: it
+    marks the surface stale, and the next `poll` launches a rebuild against the
+    newest solve as soon as the running one finishes.
+    """
+
+    def __init__(self, *, root: Path, world_id: str, session_id: str,
+                 script: Path | None = None, spawn=None, appearance: bool = False):
+        self.root = root
+        # Build the appearance on each live surface, in the same child.
+        self.appearance = appearance
+        self.world_id = world_id
+        self.session_id = session_id
+        self.script = Path(script) if script is not None             else TOWER_ROOT / "scripts" / "world_surface.py"
+        self._spawn = spawn if spawn is not None else subprocess.Popen
+        self._child = None
+        self._launches = 0
+        self._log = None
+        self._stale = False
+        self._built_from = None
+        self._pending_stamp = None
+        self._disabled = False
+
+    @property
+    def running(self) -> bool:
+        return self._child is not None and self._child.poll() is None
+
+    @property
+    def launches(self) -> int:
+        return self._launches
+
+    def solve_landed(self, store: WorldStore) -> bool:
+        """A solve finished. If it published a NEW solution, build against it
+        now, or as soon as the surface already building is done.
+
+        A finished solve is not necessarily a new solution: a solve child that
+        crashed or found nothing to add still "finishes". Rebuilding the surface
+        for it costs a GPU minute and changes nothing, so the solution file's
+        own stamp is compared with the one last built from.
+        """
+        stamp = self._solution_stamp()
+        if stamp is not None and stamp == self._built_from:
+            return False
+        self._pending_stamp = stamp
+        self._stale = True
+        return self.poll(store)
+
+    def _solution_stamp(self):
+        path = (self.root / "worlds" / self.world_id / "solve" / self.session_id
+                / "solution.json")
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def poll(self, store: WorldStore) -> bool:
+        """Launch the pending rebuild if one is owed and nothing is running."""
+        self._reap()
+        if not self._stale or self.running or self._disabled:
+            return False
+        self._stale = False
+        launched = self.maybe_launch(store)
+        if launched:
+            self._built_from = self._pending_stamp
+        return launched
+
+    @property
+    def child_pid(self) -> int | None:
+        return self._child.pid if self._child is not None else None
+
+    def _reap(self) -> None:
+        if self._child is not None and self._child.poll() is not None:
+            if self._child.returncode == SURFACE_EXIT_CANNOT_RUN_HERE:
+                # The depth network is not installed on this machine. Every
+                # later solve would launch a child that fails the same way;
+                # say so once and stop.
+                self._disabled = True
+                logger.warning(
+                    "[Tower][WorldBuilder] live surface cannot run on this "
+                    "machine; no further live surfaces this walk")
+            self._child = None
+            if self._log is not None:
+                self._log.close()
+                self._log = None
+
+    def maybe_launch(self, store: WorldStore, *, solver_running: bool = False) -> bool:
+        # `solver_running` is accepted and ignored; see the class docstring for
+        # why the surface no longer waits for the solve.
+        self._reap()
+        if self.running:
+            return False
+        log_dir = self.root / "worlds" / self.world_id / "surface" / self.session_id
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._log = open(log_dir / "surface.log", "ab")
+        except OSError:
+            self._log = None
+        argv = [
+            python_executable(), str(self.script),
+            "--root", str(self.root), "--world", self.world_id,
+            "--session", self.session_id, "--live", "--force",
+            *(["--appearance"] if self.appearance else []),
+        ]
+        extra = {}
+        if os.name == "nt":
+            # The solve and frame ingestion are CPU work and must win it.
+            extra["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        self._child = self._spawn(
+            argv, cwd=str(TOWER_ROOT), stdout=self._log or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT, env=child_environment(),
+            stdin=subprocess.DEVNULL, **extra,
+        )
+        self._launches += 1
+        logger.info(
+            "[Tower][WorldBuilder] live surface %s launched (pid %s)",
+            self._launches, self._child.pid,
+        )
+        return True
+
+    def close(self) -> None:
+        """Terminate rather than abandon. A live surface is disposable: the
+        final one replaces it, so there is nothing to wait for at Stop.
+
+        `_terminate_process_tree` and not `Popen.terminate`, because the child
+        is a python launcher that spawns the real interpreter: killing only the
+        launcher leaves the GPU job running and the lock file held.
+        """
+        self._reap()
+        if self._child is None:
+            return
+        try:
+            _terminate_process_tree(self._child)
+        except Exception:  # noqa: BLE001 -- teardown must not mask the real exit
+            logger.exception("[Tower][WorldBuilder] could not stop the live surface child")
+        self._child = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+
 class BackgroundSolver:
     """Every global solve this builder runs, as a CHILD it owns.
 
@@ -1196,6 +1368,116 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     }
 
 
+def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
+                         solved: bool, appearance: bool, prune_depth_work: bool,
+                         should_stop, stop_source=lambda: None) -> dict:
+    """The finished world's surface stages, after Stop, in THIS process.
+
+    Returns the report entries (`surface`, and `appearance` when asked). In order,
+    each stage skipped rather than truncated on a hard stop (`should_stop`):
+
+    1. `surfacify(force=True)` with the FINAL parameters (`SurfaceParams()`):
+       depth, then the transient detector masks under **union** (Grounding DINO +
+       SAM 2 on top of the OneFormer masks the live child already cached --
+       the cache is per component, so OneFormer is not run twice), then the depth
+       consistency field **warm-started** from the live child's field (the key
+       differs: final outer iterations and a later solve), then fusion, the plane
+       snap and the levels;
+    2. the final appearance on that surface, with the final parameters (union
+       masks, read from the same cache), only if the surface is `ok`;
+    3. pruning the per-frame depth work, only after both, because the appearance
+       reads each frame's fill mask and raw prediction from it.
+
+    The live child (`BackgroundSurface`, `scripts/world_surface.py --live`) runs
+    the same order with the live presets (OneFormer only, fewer outer iterations)
+    and is terminated before this starts. Extracted from `main` so the order,
+    the parameters and the stop behaviour are tested by running it.
+    """
+    report: dict = {}
+    if should_stop():
+        report["surface"] = {
+            "attempted": False,
+            "reason": f"hard stop ({stop_source()}) during finalization",
+        }
+        return report
+    if not solved:
+        report["surface"] = {
+            "attempted": False,
+            "reason": "a surface needs a global solve; there is none",
+        }
+        return report
+    from tower.world_builder.surface import SurfaceParams  # noqa: PLC0415
+    from tower.world_builder.surface_pipeline import surfacify  # noqa: PLC0415
+
+    surface_result = surfacify(
+        store, world_id, session_id,
+        # The final preset, named rather than defaulted, so the union detector
+        # and the final consistency iterations are what this line says.
+        params=SurfaceParams(),
+        # `force`, because the live stage has almost certainly left a
+        # COARSE artifact for this same solve behind. Without it the
+        # "already built from this solve" short-circuit would see a
+        # matching digest and keep the walk-time reconstruction as the
+        # finished world -- the exact failure the final stage exists
+        # to prevent. The parameters differ, so the params digest
+        # differs too and the short-circuit would not in fact fire;
+        # this is belt and braces on the thing that would be worst to
+        # get wrong.
+        force=True,
+        should_stop=should_stop,
+    )
+    report["surface"] = {"attempted": True, **surface_result.as_dict()}
+    appearance_interrupted = False
+    appearance_built = not appearance
+    # The final appearance, on the final surface, BEFORE the depth work
+    # is pruned below: it reads each frame's fill mask and raw depth
+    # prediction from that work. Skipped on a hard stop like the rest.
+    if appearance and surface_result.state == "ok":
+        if should_stop():
+            appearance_interrupted = True
+            report["appearance"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_source()}) during finalization",
+            }
+        else:
+            from tower.world_builder.appearance import AppearanceParams  # noqa: PLC0415
+            from tower.world_builder.appearance_pipeline import (  # noqa: PLC0415
+                build_appearance,
+            )
+
+            appearance_result = build_appearance(
+                store, world_id, session_id, params=AppearanceParams(),
+                should_stop=should_stop,
+            )
+            report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
+            appearance_interrupted = appearance_result.state == "stopped"
+            appearance_built = appearance_result.state == "ok"
+    # Decided by what the appearance REPORTED as well as by asking again: a
+    # stop predicate need not stay true once the stage it stopped has returned
+    # (measured: a run stopped in the appearance then pruned the work it needed).
+    #
+    # And only after an appearance that BUILT (review 1, m2). `unavailable` is
+    # most often transient -- a live child's lock whose process has not died
+    # yet, a redactor that could not load -- and pruning after it left
+    # `world_appearance.py` unable to rebuild without `world_surface.py --force`
+    # first. The work is kept until an appearance has used it.
+    if (prune_depth_work and surface_result.state == "ok" and not appearance_interrupted
+            and appearance_built and not should_stop()):
+        # The per-frame depth work is ~0.5 GB for a walk and nothing in
+        # the product reads it once the final surface exists; a later
+        # rebuild recomputes it. The dense stage prunes its own when on.
+        # Not after a hard stop: an appearance stopped half-way would be
+        # rebuilt by the next run, and it needs this work to be rebuilt.
+        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+            dense_dir,
+            prune_intermediates,
+        )
+
+        report["surface"]["depth_work_pruned_bytes"] = prune_intermediates(
+            dense_dir(store, world_id, session_id))
+    return report
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
@@ -1301,6 +1583,40 @@ def main(argv=None) -> int:
             "path. A segment's own geometry is never moved and a refusal is "
             "the default, so the worst case is the unregistered world you "
             "would have had anyway."
+        ),
+    )
+    parser.add_argument(
+        "--surface",
+        action="store_true",
+        help="reconstruct a surface: coarsely during the walk, whenever a "
+             "background solve lands, and at full resolution after Stop. "
+             "Needs --solve.",
+    )
+    parser.add_argument(
+        "--appearance",
+        action="store_true",
+        help="build the appearance artifact (redacted keyframes prepared for "
+             "view-dependent blending on the phone) after each live surface and "
+             "after the final surface. Needs --surface.",
+    )
+    parser.add_argument(
+        "--surface-script",
+        type=Path,
+        default=None,
+        help="override the live surface child's script (tests)",
+    )
+    parser.add_argument(
+        "--densify",
+        action="store_true",
+        help=(
+            "After the final build and the final solve, reconstruct a dense "
+            "point cloud from the solved cameras and persist it under "
+            "<world>/dense/<session>. Runs once, at the end, in this process "
+            "-- never on the frame path. It reads the world's own redacted "
+            "keyframe imagery, adds an artifact nothing else reads, and "
+            "changes neither derived/ nor the world's scale semantics, so a "
+            "failure leaves exactly the world you would have had. Costs "
+            "minutes: skipped outright on a hard stop."
         ),
     )
     parser.add_argument(
@@ -1558,6 +1874,15 @@ def main(argv=None) -> int:
             capture_dirs=capture_dirs, script=args.solve_script,
         )
     background_solves = args.solve and args.solve_every > 0
+    # The live surface needs a global solve to exist at all, so it is only
+    # constructed when background solves are on. With `--solve-every 0` there
+    # is one solve, at the end, and nothing to show during the walk.
+    surfacer = None
+    if args.surface and background_solves:
+        surfacer = BackgroundSurface(
+            root=args.root.resolve(), world_id=world_id, session_id=session_id,
+            script=args.surface_script, appearance=args.appearance,
+        )
 
     # THE LIFECYCLE, IN ONE PLACE, AND IT UNWINDS.
     #
@@ -1660,7 +1985,24 @@ def main(argv=None) -> int:
                 )
                 if background_solves:
                     solver.maybe_launch(store, accepted, sources)
+                # A solve landing is the one moment the live surface can be
+                # rebuilt from geometry worth trusting, so the launch is here
+                # and not on a keyframe count. It is asked AFTER the solver,
+                # so a solve that is due wins the card.
+                if surfacer is not None:
+                    if solve_landed:
+                        surfacer.solve_landed(store)
+                    else:
+                        surfacer.poll(store)
         observe_seconds = time.perf_counter() - started
+        if surfacer is not None:
+            # The walk is over, so a live surface still building is already
+            # obsolete: the final one after the final solve replaces it. Left
+            # running it competed with finalization -- on a real-time replay
+            # of the canonical walk the last live build finished 39 s after
+            # Stop, while the final solve waited. Ended here rather than only
+            # in the `finally`, which runs after finalization.
+            surfacer.close()
 
         # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?
         #
@@ -1843,6 +2185,11 @@ def main(argv=None) -> int:
         if isinstance(exc, KeyboardInterrupt):
             exit_code = 130
     finally:
+        if surfacer is not None:
+            # Before the solver, because the live surface is the disposable
+            # one: whatever it was part-way through is replaced by the final
+            # build below, and leaving it holding the GPU would slow that down.
+            surfacer.close()
         if solver is not None:
             solver.close()
         try:
@@ -1919,6 +2266,55 @@ def main(argv=None) -> int:
                 "reason": "the global solve placed these segments",
             }
         )
+
+    # The final surface, after everything load-bearing is on disk. It runs
+    # BEFORE the dense stage, and the order is not cosmetic: the dense stage
+    # prunes the per-frame depth work when it finishes, so a surface built
+    # after it found every prediction gone and ran the depth network again over
+    # the whole walk. Built first, it computes the depth stage and names it for
+    # this solve, and the dense stage then reuses it by its cache key.
+    #
+    # Skipped rather than truncated on a hard stop. The Job Object kills this
+    # tree on a 30-second grace and a half-written surface would be worse than
+    # none, which is why the artifact is published atomically and why the
+    # format checks its own length on read.
+    if args.surface:
+        report.update(final_surface_stages(
+            store, world_id, session_id,
+            solved=bool((solve_report or {}).get("solved")),
+            appearance=args.appearance,
+            prune_depth_work=not args.densify,
+            should_stop=stop_request.hard_asked_for,
+            stop_source=lambda: stop_request.source,
+        ))
+
+    # Dense reconstruction last (after the surface, which shares its depth
+    # stage), because it is the most expensive thing here
+    # and the least load-bearing: every other artifact is already on disk and
+    # complete before it starts. It is skipped rather than truncated on a hard
+    # stop -- the Job Object kills this tree on a 30-second grace and a
+    # half-written dense tree would be worse than none. Its own stages are
+    # checkpointed, so a later `scripts/world_densify.py` resumes rather than
+    # restarting.
+    if args.densify:
+        if stop_request.hard_asked_for():
+            report["dense"] = {
+                "attempted": False,
+                "reason": f"hard stop ({stop_request.source}) during finalization",
+            }
+        elif not (solve_report or {}).get("solved"):
+            report["dense"] = {
+                "attempted": False,
+                "reason": "dense reconstruction needs a global solve; there is none",
+            }
+        else:
+            from tower.world_builder.dense_pipeline import densify  # noqa: PLC0415
+
+            dense_result = densify(
+                store, world_id, session_id,
+                should_stop=stop_request.hard_asked_for,
+            )
+            report["dense"] = {"attempted": True, **dense_result.as_dict()}
 
     if args.format == "json":
         print(json.dumps(report, indent=2))

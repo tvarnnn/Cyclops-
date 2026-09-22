@@ -28,6 +28,7 @@ that produced it, so a stale derived tree is detected rather than trusted.
 import hashlib
 import json
 import os
+import re
 import time
 import logging
 import shutil
@@ -71,6 +72,31 @@ LOCK_FILENAME = "LOCK"
 DERIVED_DIRNAME = "derived"
 DERIVED_MANIFEST = "manifest.json"
 IMAGES_DIRNAME = "images"
+# A re-redacted keyframe set sits beside `images/` and never replaces it
+# (`world_builder/reredaction.py`); the pointer names which one builds read.
+REREDACTED_IMAGES_PREFIX = "images.redacted-"
+REDACTION_SET_FILENAME = "redaction_set.json"
+
+
+@dataclass(frozen=True)
+class KeyframeImageSet:
+    """Which keyframe images a build reads, and the label describing them."""
+
+    directory: Path
+    name: str
+    redaction: str | None          # the label a reader applies its trust rule to
+    stored_redaction: str | None   # what `session.json` records for `images/`
+    digest: str | None             # the set's per-frame digest; None for `images/`
+
+    @property
+    def reredacted(self) -> bool:
+        return self.name != IMAGES_DIRNAME
+
+    @property
+    def cache_token(self) -> str | None:
+        """None for the stored set, so every cache key written before
+        re-redaction existed stays valid; otherwise names the set exactly."""
+        return f"{self.name}@{self.digest}" if self.reredacted else None
 
 
 # How many times `acquire_writer_lock` will lose the exclusive create
@@ -278,7 +304,88 @@ class WorldStore:
         return self.session_dir(world_id, session_id) / EVENTS_FILENAME
 
     def images_dir(self, world_id: str, session_id: str) -> Path:
+        """The keyframes the capture wrote: AUTHORITATIVE, never rewritten.
+
+        Writers (the engine) and the re-redaction step's source read this.
+        A reader that wants the pixels a build may use asks
+        `keyframe_image_set` instead, which honours a re-redaction switch.
+        """
         return self.session_dir(world_id, session_id) / IMAGES_DIRNAME
+
+    def redaction_set_path(self, world_id: str, session_id: str) -> Path:
+        return self.session_dir(world_id, session_id) / REDACTION_SET_FILENAME
+
+    def keyframe_image_set(self, world_id: str, session_id: str) -> KeyframeImageSet:
+        """THE ONE ACCESSOR for which keyframe images a build reads, and the
+        redaction label that describes them.
+
+        Normally that is `images/` under the label `session.json` records. After
+        `scripts/world_reredact.py --apply` it is the re-redacted set beside it
+        (`images.redacted-<slug>/`), named by `redaction_set.json`, under the
+        label that set was written with. The pointer is honoured only while it
+        is whole: it names a directory of that exact shape that exists, and the
+        stored label it was made from is still the one `session.json` records.
+        Anything else reads as "no switch": the authoritative keyframes, whose
+        fill on every label the step accepts contains the set's.
+
+        Contract: WORLD-BUILDER-APPEARANCE.md section 6.5.
+        """
+        try:
+            stored = self.read_session(world_id, session_id).redaction
+        except Exception:  # noqa: BLE001 -- unreadable is untrusted, never an error
+            stored = None
+        stored = stored if isinstance(stored, str) and stored else None
+        default = KeyframeImageSet(
+            directory=self.images_dir(world_id, session_id), name=IMAGES_DIRNAME,
+            redaction=stored, stored_redaction=stored, digest=None)
+        path = self.redaction_set_path(world_id, session_id)
+        if not path.exists():
+            return default
+        try:
+            pointer = _read_json_past_a_replace(path)
+        except ValueError:
+            pointer = None
+        if not isinstance(pointer, dict):
+            logger.warning("world builder: redaction set pointer unreadable at %s; "
+                           "reading the stored keyframes", path)
+            return default
+        active = pointer.get("active")
+        if active is None:
+            return default
+        label = pointer.get("redaction")
+        digest = pointer.get("set_digest")
+        whole = (isinstance(active, str)
+                 and active.startswith(REREDACTED_IMAGES_PREFIX)
+                 and len(active) > len(REREDACTED_IMAGES_PREFIX)
+                 and "/" not in active and "\\" not in active and ".." not in active
+                 and isinstance(label, str) and bool(label)
+                 and isinstance(digest, str) and bool(digest)
+                 and pointer.get("stored_redaction") == stored)
+        directory = self.session_dir(world_id, session_id) / str(active)
+        if not whole or not directory.is_dir():
+            logger.warning(
+                "world builder: redaction set pointer at %s is not usable (active=%r, "
+                "stored label now %r, recorded %r); reading the stored keyframes",
+                path, active, stored, pointer.get("stored_redaction"))
+            return default
+        return KeyframeImageSet(directory=directory, name=active, redaction=label,
+                                stored_redaction=stored, digest=digest)
+
+    def read_redaction_set_pointer(self, world_id: str, session_id: str) -> dict | None:
+        path = self.redaction_set_path(world_id, session_id)
+        if not path.exists():
+            return None
+        try:
+            data = _read_json_past_a_replace(path)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_redaction_set_pointer(self, world_id: str, session_id: str,
+                                    pointer: dict) -> None:
+        """Switch, or switch back, a session's keyframe set: one atomic replace."""
+        with self._lock:
+            write_json_atomic(self.redaction_set_path(world_id, session_id), pointer)
 
     def derived_dir(self, world_id: str) -> Path:
         return self.world_dir(world_id) / DERIVED_DIRNAME
@@ -1155,6 +1262,163 @@ REQUIRED_MANIFEST_KEYS = (
 
 
 def session_has_drawable_geometry(store, world_id, session_id, manifest=None) -> bool:
+    """Would opening this session SHOW the wearer anything?
+
+    Sparse geometry, OR a reconstruction the viewer ladder would actually
+    serve. The second half exists because the render route asked this
+    question BEFORE walking the ladder: a session with a complete surface
+    and an empty sparse tree was refused as "no geometry yet", and the
+    listing put `has_geometry: false` on it, so the picker showed a
+    reconstructed world as empty -- the one outcome the reconstruction
+    campaign was told never to produce.
+
+    Both halves apply the same standard the ladder does to the same files,
+    because two surfaces disagreeing about one session is the failure the
+    sparse half's own docstring describes.
+    """
+    if _sparse_drawable(store, world_id, session_id, manifest):
+        return True
+    return reconstruction_drawable(store, world_id, session_id)
+
+
+def reconstruction_drawable(store, world_id, session_id) -> bool:
+    """True when a surface or dense artifact would render for this session.
+
+    Cheap enough for a listing over a whole world root: the manifest is read
+    and each level file is checked by size, and a surface level by its
+    header, without decoding any geometry. A torn level fails the size check;
+    that is the case that matters, since every artifact write is atomic and
+    a torn file only arises from a copy or a disk fault.
+    """
+    world_dir = store.world_dir(world_id)
+    return (_surface_drawable(world_dir / "surface" / session_id)
+            or _dense_drawable(world_dir / "dense" / session_id))
+
+
+def surface_artifact_drawable(store, world_id, session_id) -> bool:
+    """Whether this session's surface artifact would render. See
+    `reconstruction_drawable`. Not one built from a re-redacted keyframe set
+    the session no longer reads (`built_from_an_inactive_keyframe_set`)."""
+    return (_surface_drawable(store.world_dir(world_id) / "surface" / session_id)
+            and not built_from_an_inactive_keyframe_set(store, world_id, session_id, "surface"))
+
+
+def dense_artifact_drawable(store, world_id, session_id) -> bool:
+    """Whether this session's dense point artifact would render (and was not
+    built from a keyframe set the session no longer reads)."""
+    return (_dense_drawable(store.world_dir(world_id) / "dense" / session_id)
+            and not built_from_an_inactive_keyframe_set(store, world_id, session_id, "dense"))
+
+
+_SET_IN_PARAMS_DIGEST = re.compile(r"\|set:([^|]+)")
+
+
+def built_from_an_inactive_keyframe_set(store, world_id, session_id, kind: str) -> bool:
+    """Whether the `kind` (`surface` or `dense`) artifact's colours came from a
+    re-redacted keyframe set that is not the one the session reads now.
+
+    After `world_reredact.py --revert` the appearance route stops serving the
+    set's imagery at once (its label check names the set), but the surface and
+    dense pages -- vertex colours and point colours from the same pixels -- were
+    still served until someone rebuilt them (review 1, m4). Such an artifact is
+    reported as not drawable, so the ladder, the revision and the listing all
+    step past it until it is rebuilt from the active set.
+
+    Only that direction: an artifact built from the capture's own `images/`
+    (no set recorded) is never stale by this test, because every label a switch
+    accepts fills at least what the set does. An unreadable pointer is treated
+    as "not the same set", the safe answer.
+    """
+    man = _read_manifest_quietly(store.world_dir(world_id) / kind / session_id / "manifest.json")
+    if man is None:
+        return False
+    built = man.get("keyframe_image_set")
+    if not built and kind == "surface":
+        match = _SET_IN_PARAMS_DIGEST.search(str(man.get("params_digest") or ""))
+        built = match.group(1) if match else None
+    if not built:
+        return False
+    try:
+        active = store.keyframe_image_set(world_id, session_id).cache_token
+    except Exception:  # noqa: BLE001 -- unreadable is "not this set"
+        return True
+    return built != active
+
+
+def _read_manifest_quietly(path):
+    try:
+        man = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return man if isinstance(man, dict) else None
+
+
+def _level_files_whole(root, levels, name) -> bool:
+    if not isinstance(levels, list) or not levels:
+        return False
+    for lv in levels:
+        if not isinstance(lv, dict):
+            return False
+        level, size = lv.get("level"), lv.get("bytes")
+        if not isinstance(level, int) or not isinstance(size, int):
+            return False
+        # A level may name its own file (surface builds published as a unit);
+        # it must be a bare name in this directory. Otherwise the legacy name.
+        fname = lv.get("file", name.format(level))
+        if (not isinstance(fname, str) or "/" in fname or "\\" in fname
+                or fname.startswith(".")):
+            return False
+        try:
+            if (root / fname).stat().st_size != size:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _surface_drawable(root) -> bool:
+    from tower.world_builder.surface import (  # noqa: PLC0415
+        _HEADER,
+        MESH_MAGIC,
+        SURFACE_FORMAT,
+        SURFACE_SCHEMA_VERSION,
+    )
+
+    man = _read_manifest_quietly(root / "manifest.json")
+    if (man is None or man.get("format") != SURFACE_FORMAT
+            or man.get("schema_version") != SURFACE_SCHEMA_VERSION):
+        return False
+    faces = man.get("faces")
+    if not isinstance(faces, int) or faces <= 0:
+        return False
+    levels = man.get("levels")
+    if not _level_files_whole(root, levels, "mesh_l{}.bin"):
+        return False
+    try:
+        last = levels[-1]
+        with open(root / last.get("file", f"mesh_l{last['level']}.bin"), "rb") as handle:
+            head = handle.read(_HEADER.size)
+        magic, _nv, n_i, _flags, version, *_box = _HEADER.unpack(head)
+    except (OSError, Exception):  # noqa: BLE001 -- short or foreign header
+        return False
+    return magic == MESH_MAGIC and version == SURFACE_SCHEMA_VERSION and n_i > 0
+
+
+def _dense_drawable(root) -> bool:
+    from tower.world_builder.dense import DENSE_FORMAT  # noqa: PLC0415
+
+    man = _read_manifest_quietly(root / "manifest.json")
+    if man is None or man.get("format") != DENSE_FORMAT:
+        return False
+    levels = man.get("levels")
+    if not isinstance(levels, list) or not any(
+            isinstance(lv, dict) and isinstance(lv.get("points"), int)
+            and lv["points"] > 0 for lv in levels):
+        return False
+    return _level_files_whole(root, levels, "points_l{}.bin")
+
+
+def _sparse_drawable(store, world_id, session_id, manifest=None) -> bool:
     """Would opening this session SHOW the wearer anything?
 
     **Not "do the files exist", which is what two separate copies of this

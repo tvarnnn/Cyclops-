@@ -147,6 +147,16 @@ def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
 
     register = ("--register",) if settings.world_register else ()
     solve = ("--solve",) if settings.world_solve else ()
+    # Dense reconstruction needs the solve: it is anchored to the global
+    # solution's cameras and sparse points, and there is nothing to anchor
+    # to without one. Asking for dense without solve is a configuration
+    # mistake, and passing it anyway would make the builder refuse per
+    # session rather than here, once.
+    densify = ("--densify",) if (settings.world_densify and settings.world_solve) else ()
+    # Same dependency on the solve, for the same reason.
+    surface = ("--surface",) if (settings.world_surface and settings.world_solve) else ()
+    # The appearance is built on the surface, so it needs it.
+    appearance = ("--appearance",) if (surface and settings.world_appearance) else ()
 
     return WorkerSpec(
         argv=(
@@ -168,6 +178,16 @@ def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
             # never the web process, and seconds to minutes of solving the
             # frame path must never see.
             *solve,
+            # And the dense stage, which is minutes of GPU and runs after the
+            # world lock is released. Off unless TOWER_WORLD_DENSIFY says
+            # otherwise; see Settings.world_densify for why the default is off.
+            *densify,
+            # The surface: coarse during the walk, full after Stop. On unless
+            # TOWER_WORLD_SURFACE says otherwise; see Settings.world_surface.
+            *surface,
+            # The appearance, after each surface. On unless
+            # TOWER_WORLD_APPEARANCE says otherwise; see Settings.world_appearance.
+            *appearance,
             # So a producer whose Tower died without closing the manifest
             # stops following instead of polling that directory forever.
             # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and

@@ -65,6 +65,119 @@ def _has_geometry(store: WorldStore, world_id: str, session_id: str, manifest) -
     return session_has_drawable_geometry(store, world_id, session_id, manifest)
 
 
+def _dense_summary(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """What dense reconstruction this session has, or None.
+
+    ADDITIVE, and the contract identifier deliberately does not move. iOS
+    parses these payloads with `JSONSerialization` into `[String: Any]` and
+    reads them key by key, so a key it does not know is a key it never looks
+    at -- but it equality-tests `contract` on the first line of every guard, so
+    bumping that would empty the gallery on every older build. A world with no
+    dense artifact reports `null` and behaves exactly as it does today.
+    """
+    from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+        dense_currency,
+        read_dense_manifest,
+    )
+
+    manifest = read_dense_manifest(store, world_id, session_id)
+    if not manifest:
+        return None
+    levels = manifest.get("levels") or []
+    canonical = manifest.get("canonical_level", 0)
+    mobile = manifest.get("mobile_level", len(levels) - 1)
+    return {
+        "format": manifest.get("format"),
+        "levels": len(levels),
+        "canonical_points": (levels[canonical]["points"]
+                             if canonical < len(levels) else None),
+        "mobile_points": (levels[mobile]["points"] if mobile < len(levels) else None),
+        # Repeated from the manifest rather than re-derived. The dense stage
+        # makes no scale claim the sparse solve did not already make.
+        "scale": manifest.get("scale"),
+        # Whether this cloud was fused against the solve now on disk. False
+        # after a re-solve; None when it cannot be known, which is not the
+        # same thing and must not be shown as staleness. The render page
+        # carries the same fact as a caption; this is so a gallery can mark it
+        # without fetching an 8 MB page.
+        "solve_current": dense_currency(
+            store, world_id, session_id, manifest,
+            include_derived=False).get("solve_current"),
+    }
+
+
+APPEARANCE_IMAGERY_NOTE = (
+    "first-person keyframe imagery of a private space; best-effort face redaction with "
+    "measured false negatives; not anonymised; screens, documents and bodies are not redacted"
+)
+APPEARANCE_RETENTION_NOTE = (
+    "kept with the world under appearance/<session>/ until the session is rebuilt or the "
+    "world is purged; derived from the session keyframes, so it is deleted and rebuilt, "
+    "never edited"
+)
+
+
+def _appearance_summary(store: WorldStore, world_id: str, session_id: str, world) -> dict | None:
+    """The appearance artifact as IMAGERY (WORLD-BUILDER-WORLDS.md §2, privacy
+    lane §3.4; review 1, m6), or None when the session has none.
+
+    Reported whether or not it is served now, because it is on disk either
+    way: `state` says whether the routes serve it (`served`), would once the
+    final build lands (`rebuilding`), or have withdrawn it (`withdrawn`). The
+    label, the effective label, the privacy tags and the retention are the
+    artifact's own record. Never a URL or a path: the page fetches it by the
+    routes of §4b, and only for a session the Tower serves.
+    """
+    from tower.world_builder import appearance_pipeline as AP  # noqa: PLC0415
+    from tower.world_builder import raw_imagery as RAWIMG  # noqa: PLC0415
+
+    manifest = AP.read_appearance_manifest(store, world_id, session_id)
+    if not manifest:
+        return None
+    prov = manifest.get("appearance_provenance") or {}
+    if getattr(world, "images_purged", False):
+        state = AP.WITHDRAWN
+    elif AP.label_matches(store, world_id, session_id, manifest):
+        state = AP.SERVED
+    else:
+        state = AP.withdrawal_state(store, world_id, session_id, manifest)
+    keyframes = manifest.get("keyframes") or []
+    return {
+        "format": manifest.get("format"),
+        "state": state,
+        "quality": manifest.get("quality"),
+        "keyframes": len(keyframes),
+        "keyframes_phone": sum(1 for k in keyframes if k.get("tier") == "phone"),
+        "bytes": sum(AP.named_files(manifest).values()),
+        # §6.6, first and at the top level: the listing must never present a
+        # research build as the product. `imagery` below describes redacted
+        # imagery, so it is replaced outright rather than qualified.
+        "imagery_source": AP.imagery_source_of(manifest),
+        "privacy_safe": AP.imagery_source_of(manifest) == RAWIMG.IMAGERY_REDACTED,
+        "redaction": prov.get("session_redaction"),
+        "redaction_effective": prov.get("redaction_effective"),
+        "label_trusted": prov.get("label_trusted"),
+        "keyframe_image_set": prov.get("keyframe_image_set"),
+        "privacy_tags": list(prov.get("privacy_tags") or []),
+        "retains_raw_imagery": prov.get("retains_raw_imagery"),
+        "imagery": (RAWIMG.RAW_NOTE
+                    if AP.imagery_source_of(manifest) != RAWIMG.IMAGERY_REDACTED
+                    else APPEARANCE_IMAGERY_NOTE),
+        "retention": APPEARANCE_RETENTION_NOTE,
+    }
+
+
+def _appearance_summary_or_none(store: WorldStore, world_id: str, session_id: str, world):
+    """`_appearance_summary`, or None when it cannot be read: a report must
+    never take the session's row (or the listing) down with it."""
+    try:
+        return _appearance_summary(store, world_id, session_id, world)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Tower][WorldBuilder] appearance summary failed for %s/%s",
+                     world_id, session_id, exc_info=True)
+        return None
+
+
 def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> int:
     """How many keyframes the journal holds, whatever the record says.
 
@@ -371,6 +484,12 @@ def build_world_listing(store: WorldStore) -> dict:
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.
                 "finalization": session.finalization,
+                # Additive, and null on every world built before the dense
+                # stage existed: what dense reconstruction this session holds.
+                "dense": _dense_summary(store, world_id, session_id),
+                # Additive (review 1, m6): the appearance artifact, reported as
+                # the imagery it is. Null when the session has none.
+                "appearance": _appearance_summary_or_none(store, world_id, session_id, world),
             })
         # `_sortable` HERE TOO, and its absence here was the whole
         # argument for it thirty lines below.

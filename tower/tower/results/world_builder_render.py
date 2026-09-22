@@ -20,9 +20,15 @@ second at the mobile point budget).
 
 from __future__ import annotations
 
+import json
+import logging
+import re
+from html import escape as html_escape
+
 from tower.results.world_builder_geometry import contained_world_id
 from tower.world_builder.render import (
     DEFAULT_MAX_POINTS,
+    VIEW_DIAGNOSTICS,
     VIEW_PRODUCT,
     render_html,
 )
@@ -30,8 +36,13 @@ from tower.results.world_builder_library import _sortable
 from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
+    built_from_an_inactive_keyframe_set,
+    dense_artifact_drawable,
     session_has_drawable_geometry,
+    surface_artifact_drawable,
 )
+
+logger = logging.getLogger(__name__)
 
 # A phone draws every point on a 2-D canvas on every gesture, so the
 # budget is lower than the operator's 200k default. Fractional-stride
@@ -162,9 +173,440 @@ def resolve_session(store: WorldStore, world_id: str, session_id: str | None) ->
     return candidates[-1][1]
 
 
+class _ViewerModuleMissing(Exception):
+    """Stands in for a viewer's own "unavailable" type when its module did
+    not import at all.
+
+    The rungs below deliberately put the import OUTSIDE the `try` that
+    catches its exception, because binding the exception name inside that
+    `try` meant a broken viewer module left the name unbound and the
+    `except` clause raised `NameError` instead of falling back. Binding it
+    to `None` instead trades that for `TypeError: catching classes that do
+    not inherit from BaseException` -- the same failure with a different
+    word. It has to be bound to a real exception class, and one nothing
+    raises, so the clause is legal and never matches.
+    """
+
+
+REPRESENTATION_AUTO = "auto"
+REPRESENTATION_APPEARANCE = "appearance"
+REPRESENTATION_SPARSE = "sparse"
+REPRESENTATION_DENSE = "dense"
+REPRESENTATION_SURFACE = "surface"
+
+# The fallback ladder, best first. `auto` walks it and serves the first rung
+# this session actually has; a named representation starts the walk at its own
+# rung so "give me dense" never silently serves something better or worse
+# without saying so. The rung that is reached is reported in the page and in
+# the worlds listing, so "what am I looking at" is never a guess.
+#
+# `appearance` (2026-09-17) sits above the surface: the wearer's own redacted
+# keyframes blended over the surface they were prepared against. It is served
+# whenever the appearance routes would serve (the label still matches, the
+# world is not purged, the manifest reads) -- NOT only when the artifact is
+# `current`. During a walk every new surface makes the appearance "built on an
+# earlier surface" for the minute its rebuild takes; demoting the rung for that
+# minute would swap the page down and back up on every solve, resetting the
+# wearer's camera twice. The page says it is behind instead
+# (WORLD-BUILDER-APPEARANCE.md §8: currency is reported, never enforced).
+REPRESENTATION_LADDER = (REPRESENTATION_APPEARANCE, REPRESENTATION_SURFACE,
+                         REPRESENTATION_DENSE, REPRESENTATION_SPARSE)
+
+# What a client says it can draw, `WORLD-BUILDER-WORLDS.md` §4 (`viewer`).
+#
+# `auto` offers the appearance rung ONLY to a client that declares it. The
+# appearance page is not self-contained: it fetches its imagery through the
+# app's `glasses-world:` scheme handler, which an iOS build older than the rung
+# does not have. Such a build loads every page with `loadHTMLString`, sends no
+# `viewer`, and before this gate was served an appearance page that could fetch
+# nothing -- a broken picture where the surface used to be. Without the
+# declaration `auto` starts at the surface, exactly the page that build got
+# before the rung existed.
+#
+# A query parameter rather than a header: the page is fetched natively, but the
+# page's own revision poll goes through the scheme handler, and a parameter in
+# the proxied URL is visible in the handler's whitelist and its tests, where a
+# header would be one more thing to forget to copy. Comma-separated tokens, so
+# a later client can declare more than one; unknown tokens are ignored, never a
+# 422 (a newer app talking to an older Tower still gets a picture).
+VIEWER_APPEARANCE = "appearance-1"
+
+
+def viewer_capabilities(viewer: str | None) -> frozenset:
+    """The capability tokens a `viewer` value declares (empty for `None`)."""
+    if not viewer:
+        return frozenset()
+    return frozenset(token.strip() for token in str(viewer).split(",") if token.strip())
+
+
+def viewer_draws_appearance(viewer: str | None) -> bool:
+    """Whether the client can load the appearance page (§4 `viewer`)."""
+    return VIEWER_APPEARANCE in viewer_capabilities(viewer)
+
+
+# Transports of the appearance page (`appearance_render.TRANSPORTS`), named
+# here so the route has a default without importing the cartridge.
+TRANSPORT_APP = "app"
+TRANSPORT_TOWER = "tower"
+
+
+_REPRESENTATION_META = re.compile(
+    r'<meta name="wb-representation" content="([a-z]+)">')
+
+
+def render_revision(store: WorldStore, world_id: str, session_id: str,
+                    rung: str) -> str | None:
+    """An opaque string that changes exactly when the page for `rung` would.
+
+    The phone keeps a saved-world picture open while the Tower is still
+    building it -- during a walk the live surface is rebuilt each time a global
+    solve lands -- and asks this to learn whether a better picture exists
+    without downloading a multi-megabyte page to find out.
+
+    The sparse rung's revision is a CONSTANT on purpose. The derived tree is
+    rewritten every few keyframes, and a picture that reloaded itself that
+    often would be unusable to look at; what the wearer is waiting for is the
+    step UP the ladder, which does change the revision because the rung is in
+    it.
+
+    `None` for a surface whose manifest cannot be read now, never
+    `"surface:None"`. A bare read racing the `os.replace` of a landing build
+    fails on Windows, and the phone took that string for a new same-rung
+    revision: one needless page download, and when the page's own stamp hit
+    the same race, a swap onto an identical mesh and a second swap back
+    (review 2, iOS m5). The read now survives a replace; what still fails is
+    reported as no surface revision, and the caller answers the next rung.
+    """
+    if rung == REPRESENTATION_APPEARANCE:
+        # The page PROGRAM's revision, and the appearance EPOCH. Appearance
+        # builds are followed by the page itself and are deliberately not in
+        # it (§4a `appearance`) -- but a build that an open page must not
+        # overwrite in place (a relabel, a purge and rebuild, a re-redaction
+        # switch) starts a new epoch, and that does move the page revision. The
+        # page revision used to be a constant, so a page that had dropped its
+        # textures was stamped exactly like the rebuilt one and the app never
+        # replaced it (review 1, B1).
+        appearance = _appearance_revision(store, world_id, session_id)
+        if appearance.get("revision") is None:
+            return None
+        try:
+            from tower.world_builder.appearance_render import PAGE_REVISION  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 -- no page module, no rung
+            return None
+        epoch = appearance.get("epoch")
+        return f"{PAGE_REVISION}@{epoch}" if epoch else PAGE_REVISION
+    if rung == REPRESENTATION_SURFACE:
+        from tower.world_builder.store import _read_json_past_a_replace  # noqa: PLC0415
+
+        path = store.world_dir(world_id) / "surface" / session_id / "manifest.json"
+        if not path.exists():
+            # Every page asks for every rung's revision; a world with no
+            # surface must not pay the replace-retry backoff for it.
+            return None
+        try:
+            manifest = _read_json_past_a_replace(path)
+        except ValueError:
+            manifest = None
+        built = manifest.get("built_at") if isinstance(manifest, dict) else None
+        return None if built is None else f"surface:{built}"
+    if rung == REPRESENTATION_DENSE:
+        path = store.world_dir(world_id) / "dense" / session_id / "manifest.json"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        return f"dense:{stamp}"
+    return REPRESENTATION_SPARSE
+
+
+def _stamp_revision(store: WorldStore, world_id: str, session_id: str,
+                    html: str, revisions: dict | None = None) -> str:
+    """Write the page's own revision into its head, beside its rung.
+
+    So the phone knows which revision it is showing from the page itself, with
+    no second request -- and so no race in which a build lands between
+    fetching a page and asking what revision it was.
+    """
+    match = _REPRESENTATION_META.search(html, 0, 4096)
+    if match is None:
+        return html
+    rung = match.group(1)
+    # `revisions` is read BEFORE the page is composed. Read after, a build
+    # landing between the two stamped an OLD page with the NEW revision, and
+    # the phone -- told it already had the latest -- never fetched the final
+    # surface. Read before, the same race stamps a NEW page with an OLD
+    # revision, which costs the phone one extra fetch and is always safe.
+    revision = (revisions or {}).get(rung)
+    if revision is None:
+        own = render_revision(store, world_id, session_id, rung)
+        if own is None:
+            # No stamp rather than a false one: the phone then records the
+            # revision it polled, which is what it did before pages carried one.
+            return html
+        revision = f"{session_id}/{own}"
+    tag = f'<meta name="wb-revision" content="{html_escape(revision, quote=True)}">'
+    return html[:match.end()] + tag + html[match.end():]
+
+
+def build_render_revision(store: WorldStore, world_id: str,
+                          session_id: str | None, view: str | None = None,
+                          viewer: str | None = None) -> dict:
+    """What `GET /worlds/{id}/render` would serve now, as a revision.
+
+    Walks the same ladder in the same order, but by the artifact checks the
+    Saved Worlds listing uses rather than by composing the page. The two can
+    disagree only when an artifact passes its header check and then fails to
+    parse, and that disagreement costs one extra page fetch, not a loop: the
+    phone records the revision it was told before comparing pages.
+
+    `viewer` gates the appearance rung exactly as it gates `auto` in
+    `build_world_render`: a client that does not declare it is told the rung
+    it would be served, so an old app's follower never chases a page it cannot
+    draw. `appearance` is reported either way (it is additive data).
+    """
+    contained = contained_world_id(store, world_id)
+    if contained is None:
+        raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
+    world_id = contained
+    chosen = resolve_session(store, world_id, session_id)
+    revision = None
+    appearance = _appearance_revision(store, world_id, chosen)
+    if view == VIEW_DIAGNOSTICS:
+        rung = REPRESENTATION_SPARSE
+    elif (viewer_draws_appearance(viewer)
+          and appearance.get("revision") is not None
+          and (revision := render_revision(
+              store, world_id, chosen, REPRESENTATION_APPEARANCE)) is not None):
+        rung = REPRESENTATION_APPEARANCE
+    elif (surface_artifact_drawable(store, world_id, chosen)
+          and (revision := render_revision(
+              store, world_id, chosen, REPRESENTATION_SURFACE)) is not None):
+        # A surface whose manifest cannot be read right now is answered as
+        # absent -- the next rung -- never as `surface:None`.
+        rung = REPRESENTATION_SURFACE
+    elif dense_artifact_drawable(store, world_id, chosen):
+        rung = REPRESENTATION_DENSE
+    else:
+        rung = REPRESENTATION_SPARSE
+    if rung not in (REPRESENTATION_SURFACE, REPRESENTATION_APPEARANCE):
+        revision = render_revision(store, world_id, chosen, rung)
+    return {"session_id": chosen, "representation": rung,
+            # The session is in the revision, so an open picture whose session
+            # the Tower chose notices when the Tower would choose a newer one.
+            "revision": f"{chosen}/{revision}",
+            "live": session_build_running(store, world_id, chosen),
+            # WORLD-BUILDER-APPEARANCE.md §9. Separate from `revision` on
+            # purpose: the page follows appearance builds itself, and folding
+            # them into the page revision would swap the page -- and reset the
+            # wearer's camera -- on every one. `null` exactly when the
+            # appearance route would 404, including a changed redaction label.
+            "appearance": appearance}
+
+
+def _appearance_page(store: WorldStore, world_id: str, session_id: str, revisions: dict,
+                     transport: str, *, pinned: bool) -> str | None:
+    """The appearance page, or None to walk on down the ladder.
+
+    Served exactly when the appearance routes would serve -- the same probe
+    the revision route uses -- so the rung a page declares and the rung §4a
+    reports agree. A pinned `representation=appearance` that cannot be served
+    is a 404, like every other pinned rung.
+    """
+    appearance = _appearance_revision(store, world_id, session_id)
+    if appearance.get("revision") is None:
+        if pinned:
+            raise WorldRenderUnavailable("this session has no appearance that can be served")
+        return None
+    try:
+        from tower.world_builder.appearance_render import (  # noqa: PLC0415
+            AppearanceViewerUnavailable,
+            build_appearance_page,
+        )
+    except Exception:  # noqa: BLE001 -- an appearance module that will not import
+        logger.exception("[Tower][WorldBuilder] the appearance viewer module did not import "
+                         "for %s; falling back", world_id)
+        if pinned:
+            raise WorldRenderUnavailable("the appearance viewer is unavailable") from None
+        return None
+    try:
+        page = build_appearance_page(store, world_id, session_id, transport=transport,
+                                     appearance_revision=appearance["revision"])
+        return _stamp_revision(store, world_id, session_id, page, revisions)
+    except AppearanceViewerUnavailable as exc:
+        if pinned:
+            raise WorldRenderUnavailable(exc.reason) from None
+        logger.error(
+            "[Tower][WorldBuilder] appearance for %s/%s is served by its routes but the "
+            "page could not be composed (%s); serving a lower rung while the revision "
+            "route reports appearance", world_id, session_id, exc.reason)
+    except Exception:  # noqa: BLE001 -- never lose the world to an appearance bug
+        logger.exception("[Tower][WorldBuilder] appearance viewer failed for %s; falling back",
+                         world_id)
+        if pinned:
+            raise WorldRenderUnavailable("the appearance viewer failed") from None
+    return None
+
+
+STRICT_PAGE_POLICY = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+
+
+def render_content_security_policy(html: str, transport: str = TRANSPORT_APP) -> str:
+    """The route's CSP header for a page this module composed.
+
+    Every rung but the appearance page loads nothing from anywhere. The
+    appearance page fetches its imagery -- from the app's private scheme, or in
+    the explicitly named desktop debug transport from the Tower's own origin --
+    and its header states the same policy as its `<meta>`
+    (WORLD-BUILDER-WORLDS.md §4 rule 6).
+    """
+    match = _REPRESENTATION_META.search(html, 0, 4096)
+    if match is not None and match.group(1) == REPRESENTATION_APPEARANCE:
+        try:
+            from tower.world_builder.appearance_render import (  # noqa: PLC0415
+                content_security_policy,
+            )
+
+            return content_security_policy(transport)
+        except Exception:  # noqa: BLE001 -- the strictest policy, then
+            logger.exception("[Tower][WorldBuilder] appearance CSP unavailable")
+    return STRICT_PAGE_POLICY
+
+
+def _appearance_revision(store: WorldStore, world_id: str, session_id: str) -> dict:
+    """The appearance half of the revision, or `unavailable`.
+
+    Surviving an appearance bug is right: the page revision must still answer.
+    Spelling the survival `withdrawn` was not (review 2, m-15). `withdrawn` is
+    the word the Tower uses for a RELABEL or a PURGE, and both consumers act on
+    it as such: the page tells the wearer *"its redaction record changed, or its
+    imagery was removed"*, and the app records a privacy withdrawal. So a
+    traceback in `world_builder_appearance.py` told a wearer their redaction
+    record had changed.
+
+    `unavailable` is the fifth state (`WORLD-BUILDER-APPEARANCE.md` §9). It does
+    everything `withdrawn` does -- the textures go, because nothing re-checked
+    the label and a copy must not outlive that check, and the page keeps polling
+    -- and it says the true thing while doing it. Logged at `exception` rather
+    than `debug`: a bug that reaches here is a bug, and the Tower's own log was
+    the only place it could be seen.
+    """
+    try:
+        from tower.results.world_builder_appearance import (  # noqa: PLC0415
+            appearance_revision,
+        )
+
+        return appearance_revision(store, world_id, session_id)
+    except Exception:  # noqa: BLE001 -- the page revision must survive an appearance bug
+        logger.exception("[Tower][WorldBuilder] appearance revision failed")
+        return {"revision": None, "current": False, "state": "unavailable", "epoch": None}
+
+
+def _stage_running(status_path, is_stale) -> bool:
+    """Whether a surface or dense stage's `status.json` says `running` and the
+    process that wrote it is still that process.
+
+    **A manifest written after the `running` status means the build has
+    published**, and is not live any more even though `ok` has not landed yet.
+    Both stages write the manifest, then prune, then `ok` -- and a revision
+    poll in that gap saw the NEW revision with `live: true`. The phone offered
+    it instead of swapping it in, recorded it as handled, and the `live: false`
+    poll that followed was not new: no auto-swap after Stop (review 3, R5).
+    Every `running` write precedes the manifest of the same build, so "manifest
+    newer than status" can only mean "this build already published". Writing
+    `ok` first instead would claim a result that is not on disk yet if the
+    process dies between the two.
+    """
+    try:
+        status_stat = status_path.stat()
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(status, dict) or status.get("state") != "running":
+        return False
+    try:
+        manifest_mtime = (status_path.parent / "manifest.json").stat().st_mtime_ns
+    except OSError:
+        manifest_mtime = None
+    if manifest_mtime is not None and manifest_mtime > status_stat.st_mtime_ns:
+        return False
+    try:
+        return not is_stale(status)
+    except Exception:  # noqa: BLE001 -- a liveness probe must not 500 the route
+        return False
+
+
+def session_build_running(store: WorldStore, world_id: str, session_id: str) -> bool:
+    """Whether something is building THIS session right now, so its revision
+    may still change.
+
+    Three facts, any one of which is enough:
+
+    1. The world's writer lock is held by a live builder (the listing's `live`,
+       same probe) AND this session is the one it is writing: its record is
+       still open, or its finalization is still `pending`. The lock is per
+       world, so an older, finished session of a world being walked again is
+       not live.
+    2. The surface stage's `status.json` for this session says `running` and
+       its process is alive.
+    3. The same for the dense stage.
+
+    **Not a promise that nothing will change when it is false.** The builder
+    releases the world lock at the end of finalization and only THEN starts
+    the final surface and dense stages (`scripts/world_build_session.py`), so
+    there is a gap of up to a registration's length in which this answers
+    `false` and a better picture is still coming. A client must therefore
+    slow down on `false`, not stop -- `WORLD-BUILDER-WORLDS.md` §4a rule 6.
+    Never raises: a probe that cannot read something answers `false`, which
+    costs a client latency, never a 500.
+    """
+    try:
+        from tower.results.world_builder_library import _world_is_live  # noqa: PLC0415
+        from tower.world_builder.records import FINALIZATION_PENDING  # noqa: PLC0415
+
+        if _world_is_live(store, world_id):
+            session = store.read_session(world_id, session_id)
+            finalization = session.finalization or {}
+            if session.ended_at is None or finalization.get("state") == FINALIZATION_PENDING:
+                return True
+    except Exception:  # noqa: BLE001 -- see the docstring
+        logger.debug("[Tower][WorldBuilder] world lock probe failed for %s", world_id,
+                     exc_info=True)
+    world_dir = store.world_dir(world_id)
+    try:
+        from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+            status_is_stale as surface_status_is_stale,
+        )
+
+        if _stage_running(world_dir / "surface" / session_id / "status.json",
+                          surface_status_is_stale):
+            return True
+        # The appearance stage runs after the surface in the same child and
+        # writes the same kind of status; while it runs, a better picture is
+        # still coming.
+        if _stage_running(world_dir / "appearance" / session_id / "status.json",
+                          surface_status_is_stale):
+            return True
+    except Exception:  # noqa: BLE001 -- a surface module that will not import
+        logger.debug("[Tower][WorldBuilder] surface liveness probe failed", exc_info=True)
+    try:
+        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+            status_is_stale as dense_status_is_stale,
+        )
+
+        if _stage_running(world_dir / "dense" / session_id / "status.json",
+                          dense_status_is_stale):
+            return True
+    except Exception:  # noqa: BLE001 -- a dense module that will not import
+        logger.debug("[Tower][WorldBuilder] dense liveness probe failed", exc_info=True)
+    return False
+
+
 def build_world_render(store: WorldStore, world_id: str, session_id: str | None, *,
                        max_points: int | None = None,
-                       view: str | None = None) -> str:
+                       view: str | None = None,
+                       representation: str = REPRESENTATION_AUTO,
+                       transport: str = TRANSPORT_APP,
+                       viewer: str | None = None) -> str:
     """The viewer page for one session of one world, or
     `WorldRenderUnavailable` naming what is missing.
 
@@ -173,16 +615,169 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
     a separator Starlette's route pattern does not exclude, and every
     store path below is joined from this id. An id that escapes the root
     is "no world", and the id is answered under its canonical spelling.
+
+    `viewer` is what the client declared it can draw (`viewer_draws_appearance`).
+    `auto` starts at the appearance rung only for a client that declared it,
+    and at the surface otherwise; a PINNED `representation=appearance` is served
+    regardless, because a caller that names the rung is asking for that page.
     """
     contained = contained_world_id(store, world_id)
     if contained is None:
         raise WorldRenderUnavailable(f"no world {_clip(world_id)!r}")
     world_id = contained
     chosen = resolve_session(store, world_id, session_id)
+    # Walk the ladder from the requested rung down. A session that has a
+    # surface gets the surface, because that is the whole point of having
+    # built one; one that has only points gets points; every world built
+    # before either stage existed falls through to the sparse page unchanged.
+    revisions = {}
+    for rung in REPRESENTATION_LADDER:
+        own = render_revision(store, world_id, chosen, rung)
+        if own is not None:
+            revisions[rung] = f"{chosen}/{own}"
+    wanted = (representation if representation in REPRESENTATION_LADDER
+              else REPRESENTATION_APPEARANCE if viewer_draws_appearance(viewer)
+              else REPRESENTATION_SURFACE)
+    # The solver's diagnostic view IS the sparse page -- only it has the
+    # diagnostic rendering -- so asking for it with no representation pinned
+    # starts the ladder at sparse. Starting at the surface served the surface
+    # for "open the solver's view", and the app's text describing a
+    # diagnostics rendering was false.
+    if view == VIEW_DIAGNOSTICS and representation == REPRESENTATION_AUTO:
+        wanted = REPRESENTATION_SPARSE
+    start = REPRESENTATION_LADDER.index(wanted)
+
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_APPEARANCE):
+        page = _appearance_page(store, world_id, chosen, revisions, transport,
+                                pinned=representation == REPRESENTATION_APPEARANCE)
+        if page is not None:
+            return page
+
+    # A surface or dense artifact whose colours came from a re-redacted keyframe
+    # set the session no longer reads (a `--revert`) is not served until it is
+    # rebuilt; the ladder steps past it, as the revision route does
+    # (`store.built_from_an_inactive_keyframe_set`, review 1 m4).
+    stale = {rung: built_from_an_inactive_keyframe_set(store, world_id, chosen, rung)
+             for rung in (REPRESENTATION_SURFACE, REPRESENTATION_DENSE)}
+    if representation in stale and stale[representation]:
+        raise WorldRenderUnavailable(
+            f"this session's {representation} was built from a re-redacted keyframe set it "
+            "no longer reads; it is served again once rebuilt")
+
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_SURFACE) and not stale[REPRESENTATION_SURFACE]:
+        # Same shape as the dense rung below, and for the same reason: the
+        # import sits OUTSIDE the try that catches its exception, so a
+        # surface module that will not import degrades to the next rung
+        # instead of raising a NameError out of the except clause.
+        try:
+            from tower.world_builder.surface_render import (  # noqa: PLC0415
+                SurfaceViewerUnavailable,
+                build_surface_page,
+            )
+        except Exception:  # noqa: BLE001 -- a surface module that will not import
+            logger.exception(
+                "[Tower][WorldBuilder] the surface viewer module did not import "
+                "for %s; falling back", world_id,
+            )
+            SurfaceViewerUnavailable = _ViewerModuleMissing  # noqa: N806
+            build_surface_page = None
+        try:
+            if build_surface_page is None:
+                raise RuntimeError("surface viewer unavailable")
+            page = build_surface_page(store, world_id, chosen, max_points=max_points)
+            return _stamp_revision(store, world_id, chosen, page, revisions)
+        except SurfaceViewerUnavailable as exc:
+            if representation == REPRESENTATION_SURFACE:
+                raise WorldRenderUnavailable(exc.reason) from None
+            if surface_artifact_drawable(store, world_id, chosen):
+                # The revision route (§4a) decides the rung by this same
+                # header check, so it is now telling the phone "surface"
+                # about a page stamped with a lower rung. The phone pays one
+                # fetch per rebuild for that, not a loop, but the operator
+                # must hear about an artifact that passes its check and still
+                # cannot be drawn.
+                logger.error(
+                    "[Tower][WorldBuilder] surface artifact for %s/%s passes its "
+                    "header check but the page could not be built (%s); serving a "
+                    "lower rung while the revision route reports surface",
+                    world_id, chosen, exc.reason,
+                )
+        except Exception:  # noqa: BLE001 -- never lose the world to a surface bug
+            logger.exception(
+                "[Tower][WorldBuilder] surface viewer failed for %s; falling back",
+                world_id,
+            )
+
+    # Gated on where the walk STARTED, not on the representation asked for:
+    # `view=diagnostics` arrives as `auto` and starts at sparse, and gating on
+    # `representation != sparse` served it the dense page whenever a dense
+    # artifact existed -- while the revision route said sparse (review 3, R3).
+    if start <= REPRESENTATION_LADDER.index(REPRESENTATION_DENSE) and not stale[REPRESENTATION_DENSE]:
+        # THE IMPORT IS OUTSIDE THE try THAT CATCHES ITS EXCEPTION.
+        #
+        # `DenseViewerUnavailable` used to be bound by an import inside the
+        # same `try` whose first `except` names it. If that import raised --
+        # the one class of bug the fallback below exists for, a broken dense
+        # module -- Python evaluated the first except clause, hit a NameError
+        # on the unbound name, and propagated THAT. Later clauses of the same
+        # try are not tried, so the "never lose the sparse page to a dense bug"
+        # fallback never ran and the route returned 500.
+        try:
+            from tower.world_builder.dense import (  # noqa: PLC0415
+                POINT_STRIDE_BYTES,
+            )
+            from tower.world_builder.dense_render import (  # noqa: PLC0415
+                MOBILE_BYTE_BUDGET,
+                DenseViewerUnavailable,
+                build_dense_page,
+            )
+        except Exception:  # noqa: BLE001 -- a dense module that will not import
+            logger.exception(
+                "[Tower][WorldBuilder] the dense viewer module did not import "
+                "for %s; serving sparse", world_id,
+            )
+            DenseViewerUnavailable = _ViewerModuleMissing  # noqa: N806
+            build_dense_page = None
+
+        try:
+            if build_dense_page is None:
+                raise RuntimeError("dense viewer unavailable")
+
+            # `max_points` is validated by the route and must not then be
+            # ignored: the worlds contract calls it "point budget", and a
+            # client that asks for fewer points has to get fewer. It was
+            # dropped on this path, so `max_points=1` returned 295,000 points
+            # and a 6 MB page. Converted to the byte budget this viewer speaks,
+            # and only ever downwards -- the phone default stays the default.
+            budget = MOBILE_BYTE_BUDGET
+            if max_points is not None:
+                budget = min(budget, max(1, int(max_points)) * POINT_STRIDE_BYTES)
+            return _stamp_revision(store, world_id, chosen,
+                                   build_dense_page(store, world_id, chosen,
+                                                    budget_bytes=budget),
+                                   revisions)
+        except DenseViewerUnavailable as exc:
+            if representation == REPRESENTATION_DENSE:
+                raise WorldRenderUnavailable(exc.reason) from None
+            if dense_artifact_drawable(store, world_id, chosen):
+                # Same disagreement as the surface rung above, one rung down.
+                logger.error(
+                    "[Tower][WorldBuilder] dense artifact for %s/%s passes its "
+                    "header check but the page could not be built (%s); serving "
+                    "sparse while the revision route reports dense",
+                    world_id, chosen, exc.reason,
+                )
+        except Exception:  # noqa: BLE001 -- never lose the sparse page to a dense bug
+            logger.exception(
+                "[Tower][WorldBuilder] dense viewer failed for %s; serving sparse",
+                world_id,
+            )
+
     budget = MOBILE_MAX_POINTS if max_points is None else min(max_points, MAX_POINTS_CEILING)
     try:
-        return render_html(store, world_id, chosen, max_points=budget,
+        page = render_html(store, world_id, chosen, max_points=budget,
                            view=view or VIEW_PRODUCT)
+        return _stamp_revision(store, world_id, chosen, page, revisions)
     except FileNotFoundError:
         # Raced a `clear_derived` between the existence check and the read.
         # Worded here rather than from the exception: the phone shows the
