@@ -258,7 +258,8 @@ enforced).
   a pixel) and the surface layer with its mip levels, its depth texture and the
   blurred coverage (`gpu.layers`, about 10.3 bytes a pixel: 6.5 MB at 900×700,
   13.6 MB for a 390×844 portrait at the capped device pixel ratio 2). The
-  opening's and Overview's 64-px renders keep one more small set.
+  The opening's 64-px renders and the Best view's 128-px ones keep one more
+  small set.
   Without ASTC the WebP chunks are decoded to RGBA8, **capped at 48 layers**
   (42 MB colour) and the caption says the set is reduced.
 - **Navigation** (revised 2026-09-17, fix-it nav lane; **revised again
@@ -659,6 +660,55 @@ enforced).
     button is still not an overview** and the About text still says so: the
     re-sweep buys a frame that is not wrecked, not a view of the room.
     (`fixit\orient\ORIENT.md` §4, `fig\sheet_ov_candidates.png`.)
+
+    **The destination is stable, and it is judged on how torn the frame is**
+    (2026-09-21, fix-it bestview lane; `fixit\bestview\BESTVIEW.md`).
+
+    - *Stable.* Forty cold boots — twenty of each of two builds — chose one
+      destination each, and the whole twelve-row candidate table came back
+      identical to the last decimal in all forty, under two and three headless
+      browsers at once. The chooser is not random and the field is not raced.
+      What it was sensitive to was **the camera the reader left behind**:
+      `navView()` returns the verification override's field of view whenever
+      one is set, so a press after `setView(…fovYDeg 70)` filtered the field
+      through a frame the page never draws — 97 candidates against a fresh
+      page's 126 on one build, 111 against 138 on the other — and landed
+      somewhere else, and the orbit hook's 54° gave a third place again. Two
+      lanes measured the same two builds and disagreed about where Best view
+      goes for exactly that reason. `findOverview` now clears the override
+      **before** it takes its view and restores it at every exit, so the
+      destination is a function of the field, the walk, the opening and the
+      canvas and of nothing the reader did first; and the ranking has an
+      explicit tie-break (score, then yaw, then position) so an exact tie does
+      not depend on the order the lattice was walked in. Measured after: the
+      same destination from a fresh page, after a walk step, after `setView`,
+      after `orbitView` and on a second press, on both builds. Portrait still
+      differs from landscape, which is by design — the frame is a different
+      shape, so the best frame is a different frame.
+    - *Judged on how torn it is.* The confidence term catches a candidate
+      whose geometry the fade eats; it did not catch the one the owner would
+      have seen, whose `faded` is 0.40% — cleaner than half the shortlist —
+      and which carries a stair-stepped black shape and a column of bright
+      cream fragments down its right quarter. One more factor,
+      `cleanTerm(torn) = 0.45 + 0.55 × (1 − min(1, torn / 0.02))`, where
+      `torn` is the length of the boundary between what is drawn and what is
+      not, per frame pixel, measured on the candidate's own probe render with
+      no extra pass. `drawn` cannot tell one clean black rectangle from a
+      thousand slivers of the same area; this can. Over both builds' twelve
+      candidates the measure splits them the way looking at them does —
+      0.0022–0.0088 for the frames with nothing shredded in them, 0.0107–0.0231
+      for the torn ones — and every reference from 0.010 to 0.030 at every
+      floor from 0.15 to 0.45 picks the same candidate on both builds, by
+      8–42%. The shortlist's probe rises from **64 px to 128 px**, because at
+      64 a torn edge and a straight one are the same handful of pixels; the
+      press costs 993 → 1833 ms and 1153 → 1675 ms on SwiftShader.
+      **`speck` is measured, reported and deliberately not scored**: it is the
+      campaign's speckle rule with a box mean for the median, and at the probe
+      size it does not reproduce what it stands for — the fragments in that
+      column are one pixel wide at 900×700 and gone at 128 — so penalising it
+      picks a frame that measures cleaner and looks worse. Blotch is not
+      scored either: on this world it counts the dark desk, and the cleanest
+      frame in the shortlist has the highest blotch of all.
   - **Prev/next skip poses that render badly, and poses with nothing in them**:
     once the field is built every recorded pose is rendered in the background at
     the opening's 64-px size, and ←/→ step to the next pose whose drawn fraction

@@ -276,7 +276,17 @@ class TestThePage:
         from tower.world_builder.appearance_render import build_appearance_page
 
         html = build_appearance_page(built.store, WORLD, SESSION)
-        assert len(html.encode("utf-8")) < 256 * 1024, "a shell, not a data page"
+        # A SHELL, NOT A DATA PAGE. The cap is on the program, and the program
+        # is source and comments: the imagery is ~13 MB of blocks the page
+        # fetches, so anything that carried it would be off this scale
+        # entirely (the assertions below are what actually check that). 256 KB
+        # held from the first page until 2026-09-21, when the fix-it bestview
+        # lane added the Best view's clean term, the opening's surround term,
+        # the standoff's drift, the saved camera and the status-bar fix and
+        # went 14 KB over. Raised to 288 KB rather than paid for by deleting
+        # the reasoning: on the wire it is gzip, where the whole page is 92 KB
+        # against the 85 KB it was, and one texture chunk is 1.4 MB.
+        assert len(html.encode("utf-8")) < 288 * 1024, "a shell, not a data page"
         assert "WBAPCK" not in html.split("<script>")[0]
         manifest = built.manifest()
         for chunk in manifest["chunks"]:
@@ -1224,7 +1234,10 @@ class TestTheCapturesOwnLook:
         # looking at a black canvas for the two seconds it takes
         fin = _section(text, "async function finishOpening(", "/* -------- start ---")
         assert "opening = await chooseOpening(i => {" in fin
-        assert "shownIndex = i; ci = i; setPose(poseOf(i)); showFirst();" in fin
+        # `restored ||` since the bestview lane: a reload of this tab puts the
+        # camera back where it was, and the provisional is what it falls back
+        # to when there is nothing stored (VISUAL-REVIEW-4 #7).
+        assert "shownIndex = i; ci = i; setPose(restored || poseOf(i)); showFirst();" in fin
         assert "uShow" in _section(text, "const FS_COMPOSITE", "}`;")
 
 
@@ -1909,7 +1922,9 @@ class TestTheBestViewWasReSweptAgainstTheWiderTube:
 
     def test_the_score_will_not_recommend_geometry_the_fade_eats(self):
         over = _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
-        assert "* soundTerm(r.faded);" in over
+        # the bestview lane put `* cleanTerm(r.torn)` after it, so the
+        # confidence term is no longer the last factor on the line
+        assert "* soundTerm(r.faded)\n" in over
         assert "OVERVIEW_FADED_REF" in over and "OVERVIEW_SOUND_FLOOR" in over
         # the term itself, run: bounded, monotone, and flat once a frame is wrecked
         src = over[over.index("const OVERVIEW_FADED_REF"):over.index("function findOverview")]
@@ -2113,7 +2128,7 @@ class TestBootingWithNothingPlaced:
         poll = _section(text, "async function pollOnce(", "async function follow(")
         assert "if (shownAt === null) await finishOpening();" in poll
         opening = _section(text, "async function finishOpening(", "/* -------- start ---")
-        for step in ("opening = await chooseOpening(", "setPose(poseOf(ci));",
+        for step in ("opening = await chooseOpening(", "setPose(restored || poseOf(ci));",
                      'S.phase = "ready";', "startNav();"):
             assert step in opening, step
 
@@ -2438,13 +2453,19 @@ class TestTheHazeAndWhatTheFadeIsFor:
         text = _template()
         shade = _section(text, "const GLSL_SHADE", "const FS_BLEND")
         assert "const vec3 HAZE_RGB = vec3(0.160, 0.168, 0.190);" in shade
-        assert "vec3 haze(){ return HAZE_RGB; }" in shade
         # brighter than the brightest point of the background it sits on
         bg = _section(text, "const GLSL_BACKGROUND", "`;")
         assert "vec3(0.078, 0.084, 0.094)" in bg
         assert min(0.160, 0.168, 0.190) > max(0.078, 0.084, 0.094)
-        # flat: one constant, no texture fetch, no screen-space term
-        assert "gl_FragCoord" not in shade.split("const vec3 HAZE_RGB")[1].split("}")[0]
+        # NOT flat any more, and this is the whole of what changed: one
+        # constant plus a deterministic screen-space hash of +/- 2 of 255,
+        # because flat read as "a UI panel that failed to paint"
+        # (VISUAL-REVIEW-4 #5). No texture fetch, no hue, zero mean, and
+        # bounded: the amplitude is written down here as well as there.
+        h = _section(shade, "float hazeHash(", "/* THE CONFIDENCE FADE")
+        assert "fract(sin(dot(v" in h and "texture" not in h
+        assert "return HAZE_RGB + vec3(n * (2.0 / 255.0));" in h
+        assert "- 0.5" in h, "zero mean"
 
     def test_no_measurement_and_no_score_can_see_the_haze(self):
         """The opening and the Best view are scored on the drawn fraction, the
@@ -2477,3 +2498,167 @@ class TestTheHazeAndWhatTheFadeIsFor:
         text = _template()
         assert "haze: Math.max(0, Math.min(1, +(Q.get(\"haze\") ?? CONFIG.unseen_haze ?? 0.9)))" in text
         assert 0 < UNSEEN_HAZE <= 1
+
+
+# ---------------------------------------------------------------------------
+# fix-it bestview lane: the button lands in the same place twice, and the
+# place it lands is chosen against the campaign's own measures
+# ---------------------------------------------------------------------------
+
+
+class TestTheBestViewLandsInTheSamePlaceEveryTime:
+    """Twenty cold boots of the candidate build and twenty of the baseline
+    each chose ONE destination, and the whole twelve-row candidate table came
+    back identical to the last decimal in all forty (BESTVIEW.md §3): the
+    chooser is not random. What it was sensitive to is the camera the reader
+    left behind. `navView()` reports the VERIFICATION OVERRIDE's field of
+    view whenever one is set, so a press after a `setView` at 70 degrees
+    filtered the field through a frame the page never draws -- 97 candidates
+    against a fresh page's 126 -- and landed somewhere else. That is why two
+    lanes measured the same two builds and disagreed about where Best view
+    goes (RIMS.md's table against CANDIDATE.md §8 #1)."""
+
+    def _over(self):
+        return _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
+
+    @staticmethod
+    def _code_only(text):
+        """The section with its comments taken out: this lane's comments name
+        `navView()` several times and the order that matters is the code's."""
+        import re as _re
+        text = _re.sub(r"/\*.*?\*/", "", text, flags=_re.S)
+        return _re.sub(r"(?m)^\s*//.*$", "", text)
+
+    def test_the_chooser_clears_the_override_before_it_takes_its_view(self):
+        body = self._code_only(self._over())
+        body = body[body.index("function findOverview(){"):]
+        assert body.index("override = null;") < body.index("navView()"), \
+            "the candidate filter's field of view must be the page's own, not a setView's"
+        assert body.count("navView()") == 1, "one view, taken once, with the override gone"
+        # and it is put back on every way out, including the empty shortlist
+        assert "const restore = () => { cam = save; override = saveOverride; };" in body
+        assert "if (!top.length){ restore(); return null; }" in body
+        assert body.count("restore();") >= 2
+
+    def test_the_ranking_is_a_total_order_that_does_not_depend_on_input_order(self):
+        over = self._over()
+        src = over[over.index("function betterView"):over.index("function findOverview")]
+        _run_plain(src + r"""
+const A = {rendered: 0.8, yaw: 0.5, p: [0, 0, 0]};
+const B = {rendered: 0.7, yaw: 0.1, p: [1, 1, 1]};
+assert.ok(betterView(A, B) && !betterView(B, A), "a higher score wins, and only one way round");
+assert.ok(betterView(A, null), "anything beats nothing");
+assert.ok(!betterView(null, A) && !betterView(null, null));
+assert.ok(!betterView(A, A), "and nothing beats itself");
+// an exact tie is broken by the candidate's OWN numbers, not by where it sat
+const T1 = {rendered: 0.5, yaw: 0.1, p: [0, 0, 0]};
+const T2 = {rendered: 0.5, yaw: 0.2, p: [0, 0, 0]};
+const T3 = {rendered: 0.5, yaw: 0.2, p: [0, 0, 1]};
+assert.ok(betterView(T1, T2) && !betterView(T2, T1), "ties break on yaw");
+assert.ok(betterView(T2, T3) && !betterView(T3, T2), "then on position");
+// the same set in any order picks the same winner
+const set = [A, B, T1, T2, T3, {rendered: 0.9, yaw: 0.3, p: [2, 0, 0]}];
+const winnerOf = list => { let best = null; for (const f of list) if (betterView(f, best)) best = f; return best; };
+const first = winnerOf(set);
+for (let s = 1; s <= 200; s++){
+  const shuffled = set.slice();
+  for (let i = shuffled.length - 1; i > 0; i--){
+    const j = (s * 7919 + i * 104729) % (i + 1);
+    const t = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = t;
+  }
+  assert.strictEqual(winnerOf(shuffled), first, "shuffle " + s);
+}
+""")
+
+    def test_the_press_reports_what_it_chose_and_what_it_chose_it_over(self):
+        over = self._over()
+        for key in ("chosenIndex:", "runnerUpIndex:", "runnerUpPose:", "margin:", "probe:"):
+            assert key in over, key
+
+
+class TestTheBestViewAvoidsAFrameThatIsTornToPieces:
+    """The confidence term catches a candidate whose geometry the fade eats.
+    It did not catch the frame the owner would have seen: `faded` 0.40%,
+    98.8% drawn, detail above the reference, the widest depth range in the
+    set -- and a stair-stepped black shape with a column of bright cream
+    fragments down its right quarter. What separates it is how BROKEN UP the
+    missing part is, which is what `torn` measures (BESTVIEW.md §4)."""
+
+    def _over(self):
+        return _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
+
+    def test_the_term_is_bounded_monotone_and_saturates(self):
+        over = self._over()
+        src = over[over.index("const OVERVIEW_TORN_REF"):over.index("function betterView")]
+        _run_plain(src + r"""
+assert.strictEqual(cleanTerm(0), 1, "a frame with no torn edge at all pays nothing");
+assert.strictEqual(cleanTerm(undefined), 1, "and neither does one that was not measured");
+assert.ok(Math.abs(cleanTerm(OVERVIEW_TORN_REF) - OVERVIEW_CLEAN_FLOOR) < 1e-12);
+assert.ok(Math.abs(cleanTerm(1) - OVERVIEW_CLEAN_FLOOR) < 1e-12, "and it saturates, never below");
+let prev = 2;
+for (let t = 0; t <= 0.1; t += 0.0005){
+  const c = cleanTerm(t);
+  assert.ok(c <= prev + 1e-12 && c >= OVERVIEW_CLEAN_FLOOR - 1e-12, "t " + t);
+  prev = c;
+}
+""")
+
+    def test_the_term_is_in_the_score_and_the_speckle_proxy_is_not(self):
+        over = self._over()
+        assert "* cleanTerm(r.torn);" in over, "the clean term multiplies the rendered score"
+        assert "cleanTerm(f.torn)" in over, "and the same number is reported"
+        # `speck` is measured and reported beside it, and deliberately unscored:
+        # at the probe size it does not reproduce the campaign's speckle, and
+        # penalising it picks a frame that measures cleaner and looks worse.
+        assert "speck: +(f.speck || 0).toFixed(5)" in over
+        assert "cleanTerm(r.torn," not in over and "cleanTerm(f.speck" not in over
+        # the statistics come out of the render the score already pays for
+        clean = _section(_template(), "HOW UGLY the frame is",
+                         "    // How much of what this view draws")
+        assert "if (wantClean){" in clean and "drawBlend(" not in clean
+
+    def test_on_the_measured_candidates_it_moves_the_destination_off_the_speckle(self):
+        """The decisive rows of the twelve-candidate tables this lane measured
+        on both builds at the shipping probe (BESTVIEW.md §4.4). On the
+        candidate build c11 is the frame with the cream-speckle column --
+        0.70% black and 0.330% speckle at 900x700, the worst speckle in the
+        set -- and c05 is the frame that measures best on black, seam and
+        detail. The old score prefers c11; with the clean term c05 wins. On
+        the baseline the same rule leaves the destination exactly where it
+        already was, which is the point: the term is aimed at the regression
+        and at nothing else."""
+        over = self._over()
+        src = over[over.index("const OVERVIEW_TORN_REF"):over.index("function betterView")]
+        _run_plain(src + r"""
+const ref = 4.121, DETAIL_REF = 0.12, FADED_REF = 0.05, SOUND_FLOOR = 0.45;
+const dterm = d => Math.max(0, Math.min(1, d / DETAIL_REF));
+const sound = f => SOUND_FLOOR + (1 - SOUND_FLOOR) * (1 - Math.min(1, f / FADED_REF));
+const base = t => t.drawn * (0.4 + 0.6 * Math.min(1, t.distance / (1.5 * ref)))
+  * (0.5 + 0.5 * Math.max(0, t.toward)) * (0.15 + 0.85 * dterm(t.detail))
+  * (0.5 + 0.5 * Math.min(1, t.range / ref)) * sound(t.faded);
+// candidate build, at the shipping probe (`stats\shots_st_cand_128.json`)
+const c11 = {drawn: 0.989, detail: 0.1059, range: 8.24, toward: 0.858, distance: 10.858,
+             faded: 0.0040, torn: 0.02047};   // the cream-speckle column
+const c05 = {drawn: 0.997, detail: 0.1136, range: 3.14, toward: 0.793, distance: 5.161,
+             faded: 0.0039, torn: 0.00344};   // 0.01% black, seam 3.82, the most detail
+const c00 = {drawn: 0.997, detail: 0.0975, range: 3.18, toward: 0.775, distance: 7.974,
+             faded: 0.0012, torn: 0.00766};   // the runner-up once the term is in
+assert.ok(base(c11) > base(c05), "the old score prefers the frame with the speckle column");
+assert.ok(base(c05) * cleanTerm(c05.torn) > base(c11) * cleanTerm(c11.torn),
+          "and the clean term puts it back");
+assert.ok(base(c05) * cleanTerm(c05.torn) > base(c00) * cleanTerm(c00.torn),
+          "over the runner-up too, and by a margin worth stating");
+assert.ok(base(c05) * cleanTerm(c05.torn) / (base(c00) * cleanTerm(c00.torn)) > 1.10,
+          "at least ten per cent, not a coin flip");
+// baseline build, same probe: the destination does not move
+const b05 = {drawn: 0.997, detail: 0.1126, range: 3.90, toward: 0.810, distance: 5.875,
+             faded: 0.0047, torn: 0.00578};
+const b01 = {drawn: 0.997, detail: 0.1135, range: 2.86, toward: 0.861, distance: 8.013,
+             faded: 0.0027, torn: 0.00867};
+const b02 = {drawn: 0.985, detail: 0.1030, range: 4.88, toward: 0.887, distance: 10.875,
+             faded: 0.0122, torn: 0.01961};
+assert.ok(base(b05) > base(b01) && base(b05) > base(b02), "it already won on the baseline");
+for (const other of [b01, b02])
+  assert.ok(base(b05) * cleanTerm(b05.torn) > base(other) * cleanTerm(other.torn),
+            "and it still does");
+""")
