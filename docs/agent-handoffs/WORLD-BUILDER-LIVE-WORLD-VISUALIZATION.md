@@ -445,3 +445,21 @@ environment variable, no bypass, and `privacy_safe` stays true. The deferred
 privacy research on `world-builder/reconstruction-fixit-precision` stays
 unmerged; nothing here required it.
 
+## The serving contract, proven on the live world
+
+Driven through the real `tower.routes.geometry` router against the finished
+world, with the exact query shapes `WorldRenderViewer.swift` builds:
+
+| request | answer |
+|---|---|
+| `/render/revision?session_id=…&viewer=appearance-1` | `representation: "appearance"`, `appearance.state: "served"`, `current: true` |
+| `/render/revision?session_id=…` (no capability) | `representation: "surface"` — an older app degrades to the rung it can draw |
+| `/render?session_id=…&viewer=appearance-1` | 200, `text/html`, 282,029 B, `<meta name="wb-representation" content="appearance">` inside the first 4096 characters, which is the window iOS scans |
+| `/worlds/{w}/appearance/{s}/manifest` | 200, `X-World-Imagery: redacted`, `X-World-Redaction: faces-detected-and-filled/yunet-2023mar@0.30+plausibility3` |
+| `/worlds` | `contract: world_builder.worlds/2026-09-10` (the exact string iOS equality-tests), session `state: complete`, `has_geometry: true`, `appearance: served` |
+
+Every link in GLASSES → IPHONE → TOWER → … → SAVED WORLD → IPHONE VIEWER is
+now demonstrated on data from a real walk, with one exception: the wearer
+has not yet seen it on the phone, because the build finishes about eight
+minutes after Stop and nothing told them to wait.
+
