@@ -192,6 +192,18 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
+        "--appearance",
+        action="store_true",
+        help=(
+            "build the appearance on each surface as the builder does "
+            "(passes world_build_session.py --appearance): the walk's own "
+            "redacted keyframes, blended over the surface. Needs --surface, "
+            "for the same reason tower/main.py gates it on the surface. "
+            "Without this flag a replay cannot exercise the top rung at "
+            "all, which is why it exists."
+        ),
+    )
+    parser.add_argument(
         "--densify",
         action="store_true",
         help=(
@@ -250,6 +262,13 @@ def main(argv=None) -> int:
                          "poses the global solve places, and there is nothing "
                          "trustworthy to fuse without one")
         argv_build.append("--surface")
+    if args.appearance:
+        if not args.surface:
+            parser.error("--appearance needs --surface: the appearance is the "
+                         "walk's own keyframes blended over the surface they "
+                         "were prepared against, and there is nothing to blend "
+                         "them onto without one")
+        argv_build.append("--appearance")
 
     started = time.perf_counter()
     completed = subprocess.run(
