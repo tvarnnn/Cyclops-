@@ -661,15 +661,22 @@ as the depth-consistency gate keeping 74% of frames instead of 95%.
 
 **Wait. Do not shut the Tower down.**
 
-**Expect twenty-five to thirty minutes, not eight.** The measured figure —
-459 s, surface 373.9 s plus appearance 85.3 s — is for a *385-keyframe*
-walk. The walk asked for above is two to three times that many keyframes,
-and the per-frame stages (depth, transients, consistency, appearance) scale
-with keyframe count while only fuse/mesh/pack stay roughly fixed with the
-room. Add a final GLOMAP solve that is superlinear in images. An earlier
-draft of this procedure said "about eight minutes"; that was the small
-walk's number quoted against the big walk's instruction, and a wearer told
-eight minutes will shut the Tower down at twelve.
+**Expect fifteen to twenty minutes.** Measured, not extrapolated:
+
+| walk | photographic stages |
+|---|---|
+| 385 keyframes | 459 s (surface 374 + appearance 85) |
+| **690 keyframes** | **756 s** (surface 605 + appearance 151) |
+
+plus the final solve. An 800–1000-keyframe walk — what three to five
+minutes produces — should land around fifteen to twenty minutes. Two
+earlier drafts of this procedure were wrong in opposite directions: the
+first said "about eight minutes", which was the small walk's number quoted
+against the big walk's instruction; a reviewer then extrapolated
+twenty-five to thirty, which the 690-keyframe measurement shows is too
+pessimistic because transients scale sublinearly. **Plan for twenty and
+you will not be surprised.** A wearer told eight minutes shuts the Tower
+down at twelve, which is how the 02:37 world was lost.
 
 During the build the phone shows **"Improving"**, with its own note: *"This
 world is still being finished… the finished world is very different from
