@@ -844,10 +844,19 @@ enum WorldReconstruction: Equatable {
             // ANYTHING IS ACTUALLY RUNNING.
             //
             // `.improving` is reached only with `buildInProgress == true`,
-            // which the Tower sets from a writer lock it can see
+            // which the Tower sets from evidence it can see
             // (`lifecycle: finalizing`). The measured 179 seconds above are
             // that state, and "it is worth waiting for" is a true promise
             // there.
+            //
+            // Revised 2026-09-22: that evidence used to be the writer lock
+            // and ONLY the writer lock, which is why a wearer was told
+            // "Saved" ninety seconds after Stop with the photographic build
+            // still six minutes away — the builder releases the lock BEFORE
+            // the surface and appearance stages, deliberately. The Tower now
+            // also reports a stage that is genuinely running, from its own
+            // `status.json` and a live pid. The promise is still true; there
+            // is simply more than one way to earn it.
             //
             // `.finalizing` is everything else: `stopped_unbuilt` with
             // geometry, where `build_in_progress` is null because nothing

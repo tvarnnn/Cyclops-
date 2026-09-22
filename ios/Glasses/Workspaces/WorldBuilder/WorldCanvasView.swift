@@ -213,6 +213,19 @@ struct WorldCanvasView: View {
             // where an indicator is a report rather than an assertion, and it
             // is drawn for that case alone. `null` — an older record — keeps
             // the staleness sentence, which is what that state means.
+            //
+            // Revised 2026-09-22. `build_in_progress` now has a SECOND
+            // evidence, and this text may not name only the first. The
+            // photographic stages — the surface and the appearance, which
+            // are what the saved world is actually for — run AFTER the
+            // builder releases the writer lock, deliberately, so the phone
+            // can read the world while the better picture is being made.
+            // The Tower reports those from each stage's own `status.json`
+            // and a live pid, not from the lock. So the sentence below no
+            // longer claims a lock is held: on that path it is not, and a
+            // wearer who read "a live process holds this world's writer
+            // lock" while the surface was building was being told the one
+            // thing the Tower had carefully declined to say.
             stageHeadline(fallback: "Finalizing", systemImage: "cube")
             worldName(snapshot)
             if buildInProgress == true {
@@ -226,7 +239,7 @@ struct WorldCanvasView: View {
             reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: false)
             if buildInProgress == true {
-                detailText("A live process holds this world's writer lock and its session has stopped: the final solve and the final build are running, and these figures are not final.")
+                detailText("The Tower is still finishing this world: the final solve, the final build and the photographic reconstruction all run after the session stops, and these figures are not final.")
             } else {
                 detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
             }
