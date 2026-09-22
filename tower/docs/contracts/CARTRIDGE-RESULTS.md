@@ -747,6 +747,19 @@ one that survives the gaps between stages.
 > decided **without** consulting the liveness probe -- so a probe that breaks
 > cannot relabel all of them at once.
 
+> **`complete` is about the BUILD, not about what is being SERVED right now.**
+> The two are almost always the same and deliberately are not the same fact.
+> A world whose imagery was purged, or whose redaction label changed, keeps
+> `stages.appearance: ok` -- the build did happen -- while
+> `_servable_manifest` refuses it and the render revision reports
+> `appearance.state: withdrawn`. That is the honest split: the lifecycle says
+> the world is finished and nothing more is coming (which is true, and
+> "Improving" would be a lie), the revision route says the imagery is not
+> being served (which is also true), and the viewer falls to the best rung
+> that exists and captions it. **Read `appearance.state` on
+> `/worlds/{id}/render/revision`, never `photographic.state`, to decide what
+> can be drawn.**
+
 > **Additive.** iOS decodes this payload with `JSONSerialization`
 > dictionaries and ignores unknown keys, so a client that does not read
 > `photographic` behaves exactly as it did before -- except that it now hears

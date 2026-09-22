@@ -11,8 +11,10 @@ false Saveds came out of that one mistake:
   * **T2, the flicker.** "Running" is false in the gaps BETWEEN the stages:
     between the lock being released and the surface's first `running`
     status, and between the surface's `ok` and the appearance's first
-    `running` status -- a label-policy pass and a SHA-1 pass over every
-    keyframe, tens of seconds on a long walk. The phone said Saved for
+    `running` status. Both gaps are SHORT -- measured, the second is sub-millisecond,
+    not the "tens of seconds" an earlier draft of this claimed -- and
+    that changes nothing: a 2 Hz poll lands in them, and a builder that
+    dies in either window leaves a world that reads finished for ever. The phone said Saved for
     those polls and then went back to Improving.
 
   * **T3, the false success.** A stage that FAILED is also not running, and
@@ -37,6 +39,7 @@ and names its pid. This file pins everything either side of it.
 """
 
 import json
+import pathlib
 import time
 
 import psutil
@@ -56,6 +59,7 @@ from tower.world_builder.photographic import (
     PHOTOGRAPHIC_NEVER_RECORDED,
     PHOTOGRAPHIC_OWED,
     PHOTOGRAPHIC_RUNNING,
+    PHOTOGRAPHIC_UNATTEMPTED,
     PHOTOGRAPHIC_UNOBSERVABLE,
     photographic_state,
 )
@@ -67,6 +71,7 @@ from tower.world_builder.records import (
     STAGE_STATE_OK,
     STAGE_STATE_RUNNING,
     STAGE_STATE_STOPPED,
+    STAGE_STATE_UNAVAILABLE,
     STAGE_SURFACE,
     Session,
 )
@@ -284,8 +289,14 @@ class TestTheStageBoundariesNeverSaySaved:
         self, derived_world
     ):
         """GAP TWO, the big one: the surface has published `ok` and the
-        appearance has not written its first `running` status yet. Measured
-        at tens of seconds on a 400-keyframe walk."""
+        appearance has not written its first `running` status yet.
+
+        Measured at SUB-MILLISECOND, not the "tens of seconds" this
+        docstring first claimed: the label-policy and keyframe-hashing work
+        attributed to this window is in fact inside `build_appearance`, i.e.
+        after the record. Small is not safe -- a 2 Hz poll lands in it, and
+        a builder that dies here leaves a world that reads finished for
+        ever."""
         store, world_id, session_id = derived_world
         _finalized(store, world_id, session_id, stages={
             STAGE_SURFACE: _stage(STAGE_STATE_OK),
@@ -565,3 +576,134 @@ class TestOwedMeansSomethingWillActuallyFinishIt:
         assert _state_of(store, world_id, session_id)["state"] == (
             PHOTOGRAPHIC_OWED
         )
+
+
+class TestTheTwoJudgesAgreeShapeByShape:
+    """The anti-drift test, and the reason it enumerates rather than asserts.
+
+    `photographic_state` and `scripts/world_finish_pending.assess()` answer
+    the same question from the same two signals, and they drifted apart
+    ONCE INSIDE A SINGLE AFTERNOON while this change was being written --
+    which is how the `no-final-solve` shape below came to exist. A prose
+    promise that they agree is worth nothing; this builds each shape on disk
+    and asks both.
+
+    The rule being pinned: **if `assess()` will not pick a session up, this
+    module must not call it `owed`.** `owed` puts the phone on "Improving",
+    and the finisher is the only thing that ever ends that.
+
+    Two of `assess()`'s refusals are deliberately NOT modelled here and are
+    recorded as known limitations instead: a `finish_attempts.json` that
+    cannot be parsed (`ledger-unreadable`) and a lock file whose `pid` is
+    valid JSON but not an integer (`locked`). Both are corrupt-file states
+    that no writer ever heals, both already stop the finisher for ever
+    independently of this change, and modelling them would pull the attempt
+    ledger and the lock protocol -- which live in `scripts/` -- into the
+    serving path. They are named in the handoff.
+    """
+
+    def _assess(self, store, world_id, session_id):
+        import importlib.util
+
+        path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / (
+            "world_finish_pending.py"
+        )
+        spec = importlib.util.spec_from_file_location("wfp_agreement", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.assess(store, world_id, session_id)
+
+    @pytest.mark.parametrize("name,finalization,stages,ended", [
+        ("solved-and-interrupted", dict(_COMPLETE_SOLVED),
+         {STAGE_SURFACE: _stage(STAGE_STATE_STOPPED)}, True),
+        ("no-final-solve", {"state": FINALIZATION_COMPLETE,
+                            "final_solve": "failed", "started_at": 2.0,
+                            "updated_at": 3.0, "detail": None},
+         {STAGE_SURFACE: _stage(STAGE_STATE_STOPPED)}, True),
+        ("not-finalized", {"state": "interrupted", "final_solve": None,
+                           "started_at": 2.0, "updated_at": 3.0,
+                           "detail": None},
+         {STAGE_SURFACE: _stage(STAGE_STATE_STOPPED)}, True),
+        ("never-stopped", dict(_COMPLETE_SOLVED),
+         {STAGE_SURFACE: _stage(STAGE_STATE_STOPPED)}, False),
+        ("nothing-interrupted", dict(_COMPLETE_SOLVED),
+         {STAGE_SURFACE: _stage(STAGE_STATE_OK),
+          STAGE_APPEARANCE: _stage(STAGE_STATE_OK)}, True),
+        ("unavailable-and-attempted", dict(_COMPLETE_SOLVED),
+         {STAGE_SURFACE: _stage(STAGE_STATE_OK),
+          STAGE_APPEARANCE: _stage(STAGE_STATE_UNAVAILABLE,
+                                   detail="ASTC encoder returned 0 bytes")},
+         True),
+        ("no-stage-record", dict(_COMPLETE_SOLVED), None, True),
+    ])
+    def test_nothing_is_owed_that_the_finisher_will_not_finish(
+        self, derived_world, name, finalization, stages, ended
+    ):
+        store, world_id, session_id = derived_world
+        store.append_event(
+            world_id, session_id,
+            WorldEvent(event_id=1, kind="session_stopped", at=2.0, payload={}),
+        )
+        session = store.read_session(world_id, session_id)
+        store.write_session(Session(
+            session_id=session_id, world_id=world_id,
+            started_at=session.started_at,
+            # `never-stopped` is the crash between the journal append and the
+            # record write: the event is there, `ended_at` is not.
+            ended_at=session.ended_at if ended else None,
+            end_reason="stop" if ended else None,
+            finalization=finalization, stages=stages,
+        ))
+
+        mine = _state_of(store, world_id, session_id)
+        theirs = self._assess(store, world_id, session_id)
+
+        if mine["state"] == PHOTOGRAPHIC_OWED:
+            assert theirs.owed, (
+                f"[{name}] this module says the world owes a photographic "
+                f"room, but the finisher refuses it ({theirs.code}) -- so it "
+                f"would say 'Improving' for ever. {mine}"
+            )
+        if theirs.owed:
+            assert mine["state"] in (PHOTOGRAPHIC_OWED, PHOTOGRAPHIC_RUNNING), (
+                f"[{name}] the finisher will rebuild this world, but the "
+                f"phone is told {mine['state']!r}, which reads as finished"
+            )
+
+    def test_an_attempted_unavailable_stage_is_not_called_unattempted(
+        self, derived_world
+    ):
+        """`unavailable` is two facts; `attempted` tells them apart.
+
+        An ASTC encode that returns the wrong byte count, a WebP encode that
+        fails, open3d missing -- the pipelines record all of these as
+        `unavailable` with `attempted: True`. Filing them under "nothing is
+        wrong and nothing is coming" was T3 re-entering through a word the
+        first version of the vocabulary did not enumerate.
+        """
+        store, world_id, session_id = derived_world
+        _finalized(store, world_id, session_id, stages={
+            STAGE_SURFACE: _stage(STAGE_STATE_OK),
+            STAGE_APPEARANCE: _stage(
+                STAGE_STATE_UNAVAILABLE, attempted=True,
+                detail="ASTC encoder returned 0 bytes, expected 65536",
+            ),
+        })
+        verdict = _state_of(store, world_id, session_id)
+        assert verdict["state"] == PHOTOGRAPHIC_FAILED, verdict
+        assert "ASTC" in verdict["detail"]
+
+    def test_a_stage_nobody_asked_for_is_still_unattempted(
+        self, derived_world
+    ):
+        """The other half: `attempted: False` really is "nobody asked"."""
+        store, world_id, session_id = derived_world
+        _finalized(store, world_id, session_id, stages={
+            STAGE_SURFACE: _stage(STAGE_STATE_OK),
+            STAGE_APPEARANCE: _stage(
+                STAGE_STATE_UNAVAILABLE, attempted=False,
+                detail="the appearance is switched off on this Tower",
+            ),
+        })
+        verdict = _state_of(store, world_id, session_id)
+        assert verdict["state"] == PHOTOGRAPHIC_UNATTEMPTED, verdict

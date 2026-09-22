@@ -110,6 +110,51 @@ def prewarm(modules, *, subsystem: str, stream=None) -> tuple[str, ...]:
     return tuple(failed)
 
 
+def _warm_cuda(stream) -> bool:
+    """Ask torch for a CUDA device, so the NVIDIA driver attaches HERE.
+
+    FOUND BY AN ADVERSARIAL REVIEW OF THE FIRST VERSION OF THIS MODULE, which
+    warmed the import list above and stopped there. `import torch` does NOT
+    load the driver: the first CUDA *query* does, and on this host that query
+    maps seventeen further DLLs -- `nvcuda64.dll`, `nvapi64.dll`,
+    `nvobjectloader64.dll`, `nvcudart_hybrid64.dll` and friends. `nvcuda64`
+    starts worker and watchdog threads when it attaches, which is exactly the
+    `DllMain` behaviour this whole module exists to keep away from a parked
+    pipe reader.
+
+    And the query that does it is `tower/world_builder/dense.py`:
+
+        from moge.model.v2 import MoGeModel        # line 507
+        ...
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    -- one line after the import the py-spy stack blamed, in the same frame,
+    under the same loader lock, with the same watcher in `NtReadFile`. So the
+    first version removed one thread-spawning DLL from that frame and left a
+    second one in it.
+
+    Measured on this host: **0.02 s**, against 1.4 s for the imports above.
+    There is no argument for leaving it out.
+
+    Returns False and says so if torch is absent or the query raises; a host
+    with no CUDA still runs, on the CPU, and the stage says so itself.
+    """
+    try:
+        import torch  # noqa: PLC0415 -- already resident after `prewarm`
+
+        torch.cuda.is_available()
+        return True
+    except Exception as exc:  # noqa: BLE001 -- warming is never fatal
+        print(
+            f"[Tower][WorldBuilder] could not pre-warm the CUDA driver "
+            f"({exc.__class__.__name__}: {exc}); continuing. The stage will "
+            "resolve its own device and say which it got.",
+            file=stream if stream is not None else sys.stderr,
+            flush=True,
+        )
+        return False
+
+
 def prewarm_world_builder(stream=None) -> tuple[str, ...]:
     """The World Builder warm: the stages that draw the photographic room.
 
@@ -117,7 +162,11 @@ def prewarm_world_builder(stream=None) -> tuple[str, ...]:
     `scripts/world_finish_pending.py`, which run the same
     `final_surface_stages` path and therefore load the same DLLs.
     """
-    return prewarm(WORLD_BUILDER_MODULES, subsystem="WorldBuilder", stream=stream)
+    failed = prewarm(WORLD_BUILDER_MODULES, subsystem="WorldBuilder", stream=stream)
+    # AFTER the imports and still BEFORE any watcher: the driver attaches on
+    # the first CUDA query, not on `import torch`. See `_warm_cuda`.
+    _warm_cuda(stream)
+    return failed
 
 
 def prewarm_object_memory(stream=None) -> tuple[str, ...]:

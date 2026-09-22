@@ -1601,9 +1601,22 @@ def _still_building(base: dict, building: str | None,
             "state": LIFECYCLE_FINALIZING,
             "evidence": f"{base['evidence']}, and {owed_reason}",
             "reason": (
+                # NOT "the Tower finishes this at its next start". It
+                # usually does -- and `tower/main.py` refuses to spawn the
+                # finisher at all when TOWER_WORLD_FINISH_PENDING, the
+                # surface or the solve is switched off, and `config.py`
+                # already warns that such a world "stays sparse until
+                # somebody runs scripts/world_finish_pending.py by hand".
+                # A reviewer caught the first version promising a rescue
+                # that, on those Towers, is never coming. The world really
+                # is unfinished, so "Improving" is the honest word; the
+                # promise attached to it was the part that was not.
                 "this world does not have the photographic representation it "
-                "is owed yet: " + owed_reason + ". The Tower finishes owed "
-                "photographic work at its next start"
+                "is owed yet: " + owed_reason + ". A Tower with the "
+                "photographic stages enabled finishes owed work at its next "
+                "start; one that has them switched off will not, and this "
+                "world then stays as it is until somebody runs "
+                "scripts/world_finish_pending.py by hand"
                 if photo_state == PHOTOGRAPHIC_OWED else
                 "whether the photographic build for this world is still "
                 "running could not be determined, so this world is not "

@@ -985,23 +985,6 @@ def main(argv=None, *, stop_request=None) -> int:
     parser.add_argument("--format", choices=("json", "text"), default="json")
     args = parser.parse_args(argv)
 
-    if stop_request is None:
-        # BEFORE the watcher is armed, and that order is load-bearing on
-        # Windows. This process ran for over 95 minutes at 0% CPU on
-        # 2026-09-22 because `surfacify` loaded OpenBLAS (via moge ->
-        # scipy.linalg) while the stop watcher below was parked in a
-        # blocking `ReadFile` on the stdin pipe. Warming the native stack
-        # here, with no reader parked behind the loader, is what prevents
-        # it. See `tower/native_prewarm.py`.
-        prewarm_world_builder()
-
-        stop_request = StopRequest()
-        # Armed BEFORE the survey, so a Tower that starts and immediately
-        # begins a walk is obeyed at the first opportunity rather than at the
-        # first one after a directory scan.
-        stop_request.install(watch_stdin=args.stop_on_stdin_close)
-    should_stop = stop_request.asked_for
-
     store = WorldStore(Path(args.root))
     verdicts = survey(store, max_attempts=args.max_attempts)
     report: dict = {
@@ -1021,6 +1004,37 @@ def main(argv=None, *, stop_request=None) -> int:
         report["skipped_detail"] = [v.as_dict() for v in verdicts if not v.owed]
         _emit(report, args.format)
         return 0
+
+    # THE SURVEY IS FREE AND THE WARM IS NOT, so the survey goes first.
+    #
+    # `tower/main.py` promises that "a Tower with nothing owed spawns a
+    # process that reads some small JSON files, prints an empty report and
+    # exits", and that is the common case by a wide margin: measured on the
+    # root this was written against, 70 sessions, survey 0.04 s, **zero**
+    # owed. Warming the native stack before finding that out cost 1.4 s and
+    # some 650 MB of resident torch at every single Tower start, for nothing
+    # -- a regression an adversarial reviewer caught in the first version of
+    # this change.
+    #
+    # WHAT IS GIVEN UP, AND WHY IT IS AFFORDABLE. The watcher is armed after
+    # the survey rather than before it, so a stop asked for during those
+    # 0.04 s is not seen by this process. Nothing is at stake in that window:
+    # no lock is taken, no attempt is recorded and nothing is written until
+    # `finish` below, and the supervisor's `terminate_tree` reaps the process
+    # either way. The ordering that IS load-bearing is unchanged and is the
+    # reason these two lines are adjacent: the native stack is warmed while
+    # no thread is parked in a blocking pipe read. See
+    # `tower/native_prewarm.py` for the 95-minute deadlock that buys.
+    has_work = any(v.owed or v.exhausted for v in verdicts)
+    if not has_work:
+        _emit(report, args.format)
+        return 0
+
+    if stop_request is None:
+        prewarm_world_builder()
+        stop_request = StopRequest()
+        stop_request.install(watch_stdin=args.stop_on_stdin_close)
+    should_stop = stop_request.asked_for
 
     for verdict in verdicts:
         if not verdict.exhausted or should_stop():

@@ -12,8 +12,10 @@ wrong in three different ways at once (§7, T2/T3/T4):
     builder releases the world lock, assembles a report, imports the
     reconstruction stack, and only then writes the surface's first
     `running` status; and between the surface's `ok` and the appearance's
-    first `running` there is a label-policy pass and a SHA-1 pass over
-    every keyframe -- tens of seconds on a long walk. For those polls the
+    first `running` status. Both gaps are SHORT -- measured, the second is sub-millisecond,
+    not the "tens of seconds" an earlier draft of this claimed -- and
+    that changes nothing: a 2 Hz poll lands in them, and a builder that
+    dies in either window leaves a world that reads finished for ever. For those polls the
     Tower said ready and the phone said **Saved**, then went back to
     Improving. A wearer told to wait for "Saved" can be told it twice.
 
@@ -45,12 +47,20 @@ REPORTS it must not be able to disagree about which worlds are missing it.
 
 THE HISTORICAL WORLDS ARE THE HARD PART, and the reason this is not simply
 "anything without an appearance is unfinished". There are 166 worlds on the
-machine this was written for and 165 of them were built by a Tower that had
-no photographic stages at all. They are not broken, they are not owed
-anything, and relabelling them would turn one honest bug report into a
-hundred and sixty-five false ones. `NEVER_RECORDED` is their word, it is
-reached only when there is NO stage record AND no stage artifact on disk,
-and it maps to ready exactly as today.
+machine this was written for, and 69 of their 70 sessions were built by a
+Tower that had no photographic stages at all. They are not broken, they are
+not owed anything, and relabelling them would turn one honest bug report
+into sixty-nine false ones.
+
+MEASURED, because an earlier version of this paragraph guessed and was
+wrong: of those 70 sessions, **67 reach `UNATTEMPTED`** (they predate the
+finalization record, so they have no completed global solve to build from)
+and **2 reach `NEVER_RECORDED`**; the 1 remaining is the recovered world,
+`COMPLETE`. Both of the first two words are settled and map to ready exactly
+as before -- which is why no old world changes a word -- but they are not
+the same word, and the next person to edit either mapping should be
+reasoning from the real numbers rather than from this comment's first
+draft.
 
 The distinction is sound in both directions because of an ordering the
 builder now guarantees: `world_build_session.py` records the surface stage
@@ -71,6 +81,7 @@ from tower.world_builder.records import (
     STAGE_STATE_OK,
     STAGE_STATE_RUNNING,
     STAGE_STATE_STOPPED,
+    STAGE_STATE_UNAVAILABLE,
     STAGE_SURFACE,
 )
 
@@ -142,11 +153,25 @@ def _stage_entry(session, stage):
 def _appearance_is_expected(session) -> bool:
     """Whether a photographic room is a thing this session should have.
 
-    A session that never finalized, or finalized without a global solve,
-    cannot have one and is not owed one: `final_surface_stages` refuses
-    without a solve and records `unavailable`. Queuing it would be asking
-    for work that is defined not to happen.
+    THESE ARE `assess()`'S OWN REFUSALS, and they are here so the two cannot
+    disagree about which worlds are missing work. Saying `owed` puts the
+    phone on "Improving", and the only process that ever makes that stop
+    being true is `scripts/world_finish_pending.py`; a shape it refuses is a
+    world that would wait for ever.
+
+    * `never-stopped` -- a walk still in progress, or a builder that died
+      mid-walk. The photographic stages are not what it is missing, and
+      `world_finalize.py` is the tool for the second shape. Added after a
+      reviewer found a session with a `session_stopped` journal event and
+      `ended_at: null` -- a crash between the two writes -- reading `owed`
+      on one surface and `interrupted` on the other, with the finisher
+      silent.
+    * `not-finalized` / `no-final-solve` -- `final_surface_stages` refuses
+      without a solve and records `unavailable`. Queuing it would be asking
+      for work that is defined not to happen.
     """
+    if getattr(session, "ended_at", None) is None:
+        return False
     finalization = getattr(session, "finalization", None) or {}
     return (
         finalization.get("state") == FINALIZATION_COMPLETE
@@ -361,10 +386,42 @@ def photographic_state(store, world_id: str, session_id: str, session) -> dict:
                 # interrupted stage, not a running one.
                 return _liveness(store, world_id, session_id, stage)
 
-        # Every photographic stage reached an end of its own and none is
-        # `ok`: `unavailable` on both, which is a Tower with the appearance
-        # switched off, or a session with nothing to build from. Nothing is
-        # wrong and nothing is coming.
+        # `unavailable` IS TWO DIFFERENT FACTS AND `attempted` TELLS THEM
+        # APART. An adversarial review caught the first version of this
+        # module filing both under "nothing is wrong and nothing is coming",
+        # which is T3 re-entering through a word the vocabulary did not
+        # enumerate. The pipelines write `unavailable` for a stage that was
+        # never asked for -- the appearance switched off, no solve to build
+        # from, the surface not `ok` -- with `attempted: False`; and for a
+        # stage that RAN and could not produce -- an ASTC encode that
+        # returned the wrong byte count, a WebP encode that failed, open3d
+        # missing, a surface artifact shorter than its header -- with
+        # `attempted: True`. The second is a photographic build that broke,
+        # and telling the wearer "Saved" over it is exactly the lie this
+        # module exists to stop.
+        #
+        # Both are terminal either way: `world_finish_pending` retries only
+        # `running` and `stopped`, so neither is `owed` and neither must say
+        # "Improving". They differ in what is TRUE, and so in what is said.
+        for stage in PHOTOGRAPHIC_STAGES:
+            entry = _stage_entry(session, stage)
+            if (
+                entry.get("state") == STAGE_STATE_UNAVAILABLE
+                and entry.get("attempted")
+            ):
+                return {
+                    "state": PHOTOGRAPHIC_FAILED,
+                    "stage": stage,
+                    "detail": (
+                        entry.get("detail")
+                        or f"the {stage} stage ran and could not produce a "
+                           "photographic representation"
+                    ),
+                }
+
+        # Every photographic stage reached an end of its own, none is `ok`,
+        # and none of them was even attempted. Nothing is wrong and nothing
+        # is coming.
         return {
             "state": PHOTOGRAPHIC_UNATTEMPTED,
             "stage": None,

@@ -114,26 +114,45 @@ class TestTheWarmIsSharedAndHonest:
 
 
 class TestTheFinisherWarmsBeforeItArms:
-    """`scripts/world_finish_pending.py`: the process that actually hung."""
+    """`scripts/world_finish_pending.py`: the process that actually hung.
+
+    The warm now happens only when there is work, which is why these tests
+    have to MAKE some. See `TestTheFinisherDoesNotWarmForNothing` below for
+    the other half of that rule -- the two together are the whole contract:
+    warm before arming, and only when it will be used.
+    """
+
+    @staticmethod
+    def _armed(module, monkeypatch, *, owed):
+        """Run `main` with the survey faked, and record the call order."""
+        order = []
+        monkeypatch.setattr(
+            module, "prewarm_world_builder", lambda: order.append("prewarm")
+        )
+        monkeypatch.setattr(
+            module.StopRequest,
+            "install",
+            lambda self, *, watch_stdin=False: order.append(
+                ("install", watch_stdin)
+            ),
+        )
+        verdict = module.Verdict(
+            "w", "s", owed, "because the test says so", code="owed",
+            stage="surface",
+        )
+        monkeypatch.setattr(module, "survey", lambda *a, **k: [verdict])
+        # The stage itself is not what is under test, and running it would
+        # need a GPU and a world.
+        monkeypatch.setattr(
+            module, "finish", lambda *a, **k: {"finished": True}
+        )
+        return order
 
     def test_prewarm_runs_before_the_stdin_watcher_is_armed(
         self, tmp_path, monkeypatch
     ):
         module = _load_script("world_finish_pending.py")
-        order = []
-
-        monkeypatch.setattr(
-            module, "prewarm_world_builder", lambda: order.append("prewarm")
-        )
-
-        def fake_install(self, *, watch_stdin=False):
-            # Recorded, not performed: this test is about the order of the
-            # two calls, and it runs on pytest's own main thread, where
-            # arming real signal handlers and a real blocking reader would
-            # be both pointless and hostile.
-            order.append(("install", watch_stdin))
-
-        monkeypatch.setattr(module.StopRequest, "install", fake_install)
+        order = self._armed(module, monkeypatch, owed=True)
 
         root = tmp_path / "world_builder"
         (root / "worlds").mkdir(parents=True)
@@ -155,6 +174,29 @@ class TestTheFinisherWarmsBeforeItArms:
         because a rule with an exception is a rule that drifts.
         """
         module = _load_script("world_finish_pending.py")
+        order = self._armed(module, monkeypatch, owed=True)
+        root = tmp_path / "world_builder"
+        (root / "worlds").mkdir(parents=True)
+
+        module.main(["--root", str(root), "--format", "json"])
+
+        assert order == ["prewarm", ("install", False)], order
+
+
+class TestTheFinisherDoesNotWarmForNothing:
+    """A Tower with nothing owed must still be cheap to start.
+
+    `tower/main.py` promises that "a Tower with nothing owed spawns a process
+    that reads some small JSON files, prints an empty report and exits", and
+    the common case is exactly that: measured on the real root, 70 sessions,
+    survey 0.04 s, ZERO owed. The first version of the warm ran before the
+    survey and so paid 1.4 s and ~650 MB of resident torch at every single
+    Tower start for nothing -- caught by an adversarial review, and this is
+    the test that keeps it caught.
+    """
+
+    def test_an_empty_root_neither_warms_nor_arms(self, tmp_path, monkeypatch):
+        module = _load_script("world_finish_pending.py")
         order = []
         monkeypatch.setattr(
             module, "prewarm_world_builder", lambda: order.append("prewarm")
@@ -162,16 +204,35 @@ class TestTheFinisherWarmsBeforeItArms:
         monkeypatch.setattr(
             module.StopRequest,
             "install",
-            lambda self, *, watch_stdin=False: order.append(
-                ("install", watch_stdin)
-            ),
+            lambda self, *, watch_stdin=False: order.append("install"),
         )
         root = tmp_path / "world_builder"
         (root / "worlds").mkdir(parents=True)
 
-        module.main(["--root", str(root), "--format", "json"])
+        assert module.main(
+            ["--root", str(root), "--stop-on-stdin-close", "--format", "json"]
+        ) == 0
+        assert order == [], order
 
-        assert order == ["prewarm", ("install", False)], order
+    def test_a_dry_run_never_warms(self, tmp_path, monkeypatch):
+        """`--dry-run` is a read-only report and must stay one."""
+        module = _load_script("world_finish_pending.py")
+        order = []
+        monkeypatch.setattr(
+            module, "prewarm_world_builder", lambda: order.append("prewarm")
+        )
+        monkeypatch.setattr(
+            module, "survey",
+            lambda *a, **k: [module.Verdict(
+                "w", "s", True, "owed", code="owed", stage="surface"
+            )],
+        )
+        root = tmp_path / "world_builder"
+        (root / "worlds").mkdir(parents=True)
+
+        module.main(["--root", str(root), "--dry-run", "--format", "json"])
+
+        assert order == [], order
 
 
 class TestTheBuilderWarmsBeforeItArms:

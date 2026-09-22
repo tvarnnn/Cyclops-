@@ -258,6 +258,13 @@ adds is the ability to be specific:
 
 `stage` names `surface` or `appearance` when the word is about one.
 
+**`complete` is about the build, not about what can be drawn.** A world whose
+imagery was purged, or whose redaction label changed, keeps a completed
+appearance build while the manifest is refused and the render revision reports
+`appearance.state: withdrawn`. Decide what to DRAW from `appearance.state` on
+`/worlds/{id}/render/revision`, exactly as today; `photographic.state` decides
+what to SAY about whether the world is finished.
+
 ## 3.1 `selection`: whose world is on the wire
 
 An unpinned subscription is answered with a live world if one exists, else
