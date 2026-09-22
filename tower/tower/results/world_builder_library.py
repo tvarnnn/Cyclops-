@@ -194,12 +194,69 @@ def _keyframes_journaled(store: WorldStore, world_id: str, session_id: str) -> i
         return 0
 
 
-def session_state(session, *, live: bool, has_geometry: bool, manifest=None) -> str:
+def _photographic_build_running(store: WorldStore, world_id: str,
+                                session_id: str) -> bool:
+    """Whether a photographic stage is working on this session right now.
+
+    THE STATUS PRODUCER'S OWN PROBE, imported rather than re-derived, because
+    a second copy of this predicate is how the two surfaces drift -- and the
+    drift is not cosmetic here. Measured after the status producer learned
+    this and the listing had not: the panel said `finalizing` / "Improving"
+    while the Saved Worlds row for the SAME session said `complete`. A wearer
+    who opens the picker reads "Complete" and shuts the Tower down, which is
+    the precise failure the whole change exists to prevent, told on the
+    surface a person actually chooses a walk from.
+
+    Imported at call time. `results/world_builder` imports `_sortable` from
+    THIS module at module scope, so the reverse cannot be a module-scope
+    import; `session_build_running` reaches back into this module the same
+    way, for the same reason.
+
+    Never raises: a probe that cannot read something answers "not building",
+    which is what this module said before it asked at all.
+    """
+    try:
+        from tower.results.world_builder import (  # noqa: PLC0415
+            _photographic_build_evidence,
+        )
+
+        evidence, unobservable = _photographic_build_evidence(
+            store, world_id, session_id
+        )
+        if unobservable is not None:
+            # The probe reports its own failure and warns once; a listing row
+            # is one word with nowhere to carry a caveat, so it keeps the
+            # settled word. The status payload carries the caveat, in
+            # `build_in_progress_unavailable_reason`.
+            logger.debug("[Tower][Worlds] %s/%s: %s", world_id, session_id,
+                         unobservable)
+        return evidence is not None
+    except Exception:  # noqa: BLE001 -- a liveness probe must not 500 a listing
+        logger.warning(
+            "[Tower][Worlds] photographic build probe raised for %s/%s; this "
+            "row keeps its settled word and may say 'complete' over a world "
+            "that is still being built",
+            world_id, session_id, exc_info=True,
+        )
+        return False
+
+
+def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
+                  still_building: bool = False) -> str:
     """One word for what a session IS, from the record, the lock and the tree.
 
     Mirrors `_lifecycle` in the status producer for the facts a listing
     has (it does not compute geometry currency, so `complete` on a record
     that predates finalization means "stopped and built", not "current").
+
+    `still_building` is the fact the record and the lock cannot hold: a
+    photographic stage working on this session RIGHT NOW. The surface,
+    appearance and dense stages run after the writer lock is released, so
+    `live` -- which is the lock -- is false throughout the six to sixteen
+    minutes they take. Passed in as a fact rather than probed here, exactly
+    as `live` and `has_geometry` are, so this stays a pure function of what
+    it is told and the direct callers in `test_world_builder_finalize_cli`
+    keep working unchanged.
 
     `manifest` is the fact that made the sentence above true. Without it
     the last line read `complete if has_geometry else unbuilt`, and
@@ -224,6 +281,15 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None) -> 
     if not stopped:
         # Open record, nobody writing: killed mid-walk.
         return SESSION_INTERRUPTED
+    # ABOVE EVERY SETTLED ARM BELOW, and for the reason `_still_building` in
+    # the status producer gives at length: those arms all answer "what
+    # happened to this session", and none of them can be right while a
+    # process is still working on it. `finalizing` is this listing's word for
+    # "stopped, and something is still finishing it", which is exactly true
+    # here -- the lock arm above says the same thing about the same session a
+    # few minutes earlier, when the lock was still held.
+    if still_building:
+        return SESSION_FINALIZING
     if (
         finalization is not None
         and finalization.get("state") == FINALIZATION_COMPLETE
@@ -480,6 +546,19 @@ def build_world_listing(store: WorldStore) -> dict:
                     live=live,
                     has_geometry=has_geometry,
                     manifest=manifest,
+                    # ASKED ONLY WHERE IT CAN CHANGE THE ANSWER. `live` and
+                    # an open record are decided above it in `session_state`,
+                    # so probing for them would cost every row a lock read
+                    # and three stat calls to alter nothing. This keeps the
+                    # cost to the stopped, unlocked rows -- the window the
+                    # photographic stages actually run in.
+                    still_building=(
+                        not live
+                        and session.ended_at is not None
+                        and _photographic_build_running(
+                            store, world_id, session_id
+                        )
+                    ),
                 ),
                 # The builder's own account of how finalization went, or
                 # null on a record written before it existed.

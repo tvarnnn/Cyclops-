@@ -35,6 +35,7 @@ malformed_frame). Tower genuinely does not know it yet, and says so.
 import json
 import logging
 import math
+import time
 from pathlib import Path
 
 from tower.logging_config import client_safe_reason
@@ -506,6 +507,37 @@ class WorldBuilderStatusProducer:
         if best is None:
             return None, SELECTION_NONE, "no world could be read"
         if not live:
+            # A PHOTOGRAPHIC BUILD IS ALSO "NOW", AND THE SELECTION HAS TO
+            # SAY SO OR ONE PAYLOAD CONTRADICTS ITSELF.
+            #
+            # `live` is the writer lock, and the surface, appearance and
+            # dense stages run with it RELEASED -- so for the six to sixteen
+            # minutes they take this answered `latest` / "nothing is live" in
+            # the same payload whose `lifecycle` said `finalizing` with
+            # `build_in_progress: true`. A reviewer saw it in every run.
+            #
+            # Not cosmetic. On iOS `WorldSelection.isHistoryOfferedAsLive` is
+            # `mode == .latest`, and `TowerWorldBuilderClient` then presents
+            # the report as `.idle` -- "No world yet" -- unless `followedWalk`
+            # still names the world; and `followedWalk` stops being refreshed
+            # the moment the selection turns `latest`. So a relaunch or a
+            # jetsam kill during the build dropped the live screen to "No
+            # world yet" while the Tower was reporting a build in progress.
+            #
+            # ONLY `best` IS PROBED, not every world. Reaching here means no
+            # world holds a live lock, so nothing is capturing, and the world
+            # being built is the one that was just walked -- which is the
+            # most recently updated. Probing every world would cost a lock
+            # read and three stats per world on a 2 Hz poll (about 20 ms on
+            # the 163-world root) to change the answer for a world that
+            # cannot be the newest.
+            if self._newest_session_is_being_built(store, best):
+                return (
+                    best,
+                    SELECTION_FINALIZING,
+                    "no writer lock is held, and a photographic build is "
+                    "still running for this world's newest session",
+                )
             return (
                 best,
                 SELECTION_LATEST,
@@ -518,6 +550,24 @@ class WorldBuilderStatusProducer:
                 "a live builder holds this world's writer lock and its session has stopped",
             )
         return best, SELECTION_LIVE, "a live builder holds this world's writer lock"
+
+    def _newest_session_is_being_built(self, store, world_id) -> bool:
+        """Whether this world's newest session has a photographic stage running.
+
+        The same probe `_lifecycle` uses, so the `selection` block and the
+        `lifecycle` block in one payload cannot say opposite things about one
+        world. An unobservable answer is NOT treated as "yes": the selection
+        has no field to carry a caveat, and promoting a world on a probe that
+        just failed would be a guess. `lifecycle` carries the caveat instead.
+        """
+        sessions = store.list_session_ids(world_id)
+        if not sessions:
+            return False
+        latest = self._latest_session(store, world_id, sessions)
+        evidence, _unobservable = _photographic_build_evidence(
+            store, world_id, latest
+        )
+        return evidence is not None
 
     def _newest_session_is_stopped(self, store, world_id) -> bool:
         sessions = store.list_session_ids(world_id)
@@ -1177,10 +1227,122 @@ def _has_session_geometry(store, world_id: str, session_id: str) -> bool:
 # stages.
 _PHOTOGRAPHIC_STAGES = ("surface", "appearance", "dense")
 
+# HOW LONG A `running` STATUS IS BELIEVED WITHOUT MOVING.
+#
+# A ceiling is necessary because the pid probe underneath this one has a
+# documented one-way failure: `store._holder_is_running` treats
+# `psutil.AccessDenied` as ALIVE -- "cannot judge is not dead", which is the
+# right default for a writer lock. So a builder killed mid-surface leaves
+# `status.json` saying `running` under pid P, and if the OS later recycles P
+# onto a process this Tower may not inspect, the status reads alive forever.
+# Nothing else clears it: only another `surfacify()` rewrites the file, and
+# `_stage_running`'s "manifest newer than the status" escape hatch needs a
+# manifest that a killed build never wrote. Without a bound the phone would
+# sit on "Improving" permanently over a finished world -- this module's own
+# lie, pointing the other way.
+#
+# THE NUMBER IS DELIBERATELY LOOSE, because the two errors are not
+# symmetrical. Too tight reintroduces "Saved" in the middle of a real build,
+# which is the failure this whole change exists to kill and which destroys
+# work; too loose only means a wedged status takes longer to clear itself.
+#
+# What the ceiling must clear is the longest SUB-STAGE, not the longest
+# stage: `_status()` rewrites `running` with a fresh `updated_at` at every
+# sub-stage boundary (surface_pipeline.py:651, 673, 696, 1009, 1121, 1264),
+# six writes across a 6-16 minute build. Measured on this machine: surface
+# 374 s and appearance 85-91 s for ~385 keyframes, and a 690-keyframe walk
+# scales about 1.75x, so ~655 s for the longest whole stage. No sub-stage can
+# exceed its stage, so 655 s is a hard upper bound on the longest sub-stage,
+# and it is a generous one -- six boundaries mean the true figure is a
+# fraction of it.
+#
+# One hour is therefore about 5.5x an upper bound that is itself
+# conservative. It could be tightened once someone measures a per-sub-stage
+# histogram on a long walk, and it should not be tightened before that: what
+# this buys is turning "forever" into "an hour", and an hour of a stale
+# "Improving" row costs a wearer patience, while a minute of premature
+# "Saved" costs them the reconstruction.
+_STAGE_STATUS_MAX_AGE_S = 3600.0
 
-def _photographic_build_evidence(store, world_id, session_id) -> str | None:
-    """What is building this session's photographic representation right now,
-    named, or None when nothing is.
+
+def _stage_staleness_probe(stage: str):
+    """`status_is_stale` for one stage, imported at call time.
+
+    ONE STAGE PER CALL, and that is the whole point. The first version of this
+    imported the dense and surface probes inside a single `try`, so a dense
+    module that would not import made this function answer "nothing is
+    building" for surface and appearance too -- the fix silently disabling
+    itself, and the phone back to "Saved". `session_build_running` separates
+    them for exactly this reason and this now matches it.
+    """
+    if stage == "dense":
+        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
+            status_is_stale,
+        )
+        return status_is_stale
+    from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+        status_is_stale,
+    )
+    return status_is_stale
+
+
+def _stage_status_is_fresh(status_path, now: float) -> bool:
+    """Whether a `running` status has moved recently enough to be believed.
+
+    `updated_at` is the pipeline's own clock and is written on every state; a
+    status that lost it falls back to the file's mtime, which is always there
+    and is written by the same atomic replace. See `_STAGE_STATUS_MAX_AGE_S`
+    for why a bound is needed at all and why it is this loose.
+    """
+    written = None
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if isinstance(status, dict):
+            candidate = status.get("updated_at")
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                written = float(candidate)
+    except (OSError, ValueError):
+        return False
+    if written is None:
+        try:
+            written = status_path.stat().st_mtime
+        except OSError:
+            return False
+    return (now - written) <= _STAGE_STATUS_MAX_AGE_S
+
+
+def _stage_status_pid(status_path) -> int | None:
+    try:
+        pid = json.loads(status_path.read_text(encoding="utf-8")).get("pid")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
+
+# WARN ONCE, THEN DEBUG. The status poll runs twice a second, so a persistent
+# import failure would write two warnings a second for the life of the Tower.
+# The payload carries `build_in_progress_unavailable_reason` on every poll, so
+# the log only has to make the failure visible, not repeat it.
+_PROBE_FAILURES_SEEN: set[str] = set()
+
+
+def _warn_probe_failure(message: str) -> None:
+    if message in _PROBE_FAILURES_SEEN:
+        logger.debug(message, exc_info=True)
+        return
+    # Bounded: a flood of DISTINCT messages is itself a bug, and an unbounded
+    # set in a 2 Hz poll would be a slow leak.
+    if len(_PROBE_FAILURES_SEEN) < 64:
+        _PROBE_FAILURES_SEEN.add(message)
+    logger.warning(message, exc_info=True)
+
+
+def _photographic_build_evidence(store, world_id, session_id):
+    """Whether a photographic stage is building this session, and how sure.
+
+    Returns `(evidence, unobservable_reason)`, exactly one of which is
+    non-None, or `(None, None)` for "nothing is building, and that is a real
+    answer".
 
     THE LOCK IS NOT THE ONLY EVIDENCE THAT A WORLD IS STILL BEING BUILT, and
     treating it as the only evidence is what made a phone say "Saved" over a
@@ -1192,35 +1354,46 @@ def _photographic_build_evidence(store, world_id, session_id) -> str | None:
     `scripts/world_build_session.py` marks finalization complete and releases
     the world writer lock in its `finally`, and only THEN runs `--surface`,
     so the phone can read the world while the better picture is being made
-    (`world_builder_render.session_build_running`'s docstring says why,
-    under "Not a promise that nothing will change when it is false"). What
-    was wrong is that `_lifecycle` read "a build is running" off the LOCK
-    alone, and the lock is exactly what that ordering gives up.
+    (`world_builder_render.session_build_running`'s docstring says why, under
+    "Not a promise that nothing will change when it is false"). What was
+    wrong is that `_lifecycle` read "a build is running" off the LOCK alone,
+    and the lock is exactly what that ordering gives up.
 
-    `world_builder_render.session_build_running` already documents this gap
-    -- "there is a gap of up to a registration's length in which this answers
-    `false` and a better picture is still coming" -- and already knows how to
-    close it, because it also reads each stage's own `status.json` and
-    refuses one whose process is gone. This asks it rather than re-deriving
-    it: the same predicate `/render/revision` answers `live` with, so a
-    status poll and a revision poll cannot disagree about the same world.
+    `session_build_running` already knows how to close the gap -- it reads
+    each stage's own `status.json` and refuses one whose process is gone --
+    so this asks it rather than re-deriving it, and adds the one thing it
+    does not have: the age ceiling in `_STAGE_STATUS_MAX_AGE_S`.
 
-    Returns a STRING, not a bool, because `_lifecycle` publishes its evidence
-    to the phone and the honest sentence here is not the lock-held arm's. The
-    lock is released. "A live process holds the writer lock" would be a
-    second untruth told to cover the first.
+    A STRING, not a bool, because `_lifecycle` publishes its evidence to the
+    phone and the honest sentence here is not the lock-held arm's. The lock
+    is released. "A live process holds the writer lock" would be a second
+    untruth told to cover the first.
 
-    Never raises. A probe that cannot read something answers "nothing is
-    building", which is what this said before it existed.
+    IT DOES NOT FAIL SILENTLY, and the first version did. Every probe was
+    wrapped in `except Exception: logger.debug(...)` returning None, so any
+    import or read error quietly restored the behaviour this whole change
+    exists to remove: the Tower answers `ready`, iOS says "Saved" over a
+    world that is still building, and nothing anywhere says why. A reviewer
+    hit it for real -- another lane briefly made `world_builder/surface.py`
+    raise `NameError` at import. The failure mode of a fix must not be the
+    bug it fixes, so a swallowed exception now comes back as the second
+    element, which `_lifecycle` publishes as
+    `build_in_progress_unavailable_reason`, and is logged at WARNING once.
+
+    THE ONE PLACE THIS IS ANSWERED. `world_builder_library` imports it rather
+    than deriving its own, because the panel saying "Improving" while the
+    picker row for the same session says "Complete" is how a wearer decides
+    the world is finished and shuts the Tower down -- the same failure, told
+    twice. Two independent reviewers found that divergence.
     """
     if store is None or world_id is None or session_id is None:
         # A caller that handed over only the record and no store -- the
         # direct `_lifecycle(holder=..., stopped=..., session=...)` callers
         # in `test_world_builder_finalize_cli` and
         # `test_world_builder_lifecycle` do exactly this. No files to probe,
-        # so no claim: the old answer is the honest one for a caller that
-        # asked only about the record.
-        return None
+        # so no claim and no complaint: the old answer is the honest one for
+        # a caller that asked only about the record.
+        return None, None
     try:
         # Imported INSIDE the function, the convention `world_builder_render`
         # itself uses a few lines below `session_build_running`. That module
@@ -1233,50 +1406,147 @@ def _photographic_build_evidence(store, world_id, session_id) -> str | None:
             _stage_running,
             session_build_running,
         )
-        from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
-            status_is_stale as dense_status_is_stale,
+    except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+        detail = client_safe_reason(exc)
+        _warn_probe_failure(
+            f"[Tower][WorldBuilder] the photographic build probe cannot be "
+            f"loaded ({detail}); whether a build is running is now "
+            f"unobservable and the status says so"
         )
-        from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
-            status_is_stale as surface_status_is_stale,
-        )
-
+        return None, f"the photographic build probe could not be loaded: {detail}"
+    try:
         if not session_build_running(store, world_id, session_id):
-            return None
+            return None, None
         world_dir = store.world_dir(world_id)
-        for stage in _PHOTOGRAPHIC_STAGES:
+    except Exception as exc:  # noqa: BLE001 -- documented never to raise; belt too
+        detail = client_safe_reason(exc)
+        _warn_probe_failure(
+            f"[Tower][WorldBuilder] the photographic build gate failed "
+            f"({detail}); whether a build is running is now unobservable"
+        )
+        return None, f"the photographic build probe failed: {detail}"
+    now = time.time()
+    unobservable = None
+    for stage in _PHOTOGRAPHIC_STAGES:
+        # ONE `try` PER STAGE. A module that will not import, or a probe that
+        # throws, must cost this function that stage and nothing else --
+        # `session_build_running` separates its surface and dense probes for
+        # exactly this reason, and the first version of this did not.
+        try:
             status_path = world_dir / stage / session_id / "status.json"
-            is_stale = (
-                dense_status_is_stale if stage == "dense" else surface_status_is_stale
-            )
             # `_stage_running`, NOT a fresh `state == "running"` read. It is
-            # the same per-stage predicate the decision above is made of --
+            # the same per-stage predicate the gate above is made of --
             # staleness AND the published-manifest rule (review 3, R5) -- so
             # the stage this names is a stage that is genuinely running, and
             # the evidence cannot drift from the decision.
-            if not _stage_running(status_path, is_stale):
+            if not _stage_running(status_path, _stage_staleness_probe(stage)):
                 continue
-            try:
-                pid = json.loads(status_path.read_text(encoding="utf-8")).get("pid")
-            except (OSError, ValueError, AttributeError):
-                pid = None
-            where = f"{stage}/{session_id}/status.json"
-            if isinstance(pid, int):
-                return (
-                    f"{where} says 'running' and the process that wrote it "
-                    f"(pid {pid}) is still alive"
-                )
-            return f"{where} says 'running' and its process is still alive"
-    except Exception:  # noqa: BLE001 -- a liveness probe must not 500 a poll
-        logger.debug(
-            "[Tower][WorldBuilder] photographic build probe failed for %s/%s",
-            world_id, session_id, exc_info=True,
-        )
-        return None
-    # `session_build_running` said yes and no stage owns it, which means the
-    # WORLD LOCK was taken between the two calls -- a new capture starting on
-    # this world. The caller's `holder` is the right thing to describe that
-    # and it was read before this; say nothing rather than guess.
-    return None
+            if not _stage_status_is_fresh(status_path, now):
+                # Running, its pid reads alive, and it has not moved in an
+                # hour. See `_STAGE_STATUS_MAX_AGE_S`.
+                continue
+            pid = _stage_status_pid(status_path)
+        except Exception as exc:  # noqa: BLE001 -- this stage only
+            detail = client_safe_reason(exc)
+            _warn_probe_failure(
+                f"[Tower][WorldBuilder] the {stage} liveness probe failed "
+                f"({detail}); a build of that stage would not be reported"
+            )
+            unobservable = f"the {stage} build probe failed: {detail}"
+            continue
+        where = f"{stage}/{session_id}/status.json"
+        if pid is not None:
+            return (
+                f"{where} says 'running' and the process that wrote it "
+                f"(pid {pid}) is still alive"
+            ), None
+        return f"{where} says 'running' and its process is still alive", None
+    if unobservable is not None:
+        # The gate said something is running and the stage that would name it
+        # is the one that threw. "Nothing is building" would be a guess.
+        return None, unobservable
+    # The gate said yes and no stage owns it. Either the WORLD LOCK was taken
+    # between the two calls (a new capture starting on this world, which the
+    # caller's `holder` describes better), or every `running` status is past
+    # the age ceiling. Say nothing rather than guess.
+    return None, None
+
+
+def _still_building(base: dict, building: str | None,
+                    unobservable: str | None = None) -> dict:
+    """The settled answer, corrected by the one present-tense fact it cannot see.
+
+    A SETTLED WORD AND A PRESENT-TENSE CLAIM ARE DIFFERENT QUESTIONS, and
+    returning both from one branch is what conflated them. `state` and
+    `reason` describe what HAPPENED to this session; `build_in_progress`
+    describes whether a process is working on it RIGHT NOW. The first version
+    of this fix owned a branch of its own placed below the two
+    `end_reason in ("error", "interrupted")` arms, which meant it only ever
+    corrected the `end_reason: "stop"` case -- and `"stop"` is not the
+    ordinary shape. Leaving the World Builder screen sends `session/stop`
+    while the capture is still open, so the record reads
+    `end_reason: interrupted` and then finalises complete and solved
+    (`world_builder_library.session_state` says so in its own comments); a
+    walk that trips the recorder's 40-minute bound ends `interrupted` too, by
+    design; and `stop_session(END_REASON_ERROR, ...)` still runs a best-effort
+    final build, so `--surface` still runs after that as well. A reviewer
+    measured the result: `lifecycle: ready, model_state: finalized,
+    build_in_progress: False` beside `/render/revision` saying `live: true`.
+    `finalized` is the word iOS maps to **Saved**. The ninety-second lie, from
+    the common door.
+
+    So this is applied to EVERY stopped arm instead of owning one.
+
+    `LIFECYCLE_FINALIZING`, NOT merely `build_in_progress: True`. iOS reaches
+    "Improving" from `finalizing` AND `buildInProgress == true`; `finalized`
+    with `buildInProgress` still renders "Saved", so flipping the boolean
+    alone would have fixed nothing the wearer can see.
+
+    `finalizing` IS NOT A CLAIM THAT THE WALK WENT WELL. It is a claim that a
+    process is working, which is true here whatever the capture did. What
+    happened to the capture is not erased: the settled arm's evidence and its
+    reason are both carried into the composed strings, so an `error` walk
+    still says `error` and still carries its detail. The settled word comes
+    back on its own as soon as the stage finishes.
+
+    `finalization` travels untouched by way of `**base`: it is the builder's
+    record of the final SOLVE, and the photographic stages are a different
+    fact.
+    """
+    if building is None:
+        if unobservable is None:
+            return base
+        # THE PROBE BROKE, AND A BROKEN PROBE IS NOT AN ANSWER. `False` here
+        # would be the pre-fix claim -- "no build is running" -- asserted on
+        # no evidence, which is how this fix would quietly become the bug it
+        # fixes. `None` plus a reason is what those two fields are for.
+        return {
+            **base,
+            "build_in_progress": None,
+            "build_in_progress_unavailable_reason": unobservable,
+        }
+    settled = base.get("reason")
+    return {
+        **base,
+        "state": LIFECYCLE_FINALIZING,
+        # NOT "a live process holds the writer lock". It does not. The
+        # settled evidence is kept and the live fact is appended, so the
+        # sentence names the file and the pid actually being relied on.
+        "evidence": f"{base['evidence']}, and {building}",
+        "reason": (
+            "the photographic build for this world is still running: the "
+            "surface, appearance and dense stages run after the writer lock "
+            "is released, and the finished world looks very different from "
+            "this one"
+            + (
+                f". What is already recorded about this session: {settled}"
+                if settled
+                else ""
+            )
+        ),
+        "build_in_progress": True,
+        "build_in_progress_unavailable_reason": None,
+    }
 
 
 def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
@@ -1284,6 +1554,55 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
                store=None, world_id: str | None = None,
                session_id: str | None = None) -> dict:
     """What the Tower can SEE about whether a world is being built.
+
+    Two readings, composed. `_lifecycle_from_the_record` answers from the
+    record, the lock and the tree -- everything that is already settled. Then,
+    for a session that has stopped with no live lock, `_still_building`
+    corrects it with the one fact the record cannot hold: whether a
+    photographic stage is working on this session right now.
+
+    THE CORRECTION IS SKIPPED ON EXACTLY TWO KINDS OF ARM, and the
+    condition below says which:
+
+    * `alive` -- the two arms that read a LIVE writer lock. A live lock is
+      strictly better evidence about the same process, and `receiving`
+      deliberately reports `build_in_progress: False` because "frames are
+      arriving" is not "a build is running".
+    * `not stopped` -- a session whose journal has no `session_stopped`. The
+      shipped builder cannot produce a photographic stage for one, and
+      inventing a word for a state nobody has evidence about is how the last
+      three review rounds went.
+
+    Everything else is a stopped session with no live writer, which is the
+    whole window this correction exists for.
+    """
+    base = _lifecycle_from_the_record(
+        holder=holder,
+        stopped=stopped,
+        session=session,
+        geometry_current=geometry_current,
+        has_manifest=has_manifest,
+        has_session_geometry=has_session_geometry,
+        has_readable_figures=has_readable_figures,
+    )
+    alive = holder is not None and holder["alive"]
+    if alive or not stopped:
+        return base
+    building, unobservable = _photographic_build_evidence(
+        store, world_id, session_id
+    )
+    return _still_building(base, building, unobservable)
+
+
+def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
+                              has_manifest, has_session_geometry,
+                              has_readable_figures: bool = False) -> dict:
+    """What the RECORD, the lock and the tree say about this session.
+
+    Everything here is settled: it reads what is already on disk. The one
+    present-tense question -- is a photographic stage working on this session
+    right now -- belongs to `_still_building`, which corrects this answer on
+    every stopped arm. Callers want `_lifecycle`.
 
     This is `IOS-to-Tower.md` 1.1's central ask -- "a start/stop/failed
     signal **distinct from 'frames are arriving'**" -- and the writer lock
@@ -1295,8 +1614,6 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
 
         lock alive, not stopped                 -> receiving
         lock alive, stopped                     -> finalizing
-        no lock, stopped, a photographic stage
-          running for this session              -> finalizing
         lock dead                               -> interrupted
         stopped by error/interrupted, or a
           finalization left pending/interrupted -> interrupted
@@ -1465,60 +1782,6 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
             ),
             "reason": None,
             **_BUILD_UNOBSERVABLE,
-            "finalization": finalization,
-        }
-    # STOPPED, THE LOCK IS GONE, AND A BETTER PICTURE IS STILL BEING MADE.
-    #
-    # Every branch below this one answers a question about what is ON DISK
-    # already -- a finalization record, a manifest, a derived tree -- and
-    # each of them is a settled word: `ready`, `interrupted`,
-    # `stopped_unbuilt`. None of them can be right while a process is still
-    # working on this session, and until now none of them could tell, because
-    # the only liveness this function had was the lock.
-    #
-    # This is where the 2026-09-22 bedroom walk went wrong. The shipped
-    # builder marks finalization complete and releases the lock in its
-    # `finally`, then runs the surface, appearance and dense stages -- so
-    # ninety seconds after Stop the disk says "finalization complete, lock
-    # released, derived tree present", the branch below says READY, iOS maps
-    # `finalized` to **Saved**, and the wearer switched the Tower off with
-    # six to sixteen minutes of photographic reconstruction left to run.
-    #
-    # DELIBERATELY ABOVE the three finalization/manifest branches and
-    # DELIBERATELY BELOW the four that read the lock. The lock arms describe
-    # a live process directly and are strictly better evidence; the disk arms
-    # describe a result, and a result is not final while it is being written.
-    # The `error`/`interrupted` arms stay above it too: how a CAPTURE ended is
-    # a fact about the past that a running surface does not change.
-    #
-    # The probe is `world_builder_render.session_build_running`, which
-    # refuses a `running` status whose pid is dead and a stage that has
-    # already published its manifest -- so a Tower killed mid-surface settles
-    # into the state it was in, and does not sit on a permanent "Improving",
-    # which would be this same lie pointing the other way.
-    building = _photographic_build_evidence(store, world_id, session_id)
-    if building is not None:
-        return {
-            "state": LIFECYCLE_FINALIZING,
-            # NOT "a live process holds the writer lock". It does not. The
-            # evidence names the file and the pid that are actually being
-            # relied on, because the whole point of the state is that it is
-            # true.
-            "evidence": (
-                "session_stopped was written and the writer lock was "
-                f"released, and {building}"
-            ),
-            "reason": (
-                "the photographic build for this world is still running: the "
-                "surface, appearance and dense stages run after the lock is "
-                "released, and the finished world looks very different from "
-                "this one"
-            ),
-            "build_in_progress": True,
-            "build_in_progress_unavailable_reason": None,
-            # UNCHANGED. `finalization` describes the final SOLVE, which
-            # really did complete; the photographic stages are a different
-            # fact and must not overwrite the record of the first.
             "finalization": finalization,
         }
     if finalization is not None and finalization.get("state") != "complete":
