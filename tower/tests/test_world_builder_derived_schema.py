@@ -15,11 +15,16 @@ def test_poses_json_has_exactly_the_documented_keys(derived_world):
     data = json.loads(path.read_text())
 
     assert set(data) == {"poses"}
+    required = {
+        "keyframe_id", "segment_index", "status", "degeneracy",
+        "rotation", "translation",
+    }
+    # `observations` is written only by the global solve (the 3-D points a
+    # keyframe observes); the chain never writes it. Optional, never zero
+    # for a posed row.
+    optional = {"observations"}
     for row in data["poses"]:
-        assert set(row) == {
-            "keyframe_id", "segment_index", "status", "degeneracy",
-            "rotation", "translation",
-        }
+        assert required <= set(row) <= required | optional
 
 
 def test_a_refused_pose_keeps_null_and_not_zero(derived_world):
@@ -55,8 +60,12 @@ def test_points_json_rows_carry_their_segment(derived_world):
     data = json.loads(path.read_text())
 
     assert set(data) == {"points"}
+    required = {"segment_index", "xyz"}
+    # `rgb` is written only by the global solve, which sees the frames the
+    # points came from; the chain never writes it.
+    optional = {"rgb"}
     for row in data["points"]:
-        assert set(row) == {"segment_index", "xyz"}
+        assert required <= set(row) <= required | optional
         assert len(row["xyz"]) == 3
 
 
@@ -68,7 +77,7 @@ def test_derived_manifest_has_exactly_the_documented_keys(derived_world):
         "schema_version", "input_digest", "built_at", "backend_id",
         "session_id", "keyframes", "poses_solved", "poses_refused",
         "poses_anchor", "poses_positioned", "points", "segments",
-        "scale_state",
+        "scale_state", "global_solve",
     }
 
 

@@ -83,7 +83,27 @@ RESULT_TYPE_LIVE = "live"
 # the old id would be a lie about compatibility. Adding `poses_anchor`
 # alone would not have justified this; changing what an existing figure
 # counts does.
-WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-08-25"
+# `/2026-09-06` supersedes `/2026-08-25` because `model_state` gained a
+# word, `interrupted`, and the payload gained `selection` and
+# `lifecycle.finalization`. A phone that implements the older agreement
+# refuses an unknown `model_state` outright (by design: an unknown word is
+# a contract disagreement, not an empty world), so it must be told to
+# update rather than shown a decode failure -- which is exactly what the
+# dated identifier is for.
+# `/2026-09-10` supersedes `/2026-09-06` because a `model_state` a phone
+# already implements now arrives in a state it did not before: a
+# `lifecycle.state: "stopped_unbuilt"` with no geometry projects to
+# `interrupted` rather than `finalizing`. No word was added and nothing
+# is refused by an older phone -- it decodes both -- but a client that
+# switched on `lifecycle.state` and assumed the old projection would draw
+# the wrong screen, silently, which is worse than a decode failure.
+#
+# The rule this file states three paragraphs up is "equality only; a
+# mismatch means we are not talking about the same agreement". Leaving
+# the id alone would have served the old agreement's name over new
+# behaviour. A reviewer caught it still saying `/2026-09-06` after the
+# meaning moved.
+WORLD_BUILDER_STATUS_CONTRACT = "world_builder.status/2026-09-10"
 
 # Scene Understanding's live scene.
 #
@@ -104,13 +124,21 @@ SCENE_LIVE_CONTRACT = "scene_understanding.live/2026-08-27"
 # Document Memory's session status. The library itself is not here; see
 # `DOCUMENT_LIBRARY_CONTRACT` in `tower/results/document_memory.py`, which
 # governs the HTTP surface.
-DOCUMENT_MEMORY_STATUS_CONTRACT = "document_memory.status/2026-08-27"
+#
+# Bumped 2026-09-07 with the library identifier below, and for the same
+# reason: `identity` changed meaning. A record may now carry SIGHTINGS
+# (later observations merged onto it), the session reports them, and a
+# decoder written against "no identity across sightings" would render a
+# merged record as one observation. A shipped decoder exists, so the
+# identifier moves and that decoder says "needs update" -- which is what
+# the identifier is for.
+DOCUMENT_MEMORY_STATUS_CONTRACT = "document_memory.status/2026-09-07"
 
 # Document Memory's library, which travels over HTTP rather than on this
 # channel. Declared all the same -- see `registry.declare`'s
 # `http_contracts` -- because iOS CACHES a declaration, and a contract it
 # can only discover by making a call is a contract it cannot plan around.
-DOCUMENT_MEMORY_LIBRARY_CONTRACT = "document_memory.library/2026-08-27"
+DOCUMENT_MEMORY_LIBRARY_CONTRACT = "document_memory.library/2026-09-07"
 
 # The Experimental CV Lab status document. Restated here rather than
 # imported from `tower/cv_lab/contracts.py`, and a test asserts the two

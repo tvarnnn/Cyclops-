@@ -177,8 +177,10 @@ class SessionMetrics:
         if tx_seq is not None:
             # First tx_seq-bearing frame establishes the counter at 0 gaps;
             # from then on a jump means messages the sender transmitted and
-            # the Tower never received -- genuine transit loss, unlike a
-            # seq gap, which cannot be attributed to any single cause.
+            # this Tower never SAW -- transit loss, unlike a seq gap, which
+            # cannot be attributed to any single cause. A frame this Tower
+            # saw and refused advances the counter too, from
+            # `record_frame_rejected`, so a refusal is not scored as a loss.
             if self.tx_seq_gap_total is None:
                 self.tx_seq_gap_total = 0
             elif self.last_tx_seq is not None and tx_seq > self.last_tx_seq + 1:
@@ -195,7 +197,7 @@ class SessionMetrics:
     def record_frame_processing_error(self) -> None:
         self.frame_processing_errors += 1
 
-    def record_frame_rejected(self) -> None:
+    def record_frame_rejected(self, tx_seq: int | None = None) -> None:
         """Count a frame that arrived but was never recorded.
 
         Every frame answered with a `frame_error` -- invalid_frame,
@@ -206,6 +208,41 @@ class SessionMetrics:
         ``sampling_stride_avg`` detectable.
         """
         self.frames_rejected += 1
+        # A REFUSED FRAME STILL ARRIVED, so it must advance the transmit
+        # counter or the next accepted frame looks like transit loss.
+        #
+        # `record_frame` is the only other place `last_tx_seq` moves, and a
+        # refused frame never reaches it -- so `tx_seq_gap_total`, which
+        # this file calls "genuine transit loss", counted every Tower-side
+        # refusal as a lost message. Measured by an adversarial review: 10
+        # transmitted, 0 lost, and the number reported 3, which was exactly
+        # `frames_rejected`.
+        #
+        # `tx_seq` is None for a message refused BEFORE it decoded -- there
+        # is no frame to read it from -- and that residue is not
+        # attributable by any means this protocol has. `frames_rejected`
+        # is reported beside the gap so the reader can see how much room
+        # for doubt there is.
+        if tx_seq is not None:
+            # THE SAME ARITHMETIC `record_frame` DOES, not just an advance.
+            #
+            # The first version only moved `last_tx_seq`, which fixed the
+            # over-count (a refusal read as a loss) by creating an
+            # UNDER-count: a gap that happened to sit immediately before a
+            # refusal was swallowed whole. Measured by an adversarial
+            # review -- three frames genuinely lost in transit, then a
+            # refused frame, reported as ZERO. That is the worse error, and
+            # it lands on CV Lab, which refuses every frame while its
+            # module is stopped, arming or paused.
+            #
+            # A refused frame is one this Tower SAW. It closes the interval
+            # like any other arrival: whatever was missing before it is
+            # still missing, and it is not itself missing.
+            if self.tx_seq_gap_total is None:
+                self.tx_seq_gap_total = 0
+            elif self.last_tx_seq is not None and tx_seq > self.last_tx_seq + 1:
+                self.tx_seq_gap_total += tx_seq - self.last_tx_seq - 1
+            self.last_tx_seq = tx_seq
 
     def should_log_summary(self) -> bool:
         return (

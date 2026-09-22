@@ -37,9 +37,20 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+
+# Cartridge-blind, like this module: it knows how to start an interpreter
+# as ONE process and how to stop a process tree, and nothing about what
+# the process computes.
+from tower.process_ownership import (
+    assign_to_job,
+    interpreter_environment,
+    interpreter_executable,
+    terminate_tree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +86,18 @@ ATTACH_MODE_FROM_START = "from-start"
 ATTACH_MODE_FROM_NOW = "from-now"
 
 
-def _ask_to_stop(process) -> bool:
+def _ask_to_stop(process, *, send_signal: bool = True) -> bool:
     """Ask a worker to stop, without killing it. Returns whether it was asked.
+
+    TWO HALVES, SEPARABLE SINCE 2026-09-06. `send_signal=False` closes
+    stdin and does nothing else: that is the SOFT request `request_stop`
+    makes on behalf of a cartridge's Stop button, meaning "you are no
+    longer wanted for new frames", which a builder answers by ending its
+    session and writing its final build on its own time. The default sends
+    both halves, and that is the HARD request `shutdown` makes, meaning
+    "wrap up now". The world builder tells them apart (stdin EOF versus
+    `SIGBREAK`); the object memory producer treats both as stop. Neither
+    half is a kill.
 
     THE GRACE WINDOW WAS WAITING ON A REQUEST NOBODY HAD MADE.
 
@@ -166,6 +187,9 @@ def _ask_to_stop(process) -> bool:
                 exc_info=True,
             )
 
+    if not send_signal:
+        return asked
+
     try:
         if os.name == "nt":
             os.kill(process.pid, signal.CTRL_BREAK_EVENT)
@@ -215,6 +239,21 @@ class WorkerSpec:
     # A spec sets this only alongside the argv flag that makes its child
     # watch, so the two halves of the agreement are written in one place.
     stop_via_stdin: bool = False
+    # How long this worker needs to wrap up once ASKED, at shutdown or
+    # detach, before it is terminated. None means "whatever the caller
+    # passes", which is what every spec meant before this existed.
+    #
+    # THE SPEC'S VALUE REPLACES THE CALLER'S WHEN SET. The rule is not
+    # max() and not min(): the spec is the one place that knows what its
+    # worker does when asked -- the world builder ends its session and
+    # writes one final build, which is 30 s on a long walk, and the
+    # object memory producer flushes a queue in well under 3 -- while the
+    # caller (`lifespan`, a `CartridgeSession`) only knows a default that
+    # has to suit every worker at once. A 10 s default against a 30 s
+    # build is exactly how the builder came to be shot mid-finalization
+    # and its world reported `failed` (2026-09-06). The grace is the
+    # BOUND, not the wait: a worker that finishes sooner is reaped sooner.
+    stop_grace_seconds: float | None = None
     # Asked at every capture open: may this spec run right now?
     #
     # None means "always", which is what every spec meant before gates
@@ -250,6 +289,17 @@ class _Worker:
     # destroyed by a change meant to make a DIFFERENT worker's grace
     # useful.
     handles_stop_request: bool = False
+    # Set by `request_stop`. An asked-to-stop worker is still ALIVE -- it
+    # is finishing its final build -- but it will not follow a successor,
+    # and chaining one into it loses the rest of the walk. See
+    # `_attach_to_registry`.
+    stop_requested: bool = False
+    # The Job Object this worker was placed in, or None off Windows and on
+    # a host that refused one. HELD HERE ON PURPOSE: `KILL_ON_JOB_CLOSE`
+    # fires when the last handle closes, so the handle living on this
+    # record is what makes "the Tower died" and "the tree died" the same
+    # event. See `process_ownership.JobHandle`.
+    job: object = None
 
     def is_alive(self) -> bool:
         return self.process.poll() is None
@@ -271,7 +321,10 @@ class _SpecRegistry:
 
     def __init__(self, spec: WorkerSpec) -> None:
         self.spec = spec
-        # lineage root capture id -> worker
+        # lineage root capture id -> worker. A worker that `release` has
+        # taken a lineage away from stays here under a key no capture id
+        # maps to, so that everything iterating this table -- reap,
+        # status, shutdown -- still sees it.
         self.workers: dict[str, _Worker] = {}
         # any capture id -> the lineage root that owns it
         self.roots: dict[str, str] = {}
@@ -287,6 +340,32 @@ class _SpecRegistry:
         for capture_id in worker.lineage:
             if self.roots.get(capture_id) == root:
                 del self.roots[capture_id]
+
+    def release(self, root: str) -> _Worker:
+        """Take a lineage away from its worker WITHOUT forgetting the worker.
+
+        For a worker that has been asked to stop: it is alive, finishing
+        its final build, and will follow nothing further -- so it no
+        longer owns any capture's future, and a fresh worker must be free
+        to take the same capture. `_start` registers under the capture
+        id, and simply starting one would overwrite this worker's entry.
+        That is not a bookkeeping nit: the entry holds the record whose
+        `job` handle keeps the process alive on Windows
+        (`KILL_ON_JOB_CLOSE`), so dropping it would kill the very build
+        the soft stop was letting finish -- and off Windows it would make
+        that build an orphan `status`, `/health` and `shutdown` cannot
+        see, which `request_stop` promised would not happen.
+
+        So the worker moves to a key that is not a capture id and keeps
+        being reaped, reported and shut down like any other. The key is
+        opaque; nothing reads it back.
+        """
+        worker = self.workers.pop(root)
+        for capture_id in worker.lineage:
+            if self.roots.get(capture_id) == root:
+                del self.roots[capture_id]
+        self.workers[f"released:{worker.process.pid}:{root}"] = worker
+        return worker
 
 
 class CaptureWorkerSupervisor:
@@ -501,6 +580,60 @@ class CaptureWorkerSupervisor:
                 stopped += 1
             return stopped
 
+    def request_stop(self, name: str) -> int:
+        """ASK every worker of one spec to stop. Returns how many were asked.
+
+        The soft channel, and nothing but the soft channel: each worker
+        that opted in (`stop_via_stdin`) has its stdin closed, and this
+        returns at once. No signal, no wait, no terminate, and -- the
+        part that matters -- NO FORGETTING. The worker stays in its
+        registry until it exits and `reap` notices, so `status`,
+        `/health` and `following` keep telling the truth about a builder
+        that is spending the next thirty seconds on its final build.
+
+        This is what a World Builder Stop means. The wearer left the
+        workspace; the walk's geometry is still worth finishing, and a
+        builder that is mid-finalization must be allowed to. A Stop that
+        terminated would turn every "I looked at another tab" into an
+        interrupted world -- which is the state the 2026-09-06 walk
+        ended in for a different reason, and it was bad enough once.
+        `shutdown()` remains the hard path.
+
+        A worker that never opted in is not asked and not counted: it has
+        no reader on its stdin, so an EOF would tell it nothing. It is
+        left running and the log says so, because the only thing that
+        will stop it is the next shutdown.
+        """
+        with self._lock:
+            registry = self._registries.get(name)
+            if registry is None:
+                return 0
+            self._reap_locked()
+            asked = 0
+            for worker in registry.workers.values():
+                if not worker.handles_stop_request:
+                    logger.warning(
+                        "[Tower][Worker] %s worker pid %s for capture %s cannot "
+                        "be asked to stop (its spec has no stdin channel); it "
+                        "runs on until it finishes or the Tower shuts down",
+                        registry.spec.name,
+                        worker.process.pid,
+                        worker.capture_id,
+                    )
+                    continue
+                if _ask_to_stop(worker.process, send_signal=False):
+                    asked += 1
+                    worker.stop_requested = True
+                    logger.info(
+                        "[Tower][Worker] asked %s worker pid %s for capture %s "
+                        "to stop (stdin closed); it stays registered until it "
+                        "exits on its own",
+                        registry.spec.name,
+                        worker.process.pid,
+                        worker.capture_id,
+                    )
+            return asked
+
     def capture_closed(self, capture_id: str) -> None:
         """A recording has ended.
 
@@ -626,8 +759,17 @@ class CaptureWorkerSupervisor:
         never enters the pool path at all, and total on a two-cartridge
         one.
         """
+        # Each worker gets ITS SPEC'S grace when the spec names one, and
+        # the caller's otherwise. See `WorkerSpec.stop_grace_seconds` for
+        # why the spec's replaces rather than caps or floors the caller's.
+        def stop(item):
+            registry, _, worker = item
+            return self._stop_worker(
+                worker, _grace_for(registry.spec, grace_seconds)
+            )
+
         if len(pending) == 1:
-            return [self._stop_worker(pending[0][2], grace_seconds)]
+            return [stop(pending[0])]
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -638,12 +780,7 @@ class CaptureWorkerSupervisor:
                 max_workers=min(len(pending), 8),
                 thread_name_prefix="capture-shutdown",
             ) as pool:
-                return list(
-                    pool.map(
-                        lambda item: self._stop_worker(item[2], grace_seconds),
-                        pending,
-                    )
-                )
+                return list(pool.map(stop, pending))
         except RuntimeError:
             logger.warning(
                 "[Tower][Worker] could not start a shutdown pool; stopping "
@@ -653,10 +790,7 @@ class CaptureWorkerSupervisor:
                 "one that dies is still forgotten",
                 len(pending),
             )
-            return [
-                self._stop_worker(worker, grace_seconds)
-                for _, _, worker in pending
-            ]
+            return [stop(item) for item in pending]
 
     # -- reporting ----------------------------------------------------
 
@@ -771,7 +905,28 @@ class CaptureWorkerSupervisor:
         if continues is not None:
             root = registry.roots.get(continues)
             worker = registry.workers.get(root) if root is not None else None
-            if worker is not None and worker.is_alive():
+            if worker is not None and worker.is_alive() and worker.stop_requested:
+                # ALIVE, AND NOT FOLLOWING. This worker has been asked to
+                # stop -- `session/stop`, which is what leaving the World
+                # Builder screen sends -- and is spending its last seconds
+                # on a final build. It will never walk into this capture.
+                # Chaining the successor into it recorded a lineage nobody
+                # served: a dress-rehearsal reviewer cut the link, left the
+                # screen during the outage, came back, and watched 1,200
+                # frames get recorded and built by NOBODY while the phone
+                # showed the "success" sentence. So: fall through and start
+                # a builder on this capture. It builds the second half as
+                # its own world, which is a loss the wearer can see rather
+                # than one they cannot.
+                logger.warning(
+                    "[Tower][Worker] capture %s continues %s, but the %s "
+                    "worker pid %s following it has been asked to stop and "
+                    "is finishing; starting a new builder on the successor "
+                    "instead of chaining into a worker that will not follow",
+                    capture_id, continues, registry.spec.name,
+                    worker.process.pid,
+                )
+            elif worker is not None and worker.is_alive():
                 # The existing follower will walk into this capture by
                 # itself. Record the mapping so the NEXT successor --
                 # which names this capture, not the one we spawned on --
@@ -788,20 +943,52 @@ class CaptureWorkerSupervisor:
                     root,
                 )
                 return False
-            # Either this Tower never saw the predecessor (a restart
-            # mid-walk), or this spec's worker has died. Both mean
-            # nothing is reading this capture FOR THIS SPEC, so follow it.
-            logger.info(
-                "[Tower][Worker] capture %s continues %s but no live %s worker "
-                "owns that lineage; starting one",
-                capture_id,
-                continues,
-                registry.spec.name,
-            )
-        elif registry.owner_of(capture_id) is not None:
-            # Already followed by this spec. Attaching again would put two
-            # producers on one store.
-            return False
+            else:
+                # Either this Tower never saw the predecessor (a restart
+                # mid-walk), or this spec's worker has died. Both mean
+                # nothing is reading this capture FOR THIS SPEC, so
+                # follow it. (An `else`, not a fall-through: the
+                # asked-to-stop branch above used to fall into this line
+                # and log "no live worker owns that lineage" about a
+                # worker it had just named as alive.)
+                logger.info(
+                    "[Tower][Worker] capture %s continues %s but no live %s "
+                    "worker owns that lineage; starting one",
+                    capture_id,
+                    continues,
+                    registry.spec.name,
+                )
+        else:
+            root = registry.roots.get(capture_id)
+            owner = registry.workers.get(root) if root is not None else None
+            if owner is not None and owner.is_alive() and owner.stop_requested:
+                # THE SAME SHAPE AS THE ASKED-TO-STOP BRANCH ABOVE, reached
+                # through `attach()` instead of a successor capture. The
+                # wearer left the World Builder screen (`session/stop` --
+                # this worker was asked to stop and is finishing its final
+                # build, up to ~90 s on a long walk), came back, and
+                # pressed Start while the capture was still recording.
+                # Answering "already followed" here is what
+                # `CartridgeSession` reads as a Start pressed twice -- fine
+                # -- so the session came up `active` with
+                # `attached_capture_id: null`, frames kept being recorded,
+                # and NOBODY built them. A finishing worker does not own
+                # the future of this capture; take the lineage away from
+                # it (it stays registered until it exits, see `release`)
+                # and start a fresh builder, which builds the rest of the
+                # walk as its own world.
+                logger.warning(
+                    "[Tower][Worker] asked to attach to capture %s, but the %s "
+                    "worker pid %s following it has been asked to stop and is "
+                    "finishing; starting a new builder on it instead of "
+                    "reporting it as already followed",
+                    capture_id, registry.spec.name, owner.process.pid,
+                )
+                registry.release(root)
+            elif owner is not None:
+                # Already followed by this spec. Attaching again would put
+                # two producers on one store.
+                return False
 
         return self._start(registry, capture_id, capture_dir, attach_mode)
 
@@ -819,10 +1006,25 @@ class CaptureWorkerSupervisor:
             .replace(PLACEHOLDER_ATTACH_MODE, attach_mode)
             for part in spec.argv
         )
+        # ONE PROCESS, NOT A LAUNCHER PAIR. A spec written against
+        # `sys.executable` -- which is every spec `main.py` builds -- would
+        # on a Windows venv start a launcher that starts the interpreter,
+        # and the pid held here, logged below and reported by `/health`
+        # would be the launcher's. Terminating it kills the interpreter
+        # (the launcher's own job does that) but every grandchild
+        # survives, which is how a solve child outlived its builder on
+        # 2026-09-06. The rewrite lives here rather than at the wiring
+        # point so `main.py` stays a plain argv and no future spec has to
+        # know why it needs this.
+        env = None
+        if argv and argv[0] == sys.executable:
+            argv = (interpreter_executable(), *argv[1:])
+            env = interpreter_environment()
         try:
             process = self._spawn(
                 argv,
                 cwd=spec.cwd,
+                env=env,
                 stdout=None if spec.inherit_output else subprocess.DEVNULL,
                 stderr=None if spec.inherit_output else subprocess.DEVNULL,
                 # See `_ask_to_stop`. The write end lives on the Popen and
@@ -854,6 +1056,11 @@ class CaptureWorkerSupervisor:
             started_at=self._clock(),
             lineage=[capture_id],
             handles_stop_request=bool(spec.stop_via_stdin),
+            # Immediately, so the window in which a grandchild could be
+            # born outside the job is the width of one function return.
+            # None off Windows, on a refused host, and for a stand-in
+            # process in a test; `terminate_tree` copes with all three.
+            job=assign_to_job(process),
         )
         registry.roots[capture_id] = capture_id
         logger.info(
@@ -914,36 +1121,32 @@ class CaptureWorkerSupervisor:
                     worker.capture_id,
                     grace_seconds,
                 )
-        try:
-            process.terminate()
-        except Exception:
-            logger.exception(
-                "[Tower][Worker] could NOT terminate pid %s; it stays in the "
-                "registry so it is still visible to /health and to the next "
-                "shutdown, and nothing else will be attached in its place",
-                process.pid,
-            )
-            return False
-
+        # THE TREE, NOT THE PID. Through the worker's job on Windows, so
+        # a builder's solve child dies with it; by walking descendants
+        # elsewhere. A plain `terminate()` here is what left a solver
+        # running for 32 s after its builder was gone on 2026-09-06.
+        #
         # `terminate()` is asynchronous. On Windows it is
         # `TerminateProcess`, and a `poll()` immediately afterwards
-        # routinely still returns None -- so a worker that WAS killed
-        # would be reported as un-killable, stay in the registry, and
-        # make a Pause report itself as still following a capture.
-        #
-        # This wait is not the grace window that was removed. That one
-        # waited on a process nobody had asked to stop; this one waits on
-        # a process that has just been shot, and it is measured in
-        # milliseconds.
-        try:
-            process.wait(timeout=TERMINATE_TIMEOUT_SECONDS)
+        # routinely still returns None -- so `terminate_tree` waits
+        # `TERMINATE_TIMEOUT_SECONDS` for the process to actually go.
+        # That wait is not the grace window: the grace waited on a
+        # process that had been asked; this waits on one that has just
+        # been shot, and it is measured in milliseconds.
+        if terminate_tree(process, job=worker.job, timeout=TERMINATE_TIMEOUT_SECONDS):
             return True
-        except Exception:
-            logger.warning(
-                "[Tower][Worker] pid %s did not exit within %.1fs of being "
-                "terminated; it stays in the registry so it is still "
-                "visible, and nothing else will be attached in its place",
-                process.pid,
-                TERMINATE_TIMEOUT_SECONDS,
-            )
-            return False
+        logger.warning(
+            "[Tower][Worker] pid %s is not gone within %.1fs of being "
+            "terminated; it stays in the registry so it is still visible, "
+            "and nothing else will be attached in its place",
+            process.pid,
+            TERMINATE_TIMEOUT_SECONDS,
+        )
+        return False
+
+
+def _grace_for(spec: WorkerSpec, caller_grace: float) -> float:
+    """The grace one worker gets: its spec's when set, else the caller's."""
+    if spec.stop_grace_seconds is None:
+        return caller_grace
+    return spec.stop_grace_seconds

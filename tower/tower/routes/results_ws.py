@@ -6,17 +6,28 @@ channel is a side surface that must be able to fail without implicating
 it. Separate module, separate failure domain, and `ws.py` gains four small
 dispatch branches rather than three hundred lines.
 
-Every handler here returns without raising. A malformed subscribe, an
-unknown cartridge, a hostile payload: all become a `result_error` on the
-wire. The receive loop must never learn that the result channel had a
-problem, because the receive loop is what answers frames.
+Every handler here returns without raising -- with ONE exception that is
+not a result-channel problem at all. A malformed subscribe, an unknown
+cartridge, a hostile payload: all become a `result_error` on the wire, and
+the receive loop never learns the result channel had a problem, because the
+receive loop is what answers frames. But a `WebSocketDisconnect` means the
+SOCKET is gone, which is the receive loop's business and not a subscription
+bug; it propagates, so the connection ends cleanly rather than being
+swallowed here and re-surfacing as an uncaught `RuntimeError` from the next
+`receive_json`. See `handle`.
 """
 
+import asyncio
 import logging
+import time
+
+from fastapi import WebSocketDisconnect
 
 from tower.results import registry
 from tower.results.contracts import ENVELOPE_CONTRACT
 from tower.results.publisher import (
+    SNAPSHOT_TIMEOUT_SECONDS,
+    SnapshotTimeout,
     LOCK_TIMEOUT_S,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
     SEND_TIMEOUT_S,
@@ -49,6 +60,10 @@ ERR_UNAVAILABLE = "cartridge_unavailable"
 ERR_TOO_MANY = "too_many_subscriptions"
 ERR_UNKNOWN_SUBSCRIPTION = "unknown_subscription"
 ERR_SNAPSHOT_FAILED = "snapshot_failed"
+# How often the same target's failed first snapshot is logged. Bounded
+# in size as well: cleared when it outgrows a few hundred targets.
+FIRST_SNAPSHOT_WARNING_INTERVAL_S = 30.0
+_LAST_FIRST_SNAPSHOT_WARNING: dict = {}
 
 # How much of a client-supplied identifier comes back in a refusal.
 #
@@ -90,7 +105,12 @@ def _echo_safe(value) -> str:
 
 
 async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
-    """Dispatch one result-channel message. Never raises."""
+    """Dispatch one result-channel message.
+
+    Returns without raising for every result-channel FAULT -- see the module
+    docstring -- but lets a `WebSocketDisconnect` through, because that is
+    the socket dying, not a subscription going wrong.
+    """
     try:
         message_type = message.get("type")
         if message_type == MSG_CARTRIDGES:
@@ -99,6 +119,17 @@ async def handle(message: dict, *, websocket, sender, channel_holder) -> None:
             await _subscribe(message, websocket, sender, channel_holder)
         elif message_type == MSG_UNSUBSCRIBE:
             await _unsubscribe(message, sender, channel_holder)
+    except WebSocketDisconnect:
+        # NOT a result-channel fault, and the one thing the broad handler
+        # below must not eat. A send or a subscribe on a socket the client
+        # has already dropped raises this; swallowing it here leaves the
+        # receive loop to discover the dead socket on its NEXT
+        # `receive_json`, which raises a bare `RuntimeError: WebSocket is
+        # not connected` that ws.py does not catch and uvicorn logs as
+        # "Exception in ASGI application". Propagated, it reaches the
+        # endpoint's own `except WebSocketDisconnect` and the connection
+        # ends the way every other disconnect does.
+        raise
     except Exception:
         # Deliberately broad, and deliberately swallowed after logging.
         # This handler is called from the frame-serving receive loop; an
@@ -276,11 +307,25 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # up to a poll interval to learn anything would make reconnection feel
     # broken, and the whole contract rests on "a subscription always
     # begins with a complete snapshot".
-    import asyncio
 
     try:
-        snapshot = await asyncio.to_thread(
-            hub._snapshot_for, cartridge, result_type, world_id, session_id
+        # THE SAME DEADLINE THE POLL LOOP HAS, because this runs inline in
+        # the connection's message loop: while it waits, nothing else on
+        # this socket is answered. A reviewer injected a 3 s stall and
+        # watched a frame sent behind a subscribe wait the full 3 s for
+        # its `frame_result`, and iOS sends `result_subscribe` on every
+        # reconnect of the World Builder screen. A wedged read here hung
+        # that phone's socket outright. `TimeoutError` is an `Exception`,
+        # so it takes the reply below rather than leaving the client
+        # waiting on an answer that never comes. The thread outlives the
+        # cancel -- bounded at one per subscribe attempt, which is
+        # client-driven and not a 2 Hz loop.
+        # Through the hub's in-flight table, NOT a thread of this call's
+        # own. See `ResultHub.first_snapshot` for the measurement: a
+        # wedged read plus iOS's 2 s stall timeout minted one thread per
+        # reconnect and exhausted the executor in 60 s.
+        snapshot = await hub.first_snapshot(
+            subscription, timeout=SNAPSHOT_TIMEOUT_SECONDS, owner=channel
         )
     except Exception as exc:
         # A subscribe that cannot produce its first snapshot must SAY so.
@@ -288,16 +333,35 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
         # the client waiting on a reply that was never coming -- the
         # silent no-op IOS-to-Tower.md 2.2 rules out, and the worst of the
         # available failures because nothing on either side reports it.
-        logger.exception(
-            "[Tower][Results] could not build the first snapshot for %s/%s",
-            cartridge,
-            result_type,
-        )
+        if isinstance(exc, SnapshotTimeout):
+            # One line, and one line per target per 30 s. A phone
+            # retrying every ~2.5 s against a wedged read logged a full
+            # traceback per attempt -- a reviewer counted 216 lines a
+            # minute; shortened to one line each it was still 120 a
+            # minute from one flapping client.
+            key = (cartridge, result_type, world_id, session_id)
+            now = time.monotonic()
+            last = _LAST_FIRST_SNAPSHOT_WARNING.get(key)
+            if last is None or now - last >= FIRST_SNAPSHOT_WARNING_INTERVAL_S:
+                _LAST_FIRST_SNAPSHOT_WARNING[key] = now
+                if len(_LAST_FIRST_SNAPSHOT_WARNING) > 256:
+                    _LAST_FIRST_SNAPSHOT_WARNING.clear()
+                logger.warning(
+                    "[Tower][Results] could not build the first snapshot for "
+                    "%s/%s: %s (further failures for this target are not "
+                    "logged for %.0fs)",
+                    cartridge, result_type, exc, FIRST_SNAPSHOT_WARNING_INTERVAL_S,
+                )
+        else:
+            logger.exception(
+                "[Tower][Results] could not build the first snapshot for %s/%s",
+                cartridge,
+                result_type,
+            )
         await _error(
             sender,
             ERR_SNAPSHOT_FAILED,
-            f"the Tower could not read this cartridge's state: "
-            f"{type(exc).__name__}",
+            _first_snapshot_failure_message(exc),
             cartridge=cartridge,
             result_type=result_type,
             contract=offer["contract"],
@@ -325,6 +389,30 @@ async def _subscribe(message, websocket, sender, channel_holder) -> None:
     # first snapshot is not a special case a client has to decode twice.
     subscription.offer(snapshot)
     channel._wakeup.set()
+    # AFTER the subscription exists, so the session it may start is one
+    # somebody is already listening to. This is the phone saying "show
+    # me the scene", and for Scene Understanding it is what starts the
+    # detector -- see `tower/scene/live.py`, WHEN IT RUNS.
+    channel_holder.watcher_joined(cartridge, subscription.subscription_id)
+
+
+def _first_snapshot_failure_message(exc: BaseException) -> str:
+    """What the phone is told when its first snapshot could not be built.
+
+    The hub's own timeouts and refusals (`SnapshotTimeout`) say what they
+    waited on and whether this connection was refused, and that text is
+    written for the wire. Anything else -- including a `TimeoutError` a
+    PRODUCER raised from a socket or a filesystem call -- is named by
+    type only: its text may be a stack of internals, and a reviewer
+    measured 534 bytes of path, errno and pid going out when the first
+    version matched on `TimeoutError` alone.
+    """
+    if isinstance(exc, SnapshotTimeout):
+        return str(exc)
+    return (
+        f"the Tower could not read this cartridge's state: "
+        f"{type(exc).__name__}"
+    )
 
 
 async def _unsubscribe(message, sender, channel_holder) -> None:
@@ -340,7 +428,10 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
     subscription_id = _echo_safe(subscription_id)
     channel = channel_holder.existing()
     removed = False
+    cartridge = None
     if channel is not None:
+        existing = channel.get(subscription_id)
+        cartridge = None if existing is None else existing.cartridge
         removed = await channel.remove(subscription_id)
     if not removed:
         await _error(
@@ -353,6 +444,8 @@ async def _unsubscribe(message, sender, channel_holder) -> None:
     await sender.send(
         {"type": MSG_UNSUBSCRIBED, "subscription_id": subscription_id}
     )
+    if cartridge is not None:
+        await channel_holder.watcher_left(cartridge, subscription_id)
 
 
 async def _error(sender, reason: str, message: str, **extra) -> None:
@@ -377,6 +470,36 @@ def _declaration_inputs(websocket) -> dict:
     return registry.declaration_inputs(websocket.app.state)
 
 
+async def _off_loop_even_if_cancelled(function, *args, **kwargs) -> None:
+    """Run `function` on a thread; if this task is cancelled meanwhile,
+    let the thread finish on its own and re-raise.
+
+    A connection teardown must complete whether or not the handler task
+    survives it. `to_thread` alone abandons the await on cancellation and
+    the work with it -- the thread keeps running, but a SECOND
+    cancellation (a test client's teardown delivers several) can land
+    before the thread was even started. Starting a plain thread first
+    guarantees the work happens; awaiting its completion is best effort.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def run():
+        try:
+            function(*args, **kwargs)
+        except Exception:
+            logger.exception("[Tower][Results] teardown hook failed")
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="tower-results-teardown", daemon=True).start()
+    try:
+        await asyncio.to_thread(done.wait, 30.0)
+    except asyncio.CancelledError:
+        raise
+
+
 class ChannelHolder:
     """Lazily creates one ConnectionChannel per WebSocket.
 
@@ -386,11 +509,19 @@ class ChannelHolder:
     task, no event, no registration with the shared reader.
     """
 
-    __slots__ = ("_channel", "_clock")
+    __slots__ = ("_channel", "_clock", "owner", "_live")
 
-    def __init__(self, clock) -> None:
+    def __init__(self, clock, *, owner=None, live=None) -> None:
         self._channel = None
         self._clock = clock
+        # The connection's identity, the same token `ws.py` hands the
+        # recorder and the live cartridges. Demand is reported per
+        # subscription and released per connection, so both need it.
+        self.owner = owner
+        # The `LiveCartridges` demand surface, or None on a Tower with
+        # no live cartridge. Handed in rather than read off `app.state`
+        # so a test can construct a holder without an app.
+        self._live = live
 
     def ensure(self, websocket, sender) -> ConnectionChannel:
         if self._channel is None:
@@ -415,7 +546,44 @@ class ChannelHolder:
     def existing(self):
         return self._channel
 
+    def watcher_token(self, subscription_id: str) -> tuple:
+        return (self.owner, subscription_id)
+
+    def watcher_joined(self, cartridge: str, subscription_id: str) -> None:
+        if self._live is not None:
+            self._live.watcher_joined(
+                cartridge, self.watcher_token(subscription_id), owner=self.owner
+            )
+
+    async def watcher_left(self, cartridge: str, subscription_id: str) -> None:
+        # OFF the event loop: the last watcher leaving reaches
+        # `LiveSession.stop()` and its bounded join, for the same reason
+        # `ws.py` runs `stream_closed` through `to_thread`.
+        if self._live is not None:
+            await asyncio.to_thread(
+                self._live.watcher_left,
+                cartridge,
+                self.watcher_token(subscription_id),
+            )
+
     async def close(self) -> None:
         channel, self._channel = self._channel, None
-        if channel is not None:
+        if channel is None:
+            # Never subscribed, so never a watcher. Returning without an
+            # await keeps this connection's teardown synchronous, which
+            # `ConnectionTracker` relies on: a superseded connection's
+            # teardown must finish before the next one is measured.
+            return
+        try:
             await channel.close()
+        finally:
+            # In a `finally`, because `ConnectionChannel.close` re-raises
+            # a cancellation that is aimed at the connection handler
+            # itself -- and a connection that is being cancelled has
+            # still gone. Its watchers leave with it either way; a
+            # session kept running for a subscription whose socket is
+            # closed would be the leak this method exists to prevent.
+            if self._live is not None:
+                await _off_loop_even_if_cancelled(
+                    self._live.watchers_left, owner=self.owner
+                )

@@ -26,6 +26,87 @@ def _clear_cv_experiment_env(monkeypatch):
     monkeypatch.delenv("TOWER_CV_DEVICE", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_the_default_observation_root(monkeypatch, tmp_path):
+    """No test reads the object memory of whoever owns this checkout.
+
+    `config.DEFAULT_OBSERVATION_ROOT` is `TOWER_ROOT / "data" /
+    "object_memory"`, resolved from `config.py`'s own file location, and
+    that is CORRECT FOR THE PRODUCT. It is the default that was
+    deliberately reversed on 2026-08-26, after a real walk wrote 64
+    observations that every HTTP request answered 404 about: "a default
+    that hides data from its owner while still storing it protects
+    nobody." Nothing here undoes that. An unconfigured Tower still
+    serves; this only changes WHICH directory an unconfigured Tower
+    under test serves out of.
+
+    Because for a TEST the same default means something else entirely.
+    A test that unsets TOWER_OBSERVATION_ROOT does not get a Tower that
+    has observed nothing -- it gets the developer's own accumulated
+    store, and asserts against it. That is a privacy defect first (the
+    suite reads a real wearer's history off disk) and a flake second.
+
+    It is invisible in CI, which is why it survived: `data/` is
+    gitignored, so a fresh clone has an empty default and every
+    "observation_count == 0" passes for the wrong reason. On a machine
+    that has actually been walked around, the same assertion reads
+    `assert 64 == 0` and looks like a mystery.
+
+    A temp directory, not an empty string and not None: "unconfigured"
+    must keep meaning "the default root, whatever it is", so the routes
+    still answer 200 with an empty listing and the 404 path stays
+    reachable only by switching the cartridge off. The directory is not
+    created -- a Tower that has never observed anything has no store
+    directory either, and the read routes have to cope with that.
+
+    Enforced by two tests in `test_config.py`, which fail if this
+    fixture is removed.
+    """
+    from tower import config
+
+    monkeypatch.setattr(
+        config, "DEFAULT_OBSERVATION_ROOT", str(tmp_path / "default_object_memory")
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_default_document_root(monkeypatch, tmp_path):
+    """No test reads the documents of whoever owns this checkout.
+
+    Every word of `_isolate_the_default_observation_root` above applies
+    here unchanged, and this fixture exists because the reasoning was
+    not carried across when Document Memory gained a default root.
+
+    Before 2026-09-07 `config.document_root` had no default: a stock
+    Tower declared the cartridge unavailable and told the wearer to set
+    `TOWER_DOCUMENT_ROOT`. Document Memory V1 fixed that with
+    `DEFAULT_DOCUMENT_ROOT = TOWER_ROOT / "data" / "document_memory"`,
+    which is the same correct product decision Object Memory made a
+    fortnight earlier -- and it inherits the same test hazard, which
+    Object Memory's fixture had already been written to close.
+
+    The hazard is worse for this cartridge, not better. What Document
+    Memory persists is the TEXT OF PAGES a person held in front of their
+    face: an unisolated suite would read a real wearer's correspondence
+    off disk and assert against it. `data/` is gitignored, so on a fresh
+    clone the default is empty and every "no documents recorded" passes
+    for the wrong reason; on a machine that has actually read a page the
+    same assertion fails and looks like a mystery.
+
+    A temp directory, for the same reason as above: "unconfigured" must
+    keep meaning "the default root, whatever it is", so the routes still
+    answer with an empty library and the 404 path stays reachable only by
+    switching the cartridge off with `TOWER_DOCUMENT_ENABLED`. The
+    directory is not created -- a Tower that has never read a page has no
+    store either, and the read routes have to cope with that.
+    """
+    from tower import config
+
+    monkeypatch.setattr(
+        config, "DEFAULT_DOCUMENT_ROOT", str(tmp_path / "default_document_memory")
+    )
+
+
 def _keyframe(session_id: str, seq: int, segment_index: int) -> Keyframe:
     return Keyframe(
         keyframe_id=f"{session_id}:{seq:08d}",
@@ -90,7 +171,7 @@ def derived_world(tmp_path):
         "backend_id": "classical-sfm", "session_id": session_id,
         "keyframes": 4, "poses_solved": 1, "poses_refused": 1,
         "poses_anchor": 2, "poses_positioned": 2, "points": 2,
-        "segments": 2, "scale_state": "unknown",
+        "segments": 2, "scale_state": "unknown", "global_solve": None,
     }
     store.write_derived(world_id, session_id, poses=poses, points=points,
                         manifest=manifest)

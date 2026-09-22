@@ -1210,3 +1210,62 @@ enum ExperimentalCVState: Equatable, Sendable {
         return (run.framesProcessed ?? 0) > 0 ? .measuring : .arrivingButRefused
     }
 }
+
+// MARK: - A command in flight
+
+/// A command this app has sent and the Tower has not yet answered.
+///
+/// ## Why the phone tracks this at all
+///
+/// Every command on this wire is answered immediately and the outcome arrives
+/// as state — that is the shape `ExperimentalCVClient` documents. Between the
+/// tap and the reply, though, the state has not changed, because the document
+/// is the only thing that changes it. So without this the row that was tapped
+/// looked exactly like one that was not, for as long as the reply took, and a
+/// person's reasonable response to a button that did nothing is to press it
+/// again — which on a one-slot Lab is a second start racing the first.
+///
+/// This is deliberately **not** an optimistic state change. The lifecycle
+/// stays where the document put it; this records only that a question was
+/// asked, and which one. `.starting` remains the Tower's own, distinct phase,
+/// drawn from the document, so a person sees two truthful phases: *asked*,
+/// then *loading*.
+///
+/// ## What clears it
+///
+/// A `cv_lab_status` or `cv_lab_error` whose `request_id` matches, the socket
+/// leaving `.online`, or `TowerExperimentalCVClient.replyBoundSeconds` passing.
+/// **A reply with no `request_id` clears nothing.** The status document is also
+/// pushed on the result channel and read on connect, and neither of those
+/// carries a request id; letting them clear this would have the subscription's
+/// heartbeat answer a question it was never asked.
+nonisolated struct CVLabPendingCommand: Equatable, Sendable {
+    let command: CVLabCommand
+    /// The experiment a start named. `nil` for pause, resume and stop, which
+    /// act on whatever run is current.
+    let experimentID: String?
+    /// The `request_id` that went out, and the only thing a reply is matched on.
+    let requestID: String
+    let sentAt: Date
+
+    /// Whether a reply carrying `replyRequestID` answers this command.
+    ///
+    /// `nil` is never a match, by design and not by accident of `Optional`
+    /// comparison: a reply that names no request answers no request.
+    func isAnswered(by replyRequestID: String?) -> Bool {
+        guard let replyRequestID else { return false }
+        return replyRequestID == requestID
+    }
+
+    /// The command as a person would say it, for the one sentence this app
+    /// writes about an unanswered one.
+    var verb: String {
+        switch command {
+        case .status: return "status"
+        case .start: return "start"
+        case .pause: return "pause"
+        case .resume: return "resume"
+        case .stop: return "stop"
+        }
+    }
+}

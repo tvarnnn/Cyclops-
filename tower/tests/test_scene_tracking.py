@@ -411,7 +411,11 @@ class TestAnOcclusionIsNotANewPerson:
         assert tracker.tracks == []
 
     def test_the_stale_window_is_a_second_and_no_longer(self):
-        """One frame before the budget runs out they are still counted."""
+        """One frame before the budget runs out the track is still KEPT.
+
+        Kept is continuity: if they come back now it is the same track.
+        COUNTED is a stronger claim and stops sooner -- see the next test.
+        """
         tracker = Tracker()
         at = 0.0
         for _ in range(6):
@@ -422,7 +426,36 @@ class TestAnOcclusionIsNotANewPerson:
             tracker.update([], at=at)
             at += DELIVERED_FRAME_INTERVAL_S
 
-        assert tracker.count("person") == 1, "still inside the budget"
+        assert len(tracker.confirmed()) == 1, "still inside the budget"
         assert at - 6 * DELIVERED_FRAME_INTERVAL_S == pytest.approx(
             MAX_ABSENCE_S, abs=0.01
         )
+
+    def test_the_count_window_is_half_a_second_and_no_longer(self):
+        """Counted while seen within 0.5 s; kept for 1.0 s.
+
+        Measured 2026-09-07 on labelled sequences: departure lag was the
+        count's largest error, and counting only tracks seen within
+        0.5 s took the exact-count rate from 0.315 to 0.370 with
+        continuity unchanged.
+        """
+        from tower.scene.tracking import MAX_COUNT_ABSENCE_S
+
+        tracker = Tracker()
+        at = 0.0
+        for _ in range(6):
+            tracker.update([_person((100, 100, 200, 400))], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+
+        for _ in range(TrackerPolicy.max_count_misses):
+            tracker.update([], at=at)
+            at += DELIVERED_FRAME_INTERVAL_S
+        assert tracker.count("person") == 1, "still inside the count window"
+        assert at - 6 * DELIVERED_FRAME_INTERVAL_S == pytest.approx(
+            MAX_COUNT_ABSENCE_S, abs=0.01
+        )
+
+        tracker.update([], at=at)
+        assert tracker.count("person") == 0, "no longer counted"
+        assert len(tracker.confirmed()) == 1, "but still kept"
+        assert TrackerPolicy.max_count_misses < TrackerPolicy.max_misses

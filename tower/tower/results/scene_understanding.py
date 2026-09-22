@@ -79,7 +79,18 @@ from tower.scene.live import (
     STATE_STOPPED,
 )
 from tower.scene.records import FACING_UNKNOWN
-from tower.scene.state import REFUSED_RELATIONSHIPS, describe_position
+from tower.scene.state import (
+    REFUSED_RELATIONSHIPS,
+    SIDE_HYSTERESIS,
+    SIDE_LEFT_BELOW,
+    SIDE_RIGHT_ABOVE,
+    SIZE_LARGE,
+    SIZE_MEDIUM,
+    SIZE_SMALL,
+    SIZE_UNKNOWN,
+    apparent_size,
+    describe_position,
+)
 
 # The three sentences above, as values a decoder can switch on.
 SCENE_CLAIM = "visible-now-not-a-record"
@@ -96,20 +107,29 @@ COUNT_BASIS = "confirmed-tracks"
 # move because a set iterated differently.
 REPORTED_CLASSES = tuple(sorted(CLASSES_OF_INTEREST))
 
-# `person` is excluded from `where`, and the exclusion is the point.
-POSITION_EXCLUDED_LABELS = ("person",)
+# Since 2026-09-07 nothing is excluded from `where`: "is there a person
+# on my left" is one of the questions this cartridge exists to answer,
+# and a side count for people is a count, not a track. The earlier
+# refusal reasoned that a per-person position sampled repeatedly is a
+# movement trace; three buckets of counts, with no handle to join two
+# payloads by, carry no more of a trace than the counts already do.
+POSITION_EXCLUDED_LABELS = ()
 
 # When these were measured, and on what. Carried on every payload,
 # because a measurement asserted in the present tense reads as current
 # state -- and this platform's corpus grows continuously, so it is not.
 COUNT_MEASUREMENT = {
-    "measured_at": "2026-08-26",
-    "corpus_frames": 14128,
-    "corpus_captures": 28,
-    "is_current": False,
+    "measured_at": "2026-09-07",
+    "corpus_frames": 700,
+    "corpus_captures": 0,
+    "is_current": True,
     "note": (
-        "the corpus on this host has grown since. These figures describe "
-        "the frames they were measured on and have not been re-derived"
+        "accuracy was measured on 700 human-labelled COCO val2017 images "
+        "resized to this camera's 640 px long side -- third-party stills, "
+        "not this camera -- because the 45,594-frame corpus on this host "
+        "contains no bystander. Latency was measured on 300 real corpus "
+        "frames. Nothing here is validated on a person seen through these "
+        "glasses"
     ),
 }
 
@@ -117,53 +137,57 @@ COUNT_LIMITATIONS = (
     {
         "limitation": "size-floor",
         "detail": (
-            "the detector is effectively blind below ~2% of frame area: "
-            "recall 0.000 under 1% and 0.009 at 1-2%, measured over 14,128 "
-            "real frames against a fasterrcnn_resnet50_fpn_v2 oracle"
+            "small things are missed. On the labelled images the CUDA "
+            "detector (RT-DETRv2-R18, at its 0.5 floor) finds 0.40 of "
+            "objects under 1% of frame area, 0.64 at 1-2%, 0.74 at 2-5%, "
+            "0.81 at 5-20% and 0.88 above 20%; the CPU detector "
+            "(SSDLite320, at 0.4) finds 0.00, 0.04, 0.36, 0.62 and 0.81. "
+            "`detector` on this payload says which one counted"
         ),
     },
     {
         "limitation": "recall",
         "detail": (
-            "class recall against the same oracle: 0.306 person, 0.730 "
-            "laptop, 0.497 cell phone, 0.388 chair, 0.209 tv, 0.108 couch. "
-            "The oracle shares COCO training data with the shipped model, "
-            "so every one is an upper bound, not an estimate. The two "
-            "worst are furniture -- couch 0.108 and chair 0.161 by the "
-            "stricter of the two measures -- and both are reported by "
-            "this payload, so 0.209 is not the floor"
+            "per-class AP50 on the labelled images, CUDA detector: 0.86 "
+            "person, 0.83 laptop, 0.82 tv, 0.86 mouse, 0.71 keyboard, "
+            "0.71 bed, 0.67 couch, 0.68 bottle, 0.63 cup, 0.55 cell phone, "
+            "0.54 chair, 0.50 dining table, 0.35 book. CPU detector: 0.60 "
+            "person, 0.55 laptop, 0.56 tv, 0.20 chair, 0.09 book. Across "
+            "the 13 classes the CUDA detector's recall at its floor is "
+            "0.61 for a precision of 0.70; a count is a floor"
         ),
     },
     {
-        "limitation": "noise-classes",
+        "limitation": "people-count-accuracy",
         "detail": (
-            "chair appeared in 4 of 340 sampled corpus frames and dining "
-            "table once in 9,199. Their counts and positions are published "
-            "as detector output, not as evidence that a chair was there. "
-            "The wire-path design excluded them for exactly this reason; "
-            "they are published with the disclosure instead, because a "
-            "class silently absent from `reported_classes` would be "
-            "indistinguishable from one that was looked for and not seen"
+            "on 700 labelled stills the CUDA detector's per-image count "
+            "of people is exact on 73% of images with a mean error of "
+            "0.48 people (CPU detector at its 0.4 floor: 66%, 1.15). "
+            "Those are stills of other people's photographs, the same "
+            "700 the operating threshold was chosen on; no count has "
+            "been checked against a person standing in front of these "
+            "glasses"
         ),
     },
     {
         "limitation": "departure-lag",
         "detail": (
-            "a confirmed track keeps being counted for up to 12 further "
-            "OBSERVED frames after its last detection -- 1.0 s at the "
+            "a confirmed track keeps being counted for up to 6 further "
+            "OBSERVED frames after its last detection -- 0.5 s at the "
             "measured 12.0 fps delivery, and longer whenever "
             "frames_skipped is advancing, because the bound is a frame "
             "count and not a duration. A count can therefore include "
-            "someone who has already left. Confirmation is latched on "
-            "purpose: it is what stops the count flickering when the "
-            "detector drops a frame"
+            "someone who left within the last half second. Confirmation "
+            "needs 3 consecutive detections, so someone who just arrived "
+            "is counted about a quarter of a second late"
         ),
     },
     {
         "limitation": "field-of-view",
         "detail": (
-            "a count is about the camera's forward cone at this instant, "
-            "never about the room. Most of a room is behind the wearer"
+            "a count is about the camera's 45-degree forward cone at this "
+            "instant, never about the room. Most of a room is behind the "
+            "wearer"
         ),
     },
 )
@@ -217,6 +241,28 @@ VOLATILE_PATHS = (
     "lifecycle.ready_at",
     "lifecycle.loading_seconds",
     "people.oldest_estimate_seconds",
+    # How many are streaming and watching is diagnostics about the
+    # channel, not news about the scene. A subscriber joining must not
+    # mint an envelope for every other subscriber.
+    "lifecycle.demand.streams",
+    "lifecycle.demand.watchers",
+    "lifecycle.demand.operator_hold",
+)
+
+# The one thing the aggregates cannot hide, stated rather than left to
+# be discovered. With exactly one person in view, `where.person`,
+# `by_apparent_size` and `facing_wearer` describe that one person --
+# which is the product question ("is there a person on my left, facing
+# me") and is what the wearer's own camera preview already shows. What
+# stays refused is what would make it a RECORD: no handle to join two
+# payloads, nothing persisted, a session-scoped `session_id` that
+# forbids comparison across sessions, and the client obligation
+# (§12 of the contract) never to store a sequence of these.
+SINGLE_PERSON_NOTE = (
+    "with one person in view the side, size and facing counts describe "
+    "that person for as long as they are in view. Nothing here is kept, "
+    "nothing joins two payloads, and a client must not store a sequence "
+    "of them; the phone's own camera preview shows the same and more"
 )
 
 # Why there is no entity list, as a value rather than an absence.
@@ -269,12 +315,34 @@ REFUSED_ENTITY_FIELDS = (
 # coarse signed bearing under another name, and the same warning applies
 # to it.
 SIDE_CONVENTION = (
-    "the wearer's own left and right, as the camera sees them. A track is "
-    "'left' when its box centre falls below 0.45 of frame width in the "
-    "frame as received, 'right' above 0.55, 'centre' between the two, and "
-    "'unknown' when the frame size was never learned. The stream is "
-    "assumed unmirrored and nothing on this wire verifies that. It is "
-    "camera-relative and changes when the wearer turns their head"
+    "the wearer's own left and right, as the camera sees them. A thing is "
+    f"'left' when its box centre falls below {SIDE_LEFT_BELOW} of frame "
+    f"width in the frame as received, 'right' above {SIDE_RIGHT_ABOVE}, "
+    "'centre' between the two -- about 14 degrees of this camera's 45 -- "
+    f"with {SIDE_HYSTERESIS} of hysteresis so a thing on a line keeps its "
+    "word, and 'unknown' when the frame size was never learned. The "
+    "stream is assumed unmirrored and nothing on this wire verifies that. "
+    "It is camera-relative and changes when the wearer turns their head"
+)
+
+# What the size words mean, and what they do not.
+APPARENT_SIZE_NOTE = (
+    "how much of the frame's height a person's box takes: 'large' is 0.6 "
+    "or more, 'small' under 0.3, 'medium' between. For a standing adult "
+    "larger usually means nearer -- about 2 m at 0.6 through this lens -- "
+    "but a seated person, a child or a figure cut off by the frame edge "
+    "breaks that, so these are sizes in the picture and never distances"
+)
+
+# What a partial figure at the bottom edge is, and why it is kept apart.
+PARTIAL_BOTTOM_EDGE_NOTE = (
+    "person boxes with no head region in view -- their top starts below "
+    "the middle of the frame -- or that span the frame's width down to "
+    "its bottom edge. From a camera worn at head height that is most "
+    "often the wearer's own hands, arms, lap or legs; it can also be "
+    "somebody's legs under a table. Either way the camera saw part of a "
+    "figure, not a person in front of the wearer, so these are counted "
+    "here and not in `count`"
 )
 
 # The states in which the scene below is being refreshed. `paused` is
@@ -373,22 +441,21 @@ def _people_block(state) -> dict:
         ]
         oldest = max(ages) if ages else None
     elif state.orientation_enabled:
-        # Enabled, and every estimate has expired. `orientation_enabled`
-        # latches on ONE lifetime success, and an estimate ages out to
-        # unknown after 6 s -- so a pose model that succeeded once and
-        # then failed for good would have taken the branch above forever
-        # and published `facing_wearer: 0` while measuring nothing.
+        # Enabled, and no person currently has an established orientation.
+        # `orientation_enabled` latches on ONE lifetime success and an
+        # estimate ages out to unknown after 6 s -- so an estimator that
+        # succeeded once and then failed for good would have taken the
+        # branch above forever and published `facing_wearer: 0` while
+        # measuring nothing.
         #
-        # Zero is an answer. "Every estimate has expired" is not, and
-        # this is the one field on this payload where the difference is
-        # most likely to be mistaken for data.
+        # Zero is an answer. "Nothing is established" is not, and this is
+        # the one field on this payload where the difference is most
+        # likely to be mistaken for data. The reason says WHICH kind of
+        # not-established it is -- a reviewer found the first version
+        # asserting an expiry that had not happened for a person whose
+        # face was simply not found.
         facing = None
-        reason = (
-            "every person's orientation estimate has expired -- none was "
-            "refreshed within the 6 s the estimator's own staleness bound "
-            "allows. Reporting 0 would be an observation gap presented as "
-            "an observation of absence"
-        )
+        reason = _not_established_reason(people)
         oldest = max(
             (
                 track.facing.age_seconds
@@ -407,39 +474,89 @@ def _people_block(state) -> dict:
         )
         oldest = None
         unknown = None
+    sizes = {SIZE_LARGE: 0, SIZE_MEDIUM: 0, SIZE_SMALL: 0, SIZE_UNKNOWN: 0}
+    for track in people:
+        sizes[apparent_size(track, state.frame_height)] += 1
     return {
         "count": len(people),
         # A category, never an identity. There is no list here, no handle,
         # and nothing a client could join across two of these payloads.
         "may_include_wearer": True,
         "validated": False,
+        "partial_bottom_edge": len(state.partial_people),
+        "partial_bottom_edge_note": PARTIAL_BOTTOM_EDGE_NOTE,
+        "by_apparent_size": sizes,
+        "apparent_size_note": APPARENT_SIZE_NOTE,
         "facing_wearer": facing,
         "facing_answered": bool(facing is not None),
         "facing_unavailable_reason": reason,
         "facing_unknown": unknown,
-        # The four-state enum `IOS-to-Tower.md` 4.2 asks for is not
-        # served: `away_from_wearer` and `profile` have no bucket, so
-        # `count - facing_wearer - facing_unknown` is an undifferentiated
-        # remainder rather than a fifth category. Stated rather than left
-        # to be inferred from arithmetic that does not close.
+        # Two states are produced and the other two of the enum
+        # `IOS-to-Tower.md` 4.2 asks for are not, and the reason is now
+        # measurement rather than privacy: nothing evaluated on this
+        # platform can say "away" or "side-on" with usable precision
+        # (0.02-0.34 on 966 labelled persons), so `unknown` means "not
+        # established" and covers both.
         "facing_states_reported": ["facing_wearer", "unknown"],
         "facing_states_withheld": ["away_from_wearer", "profile"],
         "facing_states_withheld_reason": (
-            "a per-person facing state is per-person state. Publishing "
-            "the full enum as counts would narrow to one person's "
-            "orientation the moment only one person is in view"
+            "'facing away' and 'side-on' are never claimed: no method "
+            "measured on this platform produces them with usable "
+            "precision, so a person who is not established as facing the "
+            "wearer is reported as unknown, whichever way they face"
         ),
         "oldest_estimate_seconds": oldest,
+        "orientation_method": state.orientation_method,
+        "orientation_status": "experimental",
+        "orientation_validation": (
+            "a face detector on each tracked person's box; 'facing' needs "
+            "a strong face in two of the last three estimates, about half "
+            "a second. Measured at 0.83 precision and 0.64 recall on 966 "
+            "human-labelled persons in COCO stills, where 47% of people "
+            "face the camera. At the same recall and false-positive rate, "
+            "a room where only 10-20% of people face the wearer at a given "
+            "instant would give roughly 0.4-0.6 precision: about half of "
+            "the 'facing' claims could be wrong there. Never measured on a "
+            "person seen through these glasses"
+        ),
         # The wording is part of the contract. `IOS-to-Tower.md` 4.2: this
         # is body/head orientation relative to the camera, it is NOT gaze,
         # and there is no eye tracking on the target glasses.
         "facing_note": (
-            "coarse head and body orientation relative to the camera. "
-            "Render as 'facing your direction'; there is no eye tracking "
-            "on this platform, so it cannot establish what anyone was "
-            "looking at or whether they noticed the wearer"
+            "whether the front of a person's head is visible to the "
+            "camera. Render as 'appears to be facing your direction'; "
+            "there is no eye tracking on this platform, so it cannot "
+            "establish what anyone was looking at or whether they noticed "
+            "the wearer"
         ),
     }
+
+
+def _not_established_reason(people) -> str:
+    """Why no person has an established orientation, from their evidence."""
+    expired = sum(
+        1
+        for track in people
+        if track.facing.age_seconds is not None and track.facing.age_seconds > 6.0
+    )
+    never = sum(1 for track in people if track.facing_estimated_at is None)
+    looked = len(people) - expired - never
+    parts = []
+    if looked:
+        parts.append(
+            f"{looked} looked at and no face established (none found, too "
+            "weak, or the box too small)"
+        )
+    if never:
+        parts.append(f"{never} not yet estimated")
+    if expired:
+        parts.append(f"{expired} with an estimate older than the 6 s bound")
+    return (
+        "no person currently has an established orientation: "
+        + ", ".join(parts)
+        + ". Reporting 0 would be an observation gap presented as an "
+        "observation of absence"
+    )
 
 
 def _lifecycle_block(status: dict) -> dict:
@@ -464,6 +581,12 @@ def _lifecycle_block(status: dict) -> dict:
         # True is the default and is what makes the cartridge reachable
         # from a phone, which sends nothing when a cartridge is opened.
         "follows_stream": bool(status.get("follows_stream", False)),
+        # Why the session is or is not running, as counts: how many
+        # connections are streaming frames, how many subscriptions are
+        # watching this live result, and whether an operator is holding
+        # it open by hand. `runs_when` is the rule, pinned as a word.
+        # Counts and never tokens -- a subscription id would be a handle.
+        "demand": dict(status.get("demand") or {}),
     }
 
 
@@ -562,6 +685,7 @@ def live_payload(status: dict, state) -> dict:
         # has to interpret.
         "tracks": None,
         "tracks_absent_reason": TRACKS_ABSENT_REASON,
+        "single_person_note": SINGLE_PERSON_NOTE,
         "refused_entity_fields": [dict(entry) for entry in REFUSED_ENTITY_FIELDS],
         "side_convention": SIDE_CONVENTION,
         "relations": None,
@@ -577,9 +701,9 @@ def live_payload(status: dict, state) -> dict:
         ],
         "where_excludes": list(POSITION_EXCLUDED_LABELS),
         "where_excludes_reason": (
-            "a per-person position, sampled repeatedly, is a movement "
-            "trace. This cartridge keeps none and will not hand a client "
-            "the parts to assemble one"
+            "nothing is excluded. `where.person` is side COUNTS for people "
+            "-- left, centre, right -- with no handle that could join two "
+            "payloads into a movement trace"
         ),
     }
 

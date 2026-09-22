@@ -300,7 +300,24 @@ class TestBitIdenticalEquivalence:
     def test_extend_reports_only_the_structure_that_keyframe_added(
         self, sequences, intrinsics
     ):
-        """`new_points` is a delta, and the deltas must sum to the map."""
+        """`new_points` is a delta, and the deltas account for the map.
+
+        The sum used to EQUAL the snapshot. It no longer can, and the
+        difference is a real contract change worth stating rather than
+        papering over: the local bundle adjustment can move a landmark
+        somewhere its own observations no longer support, and
+        `_local_adjust` then retires it from publication. A delta is
+        therefore what the backend believed when it emitted it, and
+        `snapshot()` is what it believes now.
+
+        The shortfall is not slack. It is EXACTLY the number of
+        landmarks the adjustment retired, which is what this asserts --
+        a delta that vanished for any other reason would fail here.
+
+        A live viewer must consequently re-read `snapshot()` rather than
+        append deltas forever. Nothing in production does either today:
+        `Extension.new_points` is read by no code outside this test.
+        """
         window = sequences["strafe"]
         backend = ClassicalTwoViewBackend()
         backend.begin(intrinsics)
@@ -312,7 +329,12 @@ class TestBitIdenticalEquivalence:
             if step.new_points is not None:
                 added += len(step.new_points)
 
-        assert added == len(backend.snapshot().points)
+        published = len(backend.snapshot().points)
+        assert added - published == backend._chain.demoted, (
+            f"deltas summed to {added}, snapshot publishes {published}, and "
+            f"the adjustment retired {backend._chain.demoted} -- those three "
+            f"must reconcile exactly"
+        )
 
 
 # -- segments are independent windows, and must stay so ----------------
@@ -365,7 +387,8 @@ class TestSegmentIsolation:
         assert chain.absolute == {}
         assert chain.poses == []
         assert chain.broken is None
-        assert chain.previous_features is None
+        assert chain.references == []
+        assert chain.failures == 0
 
 
 # -- the refusal to invent intrinsics survives the new entry point -----
@@ -672,6 +695,15 @@ def _observe_all(store, payloads, intrinsics, *, rebuild_every=0, redactor=None)
             continue
         accepted += 1
         since += 1
+        # A HAND-ROLLED GATE, deliberately, and it is not the production
+        # one: `main()` widens the interval with the world
+        # (`rebuild_interval`). These walks are well under the 600-keyframe
+        # knee, where the two agree exactly, and the property under test --
+        # that a mid-walk rebuild does not change the final result -- is
+        # about rebuilding AT ALL, not about the cadence. Flagged by a
+        # reviewer as pinning a schedule production no longer uses; the
+        # answer is that it pins no schedule, and saying so is cheaper than
+        # importing the CLI into a unit test.
         if rebuild_every and since >= rebuild_every and accepted >= 2:
             engine.build(world_id, session_id)
             since = 0
@@ -866,3 +898,79 @@ class TestTheEngineFlushesRatherThanResolves:
         # rather than being handed the second session's solve.
         rebuilt = WorldBuilderEngine(store).build(world_id, first_session)
         assert rebuilt.points == first.points
+
+
+def test_a_frame_of_a_different_size_does_not_kill_the_walk(tmp_path):
+    """An unguarded C assertion on the live frame path.
+
+    `MotionTracker.measure` feeds this frame and a stored reference frame
+    straight into `cv2.calcOpticalFlowPyrLK`, which asserts they are the
+    same size -- in C, as a `cv2.error`, which is not a `ValueError` and
+    walks past `observe`'s decode guard. `world_build_session.py` catches
+    only `OSError` around the frame loop, so it reaches the outermost
+    `except BaseException`: session `end_reason: error`, finalization
+    `interrupted`, every remaining frame discarded.
+
+    A reviewer drove it through a real Tower -- 220 frames with a
+    resolution change at frame 120 -- and watched a wearer who walked the
+    whole room get "Interrupted".
+
+    Rejecting is the correct answer, not merely the safe one: the
+    calibration is per-resolution and exact, so a frame at a size this
+    session is not calibrated for could not have produced a usable pose.
+    """
+    import numpy as np
+
+    from tests import synthetic_scene as ss
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    width, height = 480, 360
+    camera_matrix = ss.camera_matrix(width, height)
+    scene = ss.furnished_room()
+    poses = ss.strafe(8, step=0.09)
+    images = ss.render_sequence(scene, poses, camera_matrix, width, height)
+
+    engine = WorldBuilderEngine(WorldStore(tmp_path / "worlds"))
+    world_id = engine.create_world("Rung Change")
+    session_id = engine.start_session(
+        world_id,
+        intrinsics=CameraIntrinsics(
+            source="self_calibrated", model="pinhole",
+            fx=float(camera_matrix[0, 0]), fy=float(camera_matrix[1, 1]),
+            cx=float(camera_matrix[0, 2]), cy=float(camera_matrix[1, 2]),
+            calibrated_width=width, calibrated_height=height,
+        ),
+        frame_source="synthetic",
+        declared_size=(width, height),
+    )
+    try:
+        for index, image in enumerate(images[:4]):
+            engine.observe(ss.encode_jpeg(image), source_seq=index, wire_seq=index)
+
+        # THE RUNG CHANGE. A perfectly decodable JPEG of another size.
+        smaller = np.ascontiguousarray(images[4][:288, :384])
+        result = engine.observe(ss.encode_jpeg(smaller), source_seq=4, wire_seq=4)
+        assert result is not None
+        assert getattr(result, "reason", None) == "frame_size_changed", result
+
+        # ...and the walk carries on. This is the half that matters: the
+        # remaining frames were being discarded with the session.
+        for index, image in enumerate(images[5:], start=5):
+            engine.observe(ss.encode_jpeg(image), source_seq=index, wire_seq=index)
+
+        summary = engine.stop_session()
+        assert summary is not None
+    finally:
+        try:
+            engine.stop_session()
+        except Exception:
+            pass
+
+    store = WorldStore(tmp_path / "worlds")
+    session = store.read_session(world_id, session_id)
+    assert session.end_reason != "error", (
+        "one frame of the wrong size ended the whole walk"
+    )
+    assert session.keyframes_accepted > 0

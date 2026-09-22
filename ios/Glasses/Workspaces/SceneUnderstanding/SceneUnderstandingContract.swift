@@ -201,7 +201,8 @@ enum SceneUnderstandingDecoder {
             refusals: refusals(from: payload),
             observation: observation,
             unavailableReason: unavailableReason,
-            unavailableReasonText: unavailableText
+            unavailableReasonText: unavailableText,
+            singlePersonNote: payload["single_person_note"] as? String
         )
     }
 
@@ -304,7 +305,13 @@ enum SceneUnderstandingDecoder {
             facingStatesReported: json["facing_states_reported"] as? [String] ?? [],
             facingStatesWithheld: json["facing_states_withheld"] as? [String] ?? [],
             facingStatesWithheldReason: json["facing_states_withheld_reason"] as? String,
-            facingNote: json["facing_note"] as? String
+            facingNote: json["facing_note"] as? String,
+            // 2026-09-07 additions, every one optional: an older Tower omits
+            // them and the defaults add nothing.
+            partialBottomEdge: json["partial_bottom_edge"] as? Int ?? 0,
+            byApparentSize: json["by_apparent_size"] as? [String: Int] ?? [:],
+            apparentSizeNote: json["apparent_size_note"] as? String,
+            orientationStatus: json["orientation_status"] as? String
         )
     }
 

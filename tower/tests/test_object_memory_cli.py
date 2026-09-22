@@ -94,13 +94,27 @@ class TestSessionDriver:
         )
 
     def test_a_missing_capture_directory_exits_nonzero(self, tmp_path):
+        # `--root` is not decoration. Without it this CLI defaults to
+        # `DEFAULT_OBSERVATION_ROOT`, which is the DEVELOPER'S OWN store
+        # inside the checkout -- and this spawn is a subprocess, so no
+        # fixture in this suite can reach it. It writes nothing today
+        # only because the guard it hits happens to be eager; that is a
+        # property of two other functions, not of this test.
+        root = tmp_path / "root"
+
         assert (
             _run(
                 "object_memory_session.py",
+                "--root",
+                str(root),
                 "--follow-capture",
                 str(tmp_path / "absent"),
             ).returncode
             != 0
+        )
+        assert not root.exists(), (
+            "a session that could not start created its observation store "
+            "anyway"
         )
 
     def test_it_reads_the_journal_rather_than_globbing_when_there_is_one(

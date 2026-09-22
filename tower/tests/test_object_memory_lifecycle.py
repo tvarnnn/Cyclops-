@@ -24,6 +24,8 @@ is the WIRING and the STATE MACHINE, which is where every one of the four
 steps actually lived.
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -147,13 +149,26 @@ def test_starting_mid_walk_attaches_to_the_capture_already_recording(app, client
 # -- the gate: a stopped cartridge remembers nothing -------------------
 
 
-def test_a_capture_opening_with_no_session_attaches_no_producer(app):
+WORLD_BUILDER_SESSION_URL = "/cartridges/world_builder/session"
+
+
+def test_a_capture_opening_with_no_session_attaches_nothing(app):
     """Armed is not recording, and the default is armed.
 
-    The builder still attaches: a world is geometry and this Tower is
-    configured to build one. The memory of which objects were around is
-    the one that waits to be asked for.
+    Since 2026-09-06 the builder is gated too: a world is geometry, but a
+    builder with its background solves attached to every capture -- a CV
+    Lab camera session included -- and the only way to run another
+    cartridge without it was a Tower restart. Each cartridge's producer
+    now waits to be asked for.
     """
+    _open_capture(app)
+
+    assert _producers(app) == []
+    assert _builders(app) == []
+
+
+def test_a_capture_opening_with_world_builder_active_attaches_only_a_builder(app, client):
+    client.post(f"{WORLD_BUILDER_SESSION_URL}/start")
     _open_capture(app)
 
     assert _producers(app) == []
@@ -161,6 +176,7 @@ def test_a_capture_opening_with_no_session_attaches_no_producer(app):
 
 
 def test_pausing_stops_the_producer_and_leaves_the_builder_alone(app, client):
+    client.post(f"{WORLD_BUILDER_SESSION_URL}/start")
     client.post(f"{SESSION_URL}/start")
     _open_capture(app)
     producer = _producers(app)[0]
@@ -365,3 +381,81 @@ def test_the_session_handlers_are_sync_so_a_pause_cannot_stall_the_frame_path():
 
     for handler in (sessions.read_session, sessions.apply_session_action):
         assert not inspect.iscoroutinefunction(handler), handler.__name__
+
+
+class TestASessionDoesNotOutliveEveryClient:
+    """A phone that goes away for good takes its cartridge sessions with it.
+
+    A `CartridgeSession` is INTENT and lives only in this process's memory.
+    Until 2026-09-07 nothing ended one when the phone that opened it went
+    away: a wearer who pressed Start and whose phone then crashed left the
+    gate open for as long as the Tower ran, and the next capture -- from any
+    cartridge, days later -- attached a producer with nobody having asked
+    for it. For Object Memory that is a recorder starting itself on somebody
+    else's walk.
+
+    `main.py` already states the rule these tests restore: cartridge sessions
+    are "deliberately NOT persisted anywhere. A Tower that restarts comes
+    back with every cartridge stopped, because resuming a memory of what a
+    camera sees without anybody asking again is the wrong default."
+
+    The second test is the other half, and is why this is gated on the LAST
+    connection rather than on the closing one: iOS reconnects in about half
+    a second while uvicorn can take 20-40 s to notice the old socket died,
+    so a superseded connection's teardown runs while the new one is already
+    live. A WiFi hiccup must not end a walk.
+    """
+
+    def test_the_session_stops_when_the_last_connection_closes(self, app, client):
+        assert client.post(f"{SESSION_URL}/start").json()["state"] == "active"
+
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            ws.receive_json()
+
+        # The stop runs OFF the event loop, on the disconnect teardown
+        # thread (`_tear_down_after_disconnect`: `session.stop()` can wait
+        # out a detach grace, and a five-second stall on the loop is a
+        # stall on every frame the Tower is serving). The test client
+        # cancels the handler in the same breath as it queues the
+        # disconnect, so the handler's own await of that thread is best
+        # effort and this GET can arrive before the thread has finished.
+        # Wait for the stop rather than assert it has already landed. (It
+        # used to sit behind three awaits instead of on a guaranteed
+        # thread, and this test failed six times in eight -- see the
+        # teardown's docstring.)
+        deadline = time.monotonic() + 5.0
+        state = None
+        while time.monotonic() < deadline:
+            state = client.get(SESSION_URL).json()["state"]
+            if state == "stopped":
+                break
+            time.sleep(0.02)
+        assert state == "stopped", (
+            "a session nobody is connected to any more must not stay active: "
+            "the next capture would attach a producer with nobody asking"
+        )
+
+    def test_a_reconnect_does_not_end_the_session(self, app, client):
+        assert client.post(f"{SESSION_URL}/start").json()["state"] == "active"
+
+        # The new connection is already live when the old one tears down --
+        # the ordering `ConnectionTracker` was written for.
+        with client.websocket_connect("/ws") as first:
+            first.send_json({"type": "ping"})
+            first.receive_json()
+            with client.websocket_connect("/ws") as second:
+                second.send_json({"type": "ping"})
+                second.receive_json()
+                # The first socket closes here, inside the second's lifetime.
+            assert client.get(SESSION_URL).json()["state"] == "active", (
+                "a superseded connection's teardown must not end a session "
+                "another connection is still holding"
+            )
+
+    def test_a_stopped_session_is_left_alone(self, app, client):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            ws.receive_json()
+
+        assert client.get(SESSION_URL).json()["state"] == "stopped"

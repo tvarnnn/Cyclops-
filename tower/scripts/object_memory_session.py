@@ -74,6 +74,7 @@ Measured at ~11.7 KB a record, about 4.3 MB an hour of walking.
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -146,9 +147,28 @@ def journal_frames(directory: Path):
 
 
 def loose_frames(directory: Path):
+    """Frames from a directory of jpegs. Validates EAGERLY -- see below.
+
+    The split is the same one `world_build_session.py: follow_capture`
+    needed, and for the same reason. A `def` containing `yield` is a
+    generator function: calling it runs none of the body, so a check
+    written as the first statement does not fire until something advances
+    the generator -- which, in `main()`, is after the store and the model
+    have been built. There the equivalent ordering minted a permanent
+    empty world on every failed session.
+
+    Latent rather than live here: `ObservationStore.__init__` and
+    `engine.load()` create nothing on disk, so today this only wastes a
+    model load. Fixed anyway, because "it is harmless because of what two
+    other functions happen not to do" is not a property anyone maintains.
+    """
     paths = sorted(directory.glob("*.jpg"))
     if not paths:
         raise SystemExit(f"no .jpg frames found under {directory}")
+    return _loose_frames(paths)
+
+
+def _loose_frames(paths):
     for index, path in enumerate(paths):
         # received_at None, not a fabricated interval: this source has no
         # clock, and the records must not pretend otherwise (Rule 3).
@@ -392,14 +412,23 @@ class _StopRequest:
         """
 
         def wait_for_close() -> None:
+            # The RAW descriptor, never `sys.stdin.buffer.read(1)`. A read
+            # through the buffered object holds that object's lock for as
+            # long as it blocks, and when this process exits NORMALLY --
+            # the capture closed, the supervisor still holding the pipe --
+            # interpreter shutdown tries to take the same lock to close
+            # stdin and aborts: "Fatal Python error: _enter_buffered_busy:
+            # could not acquire lock for <_io.BufferedReader name='<stdin>'>",
+            # a non-zero exit for a run that succeeded. `os.read` takes no
+            # Python lock; the pending ReadFile dies with the process.
             try:
-                stream = sys.stdin.buffer if sys.stdin is not None else None
-            except (AttributeError, ValueError):
+                fd = sys.stdin.fileno() if sys.stdin is not None else None
+            except (AttributeError, ValueError, OSError):
                 return
-            if stream is None:
+            if fd is None:
                 return
             try:
-                stream.read(1)
+                os.read(fd, 1)
             except Exception:
                 # A closed or unreadable pipe is itself the request. The
                 # alternative -- treating an unreadable stdin as "keep
@@ -437,6 +466,66 @@ class _StopRequest:
             if self.requested:
                 return
             yield frame
+
+
+def _prewarm_native_libraries() -> None:
+    """Load the OpenBLAS-backed native stack BEFORE any watcher thread runs.
+
+    THE ZERO-FRAME DEADLOCK, AND WHY THIS ONE LINE PREVENTS IT.
+
+    The physical run on 2026-09-06 recorded a healthy capture -- 244
+    frames, ~21 s -- and this producer, attached `from-start`, observed
+    NONE of them. It was not slow and it was not misattached: it was
+    deadlocked inside its own model load and never reached the frame
+    loop. `frames_observed: 0`, then killed at Stop because it could not
+    exit.
+
+    Reproduced deterministically on this host and dissected with py-spy
+    (`--native`). Two threads, one lock:
+
+      * the main thread is inside `transformers` loading the OWLv2
+        verifier, which imports `scipy.linalg`, which loads
+        `libscipy_openblas*.dll`. OpenBLAS spins up its thread pool in
+        `DllMain`, so the load sits under the Windows loader lock
+        (`LdrpDrainWorkQueue` / `ZwWaitForAlertByThreadId`);
+      * the `object-memory-stop-watch` daemon thread is blocked in a
+        synchronous `ReadFile` on the stdin pipe the supervisor holds
+        (`_StopRequest._watch_stdin`).
+
+    A thread parked in a blocking pipe read while the loader is bringing
+    up a DLL that creates threads is a documented Windows loader-lock
+    hazard, and here it is a hard hang: 0% CPU, forever. It is invisible
+    to the whole test suite because every subprocess test pins
+    `--verifier none` to avoid downloading weights -- so nothing ever
+    loaded transformers/scipy in a spawned worker while the stdin watcher
+    was armed. Production defaults to `owlv2`, so production hit it and
+    the tests could not.
+
+    The fix is ordering, not luck. Loading `scipy.linalg` HERE, on the
+    main thread, before `_StopRequest` arms the watcher, brings OpenBLAS
+    up single-threaded with no pipe-reader parked behind the loader. When
+    `transformers` imports `scipy.linalg` later it is already in
+    `sys.modules` and no DLL work happens -- so the watcher can stay armed
+    for the whole run, including the load, and a Stop pressed during the
+    ~8 s load is still honoured.
+
+    Contained: a host without `scipy` cannot load `owlv2` either
+    (`transformers` needs it), so it will run with no verifier regardless,
+    and there is no OpenBLAS-via-scipy to preload. Anything else that
+    fails here is a warning, never a refusal to start -- warming a library
+    must not be the thing that stops a wearer's session from beginning.
+    """
+    try:
+        import scipy.linalg  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "[Tower][ObjectMemory] could not pre-warm the native numerical "
+            f"stack ({exc.__class__.__name__}: {exc}); continuing. If a "
+            "verifier is configured and this host is Windows, watch for a "
+            "worker that loads its model and never observes a frame.",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def main(argv=None) -> int:
@@ -575,6 +664,13 @@ def main(argv=None) -> int:
     ]
     if len(chosen) != 1:
         parser.error("exactly one of --frames or --follow-capture is required")
+
+    # BEFORE the stdin watcher is armed, and that order is load-bearing on
+    # Windows: warming the OpenBLAS-backed native stack while no thread is
+    # parked in a blocking pipe read is what stops the loader-lock deadlock
+    # that made a real walk observe zero frames. See
+    # `_prewarm_native_libraries`.
+    _prewarm_native_libraries()
 
     # Installed before the follower is built and before the first frame
     # is read, because the poll loop it arms is the thing being armed.
@@ -826,5 +922,71 @@ def main(argv=None) -> int:
     return 0
 
 
+def _run_and_exit() -> None:
+    """Run the producer, then leave the process HARD -- on EVERY path.
+
+    A CLEAN FINISH THAT NO LONGER LOOKS LIKE A CRASH.
+
+    The stdin-stop watcher (`_StopRequest._watch_stdin`) is a daemon thread
+    parked in a blocking native `ReadFile` for as long as the parent holds
+    the write end of the pipe -- which it does for the whole of the
+    ordinary ending, where the walk stops because the capture closed rather
+    than because anyone pressed Stop. Letting the interpreter FINALIZE with
+    that thread still blocked races CUDA/torch teardown and access-violates
+    (`0xC0000005`) on Windows, so `CaptureWorkerSupervisor.reap` logs a walk
+    that finished as `EXITED 3221225477`. Measured on this host with the
+    verifier OFF as well as on -- it is the blocked reader and the GPU
+    teardown, not anything this cartridge computes.
+
+    `os._exit` skips that finalization, and it must be reached on EVERY exit,
+    not only success. The watcher is armed (line ~669) BEFORE `engine.load()`
+    builds the CUDA context, so an exception from `engine.load()` (a CUDA
+    OOM, a weights download that fails -- ordinary errors), from the frame
+    loop, or from building the report escapes into the SAME finalization with
+    the SAME blocked watcher, and the crash then masks the real error behind
+    exit 3221225477. An earlier version of this function only guarded the
+    success path and claimed errors "happen before a model or a watcher
+    exists"; a reviewer showed that was false. So every ending goes through
+    `os._exit` here.
+
+    The error is not lost. A real exception's traceback is printed to stderr
+    -- which the Tower console inherits -- before the hard exit, and the code
+    is a plain `1`, not a crash code. A `SystemExit` (argument parsing, or an
+    explicit one) keeps its exact code and, for a message, prints it as
+    Python would; those happen before a model or watcher exists, so a normal
+    finalize would be safe too, but a hard exit there costs nothing and keeps
+    one rule instead of two. The report and flush are unchanged: by the time
+    a clean `main()` returns, `finally: engine.release()` has already flushed.
+    """
+    try:
+        code = main()
+    except SystemExit as exc:
+        # Preserve SystemExit semantics without running finalization.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        value = exc.code
+        if isinstance(value, int):
+            os._exit(value)
+        if value is None:
+            os._exit(0)
+        # A string (or other) code: Python's default handler prints it to
+        # stderr and exits 1. Do the same, since catching it skipped that.
+        print(value, file=sys.stderr, flush=True)
+        os._exit(1)
+    except BaseException:  # noqa: BLE001
+        # Any real failure after the watcher and the CUDA context exist.
+        # Show it -- masking it behind the teardown crash is the whole
+        # defect -- then leave hard so the crash cannot happen at all.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code if isinstance(code, int) else 0)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _run_and_exit()

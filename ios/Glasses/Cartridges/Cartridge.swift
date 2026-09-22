@@ -210,8 +210,8 @@ extension Cartridge {
         //
         // **That Tower decision was made on 2026-08-27 and both premises are
         // gone.** `not_offered` is now `[]`. Document Memory declares
-        // `document_memory.status/2026-08-27` on the socket *and*
-        // `document_memory.library/2026-08-27` under a new `http_contracts`
+        // `document_memory.status/2026-09-07` on the socket *and*
+        // `document_memory.library/2026-09-07` under a new `http_contracts`
         // block. Scene Understanding declares `scene_understanding.live/…` —
         // and the persistence objection turned out to be answered by the
         // result *type*: `live` rather than `status`, where the payload IS the

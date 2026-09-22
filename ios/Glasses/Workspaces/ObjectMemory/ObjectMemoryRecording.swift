@@ -81,6 +81,40 @@ protocol ObjectMemoryCaptureOwner: AnyObject {
     func stopCameraSession()
 }
 
+/// Whether THIS APP started the capture that is running, kept somewhere that
+/// outlives a screen.
+///
+/// ## Why this is not a property on a view model
+///
+/// `ObjectMemoryRecordingCoordinator` holds the same fact as
+/// `startedTheCamera`, and it is a `let` on `ProjectManager` for a stated
+/// reason: a workspace's `@StateObject` is destroyed the moment the wearer
+/// opens a different cartridge, and rebuilt when they come back believing it
+/// started nothing.
+///
+/// Document Memory shipped that fact inside its view model, and the
+/// consequence is exactly what the rule predicts. A wearer starts Document
+/// Memory, presses Start -- the camera is now streaming and this app started
+/// it -- and switches cartridges. The view model is destroyed with no
+/// `deinit` that stops anything, so the camera keeps streaming. Coming back
+/// builds a new view model with the flag false, its panel then says "The
+/// camera is streaming from another screen", which is untrue, and its Stop
+/// sends only the Tower verb because the branch that would call
+/// `stopCameraSession()` is guarded on the flag it just lost. The capture can
+/// then only be ended from Home.
+///
+/// A reference type held by `ProjectManager` and handed to the view model
+/// fixes the lifetime without moving any of the decision-making: who may
+/// start and stop the camera is unchanged, and only the memory of having
+/// done so now lives long enough to be true.
+@MainActor
+final class CartridgeCameraClaim {
+    /// True while a capture this app started is believed to be running.
+    var startedByThisApp = false
+
+    init() {}
+}
+
 #if DEBUG
 /// `GlassesConnection` already satisfies every requirement, so the conformance
 /// is empty by construction — which is the point: the protocol was extracted

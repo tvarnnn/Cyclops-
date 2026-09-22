@@ -72,7 +72,11 @@ import io
 import itertools
 import json
 import logging
+import os
+import signal
+import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,7 +84,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
-from tower.capture import CaptureFollower  # noqa: E402
+from tower.capture import (  # noqa: E402
+    END_REASON_DISCONNECT as END_REASON_CAPTURE_DISCONNECT,
+    END_REASON_BOUNDED_LIMIT as END_REASON_CAPTURE_BOUNDED,
+    END_REASON_STOP as END_REASON_CAPTURE_STOP,
+    CaptureFollower,
+)
 from tower.world_builder.backends import (  # noqa: E402
     BACKEND_AUTO,
     BACKEND_NAMES,
@@ -89,12 +98,35 @@ from tower.world_builder.backends import (  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
 from tower.world_builder.intrinsics_store import IntrinsicsStore  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
+    FINAL_SOLVE_FAILED,
+    FINAL_SOLVE_SKIPPED,
+    FINAL_SOLVE_SOLVED,
+    FINAL_SOLVE_UNAVAILABLE,
+    FINALIZATION_COMPLETE,
+    FINALIZATION_INTERRUPTED,
     CameraIntrinsics,
     camera_intrinsics_from_json_dict,
+)
+from tower.world_builder.schema import (  # noqa: E402
+    END_REASON_ERROR,
+    END_REASON_INTERRUPTED,
+    END_REASON_STOP,
+)
+from tower.process_ownership import (  # noqa: E402
+    interpreter_environment,
+    interpreter_executable,
 )
 from tower.world_builder.store import WorldStore  # noqa: E402
 
 DEFAULT_ROOT = Path("data/world_builder")
+TOWER_ROOT = Path(__file__).resolve().parents[1]
+# Accepted keyframes between background global solves. At ~3.6 keyframes per
+# second of walk this is roughly every 15 s; a solve over a two-minute walk
+# costs ~40-80 s on this host (ledger E8/E9), so a longer walk simply gets
+# fewer, larger solves rather than a queue.
+DEFAULT_SOLVE_EVERY = 50
+# How long Stop waits for a background solve before running the final one.
+DEFAULT_SOLVE_WAIT_SECONDS = 120.0
 
 logger = logging.getLogger("tower.world_build_session")
 
@@ -122,6 +154,11 @@ class ObservedFrame:
     # and `observed_size_of` decodes the bytes instead.
     width: int | None = None
     height: int | None = None
+    # Where the raw frame lives on disk, when it lives anywhere. The global
+    # solver reads raw frames in preference to the session's redacted
+    # copies (global_solve.py, ledger E6), and only the process that
+    # observed the frame knows the path.
+    source_path: Path | None = None
 
 
 def load_frames(directory: Path) -> list[ObservedFrame]:
@@ -129,7 +166,10 @@ def load_frames(directory: Path) -> list[ObservedFrame]:
     if not paths:
         raise SystemExit(f"no .jpg frames found under {directory}")
     return [
-        ObservedFrame(payload=path.read_bytes(), source_seq=index, wire_seq=index)
+        ObservedFrame(
+            payload=path.read_bytes(), source_seq=index, wire_seq=index,
+            source_path=path,
+        )
         for index, path in enumerate(paths)
     ]
 
@@ -238,12 +278,68 @@ def resolve_intrinsics(store: IntrinsicsStore, observed_size, *, frame_source):
     return CameraIntrinsics.unknown()
 
 
-def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
-    """Yield frames from a capture directory as the Tower writes them."""
+def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls,
+                   should_stop=None, handle: dict | None = None):
+    """Yield frames from a capture directory as the Tower writes them.
+
+    THE SPLIT BELOW IS THE WHOLE POINT, AND IT IS NOT STYLE.
+
+    This used to be one generator function with the check as its first
+    statement. A `def` containing `yield` is a generator function, so
+    calling it runs NONE of the body -- the check did not execute until
+    something advanced the generator for the first time. `main()` calls
+    this at the frame-source step and does not advance it until after
+
+        store  = WorldStore(args.root)
+        engine = WorldBuilderEngine(store, ...)
+        world_id = args.world or engine.create_world(args.name)
+
+    so a session pointed at a capture directory that does not exist
+    MINTED A WORLD and only then exited nonzero. The world stayed.
+
+    That is the mechanism behind the empty worlds that accumulate with
+    install age: 86 of the 123 worlds in the corpus on this host hold a
+    `world.json` and no sessions. Every failed follow left one, and
+    nothing ever collected them.
+
+    Creating the world before the first frame is DELIBERATE and is
+    preserved -- `main()` says why: "a Tower whose phone has connected
+    but not yet sent a frame reports a world that exists and is empty
+    rather than no world at all." That claim is about a session that can
+    start. This function now refuses before `main()` reaches the store,
+    so a session that cannot start leaves nothing behind.
+
+    Validating in a plain function that RETURNS the generator is the
+    standard way to make a generator's preconditions eager. The
+    alternative -- moving the check up into `main()` -- would put the
+    precondition somewhere other than the thing it is a precondition
+    for, and the next caller would not get it.
+    """
     if not directory.exists():
         raise SystemExit(f"no capture directory at {directory}")
+    return _follow_capture(
+        directory,
+        poll_seconds=poll_seconds,
+        max_idle_polls=max_idle_polls,
+        should_stop=should_stop,
+        handle=handle,
+    )
+
+
+def _follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls,
+                    should_stop=None, handle: dict | None = None):
     follower = CaptureFollower(directory, poll_seconds=poll_seconds)
-    for frame in follower.follow(max_idle_polls=max_idle_polls):
+    # The caller needs to ask, AFTER the loop, whether the capture it was
+    # following had closed -- see `end_reason` in `main()`. The follower
+    # retargets `_directory` onto a successor across a reconnect, so its
+    # own `is_closed()` is the only answer that stays right; the directory
+    # this generator was called with may be two captures old by then.
+    if handle is not None:
+        handle["follower"] = follower
+    # `should_stop` is asked inside the poll loop, which is where this
+    # process spends a quiet walk. A stop that arrived while the follower
+    # slept is noticed at the next poll, not at the next frame.
+    for frame in follower.follow(max_idle_polls=max_idle_polls, should_stop=should_stop):
         yield ObservedFrame(
             payload=frame.raw_bytes,
             source_seq=frame.source_seq,
@@ -252,6 +348,29 @@ def follow_capture(directory: Path, *, poll_seconds: float, max_idle_polls):
             received_at=frame.received_at,
             width=frame.width,
             height=frame.height,
+            # `follower.directory`, NOT the `directory` this generator was
+            # called with. `relpath` is relative to the capture the frame
+            # CAME FROM, and a reconnect retargets the follower onto a
+            # successor -- the comment fifteen lines above says so about
+            # `is_closed()` and this line was left reading the closure.
+            #
+            # Measured on the 2026-09-09 field walk, which reconnected once:
+            # `sources.json` named capture 6a1b544c for all 643 keyframes,
+            # and 523 of them were actually in dd885cca. Every one of those
+            # 523 resolved to a path that does not exist, so `_source_frame`
+            # fell back to the session's face-redacted copies and COLMAP
+            # was fed those instead of the raw frames -- for 81% of the
+            # walk. This is the mechanism behind what the handoff had
+            # recorded as "sources.json is already 523/643 stale"; nothing
+            # was stale, the ledger was wrong when it was written.
+            #
+            # It could have been worse than missing. The phone's source
+            # index happened to run 1..953 in the first capture and
+            # 1309..6109 in the second, so no path collided; had the
+            # counter restarted at 1, the same bug would have handed
+            # COLMAP a DIFFERENT REAL PHOTOGRAPH under the right name, and
+            # nothing anywhere would have noticed.
+            source_path=follower.directory / frame.relpath,
         )
 
 
@@ -283,6 +402,798 @@ def synthetic_frames(count: int, width: int, height: int):
         for index, image in enumerate(images)
     ]
     return frames, intrinsics
+
+
+class StopRequest:
+    """A stop asked for from outside this process, at one of two levels.
+
+    THE 2026-09-06 PHYSICAL WALK IS WHY THIS EXISTS.
+
+    Until then the builder could not be asked anything. The supervisor
+    waited its grace and called `TerminateProcess`, which on Windows means
+    no unwinding, no `finally`, no `atexit` -- and a builder that died
+    between `observe()` and `stop_session()` left a lock naming a dead pid,
+    a session record with `ended_at: null`, and a derived tree nobody
+    could call anything but "failed". Twenty-eight sessions on the
+    Windows box ended that way before the walk that made it visible.
+
+    TWO LEVELS, BECAUSE TWO DIFFERENT THINGS ARE BEING ASKED.
+
+    * **Soft** -- the parent closed this process's stdin. It means "you are
+      no longer wanted for NEW frames": the wearer left World Builder, or
+      the cartridge was stopped. A builder still observing stops
+      observing, closes the session as `interrupted`, skips the final
+      solve (nobody is waiting for it) and writes its final build. A
+      builder already finalizing carries on: finalization is bounded and
+      holds no camera.
+    * **Hard** -- `SIGBREAK` / `SIGTERM` / `SIGINT`. It means "wrap up
+      now": the Tower is shutting down. Any solve child is terminated,
+      the session is closed if it is still open, the final build is
+      written from what exists, and the process exits. Bounded by one
+      build.
+
+    Both are FLAGS set from a handler or a daemon thread and acted on by
+    the main thread, for the reason `object_memory_session._StopRequest`
+    gives: a handler that took the store's lock or joined a child is how a
+    shutdown deadlocks.
+    """
+
+    SOFT = "soft"
+    HARD = "hard"
+
+    def __init__(self) -> None:
+        self.level: str | None = None
+        self.source: str | None = None
+        self._lock = threading.Lock()
+
+    def install(self, *, watch_stdin: bool = False) -> None:
+        if watch_stdin:
+            self._watch_stdin()
+        for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+            handler_signal = getattr(signal, name, None)
+            if handler_signal is None:
+                continue
+            try:
+                signal.signal(handler_signal, self._handle_signal)
+            except (ValueError, OSError):
+                # Not the main thread, or a signal this platform will not
+                # let a process take. The process can still be terminated;
+                # it just cannot be asked on that channel.
+                continue
+
+    @property
+    def asked(self) -> bool:
+        return self.level is not None
+
+    @property
+    def hard(self) -> bool:
+        return self.level == self.HARD
+
+    def asked_for(self) -> bool:
+        """A callable for `CaptureFollower.follow(should_stop=...)`."""
+        return self.level is not None
+
+    def hard_asked_for(self) -> bool:
+        return self.level == self.HARD
+
+    def request(self, level: str, source: str) -> None:
+        with self._lock:
+            # A hard request outranks a soft one; a soft one never lowers
+            # a hard one already recorded.
+            if self.level == self.HARD:
+                return
+            self.level = level
+            self.source = source
+
+    def _handle_signal(self, signum, _frame) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        self.request(self.HARD, name)
+
+    def _watch_stdin(self) -> None:
+        """Soft stop when the parent closes the pipe it holds.
+
+        A daemon thread blocked on a one-byte read: nothing is ever
+        written to this pipe, the request IS the close, and a pipe needs
+        no console -- which is why it is the channel that works under a
+        pseudoconsole, a service, or a job object.
+        """
+
+        def wait_for_close() -> None:
+            # The RAW descriptor, never `sys.stdin.buffer.read(1)`. A read
+            # through the buffered object holds that object's lock for as
+            # long as it blocks, and when this process exits NORMALLY --
+            # the capture closed, the supervisor still holding the pipe --
+            # interpreter shutdown tries to take the same lock to close
+            # stdin and aborts: "Fatal Python error: _enter_buffered_busy:
+            # could not acquire lock for <_io.BufferedReader name='<stdin>'>",
+            # a non-zero exit for a run that succeeded. `os.read` takes no
+            # Python lock; the pending ReadFile dies with the process.
+            try:
+                fd = sys.stdin.fileno() if sys.stdin is not None else None
+            except (AttributeError, ValueError, OSError):
+                return
+            if fd is None:
+                return
+            try:
+                os.read(fd, 1)
+            except Exception:  # noqa: BLE001 -- an unreadable pipe is itself the request
+                pass
+            self.request(self.SOFT, "stdin-closed")
+
+        threading.Thread(
+            target=wait_for_close, name="world-builder-stop-watch", daemon=True
+        ).start()
+
+    def bounded(self, frames):
+        """`frames`, ending at the next frame after a stop was asked for.
+
+        The follower's poll loop is the primary check on the live path;
+        this is the only one a `--frames` replay has, and it is what keeps
+        a live stop from being missed by the one frame the follower had
+        already yielded.
+        """
+        for frame in frames:
+            if self.asked:
+                return
+            yield frame
+
+
+# How long a solve child gets after `terminate()` before it is killed, and
+# how often a waiting builder looks at its stop request.
+CHILD_TERMINATE_TIMEOUT_S = 5.0
+CHILD_POLL_S = 0.25
+
+
+def python_executable() -> str:
+    """The interpreter a solve child runs under.
+
+    `tower.process_ownership` decides: on a Windows venv `sys.executable`
+    is a launcher that spawns the real interpreter underneath it with
+    silent breakaway, so a child started that way is a PAIR of processes
+    and `_terminate_process_tree` reaches only the outer one. The recipe
+    gives one process, provided `child_environment()` travels with it.
+    """
+    return interpreter_executable()
+
+
+def child_environment() -> dict:
+    """The other half of `python_executable()`: what makes it venv-aware."""
+    return interpreter_environment()
+
+
+class BackgroundSolver:
+    """Every global solve this builder runs, as a CHILD it owns.
+
+    One child at a time. `maybe_launch` starts `scripts/world_solve.py`
+    in the background when no solve is running and at least `every`
+    keyframes have been accepted since the last launch; `finished()`
+    reports (once) that a launch has completed, which is the builder's cue
+    to rebuild so the new solution reaches the derived tree without
+    waiting for the next rebuild interval. `run_final` runs the
+    finalization solve the same way, so that a stop request can end it.
+
+    OWNERSHIP IS THE POINT OF THE CLASS. On the 2026-09-06 walk the
+    builder died with a background solve in flight; the child ran on for
+    32 s as an orphan and wrote a solution nothing ever merged. Every
+    child is now tracked, `wait()` terminates rather than abandons, and
+    `close()` -- called from the builder's `finally` -- leaves nothing
+    behind. Output goes to `solve/<session>/solve.log`.
+    """
+
+    def __init__(self, *, root: Path, world_id: str, session_id: str, every: int,
+                 capture_dirs, threads: int | None = None, script: Path | None = None,
+                 spawn=None):
+        self.root = root
+        self.world_id = world_id
+        self.session_id = session_id
+        self.every = max(1, every)
+        self.capture_dirs = [Path(d) for d in capture_dirs]
+        self.threads = threads
+        self.script = Path(script) if script is not None else TOWER_ROOT / "scripts" / "world_solve.py"
+        self._spawn = spawn if spawn is not None else subprocess.Popen
+        self._child = None
+        self._launched_at_keyframes = 0
+        self._launches = 0
+        self._completed_unseen = False
+        self._log = None
+
+    @property
+    def running(self) -> bool:
+        return self._child is not None and self._child.poll() is None
+
+    @property
+    def launches(self) -> int:
+        return self._launches
+
+    @property
+    def child_pid(self) -> int | None:
+        return self._child.pid if self._child is not None else None
+
+    def _reap(self) -> None:
+        if self._child is not None and self._child.poll() is not None:
+            self._child = None
+            self._completed_unseen = True
+            if self._log is not None:
+                self._log.close()
+                self._log = None
+
+    def finished(self) -> bool:
+        """True once per completed launch."""
+        self._reap()
+        if self._completed_unseen:
+            self._completed_unseen = False
+            return True
+        return False
+
+    def _argv(self, *, final: bool) -> list[str]:
+        argv = [
+            python_executable(), str(self.script),
+            "--root", str(self.root), "--world", self.world_id, "--session", self.session_id,
+        ]
+        for capture_dir in self.capture_dirs:
+            argv += ["--capture-dir", str(capture_dir)]
+        # LOOP DETECTION ON EVERY SOLVE, not only the final one.
+        #
+        # Sequential matching reaches 20 keyframes either side and no
+        # further, so a live solve can only ever chain forwards: it cannot
+        # discover that the wearer has walked back into a room it already
+        # mapped. The consequence is not a slightly worse world, it is a
+        # world that comes APART as the walk goes on. Measured on the
+        # 2026-09-09 capture, sequential only, at the field run's own solve
+        # horizons: 6 components at 156 keyframes, 11 at 311, 14 at 526,
+        # 16 at 646, with the largest holding 24% of posed keyframes.
+        #
+        # The same capture re-solved with loop detection at the same
+        # horizons, in one workspace, the way a live session accumulates:
+        #
+        #     horizon   components   largest component's share
+        #        156        3              0.75
+        #        311        6              0.77
+        #        526        5              0.90
+        #        646        6              0.91
+        #        795        5              0.95
+        #
+        # It CONVERGES instead of fragmenting, which is the whole product
+        # requirement: geometry that becomes more recognisable while the
+        # wearer walks, not less.
+        #
+        # The cost is 1.2-1.9x the sequential solve -- 50.8 s against
+        # 42.6 s at 646 keyframes, 17.1 s against 9.1 s at 156 -- and it is
+        # paid in matching, which is incremental: pairs already tested stay
+        # in the database, so each solve only matches what is new. That is
+        # far cheaper than it looks next to a from-scratch mapping stage.
+        #
+        # `--final` still differs, and still matters: it is the one solve
+        # that sees every keyframe including the tail no live solve reached.
+        argv += ["--loop-detection"]
+        if final:
+            argv += ["--final"]
+        if self.threads is not None:
+            argv += ["--threads", str(self.threads)]
+        return argv
+
+    def maybe_launch(self, store: WorldStore, accepted: int, sources: dict) -> bool:
+        self._reap()
+        if self.running or accepted - self._launched_at_keyframes < self.every or accepted < 2:
+            return False
+        from tower.world_builder import global_solve  # noqa: PLC0415
+
+        global_solve.write_sources(store, self.world_id, self.session_id, sources)
+        workspace = global_solve.workspace_for(store, self.world_id, self.session_id)
+        workspace.root.mkdir(parents=True, exist_ok=True)
+        self._log = open(workspace.root / "solve.log", "ab")
+        self._child = self._spawn(
+            self._argv(final=False), cwd=str(TOWER_ROOT), stdout=self._log,
+            stderr=subprocess.STDOUT, env=child_environment(), stdin=subprocess.DEVNULL,
+        )
+        self._launched_at_keyframes = accepted
+        self._launches += 1
+        logger.info(
+            "[Tower][WorldBuilder] background solve %s launched at %s keyframes (pid %s)",
+            self._launches, accepted, self._child.pid,
+        )
+        return True
+
+    def wait(self, timeout: float | None, should_stop=None) -> bool:
+        """Wait for a running child. False if it had to be terminated.
+
+        A child that outlives `timeout` is TERMINATED, not abandoned: the
+        final solve that follows uses the same workspace (one feature
+        database, one `sparse/` tree it deletes first), and an abandoned
+        child still mapping into it is a corruption waiting to happen.
+        `should_stop` ends the wait early the same way.
+        """
+        if self._child is None:
+            return True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while self._child.poll() is None:
+                if should_stop is not None and should_stop():
+                    logger.warning(
+                        "[Tower][WorldBuilder] background solve pid %s terminated: "
+                        "a stop was requested", self._child.pid,
+                    )
+                    self._terminate_child()
+                    return False
+                if deadline is not None and time.monotonic() >= deadline:
+                    logger.warning(
+                        "[Tower][WorldBuilder] background solve pid %s still running after "
+                        "%ss; terminating it so the final solve owns the workspace",
+                        self._child.pid, timeout,
+                    )
+                    self._terminate_child()
+                    return False
+                time.sleep(CHILD_POLL_S)
+            return True
+        finally:
+            self._reap()
+
+    def run_final(self, store: WorldStore, sources: dict, *, should_stop=None) -> dict:
+        """The finalization solve, as a child, until it ends or a stop arrives.
+
+        Returns the child's own summary (`solved`, `solver`, `components`,
+        `timing`, ...) with `attempted: True`, or `{"attempted": True,
+        "solved": False, "interrupted": True, ...}` when `should_stop`
+        ended it. Never raises: a walk that reconstructed locally is worth
+        keeping even if the global solve failed.
+        """
+        from tower.world_builder import global_solve  # noqa: PLC0415
+
+        started = time.perf_counter()
+        try:
+            global_solve.write_sources(store, self.world_id, self.session_id, sources)
+            workspace = global_solve.workspace_for(store, self.world_id, self.session_id)
+            workspace.root.mkdir(parents=True, exist_ok=True)
+            self._log = open(workspace.root / "solve.log", "ab")
+            # `stdin=DEVNULL` ON BOTH SPAWNS, AND IT IS NOT HYGIENE. This
+            # process's stdin is the supervisor's stop pipe, and a daemon
+            # thread sits in a blocking ReadFile on it for the whole session
+            # (see StopRequest). A child that inherits that handle inherits
+            # a synchronous file object with an I/O in flight, and Windows
+            # serialises every operation on such an object -- so the child's
+            # own startup, which queries its fd 0, blocks until the pipe
+            # closes. Measured: a final solve child sat at 0.02 s of CPU for
+            # 90 s and started the instant stdin was closed.
+            self._child = self._spawn(
+                self._argv(final=True), cwd=str(TOWER_ROOT), stdout=subprocess.PIPE,
+                stderr=self._log, env=child_environment(), stdin=subprocess.DEVNULL,
+            )
+        except Exception as error:  # noqa: BLE001 -- see the docstring
+            logger.warning(
+                "[Tower][WorldBuilder] final global solve could not start for %s: %s",
+                self.session_id, error,
+            )
+            return {"attempted": True, "solved": False, "error": f"{type(error).__name__}: {error}"}
+        logger.info(
+            "[Tower][WorldBuilder] final global solve launched (pid %s)", self._child.pid
+        )
+        child = self._child
+        # Drain stdout on a thread: the summary is small, but a pipe nobody
+        # reads is a child that blocks on its last print and never exits.
+        chunks: list[bytes] = []
+
+        def drain() -> None:
+            try:
+                chunks.append(child.stdout.read())
+            except Exception:  # noqa: BLE001
+                pass
+
+        reader = threading.Thread(target=drain, name="world-builder-final-solve-stdout", daemon=True)
+        reader.start()
+        interrupted = False
+        try:
+            while child.poll() is None:
+                if should_stop is not None and should_stop():
+                    interrupted = True
+                    logger.warning(
+                        "[Tower][WorldBuilder] final global solve pid %s terminated: a hard "
+                        "stop was requested; the last background solution stands", child.pid,
+                    )
+                    self._terminate_child()
+                    break
+                time.sleep(CHILD_POLL_S)
+        finally:
+            reader.join(timeout=2.0)
+            self._reap()
+        # A hard stop that reached the child FIRST (a console control event
+        # goes to the whole process group) ends it before this loop sees
+        # the flag; the outcome is still "interrupted by the stop", not "the
+        # solver crashed".
+        if should_stop is not None and should_stop():
+            interrupted = True
+        elapsed = round(time.perf_counter() - started, 3)
+        if interrupted:
+            return {"attempted": True, "solved": False, "interrupted": True, "seconds": elapsed}
+        summary: dict = {}
+        text = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        if text:
+            try:
+                summary = json.loads(text)
+            except ValueError:
+                summary = {"solved": False, "error": f"unreadable summary: {text[-200:]}"}
+        if child.returncode not in (0, None) and not summary.get("solved"):
+            summary.setdefault("error", f"world_solve.py exited {child.returncode}")
+        summary["attempted"] = True
+        summary["seconds"] = elapsed
+        logger.info(
+            "[Tower][WorldBuilder] final global solve: solved=%s solver=%s posed=%s/%s "
+            "components=%s in %.2fs",
+            summary.get("solved"), summary.get("solver"), summary.get("keyframes_posed"),
+            summary.get("keyframes"), len(summary.get("components") or []), elapsed,
+        )
+        return summary
+
+    def close(self) -> None:
+        """Leave no child behind. Called from the builder's `finally`."""
+        if self._child is not None and self._child.poll() is None:
+            logger.warning(
+                "[Tower][WorldBuilder] solve child pid %s still running at exit; terminating",
+                self._child.pid,
+            )
+            self._terminate_child()
+        self._reap()
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def _terminate_child(self) -> None:
+        child = self._child
+        if child is None:
+            return
+        _terminate_process_tree(child)
+
+
+def _terminate_process_tree(process) -> None:
+    """Terminate a child and everything it spawned, then make sure.
+
+    Children first, because on Windows a venv interpreter may itself be a
+    launcher with the real interpreter underneath it, and terminating
+    only the handle we hold would orphan exactly the process doing the
+    work.
+    """
+    try:
+        import psutil
+
+        try:
+            descendants = psutil.Process(process.pid).children(recursive=True)
+        except psutil.Error:
+            descendants = []
+    except Exception:  # noqa: BLE001 -- psutil is a hard dependency; be safe anyway
+        descendants = []
+    for proc in descendants:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        process.terminate()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        process.wait(timeout=CHILD_TERMINATE_TIMEOUT_S)
+    except Exception:  # noqa: BLE001
+        try:
+            process.kill()
+            process.wait(timeout=CHILD_TERMINATE_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            pass
+    for proc in descendants:
+        try:
+            if proc.is_running():
+                proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def solve_session(store: WorldStore, world_id: str, session_id: str, *, capture_dirs,
+                  sources: dict, loop_detection: bool = True) -> dict:
+    """The finalisation solve, in this process, after the last frame.
+
+    Never raises: a walk that reconstructed locally is worth keeping even
+    if the global solve failed, exactly as `register_session` reasons.
+    """
+    from tower.world_builder import global_solve  # noqa: PLC0415
+    from tower.world_builder.store import compute_input_digest  # noqa: PLC0415
+
+    started = time.perf_counter()
+    try:
+        global_solve.write_sources(store, world_id, session_id, sources)
+        keyframes = store.read_keyframes(world_id, session_id)
+        summary = global_solve.solve(
+            store, world_id, session_id, capture_dirs=capture_dirs, final=True,
+            num_threads=-1, loop_detection=loop_detection,
+            input_digest=compute_input_digest(keyframes),
+        )
+    except Exception as error:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "[Tower][WorldBuilder] final global solve failed for %s: %s", session_id, error
+        )
+        return {"attempted": True, "solved": False, "error": f"{type(error).__name__}: {error}"}
+    summary["seconds"] = round(time.perf_counter() - started, 3)
+    summary["attempted"] = True
+    logger.info(
+        "[Tower][WorldBuilder] final global solve: solved=%s solver=%s posed=%s/%s "
+        "components=%s in %.2fs",
+        summary.get("solved"), summary.get("solver"), summary.get("keyframes_posed"),
+        summary.get("keyframes"), len(summary.get("components") or []), summary["seconds"],
+    )
+    return summary
+
+
+# How many keyframes a rebuild is worth, at a given size of world.
+#
+# `--rebuild-every 4` is a fixed count and the rebuild is not a fixed cost:
+# `write_derived` rewrites poses, points, support and the manifest IN FULL
+# every time, so it grows with the world while the interval does not.
+# Measured against derived trees at the field walk's own ratios (33.5
+# points and 26.2 support rows per keyframe):
+#
+#     keyframes   tree size   write_derived
+#           795      3.7 MB       0.34 s
+#          2000      9.4 MB       0.86 s
+#          4000     18.8 MB       1.85 s
+#          6000     28.2 MB       3.48 s
+#
+# At the measured 3.2 keyframes/sec, four keyframes is 1.21 s of wall time.
+# The write alone crosses that at about 2,700 keyframes -- roughly FOURTEEN
+# MINUTES into a walk -- and from there the builder falls behind for the
+# rest of the session, with the capture directory as the only queue. The
+# stated target is twenty to thirty minutes.
+#
+# So the interval grows with the world, doubling each time the keyframe
+# count doubles past the knee. That keeps the rebuild a bounded FRACTION of
+# the wall clock instead of a growing one, rather than 27% -> 69% -> 148%
+# -> 288%, which is what a fixed four gives and is why the builder fell
+# behind for the back half of a long walk.
+#
+# EVERYTHING ABOVE IS THE ORIGINAL REASONING AND IT IS SOUND. THE NUMBERS
+# IN IT ARE NOT: they cost `write_derived`, and the loop calls
+# `engine.build()`. The knee was 750 and the schedule was 795->4,
+# 1500->8, 3000->16, 6000->32. The block immediately below supersedes all
+# of that -- read it, not this.
+#
+# The wearer loses nothing that matters. A rebuild is a redraw of a world
+# that is already mostly settled by then, and the two triggers that carry
+# real news are untouched: a completed background solve still forces a
+# rebuild immediately, and the final build still runs at Stop.
+# RE-ANCHORED ON WHAT THE LOOP ACTUALLY PAYS.
+#
+# The first version of this modelled `write_derived` -- 0.342 s at 795
+# keyframes -- and set the knee at 750 so that "nothing about the
+# 2026-09-09 walk moves". The loop below does not call `write_derived`; it
+# calls `engine.build()`, which is that write plus the merge, the placement
+# pass and the manifest. Measured over the 204 rebuilds of a replay of the
+# real field capture, against that walk's own arrival rate of 3.23
+# keyframes/second:
+#
+#     keyframes     mean build     share of wall clock at interval 4
+#       1- 200        0.141 s              11.4%
+#     201- 400        0.386 s              31.1%
+#     401- 600        0.585 s              47.2%
+#     601- 800        1.006 s              81.2%
+#     801-1000        0.895 s              72.2%
+#
+# 81%, where the model said 27%. So the knee was in the wrong place AND
+# arrived one doubling late: `(accepted // 750).bit_length() - 1` is zero
+# for everything below 1500, which is about eight minutes -- the interval
+# did not widen until long after the builder had stopped keeping up.
+#
+# 600 and no `- 1`, so the first doubling lands where the measured share
+# crosses a half: 8 from 601, 16 from 1200, 32 from 2400, 64 from 4800,
+# and capped there. `min(doublings, 4)` still caps at `4 << 4` = 64; it
+# now engages at 9,600 rather than 12,000, which is past where 64 is
+# first reached either way. At 3.23 keyframes/second that is a live refresh every
+# 2.5 s at the start of the widening and every 20 s at the cap, against a
+# builder that otherwise falls permanently behind the camera with the
+# capture directory as its only queue.
+REBUILD_KNEE_KEYFRAMES = 600
+
+
+def rebuild_interval(base: int, accepted: int) -> int:
+    """The rebuild interval for a world of `accepted` keyframes."""
+    if accepted <= REBUILD_KNEE_KEYFRAMES:
+        return base
+    doublings = (accepted // REBUILD_KNEE_KEYFRAMES).bit_length()
+    return base << min(doublings, 4)
+
+
+def session_manifest(store, world_id: str, session_id: str) -> dict:
+    """The manifest that describes THIS session, from either copy.
+
+    THE READER WAS FIXED AND THE WRITERS WERE NOT. `usable_placements`
+    judges a placement by the session's own manifest; the two places that
+    STAMP a placement's `input_digest` still read the world's, which names
+    whichever session built last. In the live flow they are the same file's
+    contents, so nothing showed -- but `world_registration.py --write
+    --session <older>` on a world walked twice stamps the newer session's
+    digest, and then every one of those placements is refused by the reader
+    for disagreeing. A reviewer found it by asking what else read the
+    world-level copy.
+
+    The session's own first, then the world's but only if it names this
+    session; a manifest about another session is not evidence about this
+    one.
+    """
+    manifest = store.read_session_manifest(world_id, session_id)
+    if isinstance(manifest, dict) and manifest.get("session_id") == session_id:
+        return manifest
+    world = store.read_derived_manifest(world_id)
+    if isinstance(world, dict) and world.get("session_id") == session_id:
+        return world
+    return {}
+
+
+def should_register(result) -> bool:
+    """Whether the Sim3 registrar should run after this build.
+
+    A FUNCTION, not an expression at the call site, because the thing it
+    decides has already been got wrong once and the wrong version was
+    untestable. An adversarial review pointed out that the first fix left
+    the decision inline in `main()`, where the only test that could reach it
+    re-typed the condition into the test file and asserted the copy -- a
+    tautology that would have passed against any implementation at all.
+
+    The rule: the registrar answers "where do these fragments sit relative
+    to each other", pairwise and weakly. When a global solve has already
+    answered it from one reconstruction, a second weaker answer must not
+    overwrite the first. Otherwise the registrar is the only producer there
+    is, and it must run.
+
+    `placements_source` is set by `engine.build()`, which is the only code
+    that knows whether the build it just did wrote placements from a
+    solution. Asking anything else has been tried: the guard used to ask
+    whether the FINAL solve had succeeded, which is a different question,
+    and on the 2026-09-09 walk the answer to it was "no" while the answer to
+    this one was "yes, 72 segments across 14 components". The registrar ran
+    and replaced them with 120 refusals.
+    """
+    return (getattr(result, "diagnostics", None) or {}).get("placements_source") is None
+
+
+def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
+    """Place what can be placed, and say so. Never raises.
+
+    Registration is the step that turns a bag of independently
+    reconstructed fragments into a world. It was implemented, tested,
+    persisted and served long before anything called it, so every walk
+    up to now finalised with `placements.json` absent and iOS drew every
+    segment as its own disconnected island -- not because the pairs were
+    refused, but because the question was never asked. On the 2026-08-29
+    drawer walk asking it places 5 of 36 segments and 4,704 of 13,050
+    points; the recorded session shipped 0 of both.
+
+    Three properties make this safe to run automatically:
+
+    - It is NON-DESTRUCTIVE. `register()` writes nothing; poses, points
+      and support are untouched, and a segment's own geometry never
+      moves. Only `transform_to_world` is added, in a separate file.
+    - It is REFUSAL-BY-DEFAULT. A pair is admitted only on two
+      independent solves that agree; an unplaced segment is served
+      exactly as it is served today.
+    - It is DIGEST-BOUND. The placement records the build it was solved
+      against, and the serving layer refuses any placement whose digest
+      does not match, so a later rebuild cannot resurrect a stale
+      transform.
+
+    It runs HERE -- in the builder subprocess, after the last build --
+    and not in the web process, for the same reason `build()` does: this
+    is seconds of work, and the frame path must never pay for it. It is
+    also why failure is swallowed. A world that reconstructed is worth
+    keeping even if it could not be placed, so a registration that
+    raises is reported and does not take the session down with it.
+    """
+    from scripts.world_registration import (  # noqa: PLC0415
+        SupportMissingError,
+        placements_from_report,
+        register,
+    )
+
+    started = time.perf_counter()
+    try:
+        # NEVER OVERWRITE A GLOBAL SOLVE'S PLACEMENTS. The caller's guard is
+        # the first line of defence and this is the second, because the first
+        # one can be told the wrong thing.
+        #
+        # `load_solution` absorbs any unreadable solution and returns None --
+        # the right answer for a torn archive, and also the answer it gives
+        # if numpy changes an exception type, a schema drifts, or the box
+        # runs out of memory. In every one of those `engine.build()` writes
+        # no placements, reports `placements_source: None`, and
+        # `should_register` concludes there is no global solve to defer to.
+        # It would then call this function, which used to write
+        # unconditionally -- destroying exactly the placements the fix was
+        # written to protect, from a cause whose only symptom is one
+        # `logger.warning`. An adversarial review found that path.
+        #
+        # A placement set is trusted here only if it is REGISTERED and
+        # CURRENT: the serving layer already drops any placement whose
+        # `input_digest` disagrees with the manifest, so a stale set is not
+        # worth preserving and re-registering it is the correct outcome.
+        #
+        # INSIDE the try, and that is not tidiness. This function promises
+        # in its own docstring never to raise, and the first version of this
+        # check read the store above the guard -- which `_Boom`, the test
+        # store whose every read fails, turned straight back into the
+        # session-ending exception the guard exists to prevent.
+        existing = store.read_placements(world_id, session_id) or []
+        manifest_now = session_manifest(store, world_id, session_id)
+        digest_now = manifest_now.get("input_digest")
+        current_registered = [
+            p for p in existing
+            if p.state == "registered" and p.input_digest == digest_now
+        ]
+        if current_registered:
+            logger.info(
+                "[Tower][WorldBuilder] registration stood down for session %s: %s "
+                "current registered placements already exist",
+                session_id, len(current_registered),
+            )
+            return {
+                "attempted": False,
+                "wrote_placements": False,
+                "reason": (
+                    f"{len(current_registered)} current registered placements "
+                    "already exist and were not replaced"
+                ),
+            }
+        report = register(store, world_id, session_id)
+        # Inside the guard, not after it. Persisting is not the safe part
+        # of this: `placements_from_report` runs every placement through
+        # `SegmentPlacement.__post_init__`, which raises ValueError on a
+        # NaN scale or a non-unit quaternion -- precisely what a
+        # degenerate Sim3 produces, and precisely the failure this guard
+        # exists for. Measured with these three lines outside the try: a
+        # raising `write_placements` gave exit code 1 and zero bytes of
+        # report, losing a walk that had reconstructed perfectly well.
+        manifest = session_manifest(store, world_id, session_id)
+        placements = placements_from_report(
+            report, input_digest=manifest.get("input_digest")
+        )
+        store.write_placements(world_id, session_id, placements)
+    except SupportMissingError as error:
+        return {"attempted": True, "wrote_placements": False, "refusal": str(error)}
+    except Exception as error:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "[Tower][WorldBuilder] registration failed for session %s: %s",
+            session_id,
+            error,
+        )
+        return {
+            "attempted": True,
+            "wrote_placements": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+    elapsed = time.perf_counter() - started
+
+    logger.info(
+        "[Tower][WorldBuilder] registration: %s of %s segments placed, "
+        "%s of %s points, %s admitted pairs of %s candidates, in %.2fs",
+        report["segments_registered"],
+        report["segments_with_geometry"],
+        report["points_registered"],
+        report["points_total"],
+        len(report["admitted_pairs"]),
+        report["candidate_pairs"],
+        elapsed,
+    )
+    return {
+        "attempted": True,
+        "wrote_placements": True,
+        "reference_segment": report["reference_segment"],
+        "segments_registered": report["segments_registered"],
+        "segments_with_geometry": report["segments_with_geometry"],
+        "points_registered": report["points_registered"],
+        "points_total": report["points_total"],
+        "candidate_pairs": report["candidate_pairs"],
+        "admitted_pairs": report["admitted_pairs"],
+        "cycles_checked": report["cycles_checked"],
+        "cycle_refusal": report["cycle_refusal"],
+        "seconds": round(elapsed, 3),
+    }
 
 
 def main(argv=None) -> int:
@@ -347,6 +1258,67 @@ def main(argv=None) -> int:
             "Unset waits for the recorder to close it."
         ),
     )
+    parser.add_argument(
+        "--solve",
+        action="store_true",
+        help=(
+            "Run the global solver (tower/world_builder/global_solve.py): in "
+            "the background every --solve-every accepted keyframes during the "
+            "walk, and once more, in this process, after the last frame. Its "
+            "solution is merged into the derived tree by build(). When it "
+            "produces a solution, --register is skipped: the placements come "
+            "from one reconstruction rather than from Sim3 fits between "
+            "fragments."
+        ),
+    )
+    parser.add_argument(
+        "--solve-every",
+        type=int,
+        default=DEFAULT_SOLVE_EVERY,
+        help=(
+            "MINIMUM accepted keyframes between background solves "
+            "(0 = final solve only). The launch is checked inside the "
+            "rebuild block, so the effective spacing is this value "
+            "rounded up to the rebuild interval -- which widens with the "
+            "world (see rebuild_interval): 16x --rebuild-every past 4,800 "
+            "keyframes, so 64 at the default. A value below the current "
+            "interval cannot be honoured."
+        ),
+    )
+    parser.add_argument(
+        "--solve-wait-seconds",
+        type=float,
+        default=DEFAULT_SOLVE_WAIT_SECONDS,
+        help="how long Stop waits for a running background solve before the final solve",
+    )
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help=(
+            "After the final build, try to place the session's segments in "
+            "one coordinate frame and persist the result as placements.json. "
+            "Runs once, at the end, in this process -- never on the frame "
+            "path. A segment's own geometry is never moved and a refusal is "
+            "the default, so the worst case is the unregistered world you "
+            "would have had anyway."
+        ),
+    )
+    parser.add_argument(
+        "--stop-on-stdin-close",
+        action="store_true",
+        help=(
+            "Treat EOF on stdin as a SOFT stop request: stop observing, close "
+            "the session as interrupted, skip the final solve, write the final "
+            "build. The Tower's worker supervisor holds the other end of that "
+            "pipe. SIGBREAK/SIGTERM/SIGINT are always a HARD stop (wrap up now)."
+        ),
+    )
+    parser.add_argument(
+        "--solve-script",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,  # a test seam: run this instead of world_solve.py
+    )
     args = parser.parse_args(argv)
 
     # Configured here rather than at import, so importing this module for
@@ -359,6 +1331,11 @@ def main(argv=None) -> int:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+
+    # Installed before the follower is built and before the first frame is
+    # read, because the poll loop it arms is the thing being armed.
+    stop_request = StopRequest()
+    stop_request.install(watch_stdin=args.stop_on_stdin_close)
 
     chosen = [
         name
@@ -394,11 +1371,16 @@ def main(argv=None) -> int:
 
     capture_id = None
     synthetic_intrinsics = None
+    capture_handle: dict = {}
     if args.follow_capture:
         frames = follow_capture(
             args.follow_capture,
             poll_seconds=args.poll_seconds,
             max_idle_polls=args.max_idle_polls,
+            # Asked inside the poll loop, which is where this process
+            # spends a quiet walk. See `StopRequest`.
+            should_stop=stop_request.asked_for,
+            handle=capture_handle,
         )
         frame_source = "live-capture"
         capture_id = args.follow_capture.name
@@ -562,66 +1544,327 @@ def main(argv=None) -> int:
     rebuilds = 0
     since_rebuild = 0
     accepted = 0
-    for frame in frames:
-        outcome = engine.observe(
-            frame.payload,
-            received_at=frame.received_at,
-            source_seq=frame.source_seq,
-            wire_seq=frame.wire_seq,
-            tx_seq=frame.tx_seq,
+    warned_frame_size = False
+    # keyframe_id -> raw frame path, for the global solver (see ObservedFrame).
+    sources: dict = {}
+    capture_dirs = [d for d in (args.follow_capture, args.frames) if d is not None]
+    solver = None
+    if args.solve:
+        solver = BackgroundSolver(
+            root=args.root.resolve(), world_id=world_id, session_id=session_id,
+            # 0 means "final solve only": no background cadence, but the
+            # final solve still runs as a child this process owns.
+            every=args.solve_every if args.solve_every > 0 else 0,
+            capture_dirs=capture_dirs, script=args.solve_script,
         )
-        if outcome.keyframe_id is None:
-            continue
-        accepted += 1
-        since_rebuild += 1
-        # Two keyframes is the minimum a two-view backend can say anything
-        # about. Rebuilding on one would burn a build to produce an anchor
-        # pose and nothing else.
-        if args.rebuild_every and since_rebuild >= args.rebuild_every and accepted >= 2:
-            rebuild_started = time.perf_counter()
-            interim = engine.build(world_id, session_id)
-            rebuilds += 1
-            since_rebuild = 0
-            # One line per rebuild, not per frame. Over a 15-minute walk
-            # this process used to print nothing at all until it was
-            # over, so "why isn't World Builder changing?" had no
-            # answer short of reading the world directory by hand.
-            logger.info(
-                "[Tower][WorldBuilder] rebuild %s: %s keyframes -> %s "
-                "positioned poses, %s points, %s segments in %.2fs",
-                rebuilds,
-                interim.keyframes,
-                interim.poses_solved,
-                interim.points,
-                interim.segments,
-                time.perf_counter() - rebuild_started,
-            )
-    observe_seconds = time.perf_counter() - started
-    summary = engine.stop_session()
+    background_solves = args.solve and args.solve_every > 0
 
-    built = time.perf_counter()
-    result = engine.build(world_id, session_id)
-    build_seconds = time.perf_counter() - built
-    logger.info(
-        "[Tower][WorldBuilder] session %s finished: %s frames, %s keyframes, "
-        "%s segments, backend=%s (downgraded_from=%s), %s solved poses, "
-        "%s points, scale=%s, final build %.2fs",
-        session_id,
-        summary.frames_observed,
-        summary.keyframes_accepted,
-        summary.segments,
-        result.backend_id,
-        result.downgraded_from,
-        result.poses_solved,
-        result.points,
-        result.scale_state,
-        build_seconds,
-    )
+    # THE LIFECYCLE, IN ONE PLACE, AND IT UNWINDS.
+    #
+    # Everything from the first frame to the last write sits inside one
+    # try. A stop request ends the frame loop at the next poll; an
+    # exception ends it with `end_reason: error`; either way the session is
+    # CLOSED on disk, the finalization is RECORDED, the final build is
+    # attempted, every solve child is reaped and the lock is released.
+    # Before 2026-09-06 none of that was guaranteed, and a builder that
+    # died mid-walk left a lock naming a dead pid as the only account of
+    # what happened.
+    end_reason = END_REASON_STOP
+    exit_code = 0
+    summary = None
+    solve_report = None
+    result = None
+    observe_seconds = 0.0
+    finalization_state = FINALIZATION_COMPLETE
+    final_solve_state = None
+    finalization_detail = None
+    try:
+        for frame in stop_request.bounded(frames):
+            outcome = engine.observe(
+                frame.payload,
+                received_at=frame.received_at,
+                source_seq=frame.source_seq,
+                wire_seq=frame.wire_seq,
+                tx_seq=frame.tx_seq,
+            )
+            if outcome.keyframe_id is None:
+                if (
+                    getattr(outcome, "reason", None) == "frame_size_changed"
+                    and not warned_frame_size
+                ):
+                    # ONCE PER SESSION, at WARNING, because the engine's
+                    # rejection is silent here otherwise: this loop
+                    # `continue`d past it with no log, and a whole walk at
+                    # the wrong rung left nothing but journal lines. The
+                    # count reaches the phone through the status channel;
+                    # this is for the operator reading the Tower log.
+                    warned_frame_size = True
+                    logger.warning(
+                        "[Tower][WorldBuilder] session %s is receiving frames "
+                        "of a different size from its first frame; they are "
+                        "being rejected, because the calibration is exact "
+                        "per resolution. Every further frame at that size "
+                        "will be rejected too",
+                        session_id,
+                    )
+                continue
+            accepted += 1
+            since_rebuild += 1
+            if frame.source_path is not None:
+                sources[outcome.keyframe_id] = str(frame.source_path)
+            # A finished background solve is worth a rebuild now: the solution
+            # reaches the derived tree only through build(), and the wearer
+            # should see the world snap together as soon as it is known.
+            solve_landed = background_solves and solver.finished()
+            # Two keyframes is the minimum a two-view backend can say anything
+            # about. Rebuilding on one would burn a build to produce an anchor
+            # pose and nothing else.
+            if (args.rebuild_every and since_rebuild >= rebuild_interval(
+                    args.rebuild_every, accepted) and accepted >= 2) or (
+                solve_landed and accepted >= 2
+            ):
+                rebuild_started = time.perf_counter()
+                try:
+                    interim = engine.build(world_id, session_id)
+                except OSError as exc:
+                    # An interim rebuild is a best-effort view for the wearer;
+                    # the next one rewrites every derived file. Windows refuses
+                    # the atomic replace while any reader holds the destination
+                    # (the Tower's web thread reading points.json for the
+                    # phone, descheduled under solver load), and on 2026-09-06
+                    # that exception ended a live session mid-walk: no
+                    # session_stopped, a LOCK with a dead pid, a torn derived
+                    # tree. Say so, and try again at the next rebuild.
+                    since_rebuild = 0
+                    logger.warning(
+                        "[Tower][WorldBuilder] rebuild %s failed and will be retried "
+                        "at the next one: %s: %s",
+                        rebuilds + 1, type(exc).__name__, exc,
+                    )
+                    continue
+                rebuilds += 1
+                since_rebuild = 0
+                # One line per rebuild, not per frame. Over a 15-minute walk
+                # this process used to print nothing at all until it was
+                # over, so "why isn't World Builder changing?" had no
+                # answer short of reading the world directory by hand.
+                logger.info(
+                    "[Tower][WorldBuilder] rebuild %s: %s keyframes -> %s "
+                    "positioned poses, %s points, %s segments in %.2fs",
+                    rebuilds,
+                    interim.keyframes,
+                    interim.poses_solved,
+                    interim.points,
+                    interim.segments,
+                    time.perf_counter() - rebuild_started,
+                )
+                if background_solves:
+                    solver.maybe_launch(store, accepted, sources)
+        observe_seconds = time.perf_counter() - started
+
+        # WAS THE CAPTURE STILL RUNNING WHEN WE WERE TOLD TO GO?
+        #
+        # That is the question, and this used to ask a different one: any
+        # stop request at all made the session `interrupted`. But the
+        # wearer leaving the World Builder screen IS a soft stop -- iOS
+        # posts `session/stop` from `.onDisappear` -- and it arrives right
+        # after the Stop that closed the capture. So the ordinary way to
+        # finish a walk produced `end_reason: interrupted`, and
+        # `results/world_builder.py` maps that to Interrupted ahead of ever
+        # looking at `finalization`. Measured on a real 12 fps capture: a
+        # wearer who leaves immediately gets `interrupted`, one who lingers
+        # a second gets `stop`, on identical geometry.
+        #
+        # A capture that has written its end reason ended because somebody
+        # pressed Stop. Whether this process was also told to go afterwards
+        # says nothing about the walk. `is_closed()` is asked of the
+        # FOLLOWER, not of the directory we started with, because a
+        # reconnect retargets it onto a successor capture.
+        follower = capture_handle.get("follower")
+        # `bounded_limit` is NOT the wearer. The recorder stops itself at a
+        # configured bound and its own log says a follower sees that "exactly
+        # as if it were" a disconnect -- so treating a closed capture as an
+        # ordinary end would finalise a world at the bound, under the label
+        # `stop`, while the wearer is still walking. The bound is forty
+        # minutes now, but a walk that reaches it should say so.
+        capture_end = follower.end_reason() if follower is not None else None
+        # A reconnect still in flight when the stop arrived is NOT a
+        # finished walk, even though the capture it was following ended
+        # `disconnect` and `disconnect` counts as finished. The wearer was
+        # still walking; the link died and nobody waited for it. Only the
+        # follower knows, so it is asked -- see
+        # `CaptureFollower.stopped_awaiting_successor`.
+        abandoned_reconnect = (
+            follower is not None and follower.stopped_awaiting_successor()
+        )
+        capture_finished = (
+            capture_end in (END_REASON_CAPTURE_STOP, END_REASON_CAPTURE_DISCONNECT)
+            and not abandoned_reconnect
+        )
+        if stop_request.asked and not capture_finished:
+            # Now it means what it says: frames were still coming and
+            # somebody asked this process to go.
+            end_reason = END_REASON_INTERRUPTED
+            logger.warning(
+                "[Tower][WorldBuilder] stop requested (%s, %s) while the capture was "
+                "still open; the session ends as %r",
+                stop_request.level, stop_request.source, end_reason,
+            )
+        elif stop_request.asked:
+            logger.info(
+                "[Tower][WorldBuilder] stop requested (%s, %s) after the capture "
+                "closed (%s); this is an ordinary end and the session ends as %r",
+                stop_request.level, stop_request.source, capture_end, end_reason,
+            )
+        if capture_end == END_REASON_CAPTURE_BOUNDED:
+            # A BOUND IS NOT A STOP, and this used only to say so in a log
+            # line while recording `stop` anyway -- a warning that claimed
+            # "the truncation is not reported as a clean finish" beside the
+            # clean-finish label. Caught by an adversarial review running
+            # these very lines against a real follower.
+            #
+            # Nobody asked for this walk to end: the recorder reached forty
+            # minutes and stopped itself while the wearer was still
+            # walking, and everything after that moment is missing from the
+            # world. `interrupted` is what that is.
+            end_reason = END_REASON_INTERRUPTED
+            logger.warning(
+                "[Tower][WorldBuilder] the capture stopped ITSELF at a configured "
+                "bound, not because anyone asked; the walk was longer than the "
+                "world. The session ends as %r, and whatever came after the bound "
+                "is not in it.",
+                end_reason,
+            )
+        summary = engine.stop_session(
+            end_reason, hold_lock=True, capture_end_reason=capture_end
+        )
+
+        # -- finalization: the lock is still held, the record says pending --
+        if solver is None:
+            final_solve_state = None
+        elif stop_request.hard:
+            # ONLY a hard stop skips it. This used to be `stop_request.asked`,
+            # so a SOFT stop -- the wearer leaving the World Builder screen,
+            # or the cartridge session being stopped -- skipped the final
+            # solve too, on the reasoning that "nobody is waiting for it".
+            #
+            # The 2026-09-09 walk falsifies that premise. Nobody watches a
+            # final solve; they open the world afterwards. And the final
+            # solve is what MAKES the world: re-running the one that walk
+            # never got, on its own images, took 16 components to 6 and put
+            # 652 of 795 keyframes into one at 0.82 px, against a largest
+            # component of 156 before. Skipping it does not save the wearer
+            # a wait, it costs them the reconstruction.
+            #
+            # A hard stop is different and still skips: the Tower is going
+            # down, and `run_final` below would be killed mid-solve anyway.
+            final_solve_state = FINAL_SOLVE_SKIPPED
+            finalization_detail = (
+                f"final solve skipped: hard stop ({stop_request.source}) "
+                "while observing"
+            )
+            solver.wait(0.0)
+        else:
+            # A background solve still running at Stop is given a bounded
+            # wait and then TERMINATED, never abandoned: the final solve is
+            # about to reuse its workspace.
+            solver.wait(args.solve_wait_seconds, should_stop=stop_request.hard_asked_for)
+            if stop_request.hard:
+                final_solve_state = FINAL_SOLVE_SKIPPED
+                finalization_detail = (
+                    f"final solve skipped: hard stop ({stop_request.source}) during finalization"
+                )
+            else:
+                solve_report = solver.run_final(
+                    store, sources, should_stop=stop_request.hard_asked_for
+                )
+                if solve_report.get("solved"):
+                    final_solve_state = FINAL_SOLVE_SOLVED
+                elif solve_report.get("interrupted"):
+                    final_solve_state = FINAL_SOLVE_SKIPPED
+                    finalization_detail = (
+                        f"final solve terminated: hard stop ({stop_request.source}) "
+                        "during finalization; the last background solution stands"
+                    )
+                elif solve_report.get("error"):
+                    final_solve_state = FINAL_SOLVE_FAILED
+                    finalization_detail = f"final solve failed: {solve_report['error']}"
+                else:
+                    final_solve_state = FINAL_SOLVE_UNAVAILABLE
+                    finalization_detail = (
+                        f"final solve produced no solution: {solve_report.get('reason')}"
+                    )
+        if solver is not None:
+            if solve_report is None:
+                solve_report = {"attempted": False, "solved": False}
+            solve_report["background_launches"] = solver.launches
+            solve_report["final_solve"] = final_solve_state
+
+        built = time.perf_counter()
+        result = engine.build(world_id, session_id)
+        build_seconds = time.perf_counter() - built
+        logger.info(
+            "[Tower][WorldBuilder] session %s finished: %s frames, %s keyframes, "
+            "%s segments, backend=%s (downgraded_from=%s), %s solved poses, "
+            "%s points, scale=%s, final build %.2fs",
+            session_id,
+            summary.frames_observed,
+            summary.keyframes_accepted,
+            summary.segments,
+            result.backend_id,
+            result.downgraded_from,
+            result.poses_solved,
+            result.points,
+            result.scale_state,
+            build_seconds,
+        )
+    except BaseException as exc:  # noqa: BLE001 -- the unwind IS the point
+        exit_code = 1
+        finalization_state = FINALIZATION_INTERRUPTED
+        finalization_detail = f"{type(exc).__name__}: {exc}"
+        logger.exception(
+            "[Tower][WorldBuilder] session %s ended by %s; closing the record and "
+            "keeping what was built",
+            session_id, type(exc).__name__,
+        )
+        if engine.session_active:
+            try:
+                summary = engine.stop_session(END_REASON_ERROR, hold_lock=True)
+            except Exception:  # noqa: BLE001
+                logger.exception("[Tower][WorldBuilder] could not close the session record")
+        if result is None:
+            # A best-effort last build: whatever the journal holds is worth
+            # a derived tree. It may raise for the same reason the loop did;
+            # that is logged, not propagated over the record-keeping below.
+            try:
+                result = engine.build(world_id, session_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("[Tower][WorldBuilder] the final build after the error failed too")
+        if isinstance(exc, KeyboardInterrupt):
+            exit_code = 130
+    finally:
+        if solver is not None:
+            solver.close()
+        try:
+            engine.mark_finalization(
+                world_id, session_id,
+                state=finalization_state,
+                final_solve=final_solve_state,
+                detail=finalization_detail,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[Tower][WorldBuilder] could not record the finalization")
+        engine.release_world(world_id)
+
+    if result is None or summary is None:
+        return exit_code
 
     report = {
         "world_id": world_id,
         "session_id": session_id,
         "frame_source": frame_source,
+        "end_reason": end_reason,
+        "finalization": finalization_state,
         "frames_observed": summary.frames_observed,
         "keyframes_accepted": summary.keyframes_accepted,
         "rejected_by_reason": summary.rejected_by_reason,
@@ -636,8 +1879,46 @@ def main(argv=None) -> int:
         "observe_ms_per_frame": round(
             observe_seconds * 1000 / max(summary.frames_observed, 1), 3
         ),
-        "build_seconds": round(build_seconds, 3),
+        "build_seconds": round(build_seconds, 3) if exit_code == 0 else None,
     }
+
+    # After the final build, never between rebuilds: registration reads
+    # the derived tree and binds its answer to that build's digest, so a
+    # mid-walk run would solve against geometry the next rebuild
+    # replaces and be discarded at serve time anyway.
+    if solve_report is not None:
+        report["global_solve"] = solve_report
+    # The Sim3 registrar places fragments against each other; when the
+    # global solve produced a solution the placements already come from one
+    # reconstruction and a second, weaker answer must not overwrite them.
+    #
+    # THE QUESTION IS WHO WROTE placements.json, NOT WHETHER THE FINAL SOLVE
+    # RAN. This used to read `not (solve_report or {}).get("solved")`, and
+    # `solve_report` is the FINAL solve's report -- None whenever the session
+    # did not reach finalization normally. On the 2026-09-09 walk the session
+    # died in the observe loop, so `solve_report` was None, so the guard
+    # concluded there was no solution and ran the registrar. It ran at
+    # 20:24:48.3, sixteen seconds AFTER the last build had written its
+    # placements at 20:24:32.5, and overwrote them.
+    #
+    # What it destroyed is on record in the manifest beside the file it
+    # replaced: `global_solve` reports 72 segments registered into 14
+    # components from nine successful background solves, while the
+    # `placements.json` the phone actually reads was left saying 120 refused
+    # and 2 registered. That single substitution is why a walk that
+    # reconstructed most of a room was drawn as 87 disconnected fragments.
+    #
+    # `engine.build()` now says which producer owns the file, so the guard
+    # asks the build that actually wrote it.
+    if args.register:
+        report["registration"] = (
+            register_session(store, world_id, session_id)
+            if should_register(result)
+            else {
+                "attempted": False,
+                "reason": "the global solve placed these segments",
+            }
+        )
 
     if args.format == "json":
         print(json.dumps(report, indent=2))
@@ -649,7 +1930,7 @@ def main(argv=None) -> int:
                 "\nSYNTHETIC, NOT PHYSICAL: nothing here says anything about "
                 "the Ray-Ban camera."
             )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

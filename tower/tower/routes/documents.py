@@ -75,14 +75,24 @@ def _root(request: Request):
         raise HTTPException(
             status_code=404,
             detail=(
-                "no document root is configured on this Tower "
-                "(TOWER_DOCUMENT_ROOT is unset)"
+                "Document Memory is switched off on this Tower "
+                "(TOWER_DOCUMENT_ENABLED is off), so no document root is "
+                "configured (TOWER_DOCUMENT_ROOT is unset)"
             ),
         )
     return root
 
 
 def _store(request: Request, retention_days):
+    # The Tower's own window when the caller names none. Until 2026-09-07
+    # a read with no `retention_days` saw FOREVER while the session wrote
+    # under thirty days, so an expired-but-not-yet-pruned record was
+    # served. A caller can still narrow; nothing can widen.
+    configured = getattr(request.app.state, "document_retention_days", None)
+    if retention_days is None:
+        retention_days = configured
+    elif configured is not None:
+        retention_days = min(retention_days, configured)
     return store_from_root(_root(request), retention_days=retention_days)
 
 
@@ -184,12 +194,20 @@ def _session(request: Request):
     live = getattr(request.app.state, "live_cartridges", None)
     session = None if live is None else live.document
     if session is None:
+        # The runtime's own reason when it has one (the OCR extra is not
+        # installed, most likely), else the configuration reading. Both
+        # name TOWER_DOCUMENT_CAPTURE: iOS keys its "no capture session"
+        # outcome on that substring.
+        reason = None if live is None else live.document_unavailable_reason
         raise HTTPException(
             status_code=404,
             detail=(
-                "this Tower runs no document capture session "
-                "(TOWER_DOCUMENT_CAPTURE is off, or TOWER_DOCUMENT_ROOT is "
-                "unset). Documents recorded elsewhere are still served"
+                reason
+                or (
+                    "this Tower runs no document capture session "
+                    "(TOWER_DOCUMENT_CAPTURE is off, or TOWER_DOCUMENT_ROOT "
+                    "is unset). Documents recorded elsewhere are still served"
+                )
             ),
         )
     return session

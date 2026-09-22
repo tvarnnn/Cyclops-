@@ -23,9 +23,9 @@ import XCTest
 enum DocumentFixtures {
     /// `GET /documents`, verbatim.
     static let recent: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "spatial_ref": NSNull(),
@@ -77,9 +77,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -106,9 +106,9 @@ enum DocumentFixtures {
 
     /// `GET /documents/search?text=invoice`, verbatim.
     static let search: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "spatial_ref": NSNull(),
@@ -160,9 +160,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -196,9 +196,9 @@ enum DocumentFixtures {
 
     /// `GET /documents-session`, verbatim.
     static let session: [String: Any] = [
-        "contract": "document_memory.library/2026-08-27",
+        "contract": "document_memory.library/2026-09-07",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "recording_limitations": [
@@ -220,9 +220,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -282,7 +282,7 @@ enum DocumentFixtures {
     static let socketStatus: [String: Any] = [
         "contract_note": "session progress only. The documents themselves are on HTTP: /documents, /documents/{document_id}, /documents/search",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "absence_means": "not-recorded-by-this-cartridge",
         "time_basis": "tower-receipt",
         "library": [
@@ -360,9 +360,9 @@ enum DocumentFixtures {
             ],
         ],
         "recording_measurement": [
-            "measured_at": "2026-08-26",
-            "corpus_frames": 9199,
-            "corpus_captures": 18,
+            "measured_at": "2026-09-06",
+            "corpus_frames": 45594,
+            "corpus_captures": 97,
             "is_current": false,
             "note": "the corpus on this host has grown since. These figures describe the frames they were measured on and have not been re-derived",
         ],
@@ -380,7 +380,7 @@ enum DocumentFixtures {
     static let record: [String: Any] = [
         "document_id": "doc-1",
         "claim": "a-page-was-in-view-and-was-ocred",
-        "identity": "no-document-identity-across-sightings",
+        "identity": "same-page-by-text-and-look-within-library",
         "title": NSNull(),
         "title_is_derived": true,
         "title_max_chars": 60,
@@ -475,8 +475,13 @@ enum DocumentFixtures {
         document["summary_is_verbatim_excerpt"] = true
         document["summary_is_model_output"] = true
         document["word_count"] = 8
-        payload["document"] = document
-        payload["pages"] = [[
+        // Nested inside the document, which is where the Tower puts it:
+        // `payload["document"] = dict(_summary_view(...), pages=[...])`.
+        // This fixture used to set `payload["pages"]` at the top level, which
+        // no Tower has ever sent -- it was written to match the decoder, and
+        // the decoder was reading the wrong level, so the two agreed and the
+        // page text never arrived on a device.
+        document["pages"] = [[
             "page_index": 0,
             // Empty text with zero regions is the readable-nothing case, which
             // is a real answer and not a missing page.
@@ -494,6 +499,7 @@ enum DocumentFixtures {
             "image_kept": false,
             "image_served": false,
         ]]
+        payload["document"] = document
         payload["coverage"] = [
             "pages_observed": 1,
             "pages_total": NSNull(),
@@ -629,7 +635,7 @@ final class DocumentLimitationTests: XCTestCase {
     func testTheMeasurementIsNotPresentedAsCurrent() throws {
         let response = try XCTUnwrap(DocumentMemoryDecoder.library(from: DocumentFixtures.recent))
         XCTAssertFalse(response.recordingMeasurement.isCurrent)
-        XCTAssertEqual(response.recordingMeasurement.corpusFrames, 9199)
+        XCTAssertEqual(response.recordingMeasurement.corpusFrames, 45594)
         var bare = DocumentFixtures.recent
         bare["recording_measurement"] = NSNull()
         let plain = try XCTUnwrap(DocumentMemoryDecoder.library(from: bare))
@@ -796,6 +802,38 @@ final class DocumentFieldTests: XCTestCase {
         XCTAssertEqual(response.pages[0].observationCount, 2)
         XCTAssertNil(response.coverage?.pagesTotal)
         XCTAssertNotNil(response.coverage?.pagesTotalNote)
+    }
+
+    /// Pages are read from inside the document, and nowhere else.
+    ///
+    /// The Tower builds the single-document payload as
+    /// `payload["document"] = dict(_summary_view(...), pages=[...])`, and its
+    /// own wire test asserts `payload["document"]["pages"][0]["text"]`. This
+    /// decoder read `payload["pages"]`, a level up, where no Tower has ever
+    /// put it -- so `pages` was always empty on a device and the page text,
+    /// the only thing `GET /documents/{id}` exists to carry, never arrived.
+    ///
+    /// It survived because the fixture had been written to match the decoder
+    /// rather than the Tower: both were wrong in the same direction, so the
+    /// test agreed with the bug. This one fails in both directions -- a
+    /// top-level `pages` must be ignored, and a nested one must be read.
+    func testPagesAreReadFromInsideTheDocumentAndNotFromTheTopLevel() throws {
+        // The shape the Tower has never sent must yield nothing.
+        var topLevelOnly = DocumentFixtures.recent
+        topLevelOnly["answer"] = "matched"
+        topLevelOnly["query"] = ["kind": "document", "document_id": "doc-1"]
+        topLevelOnly["document"] = DocumentFixtures.record
+        topLevelOnly["pages"] = [["page_index": 0, "text": "top level", "text_source": "ocr"]]
+        let wrong = try XCTUnwrap(DocumentMemoryDecoder.library(from: topLevelOnly))
+        XCTAssertTrue(
+            wrong.pages.isEmpty,
+            "a page beside the document is not a page the Tower sent"
+        )
+
+        // The shape the Tower does send must be read.
+        let right = try XCTUnwrap(DocumentMemoryDecoder.library(from: DocumentFixtures.oneDocument))
+        XCTAssertEqual(right.pages.count, 1)
+        XCTAssertEqual(right.pages[0].pageIndex, 0)
     }
 
     /// A duration from an assumed frame interval is a **reconstruction** and
@@ -1029,8 +1067,221 @@ final class DocumentSessionTests: XCTestCase {
     /// just on HTTP. The two contracts are separate, and so are the two checks.
     func testTheStatusPayloadIsAlsoAssertedAgainstTheConstants() {
         var drifted = DocumentFixtures.socketStatus
-        drifted["identity"] = "document-identity-across-sightings"
+        drifted["identity"] = "no-document-identity-across-sightings"
         XCTAssertNil(DocumentMemoryDecoder.status(from: drifted))
+    }
+
+    /// The 2026-09-07 additions decode, and their absence decodes to the
+    /// defaults a 2026-08-27-shaped payload implies.
+    func testTheLiveUpdateFieldsDecodeWithDefaults() throws {
+        let bare = try XCTUnwrap(
+            DocumentMemoryDecoder.status(from: DocumentFixtures.socketStatus)
+        )
+        XCTAssertNil(bare.library.revision)
+        XCTAssertNil(bare.session.ocrDevice)
+        XCTAssertNil(bare.session.documentsResighted)
+        XCTAssertFalse(bare.session.idleStopPending)
+
+        var live = DocumentFixtures.socketStatus
+        var library = live["library"] as! [String: Any]
+        library["revision"] = 1_757_200_000_000_000_000
+        live["library"] = library
+        var session = live["session"] as! [String: Any]
+        session["ocr_device"] = "cuda"
+        session["documents_resighted"] = 2
+        session["dwells_unreadable"] = 1
+        session["idle_stop_pending"] = true
+        live["session"] = session
+
+        let decoded = try XCTUnwrap(DocumentMemoryDecoder.status(from: live))
+        XCTAssertEqual(decoded.library.revision, 1_757_200_000_000_000_000)
+        XCTAssertEqual(decoded.session.ocrDevice, "cuda")
+        XCTAssertEqual(decoded.session.documentsResighted, 2)
+        XCTAssertEqual(decoded.session.dwellsUnreadable, 1)
+        XCTAssertTrue(decoded.session.idleStopPending)
+    }
+
+    /// A record seen once decodes as such; a record with sightings carries
+    /// them, and the first observation's `observed_at` is untouched.
+    func testSightingsDecodeOnADocument() throws {
+        // A LISTING that actually carries a row. `DocumentFixtures.recent`
+        // is the empty library -- `document_count: 0`, `documents: []` --
+        // and `oneDocument` puts its record under the singular `document`
+        // key, which the decoder reads into `single` rather than into
+        // `documents`. Neither can answer a question about a row, so this
+        // test builds the listing it needs from the shared record.
+        var listing = DocumentFixtures.recent
+        listing["document_count"] = 1
+        listing["documents_in_memory"] = 1
+        listing["documents"] = [DocumentFixtures.record]
+
+        let response = try XCTUnwrap(
+            DocumentMemoryDecoder.library(from: listing)
+        )
+        let first = try XCTUnwrap(response.documents.first)
+        // A record with no sightings block reads as seen once, at the time
+        // of its first observation. That default is the claim here.
+        XCTAssertEqual(first.sightingCount, 1)
+        XCTAssertEqual(first.lastObservedAt, first.time.observedAt)
+
+        var payload = listing
+        var documents = payload["documents"] as! [[String: Any]]
+        documents[0]["sighting_count"] = 3
+        documents[0]["last_observed_at"] = 1_700_000_900.0
+        documents[0]["pages_readable"] = 1
+        payload["documents"] = documents
+        let seenAgain = try XCTUnwrap(
+            DocumentMemoryDecoder.library(from: payload)
+        )
+        let record = try XCTUnwrap(seenAgain.documents.first)
+        XCTAssertEqual(record.sightingCount, 3)
+        XCTAssertEqual(record.lastObservedAt, Date(timeIntervalSince1970: 1_700_000_900))
+        XCTAssertEqual(record.pagesReadable, 1)
+        XCTAssertEqual(record.time.observedAt, first.time.observedAt)
+    }
+
+    /// The camera claim must survive the wearer changing cartridge.
+    ///
+    /// `DocumentMemoryViewModel` is a `@StateObject` owned by its workspace
+    /// view, so SwiftUI destroys it the moment another cartridge opens and
+    /// builds a fresh one on the way back. This lane shipped
+    /// `startedTheCamera` as a private property of that view model, which
+    /// means the memory of having started the camera died with it: the
+    /// capture kept running, the rebuilt screen said the camera belonged to
+    /// somebody else, and its Stop no longer stopped it, because the branch
+    /// that calls `stopCameraSession()` is guarded on the flag that was just
+    /// lost. Only Home could then end the capture.
+    ///
+    /// The fact now lives on a `CartridgeCameraClaim` that `ProjectManager`
+    /// owns. This test destroys the view model exactly as a cartridge switch
+    /// does, keeps the claim, and asserts the second view model can still
+    /// stop what the first one started.
+    func testTheCameraClaimSurvivesACartridgeSwitch() {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+
+        // The wearer opens Document Memory and presses Start.
+        var first: DocumentMemoryViewModel? = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+        first?.send(.start)
+        XCTAssertEqual(camera.starts, 1, "Start must start the camera when nothing holds it")
+        XCTAssertTrue(claim.startedByThisApp)
+
+        // The wearer opens another cartridge. The view model goes; the
+        // camera does not.
+        first = nil
+        XCTAssertEqual(camera.stops, 0, "a cartridge switch must not stop the capture")
+
+        // And comes back. A NEW view model, the same claim.
+        let second = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+        second.send(.stop)
+
+        XCTAssertEqual(
+            camera.stops, 1,
+            "Stop after a cartridge switch must still stop the camera this app started"
+        )
+        XCTAssertFalse(claim.startedByThisApp)
+    }
+
+    /// A capture this screen started, ended by somebody else, is no longer
+    /// this screen's to stop.
+    ///
+    /// The claim outliving the view model is what
+    /// `testTheCameraClaimSurvivesACartridgeSwitch` fixed, and it is right.
+    /// But a fact that survives a cartridge switch also survives the capture
+    /// it describes, and nothing was dropping it. `captureClaimUpdates` was
+    /// subscribed only to re-render the note:
+    ///
+    ///     .sink { [weak self] _ in self?.updateCameraNote() }
+    ///
+    /// So: Start here, walk to CV Lab or Home, press Stop camera there, press
+    /// Start camera there again, and come back. The claim still says this
+    /// screen started the capture, because the only thing that ever cleared
+    /// it was this screen's own Stop. Two things then go wrong, and the
+    /// second is the serious one:
+    ///
+    /// 1. `cameraNote` is `nil` at `.running` when `startedTheCamera` — so
+    ///    the panel silently claims a capture it does not own, rather than
+    ///    saying "The camera is streaming from another screen".
+    /// 2. Stop calls `stopCameraSession()` on a capture another screen
+    ///    started.
+    ///
+    /// `ObjectMemoryRecordingCoordinator.cameraClaimChanged` has dropped
+    /// ownership on `.unclaimed` since it shipped, with a comment naming this
+    /// exact failure. Document Memory is documented as "Modelled on
+    /// `ObjectMemoryRecordingCoordinator`" and copied the branch structure
+    /// without the invalidation.
+    func testACaptureEndedElsewhereIsNoLongerThisScreensToStop() async {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+        let model = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+
+        model.send(.start)
+        XCTAssertEqual(camera.starts, 1)
+        XCTAssertTrue(claim.startedByThisApp)
+
+        // Stopped from another screen -- Home, or the CV Lab's camera card.
+        // `captureClaimUpdates` is delivered with `.receive(on: .main)`, so
+        // the drop lands on the next main-queue turn rather than inside
+        // `publish`. Awaited exactly as Object Memory's sibling test does.
+        camera.publish(.unclaimed)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(
+            claim.startedByThisApp,
+            "a capture that ended is not still this screen's to stop"
+        )
+
+        // Started again from that other screen. This screen did not do it.
+        camera.publish(.running)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertFalse(
+            claim.startedByThisApp,
+            "somebody else's capture must not be adopted by this screen"
+        )
+        XCTAssertEqual(
+            model.cameraNote,
+            "The camera is streaming from another screen; the recorder reads those frames.",
+            "the panel must not claim a capture it did not start"
+        )
+
+        // And Stop leaves it alone.
+        model.send(.stop)
+        XCTAssertEqual(
+            camera.stops, 0,
+            "Stop must not end a capture another screen started"
+        )
+    }
+
+    /// The wearer's own Stop still works, which is what stops the fix above
+    /// from being "never stop anything".
+    ///
+    /// `stopCameraSession()` moves the fake's claim to `.unclaimed` but does
+    /// not publish it, exactly as a real Stop is observed a beat later. The
+    /// ordering matters: the branch reads `startedTheCamera` before the
+    /// publication that clears it, so a claim dropped on `.unclaimed` must
+    /// not make this screen's own Stop a no-op.
+    func testThisScreensOwnStopStillStopsTheCameraItStarted() {
+        let camera = FakeCaptureOwner()
+        let claim = CartridgeCameraClaim()
+        let model = DocumentMemoryViewModel(
+            client: UnavailableDocumentMemoryClient(), camera: camera, cameraClaim: claim
+        )
+
+        model.send(.start)
+        XCTAssertTrue(claim.startedByThisApp)
+
+        model.send(.stop)
+        XCTAssertEqual(camera.stops, 1, "this screen's Stop still stops its own capture")
+        XCTAssertFalse(claim.startedByThisApp)
+
+        // The claim change arrives afterwards, as it does on a device.
+        camera.publish(.unclaimed)
+        XCTAssertFalse(claim.startedByThisApp)
     }
 
     /// A deletion that quietly failed looks exactly like one that was kept, so
@@ -1119,10 +1370,10 @@ final class DocumentContractTests: XCTestCase {
     /// other.
     func testTheTwoIdentifiersAreSeparateAndNeverInterchanged() {
         XCTAssertEqual(
-            DocumentMemoryContract.statusIdentifier, "document_memory.status/2026-08-27"
+            DocumentMemoryContract.statusIdentifier, "document_memory.status/2026-09-07"
         )
         XCTAssertEqual(
-            DocumentMemoryContract.libraryIdentifier, "document_memory.library/2026-08-27"
+            DocumentMemoryContract.libraryIdentifier, "document_memory.library/2026-09-07"
         )
         XCTAssertNotEqual(
             DocumentMemoryContract.statusIdentifier, DocumentMemoryContract.libraryIdentifier

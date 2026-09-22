@@ -533,7 +533,7 @@ today:
 | `tracking_lost` | yes | `{segment_index}` |
 | `solve_chain_broken` | yes | `{segment_index}` |
 | `keyframe_accepted` | yes | `{keyframe_id, reason, segment_index}` |
-| `session_stopped` | yes | `{end_reason}` |
+| `session_stopped` | yes | `{end_reason}`, plus `capture_end_reason` when a live capture was being followed. `end_reason` is what happened to the WORLD; `capture_end_reason` is what happened to the LINK, and they differ — a capture that ended `disconnect` still counts as a finished walk. Absent, not null, when the caller had no follower to ask. |
 | `segment_started` | reserved | — |
 | `backend_downgraded` | reserved | — |
 | `mapping_stalled` | reserved | — |

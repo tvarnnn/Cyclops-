@@ -28,6 +28,7 @@ from tower.world_builder.store import (
     WorldStore,
     WorldStoreError,
     compute_input_digest,
+    manifest_describing,
 )
 
 GEOMETRY_CONTRACT = "world_builder.geometry/2026-08-25"
@@ -121,7 +122,18 @@ def _is_current(store, world_id: str, session_id: str) -> bool:
         digest = compute_input_digest(store.read_keyframes(world_id, session_id))
     except (WorldStoreError, KeyError, ValueError, OSError):
         return False
-    return store.derived_is_current(world_id, digest)
+    # WITH the session id. Without it this asks the world's manifest, which
+    # names whichever session built last, so an older session of a world
+    # walked twice was reported not-current against another session's
+    # digest -- and `read_derived` refused to serve it at all.
+    #
+    # `derived_currency` can also answer None, "nothing here can judge it".
+    # The wire contract defines `current` as "reflects every keyframe
+    # accepted so far", which is a claim, so an unjudgeable tree reports
+    # FALSE -- the same answer the status channel gives, and the
+    # conservative one. `read_derived` treats None differently, because it
+    # is deciding whether to serve rather than what to claim.
+    return store.derived_currency(world_id, digest, session_id) is True
 
 
 def contained_world_id(store, world_id: str) -> str | None:
@@ -304,7 +316,13 @@ def usable_placements(store, world_id: str, session_id: str) -> dict:
     if not stored:
         return {}
 
-    manifest = store.read_derived_manifest(world_id) or {}
+    # THE SESSION'S OWN MANIFEST. This read the world's, which names
+    # whichever session built last, so every placement of an OLDER session
+    # was compared against another session's digest, failed, and was
+    # served as unplaced -- an earlier walk could not be composited at all.
+    # Found by a reviewer who checked what else still read the world-level
+    # copy after `derived_is_current` had been given a session id.
+    manifest = _session_manifest(store, world_id, session_id) or {}
     digest = manifest.get("input_digest")
     fresh = {}
     for placement in stored:
@@ -417,6 +435,95 @@ def _placement_fields(placement) -> dict:
     }
 
 
+def _session_manifest(store, world_id: str, session_id: str) -> dict | None:
+    """The manifest that describes THIS session, from either copy.
+
+    The session's own first -- `write_derived` writes one beside the poses
+    and points it describes -- then the world's, but only if it names this
+    session. A world manifest naming another session is not evidence about
+    this one, and treating it as such is how an older walk was served
+    another session's coverage classes and had every placement refused.
+    """
+    # `purpose="identity"`: this module's callers ask WHICH BUILD produced
+    # a tree -- `usable_placements` compares `input_digest`, `_is_current`
+    # compares `input_digest` -- and a manifest carrying a session id and a
+    # digest answers that completely. See `manifest_describing` for why
+    # neither the figures nor the SCHEMA belongs on this path.
+    return manifest_describing(store, world_id, session_id, purpose="identity")
+
+
+def manifest_for(store, world_id: str, session_id: str | None = None) -> dict | None:
+    """The manifest to judge a session by, or the world's when none is named.
+
+    `session_id` is defaulted only so callers written before per-session
+    manifests existed keep working; every caller inside this module passes
+    it. Without one this answers about whichever session built last, which
+    for `global_solve.segments` means serving one walk's coverage classes
+    as another's.
+    """
+    if session_id is not None:
+        return _session_manifest(store, world_id, session_id)
+    try:
+        return store.read_derived_manifest(world_id)
+    except Exception:  # noqa: BLE001 -- an unreadable manifest is "no judgement"
+        return None
+
+
+def _solve_segments(store, world_id: str, session_id: str) -> dict:
+    """The global solve's per-segment verdicts, or `{}`.
+
+    **A `.get` CHAIN IS NOT A GUARD.** This was
+    `(manifest or {}).get("global_solve") or {}).get("segments") or {}`,
+    which raises `AttributeError` the moment `global_solve` is a string or
+    a list rather than a dict, and again if `segments` is -- straight out
+    of `build_manifest` and into an HTTP **500** on a route whose own
+    comment promises "404 now means ABSENT only", where the phone has no
+    branch for a 500.
+
+    It was reachable at HEAD for a schema-1 manifest with a malformed
+    `global_solve`. Round 18 WIDENED it: `manifest_for` became identity-only
+    and stopped checking `schema_version`, so manifests from an unknown
+    schema -- whose fields `validate_manifest`'s own comment says "this
+    build does not know" -- now reach this chain too. A reviewer measured
+    four shapes going 200 -> 500 across that change, and pointed out it
+    becomes broad rather than narrow the moment `SCHEMA_VERSION` is
+    bumped.
+
+    The purpose split stays as it is -- `usable_placements` genuinely
+    needs only the digest, and refusing 408 real placements over a record
+    schema bump was the defect that split was for. What was wrong is
+    reading a FIGURES-shaped field off the identity path without checking
+    its shape. Both halves are fixed here: the read is type-checked, and
+    the coverage verdicts come from a manifest validated for figures.
+    """
+    manifest = manifest_describing(store, world_id, session_id, purpose="figures")
+    if not isinstance(manifest, dict):
+        return {}
+    solve = manifest.get("global_solve")
+    if not isinstance(solve, dict):
+        return {}
+    segments = solve.get("segments")
+    return segments if isinstance(segments, dict) else {}
+
+
+def coverage_for_segment(index: int, poses: list, points: list, solve_segments: dict) -> str | None:
+    """The global solve's coverage class for a segment, or a truthful
+    fallback: `unresolved` for a segment with keyframes and no points, and
+    null when nothing has judged a segment that does have points."""
+    judged = solve_segments.get(str(index)) or solve_segments.get(index)
+    # `isinstance`, not truthiness: a `segments` map whose VALUES are
+    # strings passed the `if judged` and raised `AttributeError` on the
+    # `.get` below. Same class as the chain above, one level deeper, and
+    # a reviewer produced it.
+    if isinstance(judged, dict) and judged.get("coverage") in (
+        "confident", "partial", "unresolved"
+    ):
+        return judged["coverage"]
+    if poses and not points:
+        return "unresolved"
+    return None
+
+
 def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     # Rebound BEFORE anything reads it, because this function builds the
     # payload from its own copy: canonicalising inside `_read` changed a
@@ -432,6 +539,7 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
     placements = usable_placements(store, world_id, session_id)
 
     segments = []
+    solve_segments = _solve_segments(store, world_id, session_id)
     for index in sorted(grouped):
         poses = grouped[index]["poses"]
         points = grouped[index]["points"]
@@ -451,6 +559,12 @@ def build_manifest(store, world_id: str, session_id: str) -> dict | None:
             "solved_count": sum(1 for p in poses if p.get("status") == "solved"),
             "point_count": len(points),
             "bounds": _bounds(points),
+            # Additive (2026-09-06). How much to trust this segment's
+            # geometry, from the global solve when it ran:
+            # confident | partial | unresolved, or null when no solve has
+            # judged it. Unresolved is "keyframes exist, no geometry";
+            # unseen space has no segment at all and is never drawn.
+            "coverage": coverage_for_segment(index, poses, points, solve_segments),
         })
 
     return {

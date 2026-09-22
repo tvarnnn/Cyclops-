@@ -17,10 +17,48 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import BinaryIO, Callable
 
 logger = logging.getLogger(__name__)
 
 TEMP_SUFFIX = ".tmp"
+
+
+def staging_path(path: Path) -> Path:
+    """A staging name no other writer can be using.
+
+    Public, because two modules need the one convention: this file's two
+    atomic writers and `world_builder/store.py`'s keyframe images. A second
+    spelling of it is a second chance to get it wrong.
+
+    `path.name + ".tmp"` was the convention here until an adversarial review
+    measured what it does with two writers of one destination: 656 torn reads
+    at the published path over 12 seconds, plus a writer killed by
+    `FileNotFoundError` out of `replace` because its peer's `finally` had
+    already unlinked the shared temp. One writer can also `replace` the
+    half-written temp the OTHER is still filling straight onto the
+    destination -- which is precisely the `BadZipFile` the atomic write was
+    introduced to prevent, reintroduced by the staging name.
+
+    Nothing in this Tower serialises writers of `solution.npz`:
+    `acquire_writer_lock` is per-world and taken only by the engine, and
+    `scripts/world_solve.py` takes no lock at all. A hand-run solve against a
+    world with a live builder is two writers, and that is an ordinary
+    operator action -- it is how the 2026-09-09 artifact was recovered.
+
+    pid plus uuid4: the pid makes a stray temp attributable when someone
+    finds one, and the uuid makes it unique even within one process.
+    """
+    # `p` before the pid, and it is not decoration. The sweeper has to find
+    # the pid again, and "the all-digit component" is not a safe rule:
+    # `uuid4().hex[:8]` is all decimal digits 2.33% of the time (measured
+    # over 200k samples), and the capture recorder names its own staging
+    # files `<source_seq>.jpg.tmp` -- so a frame NUMBER would be read as a
+    # pid. Both were demonstrated deleting files they should not have.
+    # A `p`-prefixed component cannot be produced by either.
+    return path.with_name(
+        f"{path.name}.p{os.getpid()}.{uuid.uuid4().hex[:8]}{TEMP_SUFFIX}"
+    )
 
 
 def new_id() -> str:
@@ -34,18 +72,95 @@ def new_id() -> str:
 
 
 # How long a writer will keep trying to replace a destination a reader
-# momentarily has open, and how long it waits between attempts. Bounded
-# and short: this exists to ride out a reader's sub-millisecond handle,
-# not to wait out a process that has parked on the file. A writer that
-# cannot win in this budget raises, exactly as it did before.
-REPLACE_RETRIES = 12
+# has open, and how it paces the attempts. Bounded: this exists to ride
+# out a reader, not to wait out a process that has parked on the file. A
+# writer that cannot win in this budget raises, exactly as it did before.
+#
+# Until 2026-09-06 the budget was 12 x 5 ms = 60 ms, sized for "a
+# reader's sub-millisecond handle". That is the handle's length on an
+# idle box. On a live walk with the global solver's background child
+# taking 18 of 20 cores, the Tower's web thread reading a 2.2 MB
+# points.json for the phone lost the CPU mid-read, held the file past
+# 60 ms, and the BUILDER -- the process the retry exists to protect --
+# died in `write_derived` with poses.json new and points.json old. Two
+# seconds is longer than any reader this Tower has that is still making
+# progress, and still short next to a rebuild cadence of one per second.
+REPLACE_BUDGET_S = 2.0
 REPLACE_BACKOFF_S = 0.005
+REPLACE_BACKOFF_MAX_S = 0.05
+
+
+def sweep_abandoned_staging(directory: Path) -> int:
+    """Remove staging files whose writer is gone. Returns how many.
+
+    UNIQUE NAMES FIXED ONE PROBLEM AND CREATED ANOTHER. A shared
+    `<name>.tmp` meant a killed writer left one file that the next
+    successful write's `finally` cleaned up. Unique names mean a killed
+    writer leaves one file EVERY TIME, and nothing removes it: the
+    `finally` does not run under `TerminateProcess`, and `purge_world` --
+    which the docstrings call the sweeper -- has no production caller at
+    all. An adversarial review measured 21 strays and 11.4 MB after six
+    hard kills, and the builder kills a solve child on every stop that
+    outstays its budget.
+
+    The pid in the name is what makes this safe: a staging file belonging
+    to a LIVE process is someone's write in flight and is left alone. Only
+    a dead writer's leavings are swept, so this can run at any time.
+    """
+    swept = 0
+    for candidate in directory.iterdir():
+        if not candidate.is_file():
+            continue
+        parts = candidate.name.split(".")
+        # `.tmp` as a COMPONENT, not as a suffix. `staging_path` puts it
+        # last for a JSON or npz write, but `prepare_images` stages an
+        # undistorted frame as `<stem>.<pid>.<uuid>.tmp.jpg` -- so a
+        # suffix match swept the writers that rarely die and missed the
+        # one the builder terminates on every over-long stop, in the very
+        # directory this claims to sweep. Caught by testing the sweeper
+        # against every staging shape rather than the one it was written
+        # against.
+        if TEMP_SUFFIX.lstrip(".") not in parts:
+            continue
+        # EXACTLY the `p<digits>` component `staging_path` writes, and
+        # nothing else. Reading "the last all-digit component" as a pid was
+        # demonstrated deleting a LIVE writer's file whenever its uuid
+        # happened to be all digits, and deleting a user's `2024.tmp`, and
+        # deleting the capture recorder's `<source_seq>.jpg.tmp` by reading
+        # the frame number as a process. A deletion primitive does not get
+        # to guess.
+        pid = None
+        for part in parts:
+            if len(part) > 1 and part[0] == "p" and part[1:].isdigit():
+                pid = int(part[1:])
+                break
+        if pid is None:
+            # Not a name this module wrote. Not ours to judge, and deleting
+            # an unattributable file is not a sweep.
+            continue
+        try:
+            import psutil
+
+            if psutil.pid_exists(pid):
+                continue
+        except Exception:  # noqa: BLE001 -- absence of psutil is not a reason to delete
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
+        swept += 1
+    if swept:
+        logger.info(
+            "storage: swept %s abandoned staging file(s) from %s", swept, directory
+        )
+    return swept
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
     """Replace `path` atomically, leaving no temp file behind either way."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + TEMP_SUFFIX)
+    temp_path = staging_path(path)
     try:
         with temp_path.open("w", encoding="utf-8") as handle:
             # `json.dumps(...)` then one write, NOT `json.dump(payload,
@@ -83,13 +198,19 @@ def write_json_atomic(path: Path, payload: dict) -> None:
             handle.write(json.dumps(payload))
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_with_retry(temp_path, path)
+        replace_with_retry(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
 
 
-def _replace_with_retry(temp_path: Path, path: Path) -> None:
+def replace_with_retry(temp_path: Path, path: Path) -> None:
     """os.replace, retried while a concurrent READER holds the destination.
+
+    Public, because every writer of a file a reader can hold needs it, not
+    only the JSON ones. `prepare_images` undistorts keyframes with a bare
+    `os.replace` and raised `PermissionError` the first time a test held one
+    of its outputs open -- which is the same WinError 5 this function was
+    written for, in a path that had never been tested.
 
     Windows refuses `replace()` onto a destination any handle has open,
     and -- measured, not assumed -- `FILE_SHARE_DELETE` does NOT lift
@@ -120,14 +241,92 @@ def _replace_with_retry(temp_path: Path, path: Path) -> None:
     operation is atomic, so it either happened or it did not. There is no
     partial state to reconcile and no possibility of writing twice.
     """
-    for attempt in range(REPLACE_RETRIES):
+    deadline = time.monotonic() + REPLACE_BUDGET_S
+    backoff = REPLACE_BACKOFF_S
+    while True:
         try:
             temp_path.replace(path)
             return
         except PermissionError:
-            if attempt == REPLACE_RETRIES - 1:
+            if time.monotonic() >= deadline:
                 raise
-            time.sleep(REPLACE_BACKOFF_S)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, REPLACE_BACKOFF_MAX_S)
+
+
+def write_bytes_atomic(path: Path, write: "Callable[[BinaryIO], None]") -> None:
+    """Publish a binary artifact atomically: `write` fills a temp file, and
+    the destination is replaced only once the bytes are whole and on disk.
+
+    The binary twin of `write_json_atomic`, and it exists for a measured
+    failure rather than for symmetry. `world_builder/global_solve.py` wrote
+    `solution.npz` by handing the FINAL path straight to
+    `np.savez_compressed`, while `solution.json` beside it went through the
+    atomic helper. A `.npz` is a zip, a zip is only a zip once its central
+    directory is written last, and the reader lives in a DIFFERENT PROCESS
+    -- the builder rebuilding the derived tree while the solver child it
+    launched is still writing.
+
+    On the 2026-09-09 walk that reader opened the file mid-write and got
+    `BadZipFile: File is not a zip file`, which ended a session holding 795
+    keyframes and 26,634 points. The same window is worse when the writer
+    is TERMINATED rather than merely slow (`BackgroundSolver.wait` kills a
+    child that outstays a stop): the torn file then persists, and every
+    later read of that world fails the same way.
+
+    Replacing a whole temp file closes both cases at once: a reader sees
+    the previous solution or the next one, never half of either.
+
+    IT DOES NOT CLEAN UP AFTER A KILL, and an earlier version of this
+    docstring claimed it did. The `finally` below runs on an exception; it
+    does not run on `TerminateProcess`, which is exactly how
+    `BackgroundSolver` ends a solve child that outstays a stop. Measured:
+    a real kill mid-write leaves the published archive VALID -- which is
+    the guarantee that matters -- and a stray `.tmp` beside it that
+    nothing prunes. `purge_world` is still the only sweeper.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = staging_path(path)
+    try:
+        with temp_path.open("wb") as handle:
+            write(handle)
+            handle.flush()
+            # fsync before the replace, not after. The replace is what
+            # publishes; bytes still sitting in the OS cache at that
+            # moment are bytes a crash can take with the rename already
+            # visible, which is the one ordering that produces a file
+            # that IS published and IS torn.
+            os.fsync(handle.fileno())
+        replace_with_retry(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def read_bytes_closed(path: Path) -> bytes:
+    """Read a binary artifact whole, with the handle closed before use.
+
+    The binary twin of `read_json_closed`, and for the same Windows
+    reason: a handle held across parsing is a handle that blocks a
+    writer's `os.replace` (WinError 5), so a reader that parses lazily
+    turns itself into the thing the write path has to retry around.
+
+    `np.load` on a path is exactly that lazy reader -- `NpzFile` keeps the
+    zip open until it is closed -- so callers hand these bytes to
+    `np.load(io.BytesIO(...))` instead. The arrays this Tower persists are
+    single-digit MB; the field session's `solution.npz` is 1.7 MB, and the
+    extra peak is one copy of the compressed file.
+
+    HOW MUCH THIS BUYS, HONESTLY: measured on that artifact, the lazy form
+    holds the handle 23.6-31.7 ms and the eager form 0.9-1.2 ms, against a
+    `REPLACE_BUDGET_S` of 2000 ms. So the retry already absorbed the lazy
+    reader comfortably and this is a margin, not a rescue. It is still the
+    right shape -- the budget is finite and a reader under solver load is
+    exactly what descheduled long enough to matter on 2026-09-06 -- but it
+    was oversold as closing a hazard, and it is not what fixed the field
+    failure. The atomic write is.
+    """
+    with path.open("rb") as handle:
+        return handle.read()
 
 
 def read_json_closed(path: Path) -> dict:

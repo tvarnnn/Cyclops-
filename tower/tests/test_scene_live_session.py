@@ -168,10 +168,30 @@ class TestStartAndStopControlTheWork:
         live, engine = stopped_session()
         first = live.start()
         _await_state(live, STATE_RUNNING)
+        before = threading.active_count()
         second = live.start()
 
         assert second["session_id"] == first["session_id"]
-        assert threading.active_count() < 50
+        # The DELTA across the second start, not the process-wide total.
+        #
+        # This assertion used to read `threading.active_count() < 50`,
+        # which is a whole-process measurement standing in for a claim
+        # about one session. Run on its own it passed; run inside the full
+        # suite on a host with torch installed it reached 54 and failed,
+        # because the number counts torch's native pools and every thread
+        # any other cartridge's tests left in the interpreter -- none of
+        # which this session started and none of which it can control. A
+        # test that fails for what its neighbours did says nothing about
+        # the code it names.
+        #
+        # What "does not start two workers" actually means is that the
+        # second start adds no thread of its own, and that is what is
+        # measured now. It is a strictly tighter bound: the old form would
+        # have passed a genuine second worker as long as the process
+        # happened to be under fifty threads.
+        assert threading.active_count() == before, (
+            "a second start must add no thread: it is the same session"
+        )
 
 
 class TestStopDiscardsTheScene:

@@ -66,6 +66,7 @@ def test_a_new_stream_does_not_resume_a_session_the_wearer_paused():
     """
     session = _session()
     try:
+        session.watcher_joined("phone-a:sub-1", owner="phone-a")
         session.stream_opened(owner="phone-a")
         assert session.status()["state"] in (STATE_RUNNING, "starting")
 
@@ -103,13 +104,15 @@ def test_a_stream_start_still_starts_a_stopped_session():
     """And the fix must not break the reason `stream_opened` exists.
 
     Nothing on the wire could start a session before this hook: opening a
-    cartridge on the phone sends nothing, and a test asserts the wire
-    stays silent. Withholding only the PAUSED promotion must leave that
-    intact.
+    cartridge on the phone sends no verb, and a test asserts that. What
+    it does send is a subscription to the live scene, and stream plus
+    subscription is the start signal (`tower/scene/live.py`, WHEN IT
+    RUNS). Withholding only the PAUSED promotion must leave that intact.
     """
     session = _session()
     try:
         assert session.status()["state"] == STATE_STOPPED
+        session.watcher_joined("phone-a:sub-1", owner="phone-a")
         session.stream_opened(owner="phone-a")
         assert session.status()["state"] in (STATE_RUNNING, "starting")
     finally:

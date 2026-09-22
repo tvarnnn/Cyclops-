@@ -9,8 +9,8 @@ import Foundation
 ///
 /// The wire types live in `DocumentMemoryLibrary.swift`; this file is the
 /// presentation vocabulary those decode into. Contracts:
-/// `document_memory.library/2026-08-27` over HTTP and
-/// `document_memory.status/2026-08-27` on the socket.
+/// `document_memory.library/2026-09-07` over HTTP and
+/// `document_memory.status/2026-09-07` on the socket.
 ///
 /// ## Three refusals, each load-bearing
 ///
@@ -141,10 +141,12 @@ struct DocumentSourceContext: Equatable, Sendable {
 /// a timestamp and nothing else must not force the UI to invent a title, and a
 /// row for such a document is a short row rather than a row full of dashes.
 struct RememberedDocument: Equatable, Identifiable, Sendable {
-    /// The Tower's identifier, opaque. **Not durable across sightings**:
-    /// reading the same page on Monday and Tuesday produces two unrelated
-    /// records with different ids and no link, which is what
-    /// `identity: "no-document-identity-across-sightings"` means.
+    /// The Tower's identifier, opaque. Since 2026-09-07 it IS durable across
+    /// sightings of the same page: a later look whose words and look both
+    /// agree with a page of this record becomes a sighting of it
+    /// (`sightingCount`, `lastObservedAt`) rather than a new record, which is
+    /// what `identity: "same-page-by-text-and-look-within-library"` means.
+    /// Anything weaker is still a separate record with its own id.
     let id: String
     /// A title the Tower **derived from the document's own first text region**,
     /// clipped to `titleMaxChars`. `nil` renders as "Untitled document", which
@@ -234,6 +236,15 @@ struct RememberedDocument: Equatable, Identifiable, Sendable {
     var summaryIsModelOutput: Bool
     /// Present only on a search result.
     var match: DocumentMatchEvidence?
+    /// How many times this record was observed, the first time included. One
+    /// for a record seen once. The fields above describe the FIRST
+    /// observation and are never rewritten by a later sighting.
+    var sightingCount: Int = 1
+    /// The most recent of those observations. Tower-receipt time.
+    var lastObservedAt: Date? = nil
+    /// Pages whose text cleared the Tower's readability floor. A record can
+    /// hold pages OCR looked at and could not read.
+    var pagesReadable: Int? = nil
 
     init(
         id: String,

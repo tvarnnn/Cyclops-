@@ -210,6 +210,86 @@ claims and are kept different all the way to the screen.
 Note `mappingSeconds` is deliberately **not** derived from an iOS timer: the
 iPhone's idea of elapsed time is not the Tower's idea of mapping time.
 
+### 1.x The render route is now the product surface, and iOS asks it two questions
+
+**AVAILABLE, with one addition MISSING — TOWER NEEDED.**
+
+As of 2026-09-09 the iOS side treats `GET /worlds/{id}/render` as **the primary
+representation of a saved world**. Opening a world from Saved Worlds pushes that
+page straight onto the screen; the sparse per-segment gallery this app draws from
+`geometry/manifest` moved behind a Diagnostics disclosure. Nothing was deleted —
+the manifest, the chunks, the placement words and the refusal prose are all still
+fetched and all still shown — but they are no longer what a person sees first.
+
+Two consequences for the Tower:
+
+1. **The render page carries the product claim now.** Its composition, its
+   colouring and its caption are what a person reads as "my world". A page that
+   colours by segment index reads as a debugger however good the geometry is.
+2. **iOS asks for a diagnostics variant of the same page: `?view=diagnostics`.**
+   `WorldRenderView.diagnostics` appends that query parameter and nothing else;
+   the product view sends no `view` parameter at all, so its URL is byte-for-byte
+   the one every previous build asked for.
+
+   **AVAILABLE as of 2026-09-09, and server-side, which is the only form that
+   works.** `world_render` declares `view`, `build_world_render` threads it, and
+   `render.py` substitutes the opening mode into the page's script.
+
+   That mattered because **a page that switches modes from `location.search`
+   does not reach the phone.** iOS loads the render page with
+   `loadHTMLString(_:baseURL: nil)`: no origin, exactly one navigation
+   (`about:blank`), every other navigation refused by
+   `WorldRenderNavigationPolicy`. That is deliberate — it is what lets the app
+   show the Tower's own 404 prose instead of a blank web view, and what makes
+   refusing navigation a one-line policy instead of an allow-list — and it will
+   not be loosened. Inside it `location.search` is empty, so an in-page
+   `?view=diagnostics` link would have gone nowhere. Selecting at compose time
+   is what made it reachable.
+
+   **iOS asks for it at open time only, never as a toggle.** "Open the solver's
+   3D view" in the world screen's Diagnostics section fetches the page already
+   in diagnostics mode. There is deliberately no in-app switch between the two
+   renderings: switching would refetch several megabytes to change one `let
+   mode` in a script already on screen, and the Tower's page carries its own
+   `<button id="mode">` and `d` key that switch in place for nothing. Keep that
+   in-page control — on the phone it is the switch.
+
+   A Tower too old to declare `view` still answers with the ordinary world page
+   and no error, because FastAPI ignores query parameters a route does not
+   declare. That is the right failure: the wearer asked to see something and
+   sees their world.
+
+**Also still MISSING: any route that would let a person act on a world that did
+not finish.** Everything under `/worlds` is a read. `WorldRecoverability` therefore
+says what survived and states plainly that finishing the world is the Tower's to
+do — iOS deliberately offers no Retry, Rebuild or Re-solve button, because there
+is nothing behind one.
+
+**And now read: `lifecycle.finalization.final_solve`.** It has been on the wire
+since `world_builder.status/2026-09-06` and was decoded by iOS and displayed by
+nothing. `pending`, `solved`, `skipped`, `failed` and `unavailable` now each
+produce a different sentence and, in two cases, a different stage word (`Saved`
+versus `Partial`). A sixth word will survive to the screen verbatim. **`null`
+produces nothing** — it conflates "no report has arrived yet", "this Tower
+predates the field" and "the record kept no account", and the phone will not
+report on the Tower from silence.
+
+**One request about how you send it.** iOS republishes `lifecycle.finalization`
+as an input in its own right, because the client dedupes `model_state` and a
+report that moves `final_solve` while the snapshot stands still would otherwise
+change nothing on screen for the whole length of a final solve. So: **keep
+sending the finalization block on the heartbeat**, even when nothing else in the
+payload has moved. iOS drops the repeats itself.
+
+**`model_state` is the single source of the lifecycle word.** iOS decodes
+`end_reason` (`WorldSessionReport`, `WorldListingSession`) and derives **nothing**
+from it — no "interrupted", no failure, no badge. So the classifier reporting a
+repaired world as `ready` with an `error` `end_reason` arrives on the phone as
+`Saved`, and nothing on this side contradicts it. (An earlier version of this
+sentence said the Tower's reason string is shown beside it; it is not —
+`modelState(from:)` drops `reason` for `finalized`, and the `.finalized` arm of
+the canvas draws none. Corrected at the 2026-09-14 Mac gate.)
+
 ---
 
 ## 2. Experimental CV Lab

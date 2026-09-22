@@ -117,7 +117,14 @@ TEXT_EXTRACTED = "extracted"
 # identifier did not move: an identifier is bumped to protect decoders
 # that exist, and none had ever decoded the earlier shape.
 DOCUMENT_CLAIM = "a-page-was-in-view-and-was-ocred"
-IDENTITY_SCOPE = "no-document-identity-across-sightings"
+# Since 2026-09-07 a record IS joined across sightings, by one rule: a
+# later dwell whose first readable page carries the same words AND looks
+# the same (`document_memory/identity.py`) becomes a sighting of the
+# record rather than a new one. Anything weaker stays a separate record.
+# The earlier value, "no-document-identity-across-sightings", was true
+# of a cartridge that made no such join; it is not true of this one,
+# and the contract identifiers moved with it.
+IDENTITY_SCOPE = "same-page-by-text-and-look-within-library"
 ABSENCE_MEANING = "not-recorded-by-this-cartridge"
 
 # What happened to the pixels, in this platform's terms and in iOS's.
@@ -234,46 +241,51 @@ RECORDING_LIMITATIONS = (
     {
         "limitation": "detection-rate",
         "detail": (
-            "on 9,199 frames of real first-person footage the page "
-            "detector fired 6 times and every one was a false positive (a "
-            "venetian blind and a backlit keyboard). After "
-            "MIN_ROW_TRANSITIONS was re-derived against those same frames "
-            "it fires 0 times. An empty library on this platform is the "
-            "expected result, not a sign that nothing was read"
+            "the contour-quad page detector this cartridge shipped with "
+            "fired 6 times on 9,199 frames of real first-person footage "
+            "and every one was a false positive (a venetian blind and a "
+            "backlit keyboard). It was replaced on 2026-09-07 by a "
+            "steadiness gate plus the OCR engine's own text detector, "
+            "which needs no page outline. That detector found zero "
+            "confident text boxes across 4,599 sampled real frames, so "
+            "an empty library on this platform's existing footage is "
+            "still the expected result, not a sign that nothing was read"
         ),
     },
     {
         "limitation": "no-validated-positive",
         "detail": (
-            "no SAMPLED capture on this platform has contained a sheet of "
-            "paper -- a visual review of 51 frames at quartile positions "
-            "across 18 captures, on a corpus that has since grown. The "
-            "detector has never been shown a positive it was built for, "
-            "so the premise is untested rather than disproved"
+            "no capture on this platform has contained a sheet of paper: "
+            "a visual review of one sharp frame from each of 71 captures "
+            "and a text-detector sweep of every tenth frame of 97 "
+            "captures found none. The pipeline has been validated on "
+            "rendered pages with known text, never on a physical page "
+            "through the glasses, so the premise is untested rather than "
+            "disproved"
         ),
     },
     {
         "limitation": "resolution",
         "detail": (
             "at the 360x640 the glasses deliver, EasyOCR returned zero "
-            "dictionary words across 919 sampled real frames -- every "
-            "tenth frame of a corpus that is dense with screen text and "
-            "also full of walls and carpet -- at median confidence 0.056. "
-            "Word recall on rendered pages at this geometry is 0.629-0.952 "
-            "with the page at its own aspect, which is the fairest "
-            "estimate of the delivered case"
+            "dictionary words across 919 sampled real frames of screen "
+            "text at median confidence 0.056. On rendered pages at that "
+            "geometry word recall is 0.98 when the page fills the frame, "
+            "0.74 at 60% of the frame height and 0.02 at 40%; at 504x896 "
+            "it is 1.00 / 0.98 / 0.66. A page must be held close, or the "
+            "stream must be raised a rung"
         ),
     },
     {
         "limitation": "resolution-remedy-is-not-a-fix",
         "detail": (
-            "a high-resolution still is the measured remedy for "
-            "RECOGNITION, and recognition is not what is failing. "
-            "Detection is the binding constraint and a still does not "
-            "touch it: the glyph gate is derived for 360x640 only and "
-            "must be re-derived at any other geometry, where the usable "
-            "window between real negatives and readable pages may close "
-            "entirely. Nobody has run that derivation"
+            "raising the stream to 720x1280 is measured to break World "
+            "Builder's tracking (73% of frames rejected as blurred), so "
+            "the resolution a session runs at is a cross-cartridge choice "
+            "the phone makes, not this cartridge. 504x896 is the "
+            "unmeasured middle rung. A false positive of the text "
+            "detector -- a keyboard, a screen -- reaches OCR and is kept "
+            "as a page that is not readable, which the record says"
         ),
     },
 )
@@ -281,16 +293,17 @@ RECORDING_LIMITATIONS = (
 # When the figures above were measured, and on what.
 #
 # Asserted in the present tense they read as current state, and this
-# platform's corpus grows continuously -- so a rate measured on 9,199
-# frames says nothing about the frames recorded since.
+# platform's corpus grows continuously -- so a rate measured on a corpus
+# says nothing about the frames recorded since.
 RECORDING_MEASUREMENT = {
-    "measured_at": "2026-08-26",
-    "corpus_frames": 9199,
-    "corpus_captures": 18,
+    "measured_at": "2026-09-06",
+    "corpus_frames": 45594,
+    "corpus_captures": 97,
     "is_current": False,
     "note": (
-        "the corpus on this host has grown since. These figures describe "
-        "the frames they were measured on and have not been re-derived"
+        "the corpus on this host grows with every session. These figures "
+        "describe the frames they were measured on: the text-detector "
+        "sweep covered every tenth frame, the recall ladder is synthetic"
     ),
 }
 
@@ -473,7 +486,14 @@ def _summary_view(document) -> dict:
         # NEVER `viewing_duration`. Appearing in the camera does not
         # establish that the wearer looked at it, noticed it, or read it.
         "observed_seconds": document.observed_seconds,
+        # Later looks at this same record, merged by `identity`. The
+        # FIRST observation's fields above are never rewritten by a
+        # sighting; these three describe the record as a whole.
+        "sighting_count": document.sighting_count,
+        "last_observed_at": document.last_observed_at,
+        "total_observed_seconds": document.total_observed_seconds,
         "pages_observed": document.pages_observed,
+        "pages_readable": sum(1 for page in document.pages if page.readable),
         "text_availability": _text_availability(document),
         "end_reason": document.end_reason,
         "timing": _timing(document),
@@ -511,6 +531,14 @@ def _page_view(page) -> dict:
         # readings of one page during one dwell is one page with an
         # observation count of two, not two pages.
         "observation_count": page.observation_count,
+        # Whether the words above cleared the readability floor. A page
+        # with regions and no readable text is one OCR looked at and
+        # could not read -- which is a different fact from never looking.
+        "readable": bool(page.readable),
+        # How many text boxes the detector found where this page was
+        # read from. Evidence that text was there even when it was not
+        # readable.
+        "box_count": page.box_count,
         # A BOOLEAN, not the path. The path told a reader that an
         # unredacted photograph of what the wearer was reading exists on
         # this Tower's disk, and where in the store -- disclosure with no
@@ -671,10 +699,19 @@ def search_documents(
     payload["no_observation_note"] = _no_observation_note(total)
     payload["documents_in_memory"] = total
     payload["searched_documents"] = result.searched_documents
+    payload["searched_pages"] = result.searched_pages
     payload["min_score"] = result.min_score
     payload["sufficient_evidence"] = bool(result.sufficient_evidence)
     payload["reason"] = result.reason
     payload["match_kind"] = "lexical"
+    # Since 2026-09-07 a term of five or more characters also matches a
+    # token within one edit of it or one it begins -- OCR reads
+    # "Kubernetes" as "Kubemetes" often enough to matter. Each match says
+    # whether it needed that, and an exact match outranks a near one.
+    payload["match_tolerance"] = (
+        "exact for terms under five characters; one edit or a prefix "
+        "for longer terms, weighted below an exact match"
+    )
     payload["document_count"] = len(result.matches)
     payload["snippet_max_chars"] = SNIPPET_MAX_CHARS
     payload["documents"] = [
@@ -684,6 +721,9 @@ def search_documents(
             matched_terms=list(match.matched_terms),
             # Bounded evidence, not an excerpt. See SNIPPET_MAX_CHARS.
             snippet=_clip(match.snippet, SNIPPET_MAX_CHARS),
+            # Which page the snippet and the score came from.
+            page_index=match.page_index,
+            fuzzy=bool(match.fuzzy),
         )
         for match in result.matches
     ]
@@ -783,17 +823,22 @@ _SESSION_NULL_FIELDS = (
     "frames_skipped",
     "frames_dropped_not_running",
     "recogniser",
+    "ocr_device",
     "capture_id",
     "capture_id_validated",
     "in_dwell",
     "dwells_started",
     "pages_detected",
     "documents_recorded",
+    "documents_resighted",
+    "dwells_unreadable",
     "last_document_id",
     "last_document_at",
     "flushed_document_id",
     "keeps_page_images",
     "follows_stream",
+    "idle_stop_seconds",
+    "idle_stop_pending",
     "retention_days",
     "documents_pruned",
     "retention_incomplete",
@@ -804,13 +849,15 @@ _SESSION_NULL_FIELDS = (
 )
 
 
-def _session_absent() -> dict:
+def _session_absent(reason: str | None = None) -> dict:
     from tower.live_session import LIFECYCLE_STATES
 
     absent = {
         "state": SESSION_UNAVAILABLE,
         "states": list(LIFECYCLE_STATES) + [SESSION_UNAVAILABLE],
-        "reason": SESSION_ABSENT_REASON,
+        # The runtime's own reason when it has one -- the OCR extra is
+        # not installed, most likely -- else the configuration reading.
+        "reason": reason or SESSION_ABSENT_REASON,
     }
     absent.update({name: None for name in _SESSION_NULL_FIELDS})
     return absent
@@ -872,10 +919,13 @@ class DocumentStatusProducer:
     with coarse timestamps can produce two writes inside one tick.
     """
 
-    def __init__(self, document_root, session, *, clock=None) -> None:
+    def __init__(
+        self, document_root, session, *, clock=None, unavailable_reason=None
+    ) -> None:
         self._root = document_root
         self._session = session
         self._clock = clock
+        self._unavailable_reason = unavailable_reason
         self._stamp = None
         self._summary = None
 
@@ -895,6 +945,7 @@ class DocumentStatusProducer:
                 "retention_applied": False,
                 "unavailable_reason": None,
                 "newest_observed_at": None,
+                "revision": 0,
                 "bytes": {"journal": 0, "images": 0, "total": 0},
                 "location_disclosed": False,
             }
@@ -917,10 +968,18 @@ class DocumentStatusProducer:
                 "retention_applied": False,
                 "unavailable_reason": None,
                 "newest_observed_at": (
-                    max(document.observed_at for document in documents)
+                    max(document.last_observed_at for document in documents)
                     if documents
                     else None
                 ),
+                # Changes whenever the journal changes -- an append, a
+                # sighting merged onto an existing record, a prune. A
+                # phone that holds a listing re-fetches it when this
+                # moves and never otherwise; the count alone would miss a
+                # sighting and a prune-plus-append in one tick. The
+                # journal's mtime, which is not a clock a client should
+                # read as one.
+                "revision": int(stamp[0]) if stamp is not None else 0,
                 "bytes": store.bytes_used(),
                 # No path, ever. The channel already holds this rule for
                 # World Builder and it is the channel's rule, not that
@@ -936,6 +995,7 @@ class DocumentStatusProducer:
                     "this Tower's document journal could not be read"
                 ),
                 "newest_observed_at": None,
+                "revision": None,
                 "bytes": None,
                 "location_disclosed": False,
             }
@@ -971,7 +1031,7 @@ class DocumentStatusProducer:
             "time_basis": TIME_BASIS,
             "library": self._library(),
             "session": (
-                _session_absent()
+                _session_absent(self._unavailable_reason)
                 if self._session is None
                 else _session_present(self._session)
             ),

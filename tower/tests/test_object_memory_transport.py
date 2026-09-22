@@ -118,6 +118,70 @@ def test_every_payload_carries_the_contract(corpus):
     assert answer["contract"] == OBSERVATIONS_CONTRACT
 
 
+# --- `since`: this recording's memories, apart from history ---------------
+
+
+def test_since_returns_only_records_written_at_or_after_it(corpus):
+    """The primitive that stops history masquerading as the current run.
+
+    The corpus holds a laptop at NOW-1d and a cell phone at NOW-2d inside
+    the window. A session that started 1.5 days ago asks `since` and gets
+    only the laptop -- the record its recording created -- not the phone
+    that predates it.
+    """
+    listing = build_observations(_store(corpus), since=NOW - 1.5 * DAY)
+
+    assert listing["observation_count"] == 1
+    assert listing["observations"][0]["object_class"] == "laptop"
+    assert all(o["recorded_at"] >= NOW - 1.5 * DAY for o in listing["observations"])
+
+
+def test_since_is_echoed_and_absent_means_the_whole_store(corpus):
+    """`null` since and a real since are different claims, said in the payload."""
+    whole = build_observations(_store(corpus))
+    scoped = build_observations(_store(corpus), since=NOW - 1.5 * DAY)
+
+    assert whole["since"] is None
+    assert whole["observation_count"] == 2
+    assert scoped["since"] == NOW - 1.5 * DAY
+
+
+def test_a_recording_that_wrote_nothing_gets_an_empty_answer_not_history(corpus):
+    """The zero-frame failure, answered honestly.
+
+    A session that starts NOW and records nothing asks `since=NOW`; the
+    store has 116-record-shaped history older than that, and the answer is
+    empty rather than borrowing it.
+    """
+    listing = build_observations(_store(corpus), since=NOW)
+
+    assert listing["observation_count"] == 0
+    assert listing["observations"] == []
+    # History is still there for the view that asks for it.
+    assert build_observations(_store(corpus))["observation_count"] == 2
+
+
+def test_since_over_the_route_and_the_contract_is_unchanged(corpus):
+    response = _client(corpus).get(
+        "/object-memory/observations", params={"since": NOW - 1.5 * DAY}
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["observation_count"] == 1
+    assert body["since"] == NOW - 1.5 * DAY
+    # Additive: the identifier a shipped iOS build compares for equality
+    # does not move because a new optional field appeared.
+    assert body["contract"] == OBSERVATIONS_CONTRACT
+
+
+def test_a_negative_since_is_refused_by_the_route(corpus):
+    response = _client(corpus).get(
+        "/object-memory/observations", params={"since": -1}
+    )
+    assert response.status_code == 422
+
+
 # --- Retention cannot be widened over the wire ---------------------------
 
 

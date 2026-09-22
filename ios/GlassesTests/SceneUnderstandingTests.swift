@@ -1095,3 +1095,204 @@ final class SceneUnderstandingClientTests: XCTestCase {
         XCTAssertEqual(client.cartridgeID, "scene-understanding")
     }
 }
+
+// MARK: - 2026-09-07 additions
+
+// @MainActor, like every other test class in this file. The app target
+// sets SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor, so the decoder, the
+// view and the client this class drives are all main-actor isolated at
+// their declaration, and a test class with no annotation cannot call
+// them synchronously.
+@MainActor
+final class SceneUnderstandingAdditionsTests: XCTestCase {
+    private func people(_ extra: [String: Any]) -> ScenePeople {
+        var json: [String: Any] = ["count": 2, "facing_wearer": 1, "facing_answered": true]
+        json.merge(extra) { _, new in new }
+        return SceneUnderstandingDecoder.people(from: json)!
+    }
+
+    func testAnOlderTowerDecodesWithNothingInvented() {
+        let decoded = people([:])
+        XCTAssertEqual(decoded.partialBottomEdge, 0)
+        XCTAssertEqual(decoded.byApparentSize, [:])
+        XCTAssertNil(decoded.orientationStatus)
+        XCTAssertNil(decoded.apparentSizeNote)
+    }
+
+    func testThePartialBucketAndSizesDecode() {
+        let decoded = people([
+            "partial_bottom_edge": 1,
+            "by_apparent_size": ["large": 1, "medium": 0, "small": 1, "unknown": 0],
+            "apparent_size_note": "sizes, never distances",
+            "orientation_status": "experimental",
+        ])
+        XCTAssertEqual(decoded.partialBottomEdge, 1)
+        XCTAssertEqual(decoded.byApparentSize["large"], 1)
+        XCTAssertEqual(decoded.byApparentSize["small"], 1)
+        XCTAssertEqual(decoded.orientationStatus, "experimental")
+        XCTAssertEqual(decoded.apparentSizeNote, "sizes, never distances")
+    }
+
+    func testPeopleAreNeverPersons() {
+        XCTAssertEqual(SceneReadingView.everydayName(for: "person", count: 1), "person")
+        XCTAssertEqual(SceneReadingView.everydayName(for: "person", count: 2), "people")
+    }
+
+    func testSizesTextOmitsEmptyBucketsAndSaysInView() {
+        XCTAssertNil(SceneReadingView.sizesText([:]))
+        XCTAssertNil(SceneReadingView.sizesText(["large": 0, "unknown": 2]))
+        XCTAssertEqual(
+            SceneReadingView.sizesText(["large": 1, "medium": 0, "small": 2]),
+            "Size in view: 1 large, 2 small"
+        )
+    }
+
+    func testTheStubClientIgnoresVisibility() {
+        let client = UnavailableSceneUnderstandingClient()
+        client.workspaceVisibilityChanged(isVisible: true)
+        client.workspaceVisibilityChanged(isVisible: false)
+        if case .unsupported = client.state {} else { XCTFail("the stub's state must not move") }
+    }
+
+    /// Visibility must reach the CONFORMER through an existential.
+    ///
+    /// This is the one thing about `workspaceVisibilityChanged` that a
+    /// compiler cannot tell you. If the method is declared only in the
+    /// protocol extension and not in the protocol's requirement list, a
+    /// call through `any SceneUnderstandingClient` -- which is how
+    /// `SceneUnderstandingViewModel` holds its client -- is dispatched
+    /// STATICALLY to the extension's no-op default. It compiles, every
+    /// other test passes, and the screen silently stops opening and
+    /// closing the live subscription. Since the Tower runs a scene session
+    /// only while somebody streams AND somebody watches, the detector then
+    /// runs for as long as the socket lives.
+    ///
+    /// The lane shipped it in that state. This test fails if it returns:
+    /// it calls through the existential and asserts the override ran.
+    func testVisibilityReachesTheConformerThroughAnExistential() {
+        final class Recorder: SceneUnderstandingClient {
+            var seen: [Bool] = []
+            let cartridgeID = "scene-understanding"
+            let state: SceneUnderstandingState = .unsupported(reason: "a test double")
+            func workspaceVisibilityChanged(isVisible: Bool) { seen.append(isVisible) }
+        }
+
+        let recorder = Recorder()
+        let erased: any SceneUnderstandingClient = recorder
+        erased.workspaceVisibilityChanged(isVisible: true)
+        erased.workspaceVisibilityChanged(isVisible: false)
+
+        XCTAssertEqual(
+            recorder.seen,
+            [true, false],
+            "workspaceVisibilityChanged must be a protocol REQUIREMENT. Declared "
+                + "only in the extension it dispatches statically through an "
+                + "existential, the no-op default runs, and the Scene screen "
+                + "never opens or closes its subscription."
+        )
+    }
+}
+
+// MARK: - The subscribe/leave race
+
+/// A `result_subscribed` that arrives after the screen has gone must be
+/// closed, not adopted.
+///
+/// Driven against a real socket rather than a stub, because the defect lives
+/// in the gap between two wire messages and nothing smaller than the wire can
+/// reproduce it: `TowerSceneUnderstandingClient` holds a concrete
+/// `TowerClient`, and the window under test is the one where a
+/// `result_subscribe` is out and its ack has not come back.
+@MainActor
+final class SceneSubscribeRaceTests: XCTestCase {
+
+    private func url(port: UInt16) -> URL { URL(string: "ws://127.0.0.1:\(port)/")! }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return condition()
+    }
+
+    /// Answers the handshake ping and the capability request, records the rest,
+    /// and deliberately does **not** answer `result_subscribe` — the ack is
+    /// sent by hand, after the screen has gone.
+    private func serve(_ server: MockTowerServer, _ recorder: MessageRecorder) {
+        server.onText = { text in
+            recorder.record(text)
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let type = json["type"] as? String
+            else { return }
+            switch type {
+            case "ping":
+                server.send(text: #"{"type":"pong"}"#)
+            case "cartridges":
+                server.send(text: #"{"type":"cartridges","envelope_contract":"cartridge_results.envelope/2026-08-23","cartridges":[{"cartridge":"scene_understanding","result_type":"live","contract":"scene_understanding.live/2026-08-27","available":true,"unavailable_reason":null,"snapshot_only":true}],"not_offered":[],"http_contracts":[]}"#)
+            default:
+                break
+            }
+        }
+    }
+
+    /// Leave the screen while the subscribe is still in flight, then let the
+    /// ack land.
+    ///
+    /// `workspaceVisibilityChanged(false)` can only unsubscribe an id it
+    /// holds, and in this window there is no id yet — so it sends nothing.
+    /// Before the fix the ack handler then assigned `subscriptionID`, opening
+    /// a subscription for a screen that no longer existed. Nothing could close
+    /// it afterwards: the visibility call is guarded on a *change*, so it will
+    /// not fire again, and `subscribeIfPossible` is the only other path. The
+    /// watcher lived as long as the socket, and on this cartridge a watcher is
+    /// what keeps a people detector running.
+    func testAnAckArrivingAfterTheScreenIsGoneIsClosedRatherThanAdopted() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = MessageRecorder()
+        serve(server, recorder)
+        defer { server.stop() }
+
+        let tower = TowerClient()
+        tower.connect(to: url(port: port))
+        let online = await waitUntil { tower.status == .online }
+        XCTAssertTrue(online, "the socket came up")
+
+        let scene = TowerSceneUnderstandingClient(tower: tower)
+        let declared = await waitUntil { tower.cartridgeDeclaration != nil }
+        XCTAssertTrue(declared, "the Tower declared its cartridges")
+
+        // The screen appears: a `result_subscribe` goes out and is left
+        // unanswered, which is the window under test.
+        scene.workspaceVisibilityChanged(isVisible: true)
+        let subscribed = await waitUntil {
+            recorder.all.contains { $0.contains("result_subscribe") }
+        }
+        XCTAssertTrue(subscribed, "the subscribe reached the wire")
+
+        // The wearer leaves before the ack.
+        scene.workspaceVisibilityChanged(isVisible: false)
+
+        // Only now does the Tower answer.
+        server.send(text: #"{"type":"result_subscribed","subscription_id":"sub-1","cartridge":"scene_understanding","result_type":"live","contract":"scene_understanding.live/2026-08-27"}"#)
+
+        let closed = await waitUntil {
+            recorder.all.contains { $0.contains("result_unsubscribe") && $0.contains("sub-1") }
+        }
+        XCTAssertTrue(
+            closed,
+            "an ack for a screen that has gone must be unsubscribed. Adopting it "
+                + "leaves a watcher nothing can retract, and the Tower keeps a "
+                + "people detector running for as long as the socket lives."
+        )
+
+        tower.disconnect()
+    }
+}

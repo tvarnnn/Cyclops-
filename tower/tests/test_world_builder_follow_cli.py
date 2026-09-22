@@ -140,11 +140,58 @@ class TestFollowCapture:
         assert result.returncode != 0
 
     def test_a_missing_capture_directory_exits_nonzero(self, tmp_path):
+        # `--root` is not decoration. Without it this CLI defaults to a
+        # RELATIVE `data/world_builder`, which resolves against pytest's
+        # working directory -- so this one test minted a world into the
+        # developer's real store on every full-suite run.
         result = _run(
-            "world_build_session.py", "--follow-capture", str(tmp_path / "absent")
+            "world_build_session.py",
+            "--root",
+            str(tmp_path / "root"),
+            "--follow-capture",
+            str(tmp_path / "absent"),
         )
 
         assert result.returncode != 0
+
+    def test_a_session_that_cannot_start_mints_no_world(self, tmp_path):
+        """A session that never begins must leave nothing behind.
+
+        This is the mechanism behind the stub worlds: 86 of the 123
+        worlds in the corpus on this host hold a `world.json` and no
+        sessions at all, and they accumulate with install age.
+
+        `world_build_session.py` creates the world BEFORE the first
+        frame, deliberately -- "a Tower whose phone has connected but
+        not yet sent a frame reports a world that exists and is empty
+        rather than no world at all". That claim is about a session that
+        CAN start. This one cannot: there is no capture directory, and
+        the process is about to exit nonzero.
+
+        It minted anyway because `follow_capture` is a GENERATOR. Its
+        `if not directory.exists(): raise SystemExit` does not run when
+        the function is called -- only when the generator is first
+        advanced, which happens AFTER `engine.create_world()`. The guard
+        fired one statement too late, every time, and left a permanent
+        world to prove it.
+        """
+        root = tmp_path / "root"
+
+        result = _run(
+            "world_build_session.py",
+            "--root",
+            str(root),
+            "--follow-capture",
+            str(tmp_path / "absent"),
+        )
+
+        assert result.returncode != 0
+        assert "no capture directory" in (result.stderr + result.stdout)
+        minted = sorted((root / "worlds").glob("*/world.json"))
+        assert not minted, (
+            f"a session that could not start minted {len(minted)} world(s): "
+            f"{[path.parent.name for path in minted]}"
+        )
 
 
 class TestIncrementalRebuild:
@@ -274,6 +321,67 @@ class TestInspectFollow:
         assert "session_started" in result.stdout
         assert "session_stopped" in result.stdout
         assert "keyframe_accepted" in result.stdout
+
+    def test_the_stop_event_records_what_happened_to_the_CAPTURE(
+        self, tmp_path, finished_capture
+    ):
+        """`end_reason` is the world's; `capture_end_reason` is the link's.
+
+        They differ in a case a real walk produces. A capture that ended
+        `disconnect` counts as finished, so a walk whose phone never came
+        back is recorded as an ordinary `stop` -- deliberately, because
+        the alternative puts the campaign's headline symptom back. That
+        choice is defensible only while the artifact still says which it
+        was, and the session record names only the FIRST capture it
+        followed, so after a reconnect the link was a timestamp search.
+        """
+        from tower.world_builder.store import WorldStore
+
+        directory, capture_id = finished_capture
+        root = tmp_path / "worlds"
+        report = json.loads(
+            _run(
+                "world_build_session.py",
+                "--follow-capture", str(directory),
+                "--root", str(root),
+                "--format", "json",
+            ).stdout
+        )
+
+        store = WorldStore(root)
+        events = store.read_events(report["world_id"], report["session_id"])
+        stopped = [e for e in events if e["kind"] == "session_stopped"]
+        assert stopped, "the walk never recorded a stop"
+        payload = stopped[-1]["payload"]
+        recorded = json.loads(
+            (directory / "capture.json").read_text(encoding="utf-8")
+        )["end_reason"]
+        assert payload["capture_end_reason"] == recorded, (
+            "the journal does not say what happened to the link: "
+            f"{payload} against a capture that ended {recorded!r}"
+        )
+
+    def test_an_offline_caller_writes_the_journal_it_always_wrote(self, tmp_path):
+        """The key is ABSENT when nobody knows, not None and not guessed.
+
+        Every offline caller -- a replay, a test, `world_finalize.py` --
+        has no follower to ask. Their journals must be byte-identical to
+        what they were before this field existed.
+        """
+        from tower.world_builder.engine import WorldBuilderEngine
+        from tower.world_builder.store import WorldStore
+
+        store = WorldStore(tmp_path / "worlds")
+        engine = WorldBuilderEngine(store)
+        world_id = engine.create_world("offline")
+        session_id = engine.start_session(world_id, frame_source="synthetic")
+        engine.stop_session("stop")
+
+        stopped = [
+            e for e in store.read_events(world_id, session_id)
+            if e["kind"] == "session_stopped"
+        ]
+        assert stopped[-1]["payload"] == {"end_reason": "stop"}
 
     def test_follow_emits_json_lines_when_asked(self, tmp_path, finished_capture):
         """A viewer consumes this, not a human. One event per line."""

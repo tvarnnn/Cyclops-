@@ -48,10 +48,20 @@ struct DocumentMemoryWorkspaceView: View {
     @StateObject private var memory: DocumentMemoryViewModel
 
     /// The client is injected and owned by `ProjectManager`; see
-    /// `CartridgeClients`.
-    init(isTowerReachable: Bool, client: any DocumentMemoryClient) {
+    /// `CartridgeClients`. The camera is the same optional owner Object
+    /// Memory's coordinator receives: present in DEBUG, `nil` in Release.
+    init(
+        isTowerReachable: Bool,
+        client: any DocumentMemoryClient,
+        camera: (any ObjectMemoryCaptureOwner)? = nil,
+        cameraClaim: CartridgeCameraClaim? = nil
+    ) {
         self.isTowerReachable = isTowerReachable
-        _memory = StateObject(wrappedValue: DocumentMemoryViewModel(client: client))
+        _memory = StateObject(
+            wrappedValue: DocumentMemoryViewModel(
+                client: client, camera: camera, cameraClaim: cameraClaim
+            )
+        )
     }
 
     private var availability: CartridgeAvailability {
@@ -76,6 +86,7 @@ struct DocumentMemoryWorkspaceView: View {
                     DocumentSessionPanel(
                         session: session,
                         outcome: memory.lastSessionOutcome,
+                        cameraNote: memory.cameraNote,
                         send: { memory.send($0) }
                     )
                 }
@@ -87,7 +98,10 @@ struct DocumentMemoryWorkspaceView: View {
         }
         // One shot, not a poll: the subscription pushes the session twice a
         // second while it is open, and this covers the case where it is not.
-        .task { memory.refreshSession() }
+        // The recent listing is asked for once, on first appearance; after
+        // that the library's `revision` on the status push re-asks whatever
+        // is showing whenever the Tower's journal changes.
+        .task { memory.appear() }
     }
 
     // MARK: Header
@@ -476,6 +490,18 @@ struct DocumentRow: View {
                     Text(duration.label)
                 }
                 Text(document.text.displayName)
+                if document.sightingCount > 1 {
+                    // A later look at the same page joined this record rather
+                    // than becoming a second one.
+                    Text("Seen \(document.sightingCount) times")
+                }
+                if let pages = document.pagesObserved, pages > 1 {
+                    if let readable = document.pagesReadable {
+                        Text("\(readable) of \(pages) pages readable")
+                    } else {
+                        Text("\(pages) pages")
+                    }
+                }
             }
             .font(.caption2)
             .foregroundStyle(.tertiary)
@@ -663,6 +689,9 @@ struct DocumentProvenanceView: View {
 struct DocumentSessionPanel: View {
     let session: DocumentSessionStatus
     var outcome: DocumentSessionOutcome?
+    /// The camera's relation to this recorder, in one line, or `nil` when
+    /// this screen started the camera itself.
+    var cameraNote: String? = nil
     let send: (DocumentMemoryContract.SessionAction) -> Void
 
     var body: some View {
@@ -715,6 +744,37 @@ struct DocumentSessionPanel: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
+            }
+
+            HStack(spacing: 10) {
+                if let recorded = session.documentsRecorded {
+                    Text("\(recorded) recorded")
+                }
+                if let resighted = session.documentsResighted, resighted > 0 {
+                    Text("\(resighted) seen again")
+                }
+                if let unreadable = session.dwellsUnreadable, unreadable > 0 {
+                    Text("\(unreadable) not readable")
+                }
+                if let device = session.ocrDevice {
+                    Text("OCR on \(device)")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .monospacedDigit()
+
+            if let cameraNote {
+                Text(cameraNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if session.idleStopPending {
+                Text("No camera is streaming to the Tower. The recorder will stop itself unless one starts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if session.loadOverdue {

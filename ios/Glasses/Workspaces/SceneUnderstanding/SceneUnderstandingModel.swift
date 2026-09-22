@@ -289,6 +289,22 @@ struct ScenePeople: Equatable, Sendable {
     /// The Tower's own wording for what facing means. Data, not decoration.
     let facingNote: String?
 
+    /// Person boxes cut off by the bottom edge with no head region in view,
+    /// kept OUT of `count`. From a camera worn at head height that is most
+    /// often the wearer's own hands, arms, lap or legs. Since 2026-09-07;
+    /// defaults to 0 for an older Tower, which is the reading that adds
+    /// nothing rather than the one that invents something.
+    var partialBottomEdge: Int = 0
+    /// How many counted people are `large`, `medium`, `small` or `unknown`
+    /// in the frame — sizes in the picture, never distances. Empty for an
+    /// older Tower.
+    var byApparentSize: [String: Int] = [:]
+    /// The Tower's own wording for what a size means. Shown, not paraphrased.
+    var apparentSizeNote: String?
+    /// `"experimental"` while the facing stage has been validated only on
+    /// still photographs. `nil` for an older Tower.
+    var orientationStatus: String?
+
     /// `count − facingWearer − facingUnknown`, when both are measurements.
     ///
     /// Named a remainder rather than a category, because that is what it is:
@@ -614,6 +630,26 @@ struct SceneReading: Equatable, Sendable {
     /// The Tower's own prose for `unavailableReason`, shown verbatim where it
     /// exists — it is more specific than any headline this app can write.
     let unavailableReasonText: String?
+
+    /// The Tower's disclosure for the case where the aggregate IS a person.
+    ///
+    /// `single_person_note` has been on the wire since 2026-09-07 and nothing
+    /// on this side read it, which made the sentence the design depends on
+    /// dead code on the only client there is. It is the answer to the privacy
+    /// reviewer's accepted limitation: with exactly one person in view, "1 on
+    /// your left, 1 large, 1 appears to be facing your direction" is an
+    /// aggregate of one, and therefore a description of that person for as
+    /// long as they stand there. The Tower says so; the phone has to show it,
+    /// because the wearer is the only one who can see both the sentence and
+    /// the person.
+    ///
+    /// Optional because an older Tower does not send it, and carried
+    /// verbatim rather than restated: it is the Tower's claim about its own
+    /// payload, and this app must not soften it.
+    let singlePersonNote: String?
+
+    /// Whether this reading is the single-person case the note is about.
+    var describesOnePerson: Bool { observation?.people.count == 1 }
 
     /// The disclosure that must appear wherever a count does.
     ///

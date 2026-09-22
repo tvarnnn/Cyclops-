@@ -102,16 +102,21 @@ NOT_OFFERED: tuple[dict, ...] = ()
 # refusal on the socket cannot drift into two different explanations of
 # one configuration.
 SCENE_DISABLED_REASON = (
-    "Scene Understanding is not enabled on this Tower "
-    "(TOWER_SCENE_UNDERSTANDING is unset or off), so no session can be "
-    "started and there is no live scene to read. This build implements "
-    "the contract"
+    "Scene Understanding is switched off on this Tower "
+    "(TOWER_SCENE_UNDERSTANDING is off), so no session can be started and "
+    "there is no live scene to read. This build implements the contract"
 )
 
+# Names TOWER_DOCUMENT_ROOT even though the root has had a managed
+# default since 2026-09-07: iOS string-matches that variable name in a
+# 404 body to tell "the cartridge is switched off" from "the route is
+# gone", and the words that still explain the state are the ones that
+# say which switch was thrown.
 DOCUMENT_DISABLED_REASON = (
-    "no document root is configured on this Tower (TOWER_DOCUMENT_ROOT "
-    "is unset), so there is nowhere to record a document and nothing to "
-    "read back. This build implements the contract"
+    "Document Memory is switched off on this Tower (TOWER_DOCUMENT_ENABLED "
+    "is off), so no document root is configured (TOWER_DOCUMENT_ROOT is "
+    "unset), there is nowhere to record a document and nothing to read "
+    "back. This build implements the contract"
 )
 
 

@@ -26,8 +26,9 @@ that produced it, so a stale derived tree is detected rather than trusted.
 """
 
 import hashlib
-import os
 import json
+import os
+import time
 import logging
 import shutil
 import threading
@@ -35,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tower.storage import (
+    staging_path,
     TEMP_SUFFIX,
     append_jsonl,
     read_json_closed,
@@ -69,6 +71,24 @@ LOCK_FILENAME = "LOCK"
 DERIVED_DIRNAME = "derived"
 DERIVED_MANIFEST = "manifest.json"
 IMAGES_DIRNAME = "images"
+
+
+# How many times `acquire_writer_lock` will lose the exclusive create
+# before it gives up. Contention here is two processes reclaiming one
+# dead lock, which resolves in one round; this is a bound, not a wait.
+_LOCK_ACQUIRE_ATTEMPTS = 8
+
+# How long an unreadable lock is given to become readable before it is
+# treated as a writer that died between its create and its write. The write
+# is one `json.dumps` and an `fsync`; a tenth of a second is four orders of
+# magnitude more than that and still imperceptible to a wearer.
+_LOCK_UNREADABLE_GRACE_S = 0.1
+# A pause between attempts, so eight of them span long enough to outlast a
+# peer's reclaim rather than burning through in a millisecond. Without it an
+# adversarial review measured every loser of a natural race exhausting all
+# eight attempts in 1.2 ms and reporting "contending" instead of naming the
+# live holder -- 104 of 104 times.
+_LOCK_RETRY_SLEEP_S = 0.02
 
 
 class WorldStoreError(Exception):
@@ -135,6 +155,87 @@ def require_pose_convention(convention: dict) -> None:
 
 
 
+
+
+# Five attempts over ~14 ms of backoff. `write_json_atomic`'s own
+# `replace_with_retry` carries a 2,000 ms budget on the writer side, so
+# the two ladders overlap rather than race each other to a failure.
+_REPLACE_READ_ATTEMPTS = 5
+_REPLACE_READ_BACKOFF = 0.001
+
+
+def _read_json_past_a_replace(path, *, absent_on_failure=True):
+    """`read_json_closed`, surviving a writer replacing the file underneath.
+
+    **ONE BUILD REPLACES SIX FILES MICROSECONDS APART** -- `world.json`
+    from `write_world`, then poses, points, support and both manifests
+    from `write_derived`, which `engine.build` calls on the very next
+    statement -- and on Windows `os.replace` onto
+    a path a reader holds open fails with WinError 5, symmetrically with
+    the reader's own `open()` during the writer's window.
+
+    The two manifests were the ones nobody guarded. `read_derived_manifest`
+    caught only `ValueError` and `read_session_manifest` only
+    `(JSONDecodeError, ValueError)`; `derived_currency` calls both with no
+    `try` at all, and `world_builder_geometry._is_current` calls
+    `derived_currency` OUTSIDE its own. So a `PermissionError` walked out
+    through `build_manifest` and became an HTTP **500** on the geometry
+    route -- measured by a reviewer at **2.4% of requests** beside a live
+    writer, on a route whose own comment promises "404 now means ABSENT
+    only" and for which the phone has no branch. On the status channel the
+    same exception is caught by `snapshot()` and blinks the whole world
+    out of existence for a poll.
+
+    A round of this campaign measured that exact hazard and fixed it on
+    `poses.json` and `points.json`, the two files it was reading at the
+    time, and walked past the three that were already unguarded.
+
+    Two immediate retries, no sleep: a replace is over in microseconds and
+    this runs in a poll path. A reviewer measured the retry taking a
+    reader from 2.77% failures to **0%** on a 1.3 MB file, and 2.60% to
+    0.39% at 2,360 writes in six seconds, with **zero** additional writer
+    failures -- `replace_with_retry` already carries a 2,000 ms budget and
+    the worst observed write used 6% of it.
+
+    A `ValueError` is NOT retried and is re-raised for the caller's own
+    handler: a file that parsed and was wrong will parse and be wrong
+    again. An `OSError` that survives the retries is a real fault, and it
+    is reported as "no manifest" rather than raised, because every caller
+    of this treats an absent manifest as "nothing here can judge it" --
+    honest and degraded, where the raise is a 500 the phone cannot read.
+    """
+    last = None
+    for attempt in range(_REPLACE_READ_ATTEMPTS):
+        try:
+            return read_json_closed(path)
+        except OSError as exc:
+            last = exc
+            if attempt + 1 < _REPLACE_READ_ATTEMPTS:
+                # A SMALL BACKOFF, AND ONLY ON FAILURE.
+                #
+                # Three back-to-back attempts are not enough against a
+                # writer that starts its next replace immediately: a probe
+                # with an unthrottled writer (~80 write_derived/s, far
+                # hotter than any real build) put all three inside one
+                # collision window and the PermissionError still escaped.
+                # The successful path never sleeps, and the whole ladder
+                # is 14 ms against a 500 ms poll.
+                time.sleep(_REPLACE_READ_BACKOFF * (2 ** attempt))
+    if not absent_on_failure:
+        # RETRY IS NOT SWALLOW, and this half keeps that true.
+        #
+        # `read_derived` deliberately leaves `OSError` out of its except
+        # tuple so that a genuine disk fault is a 500 rather than a
+        # silent 404 -- a reviewer injected EIO to establish that, and it
+        # is the right call. A transient Windows replace collision is not
+        # a disk fault, though, and telling them apart is exactly what
+        # three attempts do: what survives them is reported as itself.
+        raise last
+    logger.warning(
+        "world builder: %s stayed unreadable (%r); treating it as absent",
+        path, last,
+    )
+    return None
 
 
 class WorldStore:
@@ -205,7 +306,49 @@ class WorldStore:
         path = self.world_path(world_id)
         if not path.exists():
             raise WorldStoreError(f"no world at {path}")
-        data = read_json_closed(path)
+        # THE SIXTH FILE. `engine.build` calls `write_world` and then, on
+        # the very next statement, `write_derived` -- so `world.json` is
+        # replaced microseconds before the five that
+        # `_read_json_past_a_replace` was written for, and it was the one
+        # left on a bare read. A reviewer measured the difference with a
+        # writer doing both: escapes out of `build_manifest` fell from
+        # 9.35% to 0.00% when only `write_derived` ran, and stopped at
+        # **1.10%** when `write_world` ran too -- every residual one a
+        # `PermissionError` from this line.
+        #
+        # `absent_on_failure=False`, because this method's contract is to
+        # RAISE for a world it cannot produce (`WorldStoreError` above),
+        # and callers distinguish that from an absent world. A persistent
+        # fault must keep reaching them.
+        try:
+            data = _read_json_past_a_replace(path, absent_on_failure=False)
+        except ValueError as exc:
+            # A CORRUPT WORLD IS NOT A SERVER FAULT. `read_json_closed`
+            # raises `JSONDecodeError` (a `ValueError`) on a truncated or
+            # non-UTF-8 `world.json`, and this method let it out --
+            # through `world_builder_geometry._read`, which catches only
+            # `WorldStoreError`, and out of `routes/geometry.py`, which
+            # has no handler at all. A reviewer measured the result: an
+            # HTTP **500 on an unauthenticated route** for a world whose
+            # file is merely damaged.
+            #
+            # `WorldStoreError` is the word every caller here already
+            # understands, and it is the honest one: this world cannot be
+            # produced. A genuine `OSError` still escapes, which keeps
+            # "the disk is broken" a 500 rather than a silent 404.
+            raise WorldStoreError(f"world {world_id} is unreadable: {exc}") from exc
+        if not isinstance(data, dict):
+            # A top-level list or string parsed fine and then raised
+            # `AttributeError` out of `require_schema`'s `.get` -- an HTTP
+            # 500 on `GET /worlds` and the status producer raising on
+            # every poll, picker and panel blind while the file exists.
+            # Reproduced by a dress-rehearsal reviewer; not shown reachable
+            # from the Tower's own writers, which is why it is a
+            # `WorldStoreError` rather than a wider net.
+            raise WorldStoreError(
+                f"world {world_id} is unreadable: top level is "
+                f"{type(data).__name__}, not an object"
+            )
         require_schema(data, f"world {world_id}")
         require_pose_convention(data["pose_convention"])
         return world_from_json_dict(data)
@@ -315,7 +458,13 @@ class WorldStore:
         images = self.images_dir(world_id, session_id)
         images.mkdir(parents=True, exist_ok=True)
         path = images / filename
-        temp_path = path.with_name(path.name + TEMP_SUFFIX)
+        # `staging_path`, not `name + TEMP_SUFFIX`: a staging name derived only
+        # from the destination is shared by every writer of it. Keyframe
+        # filenames are unique per session so a collision is unlikely here,
+        # but "unlikely" is what the same pattern was called in
+        # `write_bytes_atomic` before it was measured producing 656 torn
+        # reads. One convention, one place.
+        temp_path = staging_path(path)
         try:
             with temp_path.open("wb") as handle:
                 handle.write(jpeg_bytes)
@@ -350,11 +499,41 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            data = read_json_closed(path)
-        except json.JSONDecodeError:
+            data = _read_json_past_a_replace(path)
+        except ValueError:
+            # `ValueError`, NOT `json.JSONDecodeError`. The latter is a
+            # subclass, and `UnicodeDecodeError` -- which is what invalid
+            # UTF-8 raises -- is a sibling. A reviewer wrote the same three
+            # bad bytes into each copy of one manifest and got opposite
+            # answers: the session copy (which already caught `ValueError`)
+            # refused cleanly, the world copy raised out of every reader
+            # that touches it, including out of `read_derived`'s verify
+            # gate, which sits ABOVE its own `try`. Two files meant to be
+            # identical have to fail identically.
             logger.warning("world builder: derived manifest unreadable at %s", path)
             return None
-        return data
+        return data if isinstance(data, dict) else None
+
+    def session_manifest_path(self, world_id: str, session_id: str) -> Path:
+        """The manifest beside a session's own poses and points.
+
+        Absent for anything built before `write_derived` started writing it.
+        `read_derived_manifest` above is the WORLD's, which names whichever
+        session built last; this one always describes the session it sits
+        in.
+        """
+        return self.derived_dir(world_id) / session_id / DERIVED_MANIFEST
+
+    def read_session_manifest(self, world_id: str, session_id: str) -> dict | None:
+        path = self.session_manifest_path(world_id, session_id)
+        if not path.exists():
+            return None
+        try:
+            data = _read_json_past_a_replace(path)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("world builder: session manifest unreadable at %s", path)
+            return None
+        return data if isinstance(data, dict) else None
 
     def write_derived(
         self,
@@ -395,6 +574,26 @@ class WorldStore:
             write_json_atomic(derived / "points.json", {"points": points})
             if support is not None:
                 write_json_atomic(derived / "support.json", {"support": support})
+            # THE SAME MANIFEST, BESIDE THE FILES IT DESCRIBES.
+            #
+            # A world has ONE `derived/manifest.json` and it names whichever
+            # session built last. That is the root of a whole family of
+            # defects this campaign kept fixing one symptom at a time: the
+            # status producer discards the manifest for any other session
+            # (correctly -- attributing one session's figures to another is
+            # worse), and then has no figures at all, so an older session of
+            # a world walked twice reported no geometry, no poses, no
+            # currency, and the phone rendered a red "Needs retry" over a
+            # reconstruction sitting on disk. Four separate branches were
+            # written to paper over that, three of them wrong, before the
+            # question "why is there only one copy" got asked.
+            #
+            # A session that describes itself needs none of them. Cheap
+            # (one small JSON per build, beside megabytes of points),
+            # atomic like everything else here, and additive: a world built
+            # before this has no per-session copy and reads exactly as it
+            # did.
+            write_json_atomic(derived / DERIVED_MANIFEST, manifest)
             write_json_atomic(self.derived_manifest_path(world_id), manifest)
 
     def read_derived(
@@ -420,11 +619,19 @@ class WorldStore:
             digest = compute_input_digest(
                 self.read_keyframes(world_id, session_id)
             )
-            if not self.derived_is_current(world_id, digest):
+            # `is False`, NOT `not ...`. `None` is "no manifest here can
+            # judge this" -- a legacy world walked twice, where the only
+            # manifest describes another session. Refusing that is a
+            # guaranteed 404 for a reconstruction that is sitting on disk
+            # and perfectly good; serving it with the wire contract's
+            # `current` flag OFF is the honest compromise, and the status
+            # channel says in words why it cannot be judged. Only a
+            # manifest that actually disagrees is stale.
+            if self.derived_currency(world_id, digest, session_id) is False:
                 logger.warning(
-                    "world builder: derived output for %s is stale; "
+                    "world builder: derived output for %s/%s is stale; "
                     "treating as absent",
-                    world_id,
+                    world_id, session_id,
                 )
                 return None
         derived = self.derived_dir(world_id) / session_id
@@ -433,13 +640,49 @@ class WorldStore:
         if not poses_path.exists() or not points_path.exists():
             return None
         try:
+            # THROUGH THE RETRY, for the reason `_read_json_past_a_replace`
+            # gives at length -- and with `absent_on_failure=False`, so a
+            # real fault still raises out of here exactly as it did.
+            #
+            # These two are the LARGEST files `write_derived` replaces, so
+            # they hold the collision window open longest. A probe with a
+            # live writer beside the geometry route measured the escape as
+            # an HTTP 500 here, one layer above the manifest readers that
+            # a reviewer had already found unguarded.
             return {
-                "poses": read_json_closed(poses_path)["poses"],
-                "points": read_json_closed(points_path)["points"],
+                "poses": _read_json_past_a_replace(
+                    poses_path, absent_on_failure=False
+                )["poses"],
+                "points": _read_json_past_a_replace(
+                    points_path, absent_on_failure=False
+                )["points"],
                 "support": self._read_support(derived),
             }
-        except (json.JSONDecodeError, KeyError):
-            logger.warning("world builder: derived output unreadable for %s", world_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            # `TypeError` BELONGS HERE, and its absence was the one gap in
+            # this file. `_read_support` and `read_placements` below both
+            # carry explicit comments about a top-level list raising
+            # TypeError "straight out of a method whose docstring promises
+            # it never raises"; this method, which has the same promise and
+            # the same subscript, was never given the same guard. A reviewer
+            # fed it `[]` and watched the TypeError come out through
+            # `build_manifest` as an HTTP 500 where every other corrupt
+            # derived tree gives a 404. A corrupt world and an absent one
+            # are both "nothing to serve"; neither is a server fault.
+            # (`json.JSONDecodeError` is a `ValueError`, so it is in here
+            # by inheritance rather than by being listed twice.)
+            #
+            # `OSError` IS NOT IN THIS TUPLE, and it was, briefly. A
+            # reviewer injected EIO and watched a disk fault become
+            # "no geometry for this session" -- a 404 on a route whose own
+            # comment says "404 now means ABSENT only", and an empty
+            # reconstruction in `world_inspect`. A server that cannot read
+            # its own storage should say so, loudly, and 500 is how. The
+            # widening was a guess dressed as symmetry.
+            logger.warning(
+                "world builder: derived output unreadable for %s/%s: %s: %s",
+                world_id, session_id, type(exc).__name__, exc,
+            )
             return None
 
     def write_placements(self, world_id: str, session_id: str, placements) -> None:
@@ -526,7 +769,11 @@ class WorldStore:
         if not path.exists():
             return None
         try:
-            support = read_json_closed(path)["support"]
+            # Through the retry as well: a replace collision here would
+            # otherwise be absorbed by the `except Exception` below and
+            # silently drop an index that is perfectly good, one poll
+            # after the build that wrote it.
+            support = _read_json_past_a_replace(path)["support"]
             # Shape-checked, not just parsed. A top-level list raised
             # TypeError straight out of a method whose docstring promises
             # it never raises, and a string was returned AS the support
@@ -544,10 +791,105 @@ class WorldStore:
             )
             return None
 
-    def derived_is_current(self, world_id: str, input_digest: str) -> bool:
-        manifest = self.read_derived_manifest(world_id)
+    def derived_is_current(
+        self, world_id: str, input_digest: str, session_id: str | None = None
+    ) -> bool:
+        """Whether the stored geometry answers the question these keyframes ask.
+
+        THIS HAS NO PRODUCTION CALLERS LEFT. `read_derived`, the geometry
+        route and the render page all call `derived_currency` directly,
+        because two of the three answers it gives are not booleans. Two
+        tests still call this, and a boolean is what they want. A previous
+        version of this docstring named those three as its callers; they
+        had already moved.
+
+        What the world-level version cost: on a world walked twice, every
+        reader that gated on it refused the OLDER session outright, logging
+        "stale; treating as absent". So "open an earlier walk from Saved
+        Worlds" returned a 404 for a reconstruction sitting on disk.
+        The status channel's version of the same bug was found and fixed
+        four times in four review rounds; this half of it, on the path that
+        actually serves the geometry, was found by asking what the phone
+        does after the status channel says `ready`.
+
+        With a session id, a session that has its own manifest is judged by
+        it. Anything built before those existed falls back to the world's,
+        which is exactly as right and as wrong as it was.
+        """
+        return self.derived_currency(world_id, input_digest, session_id) is True
+
+    def derived_currency(
+        self, world_id: str, input_digest: str, session_id: str | None = None
+    ):
+        """True, False, or **None for "nothing here can judge it"**.
+
+        THE THIRD ANSWER IS THE POINT, and folding it into `False` is what
+        the first version of this fix did wrong. Two different questions
+        were being asked of one boolean:
+
+          * *is this geometry current?* -- what the wire contract's
+            `current` flag means, "reflects every keyframe accepted so
+            far", and what the status channel reports.
+          * *may this geometry be served at all?* -- what
+            `read_derived`'s verify gate decides.
+
+        For a world built before per-session manifests existed, walked
+        twice, the honest answer to the first is "unknown" and to the
+        second is "yes, with the flag off". Returning `True` from one
+        boolean made the ROUTE assert `current: true` over geometry a
+        reviewer then made genuinely stale by appending a keyframe -- while
+        the status channel beside it said `current: false`. Returning
+        `False` refuses to serve a good reconstruction. Neither is the
+        answer; there are three.
+        """
+        manifest = None
+        if session_id is not None:
+            manifest = self.read_session_manifest(world_id, session_id)
+            if manifest is not None and manifest.get("session_id") != session_id:
+                # A session's own copy naming somebody else is corruption,
+                # not a world walked twice.
+                manifest = None
         if manifest is None:
-            return False
+            world_manifest = self.read_derived_manifest(world_id)
+            if not isinstance(world_manifest, dict):
+                world_manifest = None
+            if (
+                session_id is not None
+                and world_manifest is not None
+                and world_manifest.get("session_id") != session_id
+            ):
+                # The world's manifest is about another session and this
+                # one has no copy of its own: a legacy world walked twice.
+                return None
+            manifest = world_manifest
+        if manifest is None:
+            # NO MANIFEST ANYWHERE IS THE THIRD ANSWER, NOT `False`.
+            #
+            # This returned False, and the docstring above spends a
+            # paragraph explaining why that is wrong -- for the one case it
+            # DID handle, a world manifest naming another session. The case
+            # where there is no manifest at all fell through to here and got
+            # the answer the docstring rejects.
+            #
+            # `False` means "a manifest exists and disagrees", and
+            # `read_derived`'s gate refuses on exactly that. So a world
+            # built before per-session manifests existed, or one whose
+            # manifests were lost, was 404 for a reconstruction sitting on
+            # disk -- the campaign's named failure, on the serving path,
+            # in the function written to prevent it.
+            #
+            # It surfaced when the status channel learned to recount such a
+            # session's poses and points and report it `ready`: the channel
+            # promised a world and the wearer's next tap got nothing. A
+            # promise the next tap breaks is worse than the old
+            # consistently-wrong pair, which is why this is a defect the
+            # recount created rather than one it merely revealed.
+            #
+            # Nothing is lost by serving it. The wire contract carries
+            # `current`, the route sets it from this same three-valued
+            # answer, and the status channel says in words that currency
+            # cannot be judged.
+            return None
         return (
             manifest.get("schema_version") == SCHEMA_VERSION
             and manifest.get("input_digest") == input_digest
@@ -587,28 +929,172 @@ class WorldStore:
     def acquire_writer_lock(self, world_id: str) -> None:
         """Take the single-writer lock, reclaiming it from a dead process.
 
-        Liveness by pid rather than by timeout. A stale-lock timer has to
-        guess how long a legitimate writer might pause; asking the OS
-        whether the pid is still running does not guess, and psutil is
-        already a dependency.
+        Liveness by pid AND process start time rather than by timeout. A
+        stale-lock timer has to guess how long a legitimate writer might
+        pause; asking the OS whether the pid is still running does not
+        guess, and psutil is already a dependency. The start time is
+        there because Windows recycles pids aggressively: a lock left by a
+        builder that died could otherwise name a pid that now belongs to
+        an unrelated process, and the next session would be refused for
+        as long as that stranger lived (see `lock_holder`).
         """
         path = self.lock_path(world_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
+        # CREATE-EXCLUSIVE, NOT CHECK-THEN-WRITE.
+        #
+        # This read the holder and then wrote the lock, with nothing atomic
+        # in between, so two processes arriving in that window both saw "no
+        # lock" and both proceeded. The second write overwrote the first's
+        # record, so the file named only one of them -- and when the first
+        # finished, `release_writer_lock` unlinked a lock the OTHER writer
+        # still believed it held. An adversarial review measured TWO
+        # SIMULTANEOUS WRITERS ADMITTED IN 8 OF 8 TRIALS, and drove two
+        # concurrent `world_finalize.py` runs to `finalized: True` on one
+        # world. `world_finalize.py` calls this "the whole safety story".
+        #
+        # `O_CREAT | O_EXCL` is one atomic operation on Windows and POSIX
+        # alike: exactly one caller creates the file. Everyone else falls
+        # through to the liveness check, and a caller that decides the
+        # holder is gone RECLAIMS by unlinking and trying the exclusive
+        # create again -- so two processes that both find a dead lock still
+        # cannot both win, and the loser re-reads and sees the winner.
+        unreadable_since: float | None = None
+        for _attempt in range(_LOCK_ACQUIRE_ATTEMPTS):
             try:
-                holder = read_json_closed(path)
-            except json.JSONDecodeError:
-                holder = {}
-            pid = holder.get("pid")
-            if isinstance(pid, int) and _pid_is_running(pid) and pid != os.getpid():
+                handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(handle, "w", encoding="utf-8") as file:
+                    file.write(json.dumps(_lock_record(os.getpid())))
+                    file.flush()
+                    os.fsync(file.fileno())
+                # WON THE CREATE -- NOW CONFIRM WE STILL HOLD IT.
+                #
+                # The create is atomic; the reclaim below is not. A peer
+                # that decided this lock was dead unlinks whatever is at
+                # the path -- not the file it read -- so it can delete a
+                # lock created since, and then create its own. An
+                # adversarial review drove that to BOTH PROCESSES
+                # ACQUIRING, 5 of 5, with a stall injected in the reclaim
+                # window (0 of 120 naturally, so it is narrow, not
+                # imaginary).
+                #
+                # Reading our own record back closes the outcome that
+                # matters: whoever's record is on disk owns the world, and
+                # a process whose record was replaced goes round rather
+                # than returning to write underneath the winner.
+                mine = self.lock_holder(world_id)
+                if mine is not None and mine["pid"] == os.getpid():
+                    return
+                continue
+            holder = self.lock_holder(world_id)
+            if holder is None:
+                # Unreadable. Two very different things look like this and
+                # only time tells them apart.
+                #
+                # TRANSIENT: a peer is between its `O_CREAT|O_EXCL` and its
+                # write, so the file exists and is empty for microseconds.
+                # Reclaiming here would delete a live writer's lock.
+                #
+                # ORPHANED: that peer was killed in the same window, and
+                # the zero-byte file it left names nobody. This is a NEW
+                # possibility -- the old code wrote the lock through
+                # `write_json_atomic`, which is never partial -- and
+                # refusing it forever bricks the world: an adversarial
+                # review measured `acquire_writer_lock` raising in 1.3 ms
+                # and every retry, and `world_finalize.py`, refused
+                # identically. Permanently.
+                #
+                # So: wait out the transient case, then reclaim. The write
+                # window is measured in microseconds; anything unreadable
+                # for a tenth of a second is not a writer in progress.
+                now = time.monotonic()
+                if unreadable_since is None:
+                    unreadable_since = now
+                elif now - unreadable_since >= _LOCK_UNREADABLE_GRACE_S:
+                    logger.warning(
+                        "world builder: reclaiming an unreadable lock on %s; it "
+                        "names no process and has not become readable in %ss, so "
+                        "it is a writer that died mid-write",
+                        world_id, _LOCK_UNREADABLE_GRACE_S,
+                    )
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    unreadable_since = None
+                time.sleep(_LOCK_RETRY_SLEEP_S)
+                continue
+            unreadable_since = None
+            if holder["alive"] and holder["pid"] != os.getpid():
                 raise WorldLockedError(
-                    f"world {world_id} is locked by live pid {pid}; refusing a "
-                    "second writer"
+                    f"world {world_id} is locked by live pid {holder['pid']}; "
+                    "refusing a second writer"
                 )
             logger.warning(
-                "world builder: reclaiming lock on %s held by pid %r", world_id, pid
+                "world builder: reclaiming lock on %s held by pid %r",
+                world_id,
+                holder["pid"],
             )
-        write_json_atomic(path, {"pid": os.getpid()})
+            # Unlink and go round: the create is what decides, not this.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            time.sleep(_LOCK_RETRY_SLEEP_S)
+        raise WorldLockedError(
+            f"world {world_id}: could not take the writer lock in "
+            f"{_LOCK_ACQUIRE_ATTEMPTS} attempts; another writer is contending "
+            "for it"
+        )
+
+    def lock_holder(self, world_id: str) -> dict | None:
+        """Who holds the writer lock, and whether that process is alive.
+
+        None when no readable lock exists. Otherwise
+        `{"pid": int|None, "alive": bool, "unreadable": bool}`:
+        `unreadable` is a lock file that names no usable pid, which is NOT
+        "no lock" -- reporting a healthy idle world over a file that is
+        right there would downgrade a crashed builder to nothing at all.
+
+        One answer for the store, the status producer and the listing, so
+        the three cannot disagree about whether a world is live.
+        """
+        path = self.lock_path(world_id)
+        try:
+            if not path.exists():
+                return None
+            # THROUGH THE RETRY. Swallowing a transient `OSError` here
+            # returns "no lock", which every caller reads as "this world
+            # is idle" -- so a collision on the LOCK file reports a live
+            # walk as dead: `live: false` in the picker, and the status
+            # channel dropping out of `receiving` for a poll. A reviewer
+            # named this reader as one of the two still on a bare read,
+            # and the suite showed it: the one test that asserts a live
+            # session reads `receiving` failed once under full-suite load
+            # and passes 3/3 otherwise.
+            holder = _read_json_past_a_replace(path)
+            # `None` after the retries falls through to the `isinstance`
+            # check below, which already answers `unreadable: True` -- NOT
+            # "no lock", which is the downgrade this docstring warns
+            # about. No branch is needed here and an earlier version of
+            # this fix added one; a mutation showed it was dead code.
+            lock_written_at = path.stat().st_mtime
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(holder, dict):
+            return {"pid": None, "alive": False, "unreadable": True}
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return {"pid": None, "alive": False, "unreadable": True}
+        return {
+            "pid": pid,
+            "alive": _holder_is_running(
+                pid, holder.get("created_at"), lock_written_at
+            ),
+            "unreadable": False,
+        }
 
     def release_writer_lock(self, world_id: str) -> None:
         self.lock_path(world_id).unlink(missing_ok=True)
@@ -657,6 +1143,227 @@ class WorldStore:
             return PurgeReport(removed=tuple(removed), retained=tuple(retained))
 
 
+REQUIRED_MANIFEST_KEYS = (
+    "input_digest",
+    "session_id",
+    "keyframes",
+    "points",
+    "poses_solved",
+    "poses_refused",
+    "segments",
+)
+
+
+def session_has_drawable_geometry(store, world_id, session_id, manifest=None) -> bool:
+    """Would opening this session SHOW the wearer anything?
+
+    **Not "do the files exist", which is what two separate copies of this
+    used to ask.** `engine.build` calls `write_derived` unconditionally,
+    so a walk that solved nothing still leaves `poses.json` and a
+    `points.json` holding `{"points": []}` -- 14 bytes. Eleven sessions on
+    the real 163-world root are exactly that, and they were listed as
+    `complete, has_geometry: true` while the status channel for the same
+    session projected `needsRetry`.
+
+    Two surfaces need this answer and they must not compute it apart:
+
+      * `results/world_builder_library` puts it on the wire as
+        `has_geometry`, which `WorldPickerView` branches on;
+      * `results/world_builder_render.resolve_session` uses it to choose
+        WHICH session to draw, so an empty newer walk would otherwise be
+        picked over an older one that has geometry, and the page drawn
+        blank.
+
+    A third predicate, `results/world_builder._has_session_geometry`,
+    deliberately still answers EXISTENCE -- it decides which lifecycle
+    state a session is in ("was there a build"), which is a different
+    question, and its own test says so.
+
+    `manifest` is passed in when the caller already has it, which the
+    listing does; otherwise it is read here. The count of `points.json` is
+    the fallback for a session no manifest describes -- 0 of the 49 real
+    sessions with a tree, and every one of those manifests carries both
+    figures.
+    """
+    derived = store.derived_dir(world_id) / session_id
+    if not ((derived / "poses.json").exists() and (derived / "points.json").exists()):
+        return False
+    if manifest is None:
+        # `manifest_describing`, NOT A HAND-ROLLED READ.
+        #
+        # This used to re-read the manifest with a loose rule --
+        # `isinstance(dict)` and `session_id` -- which re-admitted exactly
+        # the manifests `validate_manifest` had just refused. The caller
+        # passes the strict answer, `None`, and this quietly substituted a
+        # looser one: a reviewer built a session whose manifest claims
+        # `points: 500` under a schema this build does not know, over
+        # `poses.json` and `points.json` that are both empty, and got
+        # **three answers from one payload** -- picker "complete", panel
+        # "Needs retry", render page blank.
+        #
+        # In a function whose own docstring says "two surfaces need this
+        # answer and they must not compute it apart", and one round after
+        # a reviewer counted the readers and found five.
+        manifest = manifest_describing(
+            store, world_id, session_id, purpose="figures"
+        )
+    if isinstance(manifest, dict):
+        points = manifest.get("points")
+        positioned = manifest.get("poses_positioned")
+        if isinstance(points, int) or isinstance(positioned, int):
+            return (points or 0) > 0 or (positioned or 0) > 0
+    return _points_on_disk(store, world_id, session_id) > 0
+
+
+def _points_on_disk(store, world_id, session_id) -> int:
+    """`len(points.json)`, for a session no manifest summarises.
+
+    The rows are dropped as soon as they are counted; only the length is
+    kept. Unreadable is not empty -- but the only honest answer inside a
+    bool is the one that does not promise a wearer something to look at,
+    and the status channel says the difference in words.
+    """
+    path = store.derived_dir(world_id) / session_id / "points.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))["points"]
+    except (KeyError, TypeError, ValueError, OSError):
+        return 0
+    return len(rows) if isinstance(rows, list) else 0
+
+
+def manifest_describing(store, world_id, session_id, *, purpose):
+    """The manifest that describes THIS session, judged for one PURPOSE.
+
+    **ONE READER, ONE RULE -- and the rule depends on the question, which
+    is what three rounds of this campaign kept getting wrong in both
+    directions.** Two questions are asked of a manifest and they need
+    different standards:
+
+    ``"figures"`` -- how many points, how many poses. The status channel
+    reports these and the picker draws from them, so a manifest that
+    cannot be trusted field-by-field must not supply them: schema checked,
+    required keys checked.
+
+    ``"identity"`` -- WHICH BUILD produced this tree, i.e. `input_digest`.
+    `usable_placements` and `_is_current` compare that digest and nothing
+    else. Holding them to the figures refuses manifests that answer their
+    question perfectly, and holding them to the SCHEMA is worse:
+    `SCHEMA_VERSION` versions the whole record family (`World`, `Session`,
+    `Keyframe`, `KeyframeEdge`), the manifest inherits
+    `world.schema_version` rather than the module constant, and
+    `poses.json`/`points.json` rows carry no version at all -- their shape
+    is pinned by `world_builder.geometry/2026-08-25`, which has never
+    moved under it. A reviewer bumped the constant against the real root
+    and watched **408 placements across 10 sessions drop to 0**, every
+    segment becoming a disconnected island, on a change that has nothing
+    to do with a Sim3.
+
+    The session's own copy first, then the world's but only if it names
+    this session -- a manifest naming somebody else is not evidence about
+    this one.
+    """
+    figures = purpose == "figures"
+    try:
+        manifest = validate_manifest(
+            store.read_session_manifest(world_id, session_id),
+            world_id,
+            source="session manifest",
+            require_figures=figures,
+            require_schema=figures,
+        )
+        if manifest is not None and manifest.get("session_id") == session_id:
+            return manifest
+        world = validate_manifest(
+            store.read_derived_manifest(world_id),
+            world_id,
+            require_figures=figures,
+            require_schema=figures,
+        )
+        if world is not None and world.get("session_id") == session_id:
+            return world
+    except (WorldStoreError, OSError, ValueError, KeyError, TypeError):
+        # OSError BELONGS HERE. `write_derived` replaces five files
+        # microseconds apart, and on Windows a replace onto a path a
+        # reader has open -- and a reader's open during the writer's
+        # window -- fails with WinError 5. Neither
+        # `read_derived_manifest` nor `read_session_manifest` catches it,
+        # and a reviewer measured the escape reaching `GET /worlds/...`
+        # as an HTTP **500** on 2.4% of requests beside a live writer, on
+        # a route whose own comment says "404 now means ABSENT only" and
+        # for which the phone has no branch.
+        return None
+    return None
+
+
+def validate_manifest(
+    manifest,
+    world_id,
+    source="derived manifest",
+    *,
+    require_figures=True,
+    require_schema=True,
+):
+    """Schema-check a manifest, wherever it was read from, or None.
+
+    **HERE, RATHER THAN IN ONE READER, BECAUSE THERE ARE FOUR READERS.**
+    This lived in `results/world_builder.py` and the status producer was
+    the only caller. `results/world_builder_geometry._session_manifest`
+    -- which the geometry route, `usable_placements` and the saved-worlds
+    listing all reach -- checked only `isinstance(dict)` and
+    `session_id`, so the two disagreed about any manifest that was
+    readable and wrong.
+
+    A reviewer measured what that produced: for a session whose manifest
+    declares a schema this build does not know, and whose derived tree is
+    gone, the picker said `interrupted` -- "a build ran and its output is
+    gone" -- while the status channel behind that same row said
+    `stopped_unbuilt`, "this walk produced no geometry". The two surfaces
+    this campaign spent a round reconciling, contradicting each other,
+    through a comment that claimed "four readers, one rule".
+
+    A no-op on real data: all 49 sessions with a derived tree on the
+    163-world root pass both the loose and the strict rule.
+    """
+    if not isinstance(manifest, dict):
+        # `isinstance`, not `is None`. A world manifest holding a
+        # top-level list or string reached `.get()` and came out as an
+        # AttributeError -- a 500 on the status channel, where the
+        # identically corrupt per-session copy gave a clean refusal.
+        return None
+    if require_schema and manifest.get("schema_version") != SCHEMA_VERSION:
+        # A manifest from another schema describes fields whose meaning
+        # this build does not know. It is refused as a SUMMARY; the poses
+        # and points beside it are a separate question, and
+        # `_figures_from_the_tree` answers it separately.
+        return None
+    if not require_figures:
+        # IDENTITY AND PROVENANCE ONLY, which is all some readers need.
+        #
+        # The figure check below exists because the STATUS CHANNEL reports
+        # those figures, and "geometry: available with every count null"
+        # is a claim with nothing behind it. A reader asking "which build
+        # produced this" needs only `session_id` and `input_digest`, and
+        # holding it to the figures refuses manifests that answer its
+        # question perfectly well.
+        #
+        # Unifying the two readers without this split was itself a defect:
+        # `usable_placements` started refusing every placement of a
+        # session whose manifest carries a digest and no counts, so a
+        # registered segment stopped serving its transform. Caught by
+        # `test_world_builder_placements.py`, five tests at once, in the
+        # full suite rather than in the targeted one I had been running.
+        return manifest
+    missing = [key for key in REQUIRED_MANIFEST_KEYS if manifest.get(key) is None]
+    if missing:
+        logger.warning(
+            "world builder: %s for %s is missing %s; treating it as absent "
+            "rather than reporting geometry with no figures",
+            source, world_id, missing,
+        )
+        return None
+    return manifest
+
+
 def compute_input_digest(keyframes: list[Keyframe]) -> str:
     """Digest the authoritative inputs a derived build consumed.
 
@@ -687,10 +1394,101 @@ def _parse_all(raw_records: list[dict], parser, what: str) -> list:
     return parsed
 
 
-def _pid_is_running(pid: int) -> bool:
+# How far apart two readings of one process's start time may be and still
+# name the same process. psutil reports the value at millisecond precision
+# on Windows and the two readings here are taken by different processes.
+_CREATE_TIME_TOLERANCE_S = 1.0
+
+
+def _lock_record(pid: int) -> dict:
+    """What a writer puts in its lock: the pid, and when that pid started.
+
+    The start time is what makes the pid mean one process rather than
+    whichever process the OS next hands that number to.
+    """
+    record = {"pid": pid}
     try:
         import psutil
 
-        return psutil.pid_exists(pid)
+        record["created_at"] = float(psutil.Process(pid).create_time())
+    except Exception:  # pragma: no cover - a lock without a start time still works
+        pass
+    return record
+
+
+def _pid_is_running(pid: int) -> bool:
+    return _holder_is_running(pid, None)
+
+
+# How much later than the lock file a process may have started and still
+# be believed to be its writer. A builder writes its lock within
+# milliseconds of starting; this only has to absorb clock skew and
+# filesystem timestamp granularity, and erring generous here is safe --
+# the failure it prevents (calling a LIVE builder dead) is far worse than
+# the one it allows (believing a pid recycled within five seconds).
+_RECYCLED_PID_GRACE_S = 5.0
+
+
+def _holder_is_running(pid: int, created_at, lock_written_at=None) -> bool:
+    """Whether the process a lock names is the process that WROTE it.
+
+    With a start time on the lock, a running pid whose start time differs
+    is a DIFFERENT process -- the builder that wrote the lock is dead and
+    its number was recycled.
+
+    **AND WITHOUT ONE, THE LOCK FILE'S OWN MTIME ANSWERS THE SAME
+    QUESTION.** A process that started AFTER the lock was written cannot
+    be the process that wrote it. That is not a heuristic; it is the same
+    argument the `created_at` check makes, from a timestamp the filesystem
+    keeps for free.
+
+    This matters because it is not hypothetical and it is not rare. The
+    check above reads `if created_at is None: return True`, and on the
+    machine this campaign is preparing for a retest **29 of 163 worlds
+    hold a lock file and not one of them carries `created_at`** -- they
+    were all written before the field existed. Two independent reviewers
+    found the same consequence within an hour of each other, and one
+    reproduced it end to end through a real Tower: a pid from a
+    fortnight-old lock was recycled onto a live `bash.exe`, the status
+    producer prefers a world with a live lock over every saved world, and
+    the phone was told a 16-day-old empty world was `receiving` with 0
+    keyframes and `mapping_seconds: 1,407,085`. In the end-to-end run the
+    wearer's real walk built correctly and then, **at the moment
+    finalization completed and released its own lock**, the live screen
+    reverted to the ghost and said "Mapping" forever.
+
+    The tolerance runs one way on purpose. A real builder writes its lock
+    within milliseconds of starting, so its `create_time` is at or before
+    the lock's mtime; a recycled pid on an old lock starts hours or days
+    after. Only a process that started **clearly** later is called dead,
+    so a live builder can never be judged dead by a slow clock or a coarse
+    filesystem timestamp.
+
+    Nothing is deleted to make this work: the 29 legacy locks stay exactly
+    where they are and simply read dead, which is what they are.
+    """
+    try:
+        import psutil
+
+        if not psutil.pid_exists(pid):
+            return False
+        try:
+            actual = psutil.Process(pid).create_time()
+        except psutil.AccessDenied:
+            # CANNOT JUDGE IS NOT DEAD. The process exists and its start
+            # time is hidden -- an elevation mismatch between the Tower
+            # and a `world_finalize.py` run is enough on Windows. Calling
+            # it dead would let a second writer onto one store, which is
+            # the one failure this whole lock exists to prevent; assuming
+            # it alive costs at worst a refused acquisition. A reviewer
+            # named this path; it is the safe direction.
+            return True
+        except psutil.Error:
+            return False
+        if created_at is not None:
+            return abs(float(actual) - float(created_at)) <= _CREATE_TIME_TOLERANCE_S
+        if lock_written_at is not None:
+            return float(actual) <= float(lock_written_at) + _RECYCLED_PID_GRACE_S
+        return True
     except Exception:  # pragma: no cover - psutil is a hard dependency
         return False

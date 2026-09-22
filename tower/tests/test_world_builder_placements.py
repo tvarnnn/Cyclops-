@@ -19,9 +19,11 @@ drawing an unplaced version of a segment the world now knows how to place.
 cache on the pair.
 """
 
+import pathlib
 import pytest
 
 from tower.world_builder.records import SegmentPlacement
+from tower.world_builder.schema import SCHEMA_VERSION
 from tower.world_builder.store import WorldStore
 
 
@@ -185,7 +187,19 @@ def _tiny_world(store, world_id="w" * 32, session_id="s" * 32):
     ]
     store.write_derived(
         world_id, session_id, poses=poses, points=points,
-        manifest={"session_id": session_id, "input_digest": "x"},
+        manifest={
+            # `schema_version`, because every manifest `write_derived`
+            # actually writes carries one and `derived_currency` has
+            # always required it. Without it this stub was refused by
+            # `manifest_for` once that reader was held to the same
+            # schema rule as the status channel -- and the refusal was
+            # right: a manifest whose field meanings this build cannot
+            # vouch for is not evidence for anybody. The stub was
+            # under-specified, not the rule too strict.
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "input_digest": "x",
+        },
     )
     return world_id, session_id
 
@@ -289,7 +303,19 @@ def test_the_rollup_still_moves_when_only_geometry_changes(tmp_path):
         poses=[{"keyframe_id": "k0", "segment_index": 0, "status": "anchor",
                 "degeneracy": "", "rotation": None, "translation": None}],
         points=[{"segment_index": 0, "xyz": [9.0, 9.0, 9.0]}],
-        manifest={"session_id": session_id, "input_digest": "x"},
+        manifest={
+            # `schema_version`, because every manifest `write_derived`
+            # actually writes carries one and `derived_currency` has
+            # always required it. Without it this stub was refused by
+            # `manifest_for` once that reader was held to the same
+            # schema rule as the status channel -- and the refusal was
+            # right: a manifest whose field meanings this build cannot
+            # vouch for is not evidence for anybody. The stub was
+            # under-specified, not the rule too strict.
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "input_digest": "x",
+        },
     )
     after = adapter.build_manifest(store, world_id, session_id)
     assert before["geometry_revision"] != after["geometry_revision"]
@@ -777,3 +803,82 @@ def test_a_valid_support_table_still_reads(tmp_path):
     )
     read = store.read_derived(world_id, session_id, verify=False)
     assert read["support"] == [[0, 1, 2], [0, 3, 4]]
+
+
+def test_a_manifest_being_replaced_is_not_an_http_500(derived_world, monkeypatch):
+    """The Windows collision, made deterministic.
+
+    `write_derived` replaces **five** files microseconds apart, and on
+    Windows `os.replace` onto a path a reader holds open fails with
+    WinError 5 -- symmetrically, so does the reader's `open()` inside the
+    writer's window. Neither manifest reader caught `OSError`;
+    `derived_currency` calls both with no `try`, and
+    `world_builder_geometry._is_current` calls `derived_currency` outside
+    its own. So a `PermissionError` walked out through `build_manifest`
+    and became an HTTP **500** -- measured by a reviewer at 2.4% of
+    requests beside a live writer, on a route whose own comment promises
+    *"404 now means ABSENT only"* and for which the phone has no branch.
+
+    A round of this campaign measured that hazard and added retries to
+    `poses.json` and `points.json`, the two files it happened to be
+    reading, and left the three the writer replaces beside them alone.
+
+    Injecting the error is the only way to test it deterministically: a
+    real collision needs two processes and a 2.4% chance.
+    """
+    from tower.results import world_builder_geometry as adapter
+    from tower.world_builder import store as store_module
+
+    store, world_id, session_id = derived_world
+    target = store.session_manifest_path(world_id, session_id)
+    real = store_module.read_json_closed
+    calls = {"n": 0}
+
+    def flaky(path):
+        if pathlib.Path(path) == target:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "The process cannot access the file")
+        return real(path)
+
+    monkeypatch.setattr(store_module, "read_json_closed", flaky)
+
+    # A transient collision is ridden out, not raised and not lost.
+    manifest = adapter.build_manifest(store, world_id, session_id)
+    assert manifest is not None
+    assert calls["n"] >= 3, "the reader did not retry past the replace"
+    assert manifest["segment_count"] >= 1
+
+
+def test_a_manifest_that_stays_unreadable_is_absent_not_an_exception(
+    derived_world, monkeypatch
+):
+    """And a fault that outlives the retries must still not reach the route.
+
+    Returning "no manifest" is degraded and honest: every caller treats an
+    absent manifest as "nothing here can judge it", the geometry is served
+    with `current: false`, and the status channel says so in words. The
+    raise is a 500 the phone cannot read.
+    """
+    from tower.results import world_builder_geometry as adapter
+    from tower.world_builder import store as store_module
+
+    store, world_id, session_id = derived_world
+    real = store_module.read_json_closed
+    manifests = {
+        store.session_manifest_path(world_id, session_id),
+        store.derived_manifest_path(world_id),
+    }
+
+    def always_busy(path):
+        if pathlib.Path(path) in manifests:
+            raise PermissionError(13, "The process cannot access the file")
+        return real(path)
+
+    monkeypatch.setattr(store_module, "read_json_closed", always_busy)
+
+    manifest = adapter.build_manifest(store, world_id, session_id)
+    assert manifest is not None, "a busy manifest took the geometry with it"
+    assert manifest["current"] is False, (
+        "currency was asserted from a manifest that could not be read"
+    )

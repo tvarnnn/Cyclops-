@@ -45,6 +45,10 @@ protocol DocumentMemoryClient: CartridgeClient {
     /// What the Tower's recorder is doing, or `nil` when nothing has said.
     var session: DocumentSessionStatus? { get }
     var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> { get }
+    /// What is on the Tower's disk, from the same status push, or `nil` when
+    /// nothing has said. Its `revision` is the live-update trigger.
+    var library: DocumentLibrarySummary? { get }
+    var libraryUpdates: AnyPublisher<DocumentLibrarySummary?, Never> { get }
     /// The outcome of the last verb sent. See `DocumentSessionOutcome` for why
     /// this is not a `Bool`.
     var lastSessionOutcome: DocumentSessionOutcome? { get }
@@ -66,6 +70,10 @@ extension DocumentMemoryClient {
     var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
+    var library: DocumentLibrarySummary? { nil }
+    var libraryUpdates: AnyPublisher<DocumentLibrarySummary?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
     var lastSessionOutcome: DocumentSessionOutcome? { nil }
     func send(_ action: DocumentMemoryContract.SessionAction) {}
     func refreshSession() {}
@@ -78,10 +86,10 @@ extension DocumentMemoryClient {
 /// ## Two transports, two contracts, one client
 ///
 /// ```
-/// TowerClient                socket: document_memory.status/2026-08-27
+/// TowerClient                socket: document_memory.status/2026-09-07
 ///     ↓ cartridgeResults        → what the recorder is doing, and what is on disk
 /// TowerDocumentMemoryClient
-///     ↓ DocumentMemoryHTTPClient   HTTP: document_memory.library/2026-08-27
+///     ↓ DocumentMemoryHTTPClient   HTTP: document_memory.library/2026-09-07
 ///                                  → the documents themselves
 /// ```
 ///
@@ -124,15 +132,31 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
 
     private(set) var lastSessionOutcome: DocumentSessionOutcome?
 
+    /// The `library` half of the status push. Kept since 2026-09-07: until
+    /// then every push was decoded in full and everything but `session` was
+    /// dropped, so a page recorded mid-session reached the screen only when
+    /// a person tapped Recent. `revision` on it is what the view model
+    /// re-fetches on.
+    private(set) var library: DocumentLibrarySummary? {
+        didSet {
+            guard library != oldValue else { return }
+            librarySubject.send(library)
+        }
+    }
+
     var stateUpdates: AnyPublisher<DocumentMemoryState, Never> {
         stateSubject.eraseToAnyPublisher()
     }
     var sessionUpdates: AnyPublisher<DocumentSessionStatus?, Never> {
         sessionSubject.eraseToAnyPublisher()
     }
+    var libraryUpdates: AnyPublisher<DocumentLibrarySummary?, Never> {
+        librarySubject.eraseToAnyPublisher()
+    }
 
     private let stateSubject = PassthroughSubject<DocumentMemoryState, Never>()
     private let sessionSubject = PassthroughSubject<DocumentSessionStatus?, Never>()
+    private let librarySubject = PassthroughSubject<DocumentLibrarySummary?, Never>()
 
     private let tower: TowerClient
     private let http: DocumentMemoryHTTPClient
@@ -451,6 +475,7 @@ final class TowerDocumentMemoryClient: DocumentMemoryClient {
             guard envelope.isSnapshot else { return }
             guard let status = DocumentMemoryDecoder.status(from: envelope.payload) else { return }
             session = status.session
+            library = status.library
 
         case .failed(let error):
             guard error.cartridge == DocumentMemoryContract.towerCartridge
@@ -575,15 +600,54 @@ final class DocumentMemoryViewModel: ObservableObject {
 
     @Published private(set) var lastRequestFailure: CartridgeFailure?
 
+    /// A one-line statement of the camera's relation to this recorder, for
+    /// the session panel. `nil` when this screen started the camera itself.
+    @Published private(set) var cameraNote: String?
+
     private let client: any DocumentMemoryClient
+    /// The glasses camera, when this build can reach it (DEBUG only, exactly
+    /// as Object Memory's coordinator has it). `nil` in Release, where the
+    /// Tower half still works and the panel says the camera half cannot be
+    /// reached from here.
+    private let camera: (any ObjectMemoryCaptureOwner)?
+    /// Whether this app started the running capture. Injected rather than
+    /// stored, because this view model is a `@StateObject` and is destroyed
+    /// on every cartridge switch -- see `CartridgeCameraClaim` for what that
+    /// cost when the fact lived here.
+    private let cameraClaim: CartridgeCameraClaim
+    private var startedTheCamera: Bool {
+        get { cameraClaim.startedByThisApp }
+        set { cameraClaim.startedByThisApp = newValue }
+    }
     private var cancellables: Set<AnyCancellable> = []
 
-    /// No default argument — see `WorldBuilderViewModel.init(client:)`.
-    init(client: any DocumentMemoryClient) {
+    /// The question the screen is currently showing the answer to, re-asked
+    /// when the Tower's library changes. `nil` until something is asked.
+    private var standingQuery: DocumentQuery?
+    private var lastLibraryRevision: Int?
+
+    /// No default argument for `client` — see `WorldBuilderViewModel.init(client:)`.
+    init(
+        client: any DocumentMemoryClient,
+        camera: (any ObjectMemoryCaptureOwner)? = nil,
+        // Optional with a nil default, and built in the body rather than in
+        // the signature: a default-argument expression is evaluated in a
+        // nonisolated context, and `CartridgeCameraClaim` is @MainActor, so
+        // `= CartridgeCameraClaim()` here is a main-actor call from outside
+        // the actor. The same trap this project has hit before with
+        // `= WorldGeometryClient()`.
+        cameraClaim: CartridgeCameraClaim? = nil
+    ) {
         self.client = client
+        self.camera = camera
+        // A view model given no claim gets its own, which is right for the
+        // tests and previews that construct one directly: nothing else
+        // shares their camera.
+        self.cameraClaim = cameraClaim ?? CartridgeCameraClaim()
         self.state = client.state
         self.session = client.session
         self.lastSessionOutcome = client.lastSessionOutcome
+        self.lastLibraryRevision = client.library?.revision
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
@@ -598,8 +662,85 @@ final class DocumentMemoryViewModel: ObservableObject {
                 // outcome and the status change together, and two publishers
                 // would let a view render a new state beside an old verdict.
                 self?.lastSessionOutcome = self?.client.lastSessionOutcome
+                self?.updateCameraNote()
             }
             .store(in: &cancellables)
+
+        // The live library. `revision` moves whenever the Tower's journal
+        // changes -- a page recorded, a sighting merged, a prune -- and the
+        // standing question is re-asked exactly then. Not a poll: nothing
+        // here fires on a timer, and an unchanged revision re-fetches nothing.
+        client.libraryUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] library in self?.libraryChanged(library) }
+            .store(in: &cancellables)
+
+        camera?.captureClaimUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] claim in self?.cameraClaimChanged(claim) }
+            .store(in: &cancellables)
+        updateCameraNote()
+    }
+
+    /// The camera's claim changed underneath this screen.
+    ///
+    /// Ownership is dropped when the capture ends, whoever ended it — the
+    /// same rule, for the same reason, as
+    /// `ObjectMemoryRecordingCoordinator.cameraClaimChanged`. This type is
+    /// documented as "Modelled on `ObjectMemoryRecordingCoordinator`" and
+    /// copied the branch structure of `send(_:)` without this half of it.
+    ///
+    /// The memory of having started the camera now lives on a
+    /// `CartridgeCameraClaim` that `ProjectManager` owns, so that a cartridge
+    /// switch cannot lose it and strand a running capture. That is right, and
+    /// it is exactly what makes dropping it here necessary rather than
+    /// optional: a fact that outlives the screen also outlives the capture it
+    /// describes. Without this, a Stop pressed on Home followed by a Start
+    /// pressed on Home leaves this screen believing it owns a capture it
+    /// never started — so `cameraNote` goes quiet where it should say the
+    /// camera belongs to another screen, and Stop reaches for
+    /// `stopCameraSession()` on somebody else's session.
+    ///
+    /// This screen's own Stop is unaffected: it reads the flag and clears it
+    /// in the same turn, before the `.unclaimed` that follows arrives here.
+    private func cameraClaimChanged(_ claim: CaptureClaim) {
+        if claim == .unclaimed { startedTheCamera = false }
+        updateCameraNote()
+    }
+
+    private func libraryChanged(_ library: DocumentLibrarySummary?) {
+        guard let revision = library?.revision else { return }
+        guard revision != lastLibraryRevision else { return }
+        let first = lastLibraryRevision == nil
+        lastLibraryRevision = revision
+        // The first revision seen is the baseline, not news.
+        guard !first else { return }
+        if case .searching = state { return }
+        submit(standingQuery ?? .recent(limit: 20), origin: .appText)
+    }
+
+    /// Called when the workspace appears: the session, one shot, and the
+    /// recent listing if nothing has been asked yet.
+    func appear() {
+        refreshSession()
+        if case .idle = state { showRecent() }
+    }
+
+    private func updateCameraNote() {
+        guard let camera else {
+            cameraNote = "The camera cannot be reached from this build. Start the camera from Home; the recorder here reads whatever the glasses stream."
+            return
+        }
+        switch camera.captureClaim {
+        case .unclaimed:
+            cameraNote = "No camera is streaming. Start will start it."
+        case .running:
+            cameraNote = startedTheCamera ? nil : "The camera is streaming from another screen; the recorder reads those frames."
+        case .devicePaused:
+            cameraNote = "The glasses paused delivery themselves; frames resume when they do."
+        case .ending:
+            cameraNote = "The camera is stopping."
+        }
     }
 
     func availability(isTowerReachable: Bool) -> CartridgeAvailability {
@@ -649,6 +790,7 @@ final class DocumentMemoryViewModel: ObservableObject {
 
     /// The entry point any input layer uses.
     func submit(_ query: DocumentQuery, origin: DocumentQueryOrigin) {
+        standingQuery = query
         do {
             try client.search(query, origin: origin)
             lastRequestFailure = nil
@@ -662,8 +804,33 @@ final class DocumentMemoryViewModel: ObservableObject {
         submit(.recent(limit: limit), origin: .appText)
     }
 
+    /// The Tower verb, and -- for Start and Stop -- the camera.
+    ///
+    /// Modelled on `ObjectMemoryRecordingCoordinator`: the Tower first, then
+    /// the camera only if nothing already holds it, and on Stop only a camera
+    /// this screen started. A capture Home or World Builder started is
+    /// somebody else's; the recorder simply reads its frames. Pause and
+    /// Resume are Tower verbs only -- there is no way to pause a DAT stream.
     func send(_ action: DocumentMemoryContract.SessionAction) {
         client.send(action)
+        guard let camera else { return }
+        switch action {
+        case .start:
+            if case .unclaimed = camera.captureClaim {
+                camera.startCameraSession()
+                if camera.lastCaptureStartRefusal == nil {
+                    startedTheCamera = true
+                }
+            }
+        case .stop:
+            if startedTheCamera {
+                camera.stopCameraSession()
+                startedTheCamera = false
+            }
+        case .pause, .resume:
+            break
+        }
+        updateCameraNote()
     }
 
     /// Called when the workspace appears.

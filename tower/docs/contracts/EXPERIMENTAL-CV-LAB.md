@@ -95,10 +95,26 @@ never its first ("the Tower says nothing → not built yet").
 Three surfaces, **one document from one function**:
 
 ```
-GET /cv-lab                          → {"contract", "control_contract", "status"}
+GET /cv-lab                          → {"contract", "control_contract", "status", "process"}
 {"type": "cv_lab_status"}            → {"type": "cv_lab_status", ..., "status"}
 result_subscribe experimental_cv/status → cartridge_result.payload IS that "status"
 ```
+
+`GET /cv-lab` alone also carries `process`, **beside** the document and
+never inside it:
+
+```json
+"process": {"pid": 24036, "threads": 98, "rss_mb": 1622.0}
+```
+
+It is the Tower's reading of its own process (psutil), for the operator
+asking "did the last switch give its memory back" from a machine they
+have no shell on, and for the switch soak (`scripts/cv_lab_switch_soak.py
+--live`). It is not in the document because the document is one object on
+three surfaces and a test holds them byte-equal; a thread count differs
+between two reads a millisecond apart, and the result channel would
+republish the whole document on every poll for a number that moved by
+0.1 MB. Each field is `null` when psutil cannot answer.
 
 A test asserts the three agree. **Not byte-identical across time**, and do
 not build anything on that: `elapsed_s`, the three `throughput` figures,
@@ -152,7 +168,7 @@ snapshot**; there are no deltas to merge.
 | `running` | processing frames | `.running(run)` |
 | `paused` | armed and deliberately not processing | **`.paused(run)` — a new case; see `CV-LAB-IOS-HANDOFF.md` §4** |
 | `stopped` | the last run ended; its figures are final | `.completed(run)` |
-| `failed` | the last **start** failed; another may be sent | `.failed(CartridgeFailure)` |
+| `failed` | the last start failed, **or the running experiment raised on a frame**; the experiment is released and another start may be sent | `.failed(CartridgeFailure)` |
 
 `stopped` rather than `completed` on the wire, deliberately. A bench run
 does not complete; it is stopped by a person. The Tower says what happened
@@ -172,6 +188,18 @@ real, and it is two differences:
 `lifecycle.reason` is prose for a person, present only when the state
 needs explaining. `null` is not "no reason" — it is "the state speaks for
 itself".
+
+**`failed` is always recoverable, since 2026-09-06.** Three things put a
+Lab there and the same `cv_lab_start` brings it back from all of them: an
+interactive start whose load raised; the startup default
+(`TOWER_CV_EXPERIMENT`) naming something unknown or failing to load at
+boot — logged at ERROR, and the module is still ACTIVE; and the running
+experiment raising anything other than a `FrameProcessingError` on a
+frame — the run ends, `frames_failed` counts that frame, the experiment
+is released at once, and `reason` names the exception. Nothing a frame
+does can reach the module's terminal FAILED state any more. What still
+can: a startup load that overruns the container's 120 s bound, which is
+an abandoned thread rather than a failed one.
 
 `lifecycle.since` is when the Lab entered this state.
 
@@ -240,8 +268,10 @@ The eight registered today: `baseline`, `depth`, `edge_detection`,
   "experiment": { /* the same shape as an `available` entry */ },
   "origin": "client_request",
   "started_at": 1787810180.1, "ended_at": null, "elapsed_s": 14.2,
+  "arm_ms": 231.4,
   "runtime": {"backend": "torch", "device": "cuda:0",
-              "device_requested": "auto", "model": "MiDaS_small"},
+              "device_requested": "auto", "model": "MiDaS_small",
+              "torch_threads": 2},
   "frames_offered": 12, "frames_processed": 12,
   "frames_refused": 0, "frames_failed": 0,
   "metrics": [ /* §4 */ ], "metrics_omitted": 0,
@@ -281,9 +311,21 @@ become numbers a few milliseconds later. `capacity_fps` is `null` until
 one frame has been processed, because it is derived from measured
 per-frame cost.
 
+`arm_ms` is how long this run took to arm: from the `cv_lab_start` being
+accepted (or the boot for a `startup_default` run) to the moment its
+experiment was installed and could answer a frame. `null` while `starting`
+and `null` forever for a run whose arm failed. Measured on a monotonic
+clock, so it is meaningful below the wall clock's 15.6 ms Windows tick.
+Warm figures on the reference host: ~230 ms for `depth` on CUDA, ~150 ms
+for `object_detection`, under 1 ms for everything else; the very first
+`depth` arm in a process is ~2-3 s (torch import, CUDA context, hub
+cache).
+
 `runtime` is what the experiment says it actually loaded, and is empty for
 an experiment that holds nothing. Its keys are the experiment's own; do
-not switch on them. It exists because `TOWER_CV_DEVICE=auto` is a
+not switch on them. (The two model-backed experiments report
+`torch_threads`, the intra-op budget they applied — see
+`TOWER_CV_TORCH_THREADS` in the README — beside `device`.) It exists because `TOWER_CV_DEVICE=auto` is a
 **request** and the Tower decides the answer — a run labelled "auto" has
 not said whether it used the GPU, and a CPU figure with a GPU label on it
 is a real failure this closes.
@@ -819,6 +861,12 @@ These sit alongside the transport's existing `invalid_frame`,
 the module stays ACTIVE and the next frame is accepted the moment the Lab
 is running again. The `message` beside each one says what to send.
 
+`cv_lab_failed` is also the answer to the frame on which the experiment
+itself raised: that frame's `frame_error` carries the exception's
+client-safe text and the run has already ended by the time it is sent.
+Frames after it get the same reason with `lifecycle.reason` as the
+message, until the next `cv_lab_start`.
+
 `cv_lab_unavailable` is a **defensive default** rather than a state you
 will normally see — when the Lab is `unavailable` the module behind it is
 FAILED or UNLOADED, so the transport answers `module_unavailable` before
@@ -926,22 +974,22 @@ visible.
    sequence both succeed; the second replaces the first, and both see it
    in the pushed status. There is no ownership model, because a bench with
    one slot and two operators has a social problem, not a protocol one.
-3. **Two failures are terminal and one is not.** A failed *interactive*
-   start is recoverable: the Lab goes `failed` and another start may be
-   sent. Two others are not, and both report `unavailable` until the Tower
-   restarts:
-   - a failed **startup** experiment (`TOWER_CV_EXPERIMENT` names
-     something unknown, or its load fails at boot) — the module is marked
-     FAILED, which is terminal by design, and a typo in configuration
-     should be loud;
-   - an experiment that raises something other than a
-     `FrameProcessingError` **while processing a frame**. `ModuleContainer`
-     treats that as a module failure, `mark_failed()` is terminal, and the
-     Lab goes with it. This is a property of the shared module lifecycle
-     rather than of the Lab, and closing it means giving the container a
-     way back from FAILED — V1.0/V1.1 work that is out of scope here.
-     Every registered experiment routes its recoverable failures through
-     `FrameProcessingError` precisely to stay out of this case.
+3. **One failure is still terminal.** Until 2026-09-06 there were three:
+   a failed startup default and an experiment raising on a frame both
+   reached the module's terminal FAILED state (§3.1 says what they do
+   now). What remains is a startup load that overruns the container's
+   120 s bound: the load is abandoned on its thread, the module is
+   marked FAILED and the Lab reports `unavailable` until the Tower
+   restarts. That is the shared module lifecycle's bound, not the Lab's,
+   and a warm load on the reference host is two orders of magnitude
+   inside it. Every registered experiment still routes its recoverable
+   per-frame failures through `FrameProcessingError`, which keeps the run
+   going; anything else now ends the run, not the process.
+6. **Inference runs on the event loop.** A 40 ms `object_detection` frame
+   holds every socket for 40 ms, including the reply to a command sent
+   during it. It is bounded (one frame at a time per connection; the
+   phone drops rather than queues) and it is why the torch thread budget
+   matters, but it is not a queue you can drain from the client.
 4. **No artifact, no baseline, no direction.** See §4 and §5. All three
    are `null` with a stated reason rather than omitted.
 5. **No cancellation of an in-flight arm from the client's point of
@@ -959,6 +1007,9 @@ visible.
 | The catalog | `tower/cv_lab/catalog.py` |
 | One run's identity and measurements | `tower/cv_lab/run.py` |
 | Lifecycle, selection, the frame path, the document | `tower/cv_lab/lab.py` |
+| The one loader thread every arm runs on | `tower/cv_lab/loader.py` |
+| The torch thread budget and its measured defaults | `tower/experiments/depth.py` (`resolve_torch_threads`) |
+| The switch soak | `scripts/cv_lab_switch_soak.py` |
 | The module that holds the Lab | `tower/modules/experimental_cv.py` |
 | Experiment registration and metadata | `tower/experiments/__init__.py` |
 | Control messages | `tower/routes/cv_lab_ws.py` |
@@ -973,6 +1024,20 @@ a new experiment".
 ---
 
 ## 13. Changelog
+
+### 2026-09-06 — additive; no identifier moved
+
+- `run.arm_ms` (§3.3) and `run.runtime.torch_threads` on the two
+  model-backed experiments.
+- `process` beside `status` on `GET /cv-lab` only (§2.2).
+- `failed` now also follows an experiment raising on a frame, and a
+  startup default that could not arm; both are recoverable with
+  `cv_lab_start` (§3.1, §8, §11). Nothing changed shape; a client that
+  already rendered `failed` as "another start may be sent" was right all
+  along and is now right in every case.
+- Every arm runs on one reusable loader thread per Lab. Invisible on the
+  wire; it is why a Tower that switches experiments for an afternoon
+  holds a flat thread count instead of gaining nineteen per switch.
 
 ### `experimental_cv.status/2026-08-27`, `.control/2026-08-27`, `.frame_result/2026-08-27`
 

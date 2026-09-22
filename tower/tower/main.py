@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from tower.capture import DEFAULT_MAX_IDLE_POLLS, CaptureRecorder
 from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
 from tower.cartridge_runtime import build_live_cartridges
-from tower.cartridge_session import CartridgeSession
+from tower.cartridge_session import CartridgeSession, STOP_POLICY_REQUEST
 from tower.config import KNOWN_VERIFIERS, TOWER_ROOT, Settings, get_settings
 from tower.cv_lab.preview import PreviewPolicy
 from tower.experiments import ExperimentSettings
@@ -19,7 +20,7 @@ from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
 from tower.results import build_hub
-from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY
+from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY, CARTRIDGE_WORLD_BUILDER
 from tower.results.object_memory import (
     build_face_filter,
     keyframe_store_from_root,
@@ -83,7 +84,10 @@ def _build_cv_module(settings: Settings, connection_count=None) -> Module:
     """
     return ExperimentalCVModule(
         settings.cv_experiment,
-        ExperimentSettings(device=settings.cv_device),
+        ExperimentSettings(
+            device=settings.cv_device,
+            torch_threads=settings.cv_torch_threads,
+        ),
         connection_count=connection_count,
         # Whether this Tower draws anything at all is an operator's
         # decision, so it arrives from `Settings` rather than being a
@@ -110,8 +114,8 @@ def _build_frame_observers(settings: Settings) -> list:
     return [CaptureRecorder(settings.capture_root)]
 
 
-def _world_build_spec(settings: Settings) -> WorkerSpec | None:
-    """The builder that follows a capture, or nothing.
+def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
+    """The builder that follows a capture WHILE World Builder is active, or nothing.
 
     This function and its neighbour are the ONLY places in the web
     process that know a world builder and an object memory exist, and
@@ -126,9 +130,23 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
     The web process therefore still does not build. It supervises a child
     that does, which is what keeps an expensive rebuild off the frame
     path.
+
+    GATED since 2026-09-06, like the object-memory producer, and for a
+    resource reason rather than a privacy one. Ungated, a builder -- with
+    its background global solves at all-cores-but-two -- attached to every
+    capture on the Tower, including a CV Lab camera session that never
+    asked for a world, and the only way to run CV Lab without it was
+    `TOWER_WORLD_AUTOBUILD=false` and a restart. The gate is the
+    `world_builder` cartridge session: the phone opens it when the World
+    Builder workspace is on screen and closes it when it leaves.
+    `TOWER_WORLD_AUTOBUILD` keeps its meaning -- whether a builder may run
+    at all -- and stops being the way to switch cartridges.
     """
     if settings.world_root is None or not settings.world_autobuild:
         return None
+
+    register = ("--register",) if settings.world_register else ()
+    solve = ("--solve",) if settings.world_solve else ()
 
     return WorkerSpec(
         argv=(
@@ -140,6 +158,16 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
             settings.world_root,
             "--rebuild-every",
             str(settings.world_rebuild_every),
+            # Place the segments once the walk ends. It is a flag on the
+            # child's argv rather than anything this process does,
+            # because the web process must keep knowing the builder only
+            # as a command line -- and because registration is seconds of
+            # solving that the frame path must never see.
+            *register,
+            # The global solver, same reasoning: a child of the builder,
+            # never the web process, and seconds to minutes of solving the
+            # frame path must never see.
+            *solve,
             # So a producer whose Tower died without closing the manifest
             # stops following instead of polling that directory forever.
             # See DEFAULT_MAX_IDLE_POLLS: the bound has always existed and
@@ -147,9 +175,21 @@ def _world_build_spec(settings: Settings) -> WorkerSpec | None:
             # docstring promises was never actually armed in production.
             "--max-idle-polls",
             str(DEFAULT_MAX_IDLE_POLLS),
+            # The half of the stop agreement that lives in the child: stdin
+            # EOF is a SOFT stop (end the session, write the final build,
+            # skip the final solve), and the builder installs handlers so a
+            # console control event is a HARD one (wrap up now). Paired
+            # with `stop_via_stdin` below, as the producer's is.
+            "--stop-on-stdin-close",
         ),
         cwd=str(TOWER_ROOT),
         name=WORLD_BUILD_WORKER,
+        gate=gate,
+        stop_via_stdin=True,
+        # Once asked, the builder ends within one final build; on a long
+        # walk that is tens of seconds, not the shared 10 s default that
+        # shot it mid-finalization. The grace is the bound, not the wait.
+        stop_grace_seconds=30.0,
     )
 
 
@@ -237,7 +277,7 @@ def _build_capture_worker_supervisor(settings: Settings, gates: dict):
     specs = [
         spec
         for spec in (
-            _world_build_spec(settings),
+            _world_build_spec(settings, gates.get(WORLD_BUILD_WORKER)),
             _observation_spec(settings, gates.get(OBJECT_MEMORY_WORKER)),
         )
         if spec is not None
@@ -320,12 +360,37 @@ def _log_effective_configuration(
             "unsupported"
         )
     else:
-        logger.info("[Tower][Config] world root %s", settings.world_root)
+        # ABSOLUTE, and whether it holds anything. `.env` carries the
+        # relative `data/world_builder`; a Tower launched from any directory
+        # but `tower/` resolves it somewhere else, answers `GET /worlds`
+        # with an empty list, and the phone reads "no saved worlds yet".
+        # The line that would have said so used to print the relative
+        # string.
+        resolved = Path(settings.world_root).resolve()
+        worlds_dir = resolved / "worlds"
+        if worlds_dir.is_dir():
+            logger.info("[Tower][Config] world root %s (%s)", resolved, settings.world_root)
+        else:
+            logger.warning(
+                "[Tower][Config] world root %s (%s) holds no worlds/ directory yet: "
+                "GET /worlds will answer an empty list. If saved worlds were "
+                "expected, check the directory this Tower was started from",
+                resolved,
+                settings.world_root,
+            )
 
     if settings.scene_understanding:
         logger.info(
-            "[Tower][Config] Scene Understanding is enabled; it observes "
-            "nothing until a session is started and persists nothing ever"
+            "[Tower][Config] Scene Understanding is enabled (mode %s); it "
+            "observes nothing until a client subscribes to the live scene "
+            "while a stream is open, and persists nothing ever",
+            settings.scene_understanding_mode,
+        )
+    elif settings.scene_understanding_mode == "auto":
+        logger.info(
+            "[Tower][Config] Scene Understanding is unavailable: the "
+            "optional [ml] extra is not installed. The contract is "
+            "declared and reported unavailable"
         )
     else:
         logger.info(
@@ -335,14 +400,17 @@ def _log_effective_configuration(
 
     if settings.document_root is None:
         logger.info(
-            "[Tower][Config] TOWER_DOCUMENT_ROOT is unset: /documents/* "
+            "[Tower][Config] TOWER_DOCUMENT_ENABLED is off: /documents/* "
             "will answer 404 and the contract is reported unavailable"
         )
     else:
         logger.info(
-            "[Tower][Config] document root %s (capture %s)",
+            "[Tower][Config] document root %s (capture %s, OCR device %s, "
+            "retention %s days)",
             settings.document_root,
             "on" if settings.document_capture else "off",
+            settings.document_device,
+            settings.document_retention_days,
         )
 
     if settings.observation_root is None:
@@ -423,17 +491,22 @@ def _log_effective_configuration(
             )
 
     logger.info(
-        "[Tower][Config] CV Lab startup default is %r on device %r; a client "
-        "may select another with cv_lab_start, no restart required",
+        "[Tower][Config] CV Lab startup default is %r on device %r with torch "
+        "threads %r; a client may select another with cv_lab_start, no "
+        "restart required",
         settings.cv_experiment,
         settings.cv_device,
+        settings.cv_torch_threads,
     )
 
     attached = supervisor.worker_names()
     if WORLD_BUILD_WORKER in attached:
         logger.info(
-            "[Tower][Config] a builder will be attached to each capture, "
-            "rebuilding every %s keyframes",
+            "[Tower][Config] a builder will be attached to a capture WHILE World "
+            "Builder is active on the phone (POST /cartridges/%s/session/start; "
+            "stop releases it), rebuilding every %s keyframes. It is stopped at "
+            "startup.",
+            CARTRIDGE_WORLD_BUILDER,
             settings.world_rebuild_every,
         )
     elif settings.world_root is not None:
@@ -559,8 +632,16 @@ def create_app() -> FastAPI:
         session = cartridge_sessions.get(CARTRIDGE_OBJECT_MEMORY)
         return session is not None and session.is_active()
 
+    def _world_build_gate() -> bool:
+        session = cartridge_sessions.get(CARTRIDGE_WORLD_BUILDER)
+        return session is not None and session.is_active()
+
     app.state.capture_workers = _build_capture_worker_supervisor(
-        settings, {OBJECT_MEMORY_WORKER: _object_memory_gate}
+        settings,
+        {
+            OBJECT_MEMORY_WORKER: _object_memory_gate,
+            WORLD_BUILD_WORKER: _world_build_gate,
+        },
     )
     cartridge_sessions[CARTRIDGE_OBJECT_MEMORY] = CartridgeSession(
         cartridge=CARTRIDGE_OBJECT_MEMORY,
@@ -568,6 +649,18 @@ def create_app() -> FastAPI:
         supervisor=app.state.capture_workers,
         open_capture=_open_capture_lookup(app.state.frame_observers),
         clock=time.time,
+    )
+    # World Builder's session is INTENT TO BUILD, not a recording consent:
+    # "the World Builder workspace is on the phone's screen". Its Stop asks
+    # rather than terminates (STOP_POLICY_REQUEST), because a builder that
+    # is finalizing a walk the wearer just finished must be allowed to.
+    cartridge_sessions[CARTRIDGE_WORLD_BUILDER] = CartridgeSession(
+        cartridge=CARTRIDGE_WORLD_BUILDER,
+        worker=WORLD_BUILD_WORKER,
+        supervisor=app.state.capture_workers,
+        open_capture=_open_capture_lookup(app.state.frame_observers),
+        clock=time.time,
+        stop_policy=STOP_POLICY_REQUEST,
     )
     # Deliberately NOT persisted anywhere. A Tower that restarts comes
     # back with every cartridge stopped, because resuming a memory of
@@ -590,6 +683,14 @@ def create_app() -> FastAPI:
     # records a document only when a session is started; unset means the
     # routes answer 404.
     app.state.document_root = settings.document_root
+    # The window the session writes under, so a read with no window of
+    # its own sees what the writer promised rather than forever. 0 means
+    # the operator chose forever, and None is what the routes read that as.
+    app.state.document_retention_days = (
+        settings.document_retention_days
+        if settings.document_retention_days and settings.document_retention_days > 0
+        else None
+    )
     # Whether a live session exists is a SEPARATE question from whether
     # the library can be read, and the two must not be conflated. A Tower
     # reprocessing captures offline has a library and no session; that is
@@ -612,6 +713,7 @@ def create_app() -> FastAPI:
         scene_source=live.scene,
         document_source=live.document,
         cv_lab=app.state.cv_lab,
+        document_unavailable_reason=live.document_unavailable_reason,
     )
     # Started here, not in `lifespan` above: TestClient(create_app()) used
     # without `with client:` (every pre-existing test in this repo) never

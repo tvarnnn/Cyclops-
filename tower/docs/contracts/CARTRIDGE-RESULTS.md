@@ -6,7 +6,7 @@ something does not exist, it says so and says why.
 
 **Envelope contract:** `cartridge_results.envelope/2026-08-23`
 **Producers offered:** World Builder `status`, contract
-`world_builder.status/2026-08-25`. Nothing else. See §9.
+`world_builder.status/2026-09-10`. Nothing else. See §9.
 
 **Audience.** Whoever implements the iOS consumer. You should be able to
 write it from this document without reading Tower's Python. If you find
@@ -71,7 +71,7 @@ asserts they cannot drift. **The phone does not need it.**
     {
       "cartridge": "world_builder",
       "result_type": "status",
-      "contract": "world_builder.status/2026-08-25",
+      "contract": "world_builder.status/2026-09-10",
       "available": true,
       "unavailable_reason": null,
       "snapshot_only": true
@@ -132,7 +132,7 @@ subscription open.
   "type": "result_subscribe",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-10",
   "world_id": null,
   "session_id": null,
   "since_revision": null
@@ -162,7 +162,7 @@ counter that moved would be a bug.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-10",
   "snapshot_only": true,
   "world_id": null,
   "session_id": null,
@@ -177,6 +177,15 @@ whatever `since_revision` you sent.
 `subscription_id` is unique **per connection** and starts at `sub-1` on
 each new socket. Two connections will both see `sub-1`; that is correct and
 they are entirely independent.
+
+**`world_id` and `session_id` on the reply are the request's, verbatim** —
+`null` where the request omitted them — never the world or session the
+Tower *resolved* (that is the payload's `selection` block, §10). A client
+with more than one subscribe outstanding — a pin change while an earlier,
+slower subscribe is still being answered — matches each ack to the subscribe
+it answers by these two fields, and closes an ack whose pin is not the one
+it holds. The Tower has echoed them since the channel existed; stated here
+since 2026-09-14 because the phone now depends on it.
 
 ### Unsubscribing
 
@@ -203,7 +212,7 @@ cartridge-specific part.
   "subscription_id": "sub-1",
   "cartridge": "world_builder",
   "result_type": "status",
-  "contract": "world_builder.status/2026-08-25",
+  "contract": "world_builder.status/2026-09-10",
   "seq": 4,
   "revision": "e252f739c1cdedab",
   "revision_changed": true,
@@ -323,7 +332,12 @@ keeps working through every one.
 | `consumer_too_slow` | a result was not accepted within the send timeout; **this subscription is now closed** — subscribe again to resume | `subscription_id`, `cartridge`, `result_type` |
 | `channel_failed` | the Tower's shared reader died; **this subscription is now closed** | `subscription_id`, `cartridge`, `result_type` |
 
-Every `result_error` also carries `envelope_contract`.
+Every `result_error` sent in reply to a request also carries
+`envelope_contract`. The two unsolicited ones, `channel_failed` and
+`consumer_too_slow`, do not: they are built by the publisher's send
+loop, which names the subscription and its cartridge/result type and
+nothing more (`tower/results/publisher.py`). A client must not require
+the field on a `result_error`.
 
 `channel_failed` and `consumer_too_slow` are the two that arrive
 unsolicited. On receiving it,
@@ -442,10 +456,10 @@ move.
 
 | Cartridge | Result type | Contract | Section |
 |---|---|---|---|
-| World Builder | `status` | `world_builder.status/2026-08-25` | §10 |
+| World Builder | `status` | `world_builder.status/2026-09-10` | §10 |
 | Experimental CV Lab | `status` | `experimental_cv.status/2026-08-27` | `EXPERIMENTAL-CV-LAB.md` |
 | Scene Understanding | `live` | `scene_understanding.live/2026-08-27` | §14 |
-| Document Memory | `status` | `document_memory.status/2026-08-27` | §15 |
+| Document Memory | `status` | `document_memory.status/2026-09-07` | §15 |
 
 **`not_offered` is now EMPTY, and that is a claim.** Three cartridges
 left that list on 2026-08-27 — Scene Understanding, Document Memory and
@@ -529,7 +543,7 @@ and that is worth knowing before adding a third:
 
 ## 10. World Builder `status` payload
 
-Contract: `world_builder.status/2026-08-25`.
+Contract: `world_builder.status/2026-09-10`.
 
 ### 10.0 If you implement nothing else, implement this
 
@@ -571,17 +585,29 @@ it is an App Store release rather than a Tower restart.
 ```
 
 **`model_state`** — one of `unsupported`, `idle`, `receiving`,
-`finalizing`, `finalized`, `failed`. `model_state_reason` is prose for a
-person, or null.
+`finalizing`, `finalized`, `interrupted`, `failed`. `model_state_reason` is
+prose for a person, or null.
 
 | Tower sends | Meaning | Note |
 |---|---|---|
 | `unsupported` | this Tower cannot serve World Builder at all | e.g. no world root configured. Do not invite the user to wait |
 | `idle` | Tower is fine, there is nothing to show yet | no worlds, or a world with no sessions |
 | `receiving` | a mapping session is live | a process holds the world's writer lock |
-| `finalizing` | capture ended; the stored figures are **not** the final figures | see the caveat under `lifecycle` below — Tower cannot see whether a build is *running* |
+| `finalizing` | capture ended; a builder is finishing, **or** (on a record older than 2026-09-06) the stored figures are not the final figures | `lifecycle.state` says which: `finalizing` is a live process that still holds the lock; `stopped_unbuilt` is the old caveat, and since 2026-09-10 only when the FIGURES say there is something to wait for — `geometry.element_count > 0` or `trajectory.pose_count > 0`, the same test as iOS `WorldEvidence.hasGeometry`; not `geometry.available`, which is true for a build that solved nothing — see below |
 | `finalized` | capture ended and the stored geometry matches the keyframes | |
-| `failed` | the builder died, or the session recorded an error | `model_state_reason` says which |
+| `interrupted` | the session did not end the way a walk ends: the builder died, was asked to stop mid-walk, recorded an error, or finalization was left unfinished | **`world_snapshot` and `geometry` still describe whatever was built.** `model_state_reason` says what happened; `lifecycle.finalization` says how far finalization got. Added at `/2026-09-06` (the reason the identifier moved) |
+| `failed` | reserved; nothing on disk maps to it since `/2026-09-06` | a client must still decode it |
+
+**`selection`** — why *this* world is on the wire. Added at `/2026-09-06`.
+Always present, including on an unavailable payload. **Not part of the
+revision:** two subscriptions describing the same bytes agree on `revision`
+whatever their `selection`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `mode` | `"pinned"`, `"live"`, `"finalizing"`, `"latest"`, `"none"` | `pinned`: the client named the world. `live`: a running builder holds its lock and its session is open. `finalizing`: a running builder holds its lock and its session has stopped. `latest`: **nothing is live; this is merely the most recently updated world on disk** — a client following the live world must not draw it as the live world. `none`: nothing to report |
+| `world_id`, `session_id` | string or null | what was resolved |
+| `reason` | string | prose |
 
 **`awaiting_first_update` is never sent**, deliberately. It means "frames
 are going out and the Tower has said nothing yet" — a fact about the
@@ -641,32 +667,39 @@ evidence behind these values.
 
 | `state` | Means | Evidence |
 |---|---|---|
-| `receiving` | a mapping session is live | a live pid holds the writer lock |
-| `stopped_unbuilt` | capture ended; stored geometry is not current with the keyframes | no manifest, or a stale one |
-| `ready` | capture ended; stored geometry matches the keyframes | manifest current |
-| `failed` | the builder died, or the session recorded an error | a lock held by a dead pid |
+| `receiving` | a mapping session is live | a live pid holds the writer lock, no `session_stopped` |
+| `finalizing` | the session stopped and the builder is finishing it (final solve, final build) | a live pid holds the writer lock **and** `session_stopped` was written. Since 2026-09-06 the live builder keeps its lock through finalization |
+| `ready` | the session finished; stored geometry is what it produced | `finalization.state == "complete"` and the lock released; or, on an older record, manifest current. **Since 2026-09-10 it also covers a derived tree that no manifest describes** — either none was written beside it (a world built before `write_derived` wrote one per session) or the one that was cannot be read. Currency is then genuinely unjudgeable, `geometry.current` is `false`, and `lifecycle.reason` is non-null saying so; the figures are recounted from `poses.json`/`points.json` so `element_count` and `pose_count` are real, which is what lets the world open |
+| `interrupted` | the session did not end the way a walk ends | a lock held by a dead pid (mid-walk or mid-finalization); `end_reason` `error` or `interrupted`; or a `finalization` left `pending`/`interrupted` with no live holder. **`geometry.available` says whether a reconstruction exists regardless** |
+| `stopped_unbuilt` | (records older than 2026-09-06) capture ended; stored geometry is not current with the keyframes, **or** nothing was built at all | a manifest that is present and stale, and no `finalization` record. (Not "no manifest": since 2026-09-10 a tree with no manifest is `ready`, and a manifest with no tree is `interrupted`.) The `model_state` projection tells the two meanings apart on the FIGURES — `finalizing` when `element_count` or `pose_count` is above zero, `interrupted` when neither is. Not on `geometry.available`, which is true as soon as a build ran: `engine.build` writes a derived tree even when it solved nothing, so gating on it told a wearer to keep waiting for a world with zero points in it |
+| `failed` | reserved; no longer emitted | — |
 | `idle` | a world with no live session and no stop event | — |
 | `unavailable` | nothing could be read | see `reason` |
 
 `evidence` is prose naming what was observed. `reason` is prose for a
 person, or null.
 
-> **There is deliberately no `finalizing`.** A build *does* rewrite several
-> files before its manifest lands, so the directory changes while it runs —
-> but those writes are indistinguishable from a build that made them and
-> then **died**. The writer lock is already released by then and no event
-> is written, so nothing on disk says "a process is working right now". The
-> Tower cannot observe that work is continuing, and a state named
-> `finalizing` would assert exactly that.
->
-> `lifecycle.build_in_progress` is **`null`** in every stopped state — not
-> `false`, which would be a claim that no build is running.
-> `build_in_progress_unavailable_reason` carries the explanation. It is
-> `false` only while `receiving`, where the lock proves no build has begun.
->
-> If you want to render `.finalizing`, `stopped_unbuilt` is the state to
-> map it from — but do so knowing Tower is telling you "the stored figures
-> are not the final figures", not "a process is working right now".
+**`lifecycle.finalization`** — the builder's own account of what happened
+after `session_stopped`, copied from the session record, or **null** on a
+record written before 2026-09-06 or a session that never stopped.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `"pending"`, `"complete"`, `"interrupted"` | `pending` with a live lock is `finalizing`; `pending` with no live lock is `interrupted` |
+| `final_solve` | `"pending"`, `"solved"`, `"skipped"`, `"failed"`, `"unavailable"`, or null | null when no final solve was configured. `skipped` names why in `detail` (a stop request mid-walk, a hard stop during finalization) |
+| `started_at`, `updated_at` | float | Tower clock |
+| `detail` | string or null | prose: the error, or why the solve was skipped |
+
+> **`finalizing` is now a live claim.** The builder keeps the writer lock
+> until its final build is written, so a lock held by a running pid after
+> `session_stopped` means a process is working, and
+> `lifecycle.build_in_progress` is **`true`** in that state on the evidence
+> of the lock. On records older than that change nothing on disk says so:
+> there `stopped_unbuilt` still means only "the stored figures are not the
+> final figures", `build_in_progress` is **`null`** (not `false`, which
+> would be a claim), and `build_in_progress_unavailable_reason` explains.
+> It is `false` while `receiving` and in every `interrupted` state, where
+> the lock's holder is known to be gone.
 
 **`progress`** — or `null` with no session.
 
@@ -678,6 +711,8 @@ person, or null.
 | `frames_observed` | int or **null** | **null while live.** An ordinary rejected frame writes no journal event, so this is genuinely not knowable until the session stops. `null ≠ 0` |
 | `frames_observed_unavailable_reason` | string or null | why, when null |
 | `rejected_by_reason` | object or null | histogram, available only after stop |
+| `frames_rejected_wrong_size` | int | frames rejected for being a different size from the session's first frame, counted LIVE from the journal (the engine journals this rejection, unlike an ordinary one). The calibration is exact per resolution, so such a frame could never have produced a pose; before this was counted, a whole walk at the wrong rung read "Mapping" with a frozen keyframe count and then "Saved" with a truncated world. Additive (2026-09-14) |
+| `frames_rejected_malformed` | int | frames rejected because they could not be decoded, counted live from the journal. Additive (2026-09-14) |
 | `journal_corrupt_lines` | int | Unparseable lines in the event journal. **1 at the tail is routine** — a journal is appended without fsync, so a reader can arrive mid-write. More than that, or a count that does not clear, means corruption, and the keyframe count beside it is correspondingly low |
 | `mapping_seconds` | float or **null** | **on the Tower's clock.** Do not derive this from a phone timer. **Null** if the Tower's wall clock moved backwards during the session — reported as unknown rather than clamped to `0.0`, because a plausible zero is worse than an absent value |
 | `mapping_seconds_unavailable_reason` | string or null | why, when null |
@@ -766,6 +801,8 @@ asserted without the figures to show for it.
 | `pose_count` | poses carrying a position that is **evidence**. Read from the manifest's `poses_positioned`, which the build counts per segment: every solved pose, plus the anchor of each segment that solved something. **Not** `poses_solved` (that drops the origin of every segment) and **not** `keyframes - poses_refused` (that promotes the bare anchor of a segment which resolved nothing). See the changelog for why this changed |
 | `poses_anchor` | how many poses were anchors. Reported beside the count, never folded into it, so an uncalibrated walk reads as "N segment origins, no trajectory" rather than as a trajectory |
 | `poses_solved`, `poses_refused`, `keyframes`, `segments` | the underlying figures |
+| `tracking_restarts` | how many times the tracker actually lost the world, **counted** from `tracking_lost` events. Never `segments - 1`: two independent causes open a segment, and only one of them is a tracking loss. On the 2026-09-09 walk 122 segments were 64 tracking losses, 57 solve-chain breaks and the one the session started with, while the phone rendered `segments - 1` under the words "Tracking restarted 121 times". `null` from a build with no journal to count |
+| `chain_breaks` | how many times the solver could not extend its chain and opened a segment while tracking was healthy. `events.py` is explicit that a consumer must not read one as the wearer having lost the world; it does not move `last_tracking`. Diagnostics, not a headline figure |
 | `path_length` | see below |
 | `provenance` | `"inferred"` |
 
@@ -970,6 +1007,7 @@ coordinate frame rather than a camera position.
 | lifecycle, tracking, calibration | ✅ | ✅ | ✅ |
 | `keyframes_accepted`, `mapping_seconds` | ✅ | ✅ | ✅ |
 | `frames_observed`, `rejected_by_reason` | ❌ null | ✅ | ✅ |
+| `frames_rejected_wrong_size`, `frames_rejected_malformed` | ✅ (from the journal, live) | ✅ | ✅ |
 | `scale.state` beyond `unknown` | ❌ | ❌ | ✅ |
 | geometry: representation, element count | ⚠️ | ❌ | ✅ |
 | trajectory: pose count | ⚠️ | ❌ | ✅ |
@@ -1056,15 +1094,27 @@ asserts the wire stays silent. Sessions are driven over HTTP:
 | `POST /scene/stop` | end the session and **discard** the scene |
 
 **A phone does not call any of them.** `IOS-to-Tower.md` §6.2 is
-explicit that opening a cartridge on the phone sends nothing, so the
-session follows the STREAM: `stream_start` starts it and `stream_stop`
-ends it, as does a disconnect — which is the normal case for a wearable.
-`lifecycle.follows_stream` reports whether that is on, and
-`TOWER_SCENE_AUTOSTART=false` turns it off for an operator who wants
-manual control.
+explicit that opening a cartridge on the phone sends no verb. What it
+does send is a `result_subscribe` for `scene_understanding/live`, and
+since 2026-09-07 the session runs while **somebody is streaming AND
+somebody is watching**:
 
-A stop only ever ends what the stream started. A connection that never
-sent `stream_start` cannot end a session an operator began by hand.
+- the **stream** (`stream_start` … `stream_stop` or a disconnect) is the
+  feed. The last open stream closing stops the session **whoever started
+  it** — frames come from nowhere else.
+- a **watcher** (a live subscription) is the demand. A stream with no
+  watcher — a phone using World Builder's or the CV Lab's camera — leaves
+  the session `stopped`. The last watcher leaving (`result_unsubscribe`
+  or its socket closing) stops the session and releases the detector.
+- `POST /scene/start` is the **operator** path: it runs at once with or
+  without a stream, survives watchers leaving, and ends on
+  `POST /scene/stop` or on its last stream closing.
+
+`lifecycle.follows_stream` reports whether the stream-and-watcher rule is
+on; `TOWER_SCENE_AUTOSTART=false` leaves only the operator path.
+`lifecycle.demand` reports the rule's inputs as counts. No demand event
+resumes a Pause. A connection that never sent `stream_start` cannot end
+anything.
 
 All five answer `404` when the cartridge is not enabled. A `POST` that
 returned `200` and did nothing is how an operator comes to believe a
@@ -1112,6 +1162,8 @@ to tell "zero of these" from "this Tower did not say".
 | `loading_seconds` | float or null | non-null only while still loading |
 | `load_overdue` | bool | the load has exceeded `load_overdue_after_seconds`. **Not a failure** — nothing can interrupt a blocking model load, and a first-run weight download is slow and still correct |
 | `load_overdue_after_seconds` | float | `120.0` |
+| `follows_stream` | bool | whether the stream-and-watcher rule is on (§14.2) |
+| `demand` | object | why the session is or is not running: `demand.streams` (int, connections streaming frames), `demand.watchers` (int, live subscriptions), `demand.operator_hold` (bool, started by `POST /scene/start`), `demand.runs_when` (`"stream-and-watcher-or-operator"`). Counts only, never a token; volatile, so a subscriber joining does not mint an envelope |
 
 **Freshness and flow**
 
@@ -1145,7 +1197,7 @@ any large display. The list is fixed at build time and is what keeps
 | `counts` | `{label: int}` or null | one entry per `reported_classes`, present at `0` rather than omitted |
 | `count_basis` | `"confirmed-tracks"` | counts come from the tracker, never from raw detections |
 | `count_is_lower_bound` | bool, always `true` | see §14.4 |
-| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `noise-classes`, `departure-lag`, `field-of-view` |
+| `count_limitations` | list of `{limitation, detail}` | `size-floor`, `recall`, `people-count-accuracy`, `departure-lag`, `field-of-view` |
 
 > **All five ship, unconditionally.** This row listed three until
 > 2026-08-27, omitted the noise-class disclosure entirely, and described
@@ -1235,8 +1287,25 @@ are withheld with a reason (`facing_states_withheld_reason`): a
 per-person facing state narrows to one person's orientation the moment
 only one person is in view.
 
-**`lifecycle.follows_stream`** — whether `stream_start` starts this
-session and `stream_stop` ends it. See §14.2.
+**People, since 2026-09-07.** `people` also carries
+`partial_bottom_edge` (int) with `partial_bottom_edge_note` — person
+boxes cut off by the bottom edge with no head region, most often the
+wearer's own body, kept out of `count`; `by_apparent_size` with buckets
+`large`, `medium`, `small`, `unknown` and `apparent_size_note` — sizes
+in the picture, never distances; and `orientation_method` (string or
+null), `orientation_status` (`"experimental"`) and
+`orientation_validation` (prose) — the facing stage is a face detector
+on each tracked person's box, validated only on COCO stills.
+`where` now includes `person` as side counts, and `where_excludes` is
+empty. `single_person_note` (top level, constant prose) states the one
+thing the aggregates cannot hide: with one person in view they describe
+that person while they are in view; a client must not store a sequence
+of payloads.
+
+**`lifecycle.follows_stream`** — whether a stream together with a
+watcher starts this session. See §14.2. **`lifecycle.demand`** — the
+counts that rule is evaluated over, so a client can tell "nobody is
+streaming" from "nobody is watching".
 
 **`relations`** — always `null`
 
@@ -1331,8 +1400,8 @@ event as the scene having changed.
 
 ## 15. Document Memory `status` payload, and the library on HTTP
 
-Contracts: `document_memory.status/2026-08-27` (this channel) and
-`document_memory.library/2026-08-27` (HTTP).
+Contracts: `document_memory.status/2026-09-07` (this channel) and
+`document_memory.library/2026-09-07` (HTTP).
 Subscription pair: `("document_memory", "status")`.
 
 ### 15.0 Read this before building anything against it
@@ -1405,9 +1474,9 @@ carried beside it.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `contract` | string | `document_memory.library/2026-08-27` |
+| `contract` | string | `document_memory.library/2026-09-07` |
 | `claim` | `"a-page-was-in-view-and-was-ocred"` | The wire value, pinned as `DOCUMENT_CLAIM` in `tower/results/document_memory.py`. Until the 2026-08-27 unification this table quoted an older spelling that said a document "was read" — a claim the camera cannot establish, five keys above the note saying so. The code had been corrected and the doc had not. `test_the_contract_quotes_the_values_the_wire_actually_carries` now pins the two together, and asserts the retired spelling appears nowhere in this file |
-| `identity` | `"no-document-identity-across-sightings"` | reading the same page twice yields two unrelated records |
+| `identity` | `"same-page-by-text-and-look-within-library"` | since 2026-09-07 a later dwell whose first readable page carries the same words AND looks the same as a page already on record becomes a **sighting** of that record (`sighting_count`, `last_observed_at`, `total_observed_seconds`) rather than a new one. Anything weaker — same template different numbers, half-shared text, an unreadable re-view — stays a separate record. The earlier value said no such join was made; it was true then |
 | `absence_means` | `"not-recorded-by-this-cartridge"` | |
 | `time_basis` | `"tower-receipt"` | |
 | `spatial_ref` | always `null` | this cartridge does not know where anything is |
@@ -1441,9 +1510,19 @@ learn the window its writer used. A `retention_days` query parameter
 
 `document_id`, `claim`, `identity`, `title`, `title_is_derived`,
 `summary_available`, `confidence`, `confidence_basis`, `observed_at`,
-`recorded_at`, `observed_seconds`, `pages_observed`, `text_availability`,
-`end_reason`, `timing`, `provenance`, `retains_raw_imagery`,
-`redaction`, `imagery_treatment`, `privacy_tags`, `schema_version`.
+`recorded_at`, `observed_seconds`, `sighting_count`, `last_observed_at`,
+`total_observed_seconds`, `pages_observed`, `pages_readable`,
+`text_availability`, `end_reason`, `timing`, `provenance`,
+`retains_raw_imagery`, `redaction`, `imagery_treatment`, `privacy_tags`,
+`schema_version`.
+
+**Sightings.** `observed_at`, `observed_seconds`, `provenance` and every
+page's `source_seq` describe the FIRST observation and are never
+rewritten. `sighting_count` is how many times the record was observed
+in total (one for a record seen once), `last_observed_at` the most
+recent of those, `total_observed_seconds` their sum. `pages_readable`
+counts the pages whose text cleared the readability floor; a record can
+hold pages that OCR looked at and could not read.
 
 > **The prose fields are NOT here. They are on the envelope, once.**
 > `record_notes` carries five entries — `summary_withheld`,
@@ -1550,13 +1629,17 @@ not be rendered identically to a measured one.
 |---|---|---|
 | `match_kind` | `"lexical"` | literal term matching. Never `"semantic"`; see `semantic_retrieval` |
 | `searched_documents` | int | how many records were scored. Compare with `documents_in_memory`: a difference means the retention window narrowed this read |
-| `min_score` | float | the BM25 floor a document had to clear. Default `0.1` |
+| `searched_pages` | int | how many PAGES were scored. Since 2026-09-07 the page is the unit of scoring and a document's score is its best page's |
+| `min_score` | float | the BM25 floor a page had to clear. Default `0.1` |
 | `sufficient_evidence` | bool | whether the memory held enough to answer at all. `false` with `answer: "no_observation"` is an empty memory; `false` with `not_found` is a query whose terms nothing contained |
+| `match_tolerance` | string | says in words what `fuzzy` below means: a query term of five or more characters also matches a token within one edit of it or one it begins, weighted below an exact match. OCR reads "Kubernetes" as "Kubemetes" often enough to matter |
 
 Each matched document additionally carries `score` (rounded to 4 places),
-`matched_terms`, and `snippet` — `snippet_max_chars` characters around the
+`matched_terms`, `snippet` — `snippet_max_chars` characters around the
 first matched term, **so an answer is always traceable back to text that
-was actually captured** rather than to a number a client has to trust.
+was actually captured** rather than to a number a client has to trust —
+`page_index`, the page the score and snippet came from, and `fuzzy`,
+true when any matched term was a near-miss rather than the word itself.
 
 `snippet_max_chars` is **48**, and it is on the envelope so a client reads
 the bound rather than assuming one. This paragraph said 160 until the
@@ -1580,6 +1663,8 @@ four hundred lines above it. Read the field, not the prose.
 | `source_seq` | int or null | the frame this page was read from. Null on a record written before provenance existed |
 | `observed_at` | float or null | Tower-receipt time of that frame |
 | `observation_count` | int | how many separate views of this page were merged into it. Two readings of one page during one dwell is one page with a count of two, not two pages |
+| `readable` | bool | whether `text` cleared the readability floor (at least one word at a mean confidence above the recogniser's noise floor). `false` with `region_count > 0` is a page OCR looked at and could not read — a different fact from never looking |
+| `box_count` | int | text boxes the detector found in the region this page was read from. Evidence that text was there even when it was not readable |
 | `image_kept` | bool | whether a page image exists on this Tower's disk. **False unless page images were explicitly enabled**, which is off by default, must stay off, and has no configuration path from a web process: this platform has no redaction, so a stored page image is an unredacted photograph of what the wearer was reading |
 | `image_served` | bool | always `false`. A BOOLEAN and not the path, which told a reader where in the store to find that photograph — disclosure with no consumer, since no route resolves it and none may |
 
@@ -1602,8 +1687,19 @@ exists:
 | Block | Meaning |
 |---|---|
 | `contract_note` | a string pointing at the HTTP routes, carried IN the payload so a client that reads only this channel still learns the documents are elsewhere |
-| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `bytes`, `location_disclosed: false` |
-| `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off |
+| `library` | what is on disk, **regardless of whether anything is running**: `available`, `document_count_unfiltered`, `retention_applied: false`, `unavailable_reason`, `newest_observed_at`, `revision`, `bytes`, `location_disclosed: false` |
+| `session` | the live capture, or `{state: "unavailable", reason: ...}` when `TOWER_DOCUMENT_CAPTURE` is off or the session could not be constructed (the OCR extra is not installed, most likely; `reason` says which) |
+
+**`library.revision` is the live-update trigger.** It changes whenever
+the journal changes — an append, a sighting merged onto an existing
+record, a prune — and never otherwise. A client holding a listing
+re-fetches `/documents` (or re-runs its standing search) when this
+moves; the count alone would miss a sighting, and a prune plus an append
+in one tick. It is an opaque integer (the journal's modification stamp),
+not a clock, and `newest_observed_at` now reflects the most recent
+SIGHTING of any record, not only first observations. Polling
+`/documents` on a timer remains the wrong design: it re-parses the
+journal for nothing.
 
 `library.document_count_unfiltered` and `session.library_count` are
 DIFFERENT QUANTITIES and are named apart for that reason. The first
@@ -1643,12 +1739,36 @@ serves documents recorded elsewhere and records nothing itself.
 (`state`, `states`, `session_id`, `failure_reason`, `started_at`,
 `ready_at`, `loading_seconds`, `load_overdue`, `frames_offered`,
 `frames_observed`, `frames_skipped`, `frames_dropped_not_running`) plus:
-`recogniser`, `capture_id`, `capture_id_validated`, `in_dwell`,
-`dwells_started`, `pages_detected`, `documents_recorded`,
-`last_document_id`, `last_document_at`, `flushed_document_id`,
-`keeps_page_images`, `retention_days`, `documents_pruned`,
-`retention_incomplete`, `library_count`, `library_soft_limit`,
-`library_over_soft_limit`, `library_soft_limit_note`.
+`recogniser`, `ocr_device`, `capture_id`, `capture_id_validated`,
+`in_dwell`, `dwells_started`, `pages_detected`, `documents_recorded`,
+`documents_resighted`, `dwells_unreadable`, `last_document_id`,
+`last_document_at`, `flushed_document_id`, `keeps_page_images`,
+`follows_stream`, `idle_stop_seconds`, `idle_stop_pending`,
+`retention_days`, `documents_pruned`, `retention_incomplete`,
+`library_count`, `library_soft_limit`, `library_over_soft_limit`,
+`library_soft_limit_note`.
+
+**`ocr_device`** is where the reader actually loaded — `"cuda"` or
+`"cpu"` — once the session is running, null before. `TOWER_DOCUMENT_DEVICE`
+asks; this reports. **`documents_recorded`** counts NEW records this
+session wrote; **`documents_resighted`** counts dwells this session
+merged onto a record that already existed (see `identity`);
+`last_document_id` names whichever happened last. **`dwells_unreadable`**
+counts dwells whose every page OCR looked at and could not read — they
+are persisted, with `readable: false` on each page, and a session where
+this climbs while `documents_recorded` does not is a session pointed at
+something that is not a page.
+
+**`idle_stop_seconds` / `idle_stop_pending`.** A running session whose
+stream closed starts a timer; if no stream reopens within
+`idle_stop_seconds` the session stops itself, so a phone that
+disconnected for good does not leave ~1.4 GB of OCR model resident on a
+Tower whose next cartridge wants it. Unlike a Stop a person presses, an
+idle stop does NOT read a dwell that was still open: that dwell ended
+when the stream did, and the Tower logs that it was dropped.
+`idle_stop_pending` is true while that timer runs; a reconnect or a
+frame cancels it. A Stop or Pause a person presses reads at most four
+frames of an open dwell, newest first.
 
 **`retention_incomplete`** is reported rather than logged: a deletion that
 quietly failed looks exactly like one that was kept.
@@ -1664,26 +1784,35 @@ session stops has read something.
 
 ### 15.5 Known limitations
 
-1. **The premise is untested.** §15.0. Someone has to wear the glasses and
-   read a page.
-2. **No cross-session document identity.** Reading the same page on Monday
-   and Tuesday produces two unrelated records with different ids and no
-   link. `identity` says so. Dedup exists only WITHIN one dwell, keyed on
-   a 0.65 token-set overlap.
+1. **The premise is untested on a physical page.** §15.0. The pipeline is
+   validated on rendered pages with known text; someone has to wear the
+   glasses and read a page.
+2. **Identity is one rule, and it is conservative.** A later dwell joins
+   a record only when its first readable page has the same words (token
+   overlap ≥ 0.70, numbers agreeing) AND the same look (perceptual hash
+   within 6 bits). Two invoices on one template, two pages of one book,
+   or an unreadable re-view stay separate records. A multi-page dwell
+   that matches on its first page adds a sighting and keeps the record's
+   pages; its later pages are not merged in. Records are not grouped
+   into "documents" across dwells: a dwell is the record.
 3. **No pagination.** `limit` is the only bound, capped at 200.
-4. **No semantic retrieval.** BM25 over literal terms. Calling it semantic
-   would be an overclaim, and a client routing a description here will get
-   a lexical answer.
-5. **A match cannot be attributed to a page.** Scoring is over the
-   concatenated page text.
-6. **No redaction exists.** `redaction` is an enum of one, `"none"`, and
+4. **No semantic retrieval.** BM25 over literal terms with bounded
+   near-miss tolerance. Calling it semantic would be an overclaim, and a
+   client routing a description here will get a lexical answer.
+5. **No redaction exists.** `redaction` is an enum of one, `"none"`, and
    that is the honest value for imagery this platform cannot redact. Page
    images are OFF by default and must stay off.
-7. **`retention.writer_window_days` is null.** §15.3.
-8. **Every query re-parses the journal.** There is no index. The session
-   `status` block is stat-gated and does not.
-9. **No capture timestamp.** Everything is `tower-receipt`. This is a
+6. **`retention.writer_window_days` is null.** §15.3.
+7. **The search corpus is rebuilt when the journal changes**, and cached
+   on the journal's stamp between changes. There is no persistent index;
+   the JSONL journal is the only truth and a newly persisted page is
+   searchable on the next query.
+8. **No capture timestamp.** Everything is `tower-receipt`. This is a
    cross-boundary blocker, not a Tower gap.
+9. **A text-detector false positive reaches OCR.** A keyboard or a
+   screen held steady long enough is a dwell; what OCR makes of it is
+   kept as a page with `readable: false`, and the session counts these
+   as `dwells_unreadable`.
 
 ---
 
@@ -1791,6 +1920,32 @@ The design was explicitly "designed, not implemented", so no consumer was
 broken. Minting the date the agreement actually reached a wire is the
 whole discipline these identifiers exist for.
 
+### `document_memory.status/2026-09-07` and `document_memory.library/2026-09-07` — identity, sightings, live updates
+
+Both identifiers moved because `identity` changed meaning. The
+2026-08-27 value, `"no-document-identity-across-sightings"`, described a
+cartridge that made no join across dwells; this one joins a later dwell
+onto an existing record when the words and the look both agree, and a
+decoder written against the old value would render a merged record as a
+single observation. Additive on top of that, all with defaults a
+2026-08-27 decoder would have ignored:
+
+- per document: `sighting_count`, `last_observed_at`,
+  `total_observed_seconds`, `pages_readable`;
+- per page: `readable`, `box_count`;
+- per search match: `page_index`, `fuzzy`; on the search envelope:
+  `searched_pages`, `match_tolerance`;
+- on the status `library` block: `revision`, the live-update trigger;
+- on the status `session` block: `ocr_device`, `documents_resighted`,
+  `dwells_unreadable`, `idle_stop_seconds`, `idle_stop_pending`.
+
+The 404 bodies still name `TOWER_DOCUMENT_ROOT` and
+`TOWER_DOCUMENT_CAPTURE`, which the phone string-matches, even though the
+root now has a managed default and "unconfigured" is reachable only by
+`TOWER_DOCUMENT_ENABLED=false`. The session verbs still answer `200`
+with the full envelope; the phone renders any other status as a
+transport failure.
+
 ### `document_memory.status/2026-08-27` and `document_memory.library/2026-08-27` — new
 
 First contracts for this cartridge. Two identifiers rather than one,
@@ -1799,7 +1954,22 @@ because they govern different surfaces with different failure modes: the
 `library` payload is bulk text on HTTP and is pulled. A change to one is
 not a change to the other.
 
-### `world_builder.status/2026-08-25`
+### `world_builder.status/2026-09-10`
+
+Supersedes `/2026-09-06`. No word was added and nothing an older phone
+decodes was removed; what changed is that a `model_state` it already
+implements now arrives in a state it did not before. A
+`lifecycle.state: "stopped_unbuilt"` with no drawable figures --
+`geometry.element_count` and `trajectory.pose_count` both zero or absent
+-- projects to `interrupted` rather than `finalizing`, because there is
+nothing to wait for -- a phone told to wait there waits forever. The gate
+is the figures and not `geometry.available`: `engine.build` writes a
+derived tree even when it solved nothing, so `available` is true for a
+world with zero points in it, and gating on it told a wearer to keep
+waiting for exactly that (§10.1). A client that switches on
+`model_state` needs no change; one that switched on `lifecycle.state`
+and assumed the old projection should read the two counts beside it,
+the way iOS `WorldEvidence.hasGeometry` does.
 
 Supersedes `world_builder.status/2026-08-23`. **One field changed
 meaning**, which is why the identifier moved rather than staying put for

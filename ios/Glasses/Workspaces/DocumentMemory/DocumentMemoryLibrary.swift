@@ -8,8 +8,8 @@ import Foundation
 /// The Tower's document library and capture session, as they actually exist on
 /// the wire.
 ///
-/// Contracts: `document_memory.library/2026-08-27` over HTTP and
-/// `document_memory.status/2026-08-27` on the socket. See
+/// Contracts: `document_memory.library/2026-09-07` over HTTP and
+/// `document_memory.status/2026-09-07` on the socket. See
 /// `tower/docs/contracts/CARTRIDGE-RESULTS.md` §15 and
 /// `docs/contracts/TOWER-UNIFIED-CARTRIDGES.md` §8.
 ///
@@ -456,6 +456,19 @@ struct DocumentSessionStatus: Equatable, Sendable {
     let librarySoftLimitNote: String?
     /// Why there is no session, when `state == "unavailable"`.
     let reason: String?
+    /// Where the text recogniser actually loaded (`"cuda"` / `"cpu"`), once
+    /// running. `TOWER_DOCUMENT_DEVICE` asks; this reports.
+    var ocrDevice: String? = nil
+    /// Dwells this session merged onto a record that already existed, as
+    /// sightings. `documentsRecorded` counts only NEW records.
+    var documentsResighted: Int? = nil
+    /// Dwells whose every page OCR looked at and could not read. Persisted
+    /// with `readable: false`; a session where this climbs while
+    /// `documentsRecorded` does not is pointed at something that is not a page.
+    var dwellsUnreadable: Int? = nil
+    /// True while the Tower's idle timer runs: the stream closed and the
+    /// session will stop itself unless one reopens.
+    var idleStopPending: Bool = false
 
     var isUnavailable: Bool { state == "unavailable" }
     /// The one state in which frames are being read.
@@ -482,6 +495,12 @@ struct DocumentLibrarySummary: Equatable, Sendable {
     /// Always `false`. The Tower does not disclose where on disk the library
     /// lives.
     let locationDisclosed: Bool
+    /// The live-update trigger (`document_memory.status/2026-09-07`). Opaque;
+    /// changes whenever the Tower's journal changes — an append, a sighting
+    /// merged onto a record, a prune — and never otherwise. A listing is
+    /// re-fetched when this moves, and never on a timer. `nil` from a Tower
+    /// that does not send it.
+    var revision: Int? = nil
 }
 
 /// The whole `document_memory.status` subscription payload.

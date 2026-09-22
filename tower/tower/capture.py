@@ -29,6 +29,8 @@ incidental capture, and it must never become the default path.
 
 import json
 import logging
+import os
+import pathlib
 import time
 from dataclasses import dataclass, field
 
@@ -102,8 +104,29 @@ FRAMES_DIRNAME = "frames"
 class CaptureLimits:
     """Hard bounds. Rule 15 -- no unbounded operation on the live path."""
 
-    max_seconds: float = 900.0
-    max_bytes: int = 1_073_741_824
+    # Sized for the session length the product actually asks for.
+    #
+    # 900 s -- fifteen minutes -- was the bound until an adversarial review
+    # pointed out what it does to the stated target of "potentially 20-30
+    # minute sessions". At the bound the recorder stops ITSELF, cleanly,
+    # and the warning it logs says a follower "will see the capture close
+    # exactly as if it were" a disconnect. So a thirty-minute walk recorded
+    # fifteen minutes, the builder finalised a world at the halfway point,
+    # and -- since a closed capture now reads as an ordinary wearer stop --
+    # it did so under the label `stop`. Silent truncation that looks like
+    # success is the worst shape this bug could have taken.
+    #
+    # 2400 s is forty minutes: the target plus a third, so a wearer who
+    # goes long is not truncated by a round number. It is still a BOUND,
+    # which is the point of Rule 15 -- an unbounded recorder on the live
+    # path is how a disk fills during a walk.
+    max_seconds: float = 2400.0
+    # The byte bound has to move with it or it becomes the binding one.
+    # Measured on the 2026-09-09 captures: 2,865 frames over 7 captures,
+    # mean 24.6 KB per recorded JPEG at 360x640. Forty minutes at the
+    # measured 12 fps is ~28,800 frames, ~708 MB. 2 GiB leaves room for a
+    # larger frame without the bound arriving unannounced mid-walk.
+    max_bytes: int = 2_147_483_648
 
 
 @dataclass
@@ -137,9 +160,7 @@ class CaptureRecorder:
         # and when. Only ever used to LINK a successor to it; never to
         # reopen it.
         self._interrupted: tuple[str, float] | None = None
-        from pathlib import Path
-
-        self._root = Path(root)
+        self._root = pathlib.Path(root)
         self._limits = limits or CaptureLimits()
         self._clock = clock
         self._status: CaptureStatus | None = None
@@ -260,8 +281,6 @@ class CaptureRecorder:
         # Image first with fsync, journal line second. A journal line
         # pointing at a missing image is corruption; an orphan image is
         # harmless and gets swept by purge.
-        import os
-
         temp_path = path.with_name(path.name + ".tmp")
         try:
             with temp_path.open("wb") as handle:
@@ -528,13 +547,14 @@ class CaptureFollower:
         resume_grace_seconds: float = RESUME_GRACE_SECONDS,
         start_at_end: bool = False,
     ):
-        from pathlib import Path
-
-        self._directory = Path(directory)
+        self._directory = pathlib.Path(directory)
         self._poll_seconds = poll_seconds
         self._sleep = sleep
         self._follow_reconnects = follow_reconnects
         self._resume_grace_seconds = resume_grace_seconds
+        # Set when a stop arrives WHILE waiting out a reconnect. See
+        # `stopped_awaiting_successor`.
+        self._stopped_awaiting_successor = False
         # Skip whatever the journal already holds, and yield only frames
         # recorded from now on.
         #
@@ -557,16 +577,31 @@ class CaptureFollower:
 
     def is_closed(self) -> bool:
         """True once the recorder has written an end reason."""
+        return self.end_reason() is not None
+
+    def end_reason(self) -> str | None:
+        """WHY the capture ended, or None while it is still open.
+
+        Carried rather than collapsed into `is_closed`, because the three
+        reasons are not the same event to a consumer. `stop` is the wearer.
+        `disconnect` is the link. `bounded_limit` is the recorder stopping
+        ITSELF at a configured bound while the wearer is very likely still
+        walking -- and a builder that treats that as an ordinary end
+        finalises a world at the bound and says nothing.
+        """
         path = self._directory / CAPTURE_FILENAME
         if not path.exists():
-            return False
+            return None
         try:
-            return read_json_closed(path).get("ended_at") is not None
+            manifest = read_json_closed(path)
         except (OSError, ValueError):
             # A manifest caught mid-replace is not an ended capture. Say
             # "still open" and re-read next poll rather than truncating
             # the session on a transient read.
-            return False
+            return None
+        if manifest.get("ended_at") is None:
+            return None
+        return manifest.get("end_reason") or END_REASON_STOP
 
     def follow(self, *, max_idle_polls: int | None = None, should_stop=None):
         """Frames, until the capture ends, the idle bound expires, or a
@@ -587,6 +622,9 @@ class CaptureFollower:
         journal = self._directory / FRAMES_FILENAME
         tail = _JournalTail(journal, start_at_end=self._start_at_end)
         idle_polls = 0
+        # Per FOLLOW, not per follower: a generator re-entered would
+        # otherwise carry the previous run's answer forward.
+        self._stopped_awaiting_successor = False
 
         while True:
             if should_stop is not None and should_stop():
@@ -608,8 +646,25 @@ class CaptureFollower:
                     if frame is not None:
                         yield frame
 
-                successor = self._await_successor()
+                successor = self._await_successor(should_stop=should_stop)
                 if successor is None:
+                    return
+                if should_stop is not None and should_stop():
+                    # THE SAME WINDOW, ONE INSTRUCTION WIDE.
+                    #
+                    # `_await_successor` samples `should_stop` and then
+                    # returns; the rebind below happens next, and the loop's
+                    # own check is after that. A stop set between those two
+                    # samples used to bind to a capture this follower then
+                    # read ZERO frames of -- moving `end_reason()` onto a
+                    # capture that is still open, and reporting
+                    # `stopped_awaiting_successor()` as False. That is the
+                    # defect the wait was fixed for, surviving in a window
+                    # that shrank from ninety seconds to a few statements.
+                    # A reviewer drove it. Asking once more, before the
+                    # rebind, closes it: the flag is the same fact either
+                    # way, and the follower stays where it read from.
+                    self._stopped_awaiting_successor = True
                     return
                 # Same walk, new directory. Rebind and keep going, so the
                 # driver never learns a reconnect happened and the mapping
@@ -641,25 +696,93 @@ class CaptureFollower:
         return manifest.get("end_reason") == END_REASON_DISCONNECT
 
     def _find_successor(self):
-        """A capture whose manifest names this one as its predecessor."""
+        """A capture whose manifest names this one as its predecessor.
+
+        NEWEST FIRST, AND ONLY CAPTURES YOUNGER THAN THIS ONE. A successor
+        is by definition created after its predecessor ended, so anything
+        older cannot be one, and the one we want is almost always the
+        newest directory there is.
+
+        This used to open and parse every `capture.json` under the root, in
+        whatever order `iterdir` gave, with no early exit. A reviewer
+        measured it at **11 ms per scan against 104 captures** -- and this
+        runs once per poll for up to 360 polls, so the "ninety second"
+        grace window actually ran 94 s, an overrun that grows with a
+        directory that only ever grows (about 109 s at 500 captures). The
+        wait is supposed to be bounded by the same window the recorder
+        uses, and it was not.
+
+        THE PRUNE CARRIES THE GRACE WINDOW AS SLACK, and the first version
+        did not. It cut at this capture's own mtime, and a reviewer showed
+        that mtime moves FORWARD at stop -- `write_json_atomic` on
+        `capture.json` bumps the parent directory (measured, +0.30 s). So
+        a successor created before the predecessor's `finally` ran was
+        pruned by 0.4 s and never found: 0 of 360 polls, not "a missed
+        successor on that poll" as the comment then claimed. Both mtimes
+        are frozen for the whole window, so a prune that misses once
+        misses every time.
+        `RESUME_GRACE_SECONDS` of slack is the same bound the recorder
+        uses to decide whether to link a successor at all, so nothing the
+        recorder would link can fall outside it -- and it absorbs a
+        backwards clock step of up to ninety seconds as well.
+        """
         captures_root = self._directory.parent
         mine = self._directory.name
         try:
-            entries = list(captures_root.iterdir())
+            floor = self._directory.stat().st_mtime - self._resume_grace_seconds
+        except OSError:
+            floor = None
+        candidates = []
+        try:
+            # `os.scandir`, NOT `iterdir()` + `is_dir()` + `stat()`.
+            # Windows returns the type and the timestamps in the directory
+            # entry itself, so scandir answers both from data it already
+            # has. The three-call version cost two stats per entry and was
+            # where the 11 ms went -- the JSON reads were never the
+            # expensive part.
+            with os.scandir(captures_root) as entries:
+                for entry in entries:
+                    if entry.name == mine or not entry.is_dir():
+                        continue
+                    try:
+                        mtime = entry.stat().st_mtime
+                    except OSError:
+                        continue
+                    if floor is not None and mtime < floor:
+                        continue
+                    candidates.append((mtime, pathlib.Path(entry.path)))
         except OSError:
             return None
-        for entry in entries:
-            if not entry.is_dir() or entry.name == mine:
-                continue
+        for _mtime, entry in sorted(candidates, key=lambda pair: pair[0], reverse=True):
             try:
                 manifest = read_json_closed(entry / CAPTURE_FILENAME)
             except (OSError, ValueError):
                 continue
-            if manifest.get("continues_capture") == mine:
+            if isinstance(manifest, dict) and manifest.get("continues_capture") == mine:
                 return entry
         return None
 
-    def _await_successor(self):
+    def stopped_awaiting_successor(self) -> bool:
+        """Whether this follower was stopped mid-reconnect.
+
+        A caller deciding whether a walk finished has to tell two things
+        apart that look identical from the capture alone: a walk that
+        ended, and a walk whose link died and was then abandoned before it
+        could come back. The predecessor's own end reason is `disconnect`
+        in both, and `disconnect` counts as finished -- deliberately, see
+        `scripts/world_build_session.py`. Only the follower knows that a
+        reconnect was still in flight when it was told to go.
+
+        TRUE MEANS "A SUCCESSOR HAD APPEARED AND I LEFT IT UNREAD". It does
+        not mean "the walk was cut short", which is a larger set: when the
+        stop lands before the successor's directory exists, a cut-short
+        walk is indistinguishable on disk from a finished one and this
+        reports False. See `_await_successor` for why that is the right way
+        to resolve an ambiguity nothing on disk can settle.
+        """
+        return self._stopped_awaiting_successor
+
+    def _await_successor(self, *, should_stop=None):
         """Wait out a reconnect, but only for a capture that was CUT OFF.
 
         A capture that ended politely, or at a configured bound, is
@@ -669,14 +792,70 @@ class CaptureFollower:
         The wait is bounded by the same grace window the recorder uses to
         decide whether to link a successor at all, so the two cannot
         disagree about how long a reconnect may take.
+
+        AND IT ASKS `should_stop`, WHICH IT DID NOT. Ninety seconds is a
+        long time to be deaf. `routes/ws.py` stops every cartridge session
+        when the last connection goes, and it is exactly a slow reconnect
+        that gets it there: a reviewer measured this Tower's own 52
+        reconnect chains and found three at 31-35 s, against a socket the
+        server notices as dead in 20-40 s. So the stop lands while this
+        loop is running.
+
+        What happened then was worse than the delay. The loop ran to the
+        end of the grace window, found the successor, rebound onto it, and
+        `continue`d -- straight into the `should_stop` check at the top of
+        `follow`, which returned having read ZERO frames of the capture it
+        had just bound to. The walk was truncated at the reconnect, and
+        the rebind quietly moved `end_reason()` onto a capture that was
+        still open, so nothing downstream could say what had happened.
+
+        Now the wait ends when the stop does, the follower stays bound to
+        the capture it actually read, and `stopped_awaiting_successor()`
+        records that a reconnect was in flight -- which is the one fact
+        that distinguishes an abandoned walk from a finished one.
         """
         if not self._follow_reconnects or not self._ended_by_disconnect():
             return None
         polls = max(1, int(self._resume_grace_seconds / max(self._poll_seconds, 1e-6)))
         for _ in range(polls):
             successor = self._find_successor()
+            stopping = should_stop is not None and should_stop()
             if successor is not None:
-                return successor
+                if not stopping:
+                    return successor
+                # A RECONNECT WAS IN FLIGHT AND WE ARE LEAVING ANYWAY.
+                #
+                # This is the only shape that can be DETECTED as a walk cut
+                # short -- not the only one that is. The first version set
+                # the flag on any stop that landed inside the window, which
+                # is also the ordinary shape of a phone that disconnects for
+                # good: the socket dies, `routes/ws.py` stops the session
+                # 20-40 s later, comfortably inside the 90 s grace. That
+                # quietly reversed the policy two files away that says a
+                # `disconnect` capture counts as finished, and a reviewer
+                # measured a permanent disconnect reporting `interrupted` --
+                # this campaign's headline symptom, back through the door it
+                # was pushed out of.
+                #
+                # THE RESIDUE, STATED PLAINLY. When the stop lands BEFORE
+                # the successor's directory appears, a walk that was cut
+                # short is indistinguishable on disk from a walk that
+                # ended: the same `disconnect` capture, the same absent
+                # successor. A second reviewer measured the overlap and it
+                # is not small -- reconnect chains at 31-35 s against a
+                # socket noticed dead at 20-40 s. Neither answer is
+                # derivable, so this resolves it the way the rest of the
+                # system resolves an ambiguous end: toward FINISHED, which
+                # shows a real world as Saved rather than showing a real
+                # world as broken. Closing it needs the phone to say which
+                # it was, not more cleverness here.
+                self._stopped_awaiting_successor = True
+                return None
+            if stopping:
+                # Nobody came back. The walk was over either way, so this
+                # is an ordinary end and the caller is told nothing
+                # special -- it just stops waiting for it.
+                return None
             self._sleep(self._poll_seconds)
         return None
 

@@ -690,6 +690,25 @@ nonisolated enum TowerHealthState: Equatable, Sendable {
 final class TowerClient: NSObject, ObservableObject {
     @Published private(set) var status: TowerStatus = .offline
 
+    /// Whether the automatic reconnect schedule has been spent and this
+    /// client is no longer trying.
+    ///
+    /// `status` cannot say this. It is `.failed(message)` from the first
+    /// dropped socket to the last refused retry and after, so a screen
+    /// reading it could only say "not connected" — the same words while the
+    /// phone was still retrying and after it had stopped. The only signal at
+    /// the give-up point was a log line, and the wearer does not read the
+    /// log. The World Builder capture control reads this to say, instead,
+    /// that a tap on Connect is now the only thing that will bring the Tower
+    /// back.
+    ///
+    /// Set in exactly one place, the give-up branch of `scheduleReconnect`.
+    /// Cleared wherever a socket is actually opened — `openConnection`, which
+    /// every connect path ends in — and by `cancelReconnect`, because a
+    /// deliberate disconnect is not the phone giving up. It cannot survive a
+    /// successful reconnect: no reconnect happens without a socket opening.
+    @Published private(set) var reconnectGaveUp = false
+
     #if DEBUG
     /// How many `frame_result` messages the receive loop has processed — the
     /// only end-to-end proof that the Tower received a frame and replied.
@@ -785,6 +804,57 @@ final class TowerClient: NSObject, ObservableObject {
     /// gets "no", rather than the question being unaskable there.
     @Published private(set) var isStreamingToTower = false
 
+    /// Whether frames are being **held on the phone** rather than sent.
+    ///
+    /// ## Why a gate here, and not a camera pause or a `stream_stop`
+    ///
+    /// The CV Lab's camera card offers Pause and Resume, and neither of the
+    /// two obvious implementations is available. DAT offers no app-initiated
+    /// camera pause: `StreamState.paused` is something the **glasses** do, on
+    /// a temple press or on heat, and `GlassesConnection` documents that it
+    /// cannot be overridden in either direction. And sending `stream_stop`
+    /// would end the capture lineage on the Tower — the bracket is what a
+    /// capture is keyed to, and in the operator's configuration a new bracket
+    /// spawns a new follower on the next start.
+    ///
+    /// So the gate sits on the one hop this app fully owns. While it is
+    /// closed the glasses camera keeps running, the socket and the stream
+    /// bracket stay up, the Tower keeps the experiment armed, and the only
+    /// thing the Tower sees is silence: its `source.receiving_frames` turns
+    /// false after `idle_after_s` (5 s), which is exactly what the Lab's LIVE
+    /// indicator already reads. Nothing is sent to announce the hold, because
+    /// there is no message for it and the Tower's own idle detection is the
+    /// truthful report.
+    ///
+    /// Readable in both configurations, like `isStreamingToTower` beside it,
+    /// so `disconnect()` can clear it without a build-conditional. It is
+    /// consulted only on the frame path, which is `#if DEBUG`.
+    ///
+    /// Cleared by `disconnect()` and by `sendStreamStop()`, and deliberately
+    /// **not** by `teardownConnection`: a socket that drops and reconnects on
+    /// its own schedule is not a person changing their mind, and a hold they
+    /// set should still be there when the link comes back.
+    @Published private(set) var isFrameSendingPaused = false
+
+    /// Closes the frame gate. Idempotent.
+    ///
+    /// Frames selected while it is closed are counted as session-gate drops:
+    /// they reached a terminal outcome on this side, and
+    /// `SenderMetrics.framesUnaccounted` — the one number that exists to prove
+    /// frames are not quietly queueing — must not read them as backlog.
+    func pauseFrameSending() {
+        guard !isFrameSendingPaused else { return }
+        isFrameSendingPaused = true
+        log("frame sending paused — frames are held on the phone; the camera and the stream bracket stay up")
+    }
+
+    /// Reopens the frame gate. Idempotent.
+    func resumeFrameSending() {
+        guard isFrameSendingPaused else { return }
+        isFrameSendingPaused = false
+        log("frame sending resumed")
+    }
+
     /// How much outbound latency a frame may carry before the window that
     /// admitted it is considered oversized.
     ///
@@ -842,6 +912,33 @@ final class TowerClient: NSObject, ObservableObject {
     /// pipeline's actual rate limiter. See `SendWindow` for why its capacity is
     /// derived from a latency budget rather than picked.
     private var sendWindow: SendWindow
+
+    /// A dense counter over frames this client actually handed to the socket.
+    ///
+    /// Sent as `tx_seq` beside `seq`. `seq` is the DAT capture index, and this
+    /// sender forwards only a fraction of those, so a gap in `seq` at the
+    /// Tower has three indistinguishable causes: deliberate sampling, a
+    /// sender-side drop, or genuine transit loss. `tower/metrics.py` has
+    /// carried the receiving half of the fix since 2026-08-19 and says so in
+    /// its own docstring — *"Under the CURRENT wire protocol … a gap in seq
+    /// cannot be attributed to any single cause"* — while pointing at the
+    /// `source_seq`/`tx_seq` split as what would settle it. **This sender
+    /// never sent it.** `tx_seq` is absent from every Swift file in the app.
+    ///
+    /// The cost of that showed up on the 2026-09-09 physical walk. Of the
+    /// frames the glasses captured, roughly half never reached the Tower —
+    /// capture `6a1b544c` recorded 474 of 953 source indices, `dd885cca` 2,391
+    /// of 4,801 — and one of the resulting gaps was 410 source frames, 17
+    /// seconds, which split the reconstruction in two. Nothing in the
+    /// artifacts can say whether this app declined to send those frames or the
+    /// link lost them, because `tx_seq` was null on every recorded row. Those
+    /// are opposite diagnoses with opposite fixes.
+    ///
+    /// Dense over frames SENT, which is what makes it diagnostic: a gap here
+    /// is transit loss and nothing else. So it is incremented at the send
+    /// itself, not when a frame is picked up — every `return` above the send
+    /// leaves the number unclaimed for the next frame to use.
+    private var txSequence: Int = 0
 
     /// When `sendFrame` last ran, used only to tell a wedged socket from a
     /// wedged main actor. See `mainActorGapAllowance`. Cleared on teardown, so
@@ -971,10 +1068,21 @@ final class TowerClient: NSObject, ObservableObject {
     /// forever behind a pill that never settles, and the app has a manual
     /// Connect control for the deliberate retry.
     ///
-    /// The delays total 15.5 s, but each attempt also carries up to the 6 s
-    /// pong timeout in `validateConnection`, so giving up against a dead
-    /// endpoint takes up to ~45 s.
+    /// Five attempts, delayed 0.5, 1, 2, 4 and 8 s — 15.5 s of waiting —
+    /// and each attempt is bounded by the handshake watchdog
+    /// (`handshakeLegTimeout × 2`, 12 s as shipped), not by the per-leg
+    /// timeouts it backs up. So the give-up point depends on how the host
+    /// fails: ~16 s against one that refuses the TCP connection outright,
+    /// and up to ~75 s against one that accepts TCP and never completes the
+    /// WebSocket upgrade. (An earlier version of this comment quoted a 6 s
+    /// pong timeout and ~45 s; the watchdog replaced that bound.)
     private static let reconnectBackoff: [TimeInterval] = [0.5, 1, 2, 4, 8]
+
+    /// The schedule this instance runs. The shipped one unless a test
+    /// substitutes a shorter one — the give-up point is observable behaviour,
+    /// and a test that reached it by sleeping through the real schedule
+    /// would cost the suite the better part of a minute per case.
+    private let reconnectBackoff: [TimeInterval]
 
     /// The shipped send-window capacity, as the arithmetic that justifies it
     /// rather than as a literal.
@@ -993,6 +1101,7 @@ final class TowerClient: NSObject, ObservableObject {
         )
         self.autoReconnect = false
         self.handshakeLegTimeout = Self.defaultHandshakeLegTimeout
+        self.reconnectBackoff = Self.reconnectBackoff
         super.init()
     }
 
@@ -1004,8 +1113,10 @@ final class TowerClient: NSObject, ObservableObject {
     ///   - stallTimeout: Overridable so tests can trip stall detection without
     ///     waiting `sendStallTimeout` seconds. `nil` uses the shipped value.
     ///   - autoReconnect: See the property of the same name.
+    ///   - reconnectBackoff: Overridable so a test can spend the reconnect
+    ///     budget in well under a second. `nil` uses the shipped schedule.
     ///
-    /// Both overrides are `nil`-defaulted and resolved in the body rather than
+    /// The overrides are `nil`-defaulted and resolved in the body rather than
     /// being computed default arguments: default arguments are evaluated
     /// outside this type's actor, and `defaultMaxFramesInFlight` reads
     /// main-actor-isolated configuration. `GlassesConnection.init` avoids the
@@ -1015,10 +1126,12 @@ final class TowerClient: NSObject, ObservableObject {
         maxFramesInFlight: Int? = nil,
         stallTimeout: TimeInterval? = nil,
         autoReconnect: Bool = false,
-        handshakeLegTimeout: Int? = nil
+        handshakeLegTimeout: Int? = nil,
+        reconnectBackoff: [TimeInterval]? = nil
     ) {
         self.metrics = metrics
         self.handshakeLegTimeout = handshakeLegTimeout ?? Self.defaultHandshakeLegTimeout
+        self.reconnectBackoff = reconnectBackoff ?? Self.reconnectBackoff
         self.sendWindow = SendWindow(
             capacity: maxFramesInFlight ?? Self.defaultMaxFramesInFlight,
             stallTimeout: stallTimeout ?? Self.sendStallTimeout
@@ -1113,6 +1226,11 @@ final class TowerClient: NSObject, ObservableObject {
 
         log("connection attempt: \(url)")
         status = .connecting
+        // A socket is being opened, so "stopped trying" is no longer true —
+        // whoever asked for it. Here and not in `connect(to:)`, so a reconnect
+        // and `connectIfIdle` clear it too; after the `.connecting` guard, so
+        // a redundant tap that opens nothing changes nothing.
+        reconnectGaveUp = false
 
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.session = session
@@ -1173,6 +1291,10 @@ final class TowerClient: NSObject, ObservableObject {
         cancelReconnect()
         teardownConnection(cancelWith: .normalClosure)
         status = .offline
+        // The user asked for this connection to end, so the hold they set
+        // during it ends too — a fresh connect streams. See the property for
+        // why an *automatic* teardown does not do this.
+        isFrameSendingPaused = false
         log("disconnect cleanup complete")
     }
 
@@ -1182,6 +1304,9 @@ final class TowerClient: NSObject, ObservableObject {
         reconnectURL = nil
         reconnectAttempt = 0
         becameOnlineAt = nil
+        // The user asked for this connection to end. That is not the phone
+        // giving up, and a screen must not say it was.
+        reconnectGaveUp = false
     }
 
     /// Queues one delayed reconnect attempt, if automatic reconnect is enabled
@@ -1203,12 +1328,14 @@ final class TowerClient: NSObject, ObservableObject {
         }
         becameOnlineAt = nil
 
-        guard reconnectAttempt < Self.reconnectBackoff.count else {
+        guard reconnectAttempt < reconnectBackoff.count else {
             log("reconnect given up after \(reconnectAttempt) attempts — use Connect to retry")
+            // `status` stays `.failed` and cannot carry this; see the property.
+            reconnectGaveUp = true
             return
         }
 
-        let delay = Self.reconnectBackoff[reconnectAttempt]
+        let delay = reconnectBackoff[reconnectAttempt]
         reconnectAttempt += 1
         let attempt = reconnectAttempt
         log("reconnect attempt \(attempt) scheduled in \(delay)s")
@@ -1255,6 +1382,18 @@ final class TowerClient: NSObject, ObservableObject {
             metrics.recordSessionGateDrop()
             if shouldLog {
                 log("frame #\(sequence) not sent — no stream_start sent yet (or stream_stop already sent)")
+            }
+            return
+        }
+        guard !isFrameSendingPaused else {
+            // A person closed the gate. Not an error, and not a stall: the
+            // socket is fine and nothing is queued. Counted as a session-gate
+            // drop for the reason `pauseFrameSending()` gives, and checked
+            // before the stall test below so a long hold cannot be misread as
+            // a socket that stopped draining.
+            metrics.recordSessionGateDrop()
+            if shouldLog {
+                log("frame #\(sequence) held — frame sending is paused")
             }
             return
         }
@@ -1336,9 +1475,17 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
 
+        // Read, not yet claimed. Every `return` between here and the send
+        // below leaves this number for the next frame, so `tx_seq` stays dense
+        // over frames the socket actually received. Claiming it here instead
+        // would make an encode failure or a closed send window look identical
+        // to transit loss at the Tower — the precise confusion `txSequence`
+        // exists to remove.
+        let txSeq = txSequence
         let payload: [String: Any] = [
             "type": "frame",
             "seq": sequence,
+            "tx_seq": txSeq,
             "width": width,
             "height": height,
             "format": "jpeg",
@@ -1367,8 +1514,14 @@ final class TowerClient: NSObject, ObservableObject {
             return
         }
         metrics.recordSendAttempt(wireBytes: jsonData.count)
+        // Claimed here, at the last statement before the frame goes out. The
+        // window is reserved, the JSON exists, and nothing between this line
+        // and `task.send` can decline to send. `sendFrame` is main-actor
+        // isolated with no suspension point, so no other frame can interleave
+        // and take the same number.
+        txSequence += 1
         if shouldLog {
-            log("frame #\(sequence) sending \(jsonData.count) bytes (\(width)x\(height), jpeg \(jpegData.count) bytes)")
+            log("frame #\(sequence) (tx \(txSeq)) sending \(jsonData.count) bytes (\(width)x\(height), jpeg \(jpegData.count) bytes)")
         }
 
         task.send(.string(jsonText)) { [weak self] error in
@@ -1461,6 +1614,14 @@ final class TowerClient: NSObject, ObservableObject {
     /// From this point, `sendFrame` will not forward anything until the next
     /// `sendStreamStart()`. A no-op if not currently streaming.
     func sendStreamStop() {
+        // A hold belongs to the camera session it was set in. The camera has
+        // stopped; a later start must stream, not inherit a pause nobody
+        // remembers setting and that no control on that later screen shows.
+        // Cleared BEFORE the bracket guard, deliberately: a socket drop
+        // already closed the bracket (`teardownConnection`), and a camera
+        // stopped during that gap would otherwise keep the hold into the
+        // next session, where Home has no control that shows it.
+        isFrameSendingPaused = false
         guard isStreamingToTower else {
             log("stream_stop suppressed — not currently streaming")
             return
@@ -1623,16 +1784,25 @@ final class TowerClient: NSObject, ObservableObject {
     /// serving a payload this build was not written against — a
     /// `contract_mismatch` error is a better outcome than a silent
     /// misinterpretation.
-    func subscribeToResults(cartridge: String, resultType: String, contract: String) {
-        sendResultMessage(
-            [
-                "type": "result_subscribe",
-                "cartridge": cartridge,
-                "result_type": resultType,
-                "contract": contract,
-            ],
-            label: "result_subscribe(\(cartridge))"
-        )
+    ///
+    /// `worldID` and `sessionID` pin the subscription to a stored world; the
+    /// Tower resolves the newest live world when neither is sent. The keys are
+    /// inserted only when non-nil, so an unpinned subscribe is byte-for-byte
+    /// the message it always was — a `"world_id": null` would be a claim about
+    /// a world rather than the absence of one.
+    func subscribeToResults(
+        cartridge: String, resultType: String, contract: String,
+        worldID: String? = nil, sessionID: String? = nil
+    ) {
+        var message: [String: Any] = [
+            "type": "result_subscribe",
+            "cartridge": cartridge,
+            "result_type": resultType,
+            "contract": contract,
+        ]
+        if let worldID { message["world_id"] = worldID }
+        if let sessionID { message["session_id"] = sessionID }
+        sendResultMessage(message, label: "result_subscribe(\(cartridge))")
     }
 
     /// Closes a subscription. Not required before disconnecting — the Tower
@@ -2250,6 +2420,13 @@ final class TowerClient: NSObject, ObservableObject {
         // Belongs to the socket that is going away: the next connection's
         // first frame must not be judged against the old one's pulse.
         lastSendFrameAt = nil
+        // Same reason, and it matters more than it looks. The Tower counts
+        // `tx_seq` gaps per CONNECTION (`SessionMetrics` is built per socket),
+        // so carrying the counter across a reconnect would present the frames
+        // this client never sent on the old socket as a gap on the new one —
+        // manufacturing exactly the transit loss `tx_seq` exists to measure.
+        // The 2026-09-09 walk reconnected once, mid-session.
+        txSequence = 0
 
         #if DEBUG
         // `isStreamingToTower` means "a stream_start has been sent and not yet

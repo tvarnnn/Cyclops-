@@ -39,9 +39,10 @@ from pathlib import Path
 
 from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
-from tower.storage import read_raw_jsonl
+from tower.results.world_builder_library import _sortable
+from tower.storage import read_json_closed, read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
-from tower.world_builder.records import format_distance
+from tower.world_builder.records import FINAL_SOLVE_SOLVED, format_distance
 from tower.world_builder.schema import (
     INTRINSICS_SOURCE_UNKNOWN,
     POSE_STATUS_ANCHOR,
@@ -52,7 +53,12 @@ from tower.world_builder.schema import (
     SCALE_RELATIVE,
     SCALE_UNKNOWN,
 )
-from tower.world_builder.store import WorldStore, WorldStoreError
+from tower.world_builder.store import (
+    WorldStore,
+    WorldStoreError,
+    compute_input_digest,
+    validate_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +86,35 @@ LIFECYCLE_RECEIVING = "receiving"
 # .finalizing from it -- lifecycle.build_in_progress carries the caveat
 # that makes that an informed choice rather than an inherited guess.
 LIFECYCLE_STOPPED_UNBUILT = "stopped_unbuilt"
+# Since 2026-09-06 the builder KEEPS its writer lock through the final
+# solve and the final build, and writes a `finalization` block on the
+# session record when it stops. So the comment above is now history for
+# the live path: a lock held by a running process AFTER `session_stopped`
+# is a process that is finishing, and that is what this state says. The
+# old `stopped_unbuilt` remains for records written before the change.
+LIFECYCLE_FINALIZING = "finalizing"
 LIFECYCLE_READY = "ready"
+# A session that did not end the way a walk ends. The lock names a dead
+# process, or the record says `error`/`interrupted`, or finalization was
+# left pending by a process that is gone. Named for what happened to the
+# SESSION, not for what exists on disk: the geometry block beside it says
+# whether a reconstruction is there, and on the 2026-09-06 walk it was.
+LIFECYCLE_INTERRUPTED = "interrupted"
+# Kept in the vocabulary for readers; nothing on disk maps to it any more
+# -- every fact that used to be `failed` is a more specific `interrupted`.
 LIFECYCLE_FAILED = "failed"
 LIFECYCLE_IDLE = "idle"
 LIFECYCLE_UNAVAILABLE = "unavailable"
+
+# Why THIS world is the one on the wire. The unpinned default answers with
+# a live world if any, else the newest world on disk -- and until
+# 2026-09-06 nothing said which, so a phone opening World Builder with
+# nothing live drew the newest saved world as if it were the live one.
+SELECTION_PINNED = "pinned"          # the client named it
+SELECTION_LIVE = "live"              # a running builder holds its lock, session open
+SELECTION_FINALIZING = "finalizing"  # a running builder holds its lock, session stopped
+SELECTION_LATEST = "latest"          # nothing is live; this is the most recently updated
+SELECTION_NONE = "none"              # nothing to report at all
 
 # Tracking. `limited` is deliberately NEVER emitted -- see _tracking_block.
 TRACKING_GOOD = "good"
@@ -111,6 +142,11 @@ SCALE_SEMANTICS = {
 VOLATILE_PATHS = (
     "progress.mapping_seconds",
     "world_snapshot.mapping_seconds",
+    # Not volatile but not CONTENT: two subscriptions -- one pinned to the
+    # newest world, one unpinned -- describe the same bytes on disk and
+    # must agree on the revision, or a client switching between them sees
+    # a phantom change.
+    "selection",
     # Self-referential rather than volatile: `world_snapshot.revision` IS
     # the revision, so it cannot be an input to computing it. Excluded so
     # the hash stays stable when the field is filled in afterwards.
@@ -149,16 +185,46 @@ MODEL_STATE_IDLE = "idle"
 MODEL_STATE_RECEIVING = "receiving"
 MODEL_STATE_FINALIZING = "finalizing"
 MODEL_STATE_FINALIZED = "finalized"
+# New at `world_builder.status/2026-09-06`, and the reason the identifier
+# moved: a session that ended abnormally is neither `failed` (which the
+# phone drew with no world at all) nor `finalized` (which would present a
+# half-built walk as a finished one). The snapshot and the geometry travel
+# with it, so the phone can show what exists and say what happened.
+MODEL_STATE_INTERRUPTED = "interrupted"
 MODEL_STATE_FAILED = "failed"
 
 _MODEL_STATE_BY_LIFECYCLE = {
     LIFECYCLE_RECEIVING: MODEL_STATE_RECEIVING,
-    # "capture ended, Tower still working; figures may change" is exactly
-    # what `stopped_unbuilt` means -- the stored figures are not the final
-    # figures. Tower still cannot see whether a build is RUNNING, and
-    # lifecycle.build_in_progress carries that caveat unchanged.
+    # A live process is finishing; `lifecycle.build_in_progress` is True on
+    # the evidence of the lock.
+    LIFECYCLE_FINALIZING: MODEL_STATE_FINALIZING,
+    # "capture ended, Tower still working; figures may change" is what
+    # `stopped_unbuilt` means HERE, and here it is right: the only state
+    # that still reaches this mapping is a session whose geometry is
+    # BEHIND its journal. A rebuild is outstanding, the world is intact,
+    # and "wait" is the honest word.
+    #
+    # THE PREVIOUS ROUND POINTED THIS AT `interrupted` AND THAT WAS TOO
+    # BROAD. `stopped_unbuilt` was carrying two states -- "built and
+    # behind" and "nothing here at all" -- and only the second is settled.
+    # A reviewer built both: the first started rendering a red
+    # "Interrupted ... what was built before it stopped is here" over a
+    # complete world that merely needed a rebuild. The same reviewer also
+    # showed the mapping's stated premise to be false: `stop_session()`
+    # DEFAULTS to `hold_lock=False`, so a caller that takes the default
+    # releases the lock and THEN builds, and a build really can be running
+    # here. Narrower than it first read, and a later reviewer measured the
+    # difference: the shipped offline driver,
+    # `scripts/world_build_session.py`, passes `hold_lock=True` at both of
+    # its stop sites, so the callers that take the default are the
+    # research and benchmark scripts -- which have no phone watching
+    # them.
+    #
+    # The empty case is separated at the branch instead, where it can be
+    # said precisely. See `_lifecycle`.
     LIFECYCLE_STOPPED_UNBUILT: MODEL_STATE_FINALIZING,
     LIFECYCLE_READY: MODEL_STATE_FINALIZED,
+    LIFECYCLE_INTERRUPTED: MODEL_STATE_INTERRUPTED,
     LIFECYCLE_FAILED: MODEL_STATE_FAILED,
     LIFECYCLE_IDLE: MODEL_STATE_IDLE,
 }
@@ -215,29 +281,99 @@ class _FileCache:
     # whether or not today's callers can reach it, and the recovery here
     # is free -- every entry is a pure function of a file that is still
     # there, so dropping the lot costs one re-read.
-    MAX_ENTRIES = 64
+    # SIX reads per session per snapshot -- events, the session manifest,
+    # the world manifest, the keyframe digest, and (only for a session no
+    # manifest describes) a pose summary and a point count. It was four
+    # until the recount was added, and this comment still said four; a
+    # reviewer counted. 256 therefore covers about 42 sessions rather
+    # than the 64 the next paragraph was written for, which is still more
+    # than any subscriber reaches.
+    #
+    # And the entries are NOT all small: a reviewer parsed the preserved
+    # field artifact's manifest and measured **63.5 KB** for one, against
+    # 768 bytes for an events summary. The bound was 64, and 256 is
+    # ~7 MiB worst case while covering 64 sessions -- more than any
+    # subscriber reaches. (An earlier version of this comment argued
+    # against 512, a number that was never in this file; a reviewer
+    # checked it against the diff. A comment that cites a value has to
+    # cite the one the code had.) The eviction below is one-at-a-time and
+    # least-recently-used, so crossing the bound now costs one re-read
+    # rather than every reader's.
+    MAX_ENTRIES = 256
 
     __slots__ = ("_entries",)
 
     def __init__(self) -> None:
         self._entries: dict = {}
 
-    def read(self, path, reader):
+    def read(self, kind: str, path, reader):
+        """`reader()`'s result for `path`, reparsed only when it changes.
+
+        `kind` NAMES THE READ, and it is not decoration. The key used to
+        be the path alone, so two callers asking different questions of
+        one file shared an entry: the first answer won and the second
+        caller silently got it, with no error anywhere.
+
+        That is not hypothetical. It happened during this campaign: a
+        reader was added that asked what a manifest file CLAIMS, beside
+        the existing reader that asks `_validate_manifest` what it is
+        WORTH. The second reader got the first's `None` and concluded the
+        file made no claim, so a check that was supposed to fire never
+        did. The hostile suite caught it, and the reader that hit it was
+        later removed for unrelated reasons -- but the hazard is a
+        property of a path-keyed cache, not of that reader, and the next
+        one to ask a second question of a file would have found it again.
+
+        One file, two questions, two entries.
+        """
         try:
             stat = path.stat()
             fingerprint = (stat.st_size, stat.st_mtime_ns)
         except OSError:
             # Absent or unreadable. Do not cache: a file that appears
             # later must be picked up on the next poll.
-            self._entries.pop(str(path), None)
+            self._entries.pop((kind, str(path)), None)
             return reader()
-        key = str(path)
+        key = (kind, str(path))
         cached = self._entries.get(key)
         if cached is not None and cached[0] == fingerprint:
+            # MOVE TO THE END ON A HIT: least-recently-USED, not
+            # first-in-first-out. `d[existing] = v` does not reorder a
+            # dict, so the hottest entry -- the live session's journal,
+            # refreshed every poll -- kept its original slot and was
+            # evicted FIRST. A reviewer demonstrated it on a three-key
+            # dict. `pop` then reinsert is the reorder.
+            #
+            # `pop(key, None)`, NOT `pop(key)`. This producer is a
+            # process-lifetime singleton and `_snapshot_for` is reached
+            # from `asyncio.to_thread` on BOTH the publisher's poll loop
+            # and every websocket's subscribe handler, so two threads read
+            # one cache. Check-then-act on a bare `pop` raised KeyError 15
+            # times in 16 threads under a reviewer's stress harness -- and
+            # KeyError is in `snapshot()`'s except tuple, so the world
+            # blinked out of existence on the phone for a poll.
+            self._entries.pop(key, None)
+            self._entries[key] = cached
             return cached[1]
         value = reader()
-        if len(self._entries) >= self.MAX_ENTRIES:
-            self._entries.clear()
+        # OLDEST OUT, not everything out. Clearing the lot turned the bound
+        # into a cliff: a reviewer measured the hit rate falling from 95.8%
+        # to 14.0% the moment the entry count crossed it, and this producer
+        # is a process-lifetime singleton shared by every subscriber on a
+        # host that holds 163 worlds. Python dicts keep insertion order, so
+        # the first key is the oldest touch.
+        #
+        # `list(...)`, so the eviction does not iterate a dict another
+        # thread may be writing: the same reviewer's harness produced
+        # "RuntimeError: dictionary changed size during iteration", and
+        # RuntimeError is NOT in `snapshot()`'s except tuple -- it escapes
+        # to the publisher's consecutive-failure counter and can fail the
+        # target.
+        while len(self._entries) >= self.MAX_ENTRIES:
+            oldest = next(iter(list(self._entries)), None)
+            if oldest is None:
+                break
+            self._entries.pop(oldest, None)
         self._entries[key] = (fingerprint, value)
         return value
 
@@ -268,6 +404,9 @@ class WorldBuilderStatusProducer:
     def resolve(self, world_id: str | None, session_id: str | None):
         """Pick which world and session to report on.
 
+        Returns `(world_id, session_id, problem)`; `resolve_with_selection`
+        adds WHY that world was picked, which the payload now carries.
+
         An explicit world_id is iOS's inspection mode
         (`WorldInspectionMode.inspecting(worldID:)`, 1.7), where "there is
         no capture to start, and a counter that moved would be a bug".
@@ -275,22 +414,28 @@ class WorldBuilderStatusProducer:
         recently updated world, because a client that did not name one is
         asking about now.
         """
+        chosen, session, problem, _ = self.resolve_with_selection(world_id, session_id)
+        return chosen, session, problem
+
+    def resolve_with_selection(self, world_id: str | None, session_id: str | None):
+        """`resolve`, plus the `selection` block for the payload."""
         store = WorldStore(self._root)
         try:
             world_ids = store.list_world_ids()
         except OSError:
-            return None, None, "world root is not readable"
+            return None, None, "world root is not readable", None
         if not world_ids:
-            return None, None, "no worlds exist under this Tower's world root"
+            return None, None, "no worlds exist under this Tower's world root", None
 
         if world_id is not None:
             if world_id not in world_ids:
-                return None, None, f"no world with id {world_id!r}"
+                return None, None, f"no world with id {world_id!r}", None
             chosen = world_id
+            mode, reason = SELECTION_PINNED, "the client named this world"
         else:
-            chosen = self._most_relevant(store, world_ids)
+            chosen, mode, reason = self._most_relevant(store, world_ids)
             if chosen is None:
-                return None, None, "no world could be read"
+                return None, None, "no world could be read", None
 
         if session_id is not None:
             if session_id not in store.list_session_ids(chosen):
@@ -298,27 +443,42 @@ class WorldBuilderStatusProducer:
                     None,
                     None,
                     f"world {chosen!r} has no session with id {session_id!r}",
+                    None,
                 )
-            return chosen, session_id, None
-
-        sessions = store.list_session_ids(chosen)
-        if not sessions:
-            return chosen, None, None
-        return chosen, self._latest_session(store, chosen, sessions), None
+            resolved_session = session_id
+        else:
+            sessions = store.list_session_ids(chosen)
+            resolved_session = (
+                self._latest_session(store, chosen, sessions) if sessions else None
+            )
+        selection = {
+            "mode": mode,
+            "world_id": chosen,
+            "session_id": resolved_session,
+            "reason": reason,
+        }
+        return chosen, resolved_session, None, selection
 
     def _most_relevant(self, store, world_ids):
         """A LIVE world if one exists, else the most recently updated.
+
+        Returns `(world_id, selection_mode, reason)`.
 
         "Live" means a lock held by a process that is still running. An
         earlier version accepted the mere existence of a lock file, so one
         leftover lock from a crashed builder permanently hijacked every
         default subscription -- an adversarial review demonstrated a
         stale-locked world outranking a newer, cleanly stopped one.
+
+        A live lock on a STOPPED session is a builder finalizing, and it
+        still outranks every saved world: it is what "now" looks like in
+        the two minutes after Stop. The selection names it `finalizing`
+        so a client can say so.
         """
         live = [
             wid
             for wid in world_ids
-            if (holder := _lock_holder(store, wid)) is not None
+            if (holder := store.lock_holder(wid)) is not None
             and holder.get("alive")
         ]
         candidates = live or world_ids
@@ -328,9 +488,48 @@ class WorldBuilderStatusProducer:
                 world = store.read_world(wid)
             except (WorldStoreError, KeyError, OSError):
                 continue
-            if world.updated_at > best_at:
+            # `_sortable`, FOR THE REASON THE LISTING GIVES -- and this
+            # is the surface that is up during the walk.
+            #
+            # `world_from_json_dict` does not coerce `updated_at`, and
+            # `best_at` starts at `-math.inf`, so a `world.json` carrying
+            # a string raises `TypeError` HERE, in
+            # `resolve_with_selection`, which runs BEFORE `snapshot()`'s
+            # try. Two rounds hardened the three HTTP surfaces against
+            # exactly this and did not grep for the other readers of the
+            # same fields. A reviewer built all 24 corruption shapes and
+            # found `GET /worlds`, `/render` and `/geometry/manifest`
+            # surviving every one while the status channel died on all of
+            # them.
+            if _sortable(world.updated_at) > _sortable(best_at):
                 best, best_at = wid, world.updated_at
-        return best
+        if best is None:
+            return None, SELECTION_NONE, "no world could be read"
+        if not live:
+            return (
+                best,
+                SELECTION_LATEST,
+                "nothing is live; this is the most recently updated world",
+            )
+        if self._newest_session_is_stopped(store, best):
+            return (
+                best,
+                SELECTION_FINALIZING,
+                "a live builder holds this world's writer lock and its session has stopped",
+            )
+        return best, SELECTION_LIVE, "a live builder holds this world's writer lock"
+
+    def _newest_session_is_stopped(self, store, world_id) -> bool:
+        sessions = store.list_session_ids(world_id)
+        if not sessions:
+            return False
+        latest = self._latest_session(store, world_id, sessions)
+        summary = self._files.read(
+            "events",
+            store.events_path(world_id, latest),
+            lambda: _summarise_events(*read_raw_jsonl(store.events_path(world_id, latest))),
+        )
+        return bool(summary["stopped"])
 
     def _latest_session(self, store, world_id, session_ids):
         best, best_at = session_ids[0], -math.inf
@@ -339,7 +538,8 @@ class WorldBuilderStatusProducer:
                 session = store.read_session(world_id, sid)
             except (WorldStoreError, KeyError, OSError):
                 continue
-            if session.started_at > best_at:
+            # See the world loop above: `started_at` is uncoerced too.
+            if _sortable(session.started_at) > _sortable(best_at):
                 best, best_at = sid, session.started_at
         return best
 
@@ -347,12 +547,35 @@ class WorldBuilderStatusProducer:
 
     def snapshot(self, world_id: str | None, session_id: str | None) -> Snapshot:
         """One complete status payload. Never partial, never a delta."""
-        resolved_world, resolved_session, problem = self.resolve(world_id, session_id)
+        resolved_world, resolved_session, problem, selection = (
+            self.resolve_with_selection(world_id, session_id)
+        )
         if problem is not None:
             return self._unavailable(problem)
         try:
-            return self._snapshot(resolved_world, resolved_session)
-        except (WorldStoreError, KeyError, ValueError, OSError) as exc:
+            return self._snapshot(resolved_world, resolved_session, selection)
+        except (
+            WorldStoreError,
+            KeyError,
+            ValueError,
+            OSError,
+            # `TypeError` AND `OverflowError`, because a record field that
+            # is the wrong TYPE is a corrupt-input problem exactly like a
+            # missing key, and neither was in this tuple.
+            #
+            # `_elapsed_seconds` subtracts `session.started_at` from the
+            # clock; a string raises TypeError and a `10**400` raises
+            # OverflowError, both from inside the snapshot rather than
+            # from the resolver above. Uncaught, they reach
+            # `publisher.poll_once`'s bare `except Exception`, and after
+            # `MAX_CONSECUTIVE_TARGET_FAILURES` the subscriber is sent
+            # `fail_target` and the panel stops updating **for the rest of
+            # the walk**. A reviewer traced that path; the alternative is
+            # one poll reporting `unavailable`, which is what every other
+            # corrupt input here already does.
+            TypeError,
+            OverflowError,
+        ) as exc:
             # A world this build cannot read is a real answer, not a
             # crash. Refusing to interpret an unknown schema is the store's
             # documented behaviour and it must survive to the wire rather
@@ -395,13 +618,16 @@ class WorldBuilderStatusProducer:
         )
         payload["model_state_reason"] = reason
         payload["world_snapshot"] = None
+        payload["selection"] = {
+            "mode": SELECTION_NONE, "world_id": None, "session_id": None, "reason": reason,
+        }
         return Snapshot(
             payload=payload,
             revision=compute_revision(payload, VOLATILE_PATHS),
             volatile_fields=VOLATILE_PATHS,
         )
 
-    def _snapshot(self, world_id: str, session_id: str | None) -> Snapshot:
+    def _snapshot(self, world_id: str, session_id: str | None, selection=None) -> Snapshot:
         store = WorldStore(self._root)
         world = store.read_world(world_id)
 
@@ -409,6 +635,10 @@ class WorldBuilderStatusProducer:
             payload = self._payload_no_session(store, world)
         else:
             payload = self._payload(store, world, session_id)
+        payload["selection"] = selection or {
+            "mode": SELECTION_PINNED, "world_id": world_id, "session_id": session_id,
+            "reason": "the client named this world",
+        }
 
         _attach_ios_projection(payload)
 
@@ -459,29 +689,64 @@ class WorldBuilderStatusProducer:
         # list was cached and re-scanned, 0.79 ms when the summary is
         # cached instead. The parse was never the only cost.
         events = self._files.read(
+            "events",
             store.events_path(world.world_id, session_id),
             lambda: _summarise_events(
                 *read_raw_jsonl(store.events_path(world.world_id, session_id))
             ),
         )
-        holder = _lock_holder(store, world.world_id)
+        holder = store.lock_holder(world.world_id)
+        # THE COPY BESIDE THE GEOMETRY DECIDES, and it decides here too.
+        #
+        # This read the WORLD's manifest first and fell back to the
+        # session's; `store.derived_currency` and
+        # `world_builder_geometry._session_manifest` do the opposite. A
+        # reviewer built the eleven states where the two copies disagree
+        # and found the readers picking different manifests -- reproducing
+        # BOTH of this campaign's named failures at once: `ready` beside a
+        # 404, and a route serving geometry the phone was told was still
+        # finalizing. Four readers, one rule.
         manifest = self._files.read(
-            store.derived_manifest_path(world.world_id),
-            lambda: _read_manifest(store, world.world_id),
+            "validated-manifest",
+            store.session_manifest_path(world.world_id, session_id),
+            lambda: _validate_manifest(
+                store.read_session_manifest(world.world_id, session_id),
+                world.world_id,
+                source="session manifest",
+            ),
         )
+        if manifest is not None and manifest.get("session_id") != session_id:
+            # A session's own copy naming somebody else is corruption.
+            manifest = None
         keyframes_current = self._files.read(
+            "keyframe-digest",
             store.keyframes_path(world.world_id, session_id),
             lambda: _keyframes_digest(store, world.world_id, session_id),
         )
 
-        if manifest is not None and manifest.get("session_id") != session_id:
-            # THE session check, and the only one. A world with two built
-            # sessions has ONE manifest, describing whichever built last.
-            # Attributing it to the other session would report one
-            # session's geometry as another's -- a confident wrong answer,
-            # and the reason _read_manifest deliberately does not filter:
-            # its result is cached per FILE, and that file is shared.
-            manifest = None
+        if manifest is None:
+            # THE WORLD'S COPY, only because this session has none of its
+            # own -- a world built before `write_derived` wrote one. It is
+            # still filtered by session: a manifest naming somebody else is
+            # not evidence about this session, and attributing it would
+            # report one session's geometry as another's.
+            #
+            # `_read_manifest` deliberately does not filter, because its
+            # result is cached per FILE and that file is shared by every
+            # session in the world. The check lives here, at the point of
+            # use, for that reason.
+            #
+            # When both are absent the four hand-written branches below
+            # take over. They exist for legacy worlds only.
+            manifest = self._files.read(
+                "validated-manifest",
+                store.derived_manifest_path(world.world_id),
+                lambda: _read_manifest(store, world.world_id),
+            )
+            if manifest is not None and manifest.get("session_id") != session_id:
+                # The world's copy is about another session. Attributing it
+                # here would report one session's geometry as another's.
+                manifest = None
 
         stopped = events['stopped']
         geometry_current = (
@@ -490,12 +755,38 @@ class WorldBuilderStatusProducer:
             and manifest.get("input_digest") == keyframes_current
         )
 
+        session_geometry = _has_session_geometry(store, world.world_id, session_id)
+        # The figures a manifest would have carried, recovered from the
+        # files it would have described. Only when there is no manifest
+        # and there IS a tree, so the ordinary path costs one `is None`.
+        tree_figures = (
+            _figures_from_the_tree(self._files, store, world.world_id, session_id)
+            if manifest is None and session_geometry
+            else None
+        )
         lifecycle = _lifecycle(
             holder=holder,
             stopped=stopped,
             session=session,
+            # The files the phone opens, for THIS session -- not the
+            # world's manifest, which names whichever session built last.
+            has_session_geometry=session_geometry,
             geometry_current=geometry_current,
+            # A manifest FILE, not the figures. `tree_figures` gives the
+            # blocks below their numbers back, and deliberately does not
+            # make this True: `has_manifest` decides which lifecycle state
+            # this session is in, and "a summary was recomputed from the
+            # files" is not "a build recorded what it did".
             has_manifest=manifest is not None,
+            # THE FIGURES, NOT THE PARSE. `tree_figures is not None`
+            # means only that poses.json and points.json parsed; a
+            # featureless walk parses perfectly and counts zero. Saying
+            # "the world opens" over that is the same mistake
+            # `_has_drawable_geometry` was written to stop the projection
+            # making, made again in prose two branches away, and shipped
+            # to the phone as `lifecycle.reason` while the phone's own
+            # predicate drew "Needs retry". A reviewer built it.
+            has_readable_figures=_figures_are_drawable(tree_figures),
         )
         # Which counts are trustworthy is decided by whether the session
         # was ever STOPPED -- not by whether it is currently `receiving`.
@@ -529,9 +820,16 @@ class WorldBuilderStatusProducer:
             # _calibration_block makes about a world-level calibration
             # state applies here unchanged.
             "scale": _scale_block(world, attributable=manifest is not None),
-            "geometry": _geometry_block(manifest, geometry_current, keyframes_now),
+            "geometry": _geometry_block(
+                manifest, geometry_current, keyframes_now,
+                has_session_geometry=session_geometry,
+                tree_figures=tree_figures,
+            ),
             "trajectory": self._trajectory_block(
-                store, world, session_id, manifest, geometry_current, keyframes_now
+                store, world, session_id, manifest, geometry_current,
+                keyframes_now, events,
+                has_session_geometry=session_geometry,
+                tree_figures=tree_figures,
             ),
             "persistence": _persistence_block(world),
             "artifacts": _artifacts_block(
@@ -541,15 +839,35 @@ class WorldBuilderStatusProducer:
         }
 
     def _trajectory_block(
-        self, store, world, session_id, manifest, current, keyframes_now
+        self, store, world, session_id, manifest, current, keyframes_now,
+        events, *, has_session_geometry: bool = False, tree_figures=None,
     ) -> dict:
         # Same reasoning as _geometry_block: a trajectory over the first N
         # keyframes is a correct answer to an older question, not a wrong
         # answer, and hiding it makes a live session look idle.
-        if manifest is None:
+        if manifest is not None and not has_session_geometry:
+            # See `_geometry_block`: the same payload, the same reason.
             return _trajectory_unavailable(
-                "no build has run for this session, so no poses exist"
+                "a build ran for this session and its poses are no longer "
+                "on disk; the capture is still there and it can be rebuilt"
             )
+        if manifest is None:
+            if has_session_geometry:
+                # Counted from poses.json, for the reason `_geometry_block`
+                # gives at length. This block previously said the poses
+                # "cannot be summarised here" while sitting a `stat()` away
+                # from the file that holds them.
+                if tree_figures is not None:
+                    manifest = tree_figures
+                else:
+                    return _trajectory_unavailable(
+                        "this session has poses on disk and they could not "
+                        "be read, so nothing here can summarise them"
+                    )
+            else:
+                return _trajectory_unavailable(
+                    "no build has run for this session, so no poses exist"
+                )
         revision = compute_revision(
             {
                 "digest": manifest.get("input_digest"),
@@ -557,6 +875,7 @@ class WorldBuilderStatusProducer:
                 "solved": manifest.get("poses_solved"),
                 "refused": manifest.get("poses_refused"),
                 "segments": manifest.get("segments"),
+                "tree": manifest.get("tree_fingerprint"),
             }
         )
         return {
@@ -564,13 +883,18 @@ class WorldBuilderStatusProducer:
             "current": current,
             "built_from_keyframes": manifest.get("keyframes"),
             "keyframes_now": keyframes_now,
-            "stale_reason": (
-                None
-                if current
-                else (
+            "stale_reason": _stale_reason(
+                current,
+                manifest,
+                (
                     "keyframes have been accepted since this build ran; this "
                     "path covers built_from_keyframes of them"
-                )
+                ),
+                (
+                    "these poses were counted from the file on disk because "
+                    "no manifest describes them, so nothing here can say "
+                    "which keyframes produced them"
+                ),
             ),
             # Poses that actually carry a position, which is neither
             # poses_solved nor the keyframe count. See _pose_count: the
@@ -587,6 +911,12 @@ class WorldBuilderStatusProducer:
             "poses_anchor": manifest.get("poses_anchor"),
             "keyframes": manifest.get("keyframes"),
             "segments": manifest.get("segments"),
+            # Beside `segments`, and never derivable from it. See
+            # `_events_summary`: 122 segments on the 2026-09-09 walk were
+            # 64 tracking losses plus 57 solve-chain breaks plus the one
+            # the session started with.
+            "tracking_restarts": events.get("tracking_restarts"),
+            "chain_breaks": events.get("chain_breaks"),
             "path_length": self._path_length(
                 store, world, session_id, manifest, revision
             ),
@@ -662,10 +992,16 @@ class WorldBuilderStatusProducer:
                     "so a common coordinate frame cannot be assumed"
                     if segments is None
                     else (
-                        f"this session has {segments} segments; tracking was "
-                        "lost between them, so their poses share no "
-                        "coordinate frame and a total length would sum "
-                        "incomparable distances"
+                        # NOT "tracking was lost between them", which this
+                        # string said until 2026-09-09. A segment boundary is
+                        # opened by a tracking loss OR by the solver failing
+                        # to extend its chain while tracking is healthy, and
+                        # on that walk 57 of 121 boundaries were the second.
+                        # The refusal does not depend on which: either way
+                        # the poses share no frame.
+                        f"this session is in {segments} segments whose poses "
+                        "share no coordinate frame, so a total length would "
+                        "sum incomparable distances"
                     )
                 ),
             }
@@ -683,7 +1019,37 @@ class WorldBuilderStatusProducer:
         except (WorldStoreError, KeyError, ValueError, OSError):
             derived = None
         if derived is None:
-            return {"available": False, "reason": "the derived poses are unreadable"}
+            # "UNREADABLE" IS ONE OF TWO REASONS AND IT USED TO BE THE
+            # ONLY SENTENCE. `read_derived` returns None for a tree it
+            # will not SERVE as well as for one it cannot read, and the
+            # first is much the commoner: a build older than its
+            # keyframes is refused by the verify gate by design. A
+            # reviewer printed this block's `"the derived poses are
+            # unreadable"` beside `pose_count: 4` and `element_count:
+            # 1347` counted from those same files, in one payload.
+            #
+            # The two are told apart by asking the gate what it thinks,
+            # rather than by guessing from a None.
+            stale = False
+            try:
+                digest = compute_input_digest(
+                    store.read_keyframes(world.world_id, session_id)
+                )
+                stale = store.derived_currency(
+                    world.world_id, digest, session_id
+                ) is False
+            except (WorldStoreError, KeyError, ValueError, OSError):
+                stale = False
+            return {
+                "available": False,
+                "reason": (
+                    "this session's stored poses are older than its "
+                    "keyframes, so a distance along them would not be the "
+                    "distance walked"
+                    if stale
+                    else "the derived poses could not be read"
+                ),
+            }
 
         total = 0.0
         previous = None
@@ -766,22 +1132,83 @@ _BUILD_UNOBSERVABLE = {
 }
 
 
-def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> dict:
+def _has_session_geometry(store, world_id: str, session_id: str) -> bool:
+    """Whether a derived tree was BUILT for this session.
+
+    Existence, not openability, and the difference is not a detail. The
+    serving path (`routes/geometry.py` -> `WorldStore.read_derived`) opens
+    and parses both files; a reviewer built empty ones, truncated ones and
+    wrong-shaped ones and got `ready` from this beside a 404 from the route.
+    So this answers "was there a build", which is a question about the
+    session, and the route answers "can it be read", which is a question
+    about the bytes. They are different failures and they read differently
+    on the phone: nothing here versus something corrupt.
+
+    It stays a stat rather than a parse because it runs on the 0.5 s status
+    poll and `points.json` is megabytes on a real walk. Two `stat()` calls
+    measure 72 microseconds; parsing would be four orders of magnitude
+    worse for an answer the route is about to give properly anyway.
+
+    Deliberately the SAME two files `world_builder_library._has_geometry`
+    asks about, because the listing and the status producer answering that
+    question differently is how a picker row and the canvas it opens end up
+    disagreeing. There are three copies of this predicate -- here,
+    `world_builder_library.py` and `world_builder_render.py` -- because the
+    modules must not import each other, and a test pins all three together.
+    """
+    derived = store.derived_dir(world_id) / session_id
+    return (derived / "poses.json").exists() and (derived / "points.json").exists()
+
+
+def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
+               has_session_geometry, has_readable_figures: bool = False) -> dict:
     """What the Tower can SEE about whether a world is being built.
 
     This is `IOS-to-Tower.md` 1.1's central ask -- "a start/stop/failed
     signal **distinct from 'frames are arriving'**" -- and the writer lock
     answers it exactly, because it is held for the lifetime of a mapping
-    session and by nothing else (engine.start_session acquires it,
-    stop_session releases it).
+    session and by nothing else. Since 2026-09-06 the live builder keeps
+    it through finalization too (`engine.stop_session(hold_lock=True)`),
+    and writes a `finalization` block on the record, so five states are
+    now distinguishable on disk:
 
-    A lock held by a pid that is no longer running is a genuine, visible
-    failure: a builder process died mid-session. That is worth reporting
-    as `failed` with the pid, because the alternative -- reporting
-    `receiving` forever -- would be a stale observation presented as
-    current state.
+        lock alive, not stopped                 -> receiving
+        lock alive, stopped                     -> finalizing
+        lock dead                               -> interrupted
+        stopped by error/interrupted, or a
+          finalization left pending/interrupted -> interrupted
+        stopped, finalization complete, tree    -> ready
+        stopped, finalization complete, no tree -> interrupted
+        stopped, a manifest but no tree         -> interrupted
+        stopped, neither                        -> stopped_unbuilt
+        stopped, a tree no manifest describes   -> ready, currency unknown
+        stopped, no finalization record (older
+          builder), geometry current / behind   -> ready / stopped_unbuilt
+
+    `interrupted` is deliberately NOT `failed`. On the 09-06 walk the
+    process died mid-walk and left 463 keyframes of geometry; the state
+    describes the session, and the geometry block beside it describes
+    what exists.
+
+    `has_manifest` AND `has_session_geometry` ARE DIFFERENT QUESTIONS, and
+    conflating them cost a review round. `has_manifest` is the WORLD's
+    `derived/manifest.json`, already discarded by the caller when it names
+    another session -- a world walked twice has one manifest, describing
+    whichever session built last. `has_session_geometry` is
+    `derived/<sid>/poses.json` and `points.json`: the files the phone
+    actually opens, which every built session has.
+
+    So "is this session's geometry current" is `has_manifest`, and "is
+    there anything here to open" is `has_session_geometry`. A guard that
+    asks the first when it means the second calls every older session of a
+    multi-session world unopenable -- measured, on two synthetic sessions
+    in one world with both trees on disk.
     """
-    if holder is not None and holder["alive"] and not stopped:
+    finalization = session.finalization
+    alive = holder is not None and holder["alive"]
+    lock_dead = holder is not None and not holder["alive"]
+
+    if alive and not stopped:
         return {
             "state": LIFECYCLE_RECEIVING,
             "evidence": (
@@ -790,10 +1217,29 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             "reason": None,
             "build_in_progress": False,
             "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
-    if holder is not None and not holder["alive"] and not stopped:
+    if alive and stopped:
         return {
-            "state": LIFECYCLE_FAILED,
+            "state": LIFECYCLE_FINALIZING,
+            "evidence": (
+                f"a live process (pid {holder['pid']}) holds the writer lock and "
+                "session_stopped was written"
+            ),
+            "reason": (
+                "the builder is finishing this world: the final solve and the "
+                "final build run after the session stops, and the lock is "
+                "released when they are done"
+            ),
+            # True on the evidence of the lock: the process that finishes a
+            # world is the process holding it, and it is alive.
+            "build_in_progress": True,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if lock_dead and not stopped:
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
             "evidence": (
                 "a writer lock exists but names no readable process id"
                 if holder.get("unreadable")
@@ -807,14 +1253,85 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
                 "session; its keyframes are persisted but the session was "
                 "never closed"
             ),
-            **_BUILD_UNOBSERVABLE,
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if lock_dead and stopped:
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                f"the writer lock is held by pid {holder['pid']}, which is no "
+                "longer running, and session_stopped was written"
+            ),
+            "reason": (
+                "the process finalizing this world exited before it finished; "
+                "the geometry stored is the last build it completed"
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    # A COMPLETED FINALIZATION OUTRANKS HOW THE CAPTURE ENDED.
+    #
+    # `end_reason` describes the CAPTURE; `finalization` describes the
+    # WORLD, and they are different questions. This block used to answer
+    # both with the first, so a session whose capture ended badly could
+    # never be reported as finished however it was repaired -- which made
+    # `scripts/world_finalize.py` unable to deliver what it exists for.
+    # Measured on the recovered 2026-09-09 artifact: finalization
+    # `{state: complete, final_solve: solved}`, 88 of 122 segments
+    # registered, and this function still said `interrupted`.
+    #
+    # `end_reason` is NOT rewritten to achieve this -- that walk really did
+    # end in an error and the record should keep saying so. It is carried
+    # into the reason string instead, so the phone can say a world was
+    # finished after an interrupted capture rather than having to choose
+    # which half of the truth to show.
+    if (
+        session.end_reason in ("error", "interrupted")
+        and (finalization or {}).get("state") == "complete"
+        and (finalization or {}).get("final_solve") == FINAL_SOLVE_SOLVED
+        # AND THE GEOMETRY IT IMPLIES EXISTS. A repair whose build failed
+        # can leave `complete / solved` on a world whose derived tree is
+        # gone, and the first version of this returned READY without ever
+        # asking -- an adversarial review reached it end-to-end. `ready` on
+        # a world with nothing to open is the same class of lie as
+        # "Nothing mapped yet" over 26,634 points, pointing the other way.
+        #
+        # `has_session_geometry`, NOT `has_manifest`. The first version of
+        # this guard asked the manifest, which is the world's and names
+        # only the session that built last -- so it called every OLDER
+        # session of a multi-session world unopenable, with both derived
+        # trees sitting on disk. See the docstring.
+        and has_session_geometry
+    ):
+        return {
+            "state": LIFECYCLE_READY,
+            "evidence": (
+                f"the capture ended with end_reason={session.end_reason!r}, and "
+                "the finalization record is complete with a solved final solve"
+            ),
+            "reason": (
+                f"this walk's capture ended with {session.end_reason!r}; the "
+                "world was finished afterwards and is complete"
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
     if session.end_reason in ("error", "interrupted"):
+        detail = (finalization or {}).get("detail")
         return {
-            "state": LIFECYCLE_FAILED,
+            "state": LIFECYCLE_INTERRUPTED,
             "evidence": f"the session recorded end_reason={session.end_reason!r}",
-            "reason": f"the mapping session ended with {session.end_reason!r}",
-            **_BUILD_UNOBSERVABLE,
+            "reason": (
+                f"the mapping session ended with {session.end_reason!r}"
+                + (f": {detail}" if detail else "")
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
         }
     if not stopped:
         return {
@@ -825,13 +1342,218 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
             ),
             "reason": None,
             **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
         }
-    if not has_manifest:
+    if finalization is not None and finalization.get("state") != "complete":
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                f"session_stopped was written and the finalization record is "
+                f"{finalization.get('state')!r} with no process holding the lock"
+            ),
+            "reason": (
+                "finalization did not complete; the geometry stored is the last "
+                "build that finished"
+                + (f": {finalization.get('detail')}" if finalization.get("detail") else "")
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if finalization is not None:
+        # A finished record from a builder that keeps the lock through
+        # finalization: the lock is gone because it was RELEASED, and the
+        # record says the build completed.
+        if has_session_geometry:
+            # AND the geometry it implies exists. This branch did not
+            # check, while the `error`/`interrupted` branch above -- added
+            # by the same campaign -- did, so a normally-stopped world
+            # whose derived tree had gone still read READY. The comment
+            # above claimed the hole was "noted in the handoff"; it was
+            # not, and an audit of the handoff caught the claim rather
+            # than the hole.
+            #
+            # The first fix asked `has_manifest` here too, and a reviewer
+            # measured what that does to a world walked twice: the older
+            # session read `interrupted`, over a reason saying its
+            # geometry was "no longer on disk", with `poses.json` right
+            # there. Worse than the hole it closed -- that one lied about
+            # a world with nothing in it; this lied about an intact one
+            # and invited the wearer to redo the walk.
+            return {
+                "state": LIFECYCLE_READY,
+                "evidence": (
+                    "session_stopped was written, the finalization record is "
+                    "complete, the lock was released and the derived tree is "
+                    "there"
+                ),
+                "reason": None,
+                "build_in_progress": False,
+                "build_in_progress_unavailable_reason": None,
+                "finalization": finalization,
+            }
+        # AND IT IS NOT ENOUGH TO REFUSE READY; SOMETHING TRUE HAS TO BE
+        # SAID INSTEAD.
+        #
+        # The first version of this guard let the refusal fall through to
+        # `stopped_unbuilt`, which is what an unbuilt world is. A reviewer
+        # took the fall-through end to end and found it renders on the
+        # phone as a PERMANENT "Finalizing": `stopped_unbuilt` maps to
+        # `model_state: finalizing`, and `WorldPresentation` reads that
+        # stage as `isStillChanging == true` while suppressing the
+        # sentence that would explain it. Nothing is running and nothing
+        # ever will be. Its reason -- "no geometry has been built for this
+        # session yet" -- was also simply false: a build ran and finished,
+        # and its output is gone. "yet" is the future tense of something
+        # already past.
+        #
+        # `stopped_unbuilt` also hard-codes `"finalization": None`, which
+        # was harmless while no finalised session could reach it. The only
+        # evidence that the solve completed would have been deleted on the
+        # way to the phone.
+        #
+        # So this returns what the sibling branch returns for the same
+        # physical condition -- INTERRUPTED, which iOS renders as "Needs
+        # retry": settled, not-changing, and carrying its reason. The
+        # record travels with it.
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                "session_stopped was written and the finalization record is "
+                "complete, but there is no derived tree to open"
+            ),
+            "reason": (
+                "this world was finished and its geometry is no longer on "
+                "disk; the capture is still there and it can be rebuilt"
+            ),
+            "build_in_progress": False,
+            "build_in_progress_unavailable_reason": None,
+            "finalization": finalization,
+        }
+    if has_manifest and not has_session_geometry:
+        # A MANIFEST PROVES A BUILD RAN. Saying "no geometry has been built
+        # for this session yet" over one is the same false sentence the
+        # branch above was fixed for, and it projects to the phone as a
+        # permanent `finalizing` -- now rendered as "it usually takes a few
+        # minutes… worth waiting for Saved", forever. A reviewer reached it
+        # through the ordinary case: `finalization is None` is what every
+        # offline caller leaves, so the branch above never fires for them.
+        return {
+            "state": LIFECYCLE_INTERRUPTED,
+            "evidence": (
+                "a manifest describes a build for this session and its "
+                "derived tree is not there"
+            ),
+            "reason": (
+                "this session was built and its geometry is no longer on "
+                "disk; the capture is still there and it can be rebuilt"
+            ),
+            **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
+        }
+    if not has_session_geometry:
+        # NOTHING WAS BUILT, which is a different statement from
+        # `stopped_unbuilt`'s other meaning ("built, and behind"). Both
+        # keep this state name -- it is on the wire and iOS decodes it --
+        # and they are told apart in the PROJECTION, where the difference
+        # actually matters. See `_attach_ios_projection`.
+        #
+        # `has_session_geometry`, NOT `has_manifest`, for the same reason as
+        # the two branches above -- and this one was left behind when they
+        # were fixed. A reviewer walked it: a world built twice, both
+        # derived trees on disk, an OLDER session with no finalization
+        # record, and the producer said `stopped_unbuilt` / "no geometry has
+        # been built for this session yet" / a permanent `finalizing` on the
+        # phone. Verbatim the outcome the comment twenty lines up spends a
+        # paragraph saying must never happen again, reached by a different
+        # door.
+        #
+        # `finalization is None` is not an exotic state either:
+        # `stop_session` writes the block only when `hold_lock=True`, and
+        # `hold_lock` DEFAULTS to False -- so any caller taking the default
+        # arrives here. Not "every offline caller", which is what this
+        # said until a reviewer checked: `scripts/world_build_session.py`,
+        # the offline driver that actually ships, passes `hold_lock=True`
+        # at both of its stop sites. Research and benchmark scripts take
+        # the default.
+        # `finalization`, not `None`. It is provably None on every path
+        # that reaches here -- the block above returns on both arms -- so
+        # this is a no-op today and a reviewer said so. It is spelled this
+        # way because the two sibling `stopped_unbuilt` returns below said
+        # `None` outright, and three identical situations spelled two ways
+        # is how the next person picks the wrong one.
         return {
             "state": LIFECYCLE_STOPPED_UNBUILT,
             "evidence": "capture ended and no build output exists for this session",
-            "reason": "no geometry has been built for this session yet",
+            "reason": (
+                "this walk produced no geometry; the capture is still there "
+                "and it can be rebuilt"
+            ),
             **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
+        }
+    if not has_manifest:
+        # A DERIVED TREE THAT NO MANIFEST DESCRIBES, AND THE ONE HONEST
+        # WORD LEFT.
+        #
+        # Two ways in, and an earlier version of this branch told the
+        # first one's story about both. Either no manifest FILE names this
+        # session -- a world built before `write_derived` wrote one per
+        # session -- or a file is there and cannot be used: unreadable
+        # bytes, a top-level list, a schema version from the future, a
+        # required key set to null. `_validate_manifest` was extracted so
+        # that a corrupt manifest gives a clean refusal, and the refusal
+        # was then laundered into a confident wrong sentence about a
+        # manifest "naming another session". A reviewer built all four
+        # corrupt shapes and got that sentence for every one of them.
+        #
+        # Neither case can judge currency, and the difference does not
+        # change what to do, so both get this state -- and the evidence
+        # below describes the ONLY thing both actually establish.
+        #
+        # `ready` OVERCLAIMS, and a reviewer said so with a measurement: a
+        # SECOND, unrelated session building is what flips this session
+        # from "a rebuild is outstanding" to `ready`, without anything
+        # about this session changing. The answer it replaced overclaimed
+        # in the other direction -- `stopped_unbuilt`, "no geometry has
+        # been built", projected to the phone as a permanent `finalizing`
+        # over a reconstruction sitting on disk. Between two overclaims,
+        # the one that lets a wearer open a real world wins, and the
+        # uncertainty is SAID rather than hidden.
+        #
+        # AND "THE WORLD ITSELF OPENS NORMALLY" WAS NOT TRUE WHEN THIS
+        # BRANCH FIRST CLAIMED IT. The geometry and trajectory blocks
+        # reported `available: false, element_count: null`, and iOS decides
+        # what to draw from those numbers, so a complete reconstruction --
+        # 1,347 points, 4 camera poses, served 200 by the geometry route --
+        # rendered as "Needs retry: nothing usable came of this session".
+        # The figures are recovered from the files now
+        # (`_figures_from_the_tree`), which is what makes the sentence
+        # true; `has_readable_figures` says whether that worked.
+        #
+        # Worlds built from now on do not reach this branch at all.
+        return {
+            "state": LIFECYCLE_READY,
+            "evidence": (
+                "capture ended and this session has a derived tree that no "
+                "manifest describes -- either none was written beside it or "
+                "the one that was cannot be read"
+            ),
+            "reason": (
+                "no manifest describes this session's geometry, so how "
+                "current it is cannot be judged here; its figures were "
+                "counted from the poses and points themselves and the "
+                "world opens"
+                if has_readable_figures
+                else (
+                    "no manifest describes this session's geometry, and "
+                    "counting the poses and points themselves found "
+                    "nothing to show; the capture is still there and it "
+                    "can be rebuilt"
+                )
+            ),
+            **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
         }
     if not geometry_current:
         return {
@@ -845,6 +1567,7 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
                 "figures these keyframes would produce"
             ),
             **_BUILD_UNOBSERVABLE,
+            "finalization": finalization,
         }
     return {
         "state": LIFECYCLE_READY,
@@ -852,6 +1575,7 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest) -> d
         "reason": None,
         "build_in_progress": None,
         "build_in_progress_unavailable_reason": _BUILD_UNOBSERVABLE_REASON,
+        "finalization": finalization,
     }
 
 
@@ -874,13 +1598,47 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
     accepted = 0
     last_tracking = None
     stopped = False
+    tracking_restarts = 0
+    chain_breaks = 0
+    rejected_wrong_size = 0
+    rejected_malformed = 0
     for event in events:
         kind = event.get("kind")
+        if kind == "frame_rejected":
+            # ONLY the rejections the engine journals -- an ordinary
+            # rejected frame writes no event (engine.py `observe`), and
+            # this does not pretend otherwise. What IS journaled is the
+            # kind worth a sentence on the phone: a frame of a size this
+            # session is not calibrated for. A reviewer drove seven of
+            # eight frames into that rejection and found no trace of it
+            # in the live payload, the session record or the follower's
+            # log; a whole walk at the wrong rung read "Mapping" with a
+            # frozen keyframe count and then "Saved" with a truncated
+            # world.
+            # The reason rides in the event's PAYLOAD -- `WorldEvent` is
+            # `{event_id, kind, at, payload}` -- which the first version
+            # of this read at the top level and counted nothing.
+            # Two SCALARS, not a dict keyed by reason. The summary is
+            # cached for as long as anyone is subscribed and this
+            # function's contract -- pinned by
+            # `test_the_journal_cache_holds_a_summary_not_the_journal` --
+            # is fixed size and scalars only. The engine journals exactly
+            # two rejection kinds, so two counters lose nothing.
+            payload = event.get("payload")
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            if reason == "frame_size_changed":
+                rejected_wrong_size += 1
+            elif reason == "malformed_frame":
+                rejected_malformed += 1
+            continue
         if kind == "keyframe_accepted":
             accepted += 1
             last_tracking = kind
         elif kind == "tracking_lost":
             last_tracking = kind
+            tracking_restarts += 1
+        elif kind == "solve_chain_broken":
+            chain_breaks += 1
         elif kind == "session_stopped":
             stopped = True
     return {
@@ -888,6 +1646,26 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
         "last_tracking": last_tracking,
         "stopped": stopped,
         "corrupt_lines": corrupt_lines,
+        # COUNTED, not inferred from the segment total.
+        #
+        # A segment boundary is not a tracking loss. Two independent
+        # causes open a segment (engine.py:314 on a tracking loss,
+        # engine.py:400 on a solve-chain break), and the engine is
+        # explicit that the second must not be read as the wearer having
+        # lost the world -- `solve_chain_broken` deliberately does not
+        # move `last_tracking`.
+        #
+        # iOS had no counted number to show, so it rendered
+        # `segments - 1` under the words "Tracking restarted N times".
+        # On the 2026-09-09 walk that read "121" against 64 actual
+        # losses: 57 of the 121 were the solver failing to place a
+        # keyframe while tracking was healthy. Both counts ride here now
+        # so the phone can stop doing arithmetic on a number that does
+        # not mean what its label says.
+        "tracking_restarts": tracking_restarts,
+        "chain_breaks": chain_breaks,
+        "frames_rejected_wrong_size": rejected_wrong_size,
+        "frames_rejected_malformed": rejected_malformed,
     }
 
 
@@ -938,6 +1716,12 @@ def _progress_block(session, events, counts_are_final: bool, now: float) -> dict
                 "not knowable yet"
             )
         ),
+        # LIVE, from the journal, and only for the rejections the engine
+        # journals. `rejected_by_reason` below is the session record's
+        # full tally and is final-only by design; this is the subset a
+        # wearer needs to hear about while still walking. Additive.
+        "frames_rejected_wrong_size": events.get("frames_rejected_wrong_size", 0),
+        "frames_rejected_malformed": events.get("frames_rejected_malformed", 0),
         "rejected_by_reason": (
             dict(session.rejected_by_reason) if counts_are_final else None
         ),
@@ -1058,7 +1842,9 @@ def _scale_block(world, *, attributable: bool = True) -> dict:
     }
 
 
-def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
+def _geometry_block(manifest, current: bool, keyframes_now, *,
+                    has_session_geometry: bool = False,
+                    tree_figures=None) -> dict:
     """Geometry, including geometry that is real but BEHIND.
 
     An earlier version reported anything not matching the current
@@ -1077,10 +1863,50 @@ def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
     reporting it without the flags would have let a viewer mistake it for
     the finished world. The flags are the whole difference.
     """
-    if manifest is None:
+    if manifest is not None and not has_session_geometry:
+        # A MANIFEST IS NOT GEOMETRY. It describes a build; the poses and
+        # points are the build. When the tree is gone the figures in it are
+        # a memory, and reporting them as live put `available: true,
+        # current: true, element_count: 26,634` in the same payload as a
+        # lifecycle reason saying the geometry is no longer on disk -- with
+        # the route answering 404. A reviewer printed both halves of that
+        # payload side by side. It is the "Nothing mapped yet over 26,634
+        # points" failure this campaign is named for, inverted.
         return _geometry_unavailable(
-            "no build has run for this session, so no geometry exists"
+            "a build ran for this session and its poses and points are no "
+            "longer on disk; the capture is still there and it can be "
+            "rebuilt"
         )
+    if manifest is None:
+        if has_session_geometry:
+            # A BUILD DID RUN AND NO MANIFEST DESCRIBES IT. A world built
+            # before `write_derived` wrote one per session, or one whose
+            # manifest is corrupt.
+            #
+            # "The counts genuinely cannot be given from here" is what a
+            # previous version of this comment said, and it was wrong.
+            # They come from the manifest, which is a SUMMARY of poses.json
+            # and points.json -- and those are on disk, so the summary can
+            # be recomputed. Until it was, this returned `available: false,
+            # element_count: null` over a real reconstruction, and iOS
+            # (`WorldEvidence.hasGeometry`) drew "Needs retry -- nothing
+            # usable came of this session" on top of 1,347 points and 4
+            # camera poses. Measured, not reasoned about.
+            if tree_figures is not None:
+                manifest = tree_figures
+            else:
+                # The files are there and cannot be READ. Different from
+                # "there are none", and reported as itself rather than as
+                # a count of zero.
+                return _geometry_unavailable(
+                    "this session has a derived tree and neither its poses "
+                    "nor its points could be read, so nothing here can "
+                    "summarise it; the geometry route reads the same files"
+                )
+        else:
+            return _geometry_unavailable(
+                "no build has run for this session, so no geometry exists"
+            )
     return {
         "available": True,
         # Whether this geometry reflects every keyframe accepted so far.
@@ -1114,6 +1940,11 @@ def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
                 "solved": manifest.get("poses_solved"),
                 "segments": manifest.get("segments"),
                 "scale": manifest.get("scale_state"),
+                # None on every manifest read from a file. Set only when
+                # these figures were counted from the tree, where there is
+                # no `built_at` and no digest to move the revision when a
+                # rebuild lands on the same counts.
+                "tree": manifest.get("tree_fingerprint"),
             }
         ),
         "provenance": "inferred",
@@ -1125,16 +1956,41 @@ def _geometry_block(manifest, current: bool, keyframes_now) -> dict:
         "built_at": manifest.get("built_at"),
         "time_basis": TIME_BASIS,
         "unavailable_reason": None,
-        "stale_reason": (
-            None
-            if current
-            else (
+        "stale_reason": _stale_reason(
+            current,
+            manifest,
+            (
                 "keyframes have been accepted since this build ran; these "
                 "figures are correct for the keyframes named in "
                 "built_from_keyframes and are not the final world"
-            )
+            ),
+            (
+                "these figures were counted from the poses and points on "
+                "disk because no manifest describes them, so nothing here "
+                "can say which keyframes produced them or whether a "
+                "rebuild is outstanding"
+            ),
         ),
     }
+
+
+def _stale_reason(current, manifest, behind: str, unjudgeable: str):
+    """Why these figures are not the final world -- and which "not".
+
+    `current` is False in two quite different situations and the block it
+    came from used to give the first sentence for both. "Behind" is a
+    build that is genuinely older than the keyframes, which is what the
+    first message describes. "Unjudgeable" is a build with no manifest,
+    where currency is not false but UNKNOWN: telling a wearer keyframes
+    have arrived since a build ran, when nothing here knows when it ran,
+    is a fabrication of the same family as the one this whole campaign is
+    about.
+    """
+    if current:
+        return None
+    if manifest.get("input_digest") is None and manifest.get("built_at") is None:
+        return unjudgeable
+    return behind
 
 
 def _geometry_unavailable(reason: str) -> dict:
@@ -1171,6 +2027,8 @@ def _trajectory_unavailable(reason: str) -> dict:
         "poses_anchor": None,
         "keyframes": None,
         "segments": None,
+        "tracking_restarts": None,
+        "chain_breaks": None,
         "path_length": None,
         "revision": None,
         "provenance": None,
@@ -1278,6 +2136,243 @@ def _artifacts_block(store, world_id, session_id, world, session=None) -> dict:
     }
 
 
+def _figures_are_drawable(figures) -> bool:
+    """Whether a recount produced something a viewer could draw.
+
+    Not `figures is not None`, which asks only whether the files parsed.
+    The same distinction `_has_drawable_geometry` makes of the payload,
+    made of the figures before they become one.
+    """
+    if figures is None:
+        return False
+    return (figures.get("points") or 0) > 0 or (
+        figures.get("poses_positioned") or 0
+    ) > 0
+
+
+def _figures_from_the_tree(files, store, world_id: str, session_id: str):
+    """Count the poses and points THEMSELVES, when no manifest can say.
+
+    **This is the fix for a defect this campaign itself introduced.** A
+    session whose derived tree is on disk with no manifest describing it
+    -- a world built before `write_derived` wrote one per session, or one
+    whose manifest is corrupt -- was given `lifecycle: ready` and a
+    geometry block reading `available: false, element_count: null`. The
+    branch's own comment promised "the world itself opens normally". It
+    does not: iOS decides what to draw with `WorldEvidence.hasGeometry`,
+    which is `(elements ?? 0) > 0 || (poses ?? 0) > 0`, so a *complete*
+    reconstruction rendered as **"Needs retry -- nothing usable came of
+    this session. Walking the space again is what produces another one."**
+    Measured on a real build: 1,347 points and 4 poses on disk, and that
+    sentence over them. That is the exact failure this campaign is named
+    for, reintroduced through a branch written to fix it.
+
+    A manifest is meant to be a summary of these files, so when the
+    summary is missing, counting them is neither a guess nor a
+    fabrication -- it is the same arithmetic the build did, done later.
+    What CANNOT be recovered is which keyframes produced them, so
+    `keyframes` and `input_digest` stay `None` and currency stays
+    unjudgeable; the caller says so in words.
+
+    "Meant to be", because on this Tower's own disk two of 49 sessions
+    disagree: `fcbca9e9…/158ef0ef…`'s manifest counts 463 poses where
+    `poses.json` holds 467, so the manifest and the file it sits beside
+    describe different builds. **Neither is reachable through this
+    function** -- both carry a usable manifest, so the recount never
+    runs -- and which of the two is right is a question about
+    `engine.build`, not about this. Recorded because a reviewer measured
+    it and because the sentence above would otherwise read as a
+    guarantee.
+
+    Returns None when the files cannot be read, which is a different
+    answer from "there are none" and is reported differently.
+
+    **A MANIFEST THIS BUILD CANNOT USE IS NOT A REASON TO REFUSE THE
+    FILES, and a round of this campaign spent a fix believing it was.**
+    `_validate_manifest` refuses a `schema_version` it does not know, on
+    the sound ground that such a manifest "describes fields whose meaning
+    this build does not know" -- and the first version of this recount
+    read that as evidence the POSES AND POINTS were also unreadable, and
+    refused. A reviewer built the state and showed what that produces: the
+    status channel reporting `element_count: null` and the phone drawing
+    *"Needs retry -- nothing usable came of this session"* over a tree the
+    geometry route was serving 200 for at the same moment, because
+    `world_builder_geometry._read` uses `read_derived(verify=False)` and
+    never looks at `schema_version` at all.
+
+    One refusal in one of the two readers is worse than none: it is the
+    Tower disagreeing with itself, which is the failure this campaign is
+    named for. The manifest's FIGURES are refused -- they are what the
+    schema version is about -- and the files are counted, which is what
+    both readers already do.
+
+    Both reads go through `_FileCache`, so the poll loop parses these
+    files once per change rather than once per second. poses.json is the
+    larger of the two only in pose count; points.json is the megabytes,
+    and only its LENGTH is retained -- the rows are dropped before the
+    cache stores anything.
+    """
+    derived = store.derived_dir(world_id) / session_id
+    poses_path = derived / "poses.json"
+    points_path = derived / "points.json"
+    poses = files.read(
+        "pose-summary", poses_path, lambda: _summarise_pose_rows(poses_path)
+    )
+    points = files.read(
+        "point-count", points_path, lambda: _count_rows(points_path, "points")
+    )
+    if poses is None or points is None:
+        return None
+    return {
+        "points": points,
+        # Unknowable from the tree, and left unknown rather than guessed.
+        # `built_from_keyframes: null` beside a real `element_count` is a
+        # precise statement: here is what was built, and nothing here can
+        # say what it was built from.
+        "keyframes": None,
+        "input_digest": None,
+        "built_at": None,
+        "backend_id": None,
+        "scale_state": None,
+        # An opaque change detector. `built_at` and `input_digest` are
+        # what normally make a revision move, and neither exists here, so
+        # a rebuild that happened to produce the same counts would leave
+        # the revision unchanged and the phone would not redraw. The
+        # files' own (size, mtime_ns) is the fingerprint `_FileCache`
+        # already trusts for exactly this question.
+        "tree_fingerprint": _fingerprint(poses_path, points_path),
+        **poses,
+    }
+
+
+def _fingerprint(*paths) -> str | None:
+    parts = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        parts.append(f"{stat.st_size}:{stat.st_mtime_ns}")
+    return "|".join(parts)
+
+
+def _count_rows(path, key: str):
+    """`len(json[key])`, holding on to nothing else.
+
+    points.json is the one genuinely large file here -- tens of thousands
+    of rows -- and the count is all any caller of this wants. Parsing it
+    to a list and returning the length lets the list be collected
+    immediately; returning the list would put megabytes into a
+    process-lifetime cache.
+    """
+    rows = _read_past_a_replace(path, key)
+    return len(rows) if isinstance(rows, list) else None
+
+
+def _read_past_a_replace(path, key: str):
+    """Read a file that a builder may be replacing underneath us.
+
+    **A WINDOWS MEASUREMENT, NOT A PRECAUTION.** `write_json_atomic`
+    finishes with `os.replace`, and on Windows a replace onto a path a
+    reader has open fails with WinError 5 -- and so, symmetrically, does
+    the reader's `open()` during the writer's window. A reviewer ran a
+    reader and a writer against one file for three seconds and measured
+    **3,519 failures in 14,486 reads, 24%**, every one a `PermissionError`
+    from the open rather than a torn parse.
+
+    That matters here because this reads the LARGE file. Reported as
+    "could not be read", a 24% failure rate at the publisher's 2 Hz makes
+    `geometry.available` flicker between true and false while a session
+    rebuilds, and the phone flickers with it.
+
+    A replace is over in microseconds, so a couple of immediate retries
+    cover it without a sleep in a poll path. What is still failing after
+    them is a real fault and is reported as one.
+
+    `ValueError` is NOT retried: a file that parsed and was wrong will
+    parse and be wrong again.
+    """
+    last: OSError | None = None
+    for _ in range(3):
+        try:
+            return read_json_closed(path)[key]
+        except (KeyError, TypeError, ValueError):
+            return None
+        except OSError as exc:
+            last = exc
+    logger.debug("world builder: %s stayed unreadable: %r", path, last)
+    return None
+
+
+def _summarise_pose_rows(path):
+    """`engine.build`'s own pose arithmetic, recomputed from poses.json.
+
+    Deliberately identical to the counting in `engine.build`, including
+    the rule `_pose_count` exists for: an ANCHOR is a real position only
+    when something in its segment actually solved against it. A lone
+    anchor in a segment that resolved nothing is an origin marker for an
+    empty coordinate frame, and counting it is where "Camera poses: 36"
+    over a world with `poses_solved: 0` came from on the 2026-08-24 walk.
+
+    `refused` is everything that is neither solved nor an anchor -- the
+    same definition `engine.build` uses at both of its counting sites.
+    """
+    rows = _read_past_a_replace(path, "poses")
+    if not isinstance(rows, list):
+        return None
+    solved = anchors = refused = 0
+    by_segment: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        segment = row.get("segment_index")
+        # Unhashable ids would raise inside the dict below, and a corrupt
+        # file must read as unreadable rather than as an exception out of
+        # a function whose contract is "None or a summary".
+        if isinstance(segment, (list, dict)):
+            return None
+        bucket = by_segment.setdefault(segment, [0, 0])
+        status = row.get("status")
+        if status == POSE_STATUS_SOLVED:
+            solved += 1
+            bucket[0] += 1
+        elif status == POSE_STATUS_ANCHOR:
+            anchors += 1
+            bucket[1] += 1
+        else:
+            refused += 1
+    positioned = sum(
+        solved_here + (anchors_here if solved_here else 0)
+        for solved_here, anchors_here in by_segment.values()
+    )
+    return {
+        "poses_solved": solved,
+        "poses_refused": refused,
+        "poses_anchor": anchors,
+        "poses_positioned": positioned,
+        "segments": len(by_segment),
+    }
+
+
+def _has_drawable_geometry(payload: dict) -> bool:
+    """Whether this payload carries FIGURES a viewer could draw.
+
+    Deliberately the same question `WorldEvidence.hasGeometry` asks on
+    iOS -- `(elements ?? 0) > 0 || (poses ?? 0) > 0` -- and deliberately
+    not `geometry.available`, which says only that a build ran and left a
+    tree behind. A build that solved nothing leaves one too.
+
+    Either figure alone is enough, for the reason iOS gives: a build can
+    place cameras and recover few points, or recover points across
+    segments whose cameras were never placed. Both are geometry.
+    """
+    geometry = payload.get("geometry") or {}
+    trajectory = payload.get("trajectory") or {}
+    elements = geometry.get("element_count")
+    poses = trajectory.get("pose_count")
+    return (elements or 0) > 0 or (poses or 0) > 0
+
+
 def _attach_ios_projection(payload: dict) -> None:
     """Add `model_state` and `world_snapshot` -- the fields iOS decodes.
 
@@ -1286,6 +2381,49 @@ def _attach_ios_projection(payload: dict) -> None:
     """
     lifecycle = payload["lifecycle"]
     state = _MODEL_STATE_BY_LIFECYCLE.get(lifecycle["state"], MODEL_STATE_IDLE)
+    if state == MODEL_STATE_FINALIZING and lifecycle["state"] == LIFECYCLE_STOPPED_UNBUILT:
+        # `stopped_unbuilt` CARRIES TWO STATES AND ONLY ONE OF THEM MEANS
+        # "WAIT".
+        #
+        # "Built, and behind" is a world that is intact and merely needs a
+        # rebuild: `finalizing` is right, and the phone showing "Finalizing"
+        # over it is right. "Nothing was built" is a walk that produced no
+        # geometry, and telling a wearer to wait for it is the permanent
+        # "Finalizing" four separate reviews found by four separate routes.
+        #
+        # The previous round fixed it by pointing the whole state at
+        # `interrupted`, which a fifth reviewer showed was too broad -- the
+        # behind-case started rendering a red "Interrupted ... what was
+        # built before it stopped is here" over a complete world. The
+        # distinction belongs here, where both facts are in hand, and NOT
+        # in the state name, which is on the wire and which iOS decodes.
+        #
+        # One caveat, measured: `stop_session()` defaults to
+        # `hold_lock=False`, so an offline caller can be building right now
+        # with no lock to show for it, and such a session reads "Needs
+        # retry" until its build lands. The live path holds the lock
+        # through finalization and never reaches here.
+        #
+        # THE PREDICATE IS "IS THERE ANYTHING TO DRAW", NOT
+        # "DID A BUILD RUN", and the first version of this fix used the
+        # second. `geometry.available` is true as soon as a manifest and a
+        # derived tree exist -- and `engine.build()` calls `write_derived`
+        # UNCONDITIONALLY, so a walk down a dark corridor writes
+        # poses.json, points.json and a manifest saying `points: 0,
+        # poses_solved: 0`. Gating on `available` therefore kept saying
+        # `finalizing` over a world with nothing in it: the permanent
+        # "Finalizing" back through a different door, one round after it
+        # was closed.
+        #
+        # iOS decides what to draw with `WorldEvidence.hasGeometry`, which
+        # is `(elements ?? 0) > 0 || (poses ?? 0) > 0` -- the FIGURES, not
+        # the flag. This must ask the same question of the same numbers,
+        # or the Tower tells the wearer to wait for a screen the phone
+        # will never have anything to put on. Reproduced with a
+        # featureless capture: `available: true, element_count: 0,
+        # pose_count: 0, model_state: "finalizing"`.
+        if not _has_drawable_geometry(payload):
+            state = MODEL_STATE_INTERRUPTED
     payload["model_state"] = state
     payload["model_state_reason"] = lifecycle.get("reason")
 
@@ -1345,38 +2483,6 @@ def _attach_ios_projection(payload: dict) -> None:
 # -- disk helpers -------------------------------------------------------
 
 
-def _lock_holder(store, world_id):
-    """Who holds the writer lock, and is that process still alive?
-
-    Returns None when no lock file exists. The lock is the ONLY live
-    signal the web process has, because the builder runs elsewhere.
-    """
-    path = store.lock_path(world_id)
-    try:
-        if not path.exists():
-            return None
-        holder = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    pid = holder.get("pid")
-    if not isinstance(pid, int):
-        # A lock file exists but names no usable pid. NOT the same as "no
-        # lock": reporting `idle` with "no writer lock is held" would be a
-        # false statement about a file that is right there, and would
-        # downgrade a crashed builder to a healthy-looking idle world.
-        return {"pid": None, "alive": False, "unreadable": True}
-    return {"pid": pid, "alive": _pid_is_running(pid), "unreadable": False}
-
-
-def _pid_is_running(pid: int) -> bool:
-    try:
-        import psutil
-
-        return psutil.pid_exists(pid)
-    except Exception:  # pragma: no cover - psutil is a hard dependency
-        return False
-
-
 # Keys a manifest must carry before it counts as evidence of geometry.
 # `engine.build` writes all of them; a manifest missing any is truncated,
 # hand-edited, or from a writer this build does not understand.
@@ -1384,17 +2490,6 @@ def _pid_is_running(pid: int) -> bool:
 # Gating on "the file exists" instead let a stripped manifest produce
 # `available: true` with every figure null -- "we have geometry" asserted
 # with nothing to show for it -- which an adversarial review demonstrated.
-REQUIRED_MANIFEST_KEYS = (
-    "input_digest",
-    "session_id",
-    "keyframes",
-    "points",
-    "poses_solved",
-    "poses_refused",
-    "segments",
-)
-
-
 def _read_manifest(store, world_id):
     """The world's derived manifest, unfiltered, or None.
 
@@ -1411,25 +2506,19 @@ def _read_manifest(store, world_id):
     version of this function claimed to do both and did neither after the
     cache was introduced.
     """
-    manifest = store.read_derived_manifest(world_id)
-    if manifest is None:
-        return None
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        # store.derived_is_current checks this; nothing else does. A
-        # manifest from another schema describes fields whose meaning this
-        # build does not know.
-        return None
-    missing = [key for key in REQUIRED_MANIFEST_KEYS if manifest.get(key) is None]
-    if missing:
-        logger.warning(
-            "result channel: derived manifest for %s is missing %s; "
-            "treating it as absent rather than reporting geometry with no "
-            "figures",
-            world_id,
-            missing,
-        )
-        return None
-    return manifest
+    return _validate_manifest(store.read_derived_manifest(world_id), world_id)
+
+
+def _validate_manifest(manifest, world_id, source="derived manifest"):
+    """The store's rule, reached through this module's private name.
+
+    The checks themselves moved to `WorldStore.validate_manifest` so that
+    every reader of a manifest is held to them -- the status channel, the
+    geometry route, `usable_placements` and the saved-worlds listing --
+    rather than only this one. See that function for what the split
+    produced.
+    """
+    return validate_manifest(manifest, world_id, source=source)
 
 
 def _pose_count(manifest):

@@ -5,6 +5,7 @@
 
 import Combine
 import Foundation
+import os
 
 /// Supplies `WorldModelState` to the World Builder workspace.
 ///
@@ -80,6 +81,63 @@ protocol WorldBuilderClient: CartridgeClient {
     /// Emits nothing at all for a client with no Tower behind it, which is the
     /// correct and complete behaviour rather than an omission.
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> { get }
+
+    /// Whether this client is following the live world or pinned to a stored
+    /// one. `.live` for every client that cannot pin, which is every client
+    /// but the Tower-backed one.
+    var inspection: WorldInspectionMode { get }
+
+    /// Every mode after the one `inspection` held when the view model was
+    /// built.
+    var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> { get }
+
+    /// The stored world the Tower offered in place of a live one while this
+    /// client was following live, or `nil`. See
+    /// `TowerWorldBuilderClient.recentWorld`. `nil` for every client that
+    /// cannot pin, because such a client has nothing to offer either.
+    var recentWorld: WorldRecentReference? { get }
+
+    /// The builder's own account of what happened after Stop, from the last
+    /// report. `nil` for a client with no Tower behind it and for a record
+    /// written before the builder kept one.
+    ///
+    /// ## Why this has a publisher beside it
+    ///
+    /// It did not, and the reasoning for that was wrong in a way that mattered.
+    /// The claim was that a finalization change always rides along with a state
+    /// change, so reading this property during a view body was enough, and the
+    /// worst case was a one-report lag.
+    ///
+    /// `TowerWorldBuilderClient.state` **dedupes at the source**
+    /// (`didSet { guard state != oldValue }`), and `WorldBuilderViewModel`
+    /// composes `presentation` as a computed property that nothing else
+    /// invalidates. So a Tower that flips `final_solve` from `pending` to
+    /// `solved` **without changing the snapshot** publishes nothing, redraws
+    /// nothing, and leaves "The final pass has not run yet." on screen
+    /// indefinitely — not for one report. That is precisely the multi-minute
+    /// window a long final solve occupies, which is the window the sentence
+    /// exists to describe.
+    ///
+    /// So finalization is an input in its own right, published like the other
+    /// five. `WorldBuilderViewModel` republishes it into a `@Published`, which
+    /// is what invalidates the view.
+    var finalization: WorldFinalizationReport? { get }
+
+    /// Every finalization report after the one `finalization` held when the
+    /// view model was built.
+    var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> { get }
+
+    /// Every value after the one `recentWorld` held when the view model was
+    /// built.
+    var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { get }
+
+    /// Pin the world subscription to a stored world, and optionally to one of
+    /// its sessions. A no-op for a client with no transport.
+    func inspect(worldID: String, sessionID: String?)
+
+    /// Return to following the live world. A no-op for a client with no
+    /// transport.
+    func followLive()
 }
 
 extension WorldBuilderClient {
@@ -107,6 +165,37 @@ extension WorldBuilderClient {
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
+
+    /// A client that cannot open a stored world is always live, and says so
+    /// once.
+    var inspection: WorldInspectionMode { .live }
+
+    /// Nothing offered, ever, for a client with no Tower behind it.
+    var recentWorld: WorldRecentReference? { nil }
+
+    /// A client with no Tower behind it has no builder to have finalized
+    /// anything. Absence, and never a fabricated `complete`.
+    var finalization: WorldFinalizationReport? { nil }
+
+    /// Never emits, for the reason every other default here does not: a
+    /// constant has no changes to announce.
+    var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    var inspectionUpdates: AnyPublisher<WorldInspectionMode, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// Nothing to pin; nothing happens. Not an error, because the picker is
+    /// simply not offered a world by such a client.
+    func inspect(worldID: String, sessionID: String?) {}
+
+    func followLive() {}
 }
 
 /// A World Builder client with no Tower behind it.
@@ -192,9 +281,48 @@ final class WorldBuilderViewModel: ObservableObject {
     /// aspiration.
     @Published private(set) var state: WorldModelState
 
-    /// Live vs. stored-world inspection. Nothing can change it yet because
-    /// there is no stored world to open.
-    @Published private(set) var inspection: WorldInspectionMode = .live
+    /// Live vs. stored-world inspection. Seeded from the client and
+    /// republished from `inspectionUpdates`, for the reason `state` is: the
+    /// client owns the pin, because the pin is a fact about its subscription.
+    @Published private(set) var inspection: WorldInspectionMode
+
+    /// The stored worlds the Tower listed, newest first, or empty until
+    /// `loadWorlds()` has answered. Empty is also what a Tower with no world
+    /// root reports; `worldListFailure` says which.
+    @Published private(set) var worlds: [WorldListingEntry] = []
+
+    /// Why the last `loadWorlds()` produced nothing, in a sentence, or `nil`
+    /// after a listing that succeeded. `WorldListFetchError.notFound` is the
+    /// Tower's own answer — no world root configured — and is worded as that.
+    @Published private(set) var worldListFailure: String?
+
+    /// Whether a `loadWorlds()` is in flight. The picker draws a progress
+    /// indicator from it — honestly, because a request really is out — and
+    /// nothing else reads it.
+    @Published private(set) var isLoadingWorlds = false
+
+    /// The stored world the client was offered in place of a live one, or
+    /// `nil`. Republished from the client, which owns the judgment; the
+    /// canvas shows it as one line with an Open action in the `.idle` state,
+    /// and `open(worldID:sessionID:)` is what that action calls.
+    @Published private(set) var recentWorld: WorldRecentReference?
+
+    /// The builder's account of finalization, republished from the client.
+    /// See `finalization` below for what reading it live cost.
+    @Published private(set) var finalization: WorldFinalizationReport?
+
+    /// The world whose interactive picture can be opened, or `nil` when none
+    /// has been named yet.
+    ///
+    /// Set from two places and cleared from one. Opening a stored world sets
+    /// it to the pin — the person chose that world, and if the Tower has built
+    /// nothing for it the viewer shows the Tower's own sentence saying so.
+    /// Geometry coordinates arriving on the status channel set it to the world
+    /// and session the Tower named, which is the only way the *live* world
+    /// earns one: a live world without geometry has no picture to open, and a
+    /// button that could not lead anywhere is not offered. `returnToLive()`
+    /// clears it, and the next report re-earns it.
+    @Published private(set) var renderTarget: WorldRenderTarget?
 
     /// Whether the world on screen belongs to the capture the phone has open.
     ///
@@ -202,15 +330,37 @@ final class WorldBuilderViewModel: ObservableObject {
     /// owns the judgment, and a view model that recomputed it would be a second
     /// answer able to disagree with the one the state was gated on.
     @Published private(set) var sessionBinding: WorldSessionBinding
+    /// Where the geometry fetch stands, and what came of it.
+    ///
+    /// ## Why this replaced a bare `fragmentsModel`
+    ///
+    /// It was `@Published private(set) var fragmentsModel`, assigned in exactly
+    /// one place — the end of a successful manifest-plus-chunks fetch — and
+    /// empty everywhere else. The gallery keyed its whole empty state off that
+    /// one array, so five unrelated situations (no address, gated publish,
+    /// failed manifest, undecodable manifest, refused pose convention) all drew
+    /// the sentence "The glasses have not mapped anything here yet." over the
+    /// 2026-09-06 walk's 463 keyframes and 17,674 points.
+    ///
+    /// The fetch now has a state of its own and every one of those situations
+    /// lands in a different case. `WorldPresentation.swift` carries the full
+    /// account; `WorldGeometryAccount` turns this plus the Tower's own claims
+    /// into the sentence.
+    ///
+    /// The old comment's reasoning survives inside `.failed(.poseConvention)`:
+    /// geometry under a convention this build does not implement is refused
+    /// rather than drawn, because drawing it would look like a room and mean
+    /// nothing. What changed is that the refusal now says so.
+    @Published private(set) var geometryStatus: WorldGeometryStatus = .noWorld
+
     /// The segments the Tower's manifest currently names, in the shape the
     /// gallery draws them.
     ///
-    /// Empty until a manifest arrives, and emptied again when one arrives under
-    /// a pose convention this build does not implement — an empty gallery says
-    /// "nothing mapped", which is a true thing to say about geometry that
-    /// cannot be read, whereas drawing it under the wrong convention would look
-    /// like a room and mean nothing.
-    @Published private(set) var fragmentsModel = WorldFragmentsModel(segments: [])
+    /// Derived from `geometryStatus` rather than stored beside it: two stored
+    /// properties describing one fetch is two things that can disagree, and the
+    /// disagreement would be invisible. Callers that only want the tiles — the
+    /// gallery, the tests written before this — are unchanged.
+    var fragmentsModel: WorldFragmentsModel { geometryStatus.fragments }
 
     /// The points and poses for those segments, keyed by
     /// `(content_hash, placement_hash)` — `WorldSegmentSummary.cacheKey`.
@@ -235,6 +385,9 @@ final class WorldBuilderViewModel: ObservableObject {
     /// runtime references and tears nothing down, still stands.
     private let geometry: WorldGeometryClient
     private let geometryStore = WorldGeometryStore()
+    /// The saved-worlds list, over HTTP. A struct holding a `URL` and the
+    /// shared session, like `geometry`, and defaulted for the same reason.
+    private let library: WorldListClient
 
     /// The `geometry.revision` whose manifest is currently on screen, or `nil`
     /// when there is none.
@@ -245,6 +398,45 @@ final class WorldBuilderViewModel: ObservableObject {
     /// world's revision never moves again, so leaving it set after a failure
     /// would make one refused request permanent.
     private var lastGeometryRevision: String?
+
+    /// Whose geometry `fragmentsModel`, `geometryChunks` and the live
+    /// `renderTarget` currently describe, or `nil` when they describe nobody's.
+    ///
+    /// The gallery used to be keyed on `geometry.revision` alone, and a
+    /// revision is unique only *within* a world. When the unpinned
+    /// subscription drifted from a stored world to a newly created one on the
+    /// same subscription id, the new world had no geometry to publish, so no
+    /// coordinates arrived, so nothing cleared the old world's fragments — and
+    /// they sat under the new world's "Building" heading until its first
+    /// rebuild. Keyed on identity, a different world clears the gallery
+    /// before anything of its own is fetched.
+    ///
+    /// Both halves of the address, not the world alone: derived geometry is
+    /// per session, and two sessions of one world are two galleries.
+    private var geometryOwner: WorldRenderTarget?
+
+    /// The geometry fetch currently out, and the coordinates it was started
+    /// for, or `nil` when none is.
+    ///
+    /// Held so that it can be **cancelled**. Before this, `fetchGeometry(at:)`
+    /// spawned a task per coordinates emission and kept no handle: a
+    /// superseded fetch was refused at the publish step by `isStillOurs`,
+    /// but it went on issuing segment requests — sequentially, each bounded
+    /// only by the client's timeout — for the length of the manifest it no
+    /// longer had any right to draw. On a live walk the revision moves about
+    /// as often as a fetch takes, so that was a standing queue of requests
+    /// for pictures nobody would see. Cancelling the task aborts the request
+    /// in flight as well, through `URLSession`, rather than waiting for it.
+    ///
+    /// The coordinates are kept beside the task for the heartbeat. The status
+    /// channel re-sends an unchanged address every ~2 s, and a fetch for
+    /// *those same* coordinates must not be cancelled by its own heartbeat:
+    /// `geometryDidChange` would then refuse the re-fetch under
+    /// `lastGeometryRevision` and the world would never be drawn.
+    private var geometryFetch: (coordinates: WorldGeometryCoordinates, serial: Int, task: Task<Void, Never>)?
+    /// Numbers each fetch so its task can tell, when it ends, whether the
+    /// record above is still its own. See `fetchGeometry(at:)`.
+    private var geometryFetchSerial = 0
 
     /// No default argument on `client`, deliberately.
     ///
@@ -265,21 +457,64 @@ final class WorldBuilderViewModel: ObservableObject {
     /// fails, which is behaviour no amount of reading proves.
     init(
         client: any WorldBuilderClient,
-        geometry: WorldGeometryClient = WorldGeometryClient()
+        geometry: WorldGeometryClient = WorldGeometryClient(),
+        library: WorldListClient = WorldListClient()
     ) {
         self.client = client
         self.state = client.state
         self.sessionBinding = client.sessionBinding
+        self.inspection = client.inspection
+        self.recentWorld = client.recentWorld
+        self.finalization = client.finalization
         self.geometry = geometry
+        self.library = library
+
+        // The seeded state gets the same reading `stateDidChange` would give
+        // it. It did not, and the gap was visible: the client outlives the
+        // view model (`CartridgeClients`), so a cartridge switch and back
+        // builds a fresh view model over a client already holding a world —
+        // and `.noWorld → .notAddressed` lived only in `stateDidChange`, which
+        // runs on a *change*. The gallery said "There is no world on screen
+        // for geometry to belong to" beside a world with figures until the
+        // next heartbeat moved the state, and for a world with no geometry
+        // address the heartbeat never does, so it said it indefinitely.
+        //
+        // `renderTarget` is **not** seeded, and cannot be from what the client
+        // exposes: the live world earns its picture target from the geometry
+        // coordinates, and the protocol publishes those on change only — it
+        // keeps no current value to read back. It is re-earned from the next
+        // coordinates, which for a live world arrive on the next heartbeat.
+        markWorldPresent(in: client.state)
 
         client.stateUpdates
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in self?.state = state }
+            .sink { [weak self] state in self?.stateDidChange(to: state) }
             .store(in: &cancellables)
 
         client.bindingUpdates
             .receive(on: DispatchQueue.main)
             .sink { [weak self] binding in self?.sessionBinding = binding }
+            .store(in: &cancellables)
+        client.inspectionUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] mode in self?.inspectionDidChange(to: mode) }
+            .store(in: &cancellables)
+        client.recentWorldUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] recent in self?.recentWorld = recent }
+            .store(in: &cancellables)
+        client.finalizationUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] report in
+                // The Tower re-sends the block on every heartbeat, and the
+                // client forwards it; a `@Published` assignment fires whether
+                // or not the value moved. Dropping the repeats here is what
+                // `IOS-TO-TOWER.md` promises ("iOS drops the repeats itself")
+                // and what keeps the view tree from re-rendering every ~2 s
+                // for the length of a final solve.
+                guard let self, self.finalization != report else { return }
+                self.finalization = report
+            }
             .store(in: &cancellables)
         client.geometryUpdates
             .receive(on: DispatchQueue.main)
@@ -287,21 +522,183 @@ final class WorldBuilderViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Republish the state, and forget the gallery when the state no longer
+    /// has a world for it to belong to.
+    ///
+    /// `.idle`, `.failed` and `.unsupported` carry no snapshot and never will
+    /// on their own; fragments left under them would be drawn the moment the
+    /// next world state arrived, whichever world it named. `.awaitingFirstUpdate`
+    /// is deliberately **not** in the list: it is what a reconnect and a
+    /// resubscribe pass through on the way back to the *same* world, and the
+    /// cache surviving that is what makes the picture reappear without a
+    /// refetch. A different world arriving after it is caught here too: a
+    /// world state whose snapshot names a world other than the gallery's
+    /// owner forgets the gallery **before** anything of the new world is
+    /// fetched — which matters when the new world has nothing to fetch yet,
+    /// because then no coordinates arrive to do it in `geometryDidChange`.
+    /// That is the 2026-09-06 drift, on a Tower old enough to send no
+    /// `selection` block.
+    ///
+    /// Internal rather than private so a test can drive it without a client
+    /// that publishes.
+    func stateDidChange(to state: WorldModelState) {
+        self.state = state
+        switch state {
+        case .idle, .failed, .unsupported:
+            forgetGeometry()
+        case .receiving(let snapshot),
+             .finalizing(let snapshot, _),
+             .finalized(let snapshot),
+             .interrupted(let snapshot, _):
+            // Only when something is drawn and the state names a different
+            // world. A `nil` owner means nothing is drawn — and a pinned
+            // world's picture target, set by `open` before any coordinates,
+            // must survive its own world's first state.
+            if let owner = geometryOwner, let worldID = snapshot.worldID, owner.worldID != worldID {
+                forgetGeometry()
+            }
+            markWorldPresent(in: state)
+        case .awaitingFirstUpdate:
+            break
+        }
+    }
+
+    /// A world is on screen and nothing has addressed geometry for it.
+    /// `.noWorld` is the state this object starts in and returns to; moving
+    /// off it here is what turns "there is nothing to have geometry for" into
+    /// "there is a world and no address for its geometry", which is
+    /// situations 1 and 2 of the five.
+    ///
+    /// Only from `.noWorld`, so a fetch in flight, a loaded manifest or a
+    /// recorded failure is never overwritten by a heartbeat. Its own function
+    /// so that `init` and `stateDidChange` apply one rule rather than two
+    /// copies of it — the seeded state used to skip it entirely.
+    private func markWorldPresent(in state: WorldModelState) {
+        guard state.snapshot != nil, geometryStatus == .noWorld else { return }
+        geometryStatus = .notAddressed
+    }
+
+    /// Republish the mode, and forget the gallery: whatever was drawn belonged
+    /// to the world just left.
+    ///
+    /// The picture target is handled with more care than the gallery.
+    /// `open(worldID:sessionID:)` names the pinned world for the picture
+    /// **before** this update arrives — the client publishes on the next
+    /// main-queue turn — and a pinned world with no geometry earns its target
+    /// from nowhere else. So a target naming the world now being inspected is
+    /// kept; any other is dropped, and Live re-earns one from the next
+    /// coordinates.
+    func inspectionDidChange(to mode: WorldInspectionMode) {
+        inspection = mode
+        // Whatever is being fetched belongs to the world just left as well.
+        cancelGeometryFetch()
+        clearGeometry()
+        geometryOwner = nil
+        switch mode {
+        case .live:
+            renderTarget = nil
+        case .inspecting(let worldID):
+            if renderTarget?.worldID != worldID { renderTarget = nil }
+        }
+    }
+
     /// The synchronous half of the fetch: start it, and return.
     ///
     /// The `sink` closure must not block — it runs on the main queue, on the
     /// same turn the Tower's snapshot arrived — so the work goes into a `Task`
-    /// and this returns immediately. `[weak self]` because the task outlives
-    /// the sink call: a cartridge switch during a fetch leaves the request to
-    /// resolve into a `self` that is gone, which drops it and opens nothing.
+    /// and this returns immediately.
+    ///
+    /// One fetch at a time, and the newest wins. A fetch already out for
+    /// *different* coordinates is cancelled before this one starts: its
+    /// request in flight is aborted and its segment loop stops at the next
+    /// guard, so the Tower is not asked for segments of a manifest that will
+    /// not be drawn. A fetch out for the *same* coordinates is left alone and
+    /// nothing is started — that is the heartbeat, and `geometryDidChange`
+    /// would refuse the duplicate anyway under `lastGeometryRevision`.
+    ///
+    /// `[weak self]` because the task outlives the sink call. Honestly, it
+    /// does less than it looks: `self` is resolved once, and the method call
+    /// then holds it for the length of the fetch, so a view model discarded
+    /// mid-fetch lives until that fetch ends. What bounds it now is the
+    /// client's own timeout and the cancellations above — not a `deinit`,
+    /// which could not run while the call holds `self` in the first place.
     private func fetchGeometry(at coordinates: WorldGeometryCoordinates) {
-        Task { [weak self] in
+        if let current = geometryFetch {
+            guard current.coordinates != coordinates else { return }
+            current.task.cancel()
+        }
+        geometryFetchSerial += 1
+        let serial = geometryFetchSerial
+        let task = Task { [weak self] in
+            // Cancelled before its first turn — a forget, a pin or an unpin
+            // that landed between creating this task and running it — and
+            // `geometryDidChange` must not run at all: its first statements
+            // write the owner, the picture target and `.loading` before any
+            // `await`, over exactly what the caller just cleared.
+            guard !Task.isCancelled else { return }
             await self?.geometryDidChange(
                 worldID: coordinates.worldID,
                 sessionID: coordinates.sessionID,
                 revision: coordinates.revision
             )
+            // Let go of the handle only if it is still this fetch's, so a
+            // *finished* fetch — a failed one included — is not mistaken for
+            // one still out and the next heartbeat can retry. Compared by
+            // serial, not by coordinates: a fetch cancelled by
+            // `cancelGeometryFetch` and restarted for the same coordinates
+            // would otherwise have its record cleared by the one it replaced.
+            guard let self, self.geometryFetch?.serial == serial else { return }
+            self.geometryFetch = nil
         }
+        geometryFetch = (coordinates, serial, task)
+    }
+
+    /// Stop the fetch that is out, if one is, and forget it — so the next
+    /// coordinates start a fresh one even if they are the same coordinates.
+    ///
+    /// Not called from `clearGeometry()`, deliberately: that runs *inside*
+    /// `geometryDidChange` when the owner changes, on the very task this
+    /// would cancel. The callers are the paths that discard what is drawn
+    /// from outside the fetch — a forgotten world, a pin, an unpin.
+    private func cancelGeometryFetch() {
+        geometryFetch?.task.cancel()
+        geometryFetch = nil
+    }
+
+    /// Whether a fetch that has just come back may still publish what it got.
+    ///
+    /// ## Why the revision alone is not an identity
+    ///
+    /// Every publish in `geometryDidChange` used to be guarded on
+    /// `revision == lastGeometryRevision` and nothing else, on the reading that
+    /// a revision identifies one world's geometry. It does not.
+    /// `tower/results/world_builder_geometry.py` builds `geometry_revision` as
+    /// `sha256(content_hashes + placement_hashes)[:16]` — a pure function of
+    /// *content*, with no world id and no session id in it. **Two sessions that
+    /// have solved nothing hash the same empty input and carry the identical
+    /// constant revision**, which on a Tower with 96 session-less worlds and 29
+    /// abandoned sessions is not a corner case.
+    ///
+    /// The sequence that breaks: a fetch goes out for (W1, S1) at revision R;
+    /// the reader opens (W1, S2), whose revision is also R; `clearGeometry()`
+    /// nils the marker and the new fetch sets it back to R. The old fetch
+    /// returns, finds `revision == lastGeometryRevision`, and publishes S1's
+    /// manifest under S2's heading — which is precisely the class of defect
+    /// `geometryOwner` was introduced to close, arriving through the one door
+    /// it was not asked to guard.
+    ///
+    /// So both halves are asked, every time: the same *address* and the same
+    /// *revision at that address*.
+    ///
+    /// And whether the task running this fetch has been cancelled, which is
+    /// what `fetchGeometry(at:)` does to a superseded fetch and
+    /// `cancelGeometryFetch()` to a moot one. Not redundant with the marker:
+    /// a cancelled request throws at once, so a superseded fetch can resume
+    /// and reach this guard *before* the newer fetch has had its first turn
+    /// and moved the marker. In that window the cancellation is the only
+    /// thing that refuses it.
+    private func isStillOurs(revision: String, owner: WorldRenderTarget) -> Bool {
+        !Task.isCancelled && geometryOwner == owner && revision == lastGeometryRevision
     }
 
     /// Fetch the geometry the Tower has just named, unless it is the geometry
@@ -317,15 +714,55 @@ final class WorldBuilderViewModel: ObservableObject {
     /// this from a partially-known address is refused here rather than
     /// composing a URL out of what it happened to have.
     func geometryDidChange(worldID: String?, sessionID: String?, revision: String?) async {
-        guard
-            let worldID, let sessionID, let revision,
-            revision != lastGeometryRevision
-        else { return }
+        guard let worldID, let sessionID, let revision else { return }
+
+        // The Tower has named a world with geometry; that is what the viewer
+        // can draw. Recorded before the revision guard and before the fetch,
+        // deliberately: a heartbeat under an unchanged revision still names
+        // the world truthfully, and a manifest that fails — a 404 that raced
+        // a rebuild — must not withhold a picture the render route would
+        // serve. Guarded on equality so the two-second heartbeat does not
+        // republish an unchanged value.
+        let named = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
+
+        // A different world (or a different session of the same one) than the
+        // gallery describes: everything drawn is the previous owner's and goes
+        // before anything of the new owner's is fetched. `clearGeometry()`
+        // also moves the revision marker, so a fetch still in flight for the
+        // previous owner publishes nothing. See `geometryOwner`.
+        if let owner = geometryOwner, owner != named {
+            clearGeometry()
+        }
+        geometryOwner = named
+        if renderTarget != named { renderTarget = named }
+
+        guard revision != lastGeometryRevision else { return }
         lastGeometryRevision = revision
 
-        guard let manifest = try? await geometry.manifest(
-            worldID: worldID, sessionID: sessionID
-        ) else {
+        // Said before the request goes out, so a reader is told a fetch is in
+        // flight rather than shown an empty gallery for the length of it —
+        // **but only while the phone has no answer of its own yet.**
+        //
+        // This guarded on `hasDrawableGeometry` and that was wrong, in a way a
+        // review caught before a walk did. `hasDrawableGeometry` is false for a
+        // `.loaded` manifest whose segments are all unresolved or resolved
+        // without bounds, which is the normal first minute of any walk and the
+        // *permanent* state of an anchors-only build. The revision moves every
+        // couple of seconds, so the gallery would drop to "Fetching the
+        // geometry…" and back roughly 30 times a minute, forever. The same
+        // flicker applied to `.failed` and `.towerReportsNone`, both of which
+        // refetch on every report by design.
+        //
+        // So the rule is about *having answered*, not about having tiles: once
+        // this object holds any answer for this owner — a manifest, the Tower's
+        // 404, a failure — the refetch happens silently and replaces that
+        // answer when it lands. The spinner belongs to the first fetch only.
+        if !geometryStatus.hasAnswered { geometryStatus = .loading }
+
+        let manifest: WorldGeometryManifest
+        do {
+            manifest = try await geometry.manifest(worldID: worldID, sessionID: sessionID)
+        } catch {
             // Cleared rather than kept. A manifest that failed once — a 404
             // from a world root that was not configured yet, a request that
             // raced a rebuild — would otherwise be locked out until the world
@@ -334,9 +771,47 @@ final class WorldBuilderViewModel: ObservableObject {
             //
             // Guarded, because a newer call may already have claimed the
             // marker: clearing it then would make that newer fetch's own
-            // result look superseded and be refetched from scratch.
-            if revision == lastGeometryRevision { lastGeometryRevision = nil }
-            logGeometry("manifest FAILED world=\(worldID) revision=\(revision) — will retry on the next report")
+            // result look superseded and be refetched from scratch. The same
+            // answer decides whether this failure may be published — a
+            // superseded fetch must not overwrite a newer one's result.
+            //
+            // **Both halves, not just the revision.** See `isStillOurs`, which
+            // also refuses a cancelled fetch: the request it was waiting on
+            // was aborted, and that is not a failure to record against the
+            // world.
+            let isCurrentFetch = isStillOurs(revision: revision, owner: named)
+            if isCurrentFetch { lastGeometryRevision = nil }
+            // The three failures are three different sentences to a reader, and
+            // used to be one empty gallery. `notFound` is the Tower answering
+            // that it has no geometry for this session — its own claim, not the
+            // phone's ignorance — so it is not filed under `failed` at all.
+            let status: WorldGeometryStatus
+            // Explicit optional patterns (`.some`/`nil`) rather than bare
+            // case names: the value being switched over is an `Optional`, and
+            // the sugar that lets a bare case name match through one is not
+            // something to rely on where a mis-parse would be a silent
+            // behaviour change.
+            switch error as? WorldGeometryFetchError {
+            case .some(.notFound):
+                status = .towerReportsNone(detail: "no geometry for this session")
+            case .some(.undecodable):
+                status = .failed(WorldGeometryFailure(kind: .undecodable, detail: nil))
+            case .some(.transport(let detail)):
+                status = .failed(WorldGeometryFailure(kind: .unreachable, detail: detail))
+            case nil:
+                status = .failed(
+                    WorldGeometryFailure(
+                        kind: .unreachable, detail: error.localizedDescription
+                    )
+                )
+            }
+            if isCurrentFetch { geometryStatus = status }
+            logGeometry(
+                "manifest FAILED world=\(worldID) session=\(sessionID) revision=\(revision) "
+                    + "reason=\(Self.reason(for: error)) current=\(isCurrentFetch) "
+                    + "— will retry on the next report",
+                isError: true
+            )
             return
         }
 
@@ -345,14 +820,23 @@ final class WorldBuilderViewModel: ObservableObject {
         // often as a fetch takes. The last writer must be the newest report and
         // not the slowest request, so a superseded fetch publishes nothing and
         // simply ends here.
-        guard revision == lastGeometryRevision else { return }
+        guard isStillOurs(revision: revision, owner: named) else { return }
 
         // A convention this build does not implement renders plausibly and
-        // wrongly, so it renders not at all.
+        // wrongly, so it renders not at all — and now says which of the two
+        // that is. It used to leave an empty gallery behind, indistinguishable
+        // from a world the Tower never built.
         guard manifest.poseConvention.matchesThisBuild else {
-            fragmentsModel = WorldFragmentsModel(segments: [])
             geometryChunks = [:]
-            logGeometry("manifest REFUSED — pose convention is not the one this build implements")
+            geometryStatus = .failed(WorldGeometryFailure(kind: .poseConvention, detail: nil))
+            // The marker is left where it is on purpose: a refused convention
+            // does not become acceptable on a retry, and the next *changed*
+            // revision is the only thing that could make it so.
+            logGeometry(
+                "manifest REFUSED world=\(worldID) revision=\(revision) "
+                    + "— pose convention is not the one this build implements",
+                isError: true
+            )
             return
         }
 
@@ -382,6 +866,14 @@ final class WorldBuilderViewModel: ObservableObject {
         // at the end of this function.
         var anySegmentFailed = false
         for summary in manifest.segments {
+            // Asked before *every* segment, not only after the manifest and
+            // after the loop. Those two guards refused a superseded fetch's
+            // publish, but between them it went on requesting every segment
+            // the dead manifest named — sequentially, each bounded only by the
+            // client's timeout — with a newer fetch queued behind the same
+            // Tower. Stopping here is what makes a supersede cost at most the
+            // one request already in flight.
+            guard isStillOurs(revision: revision, owner: named) else { return }
             // The cache hit that decides whether a placement change is ever
             // seen. Keyed on `contentHash` this line is the whole bug: the
             // content hash of a segment that gained a placement is unchanged
@@ -418,10 +910,28 @@ final class WorldBuilderViewModel: ObservableObject {
 
         // Checked again, for the same reason: the segment fetches above are the
         // slow part, and a newer manifest may have landed during them.
-        guard revision == lastGeometryRevision else { return }
+        guard isStillOurs(revision: revision, owner: named) else { return }
         geometryChunks = chunks
-        fragmentsModel = WorldFragmentsModel(
-            segments: manifest.segments, isCurrent: manifest.current
+        // How many of the segments the manifest named have no chunk to draw.
+        //
+        // Counted over the **summaries**, not as `segments.count - chunks.count`,
+        // which is what this was and which is wrong twice over. `chunks` is
+        // keyed by `cacheKey`, and a chunk that raced a rebuild is filed under
+        // its OWN key rather than the key that asked for it — so it swells the
+        // dictionary while drawing nothing, and the subtraction reads zero when
+        // a tile is blank. In the other direction, two summaries that share a
+        // cacheKey collapse to one entry, and the subtraction manufactures a
+        // segment that was never missing.
+        //
+        // Asking each summary whether its own key resolved is immune to both,
+        // and is exactly the question the gallery answers when it draws a blank
+        // tile. It is also broader than `anySegmentFailed`, deliberately: a
+        // chunk that arrived under a different key is as undrawable as one that
+        // never arrived, and the reader is owed the same sentence either way.
+        let unfetched = manifest.segments.filter { chunks[$0.cacheKey] == nil }.count
+        geometryStatus = .loaded(
+            WorldFragmentsModel(segments: manifest.segments, isCurrent: manifest.current),
+            unfetched: unfetched
         )
 
         // Published first, and *then* the marker is cleared: whatever did
@@ -435,7 +945,7 @@ final class WorldBuilderViewModel: ObservableObject {
         // The manifest path clears the marker for the same reason and under the
         // same staleness guard, so a newer update already in flight is not
         // stomped.
-        if anySegmentFailed, revision == lastGeometryRevision {
+        if anySegmentFailed, isStillOurs(revision: revision, owner: named) {
             lastGeometryRevision = nil
         }
 
@@ -444,6 +954,133 @@ final class WorldBuilderViewModel: ObservableObject {
                 + "points=\(chunks.values.reduce(0) { $0 + $1.points.count })"
                 + (anySegmentFailed ? " SOME FAILED — will retry on the next report" : "")
         )
+    }
+
+    // MARK: Saved worlds
+
+    /// Ask the Tower which worlds it holds. Called by the picker as it opens.
+    ///
+    /// `try?`-shaped like the geometry fetches, with the failure kept as a
+    /// sentence rather than swallowed: the picker has to say why it is empty,
+    /// and "no world root" and "the request failed" are different answers.
+    ///
+    /// ## Why the request runs in a task of its own
+    ///
+    /// This used to fetch on the caller's task, and the picker's caller is a
+    /// `.task` modifier — cancelled the moment the list is pushed aside for a
+    /// world, which is what a person opens the picker to do. The cancellation
+    /// reached `URLSession`, the fetch threw, and the picker came back to
+    /// `worlds = []` under "The world list could not be fetched: cancelled" —
+    /// a failure sentence for a request nobody refused. Nor was there a
+    /// single-flight guard: the pull-to-refresh and the `.task` overlapped,
+    /// and whichever finished last cleared `isLoadingWorlds` under the other.
+    ///
+    /// So the fetch is unstructured and shared. A caller that arrives while
+    /// one is out awaits *that* one; a caller that is cancelled while waiting
+    /// simply stops waiting, and the list lands for whoever looks next.
+    /// Nothing here reads `Task.isCancelled` because nothing can cancel the
+    /// request — that is the guarantee, not an omission.
+    func loadWorlds() async {
+        if let inFlight = worldsLoad {
+            await inFlight.value
+            return
+        }
+        let load = Task { await performLoadWorlds() }
+        worldsLoad = load
+        await load.value
+    }
+
+    /// The load itself. `worldsLoad` is the handle to it, held while it runs.
+    private var worldsLoad: Task<Void, Never>?
+
+    private func performLoadWorlds() async {
+        isLoadingWorlds = true
+        defer {
+            isLoadingWorlds = false
+            worldsLoad = nil
+        }
+        do {
+            worlds = try await library.worlds().worlds
+            worldListFailure = nil
+        } catch let error as WorldListFetchError {
+            worlds = []
+            switch error {
+            case .notFound:
+                worldListFailure = "The Tower answered that no world root is configured, so it has no saved worlds to list."
+            case .undecodable:
+                worldListFailure = "The Tower's world list could not be read as the contract this build implements."
+            case .transport(let detail):
+                worldListFailure = "The world list could not be fetched: \(detail)"
+            }
+            logWorldListFailure(worldListFailure ?? "\(error)")
+        } catch {
+            worlds = []
+            worldListFailure = "The world list could not be fetched: \(error.localizedDescription)"
+            logWorldListFailure(error.localizedDescription)
+        }
+    }
+
+    /// A failed listing, in the unified log.
+    ///
+    /// `os.Logger` rather than `print`, and not behind `#if DEBUG`: the
+    /// picker is a read-only surface that exists in Release, and on the
+    /// 2026-09-06 physical session the phone was a Release build. The only
+    /// record of why it showed "No saved worlds have been listed yet." was
+    /// the sentence on screen, which nobody photographed. Console.app can
+    /// read this one back.
+    private func logWorldListFailure(_ detail: String) {
+        Self.logger.error("worlds FAILED — \(detail, privacy: .public)")
+        logGeometry("worlds FAILED — \(detail)")
+    }
+
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "Glasses",
+        category: "WorldBuilder"
+    )
+
+    /// Open a stored world. The client re-subscribes with the pin, and the
+    /// pinned status payload then carries the geometry address exactly as the
+    /// live one does — so the fetch path below needs no change.
+    ///
+    /// The gallery is cleared **here**, not when the new manifest lands: until
+    /// it does, the fragments on screen would be the previous world's, under a
+    /// heading naming this one.
+    func open(worldID: String, sessionID: String?) {
+        client.inspect(worldID: worldID, sessionID: sessionID)
+        cancelGeometryFetch()
+        clearGeometry()
+        geometryOwner = nil
+        renderTarget = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
+    }
+
+    /// Back to the live world, by the same route.
+    func returnToLive() {
+        client.followLive()
+        forgetGeometry()
+    }
+
+    /// Forget what is drawn and rearm the fetch. A fetch already in flight for
+    /// the previous world finds the marker moved and publishes nothing —
+    /// the same staleness guard `geometryDidChange` already relies on.
+    private func clearGeometry() {
+        lastGeometryRevision = nil
+        // `.notAddressed` and not `.noWorld`: this is called when the world
+        // being looked at changes, and there is still a world — what there is
+        // not, yet, is an address for its geometry. `forgetGeometry()` is the
+        // one that says there is no world at all.
+        geometryStatus = .notAddressed
+        geometryChunks = [:]
+    }
+
+    /// `clearGeometry()` plus the owner and the picture target: nothing on
+    /// this screen describes any world any more — so nothing should still be
+    /// fetching for one, either.
+    private func forgetGeometry() {
+        cancelGeometryFetch()
+        clearGeometry()
+        geometryStatus = .noWorld
+        geometryOwner = nil
+        renderTarget = nil
     }
 
     /// The geometry pull, in the console.
@@ -463,10 +1100,111 @@ final class WorldBuilderViewModel: ObservableObject {
     /// the revision moves every couple of seconds and a line per segment would
     /// be ~50 prints a tick, which is the noise level that made the camera path
     /// decimate its own logging.
-    private func logGeometry(_ message: String) {
+    ///
+    /// ## Why it is no longer `#if DEBUG print`
+    ///
+    /// It was, and that is why the 2026-09-06 field failure could not be
+    /// diagnosed: the phone was a **Release** build, so every line this
+    /// function wrote was compiled out, and the only record of what the
+    /// geometry path did was the sentence on screen — which said the glasses
+    /// had mapped nothing, and was wrong. `logWorldListFailure` had already
+    /// learned this lesson for the world list and says so in its own comment;
+    /// this is the same fix applied to the path that actually answers the
+    /// program's central physical question.
+    ///
+    /// `privacy: .public` for the same reason it is public there: world ids,
+    /// session ids and revisions are Tower-side identifiers, not the wearer's
+    /// data, and redacting them to `<private>` would leave a log that records
+    /// that something failed and not which thing. The `print` stays under
+    /// `#if DEBUG` so a developer's console is unchanged.
+    private func logGeometry(_ message: String, isError: Bool = false) {
+        if isError {
+            Self.logger.error("geometry \(message, privacy: .public)")
+        } else {
+            Self.logger.info("geometry \(message, privacy: .public)")
+        }
         #if DEBUG
         print("[Glasses][Geometry] \(message)")
         #endif
+    }
+
+    /// One short word for what a geometry fetch threw, for the log line.
+    /// Separate from `WorldGeometryFailure.message`, which is prose for a
+    /// person; this is a token for a search across a Console.app capture.
+    private static func reason(for error: Error) -> String {
+        switch error as? WorldGeometryFetchError {
+        case .some(.notFound): return "404-no-geometry"
+        case .some(.undecodable): return "undecodable-manifest"
+        case .some(.transport(let detail)): return "transport(\(detail))"
+        case nil: return "other(\(error.localizedDescription))"
+        }
+    }
+
+    // MARK: What the screen actually says
+
+    // Six derived values, all pure functions of `state`, `geometryStatus`,
+    // `renderTarget` and the client's finalization record. None of them stores
+    // anything: a second stored copy of a derived fact is a second answer able
+    // to disagree with the first, and the whole reason this pass exists is that
+    // two such answers disagreed in the field.
+
+    /// The Tower's own account of what it built, from the current snapshot.
+    /// `nil` when there is no snapshot — which is "no world", not "a world that
+    /// reported nothing", and the two must not collapse.
+    var evidence: WorldEvidence? { WorldEvidence(snapshot: state.snapshot) }
+
+    /// `lifecycle.finalization.final_solve`, given meaning. Decoded since
+    /// 2026-09-06 and read by nothing until now.
+    ///
+    /// Reads the `@Published finalization` above, not `client.finalization`.
+    /// Reading it live off the client made this sentence unable to change: the
+    /// client dedupes `state`, `presentation` is computed, and nothing else
+    /// invalidated the view, so a `pending` to `solved` flip that left the
+    /// snapshot alone left "The final pass has not run yet." on screen for the
+    /// whole length of the solve.
+    var finalSolve: WorldFinalSolve { WorldFinalSolve(word: finalization?.finalSolve) }
+
+    /// What this world is doing, in the normal surface's vocabulary. `nil` for
+    /// the states that have no world in them.
+    var stage: WorldStage? {
+        WorldStage.stage(for: state, evidence: evidence, finalization: finalization)
+    }
+
+    /// Which 3D reconstruction can be shown, best first. The primary thing on
+    /// screen for a saved world.
+    var reconstruction: WorldReconstruction {
+        WorldReconstruction.ladder(
+            target: renderTarget, stage: stage, finalSolve: finalSolve, evidence: evidence
+        )
+    }
+
+    /// What the sparse gallery says when it has nothing to draw — decided from
+    /// the fetch's state and the Tower's claims, never from an empty array.
+    var geometryAccount: WorldGeometryAccount {
+        WorldGeometryAccount.account(for: geometryStatus, evidence: evidence)
+    }
+
+    /// Whether an interrupted or partial world still holds something, and what
+    /// can be done about it — which, there being no rebuild route on the Tower,
+    /// is nothing this app may offer a button for.
+    var recoverability: WorldRecoverability? {
+        guard let stage else { return nil }
+        let reason: String?
+        if case .interrupted(_, let towerReason) = state { reason = towerReason } else { reason = nil }
+        return WorldRecoverability.of(stage: stage, evidence: evidence, reason: reason)
+    }
+
+    /// The six above in one value, which is what the canvas is handed. Built
+    /// here and nowhere else.
+    var presentation: WorldPresentation {
+        WorldPresentation(
+            stage: stage,
+            evidence: evidence,
+            finalSolve: finalSolve,
+            reconstruction: reconstruction,
+            account: geometryAccount,
+            recoverability: recoverability
+        )
     }
 
     /// Why the cartridge is or is not usable, given the current connection.
@@ -499,7 +1237,7 @@ final class WorldBuilderViewModel: ObservableObject {
         switch state {
         case .unsupported(let reason): return reason
         case .failed(let failure): return failure.message
-        case .idle, .awaitingFirstUpdate, .receiving, .finalizing, .finalized: return nil
+        case .idle, .awaitingFirstUpdate, .receiving, .finalizing, .finalized, .interrupted: return nil
         }
     }
 }

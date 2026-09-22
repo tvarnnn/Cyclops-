@@ -1,0 +1,82 @@
+#!/bin/sh
+# Glasses lane guard.
+#
+# Tracked copy:  <repo>/.githooks/pre-commit
+# Live copy:     <repo>/.git/hooks/pre-commit   (copy this file there)
+#
+# Do NOT activate this with `core.hooksPath`. That setting REPLACES
+# .git/hooks rather than adding to it, and it resolves per worktree against
+# each worktree's own top level -- so on any branch that predates this file
+# (main, and every branch cut before 2026-08-29) git would find no hook and
+# silently run none. Copying it into .git/hooks puts one hook in the shared
+# common dir, where it covers every worktree on every branch.
+#
+# Why this exists: on 2026-08-29 two autonomous agents shared the canonical
+# checkout. The second one ran `git switch -c` and inherited the first one's
+# dirty files onto its own branch. `git add -A && git commit` would have
+# committed another lane's work. See the lane isolation policy in CLAUDE.md.
+#
+# Rule enforced: agents commit from a linked worktree, never from the
+# canonical checkout. Git already refuses to check one branch out in two
+# worktrees, so one-lane-per-worktree makes the collision impossible.
+
+git_dir=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || exit 0
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+
+# A linked worktree has its own git dir under <common>/worktrees/<name>.
+# Equal paths mean this is the canonical (main) worktree.
+[ "$git_dir" != "$common_dir" ] && exit 0
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# Integration merges are the canonical checkout's actual job, so let them
+# finish. A conflict-free merge auto-commits without consulting this hook at
+# all -- git looks for pre-merge-commit there, and none is installed -- so
+# refusing only the hand-resolved case would block the careful path while
+# waving the automatic one through. Completing a cherry-pick or a revert is
+# the same situation.
+for _state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+	if [ -e "$git_dir/$_state" ]; then
+		printf '%s\n' \
+			"lane guard: allowing an in-progress ${_state%_HEAD} to be completed here." >&2
+		exit 0
+	fi
+done
+
+if [ -z "$CLAUDECODE" ] && [ -z "$GLASSES_LANE_GUARD_STRICT" ]; then
+	printf '%s\n' \
+		"lane guard: committing directly in the canonical checkout (branch: ${branch})." \
+		"           Allowed for a human. Agents are refused here." >&2
+	exit 0
+fi
+
+cat >&2 <<EOF
+
+  LANE GUARD: refusing this commit.
+
+  You are committing in the CANONICAL checkout:
+      $(git rev-parse --show-toplevel)
+      branch: ${branch}
+
+  The canonical checkout is not a lane. It is shared by every agent, so its
+  working tree can hold another lane's uncommitted files -- and \`git switch\`
+  carries them silently onto your branch. Committing here can publish work
+  that is not yours.
+
+  Get your own worktree instead:
+
+      git -C "$(git rev-parse --show-toplevel)" worktree add \\
+          C:/Users/<you>/Projects/Glasses-worktrees/<lane-name> -b <your-branch>
+
+  Then do all of your work there. Git will refuse to let a second worktree
+  take your branch, which is the guarantee this hook is protecting.
+
+  If you already have edits in the canonical tree, move them -- do not commit:
+      git stash push -u -m "<lane>"      # in the canonical checkout
+      git stash pop                      # in your new worktree
+
+  Humans: this hook allows you through with a warning; it only refuses agents.
+  To override deliberately: git commit --no-verify
+
+EOF
+exit 1

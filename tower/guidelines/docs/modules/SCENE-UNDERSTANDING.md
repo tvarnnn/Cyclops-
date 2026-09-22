@@ -2,19 +2,22 @@
 
 ## Status
 
-**CURRENTLY IMPLEMENTED** as of 2026-08-22 (`tower/scene/`), with one
-part deliberately off by default.
+**CURRENTLY IMPLEMENTED** as of 2026-08-22 (`tower/scene/`), re-architected
+2026-09-07 on measured evidence
+(`docs/superpowers/research/2026-09-07-scene-understanding-architecture.md`).
 
 | Part | Status |
 |---|---|
-| Object detection, anonymous tracking, counts from tracks | **CURRENTLY IMPLEMENTED** |
-| Camera-relative positions and relationships | **CURRENTLY IMPLEMENTED** |
-| Query layer, including refusals | **CURRENTLY IMPLEMENTED** |
-| Coarse head orientation ("appears to be facing your direction") | **IMPLEMENTED, OFF BY DEFAULT** — 43.4 ms per call on CUDA, 956.4 ms on CPU, and CPU is the default device. See Orientation |
+| Capability | **PRODUCT-MANAGED** — offered when the `[ml]` extra imports (`TOWER_SCENE_UNDERSTANDING` unset = auto) |
+| Activation | **STREAM AND WATCHER** — runs while a phone streams AND a client subscribes to the live scene; last of either out stops it and releases the models |
+| Object detection | **CURRENTLY IMPLEMENTED** — RT-DETRv2-R18 on CUDA (mAP50 0.669 on 700 labelled images), SSDLite320 on CPU (0.367) |
+| Anonymous tracking, counts from tracks | **CURRENTLY IMPLEMENTED** — cardinality-first Hungarian, kept 1.0 s, **counted while seen within 0.5 s** |
+| Camera-relative positions, incl. people as side counts | **CURRENTLY IMPLEMENTED** — bands 0.35/0.65 with hysteresis |
+| Apparent size of people (large/medium/small), partial figures at the bottom edge | **CURRENTLY IMPLEMENTED** — sizes in the picture, never distances |
+| Coarse facing ("appears to be facing your direction") | **EXPERIMENTAL, ON BY DEFAULT** — a face detector on each tracked person's box, two states only (toward / not established), validated on COCO stills at 0.83 precision, never on this camera |
 | World-anchored positions | **BLOCKED** — no live world pose exists. Camera-relative is the honest alternative and is what ships |
 | Depth-dependent relationships (`in_front_of`, `on`, `inside`) | **REFUSED**, each with the evidence it would need |
-| Registration as a production module | **BLOCKED** at the same V1.0/V1.1 boundary as every other cartridge |
-| Validation on real people | **BLOCKED** — there is no imagery of people anywhere on this host |
+| Validation on real people | **BLOCKED** — no bystander in 45,594 corpus frames (2026-09-07 audit); COCO stills stand in and the wire says so |
 
 Plan: `docs/superpowers/plans/2026-08-22-scene-understanding-v1.md`.
 Report: `reports/2026-08-22-scene-understanding-v1-report.md`.
@@ -108,69 +111,53 @@ something looks is the first step toward recognising it again. A
 session, and a person who leaves and returns is deliberately a **new
 track**.
 
-## Orientation, and why it is off
+## Orientation: a face, visible, in a person's box
 
 *"How many people appear to be facing my direction?"* needs evidence. A
 person box carries none — inferring facing from box shape would be
 exactly the weak evidence the brief forbids.
 
-Real evidence exists: COCO keypoints include eyes and ears, and their
-**visibility pattern** is genuine coarse-orientation evidence. Both eyes
-and an ear means the front of the head is toward the camera; both ears
-and no eyes means the back of it.
+**What shipped first, and why it is gone.** The 2026-08-22 design inferred
+facing from which COCO keypoints a `keypointrcnn_resnet50_fpn` reported as
+visible: both eyes and an ear meant "toward", both ears and no eye meant
+"away", one ear meant "profile". On 2026-09-07 that rule was checked
+against 966 human-labelled persons in COCO val2017, with the ground truth
+derived from the annotators' own visibility flags. It called **220 of 228
+true-profile people "toward"**: the keypoint model reports a confident
+score and a plausible coordinate for an occluded eye, so a score threshold
+does not track human visibility exactly where it matters. `toward`
+precision was 0.56–0.62 across every threshold, and `away` / `profile`
+were 0.02–0.34 precise — wrong more often than right. It also cost 43 ms
+on CUDA and 956 ms on CPU per frame.
 
-Measured cost — warm medians over **754 real corpus frames** at 360×640,
-decode excluded, `torch.cuda.synchronize()` bracketing every CUDA call
-(`docs/superpowers/research/2026-08-26-scene-understanding-measurements.md`):
+**What ships now.** `cv2.FaceDetectorYN` — the vendored YuNet model World
+Builder already uses for redaction — runs on the upper part of each
+tracked person's box. A face found with a score ≥ 0.9 means the front of
+that head is toward the camera. On the same 966 persons that is **0.83
+precision / 0.64 recall** for `toward` (0.6: 0.63 / 0.94; 0.8: 0.69 /
+0.89); a landmark-yaw refinement and an AND with the keypoint model added
+nothing over raising the threshold. It costs **~9 ms per face on CPU**,
+no VRAM.
 
-| Model | CUDA | CPU |
-|---|---|---|
-| `ssdlite320_mobilenet_v3_large` (detection) | **30.4 ms** | **32.9 ms** |
-| `keypointrcnn_resnet50_fpn` (keypoints) | **43.4 ms** | **956.4 ms** |
-| keypoints, p95 | 50.6 ms | 1112.8 ms |
+**Two states only.** `toward_wearer`, or `unknown` meaning *not
+established* — which covers facing away, side-on, too small to tell, and
+never measured alike. "Facing away" and "side-on" are never produced,
+because nothing measured on this platform produces them with usable
+precision, and the wire says so (`facing_states_withheld_reason`).
 
-**The device is the variable that matters, and none of this document's
-earlier figures named one.** This section used to say 798 ms, "24× the
-detector" and "2.5× the ~300 ms interval the glasses deliver". All four
-numbers are wrong:
+**Voting and ageing.** One frame's detection is one vote; a track is
+reported `toward` only when two of its last three estimates agree, at the
+tracker's ~250 ms cadence — about half a second of evidence to make the
+claim and about half a second to drop it. Every estimate carries its age
+and expires to `unknown` after 6 s. Confidence never exceeds MEDIUM.
 
-- Orientation is **43.4 ms on CUDA** and **956.4 ms on CPU** — a 22.0×
-  spread, and the CPU figure is *worse* than either number previously
-  documented, because those were measured on synthetic input.
-- The detector is launch-bound at an internal 320 px and gains almost
-  nothing from the GPU, so orientation is **1.43× the detector on CUDA**
-  and 29.1× on CPU. The ratio inverts with the device.
-- The delivered frame interval, measured from the corpus's own
-  `frames.jsonl` receipt timestamps, is **83.5 ms (12.0 fps)**, not
-  ~300 ms — the docs were off by 3.6×. Against the real interval
-  orientation is **0.52× on CUDA** and 11.5× on CPU.
-- Cost is flat in the number of people: ~1 ms each, 40.0 ms at zero to
-  44.3 ms at four. VRAM peaks at 988 MB reserved of 12 GB.
-
-**The cadence survives; its constant did not.** Detector plus orientation
-is 73.8 ms against an 83.5 ms budget on CUDA — per-frame fits at the
-median and overruns at p95 (86.4 ms), at an 88% duty cycle with no
-headroom and no accuracy to show for it, since a person's facing does not
-change in 83 ms. So `ORIENTATION_INTERVAL_S` is now **3 delivered frames,
-~250 ms**, not 2.0 s. The stride is `TrackerPolicy.min_hits`: estimating
-facing more often than a track can be confirmed buys nothing.
-
-**Every estimate still carries its age**, expiring to `unknown` rather
-than being deleted — a missing field would read as "not facing". CUDA did
-*not* make that bookkeeping redundant, for two reasons unrelated to 43 ms:
-`TorchvisionPoseEstimator` defaults to `device="cpu"`, where the original
-argument holds in full at 956 ms; and `age_estimate`'s clamp guards a
-backward NTP step that pushed an expiry deadline into the future, which is
-a clock bug, not a latency one.
-
-**The old unblocker is spent.** This document used to say torch was
-CPU-only on this host and a restored CUDA build was what would change the
-decision. That build exists — `torch 2.13.0+cu132`, verified executing on
-an RTX 5070 (Blackwell, sm_120) — and the numbers above came from it. The
-cost question is closed. **Accuracy is not measured and cannot be here**:
-there is no bystander footage on this host, and the corpus's person boxes
-are almost certainly the wearer's own torso, so `facing_from_keypoints`
-remains unvalidated against ground truth.
+**Status: EXPERIMENTAL.** COCO stills are third-party photographs — front
+lit, in focus, and 47% of the people in them face the camera because
+photographers point cameras at faces. That base rate is an upper bound
+for a glasses camera in a room where most people are not looking at the
+wearer, and no person has been measured through these glasses. The wire
+carries `orientation_status: "experimental"` and `orientation_validation`
+so a client can say so.
 
 ### It is never gaze
 
@@ -262,13 +249,20 @@ because the purpose is a live answer:
 
 ## Limitations
 
-- **Detection accuracy on real people is unvalidated.** There is no
-  imagery of people anywhere on this host, so the pipeline is measured
-  and the detector's real-world behaviour is not.
+- **Detection accuracy on real people is unvalidated on this camera.**
+  There is no bystander in any of the 45,594 corpus frames, so accuracy
+  was measured on 700 human-labelled COCO images (per-image people count
+  exact on 73% of them, mean error 0.48) and the detector's behaviour
+  through these glasses is not measured.
+- **The wearer's own body is in frame in most captures.** A person box cut
+  off by the bottom edge with no head region is reported apart
+  (`partial_bottom_edge`) rather than counted; a box that includes an arm
+  raised into the head region is still counted, and that is the
+  remaining source of "1 person" in an empty room.
 - **Camera-relative only.** "Left of" means left in the current view and
   means something else the moment the wearer turns.
 - **No depth**, hence the refusals above.
-- **Orientation is coarse and optional**, and is not gaze.
+- **Orientation is coarse, experimental, and two-valued**, and is not gaze.
 - **A count is of what is *visible*.** An occluded or out-of-frame person
   is not counted, and absence of a detection is never evidence of
   absence.

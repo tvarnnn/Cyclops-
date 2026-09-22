@@ -10,9 +10,27 @@ dependencies = [
     "opencv-python-headless>=4.9",
     "numpy>=1.26",
     "psutil>=5.9",
+    # DECLARED, not borrowed. `start_tower.ps1` hands uvicorn
+    # `--env-file .env`, which uvicorn reads through python-dotenv, and
+    # `scripts/world_builder_env_check.py` reads the same file through the
+    # same library so its verdict is about the Tower that is going to run.
+    # It arrived only as `uvicorn[standard]`'s own extra, so a venv built
+    # with plain `uvicorn` -- or a future uvicorn that drops it -- would
+    # have made the pre-flight report a RED calibration verdict on a
+    # correctly configured machine, silently. Measured by a reviewer.
+    "python-dotenv>=0.13",
 ]
 
 [project.optional-dependencies]
+# The World Builder's global solver (tower/world_builder/global_solve.py).
+# BSD-3, Windows cp312 wheel, depends on numpy only; CPU-only on Windows,
+# which is fine at 360x640 (a 438-keyframe walk solves in ~90 s). Optional:
+# without it the World Builder behaves exactly as before and says so.
+# NOTE for product licensing review: the wheel bundles Ceres with
+# SuiteSparse (CHOLMOD has GPL modules).
+sfm = [
+    "pycolmap==4.2.0",
+]
 dev = [
     "pytest>=8.0",
     # httpx2, not httpx: starlette.testclient emits a
@@ -140,6 +158,22 @@ semantic = [
     #
     # `huggingface_hub` and `safetensors` are already present via timm,
     # so they are not listed.
+    "transformers>=5.16,<6",
+]
+
+scene = [
+    # Scene Understanding's CUDA detector. RT-DETRv2-R18
+    # (`PekingU/rtdetr_v2_r18vd`, Apache-2.0, ~80 MB of weights fetched
+    # from the Hugging Face hub on first load) runs through the same
+    # `transformers` the `semantic` extra already pins, so a host that
+    # installed that extra needs nothing more. Without it Scene
+    # Understanding still runs, on the torchvision SSDLite320 detector
+    # the `ml` extra carries, and the wire names which detector counted.
+    #
+    # Measured 2026-09-07 on 700 human-labelled COCO val2017 images at
+    # this camera's 640 px long side: mAP50 0.669 against SSDLite320's
+    # 0.367, person AP50 0.856 against 0.604, at 17 ms a frame on the
+    # RTX 5070 against 30 ms. See tower/scene/detect.py.
     "transformers>=5.16,<6",
 ]
 

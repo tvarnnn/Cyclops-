@@ -36,11 +36,15 @@ def _env_without_tower_settings() -> dict:
     Everything else is preserved, so the child still finds its
     interpreter, its PATH and its `sys.path`.
     """
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("TOWER_")
-    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("TOWER_")}
+    # Scene Understanding is switched OFF for both probes, deliberately.
+    # Since 2026-09-07 an unset variable means auto, and auto constructs
+    # the scene session at `create_app()` on a host that has the [ml]
+    # extra -- which imports torch on purpose. These probes are about
+    # the Lab and the OCR path; the scene cartridge's own boot cost is
+    # measured and tested in tests/test_scene_capability.py.
+    env["TOWER_SCENE_UNDERSTANDING"] = "off"
+    return env
 
 
 def _imports(path: pathlib.Path) -> list[str]:
@@ -133,6 +137,14 @@ _RESULT_CHANNEL_ADAPTERS = frozenset(
     {
         TOWER / "results" / "world_builder.py",
         TOWER / "results" / "world_builder_geometry.py",
+        # Added 2026-09-06: the saved-worlds listing (GET /worlds), an
+        # adapter over the World Builder store exactly like the geometry
+        # producer above.
+        TOWER / "results" / "world_builder_library.py",
+        # Added 2026-09-06: the interactive viewer (GET /worlds/{id}/render),
+        # the same shape again -- an adapter over the store, named after
+        # the cartridge, serving HTML where the others serve JSON.
+        TOWER / "results" / "world_builder_render.py",
         TOWER / "results" / "__init__.py",
         # Added 2026-08-27 with the Scene Understanding and Document
         # Memory wire paths. Same shape, same rule: one adapter per
@@ -583,6 +595,15 @@ def test_importing_the_lab_does_not_import_torch():
     inside a function, and this is the only way to check that -- an
     in-process assertion would pass merely because some earlier test in
     the same session had already imported it.
+
+    Scene Understanding is switched OFF for the probe, deliberately. Since
+    2026-09-07 it is offered automatically on a host that has the [ml]
+    extra, and offering it means constructing its session at boot, which
+    imports torch on purpose (`cartridge_runtime._scene_session` explains
+    why that import is eager). That is the cartridge's decision, not the
+    Lab's, and this test is about the Lab. A host WITHOUT the extra is
+    covered by `tests/test_scene_capability.py`, which blocks torch and
+    asserts the Tower still builds and says what is missing.
     """
     import subprocess
     import sys

@@ -189,10 +189,12 @@ imported, so they reach `get_settings()`.
 | `TOWER_DEV_MODE`   | `true`    | Enables debug-level logging. Does **not** control the per-frame `[Tower][Frame]` lines, which are INFO and always on |
 | `TOWER_CV_EXPERIMENT` | `baseline` | **Startup default only.** Which CV experiment this Tower arms at boot: `baseline`, `edge_detection`, `frame_quality`, `feature_detection`, `optical_flow`, `redaction_impact`, `object_detection`, `depth`. Since 2026-08-27 a client selects an experiment at runtime with `cv_lab_start` and no restart — see `docs/contracts/EXPERIMENTAL-CV-LAB.md`. This variable is what runs before anyone asks, so that a client which knows nothing about the CV Lab still gets a `frame_result` for every frame |
 | `TOWER_CV_DEVICE`   | `auto`    | Device for model-backed experiments (`auto`, `cpu`, or `cuda`) |
+| `TOWER_CV_TORCH_THREADS` | `auto` | torch's intra-op thread budget while a model-backed CV experiment is armed. `auto` is **2 on CUDA, 4 on CPU**, from a measured sweep (`tower/experiments/depth.py`); a positive integer is applied as given; `0` leaves torch's default of one thread per logical CPU — which on a 20-core host is twenty OpenMP workers spin-waiting between kernel launches, and is what "object detection pegs the machine at 99% CPU" was (12.6 cores at 20 threads against 1.8 at 2, same latency). Process-wide, like torch's own setting; if `TOWER_SCENE_TORCH_THREADS` is also set, whichever model loaded last decides |
 | `TOWER_CAPTURE_ROOT` | *(unset)* | Arms the raw dataset recorder at this path. **Unset means no recording, ever.** Arming is not recording: nothing is written until a `stream_start` arrives, and `GET /health` reports the state. Use `data` — `tower/capture.py` appends `captures/<id>` itself |
 | `TOWER_WORLD_ROOT` | *(unset)* | Where World Builder worlds are stored. **Unset means iOS sees World Builder as unsupported.** Use `data/world_builder` — `tower/world_builder/store.py` appends `worlds/<id>` itself, and the value must equal `DEFAULT_ROOT` in `scripts/world_build_session.py` or the result channel reads a different tree than the builder writes |
 | `TOWER_WORLD_AUTOBUILD` | `true` | Whether each capture automatically gets a World Builder follower attached. Only has an effect when `TOWER_WORLD_ROOT` is set. Turn it off to keep reporting existing worlds while building no new ones — useful when reprocessing a recorded capture offline, and the escape hatch if auto-attach misbehaves |
 | `TOWER_WORLD_REBUILD_EVERY` | `4` | Keyframes between mid-walk rebuilds in the attached follower. **Deliberately not the script's own default of `0`**, which means "build once, at the end" — correct for a batch reprocess and wrong for a live walk. `0` here is why the 2026-08-24 test showed a climbing keyframe count and no geometry at all until the capture closed |
+| `TOWER_WORLD_REGISTER` | `true` | Whether the follower tries to place the walk's segments in one coordinate frame when the walk ends. Off is what shipped before 2026-08-29, and off is why every walk arrived on the phone as disconnected fragments: the registration pass existed, was tested, persisted and served, and nothing invoked it. It runs **once, after the final build, in the follower subprocess** — never on the frame path — and costs ~20 s on a 36-segment walk. Refusal is still the default answer for any pair, so this makes a world no more confident, only less silent. Turn it off if a walk must finalise the instant it stops; the reconstruction is unaffected |
 
 The server does **not** bind `0.0.0.0` unless you say so: `TOWER_HOST` is
 inert, and uvicorn's own default is `127.0.0.1`. `scripts\start_tower.ps1`
@@ -290,6 +292,25 @@ physical procedure that changes this.
 | Keyframes climb, geometry stays absent | Expected mid-walk before the first rebuild. If it never appears, check `TOWER_WORLD_REBUILD_EVERY` is not `0` |
 | Poses and points are 0 | Uncalibrated. See above |
 | The world stops growing while the camera is live | Check the capture manifests under `<capture root>/captures/`. A gap longer than 90 s between captures is a new walk by design, and gets its own world |
+| The phone shows many fragments and none are connected | Read the `registration` block the follower prints when the walk ends, or re-run `scripts/world_registration.py --world <id>`. Every candidate pair is reported with the reason it was refused and how much evidence it had. `no keyframe of either segment matched` means retrieval — the walk never showed the same place twice well enough; anything else means the pairs were found and the estimate was not trusted |
+
+### Re-measuring a walk without walking it again
+
+`scripts/world_replay.py` rebuilds a recorded walk from its raw frames,
+deterministically, so a registration or tracking change can be scored against
+real physical input instead of another walk. It reproduces the two 2026-08-29
+sessions figure for figure and says so in its own output:
+
+```powershell
+.venv\Scripts\python.exe scripts\world_replay.py --case worldB `
+    --root C:\Users\<you>\Projects\Glasses-scratch\wb-replay --register
+```
+
+`--case worldA` is the plain room walk; `--case worldB` is the drawer walk with
+deliberate lateral motion and a return. `--captures <id> <id> ...` replays any
+other recorded walk, in time order. One walk is usually several captures — a
+transport disconnect ends one and the reconnect begins the next, while the
+builder keeps a single session across the gap.
 
 ## LAN Access
 

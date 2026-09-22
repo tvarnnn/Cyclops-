@@ -1188,7 +1188,7 @@ final class TowerClientTests: XCTestCase {
                     {"type":"cartridges",
                      "envelope_contract":"cartridge_results.envelope/2026-08-23",
                      "cartridges":[{"cartridge":"world_builder","result_type":"status",
-                        "contract":"world_builder.status/2026-08-25","available":true,
+                        "contract":"world_builder.status/2026-09-10","available":true,
                         "unavailable_reason":null,"snapshot_only":true}],
                      "not_offered":[]}
                     """)
@@ -1593,7 +1593,7 @@ final class TowerClientTests: XCTestCase {
 
     // MARK: - 20. The result channel
 
-    private static let worldBuilderContract = "world_builder.status/2026-08-25"
+    private static let worldBuilderContract = "world_builder.status/2026-09-10"
     private static let experimentalCVContract = "experimental_cv.status/2026-08-27"
 
     /// The declaration a **live** Tower sends, byte for byte in shape.
@@ -1624,7 +1624,7 @@ final class TowerClientTests: XCTestCase {
                         "available":true,"unavailable_reason":null,
                         "snapshot_only":true},
                        {"cartridge":"document_memory","result_type":"status",
-                        "contract":"document_memory.status/2026-08-27",
+                        "contract":"document_memory.status/2026-09-07",
                         "available":true,"unavailable_reason":null,
                         "snapshot_only":true},
                        {"cartridge":"experimental_cv","result_type":"status",
@@ -1633,7 +1633,7 @@ final class TowerClientTests: XCTestCase {
                         "snapshot_only":true}],
          "not_offered":[],
          "http_contracts":[{"cartridge":"document_memory",
-                            "contract":"document_memory.library/2026-08-27",
+                            "contract":"document_memory.library/2026-09-07",
                             "entry_route":"/documents","available":true,
                             "unavailable_reason":null,
                             "why_not_a_subscription":"document text is bulk and is the most sensitive data this platform holds"}]}
@@ -3016,6 +3016,286 @@ final class TowerClientTests: XCTestCase {
 
         client.disconnect()
     }
+
+    // MARK: - The frame gate
+
+    /// The hold is cleared by the camera STOPPING, not by a `stream_stop`
+    /// actually leaving. A socket drop closes the bracket on its own
+    /// (`teardownConnection`); a camera stopped during that gap used to keep
+    /// the hold into the next session, where Home shows no control for it.
+    func testStopClearsTheFrameGateEvenWhenTheBracketIsAlreadyGone() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        // No `sendStreamStart()`: the bracket is not open, as after a drop.
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+
+        client.sendStreamStop()
+
+        XCTAssertFalse(client.isFrameSendingPaused, "the hold outlived the camera session")
+        XCTAssertFalse(client.isStreamingToTower)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let stops = recorder.all.compactMap(decode).filter { $0["type"] as? String == "stream_stop" }
+        XCTAssertEqual(stops.count, 0, "a stop with no open bracket must still send nothing")
+    }
+
+    /// Paused: the frame is selected, counted, and never leaves the phone.
+    /// Resumed: the next one does. The bracket is untouched throughout — no
+    /// `stream_stop` goes out, because the whole point of the gate is that the
+    /// Tower keeps the capture lineage and the armed experiment.
+    func testPausedFrameSendingHoldsFramesOnThePhone() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let recorder = attachRecorder(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+        client.sendStreamStart()
+
+        func count(_ type: String) -> Int {
+            recorder.all.compactMap(decode).filter { $0["type"] as? String == type }.count
+        }
+
+        XCTAssertFalse(client.isFrameSendingPaused, "the gate must start open")
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(count("frame"), 0, "a frame left the phone while sending was paused")
+        XCTAssertEqual(count("stream_stop"), 0, "the gate must hold frames, not end the bracket")
+        XCTAssertTrue(client.isStreamingToTower, "the gate closed the stream bracket")
+
+        client.resumeFrameSending()
+        XCTAssertFalse(client.isFrameSendingPaused)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 2)
+        await expect("no frame flowed after resume") { count("frame") == 1 }
+
+        client.disconnect()
+    }
+
+    /// `disconnect()` is the user ending the connection; a hold set during it
+    /// must not survive into the next connect.
+    func testDisconnectResetsTheFrameGate() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.disconnect()
+        XCTAssertFalse(client.isFrameSendingPaused, "a disconnect left the frame gate closed")
+    }
+
+    /// A hold belongs to the camera session it was set in. `stream_stop` ends
+    /// that session's bracket, and the next start must stream.
+    func testStreamStopResetsTheFrameGate() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        await expect { client.status == .online }
+
+        client.sendStreamStart()
+        client.pauseFrameSending()
+        XCTAssertTrue(client.isFrameSendingPaused)
+        client.sendStreamStop()
+        XCTAssertFalse(client.isFrameSendingPaused, "a stream_stop left the frame gate closed")
+
+        client.disconnect()
+    }
+
+    // MARK: - tx_seq: telling a sender-side skip from a lost frame
+
+    /// Every frame carries a dense transmit counter beside the capture index.
+    ///
+    /// `seq` is the DAT capture index and this sender forwards only a fraction
+    /// of those, so a gap in `seq` at the Tower has three indistinguishable
+    /// causes: deliberate sampling, a sender-side drop, and genuine transit
+    /// loss. The Tower has carried the receiving half of the fix since
+    /// 2026-08-19 (`tower/metrics.py`, `tx_seq_gap_total`) and this app never
+    /// sent the field, so the counter stayed `None` and the question stayed
+    /// open.
+    ///
+    /// It was not academic. On the 2026-09-09 physical walk roughly half the
+    /// captured frames never reached the Tower — 474 of 953 source indices on
+    /// one capture, 2,391 of 4,801 on the next — and one resulting gap ran 410
+    /// source frames, 17 seconds, splitting the reconstruction in two. Nothing
+    /// in the artifacts can say whose fault that was.
+    func testEveryFrameCarriesADenseTransmitCounter() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+
+        // Capture indices as the real sender produces them: sparse, because
+        // only about one frame in thirty is forwarded.
+        for sequence in [1, 30, 60, 90] {
+            client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: sequence)
+        }
+
+        let arrived = await waitUntil {
+            self.frames(recorder).count == 4
+        }
+        XCTAssertTrue(arrived, "not every frame reached the server")
+
+        let sent = frames(recorder)
+        XCTAssertEqual(
+            sent.compactMap { $0["seq"] as? Int }, [1, 30, 60, 90],
+            "the capture index must be unchanged by this"
+        )
+        // The point of the whole field: DENSE, whatever seq does.
+        XCTAssertEqual(
+            sent.compactMap { $0["tx_seq"] as? Int }, [0, 1, 2, 3],
+            "tx_seq must count frames sent, not frames captured"
+        )
+
+        client.disconnect()
+    }
+
+    /// A frame this client declines to send must not consume a `tx_seq`.
+    ///
+    /// If it did, the Tower would see a hole and read it as transit loss —
+    /// manufacturing the exact confusion the counter exists to remove. A full
+    /// send window is the drop that actually happens in the field.
+    func testADroppedFrameDoesNotConsumeATransmitNumber() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
+        defer { server.stop() }
+
+        // A window of two, so the drop is arranged rather than hoped for.
+        //
+        // This test used to build a default client and push 64 frames at it,
+        // then assert only that the `tx_seq` values it saw were contiguous.
+        // Contiguous is what an *empty* list is, and what a list is when
+        // nothing was dropped at all — so the test passed whether or not the
+        // property it names ever happened. Neither `counters.count < 64` nor
+        // `sendWindowDrops > 0` was ever asserted.
+        let metrics = SenderMetrics()
+        let client = TowerClient(metrics: metrics, maxFramesInFlight: 2)
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        metrics.begin()
+        client.sendStreamStart()
+
+        // Enough frames in one main-actor turn to close the send window. The
+        // window rejects before encoding, so the surplus never reaches a send.
+        let frameCount = 64
+        for sequence in 1...frameCount {
+            client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: sequence)
+        }
+
+        // **The drop actually happened.** Asserted first, because every
+        // assertion below is vacuous without it.
+        let drops = metrics.currentSnapshot.sendWindowDrops
+        XCTAssertGreaterThan(drops, 0, "the send window never rejected anything, so this test "
+                             + "proves nothing about what a rejection does to tx_seq")
+        XCTAssertEqual(metrics.currentSnapshot.sendAttempts, 2,
+                       "only the window's worth of frames may be handed to the socket")
+        XCTAssertEqual(drops, frameCount - 2, "every frame past the window must be dropped")
+
+        _ = await waitUntil { !self.frames(recorder).isEmpty }
+
+        let counters = frames(recorder).compactMap { $0["tx_seq"] as? Int }
+        XCTAssertFalse(counters.isEmpty, "no frame was sent at all")
+        // And the sent frames are strictly fewer than the offered ones, which
+        // is the same fact from the wire's side rather than the metrics'.
+        XCTAssertLessThan(counters.count, frameCount,
+                          "every frame reached the wire, so nothing was dropped")
+        XCTAssertEqual(
+            counters, Array(0..<counters.count),
+            "tx_seq skipped a number for a frame that was never sent; the Tower "
+            + "would score that as transit loss"
+        )
+
+        client.disconnect()
+    }
+
+    /// The counter restarts with the socket.
+    ///
+    /// The Tower builds `SessionMetrics` per connection, so a counter carried
+    /// across a reconnect would present every frame sent on the old socket as
+    /// one enormous gap on the new one. The 2026-09-09 walk reconnected once,
+    /// mid-session.
+    func testTheTransmitCounterRestartsWithTheConnection() async throws {
+        let server = try MockTowerServer()
+        // `attachRecorder`, not a bare `onText` followed by `respondToPing`:
+        // the two both assign `server.onText`, so the second silently replaced
+        // the first and these tests recorded nothing. They were written on a
+        // host that could not run them.
+        let recorder = attachRecorder(server)
+        let port = try await server.start()
+        defer { server.stop() }
+
+        let client = TowerClient()
+        client.connect(to: url(port: port))
+        var online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 1)
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 30)
+        _ = await waitUntil { self.frames(recorder).count == 2 }
+        client.disconnect()
+
+        // A SECOND recorder for the second socket. `MessageRecorder` has no
+        // reset, and adding one would let a test quietly forget evidence.
+        // It has to keep answering pings, or the second socket never comes
+        // online; `attachRecorder` installs a fresh recorder that does both.
+        let afterReconnect = attachRecorder(server)
+        client.connect(to: url(port: port))
+        online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        client.sendStreamStart()
+        client.sendFrame(makeTestImage(), width: 2, height: 2, sequence: 60)
+        let arrived = await waitUntil { !self.frames(afterReconnect).isEmpty }
+        XCTAssertTrue(arrived)
+
+        XCTAssertEqual(
+            frames(afterReconnect).first?["tx_seq"] as? Int, 0,
+            "the counter carried across a reconnect; the Tower would read the "
+            + "previous connection's frames as a gap in this one"
+        )
+
+        client.disconnect()
+    }
+
+    /// Every `frame` message the recorder saw, decoded, in order.
+    private func frames(_ recorder: MessageRecorder) -> [[String: Any]] {
+        recorder.all
+            .compactMap(decode)
+            .filter { $0["type"] as? String == "frame" }
+    }
 }
 
 /// Collects CV Lab control-plane events in arrival order.
@@ -3066,4 +3346,336 @@ final class EventRecorder {
     var cancellable: AnyCancellable?
 
     func record(_ event: CartridgeResultEvent) { all.append(event) }
+}
+
+// MARK: - The Tower address override
+
+/// `TowerConfiguration` reads one environment variable in DEBUG so the
+/// Simulator can be pointed at a Tower on the Mac beside it. What it accepts
+/// is a `host[:port]` and nothing else; the URLs are built from it, so a
+/// value that would not build one must be refused rather than crash the app
+/// at first use of a `static let`.
+final class TowerConfigurationOverrideTests: XCTestCase {
+
+    func testAHostAndPortAreAccepted() {
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("127.0.0.1:8000"), "127.0.0.1:8000")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority(" tower.local:8000\n"), "tower.local:8000")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("tower.local"), "tower.local")
+        XCTAssertEqual(TowerConfiguration.acceptedAuthority("[::1]:8000"), "[::1]:8000")
+    }
+
+    func testAnythingButAHostAndPortIsRefused() {
+        for candidate in ["", "   ", "http://127.0.0.1:8000", "127.0.0.1:8000/ws",
+                          "user@host:1", "host:1?x=1", "host:1#f", ":8000", "host:notaport",
+                          // Percent-encoding: `host` decodes it, so these would
+                          // pass the character checks and then not build a URL.
+                          "%20:8000", "%7Bx%7D:1", "%2F:1", "x%23y:1"] {
+            XCTAssertNil(TowerConfiguration.acceptedAuthority(candidate), candidate)
+        }
+    }
+
+    /// Whatever is accepted builds both URLs, because the two `static let`s
+    /// force-unwrap them: an accepted value that did not would be a crash at
+    /// first use, which is the one outcome the override promises never to be.
+    func testEveryAcceptedValueBuildsBothUrls() {
+        for candidate in ["127.0.0.1:8000", "tower.local", "[::1]:8000", "a-b.c_d:65535", "10.0.0.7"] {
+            guard let accepted = TowerConfiguration.acceptedAuthority(candidate) else {
+                return XCTFail("\(candidate) should be accepted")
+            }
+            XCTAssertNotNil(URL(string: "http://\(accepted)"), candidate)
+            XCTAssertNotNil(URL(string: "ws://\(accepted)/ws"), candidate)
+        }
+    }
+
+    /// Whatever the authority resolved to, both URLs are built from the same
+    /// one and name the routes the Tower serves.
+    func testBothUrlsAreBuiltFromTheOneAuthority() {
+        let authority = TowerConfiguration.authority
+        XCTAssertEqual(TowerConfiguration.webSocketURL.absoluteString, "ws://\(authority)/ws")
+        XCTAssertEqual(TowerConfiguration.httpBaseURL.absoluteString, "http://\(authority)")
+        XCTAssertNotNil(TowerConfiguration.acceptedAuthority(authority))
+    }
+
+}
+
+// MARK: - World Builder session requests reach the Tower in order
+
+/// Answers the session surface without a network, **holding** the first
+/// request so a second can be issued while it is out, and recording when each
+/// request started and finished — which is the only way to tell "sent after
+/// the previous one was answered" from "sent at the same time".
+///
+/// Its own stub rather than `WorldBuilderSessionStubProtocol`: that one
+/// answers instantly and keeps its routes private, and this test is about
+/// what happens *during* a round trip.
+final class OrderedSessionStubProtocol: URLProtocol {
+    struct Record: Sendable {
+        let path: String
+        let startedAt: TimeInterval
+        var completedAt: TimeInterval?
+    }
+
+    private static let lock = NSLock()
+    private static var body: [String: Any] = [:]
+    private static var records: [Record] = []
+    /// Seconds to hold the answer to the first request only. Later requests
+    /// answer at once, so the test is about ordering and not about a slow
+    /// stub.
+    private static var firstRequestDelay: TimeInterval = 0
+
+    static func reset(body: [String: Any], firstRequestDelay: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.body = body
+        self.firstRequestDelay = firstRequestDelay
+        records = []
+    }
+
+    static func recorded() -> [Record] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records
+    }
+
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OrderedSessionStubProtocol.self]
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        OrderedSessionStubProtocol.lock.lock()
+        let index = OrderedSessionStubProtocol.records.count
+        OrderedSessionStubProtocol.records.append(
+            Record(path: path, startedAt: Date().timeIntervalSinceReferenceDate)
+        )
+        let delay = index == 0 ? OrderedSessionStubProtocol.firstRequestDelay : 0
+        let body = OrderedSessionStubProtocol.body
+        OrderedSessionStubProtocol.lock.unlock()
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
+            guard let url = request.url else { return }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+            OrderedSessionStubProtocol.lock.lock()
+            OrderedSessionStubProtocol.records[index].completedAt = Date().timeIntervalSinceReferenceDate
+            OrderedSessionStubProtocol.lock.unlock()
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+/// `WorldBuilderSessionController` fires `start` on appear and `stop` on
+/// disappear, and a cartridge switch does appear, disappear, appear within
+/// one round trip. The generation counter decides which reply may touch
+/// `status`; nothing decided the order the Tower *received* the requests in.
+/// Two concurrent POSTs land in whichever order the network gives them, and
+/// the Tower applies them as they land — so it could finish on `stop` with
+/// the workspace on screen, or on `start` with nobody there.
+@MainActor
+final class WorldBuilderSessionOrderingTests: XCTestCase {
+
+    private static let host = URL(string: "http://stub.invalid")!
+    private static let startPath = "/cartridges/world_builder/session/start"
+    private static let stopPath = "/cartridges/world_builder/session/stop"
+
+    /// A `cartridge_session.control/2026-08-27` snapshot the decoder accepts.
+    /// The state it reports does not matter here — the test is about the
+    /// wire order, not the footnote.
+    private static let activeSession: [String: Any] = [
+        "contract": "cartridge_session.control/2026-08-27",
+        "cartridge": "world_builder",
+        "worker": "world-build-session",
+        "supported": true,
+        "state": "active",
+        "state_means": "intent-not-liveness",
+        "states": ["stopped", "active", "paused"],
+        "actions": ["start", "pause", "resume", "stop"],
+        "session_id": "sess-1",
+        "started_at": 1788895000.0,
+        "changed_at": 1788895000.0,
+        "following": [String](),
+        "following_this_session": [String](),
+        "captures": [String](),
+        "accepted": true,
+        "changed": true,
+        "attached_capture_id": NSNull(),
+        "stop_policy": "request",
+    ]
+
+    private func makeController() -> WorldBuilderSessionController {
+        WorldBuilderSessionController(
+            control: CartridgeSessionHTTPClient(
+                baseURL: Self.host,
+                session: OrderedSessionStubProtocol.makeSession(),
+                cartridge: "world_builder"
+            )
+        )
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    /// Appear, disappear, appear while the first `start` is still out. All
+    /// three must reach the wire, in that order, and each only after the one
+    /// before it was answered.
+    func testRequestsAreSentInTheOrderTheyWereDecidedAndOneAtATime() async {
+        OrderedSessionStubProtocol.reset(body: Self.activeSession, firstRequestDelay: 0.3)
+        let controller = makeController()
+
+        controller.workspaceDidAppear(isTowerReachable: true)
+        let firstOut = await waitUntil { OrderedSessionStubProtocol.recorded().count == 1 }
+        XCTAssertTrue(firstOut, "the first start never reached the stub")
+
+        controller.workspaceDidDisappear()
+        controller.workspaceDidAppear(isTowerReachable: true)
+
+        let allAnswered = await waitUntil(timeout: 4) {
+            OrderedSessionStubProtocol.recorded().count == 3
+                && OrderedSessionStubProtocol.recorded().allSatisfy { $0.completedAt != nil }
+        }
+        let records = OrderedSessionStubProtocol.recorded()
+        XCTAssertTrue(allAnswered, "expected three answered requests, saw \(records.map(\.path))")
+        guard records.count == 3 else { return }
+
+        XCTAssertEqual(records.map(\.path), [Self.startPath, Self.stopPath, Self.startPath])
+        XCTAssertGreaterThanOrEqual(
+            records[1].startedAt, records[0].completedAt ?? .infinity,
+            "the stop was sent while the first start was still out; the Tower may apply them in either order"
+        )
+        XCTAssertGreaterThanOrEqual(
+            records[2].startedAt, records[1].completedAt ?? .infinity,
+            "the second start was sent while the stop was still out"
+        )
+
+        // The generation rule still stands: the last request decided the
+        // status, and the screen is on, so it is `.active`.
+        let active = await waitUntil { controller.status == .active }
+        XCTAssertTrue(active, "status is \(controller.status)")
+    }
+}
+
+// MARK: - The reconnect schedule says when it has given up
+
+/// When the reconnect budget is spent, `status` stays `.failed(message)` —
+/// the same value it held while the phone was still retrying — and the only
+/// signal at the give-up point was a log line. The World Builder capture
+/// control said "The Tower is not connected" in both cases, so a wearer
+/// waited for a retry that was never coming.
+@MainActor
+final class TowerReconnectGiveUpTests: XCTestCase {
+
+    private func url(port: UInt16) -> URL {
+        URL(string: "ws://127.0.0.1:\(port)/")!
+    }
+
+    private func respondToPing(_ server: MockTowerServer) {
+        server.onText = { text in
+            guard
+                let data = text.data(using: .utf8),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                json["type"] == "ping"
+            else { return }
+            server.send(text: #"{"type":"pong"}"#)
+        }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return condition()
+    }
+
+    /// A short schedule through the internal seam, so the budget is spent in
+    /// well under a second; the shipped one takes ~16 s against a refused
+    /// port, which is the case a stopped listener produces here.
+    private func makeClient() -> TowerClient {
+        TowerClient(
+            metrics: SenderMetrics(),
+            autoReconnect: true,
+            handshakeLegTimeout: 1,
+            reconnectBackoff: [0.05, 0.05, 0.05]
+        )
+    }
+
+    func testAnExhaustedScheduleSaysSoAndAFreshConnectClearsIt() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = makeClient()
+        XCTAssertFalse(client.reconnectGaveUp)
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+        XCTAssertFalse(client.reconnectGaveUp)
+
+        // The Tower goes away for good: socket dropped, listener closed, so
+        // every retry is refused at the port.
+        server.stop()
+        let gaveUp = await waitUntil(timeout: 6) { client.reconnectGaveUp }
+        XCTAssertTrue(gaveUp, "the schedule was spent and nothing said so; status is \(client.status)")
+        XCTAssertNotEqual(client.status, .online)
+
+        // A deliberate tap on Connect against a Tower that is back. The flag
+        // clears as the socket opens — before the handshake, because "stopped
+        // trying" is false from that moment — and stays clear once online.
+        let revived = try MockTowerServer()
+        let revivedPort = try await revived.start()
+        respondToPing(revived)
+        defer { revived.stop() }
+
+        client.connect(to: url(port: revivedPort))
+        XCTAssertFalse(client.reconnectGaveUp, "a fresh connect left the give-up signal standing")
+        let backOnline = await waitUntil { client.status == .online }
+        XCTAssertTrue(backOnline)
+        XCTAssertFalse(client.reconnectGaveUp)
+
+        client.disconnect()
+    }
+
+    /// A deliberate disconnect after the schedule is spent is the user acting,
+    /// not the phone giving up; the flag must not outlive it, or the capture
+    /// control would tell a person who just disconnected to tap Connect
+    /// because the phone had stopped trying.
+    func testADeliberateDisconnectClearsTheSignal() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        respondToPing(server)
+
+        let client = makeClient()
+        client.connect(to: url(port: port))
+        let online = await waitUntil { client.status == .online }
+        XCTAssertTrue(online)
+
+        server.stop()
+        let gaveUp = await waitUntil(timeout: 6) { client.reconnectGaveUp }
+        XCTAssertTrue(gaveUp, "status is \(client.status)")
+
+        client.disconnect()
+        XCTAssertFalse(client.reconnectGaveUp)
+        XCTAssertEqual(client.status, .offline)
+    }
 }

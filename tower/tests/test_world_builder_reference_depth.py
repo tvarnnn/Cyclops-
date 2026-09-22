@@ -297,6 +297,6 @@ class TestTheRetainedStateStaysBounded:
             f"observations are accumulating rather than being pruned: {sizes}"
         )
         assert (
-            len(backend._chain.older_features)
-            <= classical_module.EXTEND_REFERENCE_DEPTH - 1
-        ), "the older-reference list is unbounded"
+            len(backend._chain.references)
+            <= classical_module.EXTEND_REFERENCE_DEPTH
+        ), "the reference list is unbounded"

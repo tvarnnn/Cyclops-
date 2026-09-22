@@ -77,6 +77,18 @@ nonisolated enum WorldGeometryFetchError: Error, Equatable {
 nonisolated struct WorldGeometryClient {
     var baseURL: URL = TowerConfiguration.httpBaseURL
     var session: URLSession = .shared
+    /// Bounded (Rule 15). This was the one HTTP client in the app with no
+    /// bound of its own — the list, session, health and Object Memory clients
+    /// all carry 10 s and the render client 30 s — so a request against a
+    /// Tower that accepted the connection and then hung sat on `URLRequest`'s
+    /// 60 s default. The segment loop in `WorldBuilderViewModel` is
+    /// sequential, so that was a minute *per segment*.
+    ///
+    /// Thirty seconds, the render client's bound, rather than the ten the
+    /// small bodies get: a segment is up to a megabyte of points, and the
+    /// 2026-09-06 walk was fetched over a Tailscale path, where ten seconds
+    /// is a slow link rather than a stalled one.
+    var timeout: TimeInterval = 30
 
     func manifest(worldID: String, sessionID: String) async throws -> WorldGeometryManifest {
         let url = baseURL
@@ -141,8 +153,11 @@ nonisolated struct WorldGeometryClient {
         // this same policy, which means the layer being disabled in test was
         // left on in production — the configuration under which the deliberate
         // placement regression test passes was not the shipped one.
-        var request = URLRequest(url: requestURL)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let request = URLRequest(
+            url: requestURL,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: timeout
+        )
         do {
             let (data, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode == 404 {

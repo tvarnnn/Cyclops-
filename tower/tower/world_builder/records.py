@@ -530,6 +530,29 @@ def world_from_json_dict(data: dict) -> World:
     )
 
 
+# How a session's finalization went. Recorded by the builder on the session
+# record after `stop_session`, because until 2026-09-06 nothing on disk could
+# tell "the builder finished", "the builder is still finishing" and "the
+# builder was killed while finishing" apart -- the 09-06 physical walk ended
+# with a lock naming a dead pid, a record with `ended_at: null`, and 463
+# keyframes of usable geometry that the Tower could only call `failed`.
+FINALIZATION_PENDING = "pending"
+FINALIZATION_COMPLETE = "complete"
+FINALIZATION_INTERRUPTED = "interrupted"
+FINALIZATION_STATES = (
+    FINALIZATION_PENDING,
+    FINALIZATION_COMPLETE,
+    FINALIZATION_INTERRUPTED,
+)
+
+# What became of the final global solve inside that finalization.
+FINAL_SOLVE_PENDING = "pending"
+FINAL_SOLVE_SOLVED = "solved"
+FINAL_SOLVE_SKIPPED = "skipped"
+FINAL_SOLVE_FAILED = "failed"
+FINAL_SOLVE_UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class Session:
     """One mapping session: an explicitly started and stopped window."""
@@ -567,6 +590,15 @@ class Session:
     # session's images were filtered, so every historical session must be
     # assumed unredacted forever. One string now avoids that permanently.
     redaction: str = "none"
+    # The finalization record (see FINALIZATION_*), or None on a record that
+    # predates it or whose session never stopped. Additive and optional:
+    # the schema version does not move, and a reader that finds no key
+    # reads None, never a state.
+    #
+    #   {"state": pending|complete|interrupted,
+    #    "final_solve": pending|solved|skipped|failed|unavailable|null,
+    #    "started_at": float, "updated_at": float, "detail": str|null}
+    finalization: dict | None = None
 
     def to_json_dict(self) -> dict:
         return {
@@ -592,6 +624,9 @@ class Session:
             "retains_raw_imagery": self.retains_raw_imagery,
             "privacy_tags": list(self.privacy_tags),
             "redaction": self.redaction,
+            "finalization": (
+                dict(self.finalization) if self.finalization is not None else None
+            ),
         }
 
 
@@ -619,6 +654,13 @@ def session_from_json_dict(data: dict) -> Session:
         retains_raw_imagery=data["retains_raw_imagery"],
         privacy_tags=tuple(data["privacy_tags"]),
         redaction=data["redaction"],
+        # `.get`, deliberately: every record written before 2026-09-06 lacks
+        # the key, and those records are still valid sessions.
+        finalization=(
+            dict(data["finalization"])
+            if isinstance(data.get("finalization"), dict)
+            else None
+        ),
     )
 
 

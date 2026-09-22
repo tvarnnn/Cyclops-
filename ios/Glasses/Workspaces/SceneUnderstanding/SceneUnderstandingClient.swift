@@ -29,12 +29,33 @@ protocol SceneUnderstandingClient: CartridgeClient {
     /// `revision` so an unchanged scene coalesces on the wire. What arrives
     /// here is therefore already at a rate a `@Published` property can carry.
     var stateUpdates: AnyPublisher<SceneUnderstandingState, Never> { get }
+
+    /// The Scene screen appeared or disappeared.
+    ///
+    /// A REQUIREMENT, not only an extension default, and the distinction is
+    /// the whole feature. The view model holds its client as
+    /// `any SceneUnderstandingClient`. A method that lives only in a
+    /// protocol extension is dispatched STATICALLY through an existential,
+    /// so `client.workspaceVisibilityChanged(isVisible:)` would always run
+    /// the no-op default below and never reach
+    /// `TowerSceneUnderstandingClient`'s override -- which compiles, and
+    /// silently means the live subscription is never opened or closed by
+    /// the screen appearing or disappearing. Since the Tower runs a scene
+    /// session only while somebody streams AND somebody watches, that
+    /// leaves the detector running for as long as the socket lives, which
+    /// is exactly what "the phone watches only while the Scene screen is
+    /// open" exists to prevent.
+    func workspaceVisibilityChanged(isVisible: Bool)
 }
 
 extension SceneUnderstandingClient {
     var stateUpdates: AnyPublisher<SceneUnderstandingState, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
+
+    /// The Scene screen appeared or disappeared. A default no-op, so a client
+    /// with nothing to subscribe to (the stub) needs no code for it.
+    func workspaceVisibilityChanged(isVisible: Bool) {}
 }
 
 // MARK: - The Tower-backed client
@@ -137,6 +158,19 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
     private static let resubscribeBudget = 3
     /// The tracking session the held reading belongs to. See the type note.
     private var heldSessionID: Int?
+    /// Whether the Scene Understanding screen is on screen right now.
+    ///
+    /// **This is what starts and stops the detector on the Tower.** Since
+    /// 2026-09-07 a Tower runs a scene session only while somebody is
+    /// STREAMING and somebody is WATCHING, and a `result_subscribe` for the
+    /// live scene is what "watching" means. Subscribing at connection time —
+    /// what this client did before — kept a people detector running behind
+    /// World Builder's and the CV Lab's camera for as long as the app was
+    /// connected. So the subscription is opened when this screen appears and
+    /// closed when it disappears; the socket, the declaration and the
+    /// resubscribe budget all still gate it, but none of them can open it
+    /// while this is `false`.
+    private var workspaceVisible = false
 
     init(tower: TowerClient) {
         self.tower = tower
@@ -177,7 +211,12 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
         CartridgeAvailability.resolve(
             declared: declaredContract,
             supported: [SceneUnderstandingContract.identifier],
-            isTowerReachable: isTowerReachable
+            isTowerReachable: isTowerReachable,
+            // This build implements the contract, so a silent socket means
+            // "nobody has asked yet", not "no such contract" — the exact
+            // case `knownToThisBuild` exists for, and the one this client
+            // used to get wrong on a cold launch.
+            knownToThisBuild: true
         )
     }
 
@@ -217,6 +256,7 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
     /// two flags, so a status change and a republished declaration racing each
     /// other cannot open two subscriptions.
     private func subscribeIfPossible() {
+        guard workspaceVisible else { return }
         guard tower.status == .online, subscriptionID == nil, !isSubscribing else { return }
         guard let declaration = tower.cartridgeDeclaration else { return }
         guard
@@ -270,6 +310,32 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
         This Tower cannot serve Scene Understanding, and did not say why.
         """
 
+    // MARK: Visibility
+
+    func workspaceVisibilityChanged(isVisible: Bool) {
+        guard isVisible != workspaceVisible else { return }
+        workspaceVisible = isVisible
+        if isVisible {
+            subscribeIfPossible()
+            return
+        }
+        // Leaving the screen ends the subscription, which — with no other
+        // watcher — ends the Tower's session and releases its detector. The
+        // unsubscribe is best-effort and its `result_unsubscribed` is ignored
+        // by construction: `subscriptionID` is cleared here, so the ack for
+        // the old id matches nothing. The Tower treats a closed socket as
+        // sufficient cleanup anyway; this spares it a session nobody is
+        // reading. The reading is discarded for the same reason a stop
+        // discards it: nothing is refreshing it any more.
+        if let id = subscriptionID {
+            tower.unsubscribeFromResults(subscriptionID: id)
+        }
+        subscriptionID = nil
+        isSubscribing = false
+        heldSessionID = nil
+        state = .idle(nil)
+    }
+
     // MARK: Result channel
 
     private func handle(_ event: CartridgeResultEvent) {
@@ -281,6 +347,37 @@ final class TowerSceneUnderstandingClient: SceneUnderstandingClient {
 
         case .subscribed(let ack):
             guard ack.cartridge == SceneUnderstandingContract.towerCartridge else { return }
+            // An ack that arrives after the screen has gone must be closed,
+            // not adopted.
+            //
+            // `workspaceVisibilityChanged(false)` can only send an unsubscribe
+            // for an id it has, and between the subscribe and its ack there is
+            // no id yet — so leaving in that window sends nothing and clears
+            // flags that were already clear. Adopting the ack here then opened
+            // a subscription belonging to a screen that no longer exists.
+            // Nothing closed it until the wearer next opened this screen and
+            // left it again: the visibility call is guarded on a change, so
+            // leaving twice in a row does nothing, and `subscribeIfPossible`
+            // is the only other path. A wearer who did not come back left the
+            // watcher running for the life of the socket.
+            //
+            // That is the whole point of the cartridge undone by a race: the
+            // Tower runs its detector while somebody streams AND somebody
+            // watches, so a watcher nobody has retracted keeps a people
+            // detector running for the rest of the walk.
+            //
+            // **Not closed by this guard**, and recorded rather than fixed
+            // here: appear, leave, and return *before* the first ack, and two
+            // subscribes are outstanding. Both acks now arrive while visible,
+            // both are adopted, and the second overwrites `subscriptionID` —
+            // orphaning the first. The durable answer is a generation token on
+            // the outstanding subscribe rather than the `isSubscribing`
+            // boolean, which is a wider change than this lane should make.
+            guard workspaceVisible else {
+                tower.unsubscribeFromResults(subscriptionID: ack.subscriptionID)
+                isSubscribing = false
+                return
+            }
             subscriptionID = ack.subscriptionID
             isSubscribing = false
 
@@ -495,6 +592,13 @@ final class SceneUnderstandingViewModel: ObservableObject {
 
     func availability(isTowerReachable: Bool) -> CartridgeAvailability {
         client.availability(isTowerReachable: isTowerReachable)
+    }
+
+    /// The screen appeared or disappeared. Forwarded to the client, which is
+    /// what opens and closes the live subscription — and with it the Tower's
+    /// session.
+    func workspaceVisibilityChanged(isVisible: Bool) {
+        client.workspaceVisibilityChanged(isVisible: isVisible)
     }
 
     func phase(isTowerReachable: Bool) -> CartridgePhase {

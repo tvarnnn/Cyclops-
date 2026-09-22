@@ -307,6 +307,54 @@ def test_the_default_rebuild_cadence_is_live_not_batch(monkeypatch, tmp_path):
     )
 
 
+def test_the_attached_builder_is_told_to_register_when_the_walk_ends(
+    monkeypatch, tmp_path
+):
+    """Without this flag a walk finalises as a heap of islands.
+
+    Registration was implemented, tested, persisted and served long
+    before anything invoked it, so every physical walk up to 2026-08-29
+    finalised with no placements.json and the phone drew each segment as
+    its own disconnected fragment -- 22 of them on the drawer walk. The
+    pairs were not refused; the question was never asked. Asking it
+    places 5 of that walk's 36 segments and 4,704 of its 13,050 points.
+    """
+    from tower.main import create_app
+
+    monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(tmp_path / "capture"))
+    monkeypatch.setenv("TOWER_WORLD_ROOT", str(tmp_path / "world"))
+    monkeypatch.delenv("TOWER_WORLD_REGISTER", raising=False)
+    app = create_app()
+
+    argv = list(app.state.capture_workers.spec_for(WORLD_BUILD_WORKER).argv)
+    assert "--register" in argv, (
+        "the attached builder was not asked to place its segments, so the "
+        "walk will finalise as disconnected fragments however well it "
+        "reconstructed"
+    )
+
+
+def test_registration_can_be_turned_off_without_losing_the_reconstruction(
+    monkeypatch, tmp_path
+):
+    """The escape hatch is the only step in a walk that costs tens of seconds.
+
+    Off must still build: the flag governs whether segments are PLACED,
+    never whether they are reconstructed.
+    """
+    from tower.main import create_app
+
+    monkeypatch.setenv("TOWER_CAPTURE_ROOT", str(tmp_path / "capture"))
+    monkeypatch.setenv("TOWER_WORLD_ROOT", str(tmp_path / "world"))
+    monkeypatch.setenv("TOWER_WORLD_REGISTER", "false")
+    app = create_app()
+
+    argv = list(app.state.capture_workers.spec_for(WORLD_BUILD_WORKER).argv)
+    assert "--register" not in argv
+    assert "world_build_session.py" in " ".join(argv)
+    assert "--rebuild-every" in argv
+
+
 def test_both_worker_specs_bound_how_long_they_follow_a_dead_capture(
     monkeypatch, tmp_path
 ):

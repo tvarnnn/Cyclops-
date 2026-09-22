@@ -147,12 +147,12 @@ struct ContentView: View {
                     tower: project.towerClient,
                     client: project.cartridgeClients.worldBuilder
                 )
-            // Three of the four workspaces below receive no `glasses`, and
+            // Two of the four workspaces below receive no `glasses`, and
             // that omission is load-bearing rather than incidental. World
             // Builder shows the live viewfinder and owns a capture button, so
-            // it needs the connection. Experimental CV Lab, Document Memory and
-            // Scene Understanding show what the Tower knows; none has a session
-            // control, and none is handed the object that could start one.
+            // it needs the connection. Document Memory and Scene Understanding
+            // show what the Tower knows; neither has a session control, and
+            // neither is handed the object that could start one.
             //
             // Object Memory is the exception, and it was made one deliberately.
             // It is the only cartridge with a Start button that *means*
@@ -167,30 +167,39 @@ struct ContentView: View {
             // Object Memory now composes both halves in one tap. See
             // `ObjectMemoryRecordingCoordinator`.
             //
-            // So the count is **three**, not two: Home, World Builder, and
-            // Object Memory. The invariant that actually matters is unchanged
-            // and is the one worth restating — there is still exactly one camera
-            // pipeline and one owner of it, `GlassesConnection`, and every one
-            // of those three reaches it through `startCameraSession()` and
-            // `stopCameraSession()` and touches DAT no other way. Object Memory
-            // additionally refuses to start a capture that Home or World Builder
-            // already started, and refuses to stop one it did not start itself.
+            // The Experimental CV Lab joined for a plainer reason: an
+            // experiment is fed by the camera, and a person who had to leave
+            // for Home to start it and come back to read the result was
+            // crossing three screens for one question. Its `CVCameraCard`
+            // starts and stops the camera through the same two calls, and its
+            // Pause is a frame gate on `TowerClient`, not a camera operation.
+            //
+            // So the count is **four**, not three: Home, World Builder, Object
+            // Memory and the Experimental CV Lab. The invariant that actually
+            // matters is unchanged and is the one worth restating — there is
+            // still exactly one camera pipeline and one owner of it,
+            // `GlassesConnection`, and every one of those four reaches it
+            // through `startCameraSession()` and `stopCameraSession()` and
+            // touches DAT no other way. Object Memory additionally refuses to
+            // start a capture that another workspace already started, and
+            // refuses to stop one it did not start itself.
             //
             // The client comes from `project.cartridgeClients` so it outlives
             // the workspace's `@StateObject`, which a cartridge switch
             // destroys.
             //
             // Experimental CV Lab is the one of these that also takes
-            // `tower`, and it takes it as a plain value rather than as
-            // something to observe. The Tower's per-frame reply carries the
-            // running experiment's own result, and that workspace is where
-            // someone goes to read it — so one leaf panel inside it observes,
-            // and the workspace body does not. See
-            // `ExperimentalCVWorkspaceView.tower`.
+            // `tower`, and it takes both `tower` and `glasses` as plain values
+            // rather than as something to observe. The Tower's per-frame reply
+            // carries the running experiment's own result, and that workspace
+            // is where someone goes to read it — so leaf panels inside it
+            // observe, and the workspace body does not. See
+            // `ExperimentalCVWorkspaceView.tower` and `.glasses`.
             case .experimentalCV:
                 TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
                     ExperimentalCVWorkspaceView(
                         isTowerReachable: isTowerReachable,
+                        glasses: project.glassesConnection,
                         tower: project.towerClient,
                         client: project.cartridgeClients.experimentalCV
                     )
@@ -205,7 +214,9 @@ struct ContentView: View {
                 TowerReachabilityReader(tower: project.towerClient) { isTowerReachable in
                     DocumentMemoryWorkspaceView(
                         isTowerReachable: isTowerReachable,
-                        client: project.cartridgeClients.documentMemory
+                        client: project.cartridgeClients.documentMemory,
+                        camera: project.documentMemoryCamera,
+                        cameraClaim: project.documentMemoryCameraClaim
                     )
                 }
             case .sceneUnderstanding:

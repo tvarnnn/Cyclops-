@@ -74,14 +74,35 @@ struct WorldBuilderWorkspaceView: View {
     /// belongs on `ProjectManager`, not here.
     @StateObject private var world: WorldBuilderViewModel
 
+    /// Whether the saved-worlds sheet is up. View state, so it lives here.
+    @State private var isShowingWorlds = false
+
+    /// The world whose interactive picture is up, or `nil`. Captured from
+    /// `world.renderTarget` at the tap rather than read live, so a report
+    /// that renames the live world mid-look does not swap the sheet's content
+    /// under the reader.
+    @State private var viewerTarget: WorldRenderTarget?
+
+    /// Tells the Tower this workspace is on screen, so a builder may attach
+    /// to a capture. View-owned on purpose — see the type's own doc comment
+    /// for why it is not on the view model — and a `@StateObject` so the
+    /// `stop` on disappear comes from the same object that sent `start`.
+    @StateObject private var session: WorldBuilderSessionController
+
     /// The client is injected rather than constructed here, and owned by
     /// `ProjectManager`. See `CartridgeClients` for why: this `@StateObject` is
     /// destroyed on every cartridge switch, and a Tower-backed client holding a
     /// subscription and a partly-built world must not be.
-    init(glasses: GlassesConnection, tower: TowerClient, client: any WorldBuilderClient) {
+    init(
+        glasses: GlassesConnection,
+        tower: TowerClient,
+        client: any WorldBuilderClient,
+        session: WorldBuilderSessionController? = nil
+    ) {
         self.glasses = glasses
         self.tower = tower
         _world = StateObject(wrappedValue: WorldBuilderViewModel(client: client))
+        _session = StateObject(wrappedValue: session ?? WorldBuilderSessionController())
     }
 
     /// Connectivity reaches the view model as a value, never as an object.
@@ -113,7 +134,13 @@ struct WorldBuilderWorkspaceView: View {
                 inspection: world.inspection,
                 sessionBinding: world.sessionBinding,
                 fragments: world.fragmentsModel,
-                geometryChunks: world.geometryChunks
+                geometryChunks: world.geometryChunks,
+                presentation: world.presentation,
+                openReconstruction: { target in viewerTarget = target },
+                recentWorld: world.recentWorld,
+                openRecent: { recent in
+                    world.open(worldID: recent.worldID, sessionID: recent.sessionID)
+                }
             )
 
             #if DEBUG
@@ -121,6 +148,34 @@ struct WorldBuilderWorkspaceView: View {
             #else
             HelperText("Capture is not available in this build.")
             #endif
+
+            // Under the capture control in both configurations: the Tower's
+            // gate applies to a Release phone's neighbour as much as to a
+            // DEBUG phone's own capture. One line, worded as what was asked
+            // for — `active` is intent, and whether a builder attached is the
+            // canvas's report, not this line's.
+            HelperText(session.footnote)
+        }
+        .sheet(isPresented: $isShowingWorlds) {
+            WorldPickerView(world: world)
+        }
+        .sheet(item: $viewerTarget) { target in
+            // The title and the note come from the same `WorldPresentation`
+            // the canvas draws, so the sheet and the screen behind it cannot
+            // describe the same world differently.
+            WorldRenderViewerView(
+                target: target,
+                title: world.state.snapshot?.name,
+                note: viewerNote
+            )
+        }
+        // The World Builder cartridge session: `start` on appearance and
+        // whenever the socket comes back while on screen, `stop` on
+        // disappearance. Nothing else on the phone starts or stops a builder.
+        .onAppear { session.workspaceDidAppear(isTowerReachable: isTowerReachable) }
+        .onDisappear { session.workspaceDidDisappear() }
+        .onChange(of: isTowerReachable) { _, isReachable in
+            session.towerReachabilityChanged(isReachable: isReachable)
         }
     }
 
@@ -128,15 +183,83 @@ struct WorldBuilderWorkspaceView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("World Builder")
-                .font(.title2.weight(.semibold))
+            HStack(alignment: .firstTextBaseline) {
+                Text("World Builder")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                // Both read only, so neither is `#if DEBUG`: a Release build
+                // with no camera can still look at what the Tower has stored.
+                //
+                // The picture button is disabled, not hidden, until the Tower
+                // has named a world with geometry (`renderTarget`): a control
+                // that appears from nowhere is one nobody looks for, and a
+                // disabled one says "not yet" truthfully.
+                Button {
+                    viewerTarget = world.renderTarget
+                } label: {
+                    Label("Picture", systemImage: "cube.transparent")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .disabled(world.renderTarget == nil)
+                .accessibilityLabel("Interactive picture of the world")
+                Button {
+                    isShowingWorlds = true
+                } label: {
+                    Label("Saved worlds", systemImage: "archivebox")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+            }
             Text("What the glasses see, and what the Tower reports it has built from that. Figures come from the Tower; absent ones are not drawn.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if world.inspection.isInspecting {
+                HStack(spacing: 8) {
+                    // The world's NAME, or nothing. This line used to end in a
+                    // raw 32-character hex world id — `Looking at saved world
+                    // fcbca9e90b244785bdb671530b33c6a5.` — which is a database
+                    // key on the ordinary surface of the app. The id is still
+                    // reachable: it is in the canvas's Diagnostics disclosure
+                    // and in the 3D viewer's Details.
+                    Text(savedWorldLine)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Back to live") {
+                        world.returnToLive()
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
+    }
+
+    /// What the inspecting line says. The Tower's display name when it gave
+    /// one — 156 of the real root's 162 worlds have none — and the stage word
+    /// otherwise, which is at least a fact about the world rather than a key
+    /// into the Tower's filesystem.
+    private var savedWorldLine: String {
+        if let name = world.state.snapshot?.name, !name.isEmpty {
+            return "Looking at saved world \(name)."
+        }
+        if let stage = world.presentation.stage {
+            return "Looking at saved world · \(stage.label)."
+        }
+        return "Looking at saved world."
+    }
+
+    /// The ladder's note for the world the viewer is about to show, so the
+    /// sheet says the same thing the card behind it says.
+    private var viewerNote: String? {
+        if case .partial(_, let note) = world.presentation.reconstruction { return note }
+        return nil
     }
 }
 
@@ -224,6 +347,14 @@ private extension WorldBuilderWorkspaceView {
                 // Advice, not a `.disabled` condition — see the equivalent
                 // branch in `HomeWorkspaceView.sessionControl`.
                 HelperText("Camera access is not granted. Allow it under Connections, then start capture.")
+            } else if tower.status != .online && tower.reconnectGaveUp {
+                // Distinct from the sentence below because the remedy is
+                // different. While the phone is still retrying, waiting is
+                // enough; once the reconnect budget is spent nothing will
+                // change until someone taps Connect, and a line that said only
+                // "not connected" — the same words in both cases — left the
+                // wearer waiting for a retry that was never coming.
+                HelperText("The phone has stopped trying to reconnect. Use Connect under Connections to retry.")
             } else if tower.status != .online {
                 // The Tower must be online *before* capture starts: a
                 // `stream_start` sent while it is offline is dropped, and every

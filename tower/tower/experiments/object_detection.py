@@ -97,6 +97,7 @@ class ObjectDetectionExperiment:
         # silent downgrade, and only both numbers together can
         # tell the two apart after the fact.
         self._requested_device = None
+        self._torch_threads: int | None = None
         # Guards the handover from a load that may have been abandoned by
         # the module's load timeout. See tower/loading.py.
         self._invalidation = LoadInvalidation()
@@ -118,7 +119,11 @@ class ObjectDetectionExperiment:
             ssdlite320_mobilenet_v3_large,
         )
 
-        from tower.experiments.depth import resolve_device
+        from tower.experiments.depth import (
+            apply_torch_threads,
+            resolve_device,
+            resolve_torch_threads,
+        )
 
         requested = "auto" if settings is None else settings.device
         self._requested_device = requested
@@ -172,6 +177,10 @@ class ObjectDetectionExperiment:
         # `TOWER_CV_DEVICE=cpu` still forces CPU. This changes what
         # "auto" means, not what is reachable.
         device = resolve_device(requested)
+        self._torch_threads = resolve_torch_threads(
+            device, "auto" if settings is None else settings.torch_threads
+        )
+        apply_torch_threads(self._torch_threads)
         weights = SSDLite320_MobileNet_V3_Large_Weights.COCO_V1
         model = ssdlite320_mobilenet_v3_large(weights=weights)
         model.eval()
@@ -297,6 +306,7 @@ class ObjectDetectionExperiment:
             "model": "ssdlite320_mobilenet_v3_large",
             "weights": "COCO_V1",
             "score_threshold": SCORE_THRESHOLD,
+            "torch_threads": self._torch_threads,
         }
 
     def set_preview_capture(self, enabled: bool) -> None:
@@ -374,6 +384,11 @@ class ObjectDetectionExperiment:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         import torch
+
+        from tower.experiments.depth import apply_torch_threads
+
+        # On the inference thread, every frame: see `apply_torch_threads`.
+        apply_torch_threads(self._torch_threads)
 
         with timer.stage("preprocess"):
             tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)

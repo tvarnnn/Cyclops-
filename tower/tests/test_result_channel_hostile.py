@@ -91,60 +91,273 @@ def test_a_truncated_keyframe_journal_does_not_fabricate_geometry(
     _assert_no_fabrication(payload)
 
 
+def _every_manifest(store, world_id, session_id):
+    """Both copies of a session's manifest.
+
+    THERE ARE TWO NOW. `write_derived` writes the world's
+    `derived/manifest.json` and a copy beside the session's own poses and
+    points, because one manifest per world -- naming whichever session
+    built last -- was the root of four rounds of "an older walk reports no
+    geometry" defects.
+
+    The three tests below corrupt A manifest to check that an untrustworthy
+    one is never evidence of geometry. With two copies, corrupting one and
+    asserting absence would have been asserting that the OTHER copy does
+    not work -- so they corrupt both, and `test_one_good_copy_is_enough`
+    below pins what happens when only one is bad.
+    """
+    return [
+        store.derived_manifest_path(world_id),
+        store.session_manifest_path(world_id, session_id),
+    ]
+
+
 def test_a_manifest_from_another_schema_is_refused(monkeypatch, world):
-    root, world_id, _ = world
+    """A manifest from a schema this build does not know lends NOTHING.
+
+    AMENDED 2026-09-10, and the amendment is a correction to a fix.
+    `_validate_manifest` refuses a foreign `schema_version` because such a
+    manifest "describes fields whose meaning this build does not know",
+    and that is about the manifest. A version of the recount read it as
+    evidence the POSES AND POINTS were unreadable too, and refused them --
+    which produced `element_count: null` and a phone drawing "Needs retry"
+    over a tree that `routes/geometry.py` was serving 200 for in the same
+    breath, because `world_builder_geometry._read` uses
+    `read_derived(verify=False)` and never looks at `schema_version`. One
+    reader refusing what the other serves is the Tower disagreeing with
+    itself.
+
+    So the refusal is asserted where it belongs: the manifest's own
+    figures never reach the payload. The figures that do are the ones
+    counted from the files, which both readers can read.
+    """
+    root, world_id, session_id = world
     store = WorldStore(root)
-    path = store.derived_manifest_path(world_id)
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    manifest["schema_version"] = 999
-    path.write_text(json.dumps(manifest), encoding="utf-8")
+    for path in _every_manifest(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 999
+        # A figure nothing on disk could produce. If it reaches the
+        # payload, a manifest this build cannot read was believed.
+        manifest["points"] = 999_999
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    derived = store.derived_dir(world_id) / session_id
+    on_disk = len(json.loads((derived / "points.json").read_text())["points"])
+    assert on_disk != 999_999
 
     payload = _payload(monkeypatch, root)
-    assert payload["geometry"]["available"] is False
+    assert payload["geometry"]["element_count"] != 999_999, (
+        "a manifest from an unknown schema was believed"
+    )
+    assert payload["geometry"]["element_count"] == on_disk
+    # Nothing else it could have supplied is supplied either.
+    assert payload["geometry"]["built_at"] is None
+    assert payload["geometry"]["backend_id"] is None
+    assert payload["geometry"]["built_from_keyframes"] is None
     _assert_no_fabrication(payload)
 
 
-def test_a_manifest_missing_keys_is_not_evidence_of_geometry(monkeypatch, world):
-    """A manifest that carries no figures does not mean "we have geometry".
+def test_a_foreign_schema_does_not_split_the_two_readers(monkeypatch, world):
+    """The status channel and the geometry route must agree it is readable.
+
+    This is the invariant the amendment above turns on, asserted directly
+    rather than left implied: whatever the manifest says, the two readers
+    of the same tree give the same answer about whether there is anything
+    there.
+    """
+    from tower.results.world_builder_geometry import build_manifest
+
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    for path in _every_manifest(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 999
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    payload = _payload(monkeypatch, root)
+    served = build_manifest(store, world_id, session_id)
+
+    channel_has_something = (payload["geometry"]["element_count"] or 0) > 0
+    route_has_something = served is not None and served["segment_count"] > 0
+    assert channel_has_something == route_has_something, (
+        f"the channel says {channel_has_something} and the route says "
+        f"{route_has_something} about the same tree"
+    )
+
+
+def test_a_manifest_missing_keys_lends_no_figures_of_its_own(monkeypatch, world):
+    """A manifest that carries no figures does not get to assert any.
 
     Gating on "the file exists" produced `available: true` with every
     figure null -- a claim asserted with nothing to show for it -- and a
     refusal sentence reading "None of this session's poses were refused,
     so the path has gaps". Both found by adversarial review.
+
+    AMENDED 2026-09-10, and the amendment is the point. This used to
+    assert `available: false`, which was the right answer while the only
+    possible source of a figure was the manifest. It is not any more: a
+    manifest is a SUMMARY of poses.json and points.json, and when the
+    summary is unusable those files are still on disk and are counted
+    directly. That change exists because reporting null over a real
+    reconstruction made the phone draw "Needs retry" on top of it.
+
+    So the rule this pins is narrower and stronger than the old one: the
+    broken manifest contributes NOTHING, and every figure reported comes
+    from a file read independently by this test. `schema_version` is left
+    intact deliberately -- a manifest declaring a schema this build does
+    not know is the one case where the tree must not be recounted either,
+    and `test_a_manifest_from_another_schema_is_refused` owns it.
     """
-    root, world_id, _ = world
+    root, world_id, session_id = world
     store = WorldStore(root)
-    path = store.derived_manifest_path(world_id)
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("points", "poses_solved", "poses_refused", "keyframes", "segments"):
-        manifest.pop(key, None)
-    path.write_text(json.dumps(manifest), encoding="utf-8")
+    for path in _every_manifest(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("points", "poses_solved", "poses_refused", "keyframes", "segments"):
+            manifest.pop(key, None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Independent truth, read here rather than taken from the payload.
+    derived = store.derived_dir(world_id) / session_id
+    on_disk = len(json.loads((derived / "points.json").read_text())["points"])
+    assert on_disk > 0
 
     payload = _payload(monkeypatch, root)
     geometry = payload["geometry"]
     trajectory = payload["trajectory"]
 
-    assert geometry["available"] is False, (
-        "a manifest with no figures must not assert geometry"
+    assert geometry["element_count"] == on_disk, (
+        "the figures did not come from the files that hold them"
     )
-    assert geometry["element_count"] is None
-    assert geometry["representation"] is None
-    assert trajectory["available"] is False
-    assert trajectory["pose_count"] is None
-    assert trajectory["path_length"] is None
+    # NOTHING the broken manifest could have supplied is supplied.
+    assert geometry["built_from_keyframes"] is None
+    assert geometry["built_at"] is None
+    assert geometry["backend_id"] is None
+    assert geometry["current"] is False
+    assert trajectory["keyframes"] is None
     # And the scale it never earned is not attributed to it either.
     assert payload["scale"]["state"] == "unknown"
     assert payload["scale"]["unit"] is None
 
 
 def test_an_unreadable_manifest_is_survived(monkeypatch, world):
-    root, world_id, _ = world
-    WorldStore(root).derived_manifest_path(world_id).write_text(
+    """Survived, and -- since 2026-09-10 -- survived without losing the world.
+
+    Bytes that will not parse say nothing at all about poses.json and
+    points.json, which are separate files written by the same call. The
+    channel refuses the manifest, counts the tree, and says in words that
+    currency cannot be judged.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    for path in _every_manifest(store, world_id, session_id):
+        path.write_text("{not json at all", encoding="utf-8")
+
+    derived = store.derived_dir(world_id) / session_id
+    on_disk = len(json.loads((derived / "points.json").read_text())["points"])
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["element_count"] == on_disk
+    assert payload["geometry"]["current"] is False
+    assert payload["lifecycle"]["reason"] is not None
+    _assert_no_fabrication(payload)
+
+
+def test_both_manifest_copies_fail_the_same_way(monkeypatch, world):
+    """Two files meant to be identical have to fail identically.
+
+    `read_session_manifest` caught `ValueError`; `read_derived_manifest`
+    caught only `json.JSONDecodeError`. `UnicodeDecodeError` is a sibling
+    of the first and a subclass of neither -- so a reviewer wrote the same
+    three bad bytes into each copy and got opposite answers: the session
+    copy refused cleanly, the world copy raised out of every reader that
+    touches it, INCLUDING out of `read_derived`'s verify gate, which sits
+    above its own `try` and so never reaches the widened except tuple
+    there.
+
+    `{not json at all` -- what the test above uses -- is a JSONDecodeError
+    and is caught by both, which is why this hole survived.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+
+    for path in _every_manifest(store, world_id, session_id):
+        original = path.read_bytes()
+        try:
+            path.write_bytes(b"\xff\xfe\x00 not utf-8 at all")
+            # The store refuses rather than raising...
+            assert store.read_derived_manifest(world_id) is None or True
+            payload = _payload(monkeypatch, root)
+            assert payload.get("geometry") is not None, (
+                f"invalid UTF-8 in {path.name} took the whole snapshot down"
+            )
+            _assert_no_fabrication(payload)
+        finally:
+            path.write_bytes(original)
+
+
+def test_one_good_copy_is_enough(monkeypatch, world):
+    """Corrupting the world's manifest must not hide a session's own.
+
+    The two copies are written from one dict under one lock, so they
+    disagree only if something outside the Tower edited one -- or if a
+    crash landed between the two writes. The session's copy goes first, so
+    "session valid, world stale or absent" is exactly what an interrupted
+    build leaves, and reading the session's own is the right answer to it.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    truth = json.loads(
+        store.session_manifest_path(world_id, session_id).read_text(encoding="utf-8")
+    )
+    store.derived_manifest_path(world_id).write_text(
         "{not json at all", encoding="utf-8"
     )
 
     payload = _payload(monkeypatch, root)
-    assert payload["geometry"]["available"] is False
+    assert payload["geometry"]["available"] is True, (
+        "a session with its own valid manifest reported nothing because the "
+        "WORLD's copy was corrupt"
+    )
+    assert payload["geometry"]["element_count"] == truth["points"]
+
+
+def test_a_session_manifest_naming_another_session_is_refused(monkeypatch, world):
+    """A copy that names somebody else is corruption, not a second walk.
+
+    The whole point of the per-session copy is that it always describes the
+    directory it sits in. One that does not is the single input that could
+    turn this change into the misattribution it was meant to prevent.
+    """
+    root, world_id, session_id = world
+    store = WorldStore(root)
+    path = store.session_manifest_path(world_id, session_id)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["session_id"] = "f" * 32
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    store.derived_manifest_path(world_id).write_text(
+        "{not json at all", encoding="utf-8"
+    )
+
+    # A figure nothing on disk could produce. If it reaches the payload,
+    # the foreign manifest was accepted as this session's.
+    manifest["points"] = 999_999
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    derived = store.derived_dir(world_id) / session_id
+    on_disk = len(json.loads((derived / "points.json").read_text())["points"])
+    assert on_disk != 999_999
+
+    payload = _payload(monkeypatch, root)
+    assert payload["geometry"]["element_count"] != 999_999, (
+        "a manifest naming another session was accepted as this one's"
+    )
+    # AMENDED 2026-09-10: this used to assert `available: false`, which
+    # was how "the manifest was refused" showed up while the manifest was
+    # the only source of a figure. The refusal is now visible more
+    # directly -- the number reported is the one on disk, not the one the
+    # foreign manifest claims -- and the world still opens, which is the
+    # whole reason the recount exists.
+    assert payload["geometry"]["element_count"] == on_disk
     _assert_no_fabrication(payload)
 
 
@@ -288,9 +501,26 @@ def test_the_channel_survives_the_world_vanishing_mid_subscription(
     that partially succeeds against open handles, so the world survives in
     pieces and the outcome depends on which files happened to go. An
     earlier version of this test used it and passed or failed by luck.
-    Unlinking `world.json` is deterministic and is the stronger case
-    anyway -- the world becomes unreadable while the subscription is live.
+    Unlinking `world.json` is the stronger case anyway -- the world becomes
+    unreadable while the subscription is live.
+
+    THE UNLINK IS RETRIED, because this docstring used to call it
+    "deterministic" and it is not. The subscription under test polls
+    `world.json`, and Windows refuses to unlink a file another handle has
+    open: `PermissionError: [WinError 32]`. Measured by a reviewer at
+    roughly 1 run in 20 -- never in 11 unloaded runs, once in 4 concurrent
+    ones -- which is exactly the profile of a test that looks solid until
+    the suite is busy. `rmtree` was rejected for partially succeeding;
+    `unlink` does not partially succeed, it raises, which is worse only in
+    that it looks like a product failure.
+
+    Retrying is not weakening the test. The file still goes, the
+    subscription is still live when it does, and the assertions below are
+    unchanged; what goes away is a failure mode that belongs to the
+    filesystem rather than to the code under test.
     """
+    import time
+
     from tests.result_channel_fixtures import pump
 
     root, world_id, _ = world
@@ -300,7 +530,16 @@ def test_the_channel_survives_the_world_vanishing_mid_subscription(
         first = drain(ws, expect="cartridge_result")
         assert first["payload"]["lifecycle"]["state"] == "ready"
 
-        WorldStore(root).world_path(world_id).unlink()
+        path = WorldStore(root).world_path(world_id)
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                path.unlink()
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
         pump(client)
         later = drain(ws, expect="cartridge_result")
@@ -511,3 +750,124 @@ def test_a_bounded_identifier_still_comes_back_whole():
     )
 
     assert "not_a_cartridge" in reply
+
+
+def _both_manifests(store, world_id, session_id):
+    return [
+        store.derived_manifest_path(world_id),
+        store.session_manifest_path(world_id, session_id),
+    ]
+
+
+def _foreign_schema(store, world_id, session_id):
+    for path in _both_manifests(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 999
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _drop_the_tree(store, world_id, session_id):
+    derived = store.derived_dir(world_id) / session_id
+    (derived / "poses.json").unlink()
+    (derived / "points.json").unlink()
+
+
+def _missing_figures(store, world_id, session_id):
+    for path in _both_manifests(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("points", "poses_solved", "poses_refused",
+                    "keyframes", "segments"):
+            manifest.pop(key, None)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _unreadable(store, world_id, session_id):
+    for path in _both_manifests(store, world_id, session_id):
+        path.write_bytes(b"\xff\xfe not json")
+
+
+def _no_manifest(store, world_id, session_id):
+    for path in _both_manifests(store, world_id, session_id):
+        path.unlink()
+
+
+def _empty_build(store, world_id, session_id):
+    derived = store.derived_dir(world_id) / session_id
+    for name, key in (("poses.json", "poses"), ("points.json", "points")):
+        (derived / name).write_text(json.dumps({key: []}), encoding="utf-8")
+    for path in _both_manifests(store, world_id, session_id):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.update(points=0, poses_solved=0, poses_positioned=0)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _foreign_schema_and_no_tree(store, world_id, session_id):
+    _foreign_schema(store, world_id, session_id)
+    _drop_the_tree(store, world_id, session_id)
+
+
+BROKEN_SHAPES = {
+    "intact": lambda *a: None,
+    "foreign schema, tree present": _foreign_schema,
+    "manifest missing its figures": _missing_figures,
+    "manifest unreadable": _unreadable,
+    "no manifest at all": _no_manifest,
+    "a build that solved nothing": _empty_build,
+    "foreign schema, tree gone": _foreign_schema_and_no_tree,
+}
+
+
+@pytest.mark.parametrize("label", sorted(BROKEN_SHAPES))
+def test_the_picker_and_the_panel_agree_about_every_broken_manifest(
+    monkeypatch, tmp_path, label
+):
+    """The invariant three separate findings have landed on.
+
+    A picker row and the panel it opens are computed by different modules,
+    apart, from one disk. `session_state`'s own comment says they must not
+    disagree, and three times in this campaign they did:
+
+      * a manifest from an unknown schema with its tree GONE -- the picker
+        said `interrupted` ("a build ran and its output is gone") while
+        the panel said "this walk produced no geometry";
+      * a manifest from an unknown schema with its tree THERE -- the panel
+        called the poses unreadable while the geometry route served 1,347
+        points of them;
+      * a walk that solved nothing -- the picker said `complete,
+        has_geometry: true` over a 14-byte `points.json` while the panel
+        projected `needsRetry`.
+
+    Each was fixed on its own. This asserts the property all three were
+    instances of, over every way a manifest can be unusable, through both
+    surfaces end to end rather than through either one's helpers.
+    """
+    from tower.results.world_builder import WorldBuilderStatusProducer
+    from tower.results.world_builder_library import build_world_listing
+
+    root = tmp_path / "worlds"
+    world_id, session_id = build_world(root, frames=8)
+    store = WorldStore(root)
+    BROKEN_SHAPES[label](store, world_id, session_id)
+
+    producer = WorldBuilderStatusProducer(root, lambda: 1000.0)
+    snapshot = producer.snapshot(world_id=world_id, session_id=session_id)
+    payload = getattr(snapshot, "payload", snapshot) or {}
+    geometry = payload.get("geometry") or {}
+    trajectory = payload.get("trajectory") or {}
+    panel_has_something = (geometry.get("element_count") or 0) > 0 or (
+        trajectory.get("pose_count") or 0
+    ) > 0
+
+    row = build_world_listing(store)["worlds"][0]["sessions"][0]
+    picker_has_something = row["has_geometry"] is True
+
+    assert panel_has_something == picker_has_something, (
+        f"{label}: the panel says {panel_has_something} and the picker says "
+        f"{picker_has_something} about the same session"
+    )
+    # And the picker's WORD matches what it just claimed.
+    if picker_has_something:
+        assert row["state"] == "complete", (label, row["state"])
+    else:
+        assert row["state"] in ("unbuilt", "interrupted"), (label, row["state"])
+

@@ -46,4 +46,6 @@ def cv_lab(request: Request):
         "control_contract": CONTROL_CONTRACT,
         "contract": STATUS_CONTRACT,
         "status": lab.status(),
+        # Beside the document, not in it: see `CVLab.process_stats`.
+        "process": lab.process_stats(),
     }

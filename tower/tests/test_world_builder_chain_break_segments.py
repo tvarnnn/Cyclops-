@@ -52,10 +52,18 @@ def test_classical_reports_chain_broken_once(monkeypatch):
     from tower.world_builder.backends.classical import ClassicalTwoViewBackend
     from tower.world_builder.records import CameraIntrinsics
 
+    from tower.world_builder.backends import classical as _classical
+
     width, height = 480, 360
     camera = ss.camera_matrix(width, height)
+    # Long enough that the forced failures from index 3 on exhaust the
+    # recovery budget. The break is no longer the FIRST refusal -- a
+    # refusal costs an attempt, and MAX_RECOVERY_KEYFRAMES of them in a
+    # row cost the chain -- but it is still an EDGE, which is what this
+    # test is actually for.
+    count = 4 + _classical.MAX_RECOVERY_KEYFRAMES + 2
     images = ss.render_sequence(
-        ss.furnished_room(), ss.strafe(8, step=0.12), camera, width, height
+        ss.furnished_room(), ss.strafe(count, step=0.12), camera, width, height
     )
     frames = [
         KeyframeInput(

@@ -94,6 +94,18 @@ nonisolated struct WorldBounds: Equatable, Sendable {
     }
 }
 
+nonisolated extension WorldBounds {
+    /// A box built on this side, over points already transformed into one
+    /// reference frame. `init?(json:)` in the struct body suppressed the
+    /// synthesized memberwise initialiser, so this restores exactly that and
+    /// nothing more — no validation, because the caller (`WorldClusterBuilder`)
+    /// only ever passes triples it computed itself.
+    init(min: [Double], max: [Double]) {
+        self.min = min
+        self.max = max
+    }
+}
+
 /// Where a segment sits, as a three-valued fact rather than a bool.
 ///
 /// `registered: false` alone conflates two different situations — "we tried
@@ -462,6 +474,16 @@ nonisolated struct WorldSegmentSummary: Equatable, Sendable {
     /// `nil` when the segment resolved to nothing. Never a zero-size box —
     /// absent and empty are different claims.
     let bounds: WorldBounds?
+    /// How much the Tower's global solve trusts this segment's geometry:
+    /// `"confident"`, `"partial"` or `"unresolved"` — `WORLD-BUILDER-GEOMETRY.md`
+    /// §8. Carried as the Tower's own word rather than an enum so a value this
+    /// build does not know is still shown verbatim rather than dropped.
+    ///
+    /// `nil` when the Tower sent nothing or `null`, which means **nothing has
+    /// judged it** (no solve ran). It is not `"unresolved"` and it is not a
+    /// weaker `"partial"`: absent is absent. Additive on the wire, so it is
+    /// deliberately not in the decoder's required guard.
+    let coverage: String?
 
     /// `nil` unless this segment is registered. **Never identity.**
     var transformToWorld: WorldTransform? { placement.transform }
@@ -540,6 +562,9 @@ nonisolated extension WorldSegmentSummary {
         self.solvedCount = solvedCount
         self.pointCount = pointCount
         self.bounds = WorldBounds(json: json["bounds"])
+        // `as? String` reads `null` and a missing key the same way, as nil.
+        // Neither is a coverage claim.
+        self.coverage = json["coverage"] as? String
     }
 }
 

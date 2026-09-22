@@ -212,6 +212,13 @@ struct CartridgeSubscriptionAck: Equatable, Sendable {
     /// `absent`, `matched`, `stale` or `unrecognised`. Advisory only — the
     /// first result is a complete snapshot regardless.
     let cursorStatus: String?
+    /// The pin the Tower echoes from the `result_subscribe` it is answering
+    /// (`world_id` / `session_id`, `nil` for an unpinned subscribe). This is
+    /// what says WHICH subscribe an ack answers when more than one is out:
+    /// a pinned one and the unpinned one it replaced are not interchangeable,
+    /// and a count of outstanding acks cannot tell them apart.
+    let worldID: String?
+    let sessionID: String?
 
     init?(json: [String: Any]) {
         guard
@@ -224,6 +231,8 @@ struct CartridgeSubscriptionAck: Equatable, Sendable {
         self.resultType = resultType
         self.contract = json["contract"] as? String
         self.cursorStatus = json["cursor_status"] as? String
+        self.worldID = json["world_id"] as? String
+        self.sessionID = json["session_id"] as? String
     }
 }
 

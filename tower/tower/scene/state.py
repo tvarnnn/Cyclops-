@@ -24,6 +24,10 @@ from tower.scene.records import (
     REL_HIGHER_IN_VIEW,
     REL_LEFT_OF,
     REL_RIGHT_OF,
+    SIDE_CENTRE,
+    SIDE_LEFT,
+    SIDE_RIGHT,
+    SIDE_UNKNOWN,
     Relation,
     Track,
 )
@@ -34,6 +38,67 @@ from tower.scene.records import (
 # as one across the whole view.
 MIN_HORIZONTAL_SEPARATION_FRACTION = 0.08
 MIN_VERTICAL_SEPARATION_FRACTION = 0.08
+
+# Where "left" ends and "right" begins, as fractions of frame width.
+#
+# The camera's horizontal field of view is 44.7 degrees (self-calibrated
+# intrinsics, fx 438 px at 360 px wide; `Glasses-scratch/scene-
+# understanding-v1/corpus-audit/fov_analysis.json`). The 0.45/0.55 band
+# this shipped with was therefore 4.7 degrees wide -- narrower than a
+# person's shoulders at two metres (a 0.45 m torso subtends ~0.27 of the
+# frame there) -- so "centre" was a word almost nothing could earn and a
+# person straight ahead read as left or right depending on which
+# shoulder was nearer the middle. At 0.35/0.65 the centre band is 14
+# degrees, and each side band 15.
+SIDE_LEFT_BELOW = 0.35
+SIDE_RIGHT_ABOVE = 0.65
+
+# Hysteresis. A thing already on a side keeps that side until its centre
+# has crossed the boundary by this much, so a person standing on the
+# line does not alternate between two words while nothing moved. 0.03
+# of the frame is ~1.3 degrees, or 11 px -- above the corpus's median
+# inter-frame box motion of 4 px and below anything a person would call
+# moving.
+SIDE_HYSTERESIS = 0.03
+
+# Apparent size of a person, from box height as a fraction of frame
+# height. IMAGE-SPACE ONLY, and named so. A standing adult 1.7 m tall
+# projects to ~0.58 of the frame at 2 m and ~0.39 at 3 m through this
+# lens, so for standing adults larger means nearer -- but a seated
+# person, a child, or a figure cut off by the frame edge breaks that,
+# and nothing here can tell those apart. So the words are large / medium
+# / small, never near / far, and the wire says why.
+SIZE_LARGE_ABOVE = 0.6
+SIZE_SMALL_BELOW = 0.3
+SIZE_LARGE = "large"
+SIZE_MEDIUM = "medium"
+SIZE_SMALL = "small"
+SIZE_UNKNOWN = "unknown"
+
+# A person box with NO HEAD REGION in view -- its top starts below this
+# fraction of the frame -- is, from a camera worn at head height, most
+# often the wearer's own body: hands, forearms, lap, legs. The 2026-09-07
+# corpus audit found the wearer's body in frame in most captures and no
+# bystander in any, and on the 49 labelled wearer-only frames the
+# detector's 53 person boxes had tops at 0.31-0.91 of the frame: 50 of
+# them at or below 0.45. A standing or seated person in front of the
+# wearer has their head in the upper half of this camera's 72-degree
+# vertical field; a "person" that starts below the middle is a part of
+# one. Such a box is reported apart from the count, as a partial figure,
+# rather than as a person in front of the wearer. A real person whose
+# only visible part is their legs under a table lands in the same bucket
+# -- and that is the honest bucket for them too: the camera did not see
+# a person, it saw part of one.
+#
+# The second shape is a box that spans nearly the whole width and
+# reaches the bottom edge with its top in the upper half: the wearer's
+# own arms and torso seen while looking down (2 of the 3 boxes the first
+# rule missed). A bystander filling 80% of the frame's width would be
+# within arm's reach, and one that close has a face the estimator sees.
+NO_HEAD_REGION_ABOVE = 0.45
+BOTTOM_EDGE_FRACTION = 0.97
+FULL_WIDTH_FRACTION = 0.8
+NOT_A_HEAD_ABOVE = 0.25
 
 # Relationships this cartridge will NOT assert, and what each would need.
 # Kept as data rather than prose so a query layer can answer "why not"
@@ -101,29 +166,98 @@ REFUSED_RELATIONSHIPS = {
         "on same-class pairs too (laptop/laptop, phone/phone) and fails "
         "under motion for the same reason `in_front_of` does. This entry "
         "is no longer waiting on depth; it is waiting on the same footage "
-        "`in_front_of` names."
+        "`in_front_of` names. Apparent SIZE of a person is published "
+        "instead (large/medium/small), in those words, because a standing "
+        "adult's height is the one dimension a box does carry -- and it "
+        "is still not a distance."
     ),
 }
+
+
+def assign_side(previous: str | None, normalised_x: float | None) -> str:
+    """Which side of the view a centre-x falls on, with hysteresis.
+
+    `previous` is the side this track was last given, or None. Unknown
+    input (no frame size) is unknown output, whatever came before.
+    """
+    if normalised_x is None:
+        return SIDE_UNKNOWN
+    left_line = SIDE_LEFT_BELOW
+    right_line = SIDE_RIGHT_ABOVE
+    if previous == SIDE_LEFT:
+        left_line += SIDE_HYSTERESIS
+    elif previous == SIDE_RIGHT:
+        right_line -= SIDE_HYSTERESIS
+    elif previous == SIDE_CENTRE:
+        left_line -= SIDE_HYSTERESIS
+        right_line += SIDE_HYSTERESIS
+    if normalised_x < left_line:
+        return SIDE_LEFT
+    if normalised_x > right_line:
+        return SIDE_RIGHT
+    return SIDE_CENTRE
+
+
+def apparent_size(track: Track, frame_height: int) -> str:
+    """large / medium / small, from box height. Image-space, not distance."""
+    if not frame_height:
+        return SIZE_UNKNOWN
+    fraction = track.box.height / frame_height
+    if fraction >= SIZE_LARGE_ABOVE:
+        return SIZE_LARGE
+    if fraction < SIZE_SMALL_BELOW:
+        return SIZE_SMALL
+    return SIZE_MEDIUM
+
+
+def is_partial_at_bottom_edge(track: Track, frame_height: int, frame_width: int = 0) -> bool:
+    """A person box with no head region in view, or one that fills the
+    width down to the bottom edge.
+
+    From a head-worn camera that is most often the wearer's own body.
+    See `NO_HEAD_REGION_ABOVE`. The name keeps the wire's word for the
+    bucket; the rule no longer requires the bottom edge for the first
+    shape, because a hand resting on a laptop is a "person" that touches
+    nothing.
+    """
+    if not frame_height or track.label != "person":
+        return False
+    top = track.box.y0 / frame_height
+    if top >= NO_HEAD_REGION_ABOVE:
+        return True
+    if not frame_width:
+        return False
+    return (
+        top >= NOT_A_HEAD_ABOVE
+        and track.box.y1 >= frame_height * BOTTOM_EDGE_FRACTION
+        and track.box.width >= frame_width * FULL_WIDTH_FRACTION
+    )
 
 
 @dataclass(frozen=True)
 class SceneState:
     """What is around the wearer, as of one frame. Never stored.
 
-    `counts` come from CONFIRMED TRACKS, never from detections -- which is
-    the single correctness requirement the brief singles out.
+    `tracks` are the COUNTED tracks -- confirmed and seen within the
+    count window -- and `counts` are taken from them, never from
+    detections, which is the single correctness requirement the brief
+    singles out. `partial_people` are person tracks cut off by the
+    bottom edge with no head region (`is_partial_at_bottom_edge`); they
+    are kept apart from `tracks` and from `counts["person"]`.
     """
 
     at: float
     frame_width: int
     frame_height: int
     tracks: tuple[Track, ...] = ()
+    partial_people: tuple[Track, ...] = ()
     relations: tuple[Relation, ...] = ()
     counts: dict = field(default_factory=dict)
     frames_observed: int = 0
     detector: str = "unknown"
     score_threshold: float = 0.0
     orientation_enabled: bool = False
+    orientation_method: str | None = None
 
     def count(self, label: str) -> int:
         return int(self.counts.get(label, 0))
@@ -162,8 +296,10 @@ class SceneState:
             "detector": self.detector,
             "score_threshold": self.score_threshold,
             "orientation_enabled": self.orientation_enabled,
+            "orientation_method": self.orientation_method,
             "counts": dict(self.counts),
             "tracks": [track.to_json_dict() for track in self.tracks],
+            "partial_people": len(self.partial_people),
             "relations": [relation.to_json_dict() for relation in self.relations],
             "refused_relationships": sorted(REFUSED_RELATIONSHIPS),
         }
@@ -178,6 +314,11 @@ def describe_position(track: Track, frame_width: int, frame_height: int) -> dict
     monotonic, comparable "how far off-centre", and the field name says
     `view` so nobody reads it as a compass heading.
 
+    The side is the one the engine assigned with hysteresis
+    (`track.side`) when it has one, so the word a client sees does not
+    flicker on a boundary; a track that was never placed is placed here
+    without history.
+
     **Refuses when the frame size is unknown.** Normalising a pixel
     coordinate by zero would report every object at `normalised_x: 0.0`
     and `side: "left"` -- a specific, confident claim about where things
@@ -188,7 +329,7 @@ def describe_position(track: Track, frame_width: int, frame_height: int) -> dict
             "normalised_x": None,
             "normalised_y": None,
             "view_offset": None,
-            "side": "unknown",
+            "side": SIDE_UNKNOWN,
             "frame_of_reference": "camera",
             "note": (
                 "frame dimensions unknown, so no position can be computed. "
@@ -197,19 +338,14 @@ def describe_position(track: Track, frame_width: int, frame_height: int) -> dict
         }
 
     centre_x, centre_y = track.box.centre
-    normalised_x = centre_x / frame_width if frame_width else 0.0
-    normalised_y = centre_y / frame_height if frame_height else 0.0
+    normalised_x = centre_x / frame_width
+    normalised_y = centre_y / frame_height
+    side = track.side if track.side is not None else assign_side(None, normalised_x)
     return {
         "normalised_x": round(normalised_x, 4),
         "normalised_y": round(normalised_y, 4),
         "view_offset": round((normalised_x - 0.5) * 2.0, 4),
-        "side": (
-            "left"
-            if normalised_x < 0.45
-            else "right"
-            if normalised_x > 0.55
-            else "centre"
-        ),
+        "side": side,
         "frame_of_reference": "camera",
         "note": (
             "camera-relative; there is no live world pose to anchor to, so "
@@ -221,7 +357,7 @@ def describe_position(track: Track, frame_width: int, frame_height: int) -> dict
 def relate(tracks, frame_width: int, frame_height: int) -> list[Relation]:
     """Every relationship the evidence supports, and none that it does not.
 
-    Asserted pairwise over CONFIRMED tracks only. An unconfirmed track is
+    Asserted pairwise over COUNTED tracks only. An unconfirmed track is
     a flicker, and relating flickers produces relations that appear and
     vanish while the room is still.
     """

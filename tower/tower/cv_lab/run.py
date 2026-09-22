@@ -23,6 +23,7 @@ reported as unclassified rather than folded in under a default.
 """
 
 import logging
+import time
 
 from tower.cv_lab.contracts import (
     MAX_REPORTED_METRICS,
@@ -162,6 +163,15 @@ class LabRun:
         self.origin = origin
         self.started_at = started_at
         self.ended_at: float | None = None
+        # How long the arm took, in milliseconds, from the moment the run
+        # was minted to the moment its experiment was installed and could
+        # answer a frame. `None` until then, and `None` forever for a run
+        # whose arm failed. Measured on `perf_counter`, not on the
+        # wall clock `started_at` uses: on Windows `time.time()` ticks
+        # every ~15.6 ms, which is coarser than a cheap experiment's whole
+        # arm.
+        self.arm_ms: float | None = None
+        self.arm_started_perf = time.perf_counter()
         # Runtime facts the experiment reports about itself once loaded --
         # device, weights, versions. Empty until `describe()` is asked,
         # and empty forever for an experiment that does not implement it.

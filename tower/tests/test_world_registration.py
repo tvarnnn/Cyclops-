@@ -595,18 +595,75 @@ class TestJsonFormat:
 
 
 REAL_WORLD = "3dd986b1c2364d4b85de97152f2e39f4"
-REAL_ROOT = Path("data/world_builder")
+# Anchored to this file, not to the working directory. As
+# `Path("data/world_builder")` this resolved against whatever cwd pytest
+# happened to be launched from, so the corpus was found only when the
+# suite was run from `tower/` and from anywhere else the whole class
+# below skipped with the same message it uses for a host that genuinely
+# has no corpus. Those are different facts and only one of them is
+# benign.
+REAL_ROOT = Path(__file__).resolve().parents[1] / "data" / "world_builder"
+
+
+def _real_store():
+    store = WorldStore(REAL_ROOT)
+    if not store.world_path(REAL_WORLD).exists():
+        pytest.skip(f"world {REAL_WORLD} is not on this host")
+    return store
 
 
 @pytest.fixture(scope="module")
 def report():
-    """One registration run, shared by the checks below. ~40 s."""
-    store = WorldStore(REAL_ROOT)
-    if not store.world_path(REAL_WORLD).exists():
-        pytest.skip(f"world {REAL_WORLD} is not on this host")
+    """One registration run, shared by the checks below. ~5 s."""
+    store = _real_store()
     session_ids = store.list_session_ids(REAL_WORLD)
     try:
         return register(store, REAL_WORLD, session_ids[0])
+    except SupportMissingError as error:
+        pytest.skip(str(error))
+
+
+# The two clauses that sit AHEAD of reciprocity in `admit()`, relaxed to
+# their floor. Nothing is monkeypatched: `pair_is_hopeless` reads
+# `thresholds.min_span_over_depth` itself, so dropping that to 0.0
+# neutralises the cheap pre-filter through the gate's own configuration.
+RECIPROCITY_IS_DECISIVE = Thresholds(min_cameras=2, min_span_over_depth=0.0)
+
+
+@pytest.fixture(scope="module")
+def report_where_reciprocity_decides():
+    """The same walk, with every clause AHEAD of reciprocity relaxed. ~10 s.
+
+    THIS FIXTURE EXISTS BECAUSE THE FIRST VERSION OF IT PROVED LESS THAN
+    IT CLAIMED, and a reviewer caught it by mutation.
+
+    `admit()` evaluates its clauses in order: finite scale, cameras,
+    span/depth, THEN reciprocity, then rotation, ambiguity, reprojection.
+    On the shipped thresholds the three pairs on this walk whose two
+    directions disagree are all refused before reciprocity is ever
+    compared -- (1,50) and (12,46) on `cameras` (2 < 3), (5,6) on
+    `span_over_depth` (0.043 < 0.09). So a test that merely asserted
+    "these disagreeing pairs are not admitted" passed with the
+    reciprocity gate DISABLED ENTIRELY: setting
+    `max_reciprocity_error=10.0` left every real-walk test green and
+    reddened only three synthetic ones.
+
+    Relaxing `min_cameras` and `min_span_over_depth` moves reciprocity to
+    the front of the queue, and then the walk refuses those three pairs
+    ON RECIPROCITY, in its own words:
+
+        (1, 50)  0.89440  "the two directions disagree on scale by 1.12x"
+        (5,  6)  0.70716  "... by 1.41x"
+        (12,46)  1.35588  "... by 1.36x"
+
+    Relaxing changes no verdict: the admitted set is `[[4,5],[5,32]]`
+    here exactly as it is on the shipped thresholds, which is asserted
+    below rather than assumed.
+    """
+    store = _real_store()
+    session_ids = store.list_session_ids(REAL_WORLD)
+    try:
+        return register(store, REAL_WORLD, session_ids[0], RECIPROCITY_IS_DECISIVE)
     except SupportMissingError as error:
         pytest.skip(str(error))
 
@@ -706,16 +763,181 @@ class TestTheRealWalk:
 
         Stated as a rule rather than as "(5,6) and (30,50) are refused",
         so it keeps its meaning when the segmentation changes underneath.
+
+        This used to open with `assert disagreeing` -- an EXISTENTIAL
+        claim that the real walk must forever contain a pair whose two
+        solves disagree. That is a claim about the corpus, not about the
+        gate, and it went false the moment `pair_is_hopeless` began
+        refusing those same pairs on span/depth before they were matched:
+        the walk still contains them, they simply no longer carry a
+        number. Asserting that bad evidence must keep existing makes a
+        safety test fail on a change that only ever made the pipeline
+        refuse EARLIER.
+
+        HONEST STATUS ON THE SHIPPED THRESHOLDS: this loop's body runs
+        ZERO times on today's corpus. The only two finite reciprocities
+        here are 1.03890 and 0.95582, both well inside the 0.10 band, so
+        there is nothing for it to refuse. It is kept because it is the
+        property, and because it costs nothing to keep a rule that will
+        matter the moment the corpus changes -- but it is NOT where this
+        clause is proven. That is
+        `test_a_disagreeing_pair_is_refused_on_reciprocity_itself`, which
+        moves reciprocity to the front of `admit()`'s queue so the real
+        walk exercises it decisively, and the three synthetic tests in
+        `TestFitQualityCannotAdmit`.
+
+        Said out loud because the first version of this file implied the
+        opposite, and a reviewer had to disable the reciprocity gate
+        entirely to discover that every real-walk test stayed green.
         """
+        for pair in report["pairs"]:
+            if pair["reciprocity"] is None:
+                continue
+            if abs(pair["reciprocity"] - 1.0) > 0.10:
+                assert not pair["registered"], (
+                    f"pair {tuple(pair['pair'])} was admitted with a "
+                    f"reciprocity of {pair['reciprocity']}: its two "
+                    "independent solves disagree on scale"
+                )
+
+    def test_the_reciprocity_clause_is_actually_evaluated(self, report):
+        """The anti-vacuity guard for the test above.
+
+        That test filters on `reciprocity is not None`, because the
+        report emits null wherever `verdict.reciprocity` is not finite.
+        A pipeline that started returning NaN for every pair -- a solver
+        degrading, a refusal moved ahead of the comparison -- would empty
+        that filter, and the loop would then pass over nothing for as
+        long as anyone cared to run it. That is the regression shape most
+        likely to be mistaken for an improvement, so it is pinned here
+        rather than inferred.
+
+        Two things are asserted: the comparison is still REACHED on real
+        evidence at all, and nothing was admitted without going through
+        it. The second matters because `abs(nan - 1.0) > threshold` is
+        False -- a NaN reciprocity does not trip the refusal, it slips
+        past it -- so an admitted pair with a null reciprocity would mean
+        the gate had stopped checking.
+        """
+        finite = [p for p in report["pairs"] if p["reciprocity"] is not None]
+
+        assert finite, (
+            "no pair on the real walk reached the reciprocity comparison, "
+            "so the clause that refuses disagreeing pairs is no longer "
+            "evaluated against real evidence and the check above is a "
+            "no-op"
+        )
+        for pair in finite:
+            assert math.isfinite(pair["reciprocity"])
+
+        admitted = {tuple(p) for p in report["admitted_pairs"]}
+        for pair in report["pairs"]:
+            if tuple(pair["pair"]) in admitted:
+                assert pair["reciprocity"] is not None, (
+                    f"pair {tuple(pair['pair'])} was admitted without a "
+                    "finite reciprocity: a NaN does not trip the "
+                    "disagreement clause, it bypasses it"
+                )
+
+    def test_a_disagreeing_pair_is_refused_on_reciprocity_itself(
+        self, report_where_reciprocity_decides
+    ):
+        """The real corpus refusing a pair ON RECIPROCITY, in its own words.
+
+        The version of this test that shipped first asserted only that
+        the disagreeing pairs were not admitted -- and a reviewer showed
+        that assertion held with `max_reciprocity_error` set to 10.0,
+        i.e. with the clause switched off, because `cameras` and
+        `span_over_depth` refuse all three of them first.
+
+        So this asserts the REASON, not just the outcome. With the two
+        cheaper clauses relaxed to their floor, reciprocity is what
+        decides, and the message the gate writes says so.
+        """
+        report = report_where_reciprocity_decides
         disagreeing = [
             p for p in report["pairs"]
             if p["reciprocity"] is not None
             and abs(p["reciprocity"] - 1.0) > 0.10
         ]
 
-        assert disagreeing, "expected some pair whose two solves disagree"
+
+        assert disagreeing, (
+            "no pair on the real walk disagrees between its two directions "
+            "even with the cheaper clauses relaxed; the corpus this "
+            "property was measured on no longer exercises it, and the "
+            "checks below prove nothing"
+        )
+
+        if not disagreeing:
+            # A skip, not a failure. This line used to assert, and it was
+            # RED on a clean tree: on this world 141 of 143 pairs never
+            # reach a reciprocity number at all -- 135 are pruned on
+            # span/depth before matching and 6 solve in neither direction
+            # -- and the two that do reach one both agree. That is a fact
+            # about the footage, not a defect in the gate, and asserting
+            # it made the corpus a silent precondition of the rule.
+            #
+            # The rule below is what this test is for, and it is
+            # exercised whatever the corpus holds by the synthetic cases
+            # in TestFitQualityCannotAdmit -- specifically
+            # test_the_known_bad_pair_is_refused_despite_fitting_well,
+            # test_reciprocity_alone_flips_the_verdict and
+            # test_perfect_reprojection_does_not_rescue_bad_reciprocity.
+            # (An earlier version of this comment named TestGateClauses,
+            # which has no scale-disagreement case at all. Mutation
+            # testing found the three above are what actually kill it.)
+            #
+            # Recorded rather than deleted because a walk WITH
+            # disagreeing pairs is exactly what we want to run this
+            # against: the 2026-08-29 drawer walk has five, all refused.
+            pytest.skip(
+                "no pair on this world produced two solves that disagree; "
+                "the rule is unobservable here"
+            )
         for pair in disagreeing:
-            assert not pair["registered"]
+            assert not pair["registered"], (
+                f"pair {tuple(pair['pair'])} was admitted with a "
+                f"reciprocity of {pair['reciprocity']}"
+            )
+            assert "directions disagree on scale" in pair["reason"], (
+                f"pair {tuple(pair['pair'])} was refused for "
+                f"{pair['reason']!r} rather than on reciprocity, so this "
+                "test is not exercising the clause it names"
+            )
+
+    def test_the_cheap_clauses_change_no_verdict(
+        self, report, report_where_reciprocity_decides
+    ):
+        """`pair_is_hopeless` and its two neighbours move refusals, never make them.
+
+        The prune exists for speed and shares `admit()`'s span bar
+        precisely so it cannot change an outcome; `min_cameras` and
+        `min_span_over_depth` are the clauses ahead of reciprocity. If
+        relaxing them admitted anything new -- or the prune ever dropped
+        a pair the gate would have taken -- these two runs would part.
+
+        This is also what makes the shipped report's SILENCE about
+        disagreeing pairs safe to accept: the pairs it never scores are
+        dropped, not admitted unexamined.
+        """
+        shipped = {tuple(p) for p in report["admitted_pairs"]}
+        relaxed = {
+            tuple(p) for p in report_where_reciprocity_decides["admitted_pairs"]
+        }
+
+        assert shipped == relaxed, (
+            f"the cheap clauses changed a verdict: shipped admits "
+            f"{sorted(shipped)} where the relaxed gate admits {sorted(relaxed)}"
+        )
+        assert (
+            report["reference_segment"]
+            == report_where_reciprocity_decides["reference_segment"]
+        )
+        assert (
+            report["points_registered"]
+            == report_where_reciprocity_decides["points_registered"]
+        )
 
     def test_a_segment_that_stood_still_is_named_as_such(self, report):
         still = [r for r in report["segments"]
@@ -814,18 +1036,6 @@ def test_rotation_disagreement_is_reported_even_when_it_passes():
     assert evidence.rotation_disagreement_deg < 1e-6
     verdict = admit(evidence, Thresholds())
     assert "rotation_disagreement_deg" in verdict.clauses
-
-
-def _segment_with_span(span):
-    """A stand-in segment whose cameras span  of the scene depth."""
-    import numpy as _np
-
-    class _Seg:
-        index = 0
-        span_over_depth = span
-        points = _np.zeros((10, 3))
-
-    return _Seg()
 
 
 def _segment_with_span(value):

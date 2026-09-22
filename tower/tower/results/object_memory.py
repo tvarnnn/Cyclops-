@@ -262,6 +262,7 @@ def build_observations(
     store: ObservationStore,
     *,
     object_class: str | None = None,
+    since: float | None = None,
     requested_retention_days: float | None = None,
     recorded_classes=None,
 ) -> dict:
@@ -272,10 +273,28 @@ def build_observations(
     maintenance paths -- purge counting what it deletes, an operator
     auditing the file -- and is never the right answer for anything a
     wearer will be shown, which is everything on this wire.
+
+    `since` IS THE ANSWER TO "WHAT DID THIS RECORDING REMEMBER", and it is
+    why a failed recording can no longer wear a full store's history as its
+    own. A physical run once recorded ZERO observations while the app kept
+    showing 116 old ones, so "nothing happened" and "everything is fine"
+    looked identical. A client that stamps a session's `started_at` and asks
+    `since=<that>` gets exactly the records THIS recording created --
+    `recorded_at` is the Tower-receipt moment a record was first written, on
+    the same clock as `started_at` -- so an empty answer is an honest empty
+    answer, and the historical view is a DIFFERENT request the wearer opts
+    into. It filters by identity-in-time, not by a guess: a record is in or
+    out by when the Tower wrote it, and nothing a reader passes moves that.
     """
     observations = store.all_observations()
     if object_class is not None:
         observations = [o for o in observations if o.object_class == object_class]
+    if since is not None:
+        # `recorded_at`, not `observed_at`: the boundary is when the Tower
+        # WROTE the memory, which shares a clock with a session's
+        # `started_at`. `observed_at` is capture-journal receipt time and
+        # would answer a subtly different, wrong question near the edge.
+        observations = [o for o in observations if o.recorded_at >= since]
     # Newest first: the question this cartridge exists to answer is "when
     # did I last see", so the most recent sighting should not be at the
     # bottom of a scroll.
@@ -283,6 +302,11 @@ def build_observations(
 
     payload = _envelope(store, requested_retention_days, recorded_classes)
     payload["object_class"] = object_class
+    # Echoed so the answer says what it was filtered to. `null` means "the
+    # whole store", which is a different claim from "this session", and a
+    # client drawing "new this recording" must be able to tell them apart
+    # in the payload rather than only in its own memory of what it asked.
+    payload["since"] = since
     payload["observation_count"] = len(observations)
     payload["observations"] = [_observation_view(o) for o in observations]
     return payload

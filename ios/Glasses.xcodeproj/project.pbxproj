@@ -11,6 +11,7 @@
 		241A00E73BC38F81C53AD3EE /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B1FC178F43D5AD1315AFD45C /* Foundation.framework */; };
 		3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */; };
 		4E8D7950967282CF51E8CBE3 /* WorldGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */; };
+		4B8ABCE8956142C6BB5B21E6 /* WorldPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */; };
 		7F2D5E31A94C0B6683DF12A4 /* ObjectMemoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A17E9B0D3F42A85B61E77C /* ObjectMemoryTests.swift */; };
 		9991A422AB42B22E2459E23D /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = BC6D1772D314E7BCB789B652 /* MWDATCore */; };
 		D7881F047A369AE591F64541 /* CVLabContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3014A1C5D2A01699D4E7404 /* CVLabContractTests.swift */; };
@@ -31,10 +32,18 @@
 			remoteGlobalIDString = 6A04FA34303507A5001B7C01;
 			remoteInfo = Glasses;
 		};
+		7A11C0DE0001000000000007 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6A04FA2D303507A5001B7C01 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6A04FA34303507A5001B7C01;
+			remoteInfo = Glasses;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldGeometryTests.swift; sourceTree = "<group>"; };
+		FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldPresentationTests.swift; sourceTree = "<group>"; };
 		C4A17E9B0D3F42A85B61E77C /* ObjectMemoryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ObjectMemoryTests.swift; sourceTree = "<group>"; };
 		6A04FA35303507A5001B7C01 /* Glasses.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Glasses.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MockTowerServer.swift; sourceTree = "<group>"; };
@@ -47,6 +56,7 @@
 		E3014A195D2A01699D4E7401 /* ProductShellTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProductShellTests.swift; sourceTree = "<group>"; };
 		E3014A1A5D2A01699D4E7402 /* SenderPipelineTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SenderPipelineTests.swift; sourceTree = "<group>"; };
 		E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldBuilderIntegrationTests.swift; sourceTree = "<group>"; };
+		7A11C0DE0001000000000003 /* GlassesUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GlassesUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -66,6 +76,11 @@
 				BD2C4678A21A301655E03FE7 /* Exceptions for "Glasses" folder in "Glasses" target */,
 			);
 			path = Glasses;
+			sourceTree = "<group>";
+		};
+		7A11C0DE0001000000000002 /* GlassesUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = GlassesUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -89,6 +104,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		7A11C0DE0001000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -99,6 +121,7 @@
 				6A04FA36303507A5001B7C01 /* Products */,
 				EED23FC97EE879DA66A17A20 /* Frameworks */,
 				BF558549FCFE219E486A30BD /* GlassesTests */,
+				7A11C0DE0001000000000002 /* GlassesUITests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -107,6 +130,7 @@
 			children = (
 				6A04FA35303507A5001B7C01 /* Glasses.app */,
 				9D934BA2F3095D85C74F7364 /* GlassesTests.xctest */,
+				7A11C0DE0001000000000003 /* GlassesUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -132,6 +156,7 @@
 				E3014A185D2A01699D4E7400 /* TowerClientTests.swift */,
 				E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */,
 				0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */,
+				FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */,
 			);
 			path = GlassesTests;
 			sourceTree = "<group>";
@@ -190,6 +215,27 @@
 			productReference = 6A04FA35303507A5001B7C01 /* Glasses.app */;
 			productType = "com.apple.product-type.application";
 		};
+		7A11C0DE0001000000000001 /* GlassesUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7A11C0DE0001000000000009 /* Build configuration list for PBXNativeTarget "GlassesUITests" */;
+			buildPhases = (
+				7A11C0DE0001000000000004 /* Sources */,
+				7A11C0DE0001000000000005 /* Frameworks */,
+				7A11C0DE0001000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				7A11C0DE0001000000000008 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				7A11C0DE0001000000000002 /* GlassesUITests */,
+			);
+			name = GlassesUITests;
+			productName = GlassesUITests;
+			productReference = 7A11C0DE0001000000000003 /* GlassesUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -201,6 +247,9 @@
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					5B393CE65BE51C1C375C789E = {
+						TestTargetID = 6A04FA34303507A5001B7C01;
+					};
+					7A11C0DE0001000000000001 = {
 						TestTargetID = 6A04FA34303507A5001B7C01;
 					};
 					6A04FA34303507A5001B7C01 = {
@@ -227,6 +276,7 @@
 			targets = (
 				6A04FA34303507A5001B7C01 /* Glasses */,
 				5B393CE65BE51C1C375C789E /* GlassesTests */,
+				7A11C0DE0001000000000001 /* GlassesUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -240,6 +290,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		6A04FA33303507A5001B7C01 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7A11C0DE0001000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -270,6 +327,14 @@
 				D7881F007A369AE591F6453D /* TowerClientTests.swift in Sources */,
 				D7881F037A369AE591F64540 /* WorldBuilderIntegrationTests.swift in Sources */,
 				4E8D7950967282CF51E8CBE3 /* WorldGeometryTests.swift in Sources */,
+				4B8ABCE8956142C6BB5B21E6 /* WorldPresentationTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7A11C0DE0001000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -281,6 +346,12 @@
 			name = Glasses;
 			target = 6A04FA34303507A5001B7C01 /* Glasses */;
 			targetProxy = 4CE54B4704135E0AF44DFA7B /* PBXContainerItemProxy */;
+		};
+		7A11C0DE0001000000000008 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = Glasses;
+			target = 6A04FA34303507A5001B7C01 /* Glasses */;
+			targetProxy = 7A11C0DE0001000000000007 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -436,15 +507,15 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.Glasses;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
-				SDKROOT = auto;
+				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Debug;
@@ -480,15 +551,15 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.Glasses;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
-				SDKROOT = auto;
+				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Release;
@@ -506,7 +577,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Glasses.app/Glasses";
 				VALIDATE_PRODUCT = YES;
 			};
@@ -525,10 +596,45 @@
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Glasses.app/Glasses";
 			};
 			name = Debug;
+		};
+		7A11C0DE000100000000000A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.GlassesUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Glasses;
+			};
+			name = Debug;
+		};
+		7A11C0DE000100000000000B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tristanvarner.GlassesUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				VALIDATE_PRODUCT = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Glasses;
+			};
+			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
@@ -556,6 +662,15 @@
 			buildConfigurations = (
 				6A04FA41303507A7001B7C01 /* Debug */,
 				6A04FA42303507A7001B7C01 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7A11C0DE0001000000000009 /* Build configuration list for PBXNativeTarget "GlassesUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7A11C0DE000100000000000A /* Debug */,
+				7A11C0DE000100000000000B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

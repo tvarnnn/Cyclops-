@@ -124,6 +124,40 @@ def test_start_script_passes_host_explicitly():
     )
 
 
+def test_start_script_keeps_the_windows_listener_alive():
+    """--loop routes uvicorn onto the resilient Proactor loop.
+
+    Without it, uvicorn takes asyncio.ProactorEventLoop on Windows, whose
+    accept path (CPython gh-93821) closes the listening socket and never
+    re-arms it when a backlogged connection is reset before it is accepted.
+    A reconnecting phone does that routinely; the port then vanishes while
+    the process lives, which is what a physical test hit. --loop asyncio
+    would NOT fix it (still a Proactor loop on win32), so the factory must
+    be named explicitly.
+    """
+    executable = "\n".join(_executable_lines(START_SCRIPT))
+
+    assert "'--loop', 'tower.serve_loop:resilient_loop_factory'" in executable, (
+        "the uvicorn argument list must route onto tower/serve_loop.py, or a "
+        "reset connection will take port 8000 down while the process stays up"
+    )
+
+
+def test_start_script_bounds_shutdown():
+    """--timeout-graceful-shutdown turns an unbounded hang into a bounded exit.
+
+    uvicorn's default (None) makes Ctrl-C wait forever for a stalled
+    websocket transport to drain -- a phone suspended with the socket open --
+    and a second Ctrl-C does not help. That is the "INFO: Shutting down" that
+    then never completed in the field.
+    """
+    executable = "\n".join(_executable_lines(START_SCRIPT))
+
+    assert "'--timeout-graceful-shutdown'" in executable, (
+        "shutdown must be bounded, or a stalled connection hangs Ctrl-C forever"
+    )
+
+
 def test_start_script_names_bindhost_not_host():
     """$Host is an automatic PowerShell variable.
 

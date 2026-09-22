@@ -566,6 +566,13 @@ class TestOnlyTheStreamThatStartedASessionCanEndIt:
     hook claims to prevent. And it carried no identity, so with two
     phones streaming the first to disconnect stopped the session out from
     under the second.
+
+    The rule has since moved on once more (`tower/scene/live.py`, WHEN IT
+    RUNS): a stream starts the session only together with a watcher, and
+    the LAST OPEN STREAM closing stops it whoever pressed Start, because
+    frames come from nowhere else. What this class still pins is the
+    part that never changed: a connection that never streamed cannot end
+    anything, and a second phone's stream keeps the session alive.
     """
 
     def _scene(self):
@@ -589,22 +596,29 @@ class TestOnlyTheStreamThatStartedASessionCanEndIt:
         session = self._scene()
         try:
             session.stream_opened("phone-1")
+            session.watcher_joined("phone-1:sub-1", owner="phone-1")
             assert _await(lambda: session.state == "running")
             session.stop()
 
             session.start()  # an operator, by hand. No stream started it.
             assert _await(lambda: session.state == "running")
-            session.stream_closed("phone-1")
+            session.stream_closed("a-passing-connection")
 
             assert session.state == "running", (
                 "a disconnect ended a session the operator started"
             )
+
+            # The one stream actually feeding it closing is different:
+            # with no feed there is nothing to observe, whoever started it.
+            session.stream_closed("phone-1")
+            assert _await(lambda: session.state == "stopped")
         finally:
             session.stop()
 
     def test_the_first_of_two_streams_to_leave_does_not_stop_the_session(self):
         session = self._scene()
         try:
+            session.watcher_joined("mac:sub-1", owner="mac")
             session.stream_opened("phone-1")
             session.stream_opened("phone-2")
             assert _await(lambda: session.state == "running")
@@ -621,6 +635,7 @@ class TestOnlyTheStreamThatStartedASessionCanEndIt:
         session = self._scene()
         try:
             session.stream_opened("phone-1")
+            session.watcher_joined("phone-1:sub-1", owner="phone-1")
             assert _await(lambda: session.state == "running")
 
             session.stream_closed("a-connection-that-never-streamed")

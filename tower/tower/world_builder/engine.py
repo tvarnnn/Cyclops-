@@ -40,6 +40,9 @@ from tower.world_builder.keyframes import (
 )
 from tower.world_builder.redaction import FaceRedactor
 from tower.world_builder.records import (
+    FINAL_SOLVE_PENDING,
+    FINALIZATION_PENDING,
+    FINALIZATION_STATES,
     CameraIntrinsics,
     Keyframe,
     KeyframeEdge,
@@ -57,6 +60,7 @@ from tower.world_builder.schema import (
     SCALE_RELATIVE,
     SCALE_UNKNOWN,
 )
+from tower.world_builder import global_solve
 from tower.world_builder.store import WorldStore, compute_input_digest
 
 logger = logging.getLogger(__name__)
@@ -193,6 +197,14 @@ class WorldBuilderEngine:
         self._tracker: FrameTracker | None = None
         self._events: EventLog | None = None
         self._segment_index = 0
+        # The sequence renumbering. See `observe`.
+        self._seq_offset = 0
+        self._last_effective_seq: int | None = None
+        # The size every frame of this session must be. Set by the
+        # first frame rather than from the declared size, because
+        # the declared size is what the phone SAYS and this is what
+        # it actually sent. See `observe`.
+        self._frame_shape = None
         self._segment_solved = 0
         self._barren_segments = 0
         self._segments_used: set[int] = set()
@@ -259,6 +271,13 @@ class WorldBuilderEngine:
             self._store, world_id, session.session_id, clock=self._clock
         )
         self._segment_index = 0
+        self._seq_offset = 0
+        self._last_effective_seq = None
+        # The size every frame of this session must be. Set by the
+        # first frame rather than from the declared size, because
+        # the declared size is what the phone SAYS and this is what
+        # it actually sent. See `observe`.
+        self._frame_shape = None
         # Reset with its sibling. start_session resets every other piece
         # of per-session state; leaving this one behind let a new
         # session inherit a restart budget the previous one earned.
@@ -289,6 +308,39 @@ class WorldBuilderEngine:
         )
         session = self._session
 
+        # SEQUENCE NUMBERS RESTART WHEN THE GLASSES DO, AND THE SESSION
+        # DOES NOT. `make_keyframe_id` says it: `source_seq` "resets when
+        # the glasses session restarts". A builder follows a capture
+        # LINEAGE -- the reconnect work of this campaign -- so one session
+        # can now see the sequence start again mid-walk (a re-pair, an app
+        # relaunch inside the resume grace). The keyframe id and the image
+        # file name are both `source_seq`, so a repeated number OVERWROTE
+        # the earlier keyframe's image on disk and gave the journal two
+        # keyframes with one id; the final solve keys COLMAP on the file
+        # name and died with a SQLite constraint abort -- "Partial" over a
+        # full walk, in four of a dress rehearsal's runs. The sequence is
+        # renumbered onto a monotonic one the moment it goes backwards;
+        # `wire_seq` and `tx_seq` keep the raw numbers.
+        effective_seq = source_seq + self._seq_offset
+        if (
+            self._last_effective_seq is not None
+            and effective_seq <= self._last_effective_seq
+        ):
+            self._seq_offset = self._last_effective_seq + 1 - source_seq
+            effective_seq = source_seq + self._seq_offset
+            logger.warning(
+                "[WorldBuilder] source_seq went backwards (%s after %s): the "
+                "sender restarted; renumbering from %s so no keyframe is "
+                "overwritten",
+                source_seq, self._last_effective_seq, effective_seq,
+            )
+            self._events.append(
+                "source_seq_restarted",
+                {"source_seq": source_seq, "renumbered_to": effective_seq},
+            )
+        self._last_effective_seq = effective_seq
+        source_seq = effective_seq
+
         try:
             gray = decode_gray(raw_bytes)
         except ValueError:
@@ -296,6 +348,41 @@ class WorldBuilderEngine:
             self._note_rejected("malformed_frame")
             self._events.append("frame_rejected", {"reason": "malformed_frame"})
             return self._result("reject", "malformed_frame")
+
+        # A FRAME OF A DIFFERENT SIZE IS REJECTED, NOT TRACKED.
+        #
+        # `MotionTracker.measure` feeds this frame and a stored reference
+        # frame straight into `cv2.calcOpticalFlowPyrLK`, which asserts
+        # they are the same size -- in C, as a `cv2.error`, which is not a
+        # `ValueError` and so walks straight past the guard above.
+        # `world_build_session.py` catches only `OSError` around the frame
+        # loop, so it reaches the outermost `except BaseException`: the
+        # session is closed `end_reason: error`, finalization
+        # `interrupted`, and every remaining frame of the walk is
+        # discarded. A reviewer drove exactly that through a real Tower --
+        # 220 frames with a rung change at frame 120 -- and the wearer,
+        # who walked the whole room, gets "Interrupted".
+        #
+        # Rejecting is not merely safer than crashing, it is the correct
+        # answer: the calibration is per-resolution and exact, so a frame
+        # at a size this session is not calibrated for could not have
+        # produced a usable pose anyway. `_require_matching_resolution`
+        # would refuse the build at the next rebuild for the same reason
+        # -- and that exception is raised in one place and caught
+        # NOWHERE, so this guard is what stops it ever being reached.
+        #
+        # Counted and named, so a walk that quietly changed rung is
+        # visible afterwards instead of merely short.
+        if self._frame_shape is None:
+            self._frame_shape = gray.shape[:2]
+        elif gray.shape[:2] != self._frame_shape:
+            self._note_rejected("frame_size_changed")
+            self._events.append("frame_rejected", {
+                "reason": "frame_size_changed",
+                "expected": list(self._frame_shape),
+                "received": list(gray.shape[:2]),
+            })
+            return self._result("reject", "frame_size_changed")
 
         quality = analyse_frame(gray)
         self._selector.note_frame(quality)
@@ -428,19 +515,75 @@ class WorldBuilderEngine:
             decision.outcome, decision.reason, keyframe_id=keyframe.keyframe_id
         )
 
-    def stop_session(self, reason: str = END_REASON_STOP) -> SessionSummary:
+    def stop_session(
+        self,
+        reason: str = END_REASON_STOP,
+        *,
+        hold_lock: bool = False,
+        capture_end_reason: str | None = None,
+    ) -> SessionSummary:
+        """Close the session record. Optionally keep the writer lock.
+
+        `hold_lock=True` is the live builder's path. The final solve and
+        the final build run AFTER this call and take up to a couple of
+        minutes; while they run, the lock -- held by a process the Tower
+        can see is alive -- is the only fact on disk that says "somebody
+        is still finishing this world" rather than "this world was left
+        half-built". The record is also given a `finalization` block in
+        state `pending`, so a builder that dies inside that window leaves
+        a lock naming a dead pid AND a pending finalization, which is a
+        different, truthful story from a builder that was never asked to
+        finalize. `release_world()` drops the lock when the caller is done;
+        `mark_finalization()` moves the record on.
+
+        Default `False` keeps every offline caller exactly as it was.
+        """
         if self._session is None:
             raise SessionNotActiveError("stop_session() requires an active session")
 
+        now = self._clock()
+        finalization = None
+        if hold_lock:
+            finalization = {
+                "state": FINALIZATION_PENDING,
+                "final_solve": FINAL_SOLVE_PENDING,
+                "started_at": now,
+                "updated_at": now,
+                "detail": None,
+            }
         session = replace(
             self._session,
-            ended_at=self._clock(),
+            ended_at=now,
             end_reason=reason,
             rejected_by_reason=dict(self._rejected),
+            finalization=finalization,
         )
         self._store.write_session(session)
-        self._events.append("session_stopped", {"end_reason": reason})
-        self._store.release_writer_lock(session.world_id)
+        # `capture_end_reason` IS NOT `reason`, AND THAT IS THE POINT.
+        #
+        # `reason` is what happened to the WORLD; the capture's own end is
+        # what happened to the LINK. They differ in a case the field walk
+        # actually produced: a capture that ended `disconnect` counts as
+        # finished, so a walk whose phone never came back is recorded --
+        # deliberately, see `world_build_session.py` -- as an ordinary
+        # `stop`. That choice errs toward calling a real, openable world
+        # Saved rather than putting the campaign's headline symptom back,
+        # and it is defensible only while the artifact still says which it
+        # was. `data/captures/<id>/capture.json` says, but the session
+        # names only the FIRST capture it followed, and a reconnect starts
+        # a new one; after that the link is a timestamp search.
+        #
+        # One key on an event that is already written exactly once. Not a
+        # new periodic write on the live path -- that is the family §14.6
+        # of the handoff declines to open in the last hour of a campaign,
+        # and this is not it. Absent when the caller does not know, so
+        # every offline caller's journal is byte-identical to before.
+        stopped_payload = {"end_reason": reason}
+        if capture_end_reason is not None:
+            stopped_payload["capture_end_reason"] = capture_end_reason
+        self._events.append("session_stopped", stopped_payload)
+        if not hold_lock:
+            self._store.release_writer_lock(session.world_id)
 
         summary = SessionSummary(
             session_id=session.session_id,
@@ -458,6 +601,50 @@ class WorldBuilderEngine:
         self._tracker = None
         self._events = None
         return summary
+
+    @property
+    def session_active(self) -> bool:
+        """Whether a session is open: started and not yet stopped."""
+        return self._session is not None
+
+    def release_world(self, world_id: str) -> None:
+        """Drop the writer lock a `stop_session(hold_lock=True)` kept."""
+        self._store.release_writer_lock(world_id)
+
+    def mark_finalization(
+        self,
+        world_id: str,
+        session_id: str,
+        *,
+        state: str,
+        final_solve: str | None,
+        detail: str | None = None,
+    ) -> None:
+        """Rewrite the session's finalization block, and nothing else.
+
+        The counts, the end reason and the timestamps written by
+        `stop_session` are re-read from disk and kept; only the
+        finalization moves. `started_at` is preserved from the pending
+        record when there is one, so "how long did finalization take" stays
+        answerable from the record alone.
+        """
+        if state not in FINALIZATION_STATES:
+            raise ValueError(f"unknown finalization state {state!r}")
+        session = self._store.read_session(world_id, session_id)
+        now = self._clock()
+        previous = session.finalization or {}
+        self._store.write_session(
+            replace(
+                session,
+                finalization={
+                    "state": state,
+                    "final_solve": final_solve,
+                    "started_at": previous.get("started_at", now),
+                    "updated_at": now,
+                    "detail": detail,
+                },
+            )
+        )
 
     # -- build ---------------------------------------------------------
 
@@ -705,6 +892,43 @@ class WorldBuilderEngine:
 
         backend.release()
 
+        # A global solution (tower/world_builder/global_solve.py), when one
+        # has been persisted for this session, is expressed through the
+        # derived tree here and nowhere else: build() stays the single
+        # writer of poses.json / points.json / support.json, and the
+        # placements the solution implies are written beside them under the
+        # same input digest, so the geometry route serves them as current.
+        # Counts below are recomputed from the merged rows; the chain's own
+        # root/cascaded refusal split is kept as a diagnostic of the chain.
+        input_digest = compute_input_digest(keyframes)
+        solve_summary = None
+        placements = None
+        solution = global_solve.load_solution(self._store, world_id, session_id)
+        if solution is not None:
+            merged = global_solve.merge(
+                keyframes, pose_rows, point_rows, support_rows, solution,
+                input_digest=input_digest,
+            )
+            pose_rows = merged.pose_rows
+            point_rows = merged.point_rows
+            support_rows = merged.support_rows
+            placements = merged.placements
+            solve_summary = {**merged.summary, "segments": merged.segments}
+            poses_solved = sum(1 for r in pose_rows if r["status"] == POSE_STATUS_SOLVED)
+            poses_anchor = sum(1 for r in pose_rows if r["status"] == POSE_STATUS_ANCHOR)
+            poses_refused = len(pose_rows) - poses_solved - poses_anchor
+            solved_by_segment: dict[int, int] = {}
+            anchors_by_segment: dict[int, int] = {}
+            for r in pose_rows:
+                if r["status"] == POSE_STATUS_SOLVED:
+                    solved_by_segment[r["segment_index"]] = solved_by_segment.get(r["segment_index"], 0) + 1
+                elif r["status"] == POSE_STATUS_ANCHOR:
+                    anchors_by_segment[r["segment_index"]] = anchors_by_segment.get(r["segment_index"], 0) + 1
+            poses_positioned = sum(
+                n + anchors_by_segment.get(seg, 0) for seg, n in solved_by_segment.items()
+            )
+            total_points = len(point_rows)
+
         # Scale becomes "relative" only once something actually solved:
         # an internally consistent world with an arbitrary unit. Without a
         # solved pose there is no unit at all, so it stays "unknown".
@@ -744,7 +968,7 @@ class WorldBuilderEngine:
             support=support_rows,
             manifest={
                 "schema_version": world.schema_version,
-                "input_digest": compute_input_digest(keyframes),
+                "input_digest": input_digest,
                 "built_at": self._clock(),
                 "backend_id": backend.capabilities.backend_id,
                 "session_id": session_id,
@@ -784,8 +1008,11 @@ class WorldBuilderEngine:
                 "points_triangulated": total_triangulated,
                 "segments": len(segments),
                 "scale_state": scale_state,
+                "global_solve": solve_summary,
             },
         )
+        if placements is not None:
+            self._store.write_placements(world_id, session_id, placements)
 
         return BuildResult(
             world_id=world_id,
@@ -801,6 +1028,38 @@ class WorldBuilderEngine:
             diagnostics={
                 "points_discarded_by_segment": discards_by_segment,
                 "refusals_by_segment": refusals_by_segment,
+                # WHO OWNS placements.json after this build.
+                #
+                # "global_solve" means the merge above wrote every placement
+                # from one reconstruction. The Sim3 registrar must then not
+                # run: it answers the same question pairwise and weaker, and
+                # it OVERWRITES the same file.
+                #
+                # This is reported rather than inferred because the builder
+                # used to infer it from the wrong thing -- whether the FINAL
+                # solve had succeeded. On the 2026-09-09 walk the final solve
+                # never ran (the session died in the observe loop), so the
+                # builder concluded no solution existed and ran the
+                # registrar 16 seconds after the last build. It replaced 72
+                # segments registered into 14 components with 120 refusals
+                # and 2 registrations, and that is the world the phone then
+                # drew. Nine good background solves were discarded by a
+                # question about a tenth that never happened.
+                #
+                # "PLACED SOMETHING", not "ran". An adversarial review found
+                # the first version of this asking `placements is not None`,
+                # which is true whenever `merge()` ran at all -- including
+                # when it returns [] because every segment is still pending,
+                # and when it returns nothing but refusals because the solve
+                # posed none of their keyframes. Both of those place zero
+                # segments, and both would have stood the registrar down and
+                # left the world with no placements at all. The registrar is
+                # the correct fallback there, and this must not suppress it.
+                "placements_source": (
+                    "global_solve"
+                    if placements and any(p.state == "registered" for p in placements)
+                    else None
+                ),
             },
         )
 

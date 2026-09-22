@@ -83,7 +83,14 @@ def test_release_is_idempotent():
 
 
 def test_a_failure_during_load_still_releases():
-    """A partially-loaded experiment must not survive a FAILED transition."""
+    """A partially-loaded experiment must not survive its failed arm.
+
+    Since 2026-09-06 a startup load that raises no longer propagates out
+    of `load()` -- the Lab reports `failed` and stays usable -- so the
+    release happens inside the Lab, at once, rather than on the module's
+    FAILED transition. Either way: released exactly once, and a later
+    `mark_failed()` must not release it again.
+    """
 
     class _ExplodingExperiment(_FakeStatefulExperiment):
         def load(self, settings):
@@ -92,18 +99,24 @@ def test_a_failure_during_load_still_releases():
     fake = _ExplodingExperiment()
     module = ExperimentalCVModule("fake", experiment=fake)
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(module.load())
-    module.mark_failed()
+    asyncio.run(module.load())  # no longer raises
+    assert module.lab.status()["lifecycle"]["state"] == "failed"
+    assert "model download failed" in module.lab.status()["lifecycle"]["reason"]
+    assert fake.release_calls == 1
 
+    module.mark_failed()
     assert fake.release_calls == 1
 
 
-def test_an_unknown_experiment_name_is_rejected_at_load():
+def test_an_unknown_experiment_name_is_reported_not_raised_at_load():
+    """Loud in the log, `failed` on the wire, and not terminal."""
     module = ExperimentalCVModule("not-a-real-experiment")
 
-    with pytest.raises(ValueError, match="unknown experiment"):
-        asyncio.run(module.load())
+    asyncio.run(module.load())  # no longer raises
+
+    status = module.lab.status()
+    assert status["lifecycle"]["state"] == "failed"
+    assert "unknown experiment" in status["lifecycle"]["reason"]
 
 
 def test_the_descriptor_still_declares_no_persistence():

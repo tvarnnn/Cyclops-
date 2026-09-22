@@ -10,6 +10,34 @@ Ordered by value. **PT-1 is worth more than the rest combined.**
 
 ## PT-1 — A walk with deliberate lateral translation
 
+> ### PERFORMED 2026-08-29. HYPOTHESIS REFUTED, USEFULLY.
+>
+> World `af47007c56924e568b096cfc0eaf2b24`, session
+> `7864d3b370ed42f8b292408090a205ff`: the wearer circled a textured drawer
+> laterally and returned. 1074 frames, 218 keyframes, 36 segments, 13,050
+> points.
+>
+> **The wearer translated, and it did not fix registration by itself.**
+> Span/depth on the segments that matter is now 0.72–0.79, not 0.02–0.06 —
+> the outbound and return legs are the two best-conditioned segments in the
+> corpus. The capture is no longer the binding constraint. But the pair
+> carrying the revisit, segments 14 and 29 with 20,267 verified inliers
+> between them, was still refused.
+>
+> So the hypothesis's *premise* held (behaviour changes span/depth) and its
+> *conclusion* did not (registration did not follow). Chasing the
+> difference found two real defects: registration was never invoked from
+> any production path at all, and the Sim3 estimator was placing target
+> cameras that share no view with the source, which collapses the fitted
+> constellation and reports a scale ~2.5x wrong. Both are fixed on
+> `world-builder/fragment-registration-v1`; walk B goes from 0 placed to
+> 6 of 23 segments and 59.9% of its points.
+>
+> Full account:
+> `docs/superpowers/research/2026-08-29-the-drawer-walk-and-the-cameras-that-were-not-there.md`.
+> The walk is replayable without the glasses:
+> `scripts/world_replay.py --case worldB`.
+
 **Why this is first.** Registration already works on this branch and is
 already refusing almost everything, and the refusals are unanimous about
 the reason. Read off a real run of `world_registration.py` against the
