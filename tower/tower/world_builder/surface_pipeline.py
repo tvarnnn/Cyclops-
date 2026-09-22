@@ -454,6 +454,12 @@ class _Frames:
         self.bound = None
         self.clipped_by_bound = 0
         self.emptied_by_bound = 0
+        # PIXELS, not only frames. A frame counter cannot tell one stray pixel
+        # from a frame cut in half, and "one frame was clipped" is exactly the
+        # reading a person would shrug at. These two are the tripwire that
+        # says whether the bound is trimming noise or eating the room.
+        self.pixels_clipped_by_bound = 0
+        self.pixels_offered_to_bound = 0
         # Poses the solver placed nowhere near the rest of its own poses are
         # dropped HERE, before anything reads `items`, so the scene scale, the
         # consistency field, the transient masks and the fusion all see the
@@ -468,14 +474,26 @@ class _Frames:
         Run A of the bedroom replay: 4 of 271 gated frames (1.48%), two of
         them 53,026 and 1.6e6 units out. Run B of the SAME walk: none. The
         rule is `surface.robust_pose_outliers`; the numbers behind it are on
-        `SurfaceParams.outlier_radius_multiple`.
+        `SurfaceParams.outlier_radius_multiple` and `pose_detach_multiple`.
+
+        A DROPPED POSE COSTS THE WEARER A PHOTOGRAPH. Dropping here, before
+        anything reads `items`, is what keeps the scene scale, the
+        consistency field, the transient masks and the fusion looking at one
+        set of frames -- but it also means this gate reaches the appearance,
+        and the saved world is required to show real captured imagery. That
+        is why the rule must be a small correction or nothing at all, and why
+        `max_gated_pose_fraction` stands it down rather than letting it run.
         """
+        kw = dict(multiple=params.outlier_radius_multiple,
+                  detach=params.pose_detach_multiple,
+                  max_fraction=params.max_gated_pose_fraction)
         if not self.items:
-            return robust_pose_outliers(np.zeros((0, 3)),
-                                        multiple=params.outlier_radius_multiple).record()
+            return robust_pose_outliers(np.zeros((0, 3)), **kw).record()
         centres = np.array([-R.T @ t for _ki, _a, _b, R, t, _ho, _z in self.items])
-        report = robust_pose_outliers(centres,
-                                      multiple=params.outlier_radius_multiple)
+        report = robust_pose_outliers(centres, **kw)
+        if report.stood_down:
+            logger.warning("[Tower][WorldBuilder][surface] pose gate %s",
+                           report.detail)
         if report.gated:
             kept = []
             for item, wild in zip(self.items, report.outlier):
@@ -551,11 +569,14 @@ class _Frames:
             # and `integrate` are both handed this `ok`, and a bound applied
             # to only one of them would key blocks nothing ever writes into.
             if self.bound is not None and bool(ok.any()):
+                self.pixels_offered_to_bound += int(ok.sum())
                 inside = depth_within_bound(zt, self.K, R, t,
                                             self.bound.lo, self.bound.hi)
                 clipped = ok & ~inside
-                if bool(clipped.any()):
+                n_clipped = int(clipped.sum())
+                if n_clipped:
                     self.clipped_by_bound += 1
+                    self.pixels_clipped_by_bound += n_clipped
                     ok = ok & inside
                     if not bool(ok.any()):
                         self.emptied_by_bound += 1
@@ -601,6 +622,7 @@ def surfacify(store, world_id: str, session_id: str, *,
                     world_id, session_id, detail)
         return SurfaceResult(state=STATE_UNAVAILABLE, detail=detail)
 
+    frames = None
     try:
         # Sweep what earlier builds of this session left unnamed -- a pack
         # that was killed, levels superseded long enough ago -- whether or not
@@ -665,7 +687,7 @@ def surfacify(store, world_id: str, session_id: str, *,
         if not len(frames):
             return _unavailable(
                 root, "no keyframe passed the alignment gate, so there is "
-                      "nothing to fuse")
+                      "nothing to fuse", _outlier_record(frames))
 
         # The transient detector's masks, computed for keyframes that have none
         # under this rule yet (new keyframes, during a walk) and cached beside
@@ -679,11 +701,13 @@ def surfacify(store, world_id: str, session_id: str, *,
             imagery_source=params.imagery_source)
         seconds[STAGE_TRANSIENTS] = round(time.time() - t, 2)
         if frames.transients.state == "stopped" or _stopped(should_stop):
-            return _stop(root, STAGE_TRANSIENTS, seconds)
+            return _stop(root, STAGE_TRANSIENTS, seconds,
+                         _outlier_record(frames))
 
         median_depth, scale_source = _scene_scale(frames, solution)
         if not (median_depth > 0):
-            return _unavailable(root, "the solve has no usable scene depth")
+            return _unavailable(root, "the solve has no usable scene depth",
+                                _outlier_record(frames))
         voxel = params.voxel_frac * median_depth
         trunc = truncation_for(params, voxel, median_depth, frames.median_held_out)
         # The volume the fusion is confined to. Decided AFTER the scene scale,
@@ -698,7 +722,8 @@ def surfacify(store, world_id: str, session_id: str, *,
                                        should_stop)
             seconds[STAGE_CONSISTENCY] = round(time.time() - t, 2)
             if consistency.state == "stopped" or _stopped(should_stop):
-                return _stop(root, STAGE_CONSISTENCY, seconds)
+                return _stop(root, STAGE_CONSISTENCY, seconds,
+                             _outlier_record(frames, voxel))
             frames.correction = consistency.field
             frames.consistency = consistency.summary()
 
@@ -720,8 +745,11 @@ def surfacify(store, world_id: str, session_id: str, *,
         return result
 
     except SurfaceUnavailable as exc:
-        _status(root, state=STATE_UNAVAILABLE, detail=exc.reason)
-        return SurfaceResult(state=STATE_UNAVAILABLE, detail=exc.reason)
+        # A refusal raised from deeper than the allocation loop (the key
+        # guard runs inside `integrate` and `extract_mesh` too). It still
+        # carries what the guards did, for the same reason the loop's own
+        # refusals do.
+        return _unavailable(root, exc.reason, _outlier_record(frames))
     except DepthModelUnavailable as exc:
         # The depth network cannot run on this machine: not installed, or its
         # weights neither cached nor downloadable. That is a configuration, not
@@ -753,8 +781,14 @@ def surfacify(store, world_id: str, session_id: str, *,
     except Exception as exc:  # noqa: BLE001 -- recorded, never swallowed silently
         logger.exception("[Tower][WorldBuilder][surface] %s/%s failed",
                          world_id, session_id)
-        _status(root, state=STATE_FAILED, detail=str(exc))
-        return SurfaceResult(state=STATE_FAILED, detail=str(exc))
+        # The guards' record rides on a crash too. A diverged solve that
+        # overflows somewhere deep is exactly the case where the first
+        # question is "what did the gate and the bound see?".
+        outliers = _outlier_record(frames)
+        _status(root, state=STATE_FAILED, detail=str(exc),
+                outliers=outliers or None)
+        return SurfaceResult(state=STATE_FAILED, detail=str(exc),
+                             outliers=outliers)
     finally:
         lock.release()
 
@@ -813,20 +847,29 @@ def _ensure_transients(store, world_id, session_id, solution, intrinsics, align,
                                  detail=f"{type(exc).__name__}: {exc}")
 
 
-def _outlier_record(frames: "_Frames", voxel: float, coarsened: float,
-                    key_coarsened: float) -> dict:
+def _outlier_record(frames: "_Frames", voxel: float = 0.0, coarsened: float = 1.0,
+                    key_coarsened: float = 1.0) -> dict:
     """What this build did about the solve's outliers, for the manifest.
 
-    Always written, whether or not anything was dropped. A build that fused
-    fewer frames than the solve offered has to say which and why, or the
-    coverage it reports is a claim nobody can check; and "nothing was
-    dropped" is equally a fact about the build, not something a reader should
-    have to infer from an absent key.
+    WRITTEN ON EVERY RETURN PATH, not only on the one that succeeds. It used
+    to run on the `ok` return alone, so a build the guards themselves refused
+    wrote `"outliers": null` and left nothing on disk saying the bound had
+    done it -- and the wearer's one message was then indistinguishable from a
+    broken depth backend. A guard that cannot be seen acting is not a guard.
+
+    Always written when nothing was dropped, too: "no pose was dropped" is a
+    fact about a build, not something a reader should infer from an absent
+    key, and a build that fused fewer frames than the solve offered has to
+    say which and why or the coverage it reports is unfalsifiable.
     """
+    if frames is None:
+        return {}
     record = dict(frames.pose_gate)
     record.update({
         "frames_clipped_by_bound": int(frames.clipped_by_bound),
         "frames_emptied_by_bound": int(frames.emptied_by_bound),
+        "pixels_clipped_by_bound": int(frames.pixels_clipped_by_bound),
+        "pixels_offered_to_bound": int(frames.pixels_offered_to_bound),
         "voxel_coarsened_for_key_range": round(float(key_coarsened), 4),
         "voxel_coarsened_for_block_budget": round(
             float(coarsened) / float(key_coarsened or 1.0), 4),
@@ -841,14 +884,17 @@ def _outlier_record(frames: "_Frames", voxel: float, coarsened: float,
     return record
 
 
-def _unavailable(root: Path, detail: str) -> SurfaceResult:
-    _status(root, state=STATE_UNAVAILABLE, detail=detail)
-    return SurfaceResult(state=STATE_UNAVAILABLE, detail=detail)
+def _unavailable(root: Path, detail: str, outliers: dict | None = None) -> SurfaceResult:
+    _status(root, state=STATE_UNAVAILABLE, detail=detail, outliers=outliers or None)
+    return SurfaceResult(state=STATE_UNAVAILABLE, detail=detail,
+                         outliers=outliers or {})
 
 
-def _stop(root: Path, stage: str, seconds: dict) -> SurfaceResult:
-    _status(root, state=STATE_STOPPED, stage=stage)
-    return SurfaceResult(state=STATE_STOPPED, stopped_after=stage, seconds=seconds)
+def _stop(root: Path, stage: str, seconds: dict,
+          outliers: dict | None = None) -> SurfaceResult:
+    _status(root, state=STATE_STOPPED, stage=stage, outliers=outliers or None)
+    return SurfaceResult(state=STATE_STOPPED, stopped_after=stage, seconds=seconds,
+                         outliers=outliers or {})
 
 
 MIN_SCALE_OBSERVATIONS = 64
@@ -1012,14 +1058,35 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # all the fusion arithmetic put together -- 296 s against 10 s. Held
     # compactly and in HOST memory: on the GPU they cost 1.84 MiB a frame, which
     # on a 20-30 minute walk is 5-8 GiB of VRAM the field needs.
+    # Total coarsening, and the part of it the key range asked for. Declared
+    # before the frames are prepared so every return below can record them.
+    coarsened = 1.0
+    key_coarsened = 1.0
+
+    def record():
+        return _outlier_record(frames, voxel, coarsened, key_coarsened)
+
     cached = []
     for z, ok, img, R, tt, w in frames.prepared(params, median_depth, device):
         cached.append((z.to(torch.float16).cpu(), ok.cpu(), img.to(torch.uint8).cpu(),
                        R, tt, w.to(torch.float16).cpu()))
         if _stopped(should_stop):
-            return _stop(root, STAGE_FUSE, seconds)
+            return _stop(root, STAGE_FUSE, seconds, record())
     if not cached:
-        return _unavailable(root, "no frame produced usable depth")
+        # A REFUSAL OF ITS OWN WHEN THE BOUND DID IT. "No frame produced
+        # usable depth" is what a missing depth network says, and answering a
+        # guard's own doing with another stage's message is how a person ends
+        # up debugging the wrong thing. Named here, and the counters that
+        # prove it are in the record beside it.
+        if frames.emptied_by_bound and frames.emptied_by_bound >= len(frames):
+            return _unavailable(
+                root, f"every one of the {len(frames)} gated frames lost all of "
+                      f"its depth to the fusion bound "
+                      f"({frames.pixels_clipped_by_bound} of "
+                      f"{frames.pixels_offered_to_bound} valid pixels fell "
+                      "outside it); the bound is too tight for this scene, not "
+                      "the depth stage", record())
+        return _unavailable(root, "no frame produced usable depth", record())
 
     # Allocate within the block budget. If the walk's surface would need more
     # blocks than `max_blocks`, coarsen the voxel -- block count scales with
@@ -1037,9 +1104,15 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     # keys at THIS voxel may be perfectly keyable at a coarser one, exactly
     # as a scene too big for the block budget is. Refusing is the last
     # resort now, not the first response, and the coarsening is recorded.
-    coarsened = 1.0
-    key_coarsened = 1.0
+    #
+    # BUT ONLY SO FAR (`SurfaceParams.max_key_coarsening`). Uncapped, this
+    # loop will shrink a diverged scene until the room is a handful of blocks
+    # and publish it as `ok`, with a positive face count and an appearance
+    # built on top -- which is worse than the refusal it replaced. Past the
+    # cap the honest refusal is the answer, and it is the answer the
+    # stand-down paths of the pose gate rely on.
     attempts = 12
+    cap = params.max_key_coarsening
     for attempt in range(attempts):
         try:
             keys = [vol.blocks_for_depth(z.to(device).float(), ok.to(device), R, tt,
@@ -1049,17 +1122,27 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             del keys
         except SurfaceUnavailable as exc:
             over = exc.key_overshoot
-            if over is None or attempt == attempts - 1:
-                reason = exc.reason + (
-                    f"; coarsening the voxel x{key_coarsened:.2f} over "
-                    f"{attempt + 1} attempts did not bring it inside"
-                    if over is not None else "")
-                logger.warning("[Tower][WorldBuilder][surface] %s", reason)
-                return _unavailable(root, reason)
             # Block coordinates scale as 1/voxel, so the overshoot IS the
             # factor; 5% over it covers the truncation shell the allocation
             # adds around each block.
-            factor = max(1.1, float(over) * 1.05)
+            factor = max(1.1, float(over) * 1.05) if over is not None else 0.0
+            if over is None or attempt == attempts - 1 or (
+                    cap > 0 and key_coarsened * factor > cap):
+                reason = exc.reason
+                if over is not None:
+                    reason += (
+                        f"; bringing it inside needs the voxel coarsened "
+                        f"x{key_coarsened * factor:.2f}, past the "
+                        f"x{cap:g} a surface may be coarsened for the key "
+                        "range (max_key_coarsening). A scene that wide after "
+                        "the pose gate and the fusion bound is a solve that "
+                        "came apart, and a coarser room would be published as "
+                        "though it were the room"
+                        if cap > 0 and factor and key_coarsened * factor > cap else
+                        f"; coarsening the voxel x{key_coarsened:.2f} over "
+                        f"{attempt + 1} attempts did not bring it inside")
+                logger.warning("[Tower][WorldBuilder][surface] %s", reason)
+                return _unavailable(root, reason, record())
             coarsened *= factor
             key_coarsened *= factor
             voxel *= factor
@@ -1084,7 +1167,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
                       f"attempts, over the block budget of {params.max_blocks}; "
                       "not built")
             logger.warning("[Tower][WorldBuilder][surface] %s", reason)
-            return _unavailable(root, reason)
+            return _unavailable(root, reason, record())
         # At least 10% a round: once the band's shell radius is a whole number of
         # blocks, block count stops following voxel area smoothly and a pure
         # square-root step can stall just above the budget.
@@ -1113,7 +1196,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         if progress is not None and i % 25 == 0:
             progress(STAGE_FUSE, i, len(frames))
         if _stopped(should_stop):
-            return _stop(root, STAGE_FUSE, seconds)
+            return _stop(root, STAGE_FUSE, seconds, record())
     # The depth and validity stay (host memory, ~0.7 MiB a frame) for the
     # evidence filter after extraction; the images and weights do not.
     views = [(z, ok, R, tt) for z, ok, _img, R, tt, _w in cached]
@@ -1250,7 +1333,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
     snap_stats = None
     if params.plane_snap and len(F):
         if _stopped(should_stop):
-            return _stop(root, STAGE_MESH, seconds)
+            return _stop(root, STAGE_MESH, seconds, record())
         t = time.time()
         # After smoothing, so the snap is the last thing to move a vertex, and
         # against the depth the fusion used.
@@ -1259,7 +1342,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         seconds[STAGE_SNAP] = round(time.time() - t, 2)
     del views
     if _stopped(should_stop):
-        return _stop(root, STAGE_MESH, seconds)
+        return _stop(root, STAGE_MESH, seconds, record())
 
     t = time.time()
     _status(root, state=STATE_RUNNING, stage=STAGE_PACK)
@@ -1286,7 +1369,7 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
             # Pack is the longest stage and outlasts a hard stop's grace; it
             # must notice the stop between levels, not only at the end.
             _discard_unpublished(root, levels)
-            return _stop(root, STAGE_PACK, seconds)
+            return _stop(root, STAGE_PACK, seconds, record())
         # Each level from the previous one: see `SurfaceParams.lod_face_targets`.
         parent = source
         Vl, Fl, Cl = (V, F, C) if target <= 0 else decimate(
@@ -1325,14 +1408,14 @@ def _build(root, frames, params, median_depth, voxel, trunc, seconds,
         # names them, so nothing reads them and the previous surface stands --
         # and since nothing ever will, they are removed now.
         _discard_unpublished(root, levels)
-        return _stop(root, STAGE_PACK, seconds)
+        return _stop(root, STAGE_PACK, seconds, record())
     seconds[STAGE_PACK] = round(time.time() - t, 2)
 
     return SurfaceResult(
         state=STATE_OK, frames_used=used, frames_offered=frames.offered,
         vertices=int(len(V)), faces=int(len(F)), blocks=n_blocks,
         voxel=voxel, trunc=trunc, levels=levels, seconds=seconds,
-        outliers=_outlier_record(frames, voxel, coarsened, key_coarsened),
+        outliers=record(),
         detail=json.dumps({"components": comp_stats,
                            "confidence": _confidence_summary(vertex_evidence, root,
                                                              conf_files),

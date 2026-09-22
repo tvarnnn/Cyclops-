@@ -151,6 +151,15 @@ OUTLIER_RADIUS_MULTIPLE = 10.0
 """Default for `SurfaceParams.outlier_radius_multiple`; see it for the
 measurements behind the number."""
 
+POSE_DETACH_MULTIPLE = 2.5
+"""Default for `SurfaceParams.pose_detach_multiple`."""
+
+MAX_GATED_POSE_FRACTION = 0.05
+"""Default for `SurfaceParams.max_gated_pose_fraction`."""
+
+MAX_KEY_COARSENING = 4.0
+"""Default for `SurfaceParams.max_key_coarsening`."""
+
 FUSION_BOUND_MULTIPLE = 2.0
 """Default for `SurfaceParams.fusion_bound_multiple`."""
 
@@ -164,9 +173,13 @@ MIN_ROBUST_POINTS = 16
 """The same idea for the sparse cloud. The envelope only ever grows when the
 filter stands down, so standing down is the safe direction."""
 
-OUTLIER_VERSION = 1
+OUTLIER_VERSION = 2
 """Bumped when the rules below change what geometry is fused, so a surface
-built under the old ones rebuilds rather than claiming to be current."""
+built under the old ones rebuilds rather than claiming to be current.
+
+2: the gate requires detachment as well as scale, and stands down above
+`max_gated_pose_fraction`. Version 1 deleted up to 45% of a dwelling capture.
+"""
 
 
 @dataclass(frozen=True)
@@ -178,6 +191,13 @@ class PoseOutlierReport:
     median_radius: float
     multiple: float
     detail: str
+    p95_radius: float = 0.0
+    detach_multiple: float = 0.0
+    threshold: float = 0.0
+    stood_down: bool = False
+    """True when a rule applied and then declined to act -- too few poses to
+    be robust, or a share too large to be a correction. Distinct from "nothing
+    was out there", and the manifest keeps them apart."""
 
     @property
     def gated(self) -> int:
@@ -193,6 +213,11 @@ class PoseOutlierReport:
             "poses_gated": self.gated,
             "pose_radius_multiple": float(self.multiple),
             "pose_radius_median": float(self.median_radius),
+            "pose_radius_p95": float(self.p95_radius),
+            "pose_detach_multiple": float(self.detach_multiple),
+            "pose_gate_threshold": float(self.threshold),
+            "pose_gate_stood_down": bool(self.stood_down),
+            "pose_radius_max": float(rad.max()) if rad.size else 0.0,
             "pose_radius_gated_max": (float(rad[self.outlier].max())
                                       if self.gated else 0.0),
             "pose_detail": self.detail,
@@ -218,44 +243,97 @@ class FusionBound:
 
 
 def robust_pose_outliers(centres, *, multiple: float = OUTLIER_RADIUS_MULTIPLE,
+                         detach: float = POSE_DETACH_MULTIPLE,
+                         max_fraction: float = MAX_GATED_POSE_FRACTION,
                          min_poses: int = MIN_ROBUST_POSES) -> PoseOutlierReport:
     """The poses a solve placed nowhere near the rest of its own poses.
 
-    THE CRITERION IS A MULTIPLE OF THE SOLVE'S OWN MEDIAN RADIUS, measured
-    from the element-wise median camera centre. Both halves matter:
+    A pose is gated only when it is BOTH far on the solve's own scale AND
+    detached from the body of the solve's own distribution. Every quantity
+    here is a multiple of a statistic of these same poses, because the gauge
+    is arbitrary -- 2.33 units in one replay of a walk and 2.62 in the other,
+    for the same bedroom -- so a fixed distance means nothing.
 
-      * the median centre, not the mean, because eleven outlying centres --
-        the worst 53,026 units out -- drag the mean of 379 off the room;
-      * the median radius as the unit, because the gauge is arbitrary -- 2.33
-        units in one replay of a walk and 2.62 in the other, for the same
-        bedroom -- so a fixed distance means nothing.
+    THE SCALE TEST: radius beyond `multiple` x the median radius, measured
+    from the ELEMENT-WISE MEDIAN centre (not the mean, which eleven centres
+    up to 53,026 units out drag off the room).
 
-    A WALK IS NOT AN OUTLIER. A straight corridor spreads its centres along
-    one axis, and every one of them is a legitimate pose; the median radius
-    grows with the corridor, so the rule stays quiet. What it catches is a
-    centre an order of magnitude outside a distribution that is otherwise
-    compact -- run A's worst was 53,026 units against a median of 2.33.
+    THE DETACHMENT TEST, and why the scale test alone was wrong. A multiple
+    of the median says nothing about whether a pose is attached to the rest
+    of the walk, and a capture that DWELLS has a tiny median radius with a
+    perfectly legitimate tail. Stand in one spot for most of a walk and then
+    cross the room: the median collapses onto the spot and every pose of the
+    crossing sits ten medians out. Measured at n=360 with the scale test
+    alone -- 15.6% of an "80% dwell then walk" gated, 20.6% of a one-way
+    transit, 20.0% and 30.0% of a two-room capture (the WHOLE of room B both
+    times), 45.0% of a 55/45 split. A uniformly PACED corridor is safe at any
+    length, which is why the first version of this rule looked correct; real
+    captures are not uniformly paced, and the physical test asks the wearer to
+    walk, stand back and revisit.
+
+    So a pose must also lie beyond `detach` x the 95th-percentile radius --
+    beyond the body, not merely beyond the middle. `max radius / p95 radius`
+    separates the two populations with nothing in between:
+
+        every dwelling capture above, and every healthy solve
+        in the store (run B, the reference world)              1.00 - 1.77
+        the solves that really do carry solver noise
+        (run A 7,524; 52ed8e0a 884; 6839fb8f 86; 9a68430a 13)  13 - 11,392
+
+    2.5 sits between them on a log scale: 1.4x above the widest legitimate
+    capture measured and 5.2x below the narrowest real pathology.
+
+    THE FRACTION CAP. With detachment in place, a large detached share is not
+    "many outliers" -- it is a solve that came apart, and the honest answer to
+    that is a refusal, which the key-range guard and the block budget already
+    give. So above `max_fraction` the rule stands down and lets them speak,
+    rather than publishing a confident half-world. Every real gate measured is
+    well inside it: run A 1.48%, 9a68430a 2.4%, 52ed8e0a 1.3%, 6839fb8f 0.1%.
     """
     C = np.asarray(centres, np.float64).reshape(-1, 3)
     n = len(C)
     off = np.zeros(n, bool)
     if multiple <= 0:
         return PoseOutlierReport(off, np.zeros(n), 0.0, float(multiple),
-                                 "off: outlier_radius_multiple is 0")
+                                 "off: outlier_radius_multiple is 0",
+                                 detach_multiple=float(detach))
     if n < min_poses:
+        # Stands down rather than guess, and `_build`'s coarsening cap is
+        # what then refuses a solve this one cannot judge. It must not fall
+        # through to an unbounded coarsening: below `min_poses` the answer is
+        # the honest refusal, not a collapsed room published as `ok`.
         return PoseOutlierReport(off, np.zeros(n), 0.0, float(multiple),
                                  f"stood down: {n} poses is too few to be "
-                                 f"robust (needs {min_poses})")
+                                 f"robust (needs {min_poses})",
+                                 detach_multiple=float(detach), stood_down=True)
     radius = np.linalg.norm(C - np.median(C, axis=0), axis=1)
     med = float(np.median(radius))
+    p95 = float(np.percentile(radius, 95))
     if not med > 0:
         return PoseOutlierReport(off, radius, med, float(multiple),
-                                 "stood down: every pose is in the same place")
-    outlier = radius > multiple * med
+                                 "stood down: every pose is in the same place",
+                                 p95_radius=p95, detach_multiple=float(detach),
+                                 stood_down=True)
+    threshold = multiple * med
+    if detach > 0:
+        threshold = max(threshold, detach * p95)
+    outlier = radius > threshold
+    fraction = float(outlier.mean())
+    if max_fraction > 0 and fraction > max_fraction:
+        return PoseOutlierReport(
+            off, radius, med, float(multiple),
+            f"stood down: gating would drop {100 * fraction:.1f}% of {n} poses, "
+            f"over the {100 * max_fraction:g}% a correction may make; a share "
+            "that large is a solve that came apart, not a handful of outliers, "
+            "and the key-range and block-budget guards answer that honestly",
+            p95_radius=p95, detach_multiple=float(detach), threshold=threshold,
+            stood_down=True)
     return PoseOutlierReport(
         outlier, radius, med, float(multiple),
-        f"{int(outlier.sum())} of {n} poses lie beyond {multiple:g} x the "
-        f"median pose radius of {med:.4g}")
+        f"{int(outlier.sum())} of {n} poses lie beyond {threshold:.4g} -- "
+        f"{multiple:g} x the median pose radius of {med:.4g}, and "
+        f"{detach:g} x the p95 radius of {p95:.4g}",
+        p95_radius=p95, detach_multiple=float(detach), threshold=threshold)
 
 
 def robust_fusion_bound(points, centres, *, reach: float,
@@ -480,7 +558,36 @@ class SurfaceParams:
 
     Relative and never absolute, because `global_solve` does not normalise:
     the same room has solved to a ten-unit extent and a three-hundred-unit
-    one, so a threshold in units would be this very bug in a new place."""
+    one, so a threshold in units would be this very bug in a new place.
+
+    NOT SUFFICIENT ON ITS OWN. This is a statement about scale, and a capture
+    that dwells is far on this scale while being perfectly real; see
+    `pose_detach_multiple`, which a pose must ALSO clear."""
+
+    pose_detach_multiple: float = POSE_DETACH_MULTIPLE
+    """A pose is gated only if it also lies beyond this multiple of the 95th-
+    percentile pose radius -- detached from the BODY of the distribution, not
+    merely beyond its middle. 0 switches the detachment test off, which
+    restores the behaviour that deleted up to 45% of a dwelling capture.
+
+    The measurements, and why 2.5, are in `robust_pose_outliers`. The short
+    form: `max radius / p95 radius` is 1.00-1.77 for every legitimate capture
+    shape measured (uniform corridors at four lengths, an L-shaped apartment,
+    80% dwell then walk, one-way transit, two-room captures at 20% and 30%,
+    a 55/45 split, and the healthy replay and reference world), and 13-11,392
+    for the solves that carry real solver noise. Nothing measured lies
+    between."""
+
+    max_gated_pose_fraction: float = MAX_GATED_POSE_FRACTION
+    """The largest share of a session's poses the gate may drop. Above it the
+    gate stands down and records that it did. 0 removes the cap.
+
+    The gate exists to make a small correction. A large detached share is a
+    solve that came apart, and the honest answers to that -- the key-range
+    refusal and the block budget -- are already in place; publishing a
+    confident half-world instead is the failure this cap prevents. Every real
+    gate measured is well inside 5%: run A 1.48%, 9a68430a 2.4%, 52ed8e0a
+    1.3%, 6839fb8f 0.1%, and both healthy worlds 0%."""
 
     fusion_bound_multiple: float = FUSION_BOUND_MULTIPLE
     """How much wider than the robust envelope of the observed scene the
@@ -718,6 +825,26 @@ class SurfaceParams:
     frames of a tight bathroom made 380k blocks -- so this binds on big or
     cluttered spaces and on long walks alike. The canonical world is 234k."""
 
+    max_key_coarsening: float = MAX_KEY_COARSENING
+    """How far the voxel may be coarsened to bring a scene inside the block
+    KEY RANGE before the build is refused instead. 0 removes the cap.
+
+    THIS CAP IS THE POINT. `block_key`'s refusal is a correctness guard, and
+    it was also the backstop that caught a solve which had come apart.
+    Replacing it with an uncapped loop traded an honest refusal for a
+    confidently-wrong `ok`: a diverged scene coarsens until the room is a
+    handful of blocks, publishes a positive face count, and the appearance
+    stage builds colours on top of it. This project has already had a READY
+    rejected because the mesh looked bad; that is the wrong direction.
+
+    4 is far above anything a real room needs, because the voxel is already
+    a fraction of the scene's own median depth. At `voxel_frac` 0.0051 a block
+    edge is 0.0408 scene depths, so the keyable half-extent is about 42,800
+    scene depths -- a bedroom whose median depth is 4.5 units stays keyable
+    out to ~190,000 units, and run A's diverged solve reached 2.2e6 only
+    through poses the gate now removes. A scene that still needs more than 4x
+    after the gate and the fusion bound is not a room."""
+
     mobile_level: int = 2
     canonical_level: int = 0
 
@@ -912,7 +1039,9 @@ class SurfaceParams:
             # the difference between a bedroom and nothing. That is not what
             # these parameters build, so it rebuilds.
             ("solver-outliers", self.outlier_radius_multiple,
-             self.fusion_bound_multiple, OUTLIER_VERSION),
+             self.pose_detach_multiple, self.max_gated_pose_fraction,
+             self.fusion_bound_multiple, self.max_key_coarsening,
+             OUTLIER_VERSION),
         )
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
