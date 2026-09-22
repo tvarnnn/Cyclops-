@@ -2723,7 +2723,15 @@ for (let i = 0; i < cams.length; i++){
         decides between views that are otherwise close."""
         src = _section(_template(), *self.SRC)
         _run_plain(self.ROOM + src + r"""
-assert.ok(Math.abs(OPENING_SURROUND_FLOOR - 0.55) < 1e-12, "the shipping floor");
+assert.ok(Math.abs(OPENING_SURROUND_FLOOR - 0.80) < 1e-12, "the shipping floor");
+// THE FLOOR IS WHAT BOUNDS THE WHOLE TERM, and this is the assertion that
+// keeps the docstring above honest. At 0.55 the surround was worth up to
+// 1.82x, enough to buy an opening 8.6% worse by the page's own score -- and
+// it did, on both viewports (BESTVIEW.md 6.1). At 0.80 it is worth at most
+// 1.25x, so it separates frames that are close and cannot override one that
+// is materially better.
+assert.ok(1 / OPENING_SURROUND_FLOOR <= 1.25 + 1e-12,
+          "the most the surround can ever be worth: " + (1 / OPENING_SURROUND_FLOOR));
 // the term itself is bounded by the floor below and 1 above, whatever the pose
 const term = i => OPENING_SURROUND_FLOOR + (1 - OPENING_SURROUND_FLOOR) * surroundOf(i);
 for (let i = 0; i < cams.length; i++){

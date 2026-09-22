@@ -3968,8 +3968,32 @@ async function main(){
      of 198 and pose 120 at 22nd.
      A FACTOR, not a filter, with a high floor: a good frame with a poor
      surround still beats a poor frame with a good one. `osur` overrides the
-     floor in the debug transport. BESTVIEW.md section 6. */
-  const OPENING_SURROUND_FLOOR = Math.max(0, Math.min(1, +(Q.get("osur") ?? 0.55)));
+     floor in the debug transport.
+     THE FLOOR IS 0.80 BECAUSE 0.55 BOUGHT THE HORIZON WITH THE PICTURE.
+     At 0.55 this shipped an opening that measured better and looked worse, on
+     both viewports, and the numbers said so only if you did not look: at
+     900x700 `drawn` went 98.96 to 98.99 per cent and black 0.86 to 0.29 while
+     the frame went from the shelf, the lit monitor, the keyboard and the door
+     to a top-down close-up of the desk with its underside filling the lower
+     two thirds. At 390x844 -- the size the reviewer actually held -- it went
+     to a dark corner with half the frame in shadow.
+     Swept on the page's own scan tables (`S.opening.scanned` carries every
+     tested pose's score and surround, so the base score is recoverable and the
+     winner re-derivable at any floor: `tools\bv_surfloor.py`, both viewports,
+     21 floors each). The term is BISTABLE on this world: at every floor below
+     0.75 it takes the high-surround pose and pays 8.2 per cent of the opening
+     score for it at 900x700 and 8.6 per cent at 390x844, and at every floor
+     from 0.75 up it takes the best frame and changes nothing. There is no
+     floor at which it both bites and keeps the picture, because on this walk
+     no pose has both -- the best-looking vantage is one the wearer only
+     looked one way from, and every well-surrounded spot is a desk close-up.
+     0.80 keeps it as what the paragraph above always claimed it was: it can
+     separate frames within about six per cent of each other and it cannot buy
+     a materially worse one. On THIS world that means it does not move the
+     opening, and review-4 #1 is therefore NOT fixed here; BESTVIEW.md section
+     6.1 says what would. The mechanism is kept, measured and unit-tested
+     because a world whose walk does stand back will have the tie to break. */
+  const OPENING_SURROUND_FLOOR = Math.max(0, Math.min(1, +(Q.get("osur") ?? 0.80)));
   let surroundCache = null;
   function surroundOf(i){
     if (!cams.length) return 1;
