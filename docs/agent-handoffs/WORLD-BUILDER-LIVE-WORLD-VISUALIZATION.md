@@ -1251,3 +1251,72 @@ appearance-only interruption still re-runs the whole surface, because
 `surfacify(force=True)` is what regenerates the depth work the appearance
 reads: six to sixteen minutes where forty seconds was owed.
 
+## The visual result, on three worlds, judged on free orbit
+
+The final reviewer's framing was accepted: the at-poses A/B is the most
+flattering test available, and the product offers free orbit instead. So
+the 40-view standard set is the primary evidence.
+
+| | KNOWN-GOOD (raw, ~4 min) | LIVE2 (redacted, 100 s) | **SCALE (redacted, ~3 min, 690 kf)** |
+|---|---|---|---|
+| free-orbit verdict | a photographic **desk corner** | wide but mostly wreckage | **~23 of 40 read as a navigable room** |
+| picture % at his own 10 poses | 42.0 | 40.9 | **41.9** |
+| his own photographs, same poses | 45.2 | 38.9 | **41.3** |
+| median lumCC where it draws | 0.88 | 0.62 | 0.70 |
+| horizon ≥50% drawn | 120° | 330° | 210° (portrait) / 240° (landscape) |
+| dead sector | 150° | 0° | 30° / 0° |
+
+**At his own cameras the scale world matches his own photography almost
+exactly — 41.9% picture against 41.3%, 20.2% dark against 19.2%** — the
+closest render/photograph agreement of the three.
+
+The opening view is a wide interior: a bed with a black blanket and an open
+laptop on it, a desk to the right carrying a monitor with a legible editor
+and a purple-lit keyboard, a chair, shelving above, carpet with clothes and
+a bag. **You can see across the room.** That was not true of any earlier
+world, and the lead engineer confirmed it by looking.
+
+### Coverage did NOT rise with walk length — quality did
+
+Asked directly, the honest answer is that horizon coverage went *down* from
+LIVE2 (210°/240° against 330°/210°, with a 30° portrait dead sector LIVE2
+did not have), and the manifest agrees (phone `seen1` 0.9665 against
+0.9841). What rose is the quality of what is drawn: LIVE2 drew 330° of
+wreckage, SCALE draws 210–240° of room. The masks say the missing arc is
+**missing surface, not missing photographs** — `turn_180` is 97.0% NO
+GEOMETRY.
+
+### The redaction question, settled on the third data point
+
+The scale world is the **most heavily redacted of the three** — 12.01% of
+all keyframe pixels filled black, 47.4% of frames affected, one frame
+100% — and redaction reaches its render **least**: median UNOBSERVED across
+all forty views **0.23%**, worst 5.4%, against LIVE2's 0.91%/87.7%.
+
+More keyframes means more sources covering each other, so **the more the
+walk gives it, the less redaction costs.** That is the opposite of what a
+12% fill rate would suggest, and it is the clearest evidence that the
+default redacted path is the right product choice. Nothing in this campaign
+needed the 2026-09-21 raw bypass.
+
+### What is still missing, precisely
+
+1. **A 30–60° arc of wall with no surface behind it.** Turn left from the
+   opening and the room ends. 97% no-geometry.
+2. **The closet rail and the art wall did not reconstruct** — both were
+   photographed directly; the surface stage lost them. Hanging fabric and
+   flat painted wall are its two weakest subjects.
+3. **Landscape is a worse product than portrait** — four of twelve
+   landscape turn views are wall eaten by black blotches. Whatever is
+   scored per-aspect does not hold up rotated.
+4. **30-second page boot** on a 128-layer / 45-chunk / 222,657-face
+   artifact, measured on a software renderer. **This needs its own
+   measurement on the phone** before anyone calls it shippable.
+
+**What the owner should be told:** *from where you walked it is your room
+and it is your photographs; there is one wall the reconstruction did not
+get, and the closet is missing.* Not "walk through your bedroom". The
+remaining fix is the surface stage on flat walls and hanging fabric — not
+more keyframes, and not turning redaction off. The imagery is already there
+for 97–99% of every frame the page draws.
+
