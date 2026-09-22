@@ -18,12 +18,23 @@ session records predate the stage record entirely, and rebuilding those would
 be tens of hours of GPU nobody asked for. So "no stage record at all" must
 mean NOT OWED -- that is the single most important test in this file -- and a
 world some other process is still writing must mean NOT OWED too.
+
+AND THE PREDICATE IS ALSO WHERE THIS FEATURE CAN BE POINTLESS. An adversarial
+review measured the first version against the real root: 70 sessions, ZERO
+owed -- including the very world the incident was about. The stage record it
+selected on did not exist yet, and would not exist until a Tower carrying the
+commit had itself been interrupted. A selector that is a no-op on the only
+evidence there is has protected nothing. So there is a second signal, and the
+tests below pin BOTH halves of it: what the surface stage's own `status.json`
+already says, and the fact that reading it cannot widen the net -- ONE world
+in 166 on this machine has a `surface/` directory at all.
 """
 
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +43,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import world_finish_pending as wfp  # noqa: E402
+from scripts.world_build_session import StopRequest  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
     FINAL_SOLVE_FAILED,
     FINAL_SOLVE_SOLVED,
@@ -170,7 +182,7 @@ def test_a_finished_photographic_world_is_not_owed(tmp_path):
     assert _verdict(store).owed is False
 
 
-def test_a_session_with_no_stages_record_at_all_is_not_owed(tmp_path):
+def test_a_session_with_no_stages_record_and_no_surface_work_is_not_owed(tmp_path):
     """THE HISTORICAL-WORLD GUARD, and the most expensive test to get wrong.
 
     Absent is not a state in the vocabulary. It means "a Tower that never
@@ -178,16 +190,138 @@ def test_a_session_with_no_stages_record_at_all_is_not_owed(tmp_path):
     that predate 2026-09-22. Treating absence as "interrupted" would put
     tens of hours of GPU work into a queue nobody asked for, on worlds that
     are finished and fine.
+
+    "And no surface work": a session with no stage record AND no photographic
+    artifact on disk is a world no Tower ever tried to make a picture of.
+    That is the shape of 165 of the 166 worlds here, and it stays untouched.
     """
     store = _world(tmp_path, stages=None)
     verdict = _verdict(store)
     assert verdict.owed is False
-    assert "never recorded" in verdict.reason
+    assert verdict.code == "no-stage-record"
 
 
-def test_an_empty_stages_object_is_also_not_owed(tmp_path):
+def test_an_empty_stages_object_with_no_surface_work_is_also_not_owed(tmp_path):
     """`{}` says as little as absence does, and must be read as carefully."""
     store = _world(tmp_path, stages={})
+    assert _verdict(store).owed is False
+
+
+# -- the second signal: what the stage itself left on disk -------------
+#
+# Measured on the real root before this existed: 70 sessions, 0 owed, and the
+# ONE genuinely interrupted world -- 2f447162 / cb308801, a Tower shut down
+# eight minutes into a build on 2026-09-22 -- skipped as `no-stage-record`.
+# Its `surface/cb308801.../status.json` reads {"state": "stopped", "stage":
+# "depth", "pid": 7964}, written 82 seconds after its finalization completed.
+# The signal was there, unambiguous, and unread.
+
+
+def _surface_status(store, state, *, world_id="w1", session_id="s1",
+                    stage=STAGE_SURFACE, pid=999999, age=0.0):
+    path = store.world_dir(world_id) / stage / session_id / "status.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "pid": pid,
+            "updated_at": time.time() - age,
+            "state": state,
+            "stage": "depth",
+        }),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_stopped_surface_status_is_owed_when_no_stage_record_exists(tmp_path):
+    """THE REAL INCIDENT, in the shape it is actually on disk.
+
+    A `status.json` saying `stopped` cannot be written by a Tower that never
+    ran a photographic stage, so reading it cannot discover a historical
+    backlog -- which is the exact property the stage-record clause exists to
+    guarantee. It is the same guarantee from a different file.
+    """
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "stopped")
+    verdict = _verdict(store)
+    assert verdict.owed is True
+    assert verdict.stage == STAGE_SURFACE
+    assert verdict.code == "owed-by-status"
+
+
+def test_a_running_surface_status_under_a_dead_pid_is_owed(tmp_path):
+    """The other interrupted shape, decided by the SAME staleness helper the
+    rest of the system uses (`surface_pipeline.status_is_stale`) rather than
+    by a pid check invented here."""
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "running", pid=999999, age=600.0)
+    assert _verdict(store).owed is True
+
+
+def test_a_running_surface_status_under_a_live_pid_is_not_owed(tmp_path):
+    """Something is building it right now. Nothing here may touch it."""
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "running", pid=os.getpid())
+    verdict = _verdict(store)
+    assert verdict.owed is False
+    assert verdict.code == "building-now"
+
+
+def test_a_finished_surface_status_is_not_owed(tmp_path):
+    """`ok` is terminal from a status file exactly as it is from a record."""
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "ok")
+    assert _verdict(store).owed is False
+
+
+def test_a_failed_surface_status_is_not_owed(tmp_path):
+    """And so is `failed`: it will fail the same way again."""
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "failed")
+    assert _verdict(store).owed is False
+
+
+def test_an_interrupted_appearance_status_is_owed(tmp_path):
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "ok")
+    _surface_status(store, "stopped", stage=STAGE_APPEARANCE)
+    verdict = _verdict(store)
+    assert verdict.owed is True
+    assert verdict.stage == STAGE_APPEARANCE
+
+
+def test_the_stage_record_wins_wherever_there_is_one(tmp_path):
+    """The record is the more precise signal and it is written LAST.
+
+    A session whose record says the surface finished is finished, whatever a
+    `status.json` from an earlier coarse build still says -- the live child
+    writes one of those during every walk. Reading the file over the record
+    would resurrect a world that is already done.
+    """
+    store = _world(tmp_path, stages={STAGE_SURFACE: _stage(STAGE_STATE_OK)})
+    _surface_status(store, "stopped")
+    verdict = _verdict(store)
+    assert verdict.owed is False
+    assert verdict.code == "nothing-interrupted"
+
+
+def test_an_unreadable_surface_status_is_not_owed(tmp_path):
+    """Unreadable is not "interrupted". It is nothing at all."""
+    store = _world(tmp_path, stages=None)
+    _surface_status(store, "stopped").write_text("{not json", encoding="utf-8")
+    assert _verdict(store).owed is False
+
+
+def test_the_status_signal_still_obeys_every_other_clause(tmp_path):
+    """The second signal widens WHICH stage-state evidence counts. It does
+    not relax the finalization, the solve, the lock or the bound."""
+    store = _world(
+        tmp_path,
+        stages=None,
+        finalization=_finalization(final_solve=FINAL_SOLVE_FAILED),
+    )
+    _surface_status(store, "stopped")
     assert _verdict(store).owed is False
 
 
@@ -353,6 +487,136 @@ def test_an_exhausted_session_is_retired_into_the_record(tmp_path, monkeypatch):
     assert _verdict(store, max_attempts=2).owed is False
 
 
+def test_the_retirement_names_both_stages_of_the_way_back(tmp_path):
+    """The escape hatch has to actually work when followed.
+
+    `world_surface.py --force` alone rebuilds the geometry and no shading,
+    so a user who did exactly what the record told them got a grey mesh and
+    no way to know why. A saved world is the surface AND the appearance.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    wfp.record_attempt(store, "w1", "s1", detail="one")
+    assert wfp.main(["--root", str(tmp_path), "--max-attempts", "1"]) == 0
+    detail = store.read_session("w1", "s1").stages[STAGE_SURFACE]["detail"]
+    assert "world_surface.py" in detail
+    assert "world_appearance.py" in detail
+
+
+def test_retiring_takes_the_world_lock_and_looks_again_underneath_it(
+    tmp_path, a_live_process
+):
+    """A TOCTOU the survey opens and the lock closes.
+
+    `assess` runs over every session before anything is written, so a
+    builder can take the world between the check and `_retire`'s write --
+    and `mark_stage` is an unlocked read-modify-write of `session.json`,
+    so that builder's own stage write is what would be lost.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    wfp.record_attempt(store, "w1", "s1", detail="one")
+
+    # The world is surveyed as exhausted, and only THEN does a live writer
+    # arrive -- exactly the window between the survey and the write.
+    real_survey = wfp.survey
+
+    def survey_then_lock(store_, **kwargs):
+        verdicts = real_survey(store_, **kwargs)
+        record = {"pid": a_live_process.pid}
+        try:
+            import psutil
+
+            record["created_at"] = float(
+                psutil.Process(a_live_process.pid).create_time()
+            )
+        except Exception:  # pragma: no cover
+            pass
+        lock = store_.lock_path("w1")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps(record), encoding="utf-8")
+        return verdicts
+
+    wfp.survey, saved = survey_then_lock, wfp.survey
+    try:
+        assert wfp.main(["--root", str(tmp_path), "--max-attempts", "1"]) == 0
+    finally:
+        wfp.survey = saved
+    # Nothing was written: the record still says what the builder left.
+    assert store.read_session("w1", "s1").stages[STAGE_SURFACE]["state"] == (
+        STAGE_STATE_RUNNING
+    )
+
+
+def test_a_walk_starting_does_not_spend_an_attempt(tmp_path, monkeypatch):
+    """THE EXPECTED EVENT ON EVERY BOOT MUST BE FREE.
+
+    Boot the Tower, then go for a walk: the chore starts a six-minute
+    surface, the wearer presses Start a minute later, and the chore is
+    stopped. Counting that as a failed attempt means three ordinary days
+    retire a perfectly recoverable world to `failed` for ever.
+
+    The bound is for "something keeps killing me". An attempt is spent only
+    when this tool was LEFT ALONE and still did not finish, so a stop that
+    was asked for gives the attempt back -- and it does so from the stop
+    watcher's own thread, milliseconds after the pipe closes, because the
+    five-second grace ends in `terminate_tree` and nothing this process
+    does afterwards would ever run.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    stop = StopRequest()
+
+    def stopped_mid_surface(store_, world_id, session_id, **kwargs):
+        # The pipe closes while the depth pass is running. This is the
+        # watcher thread's call, verbatim.
+        stop.request(StopRequest.SOFT, "stdin-closed")
+        raise KeyboardInterrupt("terminate_tree got here first")
+
+    monkeypatch.setattr(wfp, "final_surface_stages", stopped_mid_surface)
+    with pytest.raises(KeyboardInterrupt):
+        wfp.main(["--root", str(tmp_path)], stop_request=stop)
+
+    assert wfp.read_attempts(store, "w1", "s1") == 0
+    # So the next boot still owes it, rather than counting down to `failed`.
+    assert _verdict(store).owed is True
+
+
+def test_a_failure_nobody_asked_for_does_spend_an_attempt(tmp_path, monkeypatch):
+    """The other half, or the bound would bound nothing.
+
+    A stage that dies with no stop request is the shape the bound exists
+    for: a machine that sleeps, an out-of-memory kill, a driver that falls
+    over. That attempt stands.
+    """
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+
+    def die(*args, **kwargs):
+        raise RuntimeError("the depth network fell over")
+
+    monkeypatch.setattr(wfp, "final_surface_stages", die)
+    assert wfp.main(["--root", str(tmp_path)]) == 1
+    assert wfp.read_attempts(store, "w1", "s1") == 1
+
+
+def test_an_attempt_that_cannot_be_counted_is_never_started(tmp_path, monkeypatch):
+    """An uncounted attempt is an unbounded one.
+
+    `record_attempt` writes before the work, so a read-only or full disk
+    made it raise BEFORE anything was counted -- and the bound then never
+    advanced, at every boot, for ever. That is precisely the loop the bound
+    exists to prevent, arriving through the bound's own front door.
+    """
+    _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    ran = []
+    monkeypatch.setattr(wfp, "final_surface_stages",
+                        lambda *a, **kw: ran.append(1))
+
+    def refuse(*args, **kwargs):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(wfp, "record_attempt", refuse)
+    assert wfp.main(["--root", str(tmp_path)]) == 1
+    assert ran == []
+
+
 # -- the CLI ----------------------------------------------------------
 
 
@@ -430,11 +694,14 @@ def test_the_cli_finishes_one_world_at_a_time(tmp_path, stage_runner):
 def test_a_stop_asked_for_before_the_work_starts_skips_it(tmp_path, stage_runner):
     """Stoppable the way the builder is. Nothing is in flight to lose: the
     stage record already carries the `running` this run would leave."""
-    _world(tmp_path, stages=INTERRUPTED_SURFACE)
-    assert (
-        wfp.main(["--root", str(tmp_path)], should_stop=lambda: True) == 0
-    )
+    store = _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    stop = StopRequest()
+    stop.request(StopRequest.SOFT, "stdin-closed")
+    assert wfp.main(["--root", str(tmp_path)], stop_request=stop) == 0
     assert stage_runner == []
+    # And it cost the world nothing: no lock, and no attempt.
+    assert wfp.read_attempts(store, "w1", "s1") == 0
+    assert not store.lock_path("w1").exists()
 
 
 def test_the_dry_run_reports_what_is_owed_and_touches_nothing(
@@ -591,3 +858,103 @@ def test_a_capture_opening_stops_the_finisher(tmp_path):
     stopped.clear()
     supervisor.attach("anything", "cap-1", tmp_path)
     assert stopped
+
+
+def test_a_stream_with_no_capture_recorder_still_stops_the_finisher(
+    tmp_path, monkeypatch
+):
+    """THE HOLE IN THE CAPTURE FUNNELS, and it is a supported configuration.
+
+    `TOWER_CAPTURE_ROOT` unset means no capture id is ever minted, so
+    `capture_opened` never fires and `attach` returns early -- while frames
+    stream and the live cartridges are told the stream opened and take the
+    GPU. The chore would have kept it, and a world writer lock, for the rest
+    of that stream. A STREAM exists whenever a phone is sending frames; a
+    CAPTURE exists only when a recorder is armed, and only the first of those
+    is the event that matters here.
+    """
+    import base64
+    import io
+
+    from fastapi.testclient import TestClient
+    from PIL import Image
+
+    from tower.main import create_app
+
+    monkeypatch.delenv("TOWER_CAPTURE_ROOT", raising=False)
+    monkeypatch.setenv("TOWER_WORLD_ROOT", str(tmp_path))
+
+    stopped = []
+
+    class _Chore:
+        def start(self):
+            return True
+
+        def stop(self, reason, **kwargs):
+            stopped.append(reason)
+
+    app = create_app()
+    assert app.state.capture_root is None, "this test needs the recorder OFF"
+    app.state.world_finish_chore = _Chore()
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 24), (10, 20, 30)).save(buffer, format="JPEG")
+    frame = {
+        "type": "frame", "seq": 1, "source_seq": 1,
+        "width": 32, "height": 24, "format": "jpeg",
+        "data": base64.b64encode(buffer.getvalue()).decode("ascii"),
+    }
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "stream_start"})
+        ws.send_json(frame)
+        assert ws.receive_json()["type"] == "frame_result"
+
+    assert stopped, "a stream opened and the chore kept the GPU"
+    assert "stream" in stopped[0]
+
+
+def test_a_second_stop_waits_for_the_child_to_actually_be_gone(tmp_path):
+    """The claim "a builder is spawned strictly after the finisher is dead"
+    has to be true for BOTH callers.
+
+    `capture_opened` comes off ws.py's threadpool and `attach` off the HTTP
+    one, and the phone streaming while the wearer presses Start interleaves
+    them. Measured on the first version: the second caller returned in 0.05 s
+    with the child still alive and running a GPU op, while the first was
+    still inside its grace -- so the guarantee held for one caller and not
+    the other.
+    """
+    from tower import main as tower_main
+    from tower.capture_workers import WorkerSpec
+
+    chore = tower_main._BackgroundChore(
+        WorkerSpec(
+            # A child that ignores the closed pipe, which is exactly what a
+            # finisher inside a depth pass looks like from out here.
+            argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+            name="probe",
+            stop_via_stdin=True,
+            stop_grace_seconds=0.5,
+        )
+    )
+    assert chore.start() is True
+    process = chore._process
+    returned = {}
+
+    def stopper(tag):
+        def run():
+            chore.stop(f"{tag}")
+            returned[tag] = process.poll() is not None
+
+        return run
+
+    first = threading.Thread(target=stopper("first"))
+    first.start()
+    time.sleep(0.05)
+    second = threading.Thread(target=stopper("second"))
+    second.start()
+    first.join(timeout=30)
+    second.join(timeout=30)
+
+    assert returned == {"first": True, "second": True}

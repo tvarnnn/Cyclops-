@@ -484,6 +484,35 @@ def _capture_workers(websocket):
     return getattr(websocket.app.state, "capture_workers", None)
 
 
+def _yield_background_work(websocket, reason: str) -> None:
+    """Stop whatever background chore this Tower is running, if it is running.
+
+    A STREAM IS THE EVENT, NOT A CAPTURE, and the difference is the whole
+    reason this exists beside `supervisor.capture_opened`. A capture exists
+    only when a recorder is armed; a stream exists whenever a phone is
+    sending frames. On a Tower with no `TOWER_CAPTURE_ROOT` -- a supported
+    and common configuration -- no capture id is ever minted, so the capture
+    funnels never fire, while the live cartridges are told the stream opened
+    and take the GPU. A chore holding the GPU (and a world's writer lock)
+    would have kept both for the rest of that stream.
+
+    Fetched by name and tolerant of absence, exactly like `_capture_workers`
+    above and for the same reason: most tests here build an app and never
+    set it. This module learns only that there is something with a `stop`
+    that must yield to a stream; `main.py` decides what that something is.
+    """
+    chore = getattr(websocket.app.state, "world_finish_chore", None)
+    if chore is None:
+        return
+    try:
+        chore.stop(reason)
+    except Exception:
+        logger.exception(
+            "[Tower][Worker] a background chore did not stop for the stream; "
+            "the stream continues without waiting for it"
+        )
+
+
 def _tell_cartridges_the_stream_opened(websocket, owner) -> None:
     """The stream boundary, handed to every live cartridge.
 
@@ -1090,6 +1119,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 active_measurement = SessionMetrics()
                 logger.info(
                     "[Tower][Session] stream_start: measurement window opened"
+                )
+                # FIRST, and off the loop. Whatever this Tower was doing on
+                # its own behalf -- finishing a world's photographic stages,
+                # today -- must give the GPU back before a recorder is armed
+                # or a cartridge is told anything. It is a bounded join
+                # (the chore's grace plus a terminate), and a bounded join
+                # on the event loop is still a join on the event loop: the
+                # same rule `_start_capture` and `_close_cartridge_streams`
+                # already follow.
+                await asyncio.to_thread(
+                    _yield_background_work, websocket, "a stream opened"
                 )
                 await _start_capture(websocket, connection_token)
                 # After the recorder, so a cartridge that wants the

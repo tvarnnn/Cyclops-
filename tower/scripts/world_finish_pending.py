@@ -50,11 +50,30 @@ does, so a finisher that is itself killed leaves behind the very signature it
 selects on. Without the bound that is an infinite loop across restarts on a
 world it can never finish.
 
-IT NEVER INVENTS WORK. A session with NO stage record at all is NOT owed.
-Absent is not a state in the vocabulary; it means "a Tower that never
-recorded this", which is every world built before 2026-09-22 -- 165 of them
-on the machine this was written on. Reading absence as "interrupted" would
-queue tens of hours of GPU against worlds that are finished and fine.
+THE BOUND COUNTS ONLY ATTEMPTS THAT ENDED ON THEIR OWN. "Boot the Tower,
+then go for a walk" is the EXPECTED event on every start, and it ends this
+process -- so counting it would retire a perfectly recoverable world to
+`failed` in three ordinary days. An attempt that ended in a stop request is
+given back, from the stop watcher's own thread, in the five seconds before
+`terminate_tree` arrives. See `forgive_attempt`.
+
+IT NEVER INVENTS WORK, AND IT IS NOT A NO-OP EITHER. Those two failures pull
+in opposite directions and `assess` has to hold both.
+
+A session with no stage record and no photographic artifact is NOT owed:
+absent is not a state in the vocabulary, it means "a Tower that never tried
+to make a picture of this", and reading it as "interrupted" would queue tens
+of hours of GPU against 165 worlds that are finished and fine.
+
+But the stage record was added on 2026-09-22 and is written by nothing that
+has run yet, so selecting on it ALONE made this tool a no-op on the only
+interrupted world in existence -- including the very one the incident above
+is about, whose `surface/<session>/status.json` had said `stopped` since 82
+seconds after its finalization completed. So there is a second signal, and it
+is safe for exactly the same reason the first is: `surface_pipeline` alone
+writes that file, so a Tower that never ran a photographic stage cannot have
+left one. Measured: 166 worlds here, ONE with a `surface/` directory, and it
+is the interrupted one. See `interrupted_stage_on_disk`.
 
 Exit status is 0 whenever the run itself was sound -- including a run that
 found nothing owed, which is the common case -- and 1 when a session that was
@@ -65,7 +84,9 @@ import argparse
 import collections
 import json
 import logging
+import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,9 +128,14 @@ INTERRUPTED_STATES = (STAGE_STATE_RUNNING, STAGE_STATE_STOPPED)
 
 # How many times this tool may start the same session before it gives up and
 # says so on the record. Three, because the failure it bounds is "something
-# keeps killing me" -- a machine that sleeps on a timer, a Tower an operator
-# keeps restarting -- and the second attempt is genuinely often the one that
-# lands.
+# keeps killing me" -- a machine that sleeps on a timer, an out-of-memory
+# kill, a driver that falls over -- and the second attempt is genuinely often
+# the one that lands.
+#
+# AN ATTEMPT IS SPENT ONLY WHEN THIS TOOL WAS LEFT ALONE AND STILL DID NOT
+# FINISH. See `forgive_attempt`: the expected event on every boot is "the
+# wearer went for a walk", and counting that would retire a perfectly
+# recoverable world to `failed` in three ordinary days.
 DEFAULT_MAX_ATTEMPTS = 3
 
 # One world per run. Not a throughput knob: the machine belongs to whoever
@@ -205,6 +231,19 @@ def read_attempts(store: WorldStore, world_id: str, session_id: str) -> int | No
     return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 
+# One writer at a time WITHIN this process. Between processes the world's
+# writer lock is the guarantee; inside it, `forgive_attempt` is called from
+# the stop watcher's thread while the main thread may still be in
+# `record_attempt`'s read-modify-write.
+_LEDGER_LOCK = threading.Lock()
+
+
+def _write_ledger(store: WorldStore, world_id: str, sessions: dict) -> None:
+    path = _attempts_path(store, world_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, {"schema": 1, "sessions": sessions})
+
+
 def record_attempt(
     store: WorldStore, world_id: str, session_id: str, *, detail: str
 ) -> int:
@@ -215,16 +254,140 @@ def record_attempt(
     process that does not live to write anything afterwards. An attempt
     counted on completion counts only the attempts that did not need
     counting.
+
+    RAISES rather than shrugging when it cannot write. An attempt that could
+    not be counted is an UNCOUNTED attempt, and a read-only or full disk made
+    this the one path that turned the bound into its opposite: every boot
+    started the same six-minute stage, none of them was ever counted, and the
+    bound never advanced. The caller refuses the work instead.
     """
-    sessions, _ = _read_ledger(store, world_id)
-    sessions = dict(sessions)
-    count = (sessions.get(session_id) or {}).get("attempts")
-    count = (count if isinstance(count, int) and not isinstance(count, bool) else 0) + 1
-    sessions[session_id] = {"attempts": count, "detail": detail}
-    path = _attempts_path(store, world_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(path, {"schema": 1, "sessions": sessions})
+    with _LEDGER_LOCK:
+        sessions, _ = _read_ledger(store, world_id)
+        sessions = dict(sessions)
+        count = (sessions.get(session_id) or {}).get("attempts")
+        count = (
+            count if isinstance(count, int) and not isinstance(count, bool) else 0
+        ) + 1
+        sessions[session_id] = {"attempts": count, "detail": detail}
+        _write_ledger(store, world_id, sessions)
     return count
+
+
+def forgive_attempt(
+    store: WorldStore, world_id: str, session_id: str, *, detail: str
+) -> None:
+    """Give an attempt back, because this run was ASKED to stop.
+
+    THE EXPECTED EVENT ON EVERY BOOT MUST BE FREE. Boot the Tower, then go
+    for a walk: the chore starts a six-minute surface, the wearer presses
+    Start a minute later, `capture_opened` closes the pipe, and five seconds
+    later `terminate_tree` kills a process that never reached a `should_stop`
+    checkpoint inside a depth pass. Counting that spends an attempt for no
+    work, and three ordinary days of doing exactly what the product expects
+    would retire a perfectly recoverable world to `failed` for ever.
+
+    So the bound counts only the attempts that ENDED ON THEIR OWN: a machine
+    that slept, an out-of-memory kill, a driver that fell over. Those leave
+    no stop request behind, which is precisely what makes them the failure
+    the bound was written for.
+
+    CALLED FROM THE STOP WATCHER'S THREAD, milliseconds after the pipe
+    closes, and that is the whole design. The grace ends in `terminate_tree`,
+    so anything this process would have done after the stage returned does
+    not run -- there is no `finally` on a `TerminateProcess`. Never raises:
+    a forgiveness that cannot be written costs one attempt, and taking the
+    process down with it would cost the world its lock.
+    """
+    try:
+        with _LEDGER_LOCK:
+            sessions, unreadable = _read_ledger(store, world_id)
+            if unreadable:
+                return
+            sessions = dict(sessions)
+            count = (sessions.get(session_id) or {}).get("attempts")
+            count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+            sessions[session_id] = {
+                "attempts": max(0, count - 1),
+                "detail": f"attempt given back: {detail}",
+            }
+            _write_ledger(store, world_id, sessions)
+    except Exception:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "[Tower][WorldBuilder] could not give back the attempt on %s/%s",
+            world_id, session_id, exc_info=True,
+        )
+
+
+# -- the second signal -------------------------------------------------
+
+
+def _stage_status(store: WorldStore, world_id: str, session_id: str,
+                  stage: str) -> dict | None:
+    """One stage's own `status.json`, or None when there is not a readable one.
+
+    The same file `session_build_running` and `_lifecycle` already read. It
+    is opened here rather than through them because they answer "is this
+    live?", and the question here is the opposite one.
+    """
+    path = store.world_dir(world_id) / stage / session_id / "status.json"
+    try:
+        status = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Unreadable is not "interrupted". It is nothing at all, and the
+        # conservative reading of nothing is to leave the world alone.
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def interrupted_stage_on_disk(store: WorldStore, world_id: str,
+                              session_id: str) -> str | None:
+    """The photographic stage whose own artifact says it was interrupted.
+
+    WHY THIS EXISTS, AND WHAT SELECTING ON THE RECORD ALONE COST.
+
+    `Session.stages` was added on 2026-09-22 and is the precise signal. It
+    is also, on the day it was added, written by nothing that has run yet.
+    An adversarial review measured the first version of this tool against the
+    real root: 70 sessions, ZERO owed -- and the skipped list included world
+    2f447162 / session cb308801, the Tower shut down eight minutes into a
+    build that this whole tool was written for. Its
+    `surface/cb308801.../status.json` had said `{"state": "stopped", "stage":
+    "depth"}` since 82 seconds after its finalization completed. A selector
+    that is a no-op on the only evidence in existence has protected nothing,
+    and would have stayed a no-op until a Tower carrying the new record had
+    itself been interrupted.
+
+    IT CANNOT WIDEN THE NET, which is the property that makes it safe. The
+    stage-record clause exists to guarantee that a historical backlog cannot
+    be discovered; this file gives the same guarantee from a different
+    direction. A `status.json` under `<world>/surface/<session>/` is written
+    by `surface_pipeline` and by nothing else, so a Tower that never ran a
+    photographic stage cannot have left one. Measured on this machine: ONE
+    world in 166 has a `surface/` directory at all, and it is the interrupted
+    one.
+
+    Only the two interrupted words count, exactly as in the record: `stopped`,
+    or `running` whose process is gone -- decided by `status_is_stale`, the
+    helper the surface pipeline itself publishes, rather than by a pid check
+    invented here.
+    """
+    # Lazily, like every other consumer of this module: `surface_pipeline`
+    # pulls in the whole reconstruction stack, and the common answer here is
+    # "there is no such file".
+    from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+        status_is_stale,
+    )
+
+    for stage in PHOTOGRAPHIC_STAGES:
+        status = _stage_status(store, world_id, session_id, stage)
+        if status is None:
+            continue
+        state = status.get("state")
+        if state == STAGE_STATE_STOPPED:
+            return stage
+        if state == STAGE_STATE_RUNNING and status_is_stale(status):
+            return stage
+    return None
 
 
 # -- the predicate -----------------------------------------------------
@@ -280,29 +443,55 @@ def assess(
             "needs a global solve and there is none"
         )
 
-    # THE HISTORICAL-WORLD GUARD, and the most consequential line in the file.
+    # TWO SIGNALS, IN PRECEDENCE ORDER, AND NEITHER CAN DISCOVER A BACKLOG.
     #
-    # `stages` absent is not a state. It means "a Tower that never recorded
-    # this", which is every session written before 2026-09-22 -- 165 worlds on
-    # the machine this was written for. An empty object says exactly as
-    # little. Reading either as "interrupted" would put tens of hours of GPU
-    # into a queue nobody asked for, against worlds that are finished.
-    if not session.stages:
-        return no(
-            "no-stage-record",
-            "this session has no stage record, which means a Tower that never "
-            "recorded one -- not an interrupted stage"
-        )
-
-    stage = None
-    for candidate in PHOTOGRAPHIC_STAGES:
-        entry = session.stages.get(candidate) or {}
-        if entry.get("state") in INTERRUPTED_STATES:
-            stage = candidate
-            break
-    if stage is None:
-        return no("nothing-interrupted",
-                  "no photographic stage is in an interrupted state")
+    # THE RECORD FIRST, wherever there is one. `Session.stages` is written
+    # last, by the builder itself, and it is the more precise of the two: a
+    # record saying the surface finished is finished, whatever a `status.json`
+    # from an earlier COARSE build during the walk still says. Reading the
+    # file over the record would resurrect worlds that are already done.
+    #
+    # THE STAGE'S OWN ARTIFACT otherwise. `stages` absent is not a state in
+    # the vocabulary -- it means "a Tower that never recorded this", which is
+    # every session written before 2026-09-22 -- but it is not the same fact
+    # as "no photographic work was ever attempted", and conflating the two is
+    # what made the first version of this tool a no-op on the one world the
+    # incident was about. See `interrupted_stage_on_disk`: a
+    # `surface/<session>/status.json` cannot exist on a Tower that never ran
+    # the stage, so this reads the same guarantee off a different file.
+    #
+    # Absent record AND no interrupted artifact is the historical world, and
+    # it stays untouched -- 165 of the 166 on this machine.
+    by_record = bool(session.stages)
+    if by_record:
+        stage = None
+        for candidate in PHOTOGRAPHIC_STAGES:
+            entry = session.stages.get(candidate) or {}
+            if entry.get("state") in INTERRUPTED_STATES:
+                stage = candidate
+                break
+        if stage is None:
+            return no("nothing-interrupted",
+                      "no photographic stage is in an interrupted state")
+    else:
+        stage = interrupted_stage_on_disk(store, world_id, session_id)
+        if stage is None:
+            # ASKED HERE, not only below. `interrupted_stage_on_disk` reads a
+            # LIVE `running` status as "not interrupted", which is correct --
+            # and would then have been reported as "no Tower ever tried to
+            # make a picture of this", which is the opposite of true. The
+            # probe is worth its cost on this branch alone: three sessions on
+            # the real root reach it.
+            if session_build_running(store, world_id, session_id):
+                return no("building-now",
+                          "a photographic stage for this session is running "
+                          "right now")
+            return no(
+                "no-stage-record",
+                "this session has no stage record and no interrupted "
+                "photographic artifact, which means a Tower that never tried "
+                "to make a picture of it -- not an interrupted stage"
+            )
 
     # "RUNNING" IS TWO DIFFERENT FACTS AND ONLY LIVENESS TELLS THEM APART.
     #
@@ -322,7 +511,14 @@ def assess(
     # open. A builder walking this world into a NEW session holds the same
     # world's lock, and writing underneath it is exactly what
     # `world_finalize.py` calls "the whole safety story".
+    #
+    # OUR OWN LOCK IS NOT A FOREIGN WRITER, the same exclusion
+    # `world_builder_library._world_is_live` makes and for the same reason.
+    # Without it `_retire` could not re-`assess` underneath the lock it just
+    # took -- and re-checking under the lock is the entire point of taking it.
     holder = store.lock_holder(world_id)
+    if holder is not None and holder["pid"] == os.getpid():
+        holder = None
     if holder is not None and (holder["alive"] or holder["unreadable"]):
         return no(
             "locked",
@@ -351,13 +547,25 @@ def assess(
             exhausted=True,
         )
 
+    if by_record:
+        evidence = (
+            f"the {stage} stage is recorded "
+            f"{(session.stages[stage] or {}).get('state')!r}"
+        )
+    else:
+        evidence = (
+            f"this session has no stage record, but its {stage} stage left an "
+            "interrupted status.json behind"
+        )
     return Verdict(
         world_id,
         session_id,
         True,
-        f"the {stage} stage is {session.stages[stage].get('state')!r} and "
-        "nothing is building it",
-        code="owed",
+        f"{evidence} and nothing is building it",
+        # The two signals are told apart in the report as well as in the code:
+        # "owed-by-status" is the one that reaches back past the record, and
+        # an operator should be able to see which of them fired.
+        code="owed" if by_record else "owed-by-status",
         stage=stage,
         attempts=attempts,
     )
@@ -375,7 +583,7 @@ def survey(store: WorldStore, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> li
 # -- doing the work ----------------------------------------------------
 
 
-def _retire(engine: WorldBuilderEngine, verdict: Verdict, max_attempts: int) -> dict:
+def _retire(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
     """Write down that this tool has given up on a session, once.
 
     "Bounded" on its own would leave a world sparse with nothing on disk
@@ -383,18 +591,80 @@ def _retire(engine: WorldBuilderEngine, verdict: Verdict, max_attempts: int) -> 
     -- it would just move it one level up. `failed` is the honest word and it
     is terminal, so this also stops the session being reassessed at every
     boot forever.
+
+    UNDER THE WRITER LOCK, AND RE-CHECKED UNDERNEATH IT. `mark_stage` is a
+    read-modify-write of `session.json` with no lock of its own, and the
+    survey that produced this verdict ran over every session in the root
+    before anything was written -- so a builder can take the world in
+    between, and the write that would be lost is that builder's own. The
+    lock closes the window, and the second `assess` is what makes taking it
+    worth anything.
     """
-    detail = (
-        f"scripts/world_finish_pending.py started this stage {verdict.attempts} "
-        f"times (bound {max_attempts}) and was interrupted every time; not "
-        "retrying. Run scripts/world_surface.py --force by hand to try again."
-    )
-    engine.mark_stage(
-        verdict.world_id, verdict.session_id, verdict.stage,
-        state=STAGE_STATE_FAILED, detail=detail,
-    )
-    return {"world_id": verdict.world_id, "session_id": verdict.session_id,
-            "retired": verdict.stage, "attempts": verdict.attempts}
+    out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+           "retired": verdict.stage, "attempts": verdict.attempts}
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001 -- reported, never forced
+        out.update({"retired": None, "reason": f"{type(exc).__name__}: {exc}"})
+        return out
+    try:
+        again = assess(store, verdict.world_id, verdict.session_id,
+                       max_attempts=max_attempts)
+        if not again.exhausted:
+            out.update({"retired": None, "reason": f"no longer {verdict.code}: "
+                                                   f"{again.code}"})
+            return out
+        detail = (
+            f"scripts/world_finish_pending.py started this stage "
+            f"{verdict.attempts} times (bound {max_attempts}) and something "
+            "ended it on its own every time; not retrying. To try again by "
+            "hand: scripts/world_surface.py --force, then "
+            "scripts/world_appearance.py -- a saved world is the surface AND "
+            "the shading on it, and the surface alone is a grey mesh."
+        )
+        WorldBuilderEngine(store).mark_stage(
+            verdict.world_id, verdict.session_id, verdict.stage,
+            state=STAGE_STATE_FAILED, detail=detail,
+        )
+    finally:
+        store.release_writer_lock(verdict.world_id)
+    return out
+
+
+def _forgive_on_stop(stop_request, forgive):
+    """Arrange for `forgive` to run the instant a stop is ASKED FOR.
+
+    WRAPPING THE INSTANCE, and that is the point rather than a shortcut.
+    `StopRequest._watch_stdin` and `_handle_signal` both reach the flag
+    through `self.request(...)`, so shadowing it on the instance puts
+    `forgive` on the watcher thread, milliseconds after the pipe closes.
+
+    Doing it at any later point does not work at all. The supervisor's grace
+    ends in `terminate_tree`, and a stage inside a depth pass will not reach
+    a `should_stop` checkpoint within it -- so there is no `finally`, no
+    `atexit` and no return value. Whatever is going to be written down about
+    this attempt has to be written while the process is still alive, in the
+    five seconds it has left.
+
+    Returns a callable that puts the original method back, and forgives at
+    most once however many times a stop is asked for.
+    """
+    original = stop_request.request
+    done = threading.Event()
+
+    def request(level, source):
+        original(level, source)
+        if not done.is_set():
+            done.set()
+            forgive(source)
+
+    stop_request.request = request
+
+    def disarm():
+        stop_request.request = original
+        return done.is_set()
+
+    return disarm
 
 
 def finish(
@@ -403,8 +673,7 @@ def finish(
     *,
     appearance: bool,
     prune_depth_work: bool,
-    should_stop,
-    stop_source=lambda: None,
+    stop_request,
 ) -> dict:
     """One owed session, finished under the world's writer lock.
 
@@ -435,10 +704,32 @@ def finish(
         report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
         return report
 
+    disarm = None
     try:
-        report["attempts"] = record_attempt(
-            store, verdict.world_id, verdict.session_id,
-            detail=f"finishing the {verdict.stage} stage",
+        try:
+            report["attempts"] = record_attempt(
+                store, verdict.world_id, verdict.session_id,
+                detail=f"finishing the {verdict.stage} stage",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # AN UNCOUNTED ATTEMPT IS AN UNBOUNDED ONE. A read-only or full
+            # disk made this raise before any work began, so nothing was
+            # counted, the bound never advanced, and every boot started the
+            # same six-minute stage again -- the loop the bound exists to
+            # prevent, arriving through the bound's own front door. A root
+            # that cannot be written to has nowhere to put a surface either.
+            report.update({
+                "finished": False,
+                "reason": f"the attempt could not be counted, so it was not "
+                          f"started: {type(exc).__name__}: {exc}",
+            })
+            return report
+        disarm = _forgive_on_stop(
+            stop_request,
+            lambda source: forgive_attempt(
+                store, verdict.world_id, verdict.session_id,
+                detail=f"stopped ({source})",
+            ),
         )
         report["stages"] = final_surface_stages(
             store, verdict.world_id, verdict.session_id,
@@ -447,8 +738,8 @@ def finish(
             solved=True,
             appearance=appearance,
             prune_depth_work=prune_depth_work,
-            should_stop=should_stop,
-            stop_source=stop_source,
+            should_stop=stop_request.asked_for,
+            stop_source=lambda: stop_request.source,
             record=_recorder(engine, verdict.world_id, verdict.session_id),
         )
         report["finished"] = True
@@ -464,6 +755,19 @@ def finish(
         # the lock is released on the way past either way.
         report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
     finally:
+        if disarm is not None:
+            # BELT AND BRACES, for the two windows the watcher thread cannot
+            # cover: a stop that landed between `record_attempt` and the wrap
+            # (microseconds, but it would spend an attempt on no work), and a
+            # stage that HONOURED the stop and returned normally, which is the
+            # happy version of the same event. `forgive_attempt` runs at most
+            # once whichever path gets there.
+            forgiven = disarm()
+            if not forgiven and stop_request.asked:
+                forgive_attempt(
+                    store, verdict.world_id, verdict.session_id,
+                    detail=f"stopped ({stop_request.source})",
+                )
         engine.release_world(verdict.world_id)
     return report
 
@@ -491,7 +795,9 @@ def _recorder(engine: WorldBuilderEngine, world_id: str, session_id: str):
 # -- the CLI -----------------------------------------------------------
 
 
-def main(argv=None, *, should_stop=None) -> int:
+def main(argv=None, *, stop_request=None) -> int:
+    """`stop_request` is the stop channel, injectable so a test can BE the
+    capture that opens mid-surface rather than approximate one."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=artifact_root_arg, required=True)
     parser.add_argument(
@@ -527,13 +833,13 @@ def main(argv=None, *, should_stop=None) -> int:
     parser.add_argument("--format", choices=("json", "text"), default="json")
     args = parser.parse_args(argv)
 
-    stop_request = StopRequest()
-    if should_stop is None:
+    if stop_request is None:
+        stop_request = StopRequest()
         # Armed BEFORE the survey, so a Tower that starts and immediately
         # begins a walk is obeyed at the first opportunity rather than at the
         # first one after a directory scan.
         stop_request.install(watch_stdin=args.stop_on_stdin_close)
-        should_stop = stop_request.asked_for
+    should_stop = stop_request.asked_for
 
     store = WorldStore(Path(args.root))
     verdicts = survey(store, max_attempts=args.max_attempts)
@@ -555,12 +861,11 @@ def main(argv=None, *, should_stop=None) -> int:
         _emit(report, args.format)
         return 0
 
-    engine = WorldBuilderEngine(store)
     for verdict in verdicts:
         if not verdict.exhausted or should_stop():
             continue
         try:
-            report["retired"].append(_retire(engine, verdict, args.max_attempts))
+            report["retired"].append(_retire(store, verdict, args.max_attempts))
         except Exception as exc:  # noqa: BLE001 -- a record is not worth an exit
             logger.warning(
                 "[Tower][WorldBuilder] could not retire %s/%s: %s",
@@ -585,8 +890,7 @@ def main(argv=None, *, should_stop=None) -> int:
             store, verdict,
             appearance=args.appearance,
             prune_depth_work=not args.keep_depth_work,
-            should_stop=should_stop,
-            stop_source=lambda: stop_request.source,
+            stop_request=stop_request,
         )
         report["finished"].append(outcome)
         done += 1

@@ -82,6 +82,11 @@ WORLD_FINISH_WORKER = "world-finish-pending"
 # again -- while the wearer pressing Start is waiting for the GPU.
 WORLD_FINISH_STOP_GRACE_SECONDS = 5.0
 
+# How long a caller that did NOT win the stop waits for the one that did.
+# The grace, the terminate timeout, and a second of slack: the bound on what
+# the winning caller can actually cost, not a guess.
+_STOP_HANDSHAKE_SECONDS = WORLD_FINISH_STOP_GRACE_SECONDS + TERMINATE_TIMEOUT_SECONDS + 1.0
+
 
 def _build_cv_module(settings: Settings, connection_count=None) -> Module:
     """The one module slot.
@@ -323,10 +328,19 @@ class _BackgroundChore:
     and it is a structural one rather than a predicate that has to be right:
     at Tower start nothing is streaming and every cartridge session is
     stopped (see `app.state.cartridge_sessions`, which is deliberately not
-    persisted). The first sign of a capture stops this for the lifetime of
+    persisted). The first sign of activity stops this for the lifetime of
     the process, so a walk can never find it running and the GPU it wanted
     is already free. Work it did not finish is not lost -- it is still
     recorded as interrupted, and the next Tower start is the next attempt.
+
+    THREE WAYS IT IS TOLD, and it needs all three. `capture_opened` and
+    `attach` on the supervisor are the funnels through which anything begins
+    following a CAPTURE (see `_SupervisorThatYieldsTheGpu`); `stream_start`
+    in `tower/routes/ws.py` is the one through which a phone begins sending
+    FRAMES. They are not the same event: a Tower with no `TOWER_CAPTURE_ROOT`
+    mints no capture id, so the first two never fire while the live
+    cartridges take the GPU -- a supported configuration in which this chore
+    would have kept the GPU, and a world's writer lock, for the whole stream.
     """
 
     def __init__(self, spec: WorkerSpec) -> None:
@@ -335,6 +349,11 @@ class _BackgroundChore:
         self._process = None
         self._job = None
         self._retired = False
+        # Whether SOMEBODY is inside `stop()` doing the waiting, and the
+        # event that says they have finished. Both exist because the
+        # blocking wait deliberately happens OUTSIDE `_lock` -- see `stop`.
+        self._stopping = False
+        self._gone = threading.Event()
 
     @property
     def name(self) -> str:
@@ -385,11 +404,23 @@ class _BackgroundChore:
             return True
 
     def stop(self, reason: str, *, grace_seconds: float | None = None) -> None:
-        """Ask it to stop, then make sure it is gone. Idempotent.
+        """Ask it to stop, and do not return until it is gone. Idempotent.
 
         `_retired` is set whether or not anything was running, so a stop that
         arrives before the start -- a capture opening while the Tower is
         still coming up -- prevents the start rather than racing it.
+
+        EVERY CALLER WAITS, NOT JUST THE ONE THAT WON. The blocking wait
+        cannot happen under `_lock` (a second caller would then block on the
+        lock and never learn whether the child is gone or merely asked), so
+        exactly one caller owns the process and the others wait on
+        `_gone`. Without that, the second caller returned immediately with
+        the child still alive -- measured at 0.05 s against 5.01 s, with the
+        child running a GPU op -- and the guarantee this whole class exists
+        for, "a builder starts only after the finisher is dead", held for
+        `capture_opened` and not for `attach`. Those two arrive on different
+        threadpools and interleave exactly when the phone is streaming and
+        the wearer presses Start.
         """
         with self._lock:
             already = self._retired
@@ -398,37 +429,61 @@ class _BackgroundChore:
             self._process = None
             job = self._job
             self._job = None
+            mine = process is not None
+            if mine:
+                self._stopping = True
+            waiting_on_someone_else = not mine and self._stopping
         if process is None:
+            if waiting_on_someone_else:
+                # Another caller is inside the wait below. Bounded by what
+                # that wait can cost: the grace, the terminate, and slack.
+                budget = _STOP_HANDSHAKE_SECONDS
+                if not self._gone.wait(timeout=budget):
+                    logger.warning(
+                        "[Tower][Worker] the %s chore was not gone within "
+                        "%.1fs of a concurrent stop (%s); continuing anyway",
+                        self._spec.name, budget, reason,
+                    )
+                return
             if not already:
                 logger.debug(
                     "[Tower][Worker] the %s chore will not start: %s",
                     self._spec.name, reason,
                 )
+            self._gone.set()
             return
-        if process.poll() is not None:
-            return
-        grace = (
-            self._spec.stop_grace_seconds if grace_seconds is None else grace_seconds
-        )
-        logger.info(
-            "[Tower][Worker] stopping the %s chore (pid %s): %s",
-            self._spec.name, process.pid, reason,
-        )
         try:
-            if process.stdin is not None:
-                process.stdin.close()
-        except Exception:  # noqa: BLE001 -- a closed pipe is the request
-            pass
-        try:
-            process.wait(timeout=grace)
-            return
-        except Exception:  # noqa: BLE001 -- it did not go on its own
-            pass
-        # THE TREE, NOT THE PID. The surface stage runs a depth network in
-        # this child's own process, but the appearance and the solve spawn
-        # grandchildren, and a plain terminate() leaves those holding the GPU
-        # the wearer just asked for.
-        terminate_tree(process, job=job, timeout=TERMINATE_TIMEOUT_SECONDS)
+            if process.poll() is not None:
+                return
+            grace = (
+                self._spec.stop_grace_seconds
+                if grace_seconds is None
+                else grace_seconds
+            )
+            logger.info(
+                "[Tower][Worker] stopping the %s chore (pid %s): %s",
+                self._spec.name, process.pid, reason,
+            )
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:  # noqa: BLE001 -- a closed pipe is the request
+                pass
+            try:
+                process.wait(timeout=grace)
+                return
+            except Exception:  # noqa: BLE001 -- it did not go on its own
+                pass
+            # THE TREE, NOT THE PID. The surface stage runs a depth network in
+            # this child's own process, but the appearance and the solve spawn
+            # grandchildren, and a plain terminate() leaves those holding the
+            # GPU the wearer just asked for.
+            terminate_tree(process, job=job, timeout=TERMINATE_TIMEOUT_SECONDS)
+        finally:
+            # Whatever happened, the callers waiting on us are released. An
+            # exception here that left this unset would hang every one of
+            # them for the full budget.
+            self._gone.set()
 
 
 def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
@@ -505,13 +560,18 @@ def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
 class _SupervisorThatYieldsTheGpu(CaptureWorkerSupervisor):
     """The supervisor, plus one line: a capture ends the background chore.
 
-    THE TWO FUNNELS, AND WHY THEY ARE THE RIGHT ONES. Everything that
-    begins following a capture passes through `capture_opened` (a
-    `stream_start` minted a capture id) or `attach` (a cartridge session
-    started against a capture that was already open). Nothing else starts a
-    follower, so hooking both means a walk cannot begin while
-    `scripts/world_finish_pending.py` is holding the GPU and a world's
-    writer lock.
+    THE TWO CAPTURE FUNNELS. Everything that begins following a capture
+    passes through `capture_opened` (a `stream_start` minted a capture id)
+    or `attach` (a cartridge session started against a capture that was
+    already open). Nothing else starts a follower, so hooking both means a
+    walk cannot begin while `scripts/world_finish_pending.py` is holding the
+    GPU and a world's writer lock.
+
+    They are not the whole story, and the part they miss is not exotic: a
+    Tower with no `TOWER_CAPTURE_ROOT` mints no capture id at all, so
+    neither fires. `tower/routes/ws.py` covers that at `stream_start`, which
+    is the event that is really being guarded against -- a phone sending
+    frames. See `_BackgroundChore`.
 
     It is a subclass rather than a callback threaded through
     `capture_workers.py` on purpose: that module is deliberately
@@ -798,11 +858,12 @@ def _log_effective_configuration(
             logger.info(
                 "[Tower][Config] photographic work INTERRUPTED by an earlier "
                 "Tower will be finished once, now, in a child process "
-                "(scripts/world_finish_pending.py), one world at a time. A "
-                "session with no stage record -- every world built before "
-                "2026-09-22 -- is never selected. It is stopped the moment a "
-                "capture opens. TOWER_WORLD_FINISH_PENDING=false switches it "
-                "off."
+                "(scripts/world_finish_pending.py), one world at a time. Only "
+                "a session whose own stage record or surface status.json says "
+                "it was interrupted is selected -- a world nothing ever tried "
+                "to make a picture of is never touched. It is stopped the "
+                "moment a stream or a capture opens. "
+                "TOWER_WORLD_FINISH_PENDING=false switches it off."
             )
         elif not settings.world_finish_pending:
             logger.warning(

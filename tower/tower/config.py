@@ -566,13 +566,19 @@ class Settings:
     # reconciled anything at startup. On 2026-09-22 a Tower was shut down eight
     # minutes into a build and the next start recovered nothing.
     #
-    # ON is safe here in a way it would not be for a general rebuild, because
-    # of what `scripts/world_finish_pending.py` counts as owed: a session with
-    # NO stage record is never selected, and that is every world built before
-    # 2026-09-22 -- 165 of them on this machine. Only a world a Tower watched
-    # being interrupted can qualify, so switching this on cannot discover a
-    # backlog. Off is for an operator who wants the GPU to belong to nothing
-    # they did not start themselves.
+    # ON is safe here in a way it would not be for a general rebuild, and the
+    # reason is what `scripts/world_finish_pending.py` counts as owed. It takes
+    # two kinds of evidence and NEITHER can discover a backlog: an interrupted
+    # `Session.stages` entry, which only a Tower from 2026-09-22 onwards
+    # writes; or, where there is no stage record at all, a
+    # `<world>/surface/<session>/status.json` that says `stopped` or `running`
+    # under a dead pid -- a file `surface_pipeline` alone writes, so a Tower
+    # that never ran a photographic stage cannot have left one. Measured on
+    # this machine: 166 worlds, ONE with a `surface/` directory, and it is the
+    # interrupted one. A dry run over the real root selects exactly it.
+    #
+    # Off is for an operator who wants the GPU to belong to nothing they did
+    # not start themselves.
     world_finish_pending: bool = True
 
 
