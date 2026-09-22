@@ -1180,3 +1180,74 @@ The 7 gated poses (1.4%) were gated by the *pre-fix* rule; this walk did
 not trip the dwell problem. The detachment fix is still required — this is
 one walk, not a proof.
 
+## The finisher, after review
+
+Two HIGH findings, both repaired, and the second one only existed because
+the first was hiding it.
+
+**It recovered nothing.** Measured against the real root: 70 sessions, 0
+owed, because all three sessions that reach `finalization: complete` were
+excluded by the no-stage-record clause — including the world whose
+`surface/<sid>/status.json` reads `stopped` at the depth stage, written 82
+seconds after finalization. The 02:37 incident itself.
+
+The repair is the reviewer's argument, which is better than the original
+design's: `status.json` is written by `surface_pipeline` and by nothing
+else, so reading it gives the **same no-backlog guarantee from a different
+file**. It is not a relaxation of the clause; it is the clause restated.
+The record still wins wherever there is one, because it is written last and
+a completed walk leaves a coarse status behind that would otherwise
+resurrect finished worlds.
+
+```
+BEFORE   70 sessions seen, 0 owed    {never-stopped 29, not-finalized 38, no-stage-record 3}
+AFTER    70 sessions seen, 1 owed    {never-stopped 29, not-finalized 38, no-stage-record 2}
+         2f44716237544569b5f2faf782d9f877 / cb30880107eb4e4bae7c53f821399549
+         code: owed-by-status
+```
+
+Exactly one world, and it is the incident. One world in 166 has a
+`surface/` directory, and it is that one.
+
+**And once it stopped being a no-op, an ordinary boot would have destroyed
+a world.** The attempt is counted before the work; a capture opening kills
+the finisher inside its five-second grace while it is in a GPU pass; three
+of those retire the stage to `failed`, which is terminal. "Boot the Tower,
+then go for a walk" is the expected event on every boot, so the feature
+would have permanently stranded precisely the world it exists to save.
+
+The rule now is that **an attempt is spent only when the tool was left
+alone and still did not finish.** That maps onto a fact already on disk —
+was a stop asked for? — and it is the distinction the bound was always
+trying to draw: a sleep, an OOM kill or a driver crash leaves no stop
+request, which is exactly what makes them the failure it was written for.
+The forgiveness runs on the stop watcher's own thread, milliseconds after
+the pipe closes, because nothing scheduled after the stage returns would
+ever run — there is no `finally` on a `TerminateProcess`.
+
+Three more, all measured:
+
+- **Two concurrent stops left the child alive.** The blocking wait sat
+  outside the lock and only the first caller held the process, so a builder
+  could be spawned against a live finisher still holding the GPU. Measured
+  before: `second returned 0.00 s, child ALIVE`. After: `second 0.45 s,
+  child gone`.
+- **A stream with no capture recorder fired neither stop funnel** — a
+  supported configuration (`TOWER_WORLD_ROOT` set, `TOWER_CAPTURE_ROOT`
+  unset) in which the chore held the card for the life of the stream.
+  `ws.py` now yields on `stream_start` itself, off the event loop.
+- `_retire` wrote the session record without the world lock; it now takes
+  the lock and re-asks the predicate underneath it.
+
+46 tests, up from 30. `-k world`: **1856 passed, 18 skipped**.
+
+### Residual, stated plainly
+
+Forgiveness makes one loop unbounded by design: a user who starts a walk on
+every single boot gets a chore that never finishes and is never retired. It
+is self-limiting — it only happens while the machine is in use — and it was
+chosen deliberately over retiring recoverable worlds. And an
+appearance-only interruption still re-runs the whole surface, because
+`surfacify(force=True)` is what regenerates the depth work the appearance
+reads: six to sixteen minutes where forty seconds was owed.
+
