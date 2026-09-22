@@ -843,3 +843,83 @@ these reviews, and `surface.py` was briefly un-importable. **Run the
 physical test from a clean checkout of the merged commit, never from a
 worktree with work in flight.**
 
+## The surface robustness fix, measured
+
+The mechanism turned out to be subtler than the extent statistics
+suggested, and worth recording precisely because the obvious fix would have
+been the wrong one. **The poison is per-frame, and it is not the point
+cloud — it is `z_sparse_max`.** `depth_bound()` clips each frame at
+`z_sparse_max × 1.5`. On the failing solve, after the existing gate:
+
+| | kept-frame `z_sparse_max` |
+|---|---|
+| camera-centre inliers (267 frames) | p50 7.7, p95 19.9, max 371 |
+| camera-centre outliers (4 frames) | **1.61e6, 1.62e6**, 171, 143 |
+
+Two frames were fitted to a sparse anchor at 1.6 million units, so their own
+far bound admitted depth out there, so their world points landed five times
+outside the keyable range. Dropping those four poses takes the fused box
+from `2.2e6` units to **519**, and the maximum block coordinate to 2,664
+against a limit of 1,048,576.
+
+Three rules, all relative to the solve's own median — never an absolute
+distance, because an absolute threshold would be this same bug in a new
+place:
+
+1. a robust pose gate at 10× the median camera radius, applied before
+   anything reads the frames, so the scene scale, the consistency field,
+   the transient masks and the fusion all see the same set;
+2. a fusion bound — inlier points unioned with every kept camera centre
+   grown by the scene-relative far bound, scaled ×2 — deliberately **not**
+   using each frame's own `z_sparse_max`, which is precisely the number a
+   stray anchor inflates;
+3. the allocation loop, which already coarsened for the block budget, now
+   coarsens for the key range too. `block_key` still refuses rather than
+   alias two cells together; it only says by how much it missed.
+
+### Results
+
+| | before | after |
+|---|---|---|
+| failing world, surface | `unavailable`, 0 faces | **`ok`, 678,396 faces** |
+| failing world, appearance | never ran | **ok**, 325 keyframes, 128 phone |
+| failing world, poses gated | — | 4 of 271 (1.48%) |
+| healthy world, poses gated | — | **0** |
+| healthy world, meshes | — | **byte-identical by SHA1** |
+| solved sessions in the store gating nothing | — | 8 of 11 |
+
+The reference world was rebuilt, compared, and then **restored
+byte-for-byte** from a verified backup.
+
+### Honest residual
+
+The recovered world is **usable but not as good as the healthy one**. Its
+appearance coverage is phone `seen1 0.9031 / seen2 0.7671` against
+`0.9841 / 0.9740`, and its surface is built at a voxel 1.48× coarser
+relative to its own scene. That is not the filter falling short: the
+engineer measured block counts at four different bound tightnesses and even
+a bound tight enough to start deleting real frames leaves that solve 2.7×
+over the block budget. Its depth is genuinely noisier — its consistency
+stage had to move the held-out cross-frame median from 0.0319 to 0.0083
+against the healthy world's 0.0223 → 0.0057. **A bad solve now yields a
+real, navigable, recognisable room instead of nothing. It does not yield
+the same room as a good solve.**
+
+### Risks carried forward
+
+- **World `9a68430a` gates 21 of 335 poses (6.3%) and puts 10.7% of its
+  points outside the bound** — well past the few-percent alarm threshold.
+  It has no surface on disk today so nothing regresses, but if that walk is
+  a genuine multi-room capture rather than a bad solve, a tenth of its
+  cloud would stop being fused. It is the world to check first the next
+  time anyone reconstructs from the canonical store.
+- **The appearance stage does not apply the pose gate.** On the recovered
+  world, 4 of its 325 selected keyframes sit beyond 10× the median camera
+  radius, the worst 655 units out. They occupy phone-tier slots and
+  contribute nothing. `surface.robust_pose_outliers` is a pure function and
+  reusable as-is; this is a cheap follow-up, deliberately not taken here
+  because it changes a selection this campaign did not otherwise touch.
+- The `×2` fusion bound is calibrated on two real worlds and a synthetic.
+  `frames_clipped_by_bound` and `frames_emptied_by_bound` are in every
+  manifest as the tripwire; on healthy worlds they read 0, and they do.
+
