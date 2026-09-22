@@ -1120,3 +1120,56 @@ This is being measured rather than assumed: a 690-keyframe walk — 1.75× the
 largest build in the project's history — is being replayed through the full
 builder path.
 
+## The scale test — 690 keyframes through the full builder path
+
+The reviewer's third-ranked failure mode was that nothing in this project
+has ever been built above ~395 frames, while the capture guidance asks for
+2.5–3× that. Measured rather than extrapolated: the 2026-09-22 01:33 walk
+(captures `27a416ae…` + `e45108bb…`, 2158 frames, 690 keyframes — **1.75×
+the largest build in the project's history**) replayed through
+`world_build_session.py` with `--solve --register --surface --appearance`.
+
+```
+SURFACE     ok    frames used/offered 493 / 621     voxel 0.02068
+            L0  1,539,495 v / 2,802,425 f / 52.1 MB
+            L1    393,705 / 600,000 / 11.9 MB
+            L2    158,837 / 222,657 /  4.6 MB   <- the phone level
+            depth 130.2  transients 300.3  consistency 19.4  fuse 20.8
+            mesh 57.2  snap 6.8  pack 70.6          = 605 s
+            outliers: 7 of 503 poses gated, 0 frames clipped, 0 emptied,
+                      key-coarsening 1.0, block-coarsening 1.25
+
+APPEARANCE  ok    quality final, imagery redacted, privacy_safe TRUE
+            591 keyframes (128 phone, 463 tower), 29.1 MB
+            coverage phone seen1 0.9665 / seen2 0.9369
+                     all   seen1 0.9995 / seen2 0.9989
+            150.8 s
+
+whole replay, staging to appearance:  17m40s
+```
+
+**It builds, and it builds well.** Four things this settles:
+
+1. **The photographic stages cost 12.6 minutes at 690 keyframes**, not the
+   19–23 the validator extrapolated. Transients — 62% of the surface cost —
+   scaled sublinearly (300 s against a predicted ~497 s) and the
+   consistency field got *cheaper* (19.4 s against 25.4 s at 385
+   keyframes). Extrapolating honestly to an 800–1000-keyframe walk gives
+   **roughly 15–20 minutes of photographic stages** plus the final solve.
+2. **The block budget holds.** `voxel_coarsened_for_key_range: 1.0` and a
+   mild 1.25 block-budget coarsening — the 12-attempt loop the reviewer
+   worried about never came near its limit at 1.75× scale.
+3. **The phone payload is bounded by design, and the bound holds.** 128
+   phone keyframes and 222,657 faces at the mobile level, essentially
+   identical to the 385-keyframe walk's 229,927. A longer walk buys the
+   selector more to choose from at the same budget; it does not grow what
+   the phone must hold.
+4. **Coverage improves with walk length**, which is the first direct
+   evidence for the capture guidance: `seen2` across all tiers is 0.9989
+   here against 0.9850 on the 385-keyframe walk, and the phone tier holds
+   at 0.9369.
+
+The 7 gated poses (1.4%) were gated by the *pre-fix* rule; this walk did
+not trip the dwell problem. The detachment fix is still required — this is
+one walk, not a proof.
+
