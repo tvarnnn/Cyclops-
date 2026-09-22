@@ -554,6 +554,27 @@ class Settings:
     # surface, and costs about 40 s of mostly-CPU work on a 400-keyframe walk.
     world_appearance: bool = True
 
+    # Finishing photographic work that was INTERRUPTED. ON, and the default is
+    # the decision.
+    #
+    # The surface and the appearance run once, in the builder child, in the six
+    # to sixteen minutes after Stop and after the world lock is released.
+    # Anything that ends that child first -- a Tower shutdown, a machine sleep,
+    # a crash, the supervisor's thirty-second stop grace -- discarded the work
+    # permanently: `scripts/world_finalize.py` rebuilds only the sparse derived
+    # tree, the serving path never writes and never spawns, and nothing
+    # reconciled anything at startup. On 2026-09-22 a Tower was shut down eight
+    # minutes into a build and the next start recovered nothing.
+    #
+    # ON is safe here in a way it would not be for a general rebuild, because
+    # of what `scripts/world_finish_pending.py` counts as owed: a session with
+    # NO stage record is never selected, and that is every world built before
+    # 2026-09-22 -- 165 of them on this machine. Only a world a Tower watched
+    # being interrupted can qualify, so switching this on cannot discover a
+    # backlog. Off is for an operator who wants the GPU to belong to nothing
+    # they did not start themselves.
+    world_finish_pending: bool = True
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -603,6 +624,7 @@ def get_settings() -> Settings:
         world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
         world_surface=_flag("TOWER_WORLD_SURFACE", default=True),
         world_appearance=_flag("TOWER_WORLD_APPEARANCE", default=True),
+        world_finish_pending=_flag("TOWER_WORLD_FINISH_PENDING", default=True),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),

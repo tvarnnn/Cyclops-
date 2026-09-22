@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -9,7 +11,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from tower.capture import DEFAULT_MAX_IDLE_POLLS, CaptureRecorder
-from tower.capture_workers import CaptureWorkerSupervisor, WorkerSpec
+from tower.capture_workers import (
+    TERMINATE_TIMEOUT_SECONDS,
+    CaptureWorkerSupervisor,
+    WorkerSpec,
+)
 from tower.cartridge_runtime import build_live_cartridges
 from tower.cartridge_session import CartridgeSession, STOP_POLICY_REQUEST
 from tower.config import KNOWN_VERIFIERS, TOWER_ROOT, Settings, get_settings
@@ -19,6 +25,12 @@ from tower.logging_config import configure_logging
 from tower.modules.base import Module
 from tower.modules.container import ModuleContainer
 from tower.modules.experimental_cv import ExperimentalCVModule
+from tower.process_ownership import (
+    assign_to_job,
+    interpreter_environment,
+    interpreter_executable,
+    terminate_tree,
+)
 from tower.results import build_hub
 from tower.results.contracts import CARTRIDGE_OBJECT_MEMORY, CARTRIDGE_WORLD_BUILDER
 from tower.results.object_memory import (
@@ -58,6 +70,17 @@ logger = logging.getLogger(__name__)
 # cartridge_blind` is what keeps that true.
 WORLD_BUILD_WORKER = "world-build-session"
 OBJECT_MEMORY_WORKER = "object-memory-session"
+# Not a capture worker. It follows no capture and belongs to no lineage; it
+# is a chore this Tower runs once at startup, before anything is streaming,
+# and abandons the moment anything is. See `_world_finish_spec`.
+WORLD_FINISH_WORKER = "world-finish-pending"
+
+# How long the finisher gets to put itself down once a capture opens. Small,
+# and deliberately much smaller than the builder's 30 s: nothing is in
+# flight that stopping would lose -- the stage record already carries the
+# `running` this run would leave behind, and the next Tower start picks it up
+# again -- while the wearer pressing Start is waiting for the GPU.
+WORLD_FINISH_STOP_GRACE_SECONDS = 5.0
 
 
 def _build_cv_module(settings: Settings, connection_count=None) -> Module:
@@ -213,6 +236,201 @@ def _world_build_spec(settings: Settings, gate=None) -> WorkerSpec | None:
     )
 
 
+def _world_finish_spec(settings: Settings) -> WorkerSpec | None:
+    """The chore that finishes photographic work a previous Tower was killed
+    during, or nothing.
+
+    THE GAP IT CLOSES. The surface and the appearance run once, in the
+    builder child, in the six to sixteen minutes after Stop and after the
+    world lock is released. Anything that ends that child first -- a Tower
+    shutdown, a machine sleep, a crash, the supervisor's thirty-second stop
+    grace -- discarded the work permanently. `scripts/world_finalize.py`
+    rebuilds only the sparse derived tree; the serving path in
+    `tower/results/world_builder*.py` performs no write and spawns no
+    process, so it never generates on demand; and nothing reconciled
+    anything at startup. On 2026-09-22 a Tower was shut down eight minutes
+    into a build and the next start recovered nothing.
+
+    AN ARGV, NOT AN IMPORT, for exactly the reason `_world_build_spec`
+    above gives at length: `test_shared_code_does_not_import_a_cartridge`
+    forbids this process from importing the cartridge, and every decision
+    about WHICH world owes work is therefore made in the child, by
+    `scripts/world_finish_pending.py`. This function decides only whether a
+    child may run at all. A Tower with nothing owed spawns a process that
+    reads some small JSON files, prints an empty report and exits.
+
+    THE SAME SETTINGS OBJECT AS THE BUILDER, and the same dependency chain.
+    A surface needs the solve it is anchored to and the appearance needs the
+    surface, so a Tower configured not to build one has nothing here to
+    finish -- refused once, here, rather than per session in the child.
+    """
+    if settings.world_root is None or not settings.world_finish_pending:
+        return None
+    # It finishes the SURFACE and the appearance. Without those, or without
+    # the solve they are anchored to, there is no photographic work for this
+    # Tower to have been interrupted during.
+    if not (settings.world_surface and settings.world_solve):
+        return None
+
+    return WorkerSpec(
+        argv=(
+            sys.executable,
+            str(TOWER_ROOT / "scripts" / "world_finish_pending.py"),
+            "--root",
+            settings.world_root,
+            # ONE WORLD PER TOWER START. Not a throughput knob: six to
+            # sixteen minutes is already a long time to hold a GPU on
+            # nobody's behalf, and a second owed world is a second start.
+            "--max-worlds",
+            "1",
+            # Whether the wearer's keyframes are shaded onto the surface,
+            # decided by the SAME setting that decides it for the builder.
+            # Passed in both directions rather than relying on the script's
+            # default, exactly as the observation producer's flags are:
+            # two defaults for one question is how a Tower comes to finish
+            # a world differently from the way it built one.
+            "--appearance" if settings.world_appearance else "--no-appearance",
+            # Mirrors `prune_depth_work=not args.densify` in the builder, so
+            # a Tower that runs the dense stage keeps the per-frame depth
+            # work a later `scripts/world_densify.py` would reuse.
+            *(("--keep-depth-work",) if settings.world_densify else ()),
+            # The half of the stop agreement that lives in the child, paired
+            # with `stop_via_stdin` below so neither can be set without the
+            # other. Closing the pipe is how a capture opening reaches a
+            # process that has no console.
+            "--stop-on-stdin-close",
+        ),
+        cwd=str(TOWER_ROOT),
+        name=WORLD_FINISH_WORKER,
+        stop_via_stdin=True,
+        stop_grace_seconds=WORLD_FINISH_STOP_GRACE_SECONDS,
+    )
+
+
+class _BackgroundChore:
+    """One child process that belongs to no capture, and yields to every one.
+
+    `CaptureWorkerSupervisor` is the right home for a worker that follows a
+    capture, and the wrong one for this: there is no capture id, no lineage
+    to chain into, and nothing for `/health` to report per capture. What this
+    shares with it is the process discipline, which is imported rather than
+    re-derived -- one process rather than a Windows launcher pair, a job
+    object assigned immediately so grandchildren die with the parent, its own
+    process group so a Ctrl-C in the Tower's console does not shoot it, and a
+    stdin pipe whose close is the stop request.
+
+    STARTED ONCE, AT STARTUP, AND NEVER RESTARTED. That is the safety gate,
+    and it is a structural one rather than a predicate that has to be right:
+    at Tower start nothing is streaming and every cartridge session is
+    stopped (see `app.state.cartridge_sessions`, which is deliberately not
+    persisted). The first sign of a capture stops this for the lifetime of
+    the process, so a walk can never find it running and the GPU it wanted
+    is already free. Work it did not finish is not lost -- it is still
+    recorded as interrupted, and the next Tower start is the next attempt.
+    """
+
+    def __init__(self, spec: WorkerSpec) -> None:
+        self._spec = spec
+        self._lock = threading.Lock()
+        self._process = None
+        self._job = None
+        self._retired = False
+
+    @property
+    def name(self) -> str:
+        return self._spec.name
+
+    def start(self) -> bool:
+        """Spawn it, unless it has already run or already yielded."""
+        with self._lock:
+            if self._retired or self._process is not None:
+                return False
+            argv = self._spec.argv
+            env = None
+            if argv and argv[0] == sys.executable:
+                # ONE PROCESS, NOT A LAUNCHER PAIR -- the same rewrite
+                # `capture_workers._start` documents. On a Windows venv the
+                # pid held here would otherwise be a launcher's, and
+                # terminating it would leave every grandchild alive.
+                argv = (interpreter_executable(), *argv[1:])
+                env = interpreter_environment()
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    cwd=self._spec.cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "[Tower][Worker] could not start the %s chore; any world "
+                    "whose photographic stages were interrupted stays sparse "
+                    "until the next start. argv: %s",
+                    self._spec.name,
+                    " ".join(argv),
+                )
+                self._retired = True
+                return False
+            self._process = process
+            self._job = assign_to_job(process)
+            logger.info(
+                "[Tower][Worker] started the %s chore, pid %s: %s",
+                self._spec.name,
+                process.pid,
+                " ".join(argv),
+            )
+            return True
+
+    def stop(self, reason: str, *, grace_seconds: float | None = None) -> None:
+        """Ask it to stop, then make sure it is gone. Idempotent.
+
+        `_retired` is set whether or not anything was running, so a stop that
+        arrives before the start -- a capture opening while the Tower is
+        still coming up -- prevents the start rather than racing it.
+        """
+        with self._lock:
+            already = self._retired
+            self._retired = True
+            process = self._process
+            self._process = None
+            job = self._job
+            self._job = None
+        if process is None:
+            if not already:
+                logger.debug(
+                    "[Tower][Worker] the %s chore will not start: %s",
+                    self._spec.name, reason,
+                )
+            return
+        if process.poll() is not None:
+            return
+        grace = (
+            self._spec.stop_grace_seconds if grace_seconds is None else grace_seconds
+        )
+        logger.info(
+            "[Tower][Worker] stopping the %s chore (pid %s): %s",
+            self._spec.name, process.pid, reason,
+        )
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except Exception:  # noqa: BLE001 -- a closed pipe is the request
+            pass
+        try:
+            process.wait(timeout=grace)
+            return
+        except Exception:  # noqa: BLE001 -- it did not go on its own
+            pass
+        # THE TREE, NOT THE PID. The surface stage runs a depth network in
+        # this child's own process, but the appearance and the solve spawn
+        # grandchildren, and a plain terminate() leaves those holding the GPU
+        # the wearer just asked for.
+        terminate_tree(process, job=job, timeout=TERMINATE_TIMEOUT_SECONDS)
+
+
 def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
     """The producer that remembers objects, and the gate that permits it.
 
@@ -284,7 +502,42 @@ def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
     )
 
 
-def _build_capture_worker_supervisor(settings: Settings, gates: dict):
+class _SupervisorThatYieldsTheGpu(CaptureWorkerSupervisor):
+    """The supervisor, plus one line: a capture ends the background chore.
+
+    THE TWO FUNNELS, AND WHY THEY ARE THE RIGHT ONES. Everything that
+    begins following a capture passes through `capture_opened` (a
+    `stream_start` minted a capture id) or `attach` (a cartridge session
+    started against a capture that was already open). Nothing else starts a
+    follower, so hooking both means a walk cannot begin while
+    `scripts/world_finish_pending.py` is holding the GPU and a world's
+    writer lock.
+
+    It is a subclass rather than a callback threaded through
+    `capture_workers.py` on purpose: that module is deliberately
+    cartridge-blind and knows only how to run an argv when a capture opens
+    (`test_the_capture_worker_supervisor_is_cartridge_blind`). Teaching it
+    about a chore that is not a capture worker would be the first thing it
+    knows that is not about captures. The knowledge belongs at the wiring
+    point, which is here.
+    """
+
+    def __init__(self, specs, *, chore) -> None:
+        super().__init__(specs)
+        self._chore = chore
+
+    def capture_opened(self, capture_id: str, capture_dir, *, continues=None) -> None:
+        self._chore.stop(f"a capture opened ({capture_id})")
+        return super().capture_opened(capture_id, capture_dir, continues=continues)
+
+    def attach(self, name: str, capture_id: str, capture_dir) -> bool:
+        self._chore.stop(f"the {name} worker attached to capture {capture_id}")
+        return super().attach(name, capture_id, capture_dir)
+
+
+def _build_capture_worker_supervisor(
+    settings: Settings, gates: dict, *, yields_the_gpu_to=None
+):
     """Decide what, if anything, follows a capture.
 
     `gates` maps a worker name to the predicate that says whether it may
@@ -293,6 +546,9 @@ def _build_capture_worker_supervisor(settings: Settings, gates: dict):
     the two are mutually referential, and the wiring point resolves that
     by handing over a closure that looks the session up when asked
     instead of capturing it at construction.
+
+    `yields_the_gpu_to` is the background chore a capture must displace, or
+    None when this Tower runs none. See `_SupervisorThatYieldsTheGpu`.
     """
     specs = [
         spec
@@ -302,7 +558,9 @@ def _build_capture_worker_supervisor(settings: Settings, gates: dict):
         )
         if spec is not None
     ]
-    return CaptureWorkerSupervisor(specs)
+    if yields_the_gpu_to is None:
+        return CaptureWorkerSupervisor(specs)
+    return _SupervisorThatYieldsTheGpu(specs, chore=yields_the_gpu_to)
 
 
 def _recorded_classes(settings: Settings) -> tuple[str, ...]:
@@ -535,6 +793,24 @@ def _log_effective_configuration(
             "recorded but NOTHING will build a world from them"
         )
 
+    if settings.world_root is not None:
+        if _world_finish_spec(settings) is not None:
+            logger.info(
+                "[Tower][Config] photographic work INTERRUPTED by an earlier "
+                "Tower will be finished once, now, in a child process "
+                "(scripts/world_finish_pending.py), one world at a time. A "
+                "session with no stage record -- every world built before "
+                "2026-09-22 -- is never selected. It is stopped the moment a "
+                "capture opens. TOWER_WORLD_FINISH_PENDING=false switches it "
+                "off."
+            )
+        elif not settings.world_finish_pending:
+            logger.warning(
+                "[Tower][Config] TOWER_WORLD_FINISH_PENDING is off: a world "
+                "whose surface or appearance was interrupted stays sparse "
+                "until somebody runs scripts/world_finish_pending.py by hand"
+            )
+
     if OBJECT_MEMORY_WORKER in attached:
         logger.info(
             "[Tower][Config] an object-memory producer will be attached to "
@@ -546,8 +822,22 @@ def _log_effective_configuration(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # BEFORE ANYTHING IS STREAMING, which is the whole safety argument for
+    # running it automatically. A Tower that has just come up has no open
+    # capture and every cartridge session stopped, so this cannot be
+    # competing with a walk; `_SupervisorThatYieldsTheGpu` ends it the
+    # instant one begins. Off-thread because spawning a process is a
+    # blocking call and this is the event loop.
+    chore = getattr(app.state, "world_finish_chore", None)
+    if chore is not None:
+        await asyncio.to_thread(chore.start)
     yield
-    # The result hub first: it holds a polling task, and stopping it
+    # The chore first, and before the workers: it is the least important
+    # process this Tower owns and the most likely to be holding a world's
+    # writer lock, and everything below wants that lock released.
+    if chore is not None:
+        await asyncio.to_thread(chore.stop, "the Tower is shutting down")
+    # The result hub next: it holds a polling task, and stopping it
     # before the module container means no snapshot can be built against
     # an app that is half torn down. Guarded with getattr because most of
     # this repo's tests construct the app without running lifespan at all
@@ -656,12 +946,23 @@ def create_app() -> FastAPI:
         session = cartridge_sessions.get(CARTRIDGE_WORLD_BUILDER)
         return session is not None and session.is_active()
 
+    # CONSTRUCTED HERE, STARTED IN `lifespan`, and the split is the point.
+    # Most of this repo's tests build the app with `TestClient(create_app())`
+    # and never run ASGI lifespan (see the comment on `load_and_start` below),
+    # so a chore spawned at construction would spawn a subprocess in every one
+    # of them. Started from lifespan, it runs when a Tower actually runs.
+    finish_spec = _world_finish_spec(settings)
+    world_finish_chore = (
+        None if finish_spec is None else _BackgroundChore(finish_spec)
+    )
+    app.state.world_finish_chore = world_finish_chore
     app.state.capture_workers = _build_capture_worker_supervisor(
         settings,
         {
             OBJECT_MEMORY_WORKER: _object_memory_gate,
             WORLD_BUILD_WORKER: _world_build_gate,
         },
+        yields_the_gpu_to=world_finish_chore,
     )
     cartridge_sessions[CARTRIDGE_OBJECT_MEMORY] = CartridgeSession(
         cartridge=CARTRIDGE_OBJECT_MEMORY,
