@@ -685,3 +685,71 @@ images, faces redacted, placed on the reconstructed room."* One finger
 orbits, two pinch and pan. Grey haze is where no kept image looked; black is
 where no geometry was measured. Both are honest — nothing is invented.
 
+## The live builder path produces a photographic world — proven
+
+The same capture was replayed through `world_build_session.py` a second
+time. `final_surface_stages` ran to completion and both artifacts landed:
+
+```
+SURFACE     wb-surface-mesh/1       frames used/offered 270/379  voxel 0.01837
+            L0 1,852,803 v / 3,508,516 f   L2 (phone) 154,980 / 226,726
+            depth 74.8  transients 153.8  consistency 21.5  fuse 9.9
+            mesh 39.7  snap 11.1  pack 71.4      = 382 s
+APPEARANCE  wb-appearance-keyframes/1  quality final
+            imagery_source redacted   privacy_safe TRUE
+            353 keyframes, phone coverage seen1 0.9814 / seen2 0.9738
+            total 90.7 s
+```
+
+This is the proof that was missing: not an offline CLI run against a
+pre-existing solve, but the actual builder the Tower spawns, following a
+capture, solving it, finalizing it, and then building the photographic
+representation of its own accord.
+
+**It also dates the outlier bug's frequency.** The same capture, replayed
+twice through the same code: run 1 failed at the surface with the keyable
+range refusal, run 2 succeeded. One failure in two live-path replays, and
+one extreme solve in eleven historical ones. That is not a rare corner —
+it is a coin the next physical test would be asked to flip.
+
+## Adversarial review round 1, and what it found
+
+An independent reviewer who wrote none of the code attacked the two
+committed fixes. It confirmed a great deal — the probe genuinely cannot
+raise, performance is noise (one lock probe and three failing `stat()`s at
+2 Hz), session isolation is correct, the atomic publish handles the
+`os.replace` race, backward compatibility is real, nothing serves `stages`
+to the phone, the `STATE_*` move breaks no importer and introduces no
+cycle, and the finalization ordering was genuinely untouched.
+
+It also found a **blocker**, which is now being fixed:
+
+**H1.** The new lifecycle arm sits below the
+`end_reason in ("error", "interrupted")` arms, so it only covers the
+`stop` path. But `world_builder_library.py:236-246` documents the ordinary
+case in its own words: *"Leaving the World Builder screen sends
+`session/stop` while the capture is open, so the record reads
+`end_reason: interrupted` and then finalises `complete`, solved, with
+geometry."* A walk that trips the 40-minute recorder bound also ends
+`interrupted` by design. Measured on the committed tree, that record shape
+with a genuinely running surface still reports `model_state: finalized` —
+the word iOS renders as **"Saved"**. The ninety-second lie, still fully
+reachable on the most likely retest path.
+
+The reviewer's diagnosis of the cause is the useful part: the placement
+comment reasons that "how a CAPTURE ended is a fact about the past that a
+running surface does not change", which is correct for the state word and
+wrong for `build_in_progress`, a present-tense claim about a live process.
+The branch returns both, which conflates them.
+
+**M2**, fixed here in Swift: the installed app drew a hard-coded sentence,
+*"A live process holds this world's writer lock…"*, under exactly the state
+where the Tower had carefully declined to claim that. The app printed the
+untruth the commit existed to refuse. One sentence, true on both paths.
+
+**M3, M5, M6, M4, L10** — the picker/panel divergence, an unbounded stale
+`running` status that could pin "Improving" forever through a recycled pid,
+a dense import failure silently disabling the whole probe, an overclaimed
+test name, and two tests that pass with the fix reverted — all handed back
+for repair.
+
