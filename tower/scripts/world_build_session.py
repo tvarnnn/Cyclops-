@@ -107,6 +107,7 @@ from tower.world_builder.records import (  # noqa: E402
     STAGE_APPEARANCE,
     STAGE_DENSE,
     STAGE_STATE_FAILED,
+    STAGE_STATE_OK,
     STAGE_STATE_RUNNING,
     STAGE_STATE_STOPPED,
     STAGE_STATE_UNAVAILABLE,
@@ -1375,6 +1376,17 @@ def register_session(store: WorldStore, world_id: str, session_id: str) -> dict:
     }
 
 
+def _terminal_detail(result):
+    """A stage result's `detail`, but only when it explains a non-`ok` state.
+
+    The surface pipeline puts its whole report in `detail` on success. That
+    belongs in the stage's own manifest, where it already is, and not on the
+    session record that the world listing reads for every session of every
+    world.
+    """
+    return None if getattr(result, "state", None) == STAGE_STATE_OK else result.detail
+
+
 def _record_raise(record, stage: str) -> None:
     """Name the exception currently being handled on the session record.
 
@@ -1475,7 +1487,14 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
             record(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
                    detail="the surface stage raised; there was nothing to shade")
         raise
-    record(STAGE_SURFACE, state=surface_result.state, detail=surface_result.detail)
+    # `detail` on the session record is for a reader asking WHY, and on a
+    # successful build the pipeline's `detail` is its entire report -- about
+    # ten kilobytes of JSON-inside-a-string, already written verbatim to
+    # `surface/<session>/manifest.json`. Copying it here would put it in every
+    # `session.json`, which the world listing parses for every session of
+    # every world on every poll. Keep it for the states a reader needs it for.
+    record(STAGE_SURFACE, state=surface_result.state,
+           detail=_terminal_detail(surface_result))
     report["surface"] = {"attempted": True, **surface_result.as_dict()}
     appearance_interrupted = False
     appearance_built = not appearance
@@ -1510,7 +1529,7 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                 _record_raise(record, STAGE_APPEARANCE)
                 raise
             record(STAGE_APPEARANCE, state=appearance_result.state,
-                   detail=appearance_result.detail)
+                   detail=_terminal_detail(appearance_result))
             report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
             appearance_interrupted = appearance_result.state == "stopped"
             appearance_built = appearance_result.state == "ok"
