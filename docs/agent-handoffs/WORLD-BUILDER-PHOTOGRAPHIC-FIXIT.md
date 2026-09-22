@@ -8,7 +8,7 @@ reconstruction. Geometry is scaffolding; it is not what the wearer looks at.**
 | Continues | `docs/agent-handoffs/WORLD-BUILDER-RECONSTRUCTION-FINAL.md`, whose READY verdict was **rejected** |
 | Branch | `world-builder/reconstruction-fixit-v1` |
 | Starting SHA | `f383015` (the rejected surface candidate) |
-| Final SHA | `__FINAL_SHA__` |
+| Final SHA | the commit that sets this line; the campaign's last content commit is `c8d8456390f2` |
 | Worktree | `C:\Users\tvllo\Projects\Glasses-worktrees\wb-fixit` |
 | Canonical dataset | world `b2a75ab40d2d415d8d6ef5e4d5f0fb3d`, session `a8c6817e14a74e3c977fccfcdacad595` |
 | Scratch (local only, not in git) | `C:\Users\tvllo\Projects\Glasses-scratch\wb-final-recon\fixit\` |
