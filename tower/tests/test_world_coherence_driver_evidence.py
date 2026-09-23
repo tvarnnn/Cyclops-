@@ -99,3 +99,26 @@ def test_run_variant_passes_the_inputs_and_records_them():
     cfg = D.VariantConfig.from_json({"metric_cache": "x", "gate": "rigid", "gate_params": {"rule": "evidence"}})
     assert cfg.metric_cache == "x" and not cfg.is_product_recipe()
     assert D.VariantConfig().metric_cache is None
+
+
+def test_each_seed_is_gated_on_its_own(tmp_path, monkeypatch):
+    """CAND scored seeds/<s>/variant, which is exported BEFORE the gate, as if it were gated. The
+    per-seed gated export must gate each seed alone, with that seed's own metric scale."""
+    links = ladder_links(cross=[(k, 30 + k, 50) for k in range(5)])
+    db = _db(tmp_path / "database.db", links)
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    gp = G.GateParams(rule="evidence", min_obs=5)
+    seen = []
+
+    def fake_tri(model, *a):
+        seen.append(model.seed)
+        return metric(4.0, 4.0 * 1.6 if model.seed == 1 else 4.0), {}
+
+    monkeypatch.setattr(D, "metric_log_tri", fake_tri)
+    out = D.gate_each_seed(gp, models, {"images": []}, tmp_path, db, tmp_path)
+    assert [g["seed"] for g in out] == [0, 1, 2] and seen == [0, 1, 2]
+    groups = {g["seed"]: len(set(g["report"]["labels"].values())) for g in out}
+    assert groups == {0: 1, 1: 2, 2: 1}          # only the seed whose own scale steps is split
+    assert all(set(g["report"]["labels"]) == set(m.names) for g, m in zip(out, models))
+    src = open(D.__file__, encoding="utf-8").read()
+    assert '"variant_gated"' in src and "BEFORE any gate" in src

@@ -979,6 +979,21 @@ def gate_inputs(gp: gate_mod.GateParams, models: list, staging: dict, world_dir,
              "database": str(database_path), "metric_log": minfo})
 
 
+def gate_each_seed(gp: gate_mod.GateParams, models: list, staging: dict, world_dir, database_path,
+                   metric_cache) -> list[dict]:
+    """The gate applied to every seed ALONE: the product path (one seeded solve, then the gate).
+
+    The ensemble gate decides only the reference seed's labels, and `seeds/<s>/variant` is exported
+    before any gate -- so seed statistics of a gated arm need this. With one model the seed-spread
+    test has nothing to compare and passes, which is the rule without the stability test."""
+    out = []
+    for m in models:
+        extra, info = gate_inputs(gp, [m], staging, world_dir, database_path, metric_cache)
+        report = gate_mod.apply_rigid_gate([m], gp, **extra)
+        out.append({"seed": m.seed, "report": report, "inputs": info})
+    return out
+
+
 def run_variant(world_dir, captures_root, out_dir, config: VariantConfig, *, cache_root=None,
                 regions_dir=None, log=print) -> dict:
     t_start = time.perf_counter()
@@ -1082,6 +1097,19 @@ def run_variant(world_dir, captures_root, out_dir, config: VariantConfig, *, cac
         (out_dir / "gate.json").write_text(json.dumps(gate_mod._json_clean(
             dict({k: v for k, v in gate_report.items() if k != "labels"}, inputs=gate_inputs_info)),
             indent=1), encoding="utf-8")
+        # per-seed GATED exports next to the pre-gate ones (seeds/<s>/variant_gated)
+        for g in gate_each_seed(gp, models, staging, world_dir, db_cache / "database.db", metric_cache):
+            m = next(mm for mm in models if mm.seed == g["seed"])
+            d = out_dir / "seeds" / str(m.seed)
+            info = export_variant(m, g["report"]["labels"], staging, world, d / "variant_gated", config,
+                                  name=f"{config.name}-s{m.seed}-gated",
+                                  meta=dict(base_meta, seed=m.seed, mapping=m.meta, gated="this seed alone"))
+            (d / "gate.json").write_text(json.dumps(gate_mod._json_clean(
+                dict({k: v for k, v in g["report"].items() if k != "labels"}, inputs=g["inputs"])),
+                indent=1), encoding="utf-8")
+            next(r for r in seeds_report["per_seed"] if r["seed"] == m.seed)["export_gated"] = info
+    seeds_report["exports"] = ("seeds/<s>/variant: this seed BEFORE any gate; seeds/<s>/variant_gated: the gate "
+                               "applied to this seed alone; <out>/variant: the reference seed under the ensemble gate")
     timings["gate_s"] = round(time.perf_counter() - t, 3)
 
     ref = models[0]
