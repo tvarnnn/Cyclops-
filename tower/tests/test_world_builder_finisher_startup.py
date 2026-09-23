@@ -41,7 +41,6 @@ deadlock is actually formed, and refused, on a Windows host. The gated
 before it ever arms its watcher; it proves the process exits, not that the
 deadlock cannot form.
 
-
 The ordering tests below need no GPU and no weights: the defect is the ORDER
 of two calls, and a fake for each records when it happened. The real
 reproduction is gated at the bottom, because forming (and refusing to form)
@@ -122,13 +121,22 @@ class TestTheWarmIsSharedAndHonest:
         assert "cv2" in WORLD_BUILDER_MODULES
 
 
-class TestTheFinisherWarmsBeforeItArms:
+class TestTheFinisherWarmsAfterItCounts:
     """`scripts/world_finish_pending.py`: the process that actually hung.
 
-    The warm now happens only when there is work, which is why these tests
-    have to MAKE some. See `TestTheFinisherDoesNotWarmForNothing` below for
-    the other half of that rule -- the two together are the whole contract:
-    warm before arming, and only when it will be used.
+    CHANGED ON 2026-09-23, and the reason is the point. The warm used to run
+    in `main`, BEFORE the watcher was armed and before anything was counted,
+    on the theory that the ordering was what kept the deadlock away. The
+    deadlock is now removed where it lived (`tower/stdin_stop.py`), and a
+    review found what the old placement cost: the warm is native imports and
+    a CUDA attach -- the very class of work that hung -- and a hang THERE came
+    before `record_attempt`, so the Tower could kill it as a stall but the
+    ledger never counted it. Retried for ever; never retired.
+
+    So the contract is now: the watcher is armed whenever there is work, and
+    the warm happens inside `finish`, AFTER the attempt is counted and before
+    the stage. `TestTheFinisherDoesNotWarmForNothing` below is the other half:
+    still no warm at all when nothing is owed.
     """
 
     @staticmethod
@@ -150,46 +158,66 @@ class TestTheFinisherWarmsBeforeItArms:
             stage="surface",
         )
         monkeypatch.setattr(module, "survey", lambda *a, **k: [verdict])
-        # The stage itself is not what is under test, and running it would
-        # need a GPU and a world.
         monkeypatch.setattr(
-            module, "finish", lambda *a, **k: {"finished": True}
+            module, "finish",
+            lambda *a, **k: order.append("finish") or {"finished": True},
         )
         return order
 
-    def test_prewarm_runs_before_the_stdin_watcher_is_armed(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_watcher_is_armed_when_there_is_work(self, tmp_path, monkeypatch):
         module = _load_script("world_finish_pending.py")
         order = self._armed(module, monkeypatch, owed=True)
-
         root = tmp_path / "world_builder"
         (root / "worlds").mkdir(parents=True)
         code = module.main(
             ["--root", str(root), "--stop-on-stdin-close", "--format", "json"]
         )
-
         assert code == 0
-        assert order == ["prewarm", ("install", True)], order
+        # No warm in `main` any more: it moved into `finish`.
+        assert order == [("install", True), "finish"], order
 
-    def test_the_warm_happens_even_without_the_stdin_flag(
+    def test_the_watcher_is_armed_even_without_the_stdin_flag(
         self, tmp_path, monkeypatch
     ):
-        """A hand-run finisher gets the same ordering.
-
-        `--stop-on-stdin-close` is the Tower's flag; a person running this
-        by hand after a failed walk does not pass it. The warm is not
-        conditional on it, because `install()` also arms signal handlers and
-        because a rule with an exception is a rule that drifts.
-        """
+        """`install()` also arms the signal handlers; a hand-run gets them."""
         module = _load_script("world_finish_pending.py")
         order = self._armed(module, monkeypatch, owed=True)
         root = tmp_path / "world_builder"
         (root / "worlds").mkdir(parents=True)
-
         module.main(["--root", str(root), "--format", "json"])
+        assert order == [("install", False), "finish"], order
 
-        assert order == ["prewarm", ("install", False)], order
+    def test_the_warm_happens_after_the_attempt_is_counted(
+        self, tmp_path, monkeypatch
+    ):
+        """A hang in the warm must be a COUNTED attempt, so the bound reaches it."""
+        from tower.world_builder.records import World
+        from tower.world_builder.store import WorldStore
+
+        module = _load_script("world_finish_pending.py")
+        store = WorldStore(tmp_path)
+        store.write_world(
+            World(world_id="w", created_at=1.0, updated_at=2.0, session_ids=("s",))
+        )
+        order = []
+        monkeypatch.setattr(
+            module, "record_attempt",
+            lambda *a, **k: order.append("attempt") or 1,
+        )
+        monkeypatch.setattr(
+            module, "prewarm_world_builder", lambda: order.append("prewarm")
+        )
+        monkeypatch.setattr(
+            module, "final_surface_stages",
+            lambda *a, **k: order.append("stages") or {},
+        )
+        verdict = module.Verdict("w", "s", True, "owed", code="owed", stage="surface")
+        report = module.finish(
+            store, verdict, appearance=True, prune_depth_work=True,
+            stop_request=module.StopRequest(),
+        )
+        assert report["finished"] is True, report
+        assert order == ["attempt", "prewarm", "stages"], order
 
 
 class TestTheFinisherDoesNotWarmForNothing:

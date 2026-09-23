@@ -22,7 +22,31 @@ def health(request: Request) -> dict:
         "capture": _capture_state(request.app),
         "capture_workers": _worker_state(request.app),
         "cartridge_sessions": _session_state(request.app),
+        "background_chore": _chore_state(request.app),
     }
+
+
+def _chore_state(app) -> dict | None:
+    """What the photographic finisher is doing, from another machine.
+
+    ADDED AFTER A 95-MINUTE STALL THAT NOTHING COULD SEE. On 2026-09-22 the
+    phone read "Finishing" for over an hour while the finisher sat at 0% CPU,
+    and the only way to learn that was a remote shell and py-spy. `running`
+    with `seconds_since_progress` climbing is that shape; `owed` with
+    `next_run_not_before_seconds` says when it will be tried again; `last`
+    says how the previous run ended -- including `stalled`.
+
+    None when this Tower runs no chore. Never raises.
+    """
+    chore = getattr(app.state, "world_finish_chore", None)
+    snapshot = getattr(chore, "snapshot", None)
+    if snapshot is None:
+        return None
+    try:
+        return snapshot()
+    except Exception:
+        logger.exception("[Tower][Health] could not read the background chore")
+        return {"error": "unavailable"}
 
 
 def _session_state(app) -> dict | None:

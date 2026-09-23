@@ -71,21 +71,61 @@ logger = logging.getLogger(__name__)
 WORLD_BUILD_WORKER = "world-build-session"
 OBJECT_MEMORY_WORKER = "object-memory-session"
 # Not a capture worker. It follows no capture and belongs to no lineage; it
-# is a chore this Tower runs once at startup, before anything is streaming,
-# and abandons the moment anything is. See `_world_finish_spec`.
+# is a chore this Tower runs while nothing is streaming and no capture worker
+# is alive, and abandons the moment anything is. See `_world_finish_spec` and
+# `_BackgroundChore`.
 WORLD_FINISH_WORKER = "world-finish-pending"
 
 # How long the finisher gets to put itself down once a capture opens. Small,
 # and deliberately much smaller than the builder's 30 s: nothing is in
 # flight that stopping would lose -- the stage record already carries the
-# `running` this run would leave behind, and the next Tower start picks it up
-# again -- while the wearer pressing Start is waiting for the GPU.
+# `running` this run would leave behind, and the chore's next run -- at the
+# next idle moment -- picks it up again -- while the wearer pressing Start is
+# waiting for the GPU.
 WORLD_FINISH_STOP_GRACE_SECONDS = 5.0
 
 # How long a caller that did NOT win the stop waits for the one that did.
 # The grace, the terminate timeout, and a second of slack: the bound on what
 # the winning caller can actually cost, not a guess.
 _STOP_HANDSHAKE_SECONDS = WORLD_FINISH_STOP_GRACE_SECONDS + TERMINATE_TIMEOUT_SECONDS + 1.0
+
+# HOW THE CHORE IS WATCHED, AND WHEN IT RUNS AGAIN. See `_BackgroundChore`.
+#
+# How often its thread looks at the child and at the Tower. A tick is a
+# `poll()`, one psutil read of the child's tree and, when nothing is running,
+# one look at the supervisor.
+CHORE_TICK_SECONDS = 15.0
+# How long the Tower must have been left alone -- no stream, no yield --
+# before a run starts. A stream that ends is usually followed within seconds
+# by the builder it started, and a run squeezed into that gap is only
+# stopped again.
+CHORE_QUIET_SECONDS = 120.0
+# A STALL, NOT A TIMEOUT. The run is killed only when its whole process tree
+# has used less than CHORE_STALL_CPU_SECONDS of CPU in CHORE_STALL_SECONDS.
+# The deadlocked finisher of 2026-09-22 used 1.64 CPU-seconds in 95 minutes,
+# all of it before the hang; a working build uses that in well under a
+# second, on the GPU stages as much as the CPU ones, because a Python loop
+# feeding a GPU is still a Python loop. A long walk's long build keeps
+# using CPU and is never touched, however long it takes.
+CHORE_STALL_SECONDS = 600.0
+CHORE_STALL_CPU_SECONDS = 1.0
+# How long to wait before running again after a run that went wrong -- an
+# exit that was not clean, or a stall -- growing with each one in a row.
+# The finisher's own attempt ledger is what bounds the RETRIES; this only
+# keeps a failure that repeats instantly from becoming a spawn loop.
+CHORE_RETRY_BACKOFF_SECONDS = (60.0, 300.0, 900.0, 3600.0)
+# A tick this many times later than it was due means the machine slept.
+CHORE_SUSPEND_GAP_FACTOR = 4
+# `scripts/world_finish_pending.py`'s exit status for "I finished a world and
+# another is still owed" -- its `EXIT_MORE_OWED`, restated here because this
+# module may not import a cartridge script
+# (`test_shared_code_does_not_import_a_cartridge`). A test holds them equal.
+CHORE_EXIT_MORE_OWED = 3
+# Its `EXIT_WAITING`: a world it might owe work to is being written by somebody
+# else. Retried after the backoff, like a failure, but reported as waiting.
+CHORE_EXIT_WAITING = 4
+# See the `--max-forgiven` argument in `_world_finish_spec`.
+CHORE_MAX_FORGIVEN = 25
 
 
 def _build_cv_module(settings: Settings, connection_count=None) -> Module:
@@ -283,9 +323,10 @@ def _world_finish_spec(settings: Settings) -> WorkerSpec | None:
             str(TOWER_ROOT / "scripts" / "world_finish_pending.py"),
             "--root",
             settings.world_root,
-            # ONE WORLD PER TOWER START. Not a throughput knob: six to
-            # sixteen minutes is already a long time to hold a GPU on
-            # nobody's behalf, and a second owed world is a second start.
+            # ONE WORLD PER RUN. Not a throughput knob: six to sixteen
+            # minutes is already a long time to hold a GPU on nobody's
+            # behalf. A second owed world is a second run, which the chore
+            # starts at the next idle moment (`CHORE_EXIT_MORE_OWED`).
             "--max-worlds",
             "1",
             # Whether the wearer's keyframes are shaded onto the surface,
@@ -295,6 +336,17 @@ def _world_finish_spec(settings: Settings) -> WorkerSpec | None:
             # two defaults for one question is how a Tower comes to finish
             # a world differently from the way it built one.
             "--appearance" if settings.world_appearance else "--no-appearance",
+            # FORGIVENESS SIZED FOR A TOWER THAT WATCHES ITS CHILD. The
+            # finisher's own default (5) bounds the stops it forgives, because
+            # run by hand nothing else would ever count a finisher that hangs
+            # and is stopped politely. This Tower kills a stall outright
+            # (`_BackgroundChore`), which counts -- and it re-runs the finisher
+            # at every idle moment, so an ordinary day of walks is many polite
+            # stops. At 5, a reviewer retired a recoverable world to `failed`
+            # after eight walks. The bound stays, for a hang that is always
+            # interrupted before the stall window closes.
+            "--max-forgiven",
+            str(CHORE_MAX_FORGIVEN),
             # Mirrors `prune_depth_work=not args.densify` in the builder, so
             # a Tower that runs the dense stage keeps the per-frame depth
             # work a later `scripts/world_densify.py` would reuse.
@@ -312,6 +364,44 @@ def _world_finish_spec(settings: Settings) -> WorkerSpec | None:
     )
 
 
+def _tree_cpu_seconds(process) -> float | None:
+    """CPU seconds used so far by `process` and everything under it, or None.
+
+    The WHOLE TREE, because the finisher's appearance and solve stages run
+    in grandchildren: a parent waiting on a busy child uses no CPU of its own
+    and is not stalled. None -- psutil missing, the process just left, access
+    refused -- is "no reading", never "no progress".
+    """
+    try:
+        import psutil  # noqa: PLC0415 -- a core dependency, imported where used
+
+        root = psutil.Process(process.pid)
+        members = [root, *root.children(recursive=True)]
+    except Exception:  # noqa: BLE001
+        return None
+    total = 0.0
+    for member in members:
+        try:
+            times = member.cpu_times()
+        except Exception:  # noqa: BLE001 -- a member that left between the two calls
+            continue
+        total += times.user + times.system
+    return total
+
+
+def _no_capture_worker_is_alive(app) -> bool:
+    """The chore's idle rule, minus the streams it tracks itself.
+
+    A builder is alive for six to sixteen minutes AFTER its stream ends,
+    running the very surface and appearance stages the chore would compete
+    with for the GPU; it holds no stream, so only the supervisor can say so.
+    """
+    supervisor = getattr(app.state, "capture_workers", None)
+    if supervisor is None:
+        return True
+    return not supervisor.status()
+
+
 class _BackgroundChore:
     """One child process that belongs to no capture, and yields to every one.
 
@@ -324,107 +414,470 @@ class _BackgroundChore:
     process group so a Ctrl-C in the Tower's console does not shoot it, and a
     stdin pipe whose close is the stop request.
 
-    STARTED ONCE, AT STARTUP, AND NEVER RESTARTED. That is the safety gate,
-    and it is a structural one rather than a predicate that has to be right:
-    at Tower start nothing is streaming and every cartridge session is
-    stopped (see `app.state.cartridge_sessions`, which is deliberately not
-    persisted). The first sign of activity stops this for the lifetime of
-    the process, so a walk can never find it running and the GPU it wanted
-    is already free. Work it did not finish is not lost -- it is still
-    recorded as interrupted, and the next Tower start is the next attempt.
+    IT RUNS WHEN THE TOWER IS IDLE, AND ONLY THEN. It is started at Tower
+    start, when nothing is streaming and every cartridge session is stopped
+    (see `app.state.cartridge_sessions`, which is deliberately not
+    persisted), and the first sign of activity stops it. That much is
+    unchanged. What changed on 2026-09-23 is what happens AFTERWARDS: it
+    used to be retired for the life of the process, so photographic work
+    that was interrupted -- by the wearer pressing Start, by a second owed
+    world past `--max-worlds`, by a stall -- waited for the NEXT TOWER
+    START. The world said "Improving" the whole time, which is a promise of
+    progress nothing was keeping. Now the work stays owed and this runs
+    again at the next idle moment: nothing streaming, no capture worker
+    alive, and a quiet period since the last yield. The idle rule is what
+    keeps the old safety argument true -- a walk still never finds this
+    running, because a walk is exactly what makes the Tower not idle.
 
-    THREE WAYS IT IS TOLD, and it needs all three. `capture_opened` and
-    `attach` on the supervisor are the funnels through which anything begins
-    following a CAPTURE (see `_SupervisorThatYieldsTheGpu`); `stream_start`
-    in `tower/routes/ws.py` is the one through which a phone begins sending
-    FRAMES. They are not the same event: a Tower with no `TOWER_CAPTURE_ROOT`
-    mints no capture id, so the first two never fire while the live
-    cartridges take the GPU -- a supported configuration in which this chore
-    would have kept the GPU, and a world's writer lock, for the whole stream.
+    A RUN IS WATCHED, NOT TIMED. On 2026-09-22 the finisher held a world for
+    95 minutes at 0% CPU: alive, holding the world's writer lock, doing
+    nothing, and reading as "running" because its pid was live. Nothing
+    here times a build -- a long walk is a long build -- but a process tree
+    that has used under `stall_cpu_seconds` of CPU in `stall_seconds` is
+    not building anything, it is stuck. It is then killed OUTRIGHT, without
+    closing its pipe first: closing the pipe is the polite stop, which the
+    finisher answers by giving its attempt back, and a stall must COUNT as
+    an attempt so that `world_finish_pending`'s retry bound can retire a
+    world that keeps doing this instead of retrying it forever. Then it is
+    run again, after a backoff, when the Tower is idle.
+
+    THREE WAYS IT IS TOLD TO YIELD, and it needs all three. `capture_opened`
+    and `attach` on the supervisor are the funnels through which anything
+    begins following a CAPTURE (see `_SupervisorThatYieldsTheGpu`);
+    `stream_start` in `tower/routes/ws.py` is the one through which a phone
+    begins sending FRAMES, and it HOLDS this chore until that stream ends.
+    They are not the same event: a Tower with no `TOWER_CAPTURE_ROOT` mints
+    no capture id, so the first two never fire while the live cartridges
+    take the GPU.
     """
 
-    def __init__(self, spec: WorkerSpec) -> None:
+    def __init__(
+        self,
+        spec: WorkerSpec,
+        *,
+        idle=None,
+        clock=time.monotonic,
+        cpu_probe=_tree_cpu_seconds,
+        tick_seconds: float = CHORE_TICK_SECONDS,
+        quiet_seconds: float = CHORE_QUIET_SECONDS,
+        stall_seconds: float = CHORE_STALL_SECONDS,
+        stall_cpu_seconds: float = CHORE_STALL_CPU_SECONDS,
+        retry_backoff: tuple[float, ...] = CHORE_RETRY_BACKOFF_SECONDS,
+    ) -> None:
         self._spec = spec
+        # "Is anything else using this machine?" Injected, because the
+        # answer lives in the supervisor and the stream bookkeeping, which
+        # are built after this object and around it.
+        self._idle = idle if idle is not None else (lambda: True)
+        self._clock = clock
+        self._cpu_probe = cpu_probe
+        self._tick_seconds = tick_seconds
+        self._quiet_seconds = quiet_seconds
+        self._stall_seconds = stall_seconds
+        self._stall_cpu_seconds = stall_cpu_seconds
+        self._retry_backoff = tuple(retry_backoff) or (0.0,)
         self._lock = threading.Lock()
         self._process = None
         self._job = None
-        self._retired = False
+        # For ever: the Tower is shutting down.
+        self._closed = False
+        # Whether a run may have something to do. True at construction --
+        # that is the startup run -- and after anything that leaves work
+        # behind: a yield, a stall, a run that did not end cleanly, a run
+        # that finished one world of several.
+        self._owed = True
+        # Streams that are open right now, by owner. Nothing runs while any
+        # is held, whatever the supervisor says.
+        self._holds: set = set()
+        # No run starts before this monotonic time: the quiet period after
+        # a yield, or the backoff after a run that went wrong.
+        self._not_before = 0.0
+        self._failures = 0
+        # Progress bookkeeping for the run in flight.
+        self._run_started_at = None
+        self._progress_at = None
+        self._progress_cpu = None
+        self._last_tick = None
+        # What /health reports.
+        self._runs = 0
+        self._stalls = 0
+        self._last_outcome: dict | None = None
         # Whether SOMEBODY is inside `stop()` doing the waiting, and the
         # event that says they have finished. Both exist because the
         # blocking wait deliberately happens OUTSIDE `_lock` -- see `stop`.
         self._stopping = False
         self._gone = threading.Event()
+        self._gone.set()
+        # A child that survived its own kill. Nothing else runs while it is
+        # alive, and it keeps the Tower from reading as idle.
+        self._lingering = None
+        self._wake = threading.Event()
+        self._monitor: threading.Thread | None = None
 
     @property
     def name(self) -> str:
         return self._spec.name
 
+    # -- starting ------------------------------------------------------
+
     def start(self) -> bool:
-        """Spawn it, unless it has already run or already yielded."""
+        """Run now, if the Tower is idle and nothing has yielded it.
+
+        Returns whether a child was spawned by this call. A start refused
+        because a capture had already opened is not lost: the work stays
+        owed, and `watch` runs it at the next idle moment.
+        """
+        return self._maybe_run("the Tower started")
+
+    def watch(self) -> None:
+        """Start the thread that watches a run and starts the next one.
+
+        Separate from `start`, and only `lifespan` calls it: a chore that is
+        merely constructed and started -- most tests -- must not leave a
+        thread behind that could spawn a process on its own later.
+        """
         with self._lock:
-            if self._retired or self._process is not None:
+            if self._closed or self._monitor is not None:
+                return
+            self._monitor = threading.Thread(
+                target=self._watch, name=f"{self._spec.name}-chore", daemon=True
+            )
+            self._monitor.start()
+
+    def _maybe_run(self, why: str) -> bool:
+        # The idle probe is asked OUTSIDE `_lock`: it takes the supervisor's
+        # lock, and the supervisor calls `stop` on this object from inside
+        # its own funnels. Everything it could race is re-checked under the
+        # lock below -- a yield that lands in between moves `_not_before`
+        # forward, and the re-check then refuses.
+        if not self._runnable(self._clock()):
+            return False
+        try:
+            idle = bool(self._idle())
+        except Exception:  # noqa: BLE001 -- an unanswerable probe is "busy"
+            logger.exception("[Tower][Worker] the %s chore could not tell whether "
+                             "the Tower is idle; not starting it", self._spec.name)
+            return False
+        if not idle:
+            return False
+        with self._lock:
+            if not self._runnable(self._clock()):
                 return False
-            argv = self._spec.argv
-            env = None
-            if argv and argv[0] == sys.executable:
-                # ONE PROCESS, NOT A LAUNCHER PAIR -- the same rewrite
-                # `capture_workers._start` documents. On a Windows venv the
-                # pid held here would otherwise be a launcher's, and
-                # terminating it would leave every grandchild alive.
-                argv = (interpreter_executable(), *argv[1:])
-                env = interpreter_environment()
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=self._spec.cwd,
-                    env=env,
-                    stdin=subprocess.PIPE,
-                    creationflags=(
-                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-                    ),
-                )
-            except Exception:
-                logger.exception(
-                    "[Tower][Worker] could not start the %s chore; any world "
-                    "whose photographic stages were interrupted stays sparse "
-                    "until the next start. argv: %s",
-                    self._spec.name,
-                    " ".join(argv),
-                )
-                self._retired = True
-                return False
-            self._process = process
-            self._job = assign_to_job(process)
-            logger.info(
-                "[Tower][Worker] started the %s chore, pid %s: %s",
+            return self._spawn_locked(why)
+
+    def _runnable(self, now: float) -> bool:
+        if self._lingering is not None and self._lingering.poll() is not None:
+            self._lingering = None
+        return (
+            not self._closed
+            and self._owed
+            and self._process is None
+            and self._lingering is None
+            and not self._stopping
+            and not self._holds
+            and now >= self._not_before
+        )
+
+    def _kill_or_keep(self, process, job, *, hard: bool) -> bool:
+        """Terminate the tree; if it will not die, keep it where it blocks runs.
+
+        A finisher that outlives its kill -- a CUDA context taking longer to
+        tear down than the wait allows -- used to be forgotten here: the
+        chore could then start a second one beside it, and a builder could
+        start while it still held the GPU and the world's lock.
+        """
+        gone = terminate_tree(
+            process, job=job, timeout=TERMINATE_TIMEOUT_SECONDS, hard=hard
+        )
+        if not gone and process.poll() is None:
+            with self._lock:
+                self._lingering = process
+            logger.error(
+                "[Tower][Worker] the %s chore (pid %s) did not die when it was "
+                "killed; nothing else will run until it has",
+                self._spec.name, process.pid,
+            )
+        return gone
+
+    def _spawn_locked(self, why: str) -> bool:
+        argv = self._spec.argv
+        env = None
+        if argv and argv[0] == sys.executable:
+            # ONE PROCESS, NOT A LAUNCHER PAIR -- the same rewrite
+            # `capture_workers._start` documents. On a Windows venv the
+            # pid held here would otherwise be a launcher's, and
+            # terminating it would leave every grandchild alive.
+            argv = (interpreter_executable(), *argv[1:])
+            env = interpreter_environment()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=self._spec.cwd,
+                env=env,
+                stdin=subprocess.PIPE,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "[Tower][Worker] could not start the %s chore; any world "
+                "whose photographic stages were interrupted stays unfinished "
+                "until this can start. argv: %s",
                 self._spec.name,
-                process.pid,
                 " ".join(argv),
             )
-            return True
+            self._after_failure_locked(self._clock())
+            return False
+        now = self._clock()
+        self._process = process
+        self._job = assign_to_job(process)
+        self._gone.clear()
+        # Taken now, and cleared: whatever this run leaves behind, its own
+        # ending says so (`_ended`).
+        self._owed = False
+        self._runs += 1
+        self._run_started_at = now
+        self._progress_at = now
+        self._progress_cpu = None
+        self._last_tick = now
+        logger.info(
+            "[Tower][Worker] started the %s chore (%s), pid %s: %s",
+            self._spec.name,
+            why,
+            process.pid,
+            " ".join(argv),
+        )
+        return True
+
+    def _after_failure_locked(self, now: float) -> None:
+        """Owed again, after a backoff that grows with each failure in a row."""
+        self._owed = True
+        self._failures += 1
+        step = self._retry_backoff[min(self._failures - 1, len(self._retry_backoff) - 1)]
+        self._not_before = max(self._not_before, now + step)
+
+    # -- the watching thread -------------------------------------------
+
+    def _watch(self) -> None:
+        while True:
+            self._wake.wait(self._tick_seconds)
+            self._wake.clear()
+            with self._lock:
+                if self._closed:
+                    return
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 -- the watcher must outlive a bad tick
+                logger.exception("[Tower][Worker] the %s chore's watcher failed "
+                                 "a tick; it keeps watching", self._spec.name)
+
+    def tick(self) -> None:
+        """One look at the child and at the Tower. Public for tests."""
+        now = self._clock()
+        with self._lock:
+            process = self._process
+            if self._closed or self._stopping:
+                return
+            # A tick that arrives far later than it was due means the
+            # machine was asleep, and a sleeping machine uses no CPU. That
+            # is not a stall, and nothing measured across it is evidence.
+            slept = (
+                self._last_tick is not None
+                and now - self._last_tick > CHORE_SUSPEND_GAP_FACTOR * self._tick_seconds
+            )
+            self._last_tick = now
+            if process is not None and slept:
+                self._progress_at = now
+                self._progress_cpu = None
+                return
+        if process is None:
+            self._maybe_run("the Tower is idle and work may be owed")
+            return
+        code = process.poll()
+        if code is not None:
+            self._ended(process, code, now)
+            return
+        self._watch_progress(process, now)
+
+    def _ended(self, process, code: int, now: float) -> None:
+        """The child exited by itself. Decide whether anything is still owed."""
+        with self._lock:
+            if self._process is not process:
+                return
+            self._process = None
+            job = self._job
+            self._job = None
+            started = self._run_started_at
+            elapsed = None if started is None else now - started
+            if code == 0:
+                # "Nothing more to do": the finisher's sound run, including
+                # the common one that found nothing owed at all.
+                self._failures = 0
+                outcome = "finished"
+            elif code == CHORE_EXIT_MORE_OWED:
+                # A world finished and another is still owed; the one-world
+                # bound ended the run, not a fault. Next idle moment.
+                self._failures = 0
+                self._owed = True
+                outcome = "finished-more-owed"
+            elif code == CHORE_EXIT_WAITING:
+                self._after_failure_locked(now)
+                outcome = "waiting"
+            else:
+                self._after_failure_locked(now)
+                outcome = "exited"
+            self._last_outcome = {
+                "outcome": outcome,
+                "exit_code": code,
+                "seconds": None if elapsed is None else round(elapsed, 1),
+            }
+            self._gone.set()
+        if job is not None:
+            job.close()
+        self._close_pipe(process)
+        log = logger.info if outcome != "exited" else logger.warning
+        log(
+            "[Tower][Worker] the %s chore (pid %s) exited %s after %s s: %s",
+            self._spec.name, process.pid, code,
+            "?" if elapsed is None else f"{elapsed:.1f}", outcome,
+        )
+
+    def _watch_progress(self, process, now: float) -> None:
+        cpu = self._cpu_probe(process)
+        if cpu is None:
+            return
+        with self._lock:
+            if self._process is not process:
+                return
+            if self._progress_cpu is None or cpu < self._progress_cpu:
+                # The first reading of this run; or the tree SHRANK, because
+                # a grandchild finished and took its CPU time with it. Either
+                # way something happened -- it is a new baseline.
+                self._progress_cpu = cpu
+                self._progress_at = now
+                return
+            if cpu - self._progress_cpu >= self._stall_cpu_seconds:
+                self._progress_cpu = cpu
+                self._progress_at = now
+                return
+            quiet_for = now - self._progress_at
+            if quiet_for < self._stall_seconds:
+                return
+            # STALLED. Taken out of the state under the lock, so a yield
+            # arriving now finds nothing to stop and a second tick finds
+            # nothing to kill.
+            self._process = None
+            job = self._job
+            self._job = None
+            self._stalls += 1
+            self._after_failure_locked(now)
+            started = self._run_started_at
+            self._last_outcome = {
+                "outcome": "stalled",
+                "exit_code": None,
+                "seconds": None if started is None else round(now - started, 1),
+                "cpu_seconds": round(cpu, 2),
+                "quiet_seconds": round(quiet_for, 1),
+            }
+            retry_in = max(0.0, self._not_before - now)
+            self._stopping = True
+        try:
+            logger.warning(
+                "[Tower][Worker] the %s chore (pid %s) is STALLED: its process "
+                "tree used %.2f CPU-seconds in total and under %.1f of them in "
+                "the last %.0f s. It is alive and doing nothing -- the shape of "
+                "the 2026-09-22 finisher that held a world for 95 minutes. "
+                "Killing it without the polite stop, so the attempt counts "
+                "against its retry bound; it runs again when the Tower is idle, "
+                "in no less than %.0f s. To see where it was stuck next time: "
+                "py-spy dump --native --pid <pid>.",
+                self._spec.name, process.pid, cpu, self._stall_cpu_seconds,
+                quiet_for, retry_in,
+            )
+            # HARD: no SIGTERM on POSIX, whose handler would forgive the attempt.
+            self._kill_or_keep(process, job, hard=True)
+            self._close_pipe(process)
+        finally:
+            if job is not None:
+                job.close()
+            with self._lock:
+                self._stopping = False
+            self._gone.set()
+
+    @staticmethod
+    def _close_pipe(process) -> None:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except Exception:  # noqa: BLE001 -- a pipe to a dead process
+            pass
+
+    # -- yielding ------------------------------------------------------
+
+    def hold(self, owner, reason: str) -> None:
+        """A stream opened: stop the chore, and keep it stopped until `release`."""
+        with self._lock:
+            if not self._closed:
+                self._holds.add(owner)
+        self.stop(reason)
+
+    def release(self, owner) -> None:
+        """That stream ended. The chore may run once the Tower is idle again.
+
+        A no-op for an owner that holds nothing. It is called on EVERY
+        disconnect, and most connections never stream -- a result
+        subscriber, a poller that reconnects every thirty seconds. Letting
+        those restart the quiet period would let any client that comes and
+        goes postpone owed work for ever.
+        """
+        with self._lock:
+            if owner not in self._holds:
+                return
+            self._holds.discard(owner)
+            # The quiet period starts now: a stream that ends is usually
+            # followed within seconds by the builder it started, and a run
+            # squeezed into that gap would only be stopped again.
+            self._not_before = max(self._not_before, self._clock() + self._quiet_seconds)
 
     def stop(self, reason: str, *, grace_seconds: float | None = None) -> None:
-        """Ask it to stop, and do not return until it is gone. Idempotent.
+        """Yield: stop the child if it is running, and do not return until it is
+        gone. Idempotent. The work it was doing stays OWED.
 
-        `_retired` is set whether or not anything was running, so a stop that
-        arrives before the start -- a capture opening while the Tower is
-        still coming up -- prevents the start rather than racing it.
+        A yield before anything has run -- a capture opening while the Tower
+        is still coming up -- prevents the run rather than racing it, and the
+        run happens at the next idle moment instead.
 
         EVERY CALLER WAITS, NOT JUST THE ONE THAT WON. The blocking wait
         cannot happen under `_lock` (a second caller would then block on the
         lock and never learn whether the child is gone or merely asked), so
-        exactly one caller owns the process and the others wait on
-        `_gone`. Without that, the second caller returned immediately with
-        the child still alive -- measured at 0.05 s against 5.01 s, with the
-        child running a GPU op -- and the guarantee this whole class exists
-        for, "a builder starts only after the finisher is dead", held for
+        exactly one caller owns the process and the others wait on `_gone`.
+        Without that, the second caller returned immediately with the child
+        still alive -- measured at 0.05 s against 5.01 s, with the child
+        running a GPU op -- and the guarantee this whole class exists for,
+        "a builder starts only after the finisher is dead", held for
         `capture_opened` and not for `attach`. Those two arrive on different
         threadpools and interleave exactly when the phone is streaming and
         the wearer presses Start.
         """
+        self._stop(reason, grace_seconds=grace_seconds, final=False)
+
+    def close(self, reason: str) -> None:
+        """The Tower is shutting down: stop the child, and never run again."""
+        self._stop(reason, grace_seconds=None, final=True)
+        self._wake.set()
+
+    def _stop(self, reason: str, *, grace_seconds: float | None, final: bool) -> None:
         with self._lock:
-            already = self._retired
-            self._retired = True
+            if final:
+                self._closed = True
+            else:
+                # Whatever was running is still owed, and nothing starts
+                # again until the Tower has been quiet for a while.
+                self._owed = True
+                self._not_before = max(
+                    self._not_before, self._clock() + self._quiet_seconds
+                )
             process = self._process
             self._process = None
             job = self._job
@@ -445,12 +898,10 @@ class _BackgroundChore:
                         self._spec.name, budget, reason,
                     )
                 return
-            if not already:
-                logger.debug(
-                    "[Tower][Worker] the %s chore will not start: %s",
-                    self._spec.name, reason,
-                )
-            self._gone.set()
+            logger.debug(
+                "[Tower][Worker] the %s chore is not running: %s",
+                self._spec.name, reason,
+            )
             return
         try:
             if process.poll() is not None:
@@ -464,11 +915,7 @@ class _BackgroundChore:
                 "[Tower][Worker] stopping the %s chore (pid %s): %s",
                 self._spec.name, process.pid, reason,
             )
-            try:
-                if process.stdin is not None:
-                    process.stdin.close()
-            except Exception:  # noqa: BLE001 -- a closed pipe is the request
-                pass
+            self._close_pipe(process)
             try:
                 process.wait(timeout=grace)
                 return
@@ -478,12 +925,56 @@ class _BackgroundChore:
             # this child's own process, but the appearance and the solve spawn
             # grandchildren, and a plain terminate() leaves those holding the
             # GPU the wearer just asked for.
-            terminate_tree(process, job=job, timeout=TERMINATE_TIMEOUT_SECONDS)
+            self._kill_or_keep(process, job, hard=False)
         finally:
+            if job is not None:
+                job.close()
+            with self._lock:
+                self._stopping = False
+                if not final:
+                    self._last_outcome = {"outcome": "yielded", "reason": reason}
             # Whatever happened, the callers waiting on us are released. An
             # exception here that left this unset would hang every one of
             # them for the full budget.
             self._gone.set()
+
+    # -- reporting -----------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """For /health: what the chore is doing, and how its last run went."""
+        now = self._clock()
+        with self._lock:
+            process = self._process
+            running = process is not None
+            return {
+                "name": self._spec.name,
+                "state": (
+                    "closed" if self._closed
+                    else "running" if running
+                    else "owed" if self._owed
+                    else "idle"
+                ),
+                "pid": process.pid if running else None,
+                "lingering_pid": (
+                    self._lingering.pid if self._lingering is not None else None
+                ),
+                "held_by_streams": len(self._holds),
+                "runs": self._runs,
+                "stalls": self._stalls,
+                "seconds_running": (
+                    round(now - self._run_started_at, 1)
+                    if running and self._run_started_at is not None else None
+                ),
+                "seconds_since_progress": (
+                    round(now - self._progress_at, 1)
+                    if running and self._progress_at is not None else None
+                ),
+                "next_run_not_before_seconds": (
+                    round(max(0.0, self._not_before - now), 1)
+                    if not running and self._owed else None
+                ),
+                "last": dict(self._last_outcome) if self._last_outcome else None,
+            }
 
 
 def _observation_spec(settings: Settings, gate) -> WorkerSpec | None:
@@ -857,13 +1348,16 @@ def _log_effective_configuration(
         if _world_finish_spec(settings) is not None:
             logger.info(
                 "[Tower][Config] photographic work INTERRUPTED by an earlier "
-                "Tower will be finished once, now, in a child process "
-                "(scripts/world_finish_pending.py), one world at a time. Only "
-                "a session whose own stage record or surface status.json says "
-                "it was interrupted is selected -- a world nothing ever tried "
-                "to make a picture of is never touched. It is stopped the "
-                "moment a stream or a capture opens. "
-                "TOWER_WORLD_FINISH_PENDING=false switches it off."
+                "Tower will be finished in a child process "
+                "(scripts/world_finish_pending.py), one world at a time, now "
+                "and again whenever the Tower is idle while work is still "
+                "owed. Only a session whose own stage record or surface "
+                "status.json says it was interrupted is selected -- a world "
+                "nothing ever tried to make a picture of is never touched. It "
+                "is stopped the moment a stream or a capture opens, and a run "
+                "that makes no CPU progress for "
+                f"{CHORE_STALL_SECONDS:.0f} s is killed as stalled and tried "
+                "again later. TOWER_WORLD_FINISH_PENDING=false switches it off."
             )
         elif not settings.world_finish_pending:
             logger.warning(
@@ -892,12 +1386,19 @@ async def lifespan(app: FastAPI):
     chore = getattr(app.state, "world_finish_chore", None)
     if chore is not None:
         await asyncio.to_thread(chore.start)
+        # And from here on, the run is watched and the next one is started
+        # whenever the Tower is idle and work is still owed. Looked up by
+        # name, like the stop below: a test may stand a bare fake in here.
+        watch = getattr(chore, "watch", None)
+        if watch is not None:
+            watch()
     yield
     # The chore first, and before the workers: it is the least important
     # process this Tower owns and the most likely to be holding a world's
     # writer lock, and everything below wants that lock released.
     if chore is not None:
-        await asyncio.to_thread(chore.stop, "the Tower is shutting down")
+        close = getattr(chore, "close", None) or chore.stop
+        await asyncio.to_thread(close, "the Tower is shutting down")
     # The result hub next: it holds a polling task, and stopping it
     # before the module container means no snapshot can be built against
     # an app that is half torn down. Guarded with getattr because most of
@@ -1014,7 +1515,11 @@ def create_app() -> FastAPI:
     # of them. Started from lifespan, it runs when a Tower actually runs.
     finish_spec = _world_finish_spec(settings)
     world_finish_chore = (
-        None if finish_spec is None else _BackgroundChore(finish_spec)
+        None
+        if finish_spec is None
+        else _BackgroundChore(
+            finish_spec, idle=lambda: _no_capture_worker_is_alive(app)
+        )
     )
     app.state.world_finish_chore = world_finish_chore
     app.state.capture_workers = _build_capture_worker_supervisor(

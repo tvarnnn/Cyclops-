@@ -121,6 +121,16 @@ def _world(
 INTERRUPTED_SURFACE = {STAGE_SURFACE: _stage(STAGE_STATE_RUNNING)}
 
 
+@pytest.fixture(autouse=True)
+def _no_native_warm(monkeypatch):
+    """`finish` warms torch and the CUDA driver before the stage; not here.
+
+    The stage itself is faked throughout this file, and the ordering of the
+    warm is `test_world_builder_finisher_startup.py`'s to pin.
+    """
+    monkeypatch.setattr(wfp, "prewarm_world_builder", lambda *a, **k: ())
+
+
 def _verdict(store, world_id="w1", session_id="s1", **kwargs):
     return wfp.assess(store, world_id, session_id, **kwargs)
 
@@ -537,7 +547,11 @@ def test_retiring_takes_the_world_lock_and_looks_again_underneath_it(
 
     wfp.survey, saved = survey_then_lock, wfp.survey
     try:
-        assert wfp.main(["--root", str(tmp_path), "--max-attempts", "1"]) == 0
+        # WAITING, not "nothing to do": the world still has to be retired, and
+        # the Tower tries again after a backoff once the writer is gone.
+        assert wfp.main(["--root", str(tmp_path), "--max-attempts", "1"]) == (
+            wfp.EXIT_WAITING
+        )
     finally:
         wfp.survey = saved
     # Nothing was written: the record still says what the builder left.
@@ -876,12 +890,33 @@ def test_running_the_cli_twice_finishes_the_work_once(tmp_path, stage_runner):
 
 
 def test_the_cli_finishes_one_world_at_a_time(tmp_path, stage_runner):
-    """Bounded. Two owed worlds are two boots, not twelve minutes of GPU in
-    one -- and a walk that starts in between must find the machine free."""
+    """Bounded. Two owed worlds are two runs, not twelve minutes of GPU in
+    one -- and a walk that starts in between must find the machine free.
+
+    AND THE FIRST RUN SAYS SO. It used to exit 0 here, which the Tower could
+    not tell from "nothing left", so the second world waited for the next
+    Tower START and read "Improving" until then. `EXIT_MORE_OWED` is how the
+    Tower learns to run it again at its next idle moment; the run after that
+    finds nothing and says 0.
+    """
     _world(tmp_path, world_id="w1", stages=INTERRUPTED_SURFACE)
     _world(tmp_path, world_id="w2", session_id="s2", stages=INTERRUPTED_SURFACE)
-    assert wfp.main(["--root", str(tmp_path)]) == 0
+    assert wfp.main(["--root", str(tmp_path)]) == wfp.EXIT_MORE_OWED
     assert len(stage_runner) == 1
+    assert wfp.main(["--root", str(tmp_path)]) == 0
+    assert sorted(call["world"] for call in stage_runner) == ["w1", "w2"]
+    assert wfp.main(["--root", str(tmp_path)]) == 0
+    assert len(stage_runner) == 2
+
+
+def test_the_exit_codes_have_one_meaning_on_both_sides():
+    """The Tower may not import this script, so it restates the numbers."""
+    from tower import main as tower_main
+
+    assert wfp.EXIT_MORE_OWED == tower_main.CHORE_EXIT_MORE_OWED
+    assert wfp.EXIT_WAITING == tower_main.CHORE_EXIT_WAITING
+    # And none may collide with another, or with the two that already existed.
+    assert len({0, 1, wfp.EXIT_MORE_OWED, wfp.EXIT_WAITING}) == 4
 
 
 def test_a_stop_asked_for_before_the_work_starts_skips_it(tmp_path, stage_runner):
@@ -1151,3 +1186,52 @@ def test_a_second_stop_waits_for_the_child_to_actually_be_gone(tmp_path):
     second.join(timeout=30)
 
     assert returned == {"first": True, "second": True}
+
+
+# -- 2026-09-23 review: corrupt bookkeeping must not stall the whole Tower ----
+
+
+def test_a_malformed_ledger_entry_does_not_take_down_the_survey(tmp_path, stage_runner):
+    """One bad entry in ONE world's ledger used to raise out of `survey` and
+    stop every owed world on the Tower. It is now that world's problem, and
+    it is recovered rather than refused for ever."""
+    store = _world(tmp_path, world_id="w1", stages=INTERRUPTED_SURFACE)
+    _world(tmp_path, world_id="w2", session_id="s2", stages=INTERRUPTED_SURFACE)
+    (store.world_dir("w1") / wfp.ATTEMPTS_FILENAME).write_text(
+        '{"schema": 1, "sessions": {"s1": 7}}', encoding="utf-8"
+    )
+    verdicts = {v.world_id: v for v in wfp.survey(store)}
+    assert verdicts["w1"].owed and verdicts["w2"].owed
+
+    # Finishing w1 sets the unreadable ledger ASIDE -- kept, not deleted --
+    # and counts from this attempt, so the retry bound still holds.
+    assert wfp.main(["--root", str(tmp_path), "--max-worlds", "2"]) == 0
+    assert sorted(c["world"] for c in stage_runner) == ["w1", "w2"]
+    aside = list(store.world_dir("w1").glob("finish_attempts.unreadable-*.json"))
+    assert len(aside) == 1 and '"s1": 7' in aside[0].read_text(encoding="utf-8")
+    assert wfp.read_attempts(store, "w1", "s1") == 1
+
+
+def test_an_assess_that_raises_is_one_sessions_problem(tmp_path, monkeypatch):
+    _world(tmp_path, world_id="w1", stages=INTERRUPTED_SURFACE)
+    _world(tmp_path, world_id="w2", session_id="s2", stages=INTERRUPTED_SURFACE)
+    real = wfp.assess
+
+    def assess(store, world_id, session_id, **kwargs):
+        if world_id == "w1":
+            raise RuntimeError("a record nobody expected")
+        return real(store, world_id, session_id, **kwargs)
+
+    monkeypatch.setattr(wfp, "assess", assess)
+    verdicts = {v.world_id: v for v in wfp.survey(WorldStore(tmp_path))}
+    assert verdicts["w1"].code == "assess-error" and not verdicts["w1"].owed
+    assert verdicts["w2"].owed
+
+
+def test_a_world_another_writer_holds_is_waiting_not_done(tmp_path, monkeypatch):
+    """Exit 0 told the Tower "nothing to do", and the work waited for the
+    next walk or restart. `EXIT_WAITING` is retried after a backoff."""
+    _world(tmp_path, stages=INTERRUPTED_SURFACE)
+    verdict = wfp.Verdict("w1", "s1", False, "locked by pid 1234", code="locked")
+    monkeypatch.setattr(wfp, "survey", lambda *a, **k: [verdict])
+    assert wfp.main(["--root", str(tmp_path)]) == wfp.EXIT_WAITING

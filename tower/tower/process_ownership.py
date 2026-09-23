@@ -286,7 +286,9 @@ def _log_job_failure(call: str, error: int) -> None:
 # -- the tree -----------------------------------------------------------
 
 
-def terminate_tree(process, *, job: JobHandle | None = None, timeout: float) -> bool:
+def terminate_tree(
+    process, *, job: JobHandle | None = None, timeout: float, hard: bool = False
+) -> bool:
     """Stop a child and everything under it. True when all of it is gone.
 
     With a job, `TerminateJobObject` does the whole tree in one call and
@@ -304,6 +306,12 @@ def terminate_tree(process, *, job: JobHandle | None = None, timeout: float) -> 
     the caller keeps such a worker in its registry so it stays visible,
     which is the contract `CaptureWorkerSupervisor._stop_worker` has
     always had.
+
+    `hard` skips the polite half on POSIX: SIGKILL, never SIGTERM first. A
+    SIGTERM runs the child's own handler, and for a stalled recovery
+    finisher that handler is the one that gives its attempt back -- the
+    stall would then never count (review, 2026-09-23). On Windows every path
+    here is already a TerminateProcess, which runs no handler.
     """
     if job is not None and not job.closed and job.terminate():
         return _wait_gone(process, timeout)
@@ -311,12 +319,18 @@ def terminate_tree(process, *, job: JobHandle | None = None, timeout: float) -> 
     descendants = _descendants(process)
     for proc in descendants:
         try:
-            proc.terminate()
+            if hard:
+                proc.kill()
+            else:
+                proc.terminate()
         except Exception:  # noqa: BLE001 -- already gone, or not ours to touch
             pass
 
     try:
-        process.terminate()
+        if hard:
+            process.kill()
+        else:
+            process.terminate()
     except Exception:
         logger.exception(
             "[Tower][Worker] could NOT terminate pid %s; it stays in the "

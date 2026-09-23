@@ -721,7 +721,7 @@ one that survives the gaps between stages.
 |---|---|---|
 | `complete` | the appearance stage finished; the photographic room exists | unchanged (`ready` on an ordinary walk) |
 | `running` | a stage is running under a live process | `finalizing` |
-| `owed` | unfinished, nothing working on it; the Tower finishes owed work at its next start | `finalizing` |
+| `owed` | unfinished, nothing working on it; the Tower finishes owed work the next time it is idle (no stream open, no capture worker alive), and at every start | `finalizing` |
 | `failed` | a stage ran and failed. **Terminal** -- nothing more is coming | unchanged (`ready`): the world is saved, at whatever rung it reached |
 | `unattempted` | the stages declined (no global solve, or the Tower's appearance setting is off) | unchanged |
 | `never_recorded` | a world from before the photographic stages existed | unchanged |

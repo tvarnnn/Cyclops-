@@ -484,7 +484,7 @@ def _capture_workers(websocket):
     return getattr(websocket.app.state, "capture_workers", None)
 
 
-def _yield_background_work(websocket, reason: str) -> None:
+def _yield_background_work(websocket, reason: str, owner=None) -> None:
     """Stop whatever background chore this Tower is running, if it is running.
 
     A STREAM IS THE EVENT, NOT A CAPTURE, and the difference is the whole
@@ -505,12 +505,40 @@ def _yield_background_work(websocket, reason: str) -> None:
     if chore is None:
         return
     try:
-        chore.stop(reason)
+        # HELD, NOT JUST STOPPED. A chore that runs again whenever the Tower
+        # is idle must be told the stream is still open, or it would find no
+        # capture worker alive -- a Tower with no recorder has none -- and
+        # take the GPU back mid-stream. `_background_work_may_resume` ends
+        # the hold. A chore with no notion of holds is simply stopped.
+        hold = getattr(chore, "hold", None)
+        if hold is not None and owner is not None:
+            hold(owner, reason)
+        else:
+            chore.stop(reason)
     except Exception:
         logger.exception(
             "[Tower][Worker] a background chore did not stop for the stream; "
             "the stream continues without waiting for it"
         )
+
+
+def _background_work_may_resume(websocket, owner) -> None:
+    """This connection's stream is over; the chore may run once the Tower is idle.
+
+    Called on `stream_stop` AND on every disconnect, for the reason the
+    recorder teardown gives: a wearable client disconnects abruptly as the
+    normal case, and a hold that outlived its stream would keep owed
+    photographic work waiting until the Tower restarted -- "Improving" with
+    nothing working on it. Idempotent, and never raises.
+    """
+    chore = getattr(websocket.app.state, "world_finish_chore", None)
+    release = getattr(chore, "release", None)
+    if release is None:
+        return
+    try:
+        release(owner)
+    except Exception:
+        logger.exception("[Tower][Worker] could not release a background chore")
 
 
 def _tell_cartridges_the_stream_opened(websocket, owner) -> None:
@@ -1129,7 +1157,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # same rule `_start_capture` and `_close_cartridge_streams`
                 # already follow.
                 await asyncio.to_thread(
-                    _yield_background_work, websocket, "a stream opened"
+                    _yield_background_work, websocket, "a stream opened",
+                    connection_token,
                 )
                 await _start_capture(websocket, connection_token)
                 # After the recorder, so a cartridge that wants the
@@ -1152,6 +1181,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     websocket, END_REASON_STOP, owner=connection_token
                 )
                 await _close_cartridge_streams(websocket, connection_token)
+                _background_work_may_resume(websocket, connection_token)
             elif message_type in cv_lab_ws.CV_LAB_MESSAGE_TYPES:
                 await cv_lab_ws.handle(
                     message, websocket=websocket, sender=sender
@@ -1219,6 +1249,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # cartridge teardown has drained through two thread hops. Both
         # calls are synchronous and cheap.
         session.client_disconnected()
+        _background_work_may_resume(websocket, connection_token)
         if active_measurement is not None:
             _finalize_stream_measurement(
                 active_measurement, end_reason="disconnect"

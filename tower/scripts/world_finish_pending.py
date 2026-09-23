@@ -85,9 +85,12 @@ writes that file, so a Tower that never ran a photographic stage cannot have
 left one. Measured: 166 worlds here, ONE with a `surface/` directory, and it
 is the interrupted one. See `interrupted_stage_on_disk`.
 
-Exit status is 0 whenever the run itself was sound -- including a run that
-found nothing owed, which is the common case -- and 1 when a session that was
-owed could not be finished.
+Exit status is 0 whenever the run itself was sound and left nothing it could
+have done -- including a run that found nothing owed, which is the common
+case -- 1 when a session that was owed could not be finished, and 3
+(`EXIT_MORE_OWED`) when the run finished what `--max-worlds` allowed and
+another world is still owed. The Tower reads that last one as "run me again
+at the next idle moment" (`tower/main.py`, `CHORE_EXIT_MORE_OWED`).
 """
 
 import argparse
@@ -97,6 +100,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -206,9 +210,21 @@ DEFAULT_MAX_FORGIVEN = 5
 
 # One world per run. Not a throughput knob: the machine belongs to whoever
 # picks the glasses up next, and six to sixteen minutes is already a long
-# time to be holding a GPU on nobody's behalf. Two owed worlds are two Tower
-# starts.
+# time to be holding a GPU on nobody's behalf. Two owed worlds are two runs:
+# this one exits `EXIT_MORE_OWED`, and the Tower starts the next at its next
+# idle moment rather than at its next start.
 DEFAULT_MAX_WORLDS = 1
+
+# "I finished what I was allowed to, and another world is still owed." Its
+# twin is `tower/main.py`'s `CHORE_EXIT_MORE_OWED`; a test holds them equal.
+EXIT_MORE_OWED = 3
+
+# "A world I might owe work to is being written by somebody else right now."
+# The Tower reads anything but 0 and 3 as "try again after a backoff", which
+# is what this wants: not nothing-to-do, and not a spawn every tick while a
+# foreign writer holds the lock.
+EXIT_WAITING = 4
+WAITING_CODES = ("locked", "building-now")
 
 # Where the attempt counter lives. Beside the world rather than on the
 # session record, because it is THIS TOOL's bookkeeping and not a fact about
@@ -285,6 +301,12 @@ def _read_ledger(store: WorldStore, world_id: str) -> tuple[dict, bool]:
         return {}, True
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):
         return {}, True
+    # Every ENTRY too. An entry that is not an object used to reach
+    # `_counter`'s `entry.get` and raise out of `survey` -- one malformed
+    # line took down the survey of EVERY world on the Tower, not just its
+    # own (adversarial review, 2026-09-23).
+    if not all(isinstance(entry, dict) for entry in data["sessions"].values()):
+        return {}, True
     return data["sessions"], False
 
 
@@ -360,7 +382,18 @@ def record_attempt(
     bound never advanced. The caller refuses the work instead.
     """
     with _LEDGER_LOCK:
-        sessions, _ = _read_ledger(store, world_id)
+        sessions, unreadable = _read_ledger(store, world_id)
+        if unreadable:
+            # AN UNREADABLE LEDGER IS SET ASIDE, NOT OBEYED FOR EVER. It used
+            # to make `assess` refuse the world permanently while the serving
+            # path, reading the stage record, called it `owed` -- "Improving"
+            # with nothing that would ever end it (two reviewers, 2026-09-23).
+            # Now it is moved beside itself, untouched, and counting starts
+            # again from this attempt: the retry bound still applies, from
+            # here. Called under the world's writer lock, so nothing else is
+            # writing it.
+            _set_aside_unreadable_ledger(store, world_id)
+            sessions = {}
         sessions = dict(sessions)
         # THE ENTRY IS EDITED, NOT REPLACED. It used to be rewritten whole,
         # which was harmless while `attempts` was the only number in it and
@@ -377,6 +410,20 @@ def record_attempt(
         sessions[session_id] = entry
         _write_ledger(store, world_id, sessions)
     return count
+
+
+def _set_aside_unreadable_ledger(store: WorldStore, world_id: str) -> None:
+    """Move an unreadable ledger out of the way, keeping it for a human."""
+    path = _attempts_path(store, world_id)
+    if not path.exists():
+        return
+    aside = path.with_name(f"{path.stem}.unreadable-{int(time.time())}{path.suffix}")
+    os.replace(path, aside)
+    logger.warning(
+        "[Tower][WorldBuilder] the finish ledger for %s was unreadable; it was "
+        "moved to %s and counting starts again from this attempt",
+        world_id, aside.name,
+    )
 
 
 def forgive_attempt(
@@ -514,13 +561,6 @@ def interrupted_stage_on_disk(store: WorldStore, world_id: str,
     helper the surface pipeline itself publishes, rather than by a pid check
     invented here.
     """
-    # Lazily, like every other consumer of this module: `surface_pipeline`
-    # pulls in the whole reconstruction stack, and the common answer here is
-    # "there is no such file".
-    from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
-        status_is_stale,
-    )
-
     for stage in PHOTOGRAPHIC_STAGES:
         status = _stage_status(store, world_id, session_id, stage)
         if status is None:
@@ -528,8 +568,18 @@ def interrupted_stage_on_disk(store: WorldStore, world_id: str,
         state = status.get("state")
         if state == STAGE_STATE_STOPPED:
             return stage
-        if state == STAGE_STATE_RUNNING and status_is_stale(status):
-            return stage
+        if state == STAGE_STATE_RUNNING:
+            # Lazily, and ONLY HERE: `surface_pipeline` pulls in the whole
+            # reconstruction stack, and the answer for almost every session is
+            # "there is no such file". Imported up front, a module that failed
+            # to import took down the judgement of every historical world
+            # rather than of the one session with a `running` status to judge.
+            from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+                status_is_stale,
+            )
+
+            if status_is_stale(status):
+                return stage
     return None
 
 
@@ -675,11 +725,10 @@ def assess(
 
     attempts = read_attempts(store, world_id, session_id)
     if attempts is None:
-        return no(
-            "ledger-unreadable",
-            "this tool's attempt ledger for this world is unreadable, so it "
-            "cannot tell a first attempt from a hundredth"
-        )
+        # Owed, not refused: `record_attempt` sets the unreadable ledger aside
+        # under the world's lock and counts from there, so the bound still
+        # holds. Refusing here was "Improving" for ever on the phone.
+        attempts = 0
     if attempts >= max_attempts:
         return no(
             "attempt-bound",
@@ -719,7 +768,22 @@ def survey(store: WorldStore, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> li
     verdicts = []
     for world_id in store.list_world_ids():
         for session_id in store.list_session_ids(world_id):
-            verdicts.append(assess(store, world_id, session_id, max_attempts=max_attempts))
+            try:
+                verdicts.append(
+                    assess(store, world_id, session_id, max_attempts=max_attempts))
+            except Exception as exc:  # noqa: BLE001 -- one session, not the root
+                # ONE SESSION'S PROBLEM STAYS ONE SESSION'S. An exception here
+                # used to end the whole survey, so every owed world on the
+                # Tower waited on the one that could not be read.
+                logger.warning(
+                    "[Tower][WorldBuilder] could not assess %s/%s: %s: %s",
+                    world_id, session_id, type(exc).__name__, exc,
+                )
+                verdicts.append(Verdict(
+                    world_id, session_id, False,
+                    f"this session could not be assessed: {type(exc).__name__}: {exc}",
+                    code="assess-error",
+                ))
     return verdicts
 
 
@@ -876,6 +940,13 @@ def finish(
                 max_forgiven=max_forgiven,
             ),
         )
+        # THE WARM, AFTER THE ATTEMPT IS COUNTED. It is the native imports and
+        # the CUDA attach -- exactly the class of work that hung on 2026-09-22
+        # -- and it used to run before `record_attempt`, so a hang in it was a
+        # stall the Tower could kill but the ledger never counted: retried
+        # for ever, never retired (review, 2026-09-23). Since
+        # `tower/stdin_stop.py` it no longer has to precede the stop watcher.
+        prewarm_world_builder()
         report["stages"] = final_surface_stages(
             store, verdict.world_id, verdict.session_id,
             # Guaranteed by `assess`: a session is not owed unless its
@@ -1029,26 +1100,41 @@ def main(argv=None, *, stop_request=None) -> int:
     has_work = any(v.owed or v.exhausted for v in verdicts)
     if not has_work:
         _emit(report, args.format)
-        return 0
+        # Nothing THIS run can do -- but a world held by another writer may
+        # still owe work once that writer lets go. See `EXIT_WAITING`.
+        return EXIT_WAITING if any(v.code in WAITING_CODES for v in verdicts) else 0
 
     if stop_request is None:
-        prewarm_world_builder()
+        # The native warm is in `finish`, after the attempt is counted; the
+        # watcher no longer has to wait for it (`tower/stdin_stop.py`).
         stop_request = StopRequest()
         stop_request.install(watch_stdin=args.stop_on_stdin_close)
     should_stop = stop_request.asked_for
 
+    retire_failures = 0
+    retire_waiting = 0
     for verdict in verdicts:
         if not verdict.exhausted or should_stop():
             continue
         try:
-            report["retired"].append(_retire(store, verdict, args.max_attempts))
+            retired = _retire(store, verdict, args.max_attempts)
+            report["retired"].append(retired)
+            reason = retired.get("reason") or ""
+            if retired.get("retired") is None and not reason.startswith("no longer"):
+                # Not retired and not moot. A live writer holding the lock is
+                # WAITING -- try again later; anything else went wrong.
+                if "WorldLockedError" in reason:
+                    retire_waiting += 1
+                else:
+                    retire_failures += 1
         except Exception as exc:  # noqa: BLE001 -- a record is not worth an exit
+            retire_failures += 1
             logger.warning(
                 "[Tower][WorldBuilder] could not retire %s/%s: %s",
                 verdict.world_id, verdict.session_id, exc,
             )
 
-    failures = 0
+    failures = retire_failures
     done = 0
     # ONE AT A TIME, and the stop checked between each. A run asked to stop
     # between two worlds stops there rather than starting a second
@@ -1075,7 +1161,16 @@ def main(argv=None, *, stop_request=None) -> int:
             failures += 1
 
     _emit(report, args.format)
-    return 1 if failures else 0
+    if failures:
+        return 1
+    if "bounded_at" in report:
+        return EXIT_MORE_OWED
+    if retire_waiting or any(v.code in WAITING_CODES for v in verdicts):
+        # Somebody else is writing a world this run would otherwise have
+        # looked at -- a hand-run tool, another Tower on the same root. Not
+        # nothing-to-do: the Tower tries again later, after a backoff.
+        return EXIT_WAITING
+    return 0
 
 
 def _emit(report: dict, fmt: str) -> None:

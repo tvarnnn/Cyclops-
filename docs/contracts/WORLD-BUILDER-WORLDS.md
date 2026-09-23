@@ -91,7 +91,7 @@ between stages rather than false in them.
 |---|---|---|
 | `complete` | the appearance stage finished; the photographic room exists | unchanged (`complete` on an ordinary walk) |
 | `running` | a stage is running under a live process | `finalizing` |
-| `owed` | unfinished, nothing working on it; the Tower finishes owed work at its next start | `finalizing` |
+| `owed` | unfinished, nothing working on it; the Tower finishes owed work the next time it is idle (no stream open, no capture worker alive), and at every start | `finalizing` |
 | `failed` | a stage ran and failed. **Terminal** — nothing more is coming | unchanged (`complete`): the world is saved, at whatever rung it reached |
 | `unattempted` | the stages declined (no global solve, or the Tower's appearance setting is off) | unchanged |
 | `never_recorded` | a world from before the photographic stages existed | unchanged |
@@ -114,7 +114,7 @@ is `complete`, `final_solve` is `solved`, the derived tree is on disk and the
 render route (§4) serves it. What failed is the photographic room on top of
 it. `finalizing` would tell the wearer to wait, and waiting does not fix a
 stage that ran and raised — `world_finish_pending.py` picks up the
-INTERRUPTED stages at the next Tower start, not the failed ones.
+INTERRUPTED stages the next time the Tower is idle, not the failed ones.
 `interrupted` was the other tempting answer and it is worse: it is defined
 above as a claim about the CAPTURE and the SOLVE, both of which succeeded
 here, so it would tell the wearer their walk was lost. The word never claims
