@@ -53,28 +53,116 @@ import math
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 COLMAP_PAIR_BASE = 2147483647
-# COLMAP TwoViewGeometry::ConfigurationType
+# COLMAP TwoViewGeometry::ConfigurationType, integer values as pycolmap 4.2
+# reports them (`pycolmap.TwoViewGeometryConfiguration`; note CALIBRATED_RIG
+# is 9, not 3).
 TWO_VIEW_CONFIG = {
     0: "undefined", 1: "degenerate", 2: "calibrated", 3: "uncalibrated",
     4: "planar", 5: "panoramic", 6: "planar_or_panoramic", 7: "watermark",
-    8: "multiple",
+    8: "multiple", 9: "calibrated_rig",
 }
-# A verified pair in the sense GLOMAP's view graph uses by default.
+
+# WHAT "VERIFIED" MEANS IN THIS MODULE, stated because every connectivity
+# number (cut strength, island links, revisit pairs) depends on it.
+#
+# A pair is verified when its stored two-view geometry has at least
+# `MIN_VERIFIED_INLIERS` inlier matches AND its configuration is not in
+# `UNVERIFIED_CONFIGS`. 15 is pycolmap's `GlobalPipelineOptions.min_num_matches`
+# default (checked on pycolmap 4.2.0), the floor below which GLOMAP does not
+# admit a pair to its view graph; global_solve.solve does not change it.
+# UNDEFINED and DEGENERATE carry no geometry. WATERMARK is counted as verified
+# because `GlobalPipelineOptions.ignore_watermarks` defaults to False, i.e.
+# the solver uses those pairs too. This mirrors the solver's admission as far
+# as its options expose it; it does not reproduce GLOMAP's later view-graph
+# filtering (rotation-averaging outlier removal at max_rotation_error_deg=10).
+#
+# Measured on the three frozen worlds of the 2026-09-23 run: every pair with
+# >= 15 inliers has config 2, 3, 6 or 7, and every config-0 pair has 0 rows,
+# so the config clause changes nothing there -- it is explicit so that it
+# cannot silently start mattering.
 MIN_VERIFIED_INLIERS = 15
+UNVERIFIED_CONFIGS = frozenset({0, 1})
 # global_solve.MIN_IMAGE_OBSERVATIONS, restated so this module can be read
-# without importing the builder; `load_world` checks the two agree when the
-# builder is importable.
+# without importing the builder; `check_builder_constants()` compares the two.
 MIN_IMAGE_OBSERVATIONS = 30
 # Sequential matching window (global_solve.SEQUENTIAL_OVERLAP); pairs further
 # apart than this in keyframe order can only have come from loop detection.
 SEQUENTIAL_OVERLAP = 20
+
+
+def check_builder_constants() -> list[str]:
+    """Differences between the constants restated here and the builder's.
+
+    Returns human-readable mismatch strings (empty when they agree, or when
+    the builder cannot be imported -- then nothing can be compared)."""
+    try:
+        from tower.world_builder import global_solve
+    except Exception:  # noqa: BLE001 -- a missing builder is "cannot compare"
+        return []
+    out = []
+    for name in ("MIN_IMAGE_OBSERVATIONS", "SEQUENTIAL_OVERLAP"):
+        theirs = getattr(global_solve, name, None)
+        if theirs is not None and theirs != globals()[name]:
+            out.append(f"{name}: trace {globals()[name]} != global_solve {theirs}")
+    return out
+
+
+def decode_pair_id(pair_id: int) -> tuple[int, int]:
+    """COLMAP pair_id -> (image_id1, image_id2), image_id1 < image_id2.
+
+    COLMAP encodes pair_id = image_id1 * 2147483647 + image_id2 with the
+    smaller id first (Database::ImagePairToPairId)."""
+    pair_id = int(pair_id)
+    id2 = pair_id % COLMAP_PAIR_BASE
+    id1 = (pair_id - id2) // COLMAP_PAIR_BASE
+    return id1, id2
+
+
+def is_verified(inliers, config, min_inliers: int = MIN_VERIFIED_INLIERS,
+                unverified_configs=UNVERIFIED_CONFIGS):
+    """Vectorised 'verified' predicate; see the comment on MIN_VERIFIED_INLIERS."""
+    inliers = np.asarray(inliers)
+    config = np.asarray(config)
+    return (inliers >= min_inliers) & ~np.isin(config, list(unverified_configs))
+
+
+class StaleDatabaseError(RuntimeError):
+    """The database has a non-empty write-ahead log that immutable=1 would ignore."""
+
+
+def open_database_readonly(db_path, *, on_nonempty_wal: str = "refuse") -> sqlite3.Connection:
+    """Open a COLMAP database strictly read-only, and never create side files.
+
+    ALWAYS ``mode=ro&immutable=1``. Plain ``mode=ro`` on a WAL-mode database
+    CREATES ``-wal`` and ``-shm`` beside it (measured on a copy of the target
+    database: `mode=ro` left both files, `immutable=1` left none) -- which is
+    how side files appeared next to the frozen evidence. ``immutable=1``,
+    however, also means SQLite will not read a ``-wal`` that already holds
+    committed-but-uncheckpointed pages, e.g. from a solve that was killed: the
+    reader silently sees an OLD database. So a non-empty ``-wal`` is refused
+    (default) or warned about (``on_nonempty_wal="warn"``); it is never
+    silently ignored. An empty ``-wal`` carries nothing and is harmless.
+    """
+    import logging
+
+    path = Path(db_path).resolve()
+    wal = path.with_name(path.name + "-wal")
+    if wal.exists() and wal.stat().st_size > 0:
+        message = (f"{wal} is non-empty ({wal.stat().st_size} bytes): an immutable read-only open "
+                   f"would ignore it and read a stale database. Checkpoint it in a COPY "
+                   f"(e.g. sqlite3 <copy> 'PRAGMA wal_checkpoint') and point this at the copy.")
+        if on_nonempty_wal == "warn":
+            logging.getLogger(__name__).warning(message)
+        else:
+            raise StaleDatabaseError(message)
+    return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +482,12 @@ def rerun_live_chain(paths: WorldPaths, keyframes: list[dict], session: dict) ->
 class PairGraph:
     """Read-only view of `database.db`, keyed by keyframe order index."""
 
-    def __init__(self, db_path: Path, index_by_name: dict[str, int]):
-        uri = Path(db_path).resolve().as_uri() + "?mode=ro&immutable=1"
-        self.con = sqlite3.connect(uri, uri=True)
+    def __init__(self, db_path: Path, index_by_name: dict[str, int], *,
+                 min_inliers: int = MIN_VERIFIED_INLIERS, unverified_configs=UNVERIFIED_CONFIGS,
+                 on_nonempty_wal: str = "refuse"):
+        self.con = open_database_readonly(db_path, on_nonempty_wal=on_nonempty_wal)
+        self.min_inliers = int(min_inliers)
+        self.unverified_configs = frozenset(unverified_configs)
         self.index_by_name = index_by_name
         self.image_index = {}
         for image_id, name in self.con.execute("select image_id, name from images"):
@@ -411,8 +502,7 @@ class PairGraph:
         rows = []
         raw = {pid: r for pid, r in self.con.execute("select pair_id, rows from matches")}
         for pid, nrows, cfg in self.con.execute("select pair_id, rows, config from two_view_geometries"):
-            id2 = pid % COLMAP_PAIR_BASE
-            id1 = (pid - id2) // COLMAP_PAIR_BASE
+            id1, id2 = decode_pair_id(pid)
             if id1 not in self.image_index or id2 not in self.image_index:
                 continue
             a, b = self.image_index[id1], self.image_index[id2]
@@ -424,7 +514,8 @@ class PairGraph:
         if len(self.pairs):
             self.pairs["gap"] = self.pairs["b"] - self.pairs["a"]
             self.pairs["config_name"] = self.pairs["config"].map(TWO_VIEW_CONFIG)
-            self.pairs["verified"] = self.pairs["inliers"] >= MIN_VERIFIED_INLIERS
+            self.pairs["verified"] = is_verified(self.pairs["inliers"], self.pairs["config"],
+                                                 self.min_inliers, self.unverified_configs)
         self._by_ab = {(int(r.a), int(r.b)): r for r in self.pairs.itertuples(index=False)}
 
     def keypoints(self, image_id: int) -> np.ndarray:
@@ -462,6 +553,13 @@ class PairGraph:
         planar/panoramic pairs a homography, whose rotation K^-1 H K is exact
         for a pure rotation (reported as model 'H', translation unknown).
         Returns dict(model, R, t (unit or None), n) or None.
+
+        APPROXIMATION, stated: K^-1 H K projected to SO(3) is the rotation only
+        when the pair is a pure rotation. For a PLANAR pair with real
+        translation it is R + t n^T / d, and the projection is biased by the
+        plane-induced term; COLMAP's config does not say which of the two a
+        PLANAR_OR_PANORAMIC pair is. Treat H-model errors of a few degrees as
+        estimator noise, not solver disagreement.
         """
         import cv2
 
@@ -490,7 +588,23 @@ class PairGraph:
 # The per-keyframe table.
 
 
-EDT = timezone(timedelta(hours=-4))
+def wallclock_columns(epochs) -> tuple[list[str], list[str]]:
+    """Receipt times as (UTC ISO strings, host-local strings WITH their offset).
+
+    Local time is the host's zone at that instant (`datetime.astimezone()`),
+    labelled with its UTC offset so a reader never has to guess the zone; the
+    UTC column is the unambiguous one. Replaces a hard-coded EDT (UTC-4)."""
+    utc, local = [], []
+    for v in epochs:
+        if v is None or not np.isfinite(v):
+            utc.append(None)
+            local.append(None)
+            continue
+        u = datetime.fromtimestamp(float(v), timezone.utc)
+        utc.append(u.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-4] + "Z")
+        loc = u.astimezone()
+        local.append(loc.strftime("%H:%M:%S.%f")[:-4] + loc.strftime(" %z"))
+    return utc, local
 
 
 def _solution_poses(solution: dict, keyframe_ids: list[str]):
@@ -662,7 +776,7 @@ def load_keyframe_table(world_dir, session_id: str | None = None, *, captures_ro
         frames = load_capture_frames([Path(c) for c in capture_dirs])
     walk_start = float(frames["received_at"].iloc[0]) if frames is not None and len(frames) else float(T["received_at"].iloc[0])
     T["t_s"] = T["received_at"] - walk_start
-    T["wallclock_edt"] = [datetime.fromtimestamp(v, EDT).strftime("%H:%M:%S.%f")[:-4] for v in T["received_at"]]
+    T["wallclock_utc"], T["wallclock_local"] = wallclock_columns(T["received_at"])
     ctx["walk_start"] = walk_start
     if frames is not None and len(frames):
         pos = {round(float(v), 6): int(i) for i, v in zip(frames["frame_index"], frames["received_at"])}
@@ -674,19 +788,37 @@ def load_keyframe_table(world_dir, session_id: str | None = None, *, captures_ro
             acc = replayed.index[replayed["outcome"] == "accept"].to_numpy()
             ctx["replay_matches_journal"] = bool(len(acc) == n and np.array_equal(acc, T["capture_frame_index"].to_numpy()))
             ctx["replay_histogram"] = dict(Counter(replayed.loc[replayed["outcome"] != "accept", "reason"]))
-        gap_total, gap_reasons, gap_sec, gap_drop, gap_lost = [], [], [], [], []
+        # A keyframe whose receipt time matches no capture frame (a journal
+        # written from frames this capture does not hold) gets NO gap figures
+        # -- not figures invented from a guessed position. It is flagged, and
+        # the next matched keyframe's gap is measured from the last MATCHED
+        # one and flagged as spanning it.
+        T["capture_frame_matched"] = T["capture_frame_index"].notna()
+        ctx["unmatched_keyframes"] = int((~T["capture_frame_matched"]).sum())
+        gap_total, gap_reasons, gap_sec, gap_drop, spans = [], [], [], [], []
         prev = -1
         prev_seq = None
         prev_t = walk_start
+        skipped = False
         for i in range(n):
             ci = T["capture_frame_index"].iloc[i]
-            ci = int(ci) if np.isfinite(ci) else prev + 1
+            if not np.isfinite(ci):
+                gap_total.append(np.nan)
+                gap_reasons.append(None)
+                gap_sec.append(np.nan)
+                gap_drop.append(np.nan)
+                spans.append(False)
+                skipped = True
+                continue
+            ci = int(ci)
+            spans.append(skipped)
+            skipped = False
             gap_total.append(ci - prev - 1)
             if replayed is not None:
-                seg = replayed.iloc[prev + 1:ci]
-                c = Counter(seg["reason"])
+                c = Counter(replayed.iloc[prev + 1:ci]["reason"])
                 gap_reasons.append(";".join(f"{k}:{v}" for k, v in sorted(c.items())))
-                gap_lost.append(int(c.get("tracking_lost", 0)))
+            else:
+                gap_reasons.append(None)
             seq = frames["source_seq"].iloc[ci]
             cap = frames["capture_id"].iloc[ci]
             if prev_seq is not None and prev >= 0 and frames["capture_id"].iloc[prev] == cap:
@@ -698,11 +830,13 @@ def load_keyframe_table(world_dir, session_id: str | None = None, *, captures_ro
         T["gap_frames_rejected"] = gap_total
         T["gap_seconds"] = gap_sec
         T["gap_frames_never_delivered"] = gap_drop
+        T["gap_spans_unmatched_keyframe"] = spans
         if replayed is not None:
             T["gap_reject_reasons"] = gap_reasons
             for r in ("blurred", "insufficient_motion", "tracking_degraded", "tracking_lost",
                       "no_motion_evidence", "tracking_held"):
-                T[f"gap_{r}"] = [int(dict(x.split(":") for x in s.split(";") if x).get(r, 0)) for s in gap_reasons]
+                T[f"gap_{r}"] = [np.nan if s is None else int(dict(x.split(":") for x in s.split(";") if x).get(r, 0))
+                                 for s in gap_reasons]
     else:
         T["gap_seconds"] = T["received_at"].diff().fillna(T["received_at"].iloc[0] - walk_start)
 
@@ -902,7 +1036,7 @@ def load_keyframe_table(world_dir, session_id: str | None = None, *, captures_ro
             cols["db_max_inliers_back20"].append(back.get(i, 0))
             cols["db_verified_back"].append(int(vb.get(i, 0)))
             cols["db_loop_verified"].append(int(loop_count.get(i, 0)))
-            rel = graph.relative_pose(i - 1, i) if (p is not None and p.inliers >= MIN_VERIFIED_INLIERS) else None
+            rel = graph.relative_pose(i - 1, i) if (p is not None and bool(p.verified)) else None
             if rel is None:
                 for c in ("tv_model", "tv_rot_deg", "tv_vs_g_rot_err_deg", "tv_vs_g_tdir_err_deg", "tv_vs_live_rot_err_deg"):
                     cols[c].append(None if c == "tv_model" else np.nan)
@@ -959,8 +1093,7 @@ def load_keyframe_table(world_dir, session_id: str | None = None, *, captures_ro
         p = plc.get(int(T["segment_id"].iloc[i]))
         if row is None or row.get("translation") is None or p is None or p.get("state") != "registered":
             continue
-        R = quat_wxyz_to_R(p["rotation_wxyz"])
-        pw[i] = float(p["scale"]) * R @ np.asarray(row["translation"], float) + np.asarray(p["translation"], float)
+        pw[i] = compose_placement(p, row["translation"])
     T["pub_ref_Cx"], T["pub_ref_Cy"], T["pub_ref_Cz"] = pw[:, 0], pw[:, 1], pw[:, 2]
     T["pub_drawn_in_main_frame"] = [
         (T["placement_state"].iloc[i] == "registered" and np.isfinite(pw[i]).all()
@@ -1094,6 +1227,19 @@ def track_cut(T: pd.DataFrame, ctx: dict, solution: dict) -> np.ndarray:
     return np.cumsum(diff)[:n]
 
 
+def compose_placement(placement: dict, local_xyz, local_rotation_wxyz=None):
+    """Map a segment-local point (or camera centre) into the placement's
+    reference frame: X_ref = scale * R(q) @ X_seg + t -- the store's own rule
+    (render.py module docstring, WorldGeometry.swift). With a local rotation
+    (T_world_camera quaternion) also returns R_ref_camera = R(q) @ R_local.
+    Only meaningful for a `registered` placement."""
+    R = quat_wxyz_to_R(placement["rotation_wxyz"])
+    x = float(placement["scale"]) * R @ np.asarray(local_xyz, float) + np.asarray(placement["translation"], float)
+    if local_rotation_wxyz is None:
+        return x
+    return x, R @ quat_wxyz_to_R(local_rotation_wxyz)
+
+
 def _main_reference(placements: list[dict], gseg: dict):
     counts = Counter(p.get("reference_segment") for p in placements if p.get("state") == "registered")
     return counts.most_common(1)[0][0] if counts else None
@@ -1198,10 +1344,14 @@ def segment_table(T: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 
 def _live_R(ctx, keyframe_id):
-    lr = ctx.get("_live_R")
-    if lr is None:
-        return None
-    return lr.get(keyframe_id)
+    """The re-run live chain's R_world_camera for a keyframe, or None.
+
+    Read from `ctx["_live_R_store"]`, which `load_keyframe_table` fills when
+    `live_chain=True`. (It used to read a key only `run_trace` set, so a
+    direct `segment_table(T, ctx)` call silently lost its orientation
+    columns.) A caller building a context by hand supplies the same key."""
+    store = ctx.get("_live_R_store") or {}
+    return store.get(keyframe_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1954,9 +2104,6 @@ def run_trace(world_dir, out_dir, *, session_id=None, captures_root=None, captur
                                  return_context=True)
     paths = ctx["paths"]
     tag = tag or paths.world_id[:8]
-    # live-chain rotations for the Sim3 rotation residual
-    if live_chain:
-        ctx["_live_R"] = _live_rotations(T, ctx)
     S = segment_table(T, ctx)
     solution = load_solution(paths)
     if pairs and ctx.get("graph") is not None and solution is not None:
@@ -2021,6 +2168,11 @@ def run_trace(world_dir, out_dir, *, session_id=None, captures_root=None, captur
         "main_component": ctx.get("main_component"),
         "up": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in (ctx.get("up") or {}).items()},
         "robust_extent_p95": ctx.get("robust_extent"),
+        "unmatched_keyframes": ctx.get("unmatched_keyframes"),
+        "verified_pair_rule": {"min_inliers": MIN_VERIFIED_INLIERS,
+                               "unverified_configs": sorted(TWO_VIEW_CONFIG[c] for c in UNVERIFIED_CONFIGS)},
+        "builder_constant_mismatches": check_builder_constants(),
+        "walk_start_utc": wallclock_columns([ctx["walk_start"]])[0][0],
     }
     if "replay" in ctx:
         ctx["replay"].to_csv(out_dir / f"frames_{tag}.csv", index=False)
@@ -2032,11 +2184,6 @@ def run_trace(world_dir, out_dir, *, session_id=None, captures_root=None, captur
     with open(out_dir / f"summary_{tag}.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, default=str)
     return {"table": T, "segments": S, "context": ctx, "summary": summary}
-
-
-def _live_rotations(T, ctx):
-    """Recover the live R_wc per keyframe from the re-run (kept on the context)."""
-    return ctx.get("_live_R_store", {})
 
 
 def _pair_plot(PC: pd.DataFrame, T: pd.DataFrame, out_dir: Path, tag: str) -> None:
