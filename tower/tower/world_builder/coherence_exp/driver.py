@@ -963,6 +963,10 @@ def metric_log_tri(model: gate_mod.SeedModel, staging: dict, world_dir, metric_c
     return out, info
 
 
+# read_link_rotations per (database, configs, floor): one estimate serves the ensemble gate and every seed's.
+_LINK_ROTATIONS: dict = {}
+
+
 def gate_inputs(gp: gate_mod.GateParams, models: list, staging: dict, world_dir, database_path,
                 metric_cache) -> tuple[dict, dict]:
     """Keyword arguments for `gate.apply_rigid_gate` beyond (models, params), and a record of them.
@@ -972,10 +976,21 @@ def gate_inputs(gp: gate_mod.GateParams, models: list, staging: dict, world_dir,
     (`metric_log`, the reference model's TRI ratio; `metric_log_tri`)."""
     if gp.rule != "evidence":
         return {}, {"rule": gp.rule}
-    links = gate_mod.read_verified_links(database_path, min_inliers=gp.min_link_inliers)
+    exclude = gate_mod.NOT_VERIFIED_CONFIGS + ((gate_mod.UNCALIBRATED_CONFIG,) if gp.exclude_uncalibrated_links
+                                             else ())
+    links = gate_mod.read_verified_links(database_path, min_inliers=gp.min_link_inliers, exclude_configs=exclude)
     metric_log, minfo = metric_log_tri(models[0], staging, world_dir, metric_cache)
-    return ({"links": links, "metric_log": metric_log},
+    extra = {"links": links, "metric_log": metric_log}
+    if gp.max_link_disagreement_deg is not None:
+        key = (str(database_path), exclude, gp.min_link_inliers)
+        if key not in _LINK_ROTATIONS:
+            _LINK_ROTATIONS[key] = gate_mod.read_link_rotations(database_path, staging["camera"],
+                                                                min_inliers=gp.min_link_inliers,
+                                                                exclude_configs=exclude)
+        extra["link_rotations"] = _LINK_ROTATIONS[key]
+    return (extra,
             {"rule": gp.rule, "links": len(links), "links_min_inliers": gp.min_link_inliers,
+             "links_excluded_configs": list(exclude),
              "database": str(database_path), "metric_log": minfo})
 
 

@@ -133,6 +133,26 @@ class GateParams:
     # evidence rule: a verified pair counts as a link at COLMAP's verification
     # floor (two_view_geometry min_num_inliers; bridge.MIN_VERIFIED_INLIERS).
     min_link_inliers: int = 15
+    # evidence rule: drop UNCALIBRATED two-view geometries (COLMAP config 3) from the links. The cameras are
+    # calibrated; COLMAP labels a pair UNCALIBRATED when the essential matrix explains clearly fewer of its
+    # matches than a fundamental matrix, i.e. the matches do not fit the known camera. On the control their
+    # rotation disagrees with the solve by p95 47 deg (CALIBRATED: 14). 6839fb8f kf 92-98 (misplaced 88-113
+    # deg) was attached by four such links, 15-18 inliers each, every one contradicted by the solve by
+    # 34-96 deg (RUN/experiments/P2-LM/gatefix/b6839_links.json).
+    exclude_uncalibrated_links: bool = False
+    # evidence rule: attach a group only when its metric level is MEASURED and matches (scale_levels_differ
+    # False). Default False keeps the lenient reading: a group whose level cannot be measured (fewer than
+    # scale_min_cameras TRI ratios on a side) passes the scale test. On 2f447162 that let a 14-keyframe
+    # island at scale x0.02-0.04, 37-41 deg tilt and ~1 m height error attach on two links alone.
+    require_group_scale: bool = False
+    # evidence rule: a verified link is evidence only when the solve HONOURS it -- its own two-view rotation
+    # (COLMAP's pose for the pair's stored geometry, `read_link_rotations`) is within this many degrees of the
+    # reference model's relative rotation. None = off. A link the solve contradicts is not evidence that the
+    # solve placed the pair right: 6839fb8f kf 92-98 (misplaced 88-113 deg) was attached and held by links the
+    # solve contradicts by 34-96 deg. The bound is the CONTROL's: p95 of link-vs-solve disagreement over all
+    # b2a75ab4 links, 25.2 deg (p90 16.8). GT's 24 cases, masked arms: 6839 7 -> 0 misplaced attached, control
+    # and target unchanged (RUN/experiments/P2-LM/gatefix/gt_agree.txt).
+    max_link_disagreement_deg: float | None = None
     # evidence rule: a metric scale step / mismatch beyond this factor splits
     # (harness PLAUSIBILITY scale_max_factor: MoGe's per-image error is a few
     # %, region bias ~10 %; x1.25 is a reconstruction error, not noise).
@@ -312,7 +332,7 @@ def group_spread(models: list[SeedModel], ref_group_names, group_names, ext: flo
 
 
 def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None, *,
-                     links=None, metric_log=None) -> dict:
+                     links=None, metric_log=None, link_rotations=None) -> dict:
     """Final component per camera of the reference seed (models[0]).
 
     Returns {"labels": {name: int}, "components": [...], "rounds": [...],
@@ -322,7 +342,7 @@ def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None, 
     `apply_evidence_gate`)."""
     params = params or GateParams()
     if params.rule == "evidence":
-        return apply_evidence_gate(models, params, links=links, metric_log=metric_log)
+        return apply_evidence_gate(models, params, links=links, metric_log=metric_log, link_rotations=link_rotations)
     ref = models[0]
     M = incidence(ref)
     C = shared_counts(M)
@@ -422,10 +442,10 @@ def _finish(ref: SeedModel, labels: np.ndarray, supported: np.ndarray, rounds: l
 # the evidence rule
 
 
-def read_verified_links(database_path, min_inliers: int = 15) -> dict:
+def read_verified_links(database_path, min_inliers: int = 15, exclude_configs=(0, 1)) -> dict:
     """{(name_a, name_b) sorted: inliers} for every verified two-view geometry of a COLMAP database
-    (config not UNDEFINED / DEGENERATE, >= `min_inliers` inliers). Opened read-only and immutable, so a
-    frozen database is never touched."""
+    (config not in `exclude_configs` -- default UNDEFINED / DEGENERATE -- and >= `min_inliers` inliers).
+    Opened read-only and immutable, so a frozen database is never touched."""
     import sqlite3
     from pathlib import Path
 
@@ -435,7 +455,7 @@ def read_verified_links(database_path, min_inliers: int = 15) -> dict:
         names = dict(con.execute("select image_id, name from images").fetchall())
         out = {}
         for pid, rows, config in con.execute("select pair_id, rows, config from two_view_geometries"):
-            if config in (0, 1) or rows < min_inliers:
+            if config in exclude_configs or rows < min_inliers:
                 continue
             b = int(pid) % _COLMAP_PAIR_BASE
             a = (int(pid) - b) // _COLMAP_PAIR_BASE
@@ -446,7 +466,57 @@ def read_verified_links(database_path, min_inliers: int = 15) -> dict:
         con.close()
 
 
+def read_link_rotations(database_path, camera: dict, min_inliers: int = 15, exclude_configs=(0, 1)) -> dict:
+    """{(name_a, name_b): R_b_from_a} for every verified pair: COLMAP's own relative pose for the pair's stored
+    geometry and inliers (`pycolmap.estimate_two_view_geometry_pose`, which decomposes E or H by the pair's
+    configuration); `camera` is the single PINHOLE camera {fx, fy, cx, cy, width, height}. Pairs whose pose
+    cannot be recovered are absent. Read-only and immutable, like `read_verified_links`."""
+    import sqlite3
+    from pathlib import Path
+
+    import pycolmap
+
+    cam = pycolmap.Camera(model="PINHOLE", width=int(camera["width"]), height=int(camera["height"]),
+                          params=[camera["fx"], camera["fy"], camera["cx"], camera["cy"]])
+    uri = Path(database_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True)
+    try:
+        names = dict(con.execute("select image_id, name from images").fetchall())
+        kp: dict = {}
+
+        def keypoints(i):
+            if i not in kp:
+                r, c, d = con.execute("select rows, cols, data from keypoints where image_id=?", (i,)).fetchone()
+                kp[i] = np.frombuffer(d, np.float32).reshape(r, c)[:, :2].astype(np.float64)
+            return kp[i]
+
+        out = {}
+        for pid, rows, config, data, F, E, H in con.execute(
+                "select pair_id, rows, config, data, F, E, H from two_view_geometries"):
+            if config in exclude_configs or rows < min_inliers or data is None:
+                continue
+            b = int(pid) % _COLMAP_PAIR_BASE
+            a = (int(pid) - b) // _COLMAP_PAIR_BASE
+            if a not in names or b not in names:
+                continue
+            m = np.frombuffer(data, np.uint32).reshape(rows, 2)
+            tvg = pycolmap.TwoViewGeometry()
+            tvg.config = pycolmap.TwoViewGeometryConfiguration(int(config))
+            for attr, blob in (("F", F), ("E", E), ("H", H)):
+                if blob is not None:
+                    setattr(tvg, attr, np.frombuffer(blob, np.float64).reshape(3, 3))
+            tvg.inlier_matches = np.arange(rows, dtype=np.uint32).repeat(2).reshape(rows, 2)
+            if pycolmap.estimate_two_view_geometry_pose(cam, keypoints(a)[m[:, 0]], cam, keypoints(b)[m[:, 1]], tvg):
+                out[(names[a], names[b])] = np.asarray(tvg.cam2_from_cam1.rotation.matrix())
+        return out
+    finally:
+        con.close()
+
+
 _COLMAP_PAIR_BASE = 2147483647
+# COLMAP TwoViewGeometry configurations that are not link evidence for the gate.
+NOT_VERIFIED_CONFIGS = (0, 1)          # UNDEFINED, DEGENERATE
+UNCALIBRATED_CONFIG = 3
 
 
 def biconnected_blocks(adj: list[set]) -> list[set]:
@@ -599,7 +669,7 @@ def _scale_split(g: np.ndarray, R: np.ndarray, rank: np.ndarray, params: GatePar
 
 
 def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = None, *,
-                        links=None, metric_log=None) -> dict:
+                        links=None, metric_log=None, link_rotations=None) -> dict:
     """The evidence rule (module docstring). Cameras of the reference seed (models[0]).
 
     links: {(name_a, name_b): inliers} verified pairs (`read_verified_links`), or None.
@@ -625,15 +695,35 @@ def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = Non
         raise ValueError("the evidence gate needs metric_log (per-camera log(z_sfm / z_metric), e.g. the harness "
                          "TRI ratio) and should get links (read_verified_links); pass require_metric=False to run "
                          "without scale evidence")
+    honoured = None
+    if params.max_link_disagreement_deg is not None and links is not None:
+        if link_rotations is None:
+            raise ValueError("max_link_disagreement_deg needs link_rotations (read_link_rotations)")
+        honoured = set()
+        for (a, b), R_ba in dict(link_rotations).items():
+            ia, ib = idx.get(a), idx.get(b)
+            if ia is None or ib is None:
+                continue
+            R_solve = ref.R_cw[ib] @ ref.R_cw[ia].T
+            c = (np.trace(np.asarray(R_ba).T @ R_solve) - 1.0) / 2.0
+            if math.degrees(math.acos(min(1.0, max(-1.0, c)))) <= params.max_link_disagreement_deg:
+                honoured.add(tuple(sorted((a, b))))
     edges = []
+    n_contradicted = 0
     if links is not None:
         for (a, b), inl in dict(links).items():
             ia, ib = idx.get(a), idx.get(b)
             if ia is not None and ib is not None and ia != ib and inl >= params.min_link_inliers:
+                if honoured is not None and tuple(sorted((a, b))) not in honoured:
+                    n_contradicted += 1
+                    continue
                 edges.append((ia, ib))
     no_links = "unavailable: candidate groups = rigid groups at 3 shared points; redundancy not tested"
     evidence = {"links": (f"{len(edges)} verified pairs >= {params.min_link_inliers} inliers" if links is not None
                           else no_links),
+                "links_not_honoured": (None if honoured is None else
+                                       f"{n_contradicted} verified pairs set aside: the solve contradicts them by more "
+                                       f"than {params.max_link_disagreement_deg} deg, or their rotation is unknown"),
                 "metric_scale": (f"{int(np.isfinite(R).any(0).sum())} cameras, {len(maps)} estimator(s)"
                                  if have_metric else "unavailable: scale split / scale agreement not tested")}
     labels = np.full(ref.n, -1, dtype=np.int64)
@@ -692,7 +782,9 @@ def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = Non
                         lk, _ = _level(R[0], kept_idx)
                         if lg is not None and lk is not None:
                             d["scale_factor"] = math.exp(lg - lk)
-                        scale_ok = scale_levels_differ(R, kept_idx, g, params) is not True
+                        differ = scale_levels_differ(R, kept_idx, g, params)
+                        scale_ok = differ is False if params.require_group_scale else differ is not True
+                        d["scale_measured"] = differ is not None
                     d.update(stable=bool(stable), redundant=bool(redundant), scale_ok=bool(scale_ok))
                     if stable and redundant and coupled and scale_ok and len(cross) > best_n:
                         best, best_n = j, len(cross)
@@ -710,7 +802,10 @@ def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = Non
                 if not d.get("stable", True):
                     why.append(f"seed spread {d['spread']:.3f} > {params.max_spread}")
                 if not d.get("scale_ok", True):
-                    why.append(f"metric scale x{d.get('scale_factor', float('nan')):.2f} vs the kept groups")
+                    if d.get("scale_measured", True):
+                        why.append(f"metric scale x{d.get('scale_factor', float('nan')):.2f} vs the kept groups")
+                    else:
+                        why.append(f"metric scale not measurable (< {params.scale_min_cameras} cameras with a ratio)")
                 decisions.append({"group": int(g.min()), "kept": False, "why": "; ".join(why) or "not coupled"})
             ids = np.concatenate(kept)
             labels[ids] = next_label

@@ -122,3 +122,76 @@ def test_each_seed_is_gated_on_its_own(tmp_path, monkeypatch):
     assert all(set(g["report"]["labels"]) == set(m.names) for g, m in zip(out, models))
     src = open(D.__file__, encoding="utf-8").read()
     assert '"variant_gated"' in src and "BEFORE any gate" in src
+
+
+def test_uncalibrated_links_can_be_excluded_from_the_evidence(tmp_path, monkeypatch):
+    """6839fb8f kf 92-98 was attached by four UNCALIBRATED (config 3) links that the solve contradicts by
+    34-96 deg. With `exclude_uncalibrated_links` such links are not evidence, so a group they alone attach
+    is split off; the default keeps today's behaviour."""
+    links = ladder_links(cross=[(k, 30 + k, 50) for k in range(5)])
+    cross = {tuple(sorted((f"{k:06d}_k.jpg", f"{30 + k:06d}_k.jpg"))) for k in range(5)}
+    db = _db(tmp_path / "database.db", links)
+    con = sqlite3.connect(db)
+    ids = dict(con.execute("select name, image_id from images").fetchall())
+    for a, b in cross:
+        ia, ib = sorted((ids[a], ids[b]))
+        con.execute("update two_view_geometries set config = 3 where pair_id = ?", (ia * BASE + ib,))
+    con.commit()
+    con.close()
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    monkeypatch.setattr(D, "metric_log_tri", lambda *a: (metric(4.0, 4.0), {}))
+    for exclude, n_groups in ((False, 1), (True, 2)):
+        gp = G.GateParams(rule="evidence", min_obs=5, exclude_uncalibrated_links=exclude)
+        extra, info = D.gate_inputs(gp, models, {"images": []}, tmp_path, db, tmp_path)
+        assert (3 in info["links_excluded_configs"]) is exclude
+        out = G.apply_rigid_gate(models, gp, **extra)
+        assert len(set(out["labels"].values())) == n_groups, exclude
+
+
+def test_a_group_without_measurable_scale_attaches_only_under_the_lenient_reading(tmp_path, monkeypatch):
+    """2f447162: a 14-keyframe island at scale x0.02-0.04 attached on two links because its metric level
+    could not be measured, and the default reading lets an unmeasured group pass. `require_group_scale`
+    attaches a group only when its level is measured and matches."""
+    # B joins A through the cut vertex 30 (linked to 28 and 29): its own block, attached by a closed triangle
+    links = ladder_links(cross=[(29, 30, 50), (28, 30, 50)])
+    db = _db(tmp_path / "database.db", links)
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    only_a = {k: v for k, v in metric(4.0, 4.0).items() if int(k[:6]) <= 30}   # B's own cameras unmeasured
+    monkeypatch.setattr(D, "metric_log_tri", lambda *a: (only_a, {}))
+    for strict, n_groups in ((False, 1), (True, 2)):
+        gp = G.GateParams(rule="evidence", min_obs=5, require_group_scale=strict)
+        extra, _ = D.gate_inputs(gp, models, {"images": []}, tmp_path, db, tmp_path)
+        out = G.apply_rigid_gate(models, gp, **extra)
+        assert len(set(out["labels"].values())) == n_groups, strict
+        if strict:
+            why = [d["why"] for r in out["rounds"] for d in r["decisions"] if not d["kept"]]
+            assert any("not measurable" in w for w in why), why
+
+
+def _rot_z(deg):
+    t = np.radians(deg)
+    return np.array([[np.cos(t), -np.sin(t), 0.0], [np.sin(t), np.cos(t), 0.0], [0.0, 0.0, 1.0]])
+
+
+def test_only_links_the_solve_honours_are_evidence():
+    """6839fb8f kf 92-98 was held by links the solve contradicts by 34-96 deg. With max_link_disagreement_deg a
+    link counts only when its own rotation agrees with the solve's; the ladders stay, the contradicted cross
+    links go, and island B is no longer one block with A."""
+    links = ladder_links(cross=[(k, 30 + k, 50) for k in range(5)])
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    ref = models[0]
+    idx = ref.index()
+    cross = {tuple(sorted((f"{k:06d}_k.jpg", f"{30 + k:06d}_k.jpg"))) for k in range(5)}
+    level = metric(4.0, 4.0)
+    for off_deg, n_groups in ((2.0, 1), (60.0, 2)):
+        rots = {}
+        for a, b in links:
+            R = ref.R_cw[idx[b]] @ ref.R_cw[idx[a]].T
+            rots[(a, b)] = (_rot_z(off_deg) @ R) if (a, b) in cross else R
+        gp = G.GateParams(rule="evidence", min_obs=5, max_link_disagreement_deg=25.0)
+        out = G.apply_rigid_gate(models, gp, links=links, metric_log=level, link_rotations=rots)
+        assert len(set(out["labels"].values())) == n_groups, off_deg
+        assert "set aside" in out["evidence"]["links_not_honoured"]
+    with pytest.raises(ValueError, match="link_rotations"):
+        G.apply_rigid_gate(models, G.GateParams(rule="evidence", min_obs=5, max_link_disagreement_deg=25.0),
+                           links=links, metric_log=level)
