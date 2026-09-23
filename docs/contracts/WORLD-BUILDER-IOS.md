@@ -564,6 +564,18 @@ WORLDS §4, which fetches its imagery:
   another world or session, any other route, any method but GET, a query
   elsewhere, a user, port or fragment, an empty, `.` or `..` segment. The
   whitelist is the pure `WorldAssetRequest.parse`.
+- **PROPOSED 2026-09-23 — awaiting Mac review; NOT implemented, and the
+  handler answers none of these today. Requires Mac validation.** Area viewers
+  (`WORLD-BUILDER-COMPONENTS.md` §5.5) would add a second whitelist, for a
+  viewer opened for one (`<w>`, `<s>`, `<a>`) taken from the listing row, `<a>`
+  exactly 16 lower-hex: `/worlds/<w>/areas/<s>/<a>/render` (no query, the page
+  from memory); `/worlds/<w>/areas/<s>/<a>/render/revision` (no query, proxied
+  with none); `/worlds/<w>/areas/<s>/<a>/appearance/manifest`; and
+  `…/areas/<s>/<a>/appearance/chunk/<digest>` and `…/appearance/proxy/<digest>`
+  with a 32 lower-hex digest. An area viewer's handler answers **none** of the
+  room routes above, and a room viewer's handler answers **no** `/areas/` path;
+  `<s>` is never learned from the page's `wb-revision`; memory and its
+  authorisation are per (`<s>`, `<a>`). The room whitelist above is unchanged.
 - **Proxying.** Whitelisted requests go to the same path on
   `TowerConfiguration.httpBaseURL` through `WorldAssetClient`: an ephemeral
   session, `urlCache = nil`, no cookies, `.reloadIgnoringLocalAndRemoteCacheData`.

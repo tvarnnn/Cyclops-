@@ -796,6 +796,20 @@ source as an untuned placeholder and is not emitted as an event at all.
 Emitting `limited` from it would present an unmeasured placeholder as a
 calibrated judgment.
 
+**`tracking.recovery`** — **PROPOSED 2026-09-23, awaiting Mac review; nothing
+implemented.** An additive, fixed-arity object, or **`null`** when the
+session's journal records no relocalizer (every session today; `null` means
+*not recorded*, never *no losses*). It reports the live relocalizer's current
+or last episode (`state`: `none` / `searching` / `prompting` / `recovered` /
+`timed_out`; `recovered` only on a triangle of two ≥ 50-inlier links closing
+within 8°, or one ≥ 100-inlier link), the latest look-back `prompt` with a
+per-session, strictly increasing `id` the phone speaks at most once, per-session
+`counts`, and — read-only, as the builder ran them — the prompt-rate
+`limiter` (never more than 2 prompts in any 60 s) and the `acceptance`
+parameters. Every time is the Tower's clock; nothing in it advances by itself,
+so it moves `revision` only when the state does. The contract identifier does
+not move. Specified in `docs/contracts/WORLD-BUILDER-COMPONENTS.md` §6.
+
 **`calibration`** — scope is **`"session"`**, always.
 
 | `state` | Condition |
