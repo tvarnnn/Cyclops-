@@ -87,6 +87,7 @@ between stages rather than false in them.
 | `state` | one of the seven words below | never null when the block is present |
 | `stage` | `"surface"`, `"appearance"`, or null | the stage the word is about |
 | `detail` | string | prose; safe to show, names no path |
+| `scope` | `"room"` \| `"area"`, optional | **PROPOSED 2026-09-23 (C1 E3), additive:** `"area"` exactly when the word is an area's (`WORLD-BUILDER-COMPONENTS.md` §3.4); absent means `"room"`. The phone chooses its Improving copy from it and never parses `detail` |
 
 | `state` | Meaning | the session's `state` |
 |---|---|---|
@@ -122,9 +123,11 @@ here, so it would tell the wearer their walk was lost. The word never claims
 photographic success, because the word was never about the photographic
 room. This block is, and it says `failed`, with `detail` carrying the reason.
 
-**`never_recorded` is load-bearing for compatibility.** 165 of the 166
-worlds on the development Tower were built by a Tower with no photographic
-stages at all. They are finished, they are owed nothing, and their rows are
+**`never_recorded` is load-bearing for compatibility.** Worlds built by a
+Tower with no photographic stages at all (corrected 2026-09-23, C1 E10: the
+Tower's own code measured 67 `unattempted` and 2 `never_recorded` on the
+development root, `tower/tower/world_builder/photographic.py`, not "165 of
+166"). They are finished, they are owed nothing, and their rows are
 unchanged. It is reached only when there is NO stage record AND no stage
 artifact on disk, and it is decided **without** consulting the liveness
 probe — so a probe that breaks cannot relabel all of them at once. The

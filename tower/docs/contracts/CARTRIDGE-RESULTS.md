@@ -739,9 +739,11 @@ one that survives the gaps between stages.
 > not coming -- so `failed` keeps its `ready` and tells the truth in this
 > block instead.
 
-> **`never_recorded` is load-bearing for compatibility.** 165 of the 166
-> worlds on the machine this was written for were built by a Tower with no
-> photographic stages at all. They are finished, they are owed nothing, and
+> **`never_recorded` is load-bearing for compatibility.** Worlds built by a
+> Tower with no photographic stages at all (corrected 2026-09-23, C1 E10: the
+> Tower's own code measured 67 `unattempted` and 2 `never_recorded` on the
+> development root, not "165 of 166"; PROPOSED the same day: the block gains an
+> additive `scope: "room" | "area"`, `WORLD-BUILDER-COMPONENTS.md` §3.4). They are finished, they are owed nothing, and
 > they keep reading `ready`/`finalized` exactly as before. It is reached only
 > when there is NO stage record AND no stage artifact on disk, and it is
 > decided **without** consulting the liveness probe -- so a probe that breaks

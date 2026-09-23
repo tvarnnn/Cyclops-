@@ -234,6 +234,19 @@ null` nothing changes. When implemented, WORLDS §2a and CARTRIDGE-RESULTS
 `lifecycle.photographic` gain one sentence each; they are not edited by this
 proposal.
 
+**`scope` (C1 E3).** The block gains `scope: "room" | "area"` (additive), on
+the row and on `lifecycle.photographic`: `"area"` exactly when the word it
+carries is an area's under the rule above; absent means `"room"` (an older
+Tower). The phone says *Saved. 1 area of this walk is still being finished*
+from it and never parses `detail`; the room's Improving note ("the finished
+world is very different from this one") is shown only for `scope: "room"`.
+
+**`build_in_progress` (C1 E13).** Whenever `photographic.state` is `running`,
+`lifecycle.build_in_progress` is `true`, for an area as for the room (today
+`_still_building` answers `false` for every unsettled word but `unobservable`,
+`tower/tower/results/world_builder.py`). The liveness probe must therefore see
+the area stages' status files as well as the room's (T9).
+
 ## 4. The room page, for a session with components
 
 Unchanged route, queries, ladder, revision and follower rules (WORLDS §4, §4a;
@@ -302,6 +315,12 @@ the room's id, a `none` entry's id — terminal for that id);
 **`this area has not been built yet`** (transient: its build is owed or running
 and nothing is drawable); **`this area could not be built`** (terminal: its build
 failed or was declined and nothing is drawable). **422** as in the table.
+
+**The four area sentences are stable identifiers (C1 E4)**, compared for
+equality by the phone exactly as it already compares FastAPI's `Not Found`:
+terminal — `no such area in this session`, `this area could not be built`,
+`this session has no areas`; transient — `this area has not been built yet`.
+Their text never changes without a contract change, and a Tower test pins it.
 
 ### 5.2 `GET /worlds/{world_id}/areas/{session_id}/{area_id}/render/revision`
 
@@ -415,6 +434,12 @@ taken from the listing row, with `<a>` exactly 16 lower-hex (checked like
   200 within the last 20 s authorises only that area's bundles; a copy made
   under one area's manifest is never answered for another area or for the room.
   The copy is dropped under the same conditions as the room's (IOS §10).
+- **Replace, never stack (C1 E5).** At most one world web view exists at a
+  time: opening an area replaces the room viewer, and *Back to the room*
+  reloads the room page (camera reset) and re-fetches its imagery — which the
+  room viewer already does on return today. Areas may also be opened directly
+  from a Saved Worlds session row, from the listing's `components`, without
+  loading the room first.
 
 ### 5.6 Rules
 
@@ -527,7 +552,9 @@ layers:
    on replay to ≤ 2/min **before** the cap. `mechanism` names it; `cooldown_s` is
    its parameter when it is a cooldown, else `null`. Values of `prompt_after_s`,
    `timeout_s`, `cooldown_s` and `speak_window_s` are P3.2's (OPEN T5); the replay
-   tried `prompt_after_s` 1–5 s and `timeout_s` 10–20 s.
+   tried `prompt_after_s` 1–5 s and `timeout_s` 10–20 s. **`speak_window_s` ≤ 5 s
+   (C1 E7):** it bounds both a stale "look back" and the one repeat a relaunch
+   can cause.
 
 Because the parameters and the counts are on the wire, the guarantee is visible:
 `counts.prompts` over a session can be checked against `max_prompts` per
@@ -540,13 +567,34 @@ Speak `prompt` if and only if **all** hold:
 
 1. the session is **live and is the one this phone is streaming to**: IOS §9's
    `WorldSessionBinding` is `.bound` (camera bracket open; the Tower says
-   `receiving`, `ended_at: null`, `frame_source: "live-capture"`), whether the
-   subscription is pinned or following. Never under `.none`, `.awaiting` or
-   `.foreign`, so never for a stopped, finalizing or historical session;
+   `receiving`, `ended_at: null`, `frame_source: "live-capture"`), **while the
+   phone follows the live session (unpinned)** (C1 E1). A pinned subscription
+   never speaks: its binding is always `.none` (IOS, `TowerWorldBuilderClient`
+   `isCaptureBracketOpen`), and it receives the pinned world's payload, not the
+   live one — so opening Saved Worlds mid-walk silences prompts until *Back to
+   live*. Never under `.none`, `.awaiting` or `.foreign`, so never for a
+   stopped, finalizing or historical session;
 2. `recovery.state == "prompting"`, `prompt.episode == recovery.episode`, and
    `prompt.kind` is one the phone knows (an unknown kind is never spoken);
 3. `prompt.id` is **greater than** `lastSpoken[(world_id, session_id)]`;
-4. the envelope's `tower_sent_at ≤ prompt.speak_until`.
+4. the envelope's `tower_sent_at ≤ prompt.speak_until`. (C1 E2: the phone must
+   decode the envelope's `tower_sent_at`, which `CARTRIDGE-RESULTS.md` §4 already
+   sends; today's decoder reads only `seq`, `revision`, `revision_changed`,
+   `coalesced` and `snapshot`.)
+
+**How the phone speaks (C1 E6).** Through A2DP only, never HFP: audio session
+category `.playback`, mode `.voicePrompt`, option `.duckOthers`, activated
+around each utterance; and only when the current output route is Bluetooth
+(A2DP or LE) — a phone speaker in a pocket is useless to the wearer and audible
+to others; a prompt not spoken for want of a route is logged, never retried.
+The app declares the `audio` background mode. The wearer locks the phone **on
+the World Builder screen** (leaving it stops the cartridge session). Only a
+device settles three facts, and the physical test measures them: (i) speech is
+audible on the glasses with the phone locked; (ii) the camera's frame rate and
+resolution while speaking (A2DP shares the Bluetooth Classic link with the
+camera stream); (iii) the latency from `issued_at` to audible. Prompts exist
+only in DEBUG builds, because Release has no capture path (C1 M14): the
+physical test runs a DEBUG build.
 
 Then set `lastSpoken` to `prompt.id` **before** speech starts. Heartbeats
 (`revision_changed: false`) and coalesced snapshots carry the same id, so they
@@ -631,10 +679,13 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
 No arrow toward the room, no distance, no size, no name, no position — none of
 them is known.
 
-**The spoken prompt** (`prompt.kind: "look-back"`): the phone owns the words.
-Proposed: *Look back at what you were just looking at.* (OPEN M11)
+**The spoken prompt** (`prompt.kind: "look-back"`): the phone owns the words:
+*Look back the way you came.* (C1 E14; about 1.5 s — every extra word is more
+Bluetooth audio during the look-back.) Spans are `m:ss` with an en dash
+(`0:29–0:33`); minutes are not wrapped past 59 and hours are never used.
 
-**`tracking.recovery` on the world screen** (proposed copy, OPEN M11):
+**`tracking.recovery` on the world screen** (accepted by C1; shown only while
+following live and bound, never on a saved world):
 `searching` or `prompting` — *Finding where you are…*; `recovered` — *Linked
 back to what you saw before* (not "placed", §6.3); `timed_out` — *Could not link
 back; this part may be shown as a separate area.*
@@ -653,7 +704,19 @@ back; this part may be shown as a separate area.*
 - Status of this document moves from PROPOSED to implemented only when the Mac
   has reviewed it and both halves exist.
 
-## 10. OPEN questions for the Mac Validation Lead
+## 10. Questions for the Mac Validation Lead — ANSWERED (C1, 2026-09-23)
+
+The Mac's C1 review (run mailbox `mac-001-contract-review.md`) answered every
+question below: 9 OK, 5 CHANGE (M2, M3, M11, M13 and the edits E1–E14, all
+applied in this document and the cross-referenced ones), 0 blockers. In short:
+M1 one handler per viewer with a scope fixed at creation; M2 replace, never
+stack; M3 feasible over A2DP with the `audio` background mode, three facts left
+to the device; M4 memory only; M5 read `recovery` from the payload's `tracking`
+block, not `world_snapshot`; M6 no count needed; M7 number by list position; M8
+the unknown-value pattern exists; M9 no cap; M10 no id on the wire (the phone
+checks `wb-area` and the `wb-revision` prefix); M11 shorter prompt; M12 the
+phone sends no `viewer` on area routes; M13 needs `scope` and
+`build_in_progress`; M14 prompts are DEBUG-only. The original questions follow.
 
 - **M1 — handler shape.** One `WKURLSchemeHandler` per viewer bound to its triple,
   or one handler with two whitelists? Can `WorldAssetRequest.parse` take the area
