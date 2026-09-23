@@ -58,6 +58,7 @@ Per session:
 | `finalization` | object \| null | The builder's own record of what happened after the session stopped: `{state: pending\|complete\|interrupted, final_solve: pending\|solved\|skipped\|failed\|unavailable\|null, started_at, updated_at, detail}`. `null` on records written before 2026-09-06 and on sessions that never stopped. Additive (2026-09-06) |
 | `appearance` | object \| null | **The appearance artifact, reported as the imagery it is** (additive, 2026-09-17, review 1 m6): `{format, state: served\|rebuilding\|withdrawn, quality, keyframes, keyframes_phone, bytes, redaction, redaction_effective, label_trusted, keyframe_image_set, privacy_tags, retains_raw_imagery, imagery, retention}`. `state` is `APPEARANCE.md` §9's: whether the routes serve it now. `redaction` is the label it was built under and `redaction_effective` what was applied; `imagery` says *first-person keyframe imagery of a private space; best-effort face redaction with measured false negatives; not anonymised*; `retention` says it is kept with the world until rebuilt or purged. No URL, id or path: the page reaches it through §4b only. `null` when the session has none |
 | `photographic` | object | **Where this session's photographic representation — the image-based room, which is the final user-facing output — has got to** (additive, 2026-09-22): `{state, stage: "surface"\|"appearance"\|null, detail}`. `state` is one word from a closed vocabulary: `complete`, `running`, `owed`, `failed`, `unattempted`, `never_recorded`, `unobservable`. The same block the status payload carries (`CARTRIDGE-RESULTS.md`, `lifecycle.photographic`), computed from the same helper, so a phone that reads the row and then opens the panel reads one fact and not two. §2a says what each word means, which of them move `state` and which do not, and why `failed` does not. **Always present on this listing**, unlike the status channel's `lifecycle.photographic`, which is null when the lifecycle was computed from the record alone: a row is built for every session, and a row with no answer is a row that keeps saying `complete`, which is the failure being fixed. A probe that cannot answer yields the `unobservable` WORD, never a missing block |
+| `components` | array \| null | **PROPOSED 2026-09-23 — awaiting Mac review; nothing implemented.** The pieces of this walk's final solve after the evidence gate: exactly one `placed` (the room) first, then every piece the gate could not place, with `reason`, keyframes, capture spans, `shown_as` (`room` / `area` / `none`) and its own §2a block. No metric figure, no name. **`null` means not computed** — every world today — never "no areas". Additive; the contract identifier does not move. Specified in [`WORLD-BUILDER-COMPONENTS.md`](WORLD-BUILDER-COMPONENTS.md) §2–§3 |
 
 ## 2a. `photographic` — whether the room the wearer walked actually exists
 
@@ -86,6 +87,7 @@ between stages rather than false in them.
 | `state` | one of the seven words below | never null when the block is present |
 | `stage` | `"surface"`, `"appearance"`, or null | the stage the word is about |
 | `detail` | string | prose; safe to show, names no path |
+| `scope` | `"room"` \| `"area"`, optional | **PROPOSED 2026-09-23 (C1 E3), additive:** `"area"` exactly when the word is an area's (`WORLD-BUILDER-COMPONENTS.md` §3.4); absent means `"room"`. The phone chooses its Improving copy from it and never parses `detail` |
 
 | `state` | Meaning | the session's `state` |
 |---|---|---|
@@ -121,9 +123,11 @@ here, so it would tell the wearer their walk was lost. The word never claims
 photographic success, because the word was never about the photographic
 room. This block is, and it says `failed`, with `detail` carrying the reason.
 
-**`never_recorded` is load-bearing for compatibility.** 165 of the 166
-worlds on the development Tower were built by a Tower with no photographic
-stages at all. They are finished, they are owed nothing, and their rows are
+**`never_recorded` is load-bearing for compatibility.** Worlds built by a
+Tower with no photographic stages at all (corrected 2026-09-23, C1 E10: the
+Tower's own code measured 67 `unattempted` and 2 `never_recorded` on the
+development root, `tower/tower/world_builder/photographic.py`, not "165 of
+166"). They are finished, they are owed nothing, and their rows are
 unchanged. It is reached only when there is NO stage record AND no stage
 artifact on disk, and it is decided **without** consulting the liveness
 probe — so a probe that breaks cannot relabel all of them at once. The
@@ -1089,6 +1093,13 @@ this session's surface, appearance (added 2026-09-17) or dense stage reports
 lands a moment later. Otherwise a poll in that gap reported the finished build as
 live, and a client that offers live builds rather than swapping them in missed
 the finished one. See rule 6 for what `false` does and does not promise.
+
+`components` (**PROPOSED 2026-09-23 — awaiting Mac review; nothing
+implemented**): additive, the chosen session's `components` array exactly as on
+its §2 row, or `null` when not computed. **Not part of `revision`**: an area
+finishing never swaps the room page. Areas are not a rung and not a query
+parameter of §4; they have their own routes, `GET /worlds/{w}/areas/{s}/{a}/…`
+(`WORLD-BUILDER-COMPONENTS.md` §3.2 and §5).
 
 Every page §4 serves carries the same two values in its head, within its first
 4096 characters:
