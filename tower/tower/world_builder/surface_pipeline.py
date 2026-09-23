@@ -479,10 +479,9 @@ class _Frames:
             if ho is None:
                 self.refused_unscorable.append(int(r["ki"]))
                 continue
-            if ho is not None:
-                held.append(ho)
-                if ho > params.gate_rel:
-                    continue
+            held.append(ho)
+            if ho > params.gate_rel:
+                continue
             pose = poses.get(r["kid"])
             if pose is None:
                 continue
@@ -494,13 +493,13 @@ class _Frames:
             self.items.append((ki, float(r["a"]), float(r["b"]),
                                np.array(pose["rotation"], float).reshape(3, 3),
                                np.array(pose["translation"], float),
-                               1.0 if ho is None else float(ho),
+                               float(ho),
                                r.get("z_sparse_max")))
         if self.refused_inverted or self.refused_unscorable:
             logger.warning(
-                "[Tower][WorldBuilder][surface] depth fits that are not physical are not "
-                "fused: %d inverted (a <= 0) %s, %d whose held-out half is (no held-out "
-                "score) %s", len(self.refused_inverted), self.refused_inverted[:40],
+                "[Tower][WorldBuilder][surface] not fusing %d frames whose depth fit is "
+                "inverted or non-finite (keyframes %s) and %d whose held-out half could not "
+                "be scored (keyframes %s)", len(self.refused_inverted), self.refused_inverted[:40],
                 len(self.refused_unscorable), self.refused_unscorable[:40])
         self.median_held_out = float(np.median(held)) if held else None
         self.offered = len(align.get("records", []))
@@ -709,8 +708,12 @@ def surfacify(store, world_id: str, session_id: str, *,
 
         tparams = TransientParams(mode=params.transient_detector)
         pdigest += "|transients:" + tparams.rule_id()
-        # Which depth fits may be fused (`fit_is_physical`). A surface built
-        # before inverted fits were refused must be rebuilt, not reused.
+        # Which depth fits may be fused (`fit_is_physical`). This only stops a
+        # NON-forced build from answering "already built" with a surface fused
+        # under the old gate; the product's builds pass force and rebuild
+        # anyway. Existing worlds are NOT refreshed by deploying this: their
+        # surface stays as fused until `world_surface.py --world X` (then
+        # `world_appearance.py`) is run for them.
         pdigest += "|" + FIT_GATE_ID
         if is_raw(params.imagery_source):
             # §6.6. `_params_digest` already carries it through

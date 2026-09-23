@@ -71,6 +71,16 @@ def test_an_unscorable_fit_is_refused_like_the_dense_stage_does(tmp_path):
     assert rec["frames_refused_inverted_fit"] == 0 and rec["frames_refused_unscorable_fit"] == 1
 
 
+def test_a_scored_inverted_fit_is_refused_too(tmp_path):
+    """An inverted full fit whose held-out half happened to score. The
+    known-good control's ki 196 had a = -0.038 with a held-out error of 0.033,
+    under the gate, and the old code fused it inverted at weight 0.59; the
+    slope, not the score, decides whether depth can be fused at all."""
+    frames = _world(tmp_path, [_rec(0, 0.78, 0.12, 0.025), _rec(1, -0.038, 1.20, 0.033)])
+    assert [item[0] for item in frames.items] == [0]
+    assert frames.refused_inverted == [1] and frames.refused_unscorable == []
+
+
 def test_the_min_sparse_points_floor_guarantees_a_held_out_split():
     """The premise above: at the depth stage's floor of anchors, both halves
     of `align_frame`'s split reach its own 10-anchor minimum."""
@@ -103,7 +113,9 @@ def test_the_real_mechanism_negative_slope_means_no_held_out_score():
 
 
 def test_the_gate_is_in_the_params_digest():
-    """A surface fused under the old gate must be rebuilt, not reused."""
+    """A non-forced build must not answer "already built" with a surface fused
+    under the old gate. (Forced product builds rebuild anyway, and deploying
+    the gate does not refresh existing worlds.)"""
     assert SP.FIT_GATE_ID == "fit-gate:a>0+scored"
     src = open(SP.__file__, encoding="utf-8").read()
     assert 'pdigest += "|" + FIT_GATE_ID' in src
