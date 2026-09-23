@@ -3,91 +3,95 @@
 Every forensic render of a world -- cameras, sparse points, the fused
 surface, the appearance -- is taken from the SAME set of viewpoints, and that
 set is derived from the walk alone by a fixed rule. Nobody picks a flattering
-angle, and a variant of a world (a re-solve, a re-fusion) gets its viewpoints
-from the same rule applied to its own trajectory, so two renders of the same
-view name are directly comparable.
+angle.
 
-The rule (`RULE_VERSION`)
--------------------------
+TWO WAYS TO GET A VIEWPOINT SET FOR A VARIANT
+---------------------------------------------
+* **Transferred (recommended for A/B).** Derive the set ONCE, on the
+  reference (usually the frozen world), and carry it onto each variant of
+  the same world with `transfer_viewpoints`: a robust Sim(3) fitted on the
+  camera centres of shared, supported keyframes maps every view into the
+  variant's gauge. ORBIT_3 of the reference and ORBIT_3 of the variant are
+  then the same physical viewpoint up to the variant's own error, which is
+  what an A/B render needs.
+* **Native.** Apply the rule to the variant's own poses
+  (`viewpoint_set` / `viewpoints_for_world`). Two natively derived sets agree
+  only as far as the frame (c, u, r, e1) is stable; the set records the
+  frame's conditioning (`frame.conditioning`) so a reader can tell. Measured
+  on C1's three GLOMAP reruns of the target (Sim(3) rms/r 0.03-0.05): e1
+  after alignment moved 6.2 / 6.0 / 1.4 deg under rule /2 versus
+  122 / 14 / 82 deg under rule /1.
+
+The rule (`RULE_VERSION` = wb-coherence-viewpoints/2)
+-----------------------------------------------------
 Inputs: posed keyframes as camera-to-world transforms ``T_world_camera``
 (4x4, OpenCV camera axes: x right, y DOWN, z forward), the capture order of
-ALL accepted keyframes, and optionally each posed keyframe's solver
-component.
+ALL accepted keyframes, optionally each posed keyframe's solver component,
+and optionally each posed keyframe's observation count.
 
-* Frame. Only the posed keyframes of the LARGEST component are used (ties:
-  the lowest component id). Let C_i be their camera centres.
-  - ``center`` c = coordinate-wise median of C_i. (Coordinate-wise, so it is
-    equivariant under translation and scale but only approximately under
-    rotation; the TRAJ keyframe choice does not depend on it at all.)
-  - ``up`` u = trimmed mean of the camera up vectors, where a camera's up is
-    the -Y column of R_world_camera (OpenCV y points down). This is the
-    camera-only seed of ``surface_render._camera_up``; the surface stage then
-    refines it on the mesh (``surface_render.surface_up``), which we
-    deliberately do NOT do, because the viewpoints must not depend on the
-    layer under evaluation. Trim: compute the plain mean, drop the ups whose
-    angle to it is above the 90th percentile, and re-average.
-  - ``radius`` r = 90th percentile of |C_i - c|.
-  - ``axis`` e1 = the principal axis of the C_i projected onto the plane
-    perpendicular to u (PCA of the centred, projected centres), sign fixed
-    so that e1 . (C_first - c) >= 0 where C_first is the first posed
-    main-component keyframe in capture order. e2 = u x e1, so (e1, e2, u)
-    is right-handed.
-* TOP. Orthographic, looking along -u (camera z = -u, camera x = e1). It
-  frames the 2nd..98th percentile box of the C_i in (e1, e2), each side
-  padded by 50% of that axis's extent (a box twice as wide and twice as deep
-  as the percentile box, same centre), with a floor of 0.5 r on each
-  half-extent so a straight-line walk does not produce a sliver. Camera
-  placed at c + 4 r u. Rendered with back faces culled ("dollhouse"), so a
-  ceiling -- whose normal faces down, toward the cameras that saw it -- does
-  not hide the room.
-* ORBIT_k, k = 0..7. Perspective, vertical FOV 60 deg, eye at
+* Supported cameras. When observation counts are given, a keyframe with fewer
+  than ``min_observations`` (default 30 = `global_solve.MIN_IMAGE_OBSERVATIONS`,
+  the product's publish floor) is UNSUPPORTED and takes no part in anything:
+  not the frame, not the TRAJ choice. Without counts the caller vouches that
+  every pose given is supported (e.g. the harness passes published poses).
+  Unsupported cameras were what drove rule /1's worst swings (a single
+  zero-observation camera far from the walk moves an unweighted PCA).
+* Main component: the component with the most supported keyframes (ties: the
+  lowest id). Let C_i be the centres of its supported keyframes, in capture
+  order.
+* ``center`` c = geometric median of C_i (Weiszfeld; Sim(3)-equivariant,
+  unlike rule /1's coordinate-wise median).
+* ``up`` u = trimmed mean of the camera up vectors (-Y column of R_wc): plain
+  mean, drop ups above the 90th-percentile angle to it, re-average. The
+  camera-only seed of ``surface_render._camera_up``, deliberately NOT refined
+  on the mesh: viewpoints must not depend on the layer under evaluation.
+* ``radius`` r = 90th percentile of |C_i - c|.
+* ``axis`` e1 = principal axis of the INNER centres (|C_i - c| <= r) projected
+  onto the plane perpendicular to u. Sign: e1 . m >= 0, where m is the mean
+  horizontal viewing direction (mean of the camera z axes projected
+  perpendicular to u) -- a whole-walk quantity, where rule /1 used the first
+  keyframe. e2 = u x e1.
+  ``frame.conditioning`` records pca_ratio = lambda2/lambda1 (near 1: the
+  axis is ill-defined) and view_resultant = |m| / mean |z_h| (near 0: the sign
+  is ill-defined), and ``stable`` = pca_ratio <= 0.8 and view_resultant >= 0.15.
+  When not stable, use transfer mode for cross-variant comparison.
+* TOP: orthographic, looking along -u (camera z = -u, camera x = e1), framing
+  the 2nd..98th percentile box of the C_i in (e1, e2), each side padded by
+  50% of that axis's extent, a floor of 0.5 r per half-extent. Camera at
+  c + 4 r u. Back faces culled ("dollhouse").
+* ORBIT_k, k = 0..7: perspective, vertical FOV 60 deg, eye at
   c + 2 r (cos 35deg (cos a e1 + sin a e2) + sin 35deg u), a = 45deg k,
-  looking at c with image-up along u. Back faces culled, as for TOP.
-* TRAJ_jj, j = 0..11. Keyframe at capture-order index
-  floor((j + 0.5) / 12 * N) among ALL N accepted keyframes. If that keyframe
-  is unposed or outside the main component, the nearest posed
-  main-component keyframe by capture-order index is used instead (ties go to
-  the EARLIER keyframe) and the substitution is recorded. Two views each:
-  - ``TRAJ_jj_insitu``: the keyframe's own pose, the given intrinsics and
-    image size. No culling.
-  - ``TRAJ_jj_pullback``: the same orientation, the centre moved 0.75 r
-    backwards along the viewing axis (-z) and 0.25 r along u, vertical FOV
-    75 deg, the in-situ aspect ratio. No culling.
+  looking at c with image-up along u. Back faces culled.
+* TRAJ_jj, j = 0..11: the keyframe at capture-order index
+  floor((j + 0.5) / 12 * N) among ALL N accepted keyframes; if it is not a
+  supported main-component keyframe, the nearest one by capture-order index
+  (ties: earlier), recorded as a substitution.
+  - ``TRAJ_jj_insitu``: that keyframe's own pose and the given intrinsics.
+  - ``TRAJ_jj_pullback``: same orientation, centre moved 0.75 r back along the
+    viewing axis and 0.25 r along u, vertical FOV 75 deg.
 
-The TRAJ keyframe choice depends only on the capture order and on which
-keyframes are posed in which component, so it is invariant under any global
-Sim(3) of the poses and is keyed by keyframe id -- the handle for comparing
-the same view across variants.
+The set also stores ``anchors`` (keyframe id -> camera centre of every
+supported main-component keyframe), so `transfer_viewpoints` needs only the
+set and the target poses.
 
 API
 ---
-``viewpoint_set(poses, capture_order, component_of, intrinsics) -> dict``
-    The whole set, JSON-serialisable.
-``viewpoints_for_world(world_dir, session_id=None, *, source="solve") -> dict``
-    Convenience: reads ``solve/<sid>/solution.json`` (GLOMAP global solve;
-    the poses the surface/appearance stages use) and
-    ``sessions/<sid>/keyframes.jsonl`` of a world directory (or a variant
-    directory of the same shape) and returns ``viewpoint_set(...)``.
-``save_viewpoints(vs, path)`` / ``load_viewpoints(path)``
-``view_T_world_camera(view) -> (4, 4) ndarray``;
-``view_K(view) -> (3, 3) ndarray`` (perspective views only);
-``project(view, X_world) -> (uv (N, 2), depth (N,))`` for either projection.
-``poses_from_solution(meta) -> (poses, component_of)`` converts the
-    solution's R_cw / t_cw to T_world_camera.
-
-Every view dict carries: ``name``, ``family`` (TOP / ORBIT / TRAJ_INSITU /
-TRAJ_PULLBACK), ``projection`` ("orthographic" | "perspective"),
-``T_world_camera`` (4x4 list), ``width``, ``height``, ``cull_backfaces``;
-perspective views add ``fx, fy, cx, cy, fov_y_deg``; orthographic views add
-``half_width``, ``half_height`` (world units at the image edges); TRAJ views
-add ``keyframe_id``, ``requested_keyframe_id``, ``capture_index``,
-``requested_capture_index``, ``quantile``, ``substituted``,
-``substitution_reason``.
+``viewpoint_set(poses, capture_order, component_of, intrinsics, *,
+observations=None, min_observations=30) -> dict``
+``viewpoints_for_world(world_dir, session_id=None) -> dict``
+``transfer_viewpoints(vs, poses_from, poses_to, *, observations_to=None,
+component_of_to=None, intrinsics_to=None, insitu="own") -> dict``
+``transfer_viewpoints_for_world(vs, world_dir, session_id=None) -> dict``
+``save_viewpoints`` / ``load_viewpoints`` / ``views_by_name`` /
+``view_T_world_camera`` / ``view_K`` / ``project(view, X) -> (uv, z)`` /
+``poses_from_solution(meta) -> (poses, component_of)`` /
+``observations_from_solution(meta) -> {kid: n}``.
 
 CLI::
 
-    python -m tower.world_builder.coherence_eval.viewpoints WORLD_DIR \
-        [--session SID] --out VIEWPOINTS.json
+    python -m tower.world_builder.coherence_eval.viewpoints WORLD_DIR --out X.json
+    python -m tower.world_builder.coherence_eval.viewpoints VARIANT_DIR \
+        --transfer-from REFERENCE_VIEWPOINTS.json --out Y.json
 """
 
 from __future__ import annotations
@@ -99,9 +103,11 @@ from typing import Iterable
 
 import numpy as np
 
-RULE_VERSION = "wb-coherence-viewpoints/1"
-SCHEMA = "glasses.wb.coherence.viewpoints/1"
+RULE_VERSION = "wb-coherence-viewpoints/2"
+SCHEMA = "glasses.wb.coherence.viewpoints/2"
+READABLE_SCHEMAS = ("glasses.wb.coherence.viewpoints/1", SCHEMA)
 
+MIN_OBSERVATIONS = 30          # == global_solve.MIN_IMAGE_OBSERVATIONS
 N_ORBIT = 8
 ORBIT_ELEVATION_DEG = 35.0
 ORBIT_DISTANCE_R = 2.0
@@ -115,6 +121,8 @@ TOP_MARGIN = 0.5
 TOP_MIN_HALF_R = 0.5
 UP_TRIM_PERCENTILE = 90.0
 RADIUS_PERCENTILE = 90.0
+STABLE_MAX_PCA_RATIO = 0.8
+STABLE_MIN_VIEW_RESULTANT = 0.15
 
 DEFAULT_ORBIT_SIZE = (1024, 768)
 DEFAULT_TOP_LONG_SIDE = 1024
@@ -162,13 +170,68 @@ def _f_from_fov(size_px: int, fov_deg: float) -> float:
     return 0.5 * size_px / math.tan(math.radians(fov_deg) / 2.0)
 
 
+def geometric_median(X, iters: int = 500, tol: float = 1e-12) -> np.ndarray:
+    """Weiszfeld's algorithm, started at the mean. Deterministic."""
+    X = np.asarray(X, np.float64)
+    y = X.mean(axis=0)
+    for _ in range(iters):
+        d = np.linalg.norm(X - y, axis=1)
+        if (d < 1e-12).any():   # sitting on a sample: nudge off it
+            d = np.maximum(d, 1e-12)
+        w = 1.0 / d
+        y2 = (X * w[:, None]).sum(0) / w.sum()
+        if np.linalg.norm(y2 - y) <= tol * max(1.0, float(np.linalg.norm(y))):
+            return y2
+        y = y2
+    return y
+
+
+def umeyama(src, dst, with_scale: bool = True):
+    """Least-squares similarity dst ~ s R src + t (Umeyama 1991)."""
+    src = np.asarray(src, float)
+    dst = np.asarray(dst, float)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    xs, xd = src - mu_s, dst - mu_d
+    var_s = (xs ** 2).sum() / len(src)
+    cov = xd.T @ xs / len(src)
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    s = float(np.trace(np.diag(D) @ S) / var_s) if (with_scale and var_s > 0) else 1.0
+    return s, R, mu_d - s * R @ mu_s
+
+
+def robust_sim3(src, dst, *, trim: float = 3.0, iters: int = 5):
+    """Umeyama with iterative trimming of residuals > trim * 1.4826 * MAD
+    (floored at 1e-9 of the target spread). Returns (s, R, t, inlier mask)."""
+    src = np.asarray(src, float)
+    dst = np.asarray(dst, float)
+    keep = np.ones(len(src), bool)
+    spread = float(np.linalg.norm(dst - dst.mean(0), axis=1).mean()) or 1.0
+    for _ in range(iters):
+        s, R, t = umeyama(src[keep], dst[keep])
+        res = np.linalg.norm(dst - (s * (R @ src.T).T + t), axis=1)
+        med = float(np.median(res[keep]))
+        mad = float(np.median(np.abs(res[keep] - med)))
+        thr = max(med + trim * 1.4826 * mad, 1e-9 * spread)
+        new = res <= thr
+        if new.sum() < 3 or np.array_equal(new, keep):
+            break
+        keep = new
+    s, R, t = umeyama(src[keep], dst[keep])
+    return s, R, t, keep
+
+
 # ---------------------------------------------------------------------------
 # the frame
 # ---------------------------------------------------------------------------
 
 
 def main_component(posed: Iterable[str], component_of: dict | None) -> tuple[int | None, list[str]]:
-    """(component id, posed keyframe ids in it). None when no components."""
+    """(component id, the given keyframe ids in it, order kept). None when
+    there are no components. Size = count among `posed`."""
     posed = list(posed)
     if not component_of:
         return None, posed
@@ -195,29 +258,37 @@ def robust_up(R_wc_list: list[np.ndarray]) -> np.ndarray:
     return m
 
 
-def walk_frame(poses: dict, capture_order: list[str], component_of: dict | None) -> dict:
+def supported_ids(poses: dict, observations: dict | None,
+                  min_observations: int = MIN_OBSERVATIONS) -> set:
+    if observations is None:
+        return set(poses)
+    return {k for k in poses if int(observations.get(k) or 0) >= int(min_observations)}
+
+
+def walk_frame(poses: dict, capture_order: list[str], component_of: dict | None, *,
+               observations: dict | None = None,
+               min_observations: int = MIN_OBSERVATIONS) -> dict:
     """The (c, u, r, e1, e2) frame of the rule, plus bookkeeping."""
     order_index = {k: i for i, k in enumerate(capture_order)}
-    posed = [k for k in capture_order if k in poses]
-    # Posed keyframes missing from capture_order go last, sorted by id.
-    posed += sorted(k for k in poses if k not in order_index)
+    sup = supported_ids(poses, observations, min_observations)
+    posed = [k for k in capture_order if k in sup]
+    posed += sorted(k for k in sup if k not in order_index)
     comp, main = main_component(posed, component_of)
-    if len(main) < 2:
-        raise ValueError(f"need >= 2 posed keyframes in the main component, have {len(main)}")
+    if len(main) < 3:
+        raise ValueError(f"need >= 3 supported posed keyframes in the main component, have {len(main)}")
     T = np.array([np.asarray(poses[k], float) for k in main])
     C = T[:, :3, 3]
-    c = np.median(C, axis=0)
+    c = geometric_median(C)
     u = robust_up([t[:3, :3] for t in T])
     d = np.linalg.norm(C - c, axis=1)
     r = float(np.percentile(d, RADIUS_PERCENTILE))
     if not r > 1e-12:
         r = float(d.max()) if d.max() > 1e-12 else 1.0
-    # principal horizontal axis
-    P = C - c
+    inner = d <= r
+    P = C[inner] - c
     P = P - np.outer(P @ u, u)
     P0 = P - P.mean(axis=0)
-    cov = P0.T @ P0
-    w, V = np.linalg.eigh(cov)
+    w, V = np.linalg.eigh(P0.T @ P0)
     e1 = V[:, int(np.argmax(w))]
     e1 = e1 - (e1 @ u) * u
     if np.linalg.norm(e1) < 1e-9:  # all centres on the up axis
@@ -225,18 +296,28 @@ def walk_frame(poses: dict, capture_order: list[str], component_of: dict | None)
         if np.linalg.norm(e1) < 1e-9:
             e1 = np.cross(u, [0.0, 1.0, 0.0])
     e1 = _unit(e1)
-    first = main[0]
-    if float(e1 @ (np.asarray(poses[first], float)[:3, 3] - c)) < 0:
+    ws = np.sort(w)[::-1]
+    pca_ratio = float(ws[1] / ws[0]) if ws[0] > 0 else 1.0
+    Z = T[:, :3, 2]
+    Zh = Z - np.outer(Z @ u, u)
+    m = Zh.mean(axis=0)
+    denom = float(np.linalg.norm(Zh, axis=1).mean()) or 1.0
+    view_resultant = float(np.linalg.norm(m) / denom)
+    if float(e1 @ m) < 0:
         e1 = -e1
     e2 = np.cross(u, e1)
     return {
         "component": comp,
         "main_keyframes": main,
-        "posed_total": len(posed),
+        "posed_total": len(poses),
+        "supported_total": len(sup),
         "center": c, "up": u, "radius": r, "axis1": e1, "axis2": e2,
-        "first_keyframe_id": first,
         "centres": C,
-        "order_index": order_index,
+        "conditioning": {
+            "pca_ratio": pca_ratio, "view_resultant": view_resultant,
+            "stable": bool(pca_ratio <= STABLE_MAX_PCA_RATIO
+                           and view_resultant >= STABLE_MIN_VIEW_RESULTANT),
+        },
     }
 
 
@@ -278,31 +359,36 @@ def _traj_choice(capture_order, main_set, j) -> dict:
         if best is not None:
             break
     if best is None:
-        raise ValueError("no posed main-component keyframe in capture order")
+        raise ValueError("no supported main-component keyframe in capture order")
     return {"quantile": q, "requested_capture_index": idx, "requested_keyframe_id": req,
             "capture_index": best, "keyframe_id": capture_order[best], "substituted": True,
-            "substitution_reason": "unposed-or-outside-main-component"}
+            "substitution_reason": "unposed-unsupported-or-outside-main-component"}
 
 
 def viewpoint_set(poses: dict, capture_order: list[str], component_of: dict | None,
-                  intrinsics: dict, *, orbit_size=DEFAULT_ORBIT_SIZE,
+                  intrinsics: dict, *, observations: dict | None = None,
+                  min_observations: int = MIN_OBSERVATIONS,
+                  orbit_size=DEFAULT_ORBIT_SIZE,
                   top_long_side: int = DEFAULT_TOP_LONG_SIDE,
                   pullback_scale: float = DEFAULT_PULLBACK_SCALE,
                   meta: dict | None = None) -> dict:
-    """The full viewpoint set of the rule in the module docstring.
+    """The full viewpoint set of the rule in the module docstring (native mode).
 
     poses: keyframe id -> (4, 4) T_world_camera (camera-to-world, OpenCV axes).
     capture_order: ALL accepted keyframe ids in capture order (posed or not).
     component_of: keyframe id -> solver component, or None (one component).
     intrinsics: {fx, fy, cx, cy, width, height} of the in-situ camera -- the
         pinhole the poses are expressed in.
-    Returns a JSON-serialisable dict (see module docstring for the fields).
+    observations: keyframe id -> observation count; below `min_observations`
+        a keyframe is unsupported and ignored. None: every pose is supported.
+    Returns a JSON-serialisable dict.
     """
     for key in ("fx", "fy", "cx", "cy", "width", "height"):
         if key not in intrinsics:
             raise ValueError(f"intrinsics missing {key!r}")
     capture_order = list(capture_order)
-    fr = walk_frame(poses, capture_order, component_of)
+    fr = walk_frame(poses, capture_order, component_of, observations=observations,
+                    min_observations=min_observations)
     c, u, r, e1, e2 = fr["center"], fr["up"], fr["radius"], fr["axis1"], fr["axis2"]
     views = []
 
@@ -314,7 +400,6 @@ def viewpoint_set(poses: dict, capture_order: list[str], component_of: dict | No
     mid1, mid2 = 0.5 * (lo1 + hi1), 0.5 * (lo2 + hi2)
     hw = max(0.5 * (hi1 - lo1) + TOP_MARGIN * (hi1 - lo1), TOP_MIN_HALF_R * r)
     hh = max(0.5 * (hi2 - lo2) + TOP_MARGIN * (hi2 - lo2), TOP_MIN_HALF_R * r)
-    # image x = e1, image y = -e2 (camera y = z x x = (-u) x e1 = -e2)
     if hw >= hh:
         W = int(top_long_side)
         H = max(2, int(round(top_long_side * hh / hw)))
@@ -352,7 +437,8 @@ def viewpoint_set(poses: dict, capture_order: list[str], component_of: dict | No
         views.append(_perspective(
             f"TRAJ_{j:02d}_insitu", "TRAJ_INSITU", T, iw, ih,
             fx=float(intrinsics["fx"]), fy=float(intrinsics["fy"]),
-            cx=float(intrinsics["cx"]), cy=float(intrinsics["cy"]), cull=False, **ch))
+            cx=float(intrinsics["cx"]), cy=float(intrinsics["cy"]), cull=False,
+            pose_source="own", **ch))
         Cp = C - PULLBACK_BACK_R * r * R[:, 2] + PULLBACK_UP_R * r * u
         views.append(_perspective(
             f"TRAJ_{j:02d}_pullback", "TRAJ_PULLBACK", _T(R, Cp), pw, ph,
@@ -361,6 +447,7 @@ def viewpoint_set(poses: dict, capture_order: list[str], component_of: dict | No
     return {
         "schema": SCHEMA,
         "rule": RULE_VERSION,
+        "mode": "native",
         "rule_parameters": {
             "orbit": {"n": N_ORBIT, "elevation_deg": ORBIT_ELEVATION_DEG,
                       "distance_r": ORBIT_DISTANCE_R, "fov_y_deg": ORBIT_FOV_Y_DEG},
@@ -369,26 +456,136 @@ def viewpoint_set(poses: dict, capture_order: list[str], component_of: dict | No
                      "pullback_scale": pullback_scale},
             "top": {"percentiles": list(TOP_PERCENTILES), "margin": TOP_MARGIN,
                     "min_half_r": TOP_MIN_HALF_R, "camera_height_r": 4.0},
+            "support": ({"min_observations": int(min_observations)} if observations is not None
+                        else "caller-vouched (no observation counts given)"),
             "up": f"trimmed mean of camera -Y (keep angle <= p{UP_TRIM_PERCENTILE:g})",
             "radius": f"p{RADIUS_PERCENTILE:g} of |C_i - c|",
-            "center": "coordinate-wise median of main-component camera centres",
+            "center": "geometric median of supported main-component camera centres",
+            "axis": "PCA of centres with |C_i - c| <= r, perpendicular to up; "
+                    "sign by mean horizontal viewing direction",
         },
         "frame": {
             "component": fr["component"],
             "posed_in_component": len(fr["main_keyframes"]),
             "posed_total": fr["posed_total"],
+            "supported_total": fr["supported_total"],
             "accepted_total": len(capture_order),
             "center": _list(c), "up": _list(u), "radius": float(r),
             "axis1": _list(e1), "axis2": _list(e2),
-            "first_keyframe_id": fr["first_keyframe_id"],
+            "conditioning": fr["conditioning"],
         },
         "intrinsics": {k: (float(intrinsics[k]) if k in ("fx", "fy", "cx", "cy")
                            else int(intrinsics[k]))
                        for k in ("fx", "fy", "cx", "cy", "width", "height")},
         "main_keyframe_ids": list(fr["main_keyframes"]),
+        "anchors": {k: _list(np.asarray(poses[k], float)[:3, 3]) for k in fr["main_keyframes"]},
         "views": views,
         "meta": dict(meta or {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# transfer: one viewpoint set carried across variants of one world
+# ---------------------------------------------------------------------------
+
+
+def transfer_viewpoints(vs: dict, poses_from: dict | None, poses_to: dict, *,
+                        observations_to: dict | None = None,
+                        min_observations: int = MIN_OBSERVATIONS,
+                        component_of_to: dict | None = None,
+                        intrinsics_to: dict | None = None,
+                        insitu: str = "own", min_shared: int = 6,
+                        trim: float = 3.0, meta: dict | None = None) -> dict:
+    """Carry viewpoint set `vs` into the gauge of `poses_to` (recommended for A/B).
+
+    A Sim(3) X_to = s R X_from + t is fitted (Umeyama, trimmed at `trim` x
+    1.4826 MAD) on the camera centres of keyframes that are in `vs`'s main
+    component AND supported in `poses_to` (observation floor when
+    `observations_to` is given) AND, when `component_of_to` is given, in the
+    target's component holding the most of them. `poses_from` supplies the
+    source centres; None uses the centres stored in `vs["anchors"]`.
+
+    Every view is mapped by the Sim(3): R_wc' = R R_wc, C' = s R C + t, and
+    orthographic half extents scale by s. TRAJ_INSITU views use the keyframe's
+    OWN pose in `poses_to` when it is posed and supported there (`insitu="own"`,
+    the default: in-situ means "from where this variant put that camera"), and
+    the mapped pose otherwise (`pose_source` says which). Everything else,
+    pullbacks included, is the mapped physical viewpoint. The returned set's
+    anchors are expressed in the target gauge, so transfers chain.
+    """
+    if insitu not in ("own", "transferred"):
+        raise ValueError(f"insitu must be 'own' or 'transferred', not {insitu!r}")
+    if poses_from is None:
+        anchors = vs.get("anchors")
+        if not anchors:
+            raise ValueError("viewpoint set has no anchors (rule /1?); pass poses_from")
+        src_c = {k: np.asarray(v, float) for k, v in anchors.items()}
+    else:
+        src_c = {k: np.asarray(T, float)[:3, 3] for k, T in poses_from.items()}
+    sup_to = supported_ids(poses_to, observations_to, min_observations)
+    shared = [k for k in vs["main_keyframe_ids"] if k in src_c and k in sup_to]
+    comp_used = None
+    if component_of_to:
+        comp_used, shared = main_component(shared, component_of_to)
+    if len(shared) < max(3, int(min_shared)):
+        raise ValueError(f"only {len(shared)} shared supported keyframes; need {max(3, min_shared)}")
+    src = np.array([src_c[k] for k in shared])
+    dst = np.array([np.asarray(poses_to[k], float)[:3, 3] for k in shared])
+    s, R, t, inl = robust_sim3(src, dst, trim=trim)
+    res = np.linalg.norm(dst - (s * (R @ src.T).T + t), axis=1)
+    r_from = float(vs["frame"]["radius"])
+    r_to = s * r_from
+
+    def mapT(Tm):
+        Tm = np.asarray(Tm, float).reshape(4, 4)
+        return _T(R @ Tm[:3, :3], s * R @ Tm[:3, 3] + t)
+
+    out = json.loads(json.dumps(vs))  # deep copy
+    for v in out["views"]:
+        v["T_world_camera"] = _list(mapT(v["T_world_camera"]))
+        if v["projection"] == "orthographic":
+            v["half_width"] = float(v["half_width"] * s)
+            v["half_height"] = float(v["half_height"] * s)
+        if v["family"] == "TRAJ_INSITU":
+            kid = v.get("keyframe_id")
+            if insitu == "own" and kid in sup_to:
+                v["T_world_camera"] = _list(np.asarray(poses_to[kid], float))
+                v["pose_source"] = "own"
+                if intrinsics_to:
+                    for k2 in ("fx", "fy", "cx", "cy"):
+                        v[k2] = float(intrinsics_to[k2])
+                    v["width"], v["height"] = int(intrinsics_to["width"]), int(intrinsics_to["height"])
+                    v["fov_y_deg"] = math.degrees(2.0 * math.atan(0.5 * v["height"] / v["fy"]))
+            else:
+                v["pose_source"] = "transferred"
+            v["keyframe_in_target"] = bool(kid in sup_to)
+    fr = out["frame"]
+    fr["center"] = _list(s * R @ np.asarray(fr["center"], float) + t)
+    for key in ("up", "axis1", "axis2"):
+        fr[key] = _list(R @ np.asarray(fr[key], float))
+    fr["radius"] = float(r_to)
+    out["anchors"] = {k: _list(s * R @ np.asarray(c, float) + t) for k, c in src_c.items()
+                      if k in set(vs["main_keyframe_ids"])}
+    if intrinsics_to:
+        out["intrinsics"] = {k: (float(intrinsics_to[k]) if k in ("fx", "fy", "cx", "cy")
+                                 else int(intrinsics_to[k]))
+                             for k in ("fx", "fy", "cx", "cy", "width", "height")}
+    out["mode"] = "transferred"
+    out["transfer"] = {
+        "from_rule": vs.get("rule"), "from_mode": vs.get("mode", "native"),
+        "from_meta": vs.get("meta", {}),
+        "scale": float(s), "rotation": _list(R), "translation": _list(t),
+        "shared": len(shared), "inliers": int(inl.sum()),
+        "target_component": comp_used,
+        "rms_over_r": float(np.sqrt((res[inl] ** 2).mean()) / r_to),
+        "residual_p90_over_r_all": float(np.percentile(res, 90) / r_to),
+        "insitu": insitu,
+        "traj_keyframes_missing_in_target": sorted(
+            v["keyframe_id"] for v in out["views"]
+            if v["family"] == "TRAJ_INSITU" and v["keyframe_id"] not in sup_to),
+    }
+    out["meta"] = dict(meta or {})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -440,8 +637,8 @@ def save_viewpoints(vs: dict, path) -> Path:
 
 def load_viewpoints(path) -> dict:
     vs = json.loads(Path(path).read_text(encoding="utf-8"))
-    if vs.get("schema") != SCHEMA:
-        raise ValueError(f"{path}: not a {SCHEMA} file (schema={vs.get('schema')!r})")
+    if vs.get("schema") not in READABLE_SCHEMAS:
+        raise ValueError(f"{path}: not a viewpoints file (schema={vs.get('schema')!r})")
     return vs
 
 
@@ -465,6 +662,10 @@ def poses_from_solution(meta: dict) -> tuple[dict, dict]:
         if p.get("component") is not None:
             comp[kid] = int(p["component"])
     return poses, comp
+
+
+def observations_from_solution(meta: dict) -> dict:
+    return {kid: int(p.get("observations") or 0) for kid, p in (meta.get("poses") or {}).items()}
 
 
 def capture_order_from_keyframes(path) -> list[str]:
@@ -493,29 +694,34 @@ def single_session_id(world_dir) -> str:
     return sessions[0]
 
 
-def viewpoints_for_world(world_dir, session_id: str | None = None, *,
-                         source: str = "solve", **kw) -> dict:
-    """`viewpoint_set` for a world (or variant) directory, read-only.
-
-    source="solve": solve/<sid>/solution.json (the global solve). The
-    in-situ camera is the solution's pinhole camera -- the undistorted
-    camera the poses, the depth and the fusion are all expressed in -- and
-    the session's self-calibrated (distorted) intrinsics are recorded in
-    `meta` for reference.
-    """
+def _read_world(world_dir, session_id):
     world_dir = Path(world_dir)
     sid = session_id or single_session_id(world_dir)
-    if source != "solve":
-        raise ValueError(f"unknown source {source!r}")
     meta = json.loads((world_dir / "solve" / sid / "solution.json").read_text(encoding="utf-8"))
     poses, comp = poses_from_solution(meta)
+    return world_dir, sid, meta, poses, comp, observations_from_solution(meta)
+
+
+def viewpoints_for_world(world_dir, session_id: str | None = None, *,
+                         source: str = "solve",
+                         min_observations: int = MIN_OBSERVATIONS, **kw) -> dict:
+    """Native `viewpoint_set` for a world (or variant) directory, read-only.
+
+    Poses: solve/<sid>/solution.json (the global solve), with its observation
+    counts as the support rule. In-situ camera: the solution's pinhole -- the
+    undistorted camera the poses, depth and fusion are expressed in; the
+    session's self-calibrated intrinsics are recorded in `meta`.
+    """
+    if source != "solve":
+        raise ValueError(f"unknown source {source!r}")
+    world_dir, sid, meta, poses, comp, obs = _read_world(world_dir, session_id)
     order = capture_order_from_keyframes(world_dir / "sessions" / sid / "keyframes.jsonl")
-    cam = dict(meta["camera"])
     session_intr = None
     sj = world_dir / "sessions" / sid / "session.json"
     if sj.exists():
         session_intr = json.loads(sj.read_text(encoding="utf-8")).get("intrinsics")
-    return viewpoint_set(poses, order, comp, cam, meta={
+    return viewpoint_set(poses, order, comp, dict(meta["camera"]), observations=obs,
+                         min_observations=min_observations, meta={
         "world_dir": str(world_dir), "world_id": world_dir.name, "session_id": sid,
         "pose_source": f"solve/{sid}/solution.json",
         "solver": meta.get("solver"), "input_digest": meta.get("input_digest"),
@@ -524,23 +730,50 @@ def viewpoints_for_world(world_dir, session_id: str | None = None, *,
     }, **kw)
 
 
+def transfer_viewpoints_for_world(vs: dict, world_dir, session_id: str | None = None, *,
+                                  min_observations: int = MIN_OBSERVATIONS, **kw) -> dict:
+    """`transfer_viewpoints` of `vs` onto a world (or variant) directory's solve."""
+    world_dir, sid, meta, poses, comp, obs = _read_world(world_dir, session_id)
+    return transfer_viewpoints(vs, None, poses, observations_to=obs,
+                               min_observations=min_observations, component_of_to=comp,
+                               intrinsics_to=dict(meta["camera"]), meta={
+        "world_dir": str(world_dir), "world_id": world_dir.name, "session_id": sid,
+        "pose_source": f"solve/{sid}/solution.json",
+        "solver": meta.get("solver"), "input_digest": meta.get("input_digest"),
+    }, **kw)
+
+
 def main(argv=None) -> int:
     import argparse
+
+    from tower.artifact_paths import artifact_root_arg
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("world_dir")
     ap.add_argument("--session", default=None)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, type=artifact_root_arg,
+                    help="output JSON path (refused at a drive root or directly in home)")
+    ap.add_argument("--transfer-from", default=None,
+                    help="a reference viewpoints JSON to carry onto WORLD_DIR (A/B mode)")
     a = ap.parse_args(argv)
-    vs = viewpoints_for_world(a.world_dir, a.session)
+    if a.transfer_from:
+        vs = transfer_viewpoints_for_world(load_viewpoints(a.transfer_from), a.world_dir, a.session)
+        tr = vs["transfer"]
+        print(f"transferred: {tr['inliers']}/{tr['shared']} shared keyframes, scale {tr['scale']:.4g}, "
+              f"rms/r {tr['rms_over_r']:.4f}; TRAJ keyframes missing in target: "
+              f"{tr['traj_keyframes_missing_in_target']}")
+    else:
+        vs = viewpoints_for_world(a.world_dir, a.session)
     save_viewpoints(vs, a.out)
     fr = vs["frame"]
-    print(f"{len(vs['views'])} views; component {fr['component']} "
-          f"({fr['posed_in_component']} posed of {fr['accepted_total']}); r={fr['radius']:.4g}")
+    print(f"{len(vs['views'])} views ({vs['mode']}); component {fr['component']} "
+          f"({fr['posed_in_component']} supported of {fr['accepted_total']}); r={fr['radius']:.4g}; "
+          f"conditioning {fr['conditioning']}")
     for v in vs["views"]:
         if v["family"] == "TRAJ_INSITU":
             print(f"  {v['name']}: {v['keyframe_id']}"
-                  + (f" (for {v['requested_keyframe_id']})" if v["substituted"] else ""))
+                  + (f" (for {v['requested_keyframe_id']})" if v["substituted"] else "")
+                  + (f" [{v.get('pose_source')}]" if vs["mode"] == "transferred" else ""))
     return 0
 
 

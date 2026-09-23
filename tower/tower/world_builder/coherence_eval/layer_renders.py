@@ -16,22 +16,31 @@ renders, from every view of `viewpoints.viewpoint_set`:
 Optionally, when a region-label CSV (forensic annotation, never an input to
 reconstruction) is given, ``cameras_region`` and ``sparse_region`` colour by
 the region of the keyframe (for points: of their first observing keyframe).
+Any label gets a colour (`region_rgb`): the known vocabulary keeps fixed
+colours, anything else a deterministic colour derived from the label text.
+
+MAIN COMPONENT ONLY BY DEFAULT. Cameras and points of the viewpoint frame's
+component are drawn; cameras below the observation floor (unsupported: the
+product does not publish them) are drawn grey. Minor components are opt-in
+(`include_minor=True`) and are then drawn in THEIR OWN solver gauge, which is
+not registered to the main one -- the index says so. Component colours never
+wrap (`component_rgb`).
 
 WHAT IS AND IS NOT A RENDERER CHOICE. Surfaces are ray cast exactly
 (Open3D/Embree ``RaycastingScene``) against the stored triangles; nothing is
 smoothed, filled or re-coloured. TOP/ORBIT views cull back faces (a face is
 back-facing when its stored winding normal points away from the viewer) so an
 outside view can see into a room -- the view dict says so (``cull_backfaces``)
-and TRAJ views never cull. Sparse points of minor components are drawn where
-the solve left them: in THEIR OWN component's gauge, which is not the main
-component's (see ``global_solve.Solution``); the legend says so.
+and TRAJ views never cull.
 
 Nothing here writes anywhere but ``out_dir``.
 """
 
 from __future__ import annotations
 
+import colorsys
 import csv
+import hashlib
 import json
 import math
 import time
@@ -51,7 +60,31 @@ REGION_RGB = {
     "bed": (70, 220, 70), "hallway": (200, 90, 255), "other": (200, 200, 200),
     "unclear": (110, 110, 110), None: (70, 70, 70),
 }
+UNSUPPORTED_RGB = (125, 125, 125)
 LAYERS_DEFAULT = ("cameras", "sparse", "sparse_time", "surface", "surface_rgb")
+MINOR_GAUGE_NOTE = ("minor components are drawn in their OWN solver gauge, not registered to "
+                    "the main component; positions relative to the main component mean nothing")
+
+
+def component_rgb(index) -> tuple:
+    """Colour of component `index` (0 = main). The first 8 are fixed; beyond
+    them, golden-angle hues -- a palette that never wraps silently."""
+    i = int(index)
+    if 0 <= i < len(COMPONENT_RGB):
+        return COMPONENT_RGB[i]
+    h = (0.61803398875 * i) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.65, 0.95)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def region_rgb(label) -> tuple:
+    """Evaluation-only colour of a region label. Known labels keep fixed
+    colours; any other label gets a deterministic colour from its text."""
+    if label in REGION_RGB:
+        return REGION_RGB[label]
+    h = int(hashlib.sha1(str(label).encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+    r, g, b = colorsys.hsv_to_rgb(h, 0.55, 0.9)
+    return (int(r * 255), int(g * 255), int(b * 255))
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +110,24 @@ class WorldLayers:
     surface_manifest: dict | None
     regions: dict = field(default_factory=dict)   # kid -> region label
     surface_dir: Path | None = None               # default: world_dir/surface/<sid>
+    pose_observations: dict | None = None         # kid -> observation count (None: all supported)
+    min_observations: int = 30
+
+    def supported(self, kid) -> bool:
+        if self.pose_observations is None:
+            return kid in self.poses
+        return int(self.pose_observations.get(kid) or 0) >= int(self.min_observations)
+
+    def main_component(self):
+        """Largest component by supported cameras (ties: lowest id)."""
+        counts: dict = {}
+        for k in self.poses:
+            if self.supported(k):
+                c = self.component_of.get(k)
+                counts[c] = counts.get(c, 0) + 1
+        if not counts:
+            return None
+        return sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
 
     @property
     def world_id(self) -> str:
@@ -137,6 +188,7 @@ def load_world(world_dir, session_id: str | None = None, regions_csv=None,
         surface_manifest=manifest,
         regions=read_regions(regions_csv) if regions_csv else {},
         surface_dir=Path(surface_dir) if surface_dir else None,
+        pose_observations=vp.observations_from_solution(meta),
     )
 
 
@@ -325,29 +377,33 @@ def frustum_segments(T, size):
 
 
 def render_cameras(view, world: WorldLayers, frame_radius: float, color_by="component",
-                   scale: float = 1.0):
+                   scale: float = 1.0, *, component=None, include_minor: bool = False):
+    """Frusta + the main component's capture-order path.
+
+    Default: the main component only (`component`, else the largest by
+    supported cameras); unsupported cameras grey. `include_minor=True` adds
+    the other components in their own gauge (see MINOR_GAUGE_NOTE)."""
+    main_comp = world.main_component() if component is None else component
     segs, cols = [], []
-    main_comp = None
-    counts = {}
-    for k in world.poses:
-        c = world.component_of.get(k)
-        counts[c] = counts.get(c, 0) + 1
-    main_comp = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0] if counts else None
     size = 0.04 * frame_radius
     for k in world.capture_order:
         T = world.poses.get(k)
         if T is None:
             continue
-        if color_by == "region":
-            col = REGION_RGB.get(world.regions.get(k), REGION_RGB[None])
+        comp = world.component_of.get(k)
+        if comp != main_comp and not include_minor:
+            continue
+        if not world.supported(k):
+            col = UNSUPPORTED_RGB
+        elif color_by == "region":
+            col = region_rgb(world.regions.get(k))
         else:
-            col = COMPONENT_RGB[int(world.component_of.get(k, 0)) % len(COMPONENT_RGB)]
-        for s in frustum_segments(T, size):
-            segs.append(s)
+            col = component_rgb(0 if comp == main_comp else _minor_rank(world, comp, main_comp))
+        for sgm in frustum_segments(T, size):
+            segs.append(sgm)
             cols.append(col)
-    # capture-order path of the main component
     path = [world.poses[k][:3, 3] for k in world.capture_order
-            if k in world.poses and world.component_of.get(k) == main_comp]
+            if k in world.poses and world.component_of.get(k) == main_comp and world.supported(k)]
     for a, b in zip(path[:-1], path[1:]):
         segs.append((a, b))
         cols.append((230, 230, 230))
@@ -355,6 +411,17 @@ def render_cameras(view, world: WorldLayers, frame_radius: float, color_by="comp
         return render_points(view, np.zeros((0, 3)), np.zeros((0, 3)), scale=scale)
     P, C = _segments_to_points(view, np.array(segs), cols, scale)
     return render_points(view, P, C, radius_px=0, scale=scale)
+
+
+def _minor_rank(world: WorldLayers, comp, main_comp) -> int:
+    """1-based colour rank of a minor component (by camera count, then id)."""
+    counts: dict = {}
+    for k in world.poses:
+        c = world.component_of.get(k)
+        if c != main_comp:
+            counts[c] = counts.get(c, 0) + 1
+    order = sorted(counts, key=lambda c: (-counts[c], str(c)))
+    return 1 + order.index(comp) if comp in order else len(order) + 1
 
 
 def turbo(x):
@@ -461,13 +528,10 @@ def region_insitu_keyframes(world: WorldLayers, per_region: int = 3) -> list:
     """Evaluation-only choice of extra in-situ keyframes: per region label,
     the posed main-component keyframes at within-region capture quantiles
     (i + 0.5) / per_region. Region labels choose WHERE TO LOOK, nothing else."""
-    counts = {}
-    for k in world.poses:
-        counts[world.component_of.get(k)] = counts.get(world.component_of.get(k), 0) + 1
-    main = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    main = world.main_component()
     by = {}
     for k in world.capture_order:
-        if k in world.poses and world.component_of.get(k) == main:
+        if k in world.poses and world.component_of.get(k) == main and world.supported(k):
             by.setdefault(world.regions.get(k), []).append(k)
     out = []
     for reg in sorted(by, key=lambda r: str(r)):
@@ -562,12 +626,16 @@ def keyframe_surface_metrics(world: WorldLayers, caster: "MeshCaster", kid: str,
 
 def render_world(world_dir, out_dir, *, session_id=None, viewpoints=None, regions_csv=None,
                  layers=LAYERS_DEFAULT, level: int = 0, orbit_scale: float = 1.0,
-                 point_radius: int = 1, surface_dir=None, log=print) -> dict:
+                 point_radius: int = 1, surface_dir=None, include_minor: bool = False,
+                 log=print) -> dict:
     """Render `layers` of a world from its viewpoint set into `out_dir`.
 
     Layout: out_dir/<layer>/<view>.png, out_dir/sheets/<layer>.png,
     out_dir/index.json. `viewpoints` is a viewpoint-set dict (or path); by
-    default the rule is applied to this world's own trajectory.
+    default the rule is applied to this world's own trajectory. For A/B
+    renders of variants, pass a set transferred from the reference
+    (`viewpoints.transfer_viewpoints`). Main component only unless
+    `include_minor`.
     """
     out_dir = Path(out_dir)
     world = load_world(world_dir, session_id, regions_csv, surface_dir)
@@ -578,19 +646,23 @@ def render_world(world_dir, out_dir, *, session_id=None, viewpoints=None, region
     else:
         vs = viewpoints
     r = float(vs["frame"]["radius"])
+    main = world.main_component()
     layers = list(layers)
     if regions_csv and world.regions:
         for extra in ("cameras_region", "sparse_region"):
             if extra not in layers:
                 layers.append(extra)
     index = {"world_dir": str(world.world_dir), "session_id": world.session_id,
-             "viewpoint_rule": vs["rule"], "frame": vs["frame"], "layers": {},
+             "viewpoint_rule": vs["rule"], "viewpoint_mode": vs.get("mode", "native"),
+             "frame": vs["frame"], "layers": {},
+             "main_component": main, "include_minor": bool(include_minor),
              "surface_level": level,
              "surface_file": (str(world.surface_level_path(level))
                               if world.surface_level_path(level) else None),
              "notes": [
-                 "sparse/cameras: global solve (solve/<sid>/solution.*); minor components "
-                 "are drawn in their own gauge, not registered to the main one",
+                 "sparse/cameras: global solve (solve/<sid>/solution.*); "
+                 + ("main component + " + MINOR_GAUGE_NOTE if include_minor
+                    else "main component only; unsupported main cameras grey"),
                  "surface: published level from surface/<sid>/manifest.json; exact ray "
                  "cast; TOP/ORBIT cull back faces; TRAJ views do not",
              ]}
@@ -606,15 +678,24 @@ def render_world(world_dir, out_dir, *, session_id=None, viewpoints=None, region
             caster = MeshCaster(V, F, C)
             log(f"surface level {level}: {len(V)} vertices, {len(F)} faces "
                 f"(scene {time.time() - t0:.1f}s)")
-    # point colourings
-    X = world.xyz
+    # points: the main component only unless include_minor
+    keep = (np.ones(len(world.xyz), bool) if include_minor
+            else np.asarray(world.point_component) == (main if main is not None else 0))
+    X = world.xyz[keep]
+    pcomp = np.asarray(world.point_component)[keep]
+    pfirst = [k for k, m in zip(world.point_first_kid, keep) if m]
     kid_rank = {k: i / max(1, len(world.capture_order) - 1)
                 for i, k in enumerate(world.capture_order)}
-    pc_comp = np.array([COMPONENT_RGB[int(c) % len(COMPONENT_RGB)] for c in world.point_component],
+    minor_rank = {c: _minor_rank(world, c, main) for c in set(pcomp.tolist()) if c != main}
+    pc_comp = np.array([component_rgb(0 if c == main else minor_rank[c]) for c in pcomp],
                        np.uint8).reshape(-1, 3)
-    pc_time = turbo(np.array([kid_rank.get(k, 0.0) for k in world.point_first_kid]))
-    pc_region = np.array([REGION_RGB.get(world.regions.get(k), REGION_RGB[None])
-                          for k in world.point_first_kid], np.uint8).reshape(-1, 3)
+    pc_time = turbo(np.array([kid_rank.get(k, 0.0) for k in pfirst]))
+    pc_region = np.array([region_rgb(world.regions.get(k)) for k in pfirst],
+                         np.uint8).reshape(-1, 3)
+    index["points_drawn"] = int(len(X))
+    index["points_not_drawn_minor"] = int((~keep).sum())
+    index["component_colours"] = {str(main): list(component_rgb(0)),
+                                  **{str(c): list(component_rgb(i)) for c, i in minor_rank.items()}}
     for layer in layers:
         tiles = []
         stats = {}
@@ -622,9 +703,11 @@ def render_world(world_dir, out_dir, *, session_id=None, viewpoints=None, region
         for view in vs["views"]:
             s = orbit_scale if view["family"] in ("TOP", "ORBIT") else 1.0
             if layer == "cameras":
-                img = render_cameras(view, world, r, "component", s)
+                img = render_cameras(view, world, r, "component", s, component=main,
+                                     include_minor=include_minor)
             elif layer == "cameras_region":
-                img = render_cameras(view, world, r, "region", s)
+                img = render_cameras(view, world, r, "region", s, component=main,
+                                     include_minor=include_minor)
             elif layer == "sparse":
                 img = render_points(view, X, pc_comp, point_radius, s)
             elif layer == "sparse_time":
@@ -660,7 +743,8 @@ def render_world(world_dir, out_dir, *, session_id=None, viewpoints=None, region
 
 def insitu_and_metrics(world_dir, out_dir, *, session_id=None, viewpoints=None,
                        regions_csv=None, level: int = 0, per_region: int = 3,
-                       metrics_scale: float = 0.5, surface_dir=None, log=print) -> dict:
+                       metrics_scale: float = 0.5, surface_dir=None,
+                       include_minor: bool = False, log=print) -> dict:
     """In-situ photo-vs-surface comparisons and per-keyframe surface metrics.
 
     Writes out_dir/insitu_compare/<name>.png (+ sheets), and
@@ -703,15 +787,18 @@ def insitu_and_metrics(world_dir, out_dir, *, session_id=None, viewpoints=None,
     rows = []
     t0 = time.time()
     rank = {k: i for i, k in enumerate(world.capture_order)}
+    main = world.main_component()
     for kid in world.capture_order:
         if kid not in world.poses:
             continue
+        if world.component_of.get(kid) != main and not include_minor:
+            continue
         r = keyframe_surface_metrics(world, caster, kid, voxel=voxel, scale=metrics_scale)
         r.update({"capture_index": rank[kid], "component": world.component_of.get(kid),
-                  "region": world.regions.get(kid)})
+                  "region": world.regions.get(kid), "supported": world.supported(kid)})
         rows.append(r)
     log(f"metrics: {len(rows)} keyframes in {time.time() - t0:.1f}s")
-    cols = ["capture_index", "kid", "component", "region", "coverage", "front", "doubled",
+    cols = ["capture_index", "kid", "component", "supported", "region", "coverage", "front", "doubled",
             "sparse_n", "sparse_hit", "sparse_abs_rel_med", "sparse_agree", "sparse_in_front",
             "sparse_behind_or_missing"]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -729,7 +816,7 @@ def insitu_and_metrics(world_dir, out_dir, *, session_id=None, viewpoints=None,
         def med(field):
             vals = [x[field] for x in rs if x.get(field) is not None]
             return round(float(np.median(vals)), 4) if vals else None
-        agg[key] = {"n": len(rs), **{f: med(f) for f in cols[4:] if f != "sparse_n"}}
+        agg[key] = {"n": len(rs), **{f: med(f) for f in cols[5:] if f != "sparse_n"}}
     (out_dir / "surface_keyframe_metrics_summary.json").write_text(
         json.dumps({"voxel": voxel, "level": level, "scale": metrics_scale,
                     "by_component_region_median": agg}, indent=1), encoding="utf-8")
