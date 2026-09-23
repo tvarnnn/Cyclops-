@@ -628,14 +628,37 @@ def build_cross_island_tier(world: WorldInfo, cache_root, *, workers: int | None
 LOFTR_ARRAYS = "xisland_loftr.npz"
 LOFTR_MANIFEST = "xisland_loftr_manifest.json"
 LOFTR_PARAMS = {
-    "version": 1,
+    "version": 2,
     "matcher": "zju-community/efficientloftr (Apache-2.0) via transformers",
     "input_size": [608, 352],
     "match_threshold": 0.2,
     "min_island": 10,
     "top_k_per_island_pair": 200,
+    "keypoints": "float (eloftr_matches_float: post_process_keypoint_matching minus its int32 cast)",
     "verification": "verify_points with the base tier's own floors (strict) -- same RANSAC, same thresholds",
 }
+
+
+def eloftr_matches_float(outputs, target_sizes, threshold: float = 0.0) -> list[dict]:
+    """transformers' `post_process_keypoint_matching` for EfficientLoFTR,
+    without its `keypoints.to(torch.int32)`.
+
+    The library truncates every keypoint to a whole pixel -- up to 1 px of
+    error, which is the whole RANSAC threshold `verify_points` applies -- so
+    version 1 of this tier verified learned matches under a bias SIFT's
+    sub-pixel keypoints never carry. Same scaling, same score/match filter,
+    float coordinates. `target_sizes` is a list of ((h0, w0), (h1, w1)).
+    """
+    import torch
+
+    sizes = torch.tensor(target_sizes, device=outputs.matches.device, dtype=torch.float32)
+    keypoints = outputs.keypoints.float() * sizes.flip(-1).reshape(-1, 2, 1, 2)
+    results = []
+    for kp, matches, scores in zip(keypoints, outputs.matches, outputs.matching_scores):
+        valid = torch.logical_and(scores > threshold, matches > -1)
+        results.append({"keypoints0": kp[0][valid[0]], "keypoints1": kp[1][valid[1]],
+                        "matching_scores": scores[0][valid[0]]})
+    return results
 
 
 def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str | None = None, log=print,
@@ -707,8 +730,7 @@ def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str
                                                           "width": lp["input_size"][1]}).to(device)
         with torch.inference_mode():
             out = model(**inputs)
-        res = proc.post_process_keypoint_matching(out, [[a.shape[:2], b.shape[:2]]],
-                                                  threshold=lp["match_threshold"])[0]
+        res = eloftr_matches_float(out, [[a.shape[:2], b.shape[:2]]], threshold=lp["match_threshold"])[0]
         p0 = res["keypoints0"].cpu().numpy().astype(np.float64)
         p1 = res["keypoints1"].cpu().numpy().astype(np.float64)
         r = verify_points(p0, p1, K, size, params, distant=(j - i) > params["distant_gap"])

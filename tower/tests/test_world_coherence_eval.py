@@ -1101,3 +1101,38 @@ def test_placement_plausibility_fails_the_right_check(case, fails):
     if case == "tilted":
         assert r[other]["tilt_deg"] > 15.0
     assert out["islands"]["placement_plausibility"]["unobservable_without_image_links"]
+
+
+def test_eloftr_float_matches_are_the_library_postprocess_without_truncation():
+    """V (P2-E3) found transformers' EfficientLoFTR post-process truncates
+    keypoints to int32 -- up to 1 px, the whole verify_points threshold. The
+    harness helper must select the same matches and scale identically, and
+    differ from the library only by that truncation."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    from types import SimpleNamespace
+
+    from tower.world_builder.coherence_eval.eval_pairs import eloftr_matches_float
+
+    try:
+        from transformers.models.efficientloftr.image_processing_efficientloftr import (
+            EfficientLoFTRImageProcessor,
+        )
+    except ImportError:  # pragma: no cover
+        pytest.skip("transformers without EfficientLoFTR")
+    g = torch.Generator().manual_seed(0)
+    kp = torch.rand(1, 2, 50, 2, generator=g)
+    matches = torch.where(torch.rand(1, 2, 50, generator=g) > 0.3, torch.arange(50).repeat(1, 2, 1), -1)
+    matches[0, 1] = matches[0, 0]            # symmetric validity, as the model emits
+    scores = torch.rand(1, 2, 50, generator=g)
+    scores[0, 1] = scores[0, 0]
+    out = SimpleNamespace(keypoints=kp, matches=matches, matching_scores=scores)
+    sizes = [((639, 359), (639, 359))]
+    lib = EfficientLoFTRImageProcessor().post_process_keypoint_matching(out, sizes, threshold=0.2)[0]
+    ours = eloftr_matches_float(out, sizes, threshold=0.2)[0]
+    assert ours["keypoints0"].shape == lib["keypoints0"].shape
+    assert torch.equal(ours["keypoints0"].to(torch.int32), lib["keypoints0"])
+    assert torch.equal(ours["keypoints1"].to(torch.int32), lib["keypoints1"])
+    assert torch.equal(ours["matching_scores"], lib["matching_scores"])
+    frac = (ours["keypoints0"] - ours["keypoints0"].floor()).abs()
+    assert float(frac.max()) > 0.1   # sub-pixel information survives
