@@ -26,9 +26,19 @@ One walk is usually SEVERAL captures. The Tower mints a capture at
 `stream_start`, so a transport disconnect ends one and the reconnect
 begins the next, while the World Builder follower keeps a single session
 across the gap (under the 90 s new-walk bound). Both sessions here are
-three captures. `CASES` records which, in time order; the frame numbering
-across them is disjoint and increasing, so a merged directory in sorted
-order is the walk's true frame order.
+three captures. `CASES` records which, in time order.
+
+The frame numbering across captures is NOT a walk-wide clock. In the two
+cases above it happens to be disjoint and increasing, but on other walks
+(4cae0b26, adc75972) every reconnect restarts it at `00000001.jpg`, so
+the raw names collide and a merged directory sorted by raw name would
+interleave captures. `stage_frames` therefore names each staged frame
+`<capture ordinal>_<capture id[:8]>_<raw name>`: unique by construction,
+sorted into capture order first and raw-name order within a capture, and
+naming its own source. Where the numbering does continue, that order is
+exactly the raw-name order, so the pinned cases replay the same frames in
+the same order as before. `staging.json` beside the frames maps every
+staged name back to its capture and raw file.
 
 WHAT IT IS NOT
 
@@ -104,33 +114,102 @@ CASES = {
 }
 
 
+STAGING_MANIFEST = "staging.json"
+STAGING_SCHEMA = "wb-replay-staging/1"
+
+
+def staged_name(ordinal: int, width: int, capture: str, raw_name: str) -> str:
+    """The staged file name of one raw frame: `<ordinal>_<capture[:8]>_<raw>`.
+
+    The zero-padded capture ordinal leads, so a plain sort of the staging
+    directory -- which is all `world_build_session.py --frames` does -- is
+    capture order first and raw-name order within a capture. The capture id
+    is there for the reader: a staged path in `sources.json` then says which
+    capture and which raw frame it is without a lookup.
+    """
+    return f"{ordinal:0{width}d}_{capture[:8]}_{raw_name}"
+
+
 def stage_frames(captures, capture_root: Path, staging: Path) -> int:
     """Hard-link one walk's frames into a single directory, in walk order.
 
     Hard links, not copies: a replay of a thousand-frame walk must not
     cost what the capture cost, and the originals are evidence this tool
-    has no business rewriting. A name collision is a hard error rather
-    than an overwrite -- two captures numbering frames the same way would
-    otherwise silently drop half the walk.
+    has no business rewriting.
+
+    Chained captures may restart their frame numbering (a reconnect begins
+    again at `00000001.jpg`), so raw names are not unique across a walk and
+    their sort order is not the walk's order. Every frame is staged under
+    `staged_name`, which is both. `staging.json` records, per staged name,
+    the capture, its position in the chain and the raw file it links to --
+    the builder's `sources.json` names the staged path, and this is what
+    takes that path back to the raw frame.
+
+    Everything is checked before anything is linked, so a refusal leaves no
+    half-staged walk behind:
+      * a capture named twice would replay part of the walk twice;
+      * a `.jpg` already in the staging directory that this walk does not
+        stage (an earlier replay into the same root) would be read as
+        part of the walk;
+      * a staged name that exists but is a different file would silently
+        substitute another photograph.
     """
-    staging.mkdir(parents=True, exist_ok=True)
-    seen: dict = {}
-    for capture in captures:
+    captures = list(captures)
+    repeated = sorted({c for c in captures if captures.count(c) > 1})
+    if repeated:
+        raise SystemExit(
+            f"capture(s) {', '.join(repeated)} named more than once; a walk "
+            "stages each capture exactly once"
+        )
+    width = max(3, len(str(max(len(captures) - 1, 0))))
+    plan = []
+    for ordinal, capture in enumerate(captures):
         frames = capture_root / capture / "frames"
         if not frames.is_dir():
             raise SystemExit(f"capture {capture} has no frames directory at {frames}")
         for source in sorted(frames.glob("*.jpg")):
-            if source.name in seen:
-                raise SystemExit(
-                    f"frame {source.name} appears in two captures "
-                    f"({seen[source.name]} and {source}); this walk cannot be "
-                    "staged as one sorted directory"
-                )
-            seen[source.name] = source
-            target = staging / source.name
-            if not target.exists():
-                os.link(source, target)
-    return len(seen)
+            plan.append((staged_name(ordinal, width, capture, source.name),
+                         ordinal, capture, source))
+
+    staging.mkdir(parents=True, exist_ok=True)
+    planned = {name for name, _, _, _ in plan}
+    foreign = sorted(p.name for p in staging.glob("*.jpg") if p.name not in planned)
+    if foreign:
+        raise SystemExit(
+            f"{staging} already holds {len(foreign)} frame(s) this walk does not "
+            f"stage (first: {foreign[0]}); they would be replayed as part of it. "
+            "Replay into a fresh --root"
+        )
+    for name, _, _, source in plan:
+        target = staging / name
+        if target.exists() and not os.path.samefile(source, target):
+            raise SystemExit(
+                f"{target} exists and is not a link to {source}; refusing to "
+                "replay a different photograph under this name"
+            )
+
+    for name, _, _, source in plan:
+        target = staging / name
+        if not target.exists():
+            os.link(source, target)
+    manifest = {
+        "schema": STAGING_SCHEMA,
+        "captures": captures,
+        "frames": [
+            {
+                "staged": name,
+                "capture_id": capture,
+                "capture_ordinal": ordinal,
+                "raw_name": source.name,
+                "raw_path": str(source.resolve()),
+            }
+            for name, ordinal, capture, source in plan
+        ],
+    }
+    (staging / STAGING_MANIFEST).write_text(
+        json.dumps(manifest, indent=1), encoding="utf-8"
+    )
+    return len(plan)
 
 
 def main(argv=None) -> int:
@@ -284,6 +363,7 @@ def main(argv=None) -> int:
         "case": args.case,
         "captures": list(captures),
         "frames_staged": frames,
+        "staging_manifest": str(staging / STAGING_MANIFEST),
         "wall_seconds": round(elapsed, 2),
     }
 
