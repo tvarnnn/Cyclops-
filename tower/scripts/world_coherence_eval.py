@@ -9,9 +9,13 @@ that a variant is better is a statement about identical measurements.
 SUBCOMMANDS
 
   cache    build the per-world caches (images only, solver-independent):
-             --what depth   MoGe-2 metric depth per keyframe (GPU)
-             --what pairs   verified image pairs: adjacent + retrieved revisits,
-                            SIFT + essential-matrix RANSAC (CPU)
+             --what depth    MoGe-2 metric depth per keyframe (GPU)
+             --what pairs    verified image pairs: adjacent + retrieved revisits,
+                             SIFT + essential-matrix RANSAC (CPU) -- the base tier
+             --what xisland  flagged cross-island tier: exhaustive SIFT between
+                             the base tier's islands (CPU)
+             --what xisland_loftr  optional EfficientLoFTR cross-island tier (GPU;
+                             weights in the HF cache named by HF_HOME)
   eval     metrics.json + metrics.md for one variant of one world
   compare  a diff table of two metrics.json
   table    headline metrics of several metrics.json side by side
@@ -63,13 +67,24 @@ def cmd_cache(args) -> int:
 
     world = open_world(args.world, args.session)
     root = _cache_root(args)
-    what = {"all": ("pairs", "depth")}.get(args.what, (args.what,))
+    what = {"all": ("pairs", "xisland", "depth")}.get(args.what, (args.what,))
     if "pairs" in what:
         from tower.world_builder.coherence_eval.eval_pairs import build_pair_cache
 
         m = build_pair_cache(world, root, workers=args.workers, log=lambda s: print(s, flush=True),
                              allow_descriptor_fallback=args.allow_descriptor_fallback)
         print(json.dumps({k: m[k] for k in ("counts", "seconds") if k in m}, indent=1))
+    if "xisland" in what:
+        from tower.world_builder.coherence_eval.eval_pairs import build_cross_island_tier
+
+        m = build_cross_island_tier(world, root, workers=args.workers, log=lambda s: print(s, flush=True))
+        print(json.dumps({k: m[k] for k in ("counts", "links_by_island_pair", "seconds") if k in m}, indent=1))
+    if "xisland_loftr" in what:
+        from tower.world_builder.coherence_eval.eval_pairs import build_learned_cross_island_tier
+
+        m = build_learned_cross_island_tier(world, root, log=lambda s: print(s, flush=True))
+        print(json.dumps({k: m[k] for k in ("counts", "links_by_island_pair", "seconds", "peak_vram_mb")
+                          if k in m}, indent=1))
     if "depth" in what:
         from tower.world_builder.coherence_eval.eval_depth import build_depth_cache
 
@@ -91,7 +106,7 @@ def _load_variant(args, world):
         kwargs["publish_min_model_images"] = args.publish_min_model_images
     if getattr(args, "image_space", None):
         kwargs["image_space"] = args.image_space
-    v = ev.load_any(Path(args.variant), world, **kwargs)
+    v = ev.load_any(Path(args.variant), world, force=bool(getattr(args, "force", False)), **kwargs)
     if args.name:
         v.name = args.name
         v.meta["variant"] = args.name
@@ -108,7 +123,7 @@ def cmd_eval(args) -> int:
     regions_dir = Path(args.regions_dir) if args.regions_dir else None
     result = metrics.evaluate_world_variant(
         world, variant, cache_root=cache_root, regions_dir=regions_dir,
-        renders=args.renders, out_dir=args.out)
+        renders=args.renders, out_dir=args.out, viewpoints_from=args.viewpoints_from)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     metrics.write_outputs(result, out)
@@ -197,11 +212,16 @@ def main(argv=None) -> int:
                        help="COLMAP input: minimum registered images for a model to publish (default 5)")
         q.add_argument("--image-space", choices=("canonical", "raw", "custom"), default=None,
                        help="COLMAP input: pixel space of the observations (default: inferred from size)")
+        q.add_argument("--force", action="store_true",
+                       help="evaluate a variant whose world/session ids (or image names) do not match --world")
 
     c = sub.add_parser("cache", help="build per-world caches (depth: GPU; pairs: CPU)")
     world_args(c)
     cache_arg(c)
-    c.add_argument("--what", choices=("depth", "pairs", "all"), default="all")
+    c.add_argument("--what", choices=("depth", "pairs", "xisland", "xisland_loftr", "all"), default="all",
+                   help="xisland = the flagged cross-island SIFT tier (needs pairs first); xisland_loftr = "
+                        "the optional learned-matcher tier (GPU; EfficientLoFTR weights via HF_HOME); "
+                        "all = pairs + xisland + depth")
     c.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     c.add_argument("--allow-descriptor-fallback", action="store_true",
                    help="pairs: use tiny-image retrieval if DINOv2 cannot load (recorded; not comparable)")
@@ -215,7 +235,10 @@ def main(argv=None) -> int:
     e.add_argument("--regions-dir", default=None,
                    help="dir with <world_id>_regions.csv / <world_id>_revisits.csv (evaluation-only labels)")
     e.add_argument("--renders", action="store_true",
-                   help="also render the fixed viewpoint set (needs coherence_eval.layer_renders)")
+                   help="also render the variant's main component from the viewpoint set (C2's renderer)")
+    e.add_argument("--viewpoints-from", default=None,
+                   help="A/B: carry this viewpoints.json (e.g. the baseline's) into the variant's gauge "
+                        "(viewpoints.transfer_viewpoints) instead of applying the rule natively")
     e.set_defaults(func=cmd_eval)
 
     k = sub.add_parser("compare", help="diff two metrics.json")
@@ -232,7 +255,8 @@ def main(argv=None) -> int:
 
     m = sub.add_parser("measure", help="run a command; record wall time, peak RSS, peak VRAM")
     m.add_argument("--out", type=artifact_root_arg, default=None, help="runtime JSON to write")
-    m.add_argument("--variant", default=None, help="interchange dir whose meta.runtime to fill")
+    m.add_argument("--variant", type=artifact_root_arg, default=None,
+                   help="interchange dir whose meta.runtime to fill (rewrites its reconstruction.json)")
     m.add_argument("--poll", type=float, default=0.5, help="seconds between samples")
     m.add_argument("command", nargs=argparse.REMAINDER)
     m.set_defaults(func=cmd_measure)

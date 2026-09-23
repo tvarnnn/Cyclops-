@@ -10,16 +10,24 @@ component. Every metric below is invariant under an independent Sim(3) of each
 component: it uses only ratios of distances within one component, relative
 rotations, camera-frame depths up to a per-component constant (log-ratios are
 centred per component), and pixel errors. `tests/test_world_coherence_eval.py`
-checks this under random Sim(3) transforms.
+checks this under random Sim(3) transforms. (Physical continuity, H5 below,
+converts steps to metres with the component's own MoGe scale, which is a
+ratio of two quantities in the same gauge -- also invariant.)
 
-WHAT IS COUNTED. Pose metrics use the variant's PUBLISHED keyframes (what it
-would show; `status` in the interchange format). Posed-but-unpublished
-keyframes count only in registration. A variant therefore cannot improve the
-geometric metrics by publishing less without registration showing the loss,
-and cannot improve registration by publishing wrong poses without the
-continuity, revisit and sanity metrics showing it. Region labels
-(`regions`/`revisits`) are forensic annotations used ONLY in these reports;
-nothing here feeds anything back into a reconstruction.
+WHAT IS COUNTED, AND OVER WHAT. Pose metrics use the variant's PUBLISHED
+keyframes (what it would show; `status` in the interchange format). Every
+coherence FRACTION that could be improved by publishing less is ALSO reported
+over a FIXED denominator -- all accepted keyframes of the world, with
+unposed, unpublished, off-main and no-ratio keyframes counted as failures
+(`fixed_denominator`) -- and `compare` withholds its verdict when coverage
+changed. Region labels (`regions`/`revisits`) are forensic annotations used
+ONLY in these reports; nothing here feeds anything back into a
+reconstruction.
+
+WHAT THE HARNESS CANNOT SEE. Where one image island (see b2) sits relative to
+another when no verified image pair links them: those island pairs are
+listed as "UNOBSERVED" and no number pretends otherwise. A misrotation of an
+island about the vertical axis (tilt, b2, sees only non-vertical axes).
 
 THE METRICS (keys in metrics.json; every threshold is in `PARAMS`)
 
@@ -28,85 +36,80 @@ a. registration  -- fractions of the world's accepted keyframes that are
 b. components     -- components = the variant's stated frames (COLMAP models,
    solve components); a variant that states none gets the connected
    components of its covisibility graph (>= `covis_min_shared` shared
-   points) when it has observations, else ONE frame. Sizes, count
-   of joined (>= 2 published) and singleton components, the largest share,
-   and `main_runs`: the maximal runs of consecutive capture indices inside the
-   largest component (how often the walk leaves the main frame). With
-   observations: `covisibility_components_in_main`, the connected components
-   of the main frame's covisibility graph (edge = >= `covis_min_shared`
-   shared points) -- a frame held together by a thin link shows up here.
-c. continuity     -- per consecutive published pair (in capture order) of one
-   component: ratio = |c_j+1 - c_j| / (local median per-keyframe step x index
-   gap), the local median over `jump_window` steps each side (excluding the
-   step itself), floored at `jump_floor_frac` x the component's median step
-   (a pause must not make an ordinary step look like a jump). With keyframe
-   times (the world's receipt times; identical for every variant) the same is
-   computed for SPEED (step / max(dt, `dt_floor_s`)) and a translation JUMP
-   needs BOTH ratios > `jump_ratio`; a rotation jump needs > `rot_jump_deg`
-   per index gap AND > `rot_jump_deg_per_s`. The time test is what separates
-   a pose error (a large displacement in a fraction of a second) from a
-   legitimate long move across a tracking loss: on the known-good control
-   world the index-only rule flags 14-16 steps, almost all at tracker-segment
-   boundaries, the time-aware rule 2. `index_jumps` keeps the index-only count.
-   A SPIKE keyframe has jumps on both sides. Each jump says whether a
-   tracker-segment boundary (tracking lost in the frontend) lies inside it.
-   Limitation: receipt times include network jitter (tens of ms); a solver
-   error that moves a whole later block smoothly (a scale step) is NOT a jump
-   -- that is what the scale metric is for.
-d. scale          -- (i) `placement_scales`: spread of per-segment Sim(3)
-   scales where the variant declares them (the saved world's are exactly 1 by
-   construction: a GLOMAP model is one reconstruction). (ii) `depth`: per
-   published keyframe, r_k = median over its observations of
-   log(z_sfm / z_mono), z_sfm the camera-frame depth of the observed point,
-   z_mono the cached monocular metric depth (MoGe-2) at the observation pixel
-   (observations with reprojection error > `reproj_gate_px` excluded; >=
-   `depth_min_samples` per keyframe). r is centred on its component median
-   (gauge). Reported: robust spread (1.4826 MAD), Theil-Sen drift slope
-   over capture index (per 100 keyframes) and the drift it implies across the
-   component's span, step changes (difference of medians of
-   `scale_step_window` keyframes either side, peaks > `scale_step_log`),
-   spread per tracker segment, per region; and research lane D3's three
-   level numbers (`levels`): the share of keyframes within x1.5 of the
-   dominant scale level, the longest off-level run, and the largest step
-   between 15-keyframe windows. `units_per_metre` (exp of the uncentred
-   median) and `d3_pooled_informative` (all components pooled, as D3's pilot
-   did) are gauge-DEPENDENT and informative only.
-   Limitation: MoGe's per-image scale error (a few %) is noise in r_k; only
-   multi-keyframe statistics are meaningful. Needs the variant's own
-   observations; N/A otherwise.
-e. revisits       -- against the world's cached verified pair set: per pair
-   with both keyframes published in ONE component, the relative-rotation
-   error (deg) and, where the pair's translation is reliable (essential-matrix
-   model and parallax >= `t_min_parallax_deg`: below ~3 deg the measured
-   direction itself scatters by tens of degrees on these images), the
-   translation-direction error (deg) and the median Sampson epipolar error
-   (px) of the pair's stored inliers under the variant's relative pose.
-   Buckets by capture-order gap: adjacent (1), near (2..`revisit_window`),
-   distant (> `revisit_window`, i.e. beyond any sequential matching window:
-   true revisits). `joined_fraction` = pairs with both keyframes published in
-   one component / all verified pairs of the bucket; `main_joined_fraction`
-   likewise for the largest component. `annotated`: for C0's hand-annotated
-   revisit ranges, the closest-approach and centroid distances between the
-   two ranges' main-component camera centres over the main component's p90
-   radius (evaluation only; two ranges can see one place from different
-   positions, so a large distance is a flag, not a proof).
-f. reprojection   -- the variant's own observations through its own poses and
-   cameras: median, p90, p99, max, >3 px fraction, behind-camera count.
-g. regions        -- per C0 region: keyframes, fraction posed, published,
-   published in the main component, and "clean" (in main, not a spike, not an
-   outlier camera); jump endpoints and scale per region.
-h. sanity         -- per component: camera centres' distances from their
-   geometric median; p90 radius R90, max/R90, outlier cameras (> `outlier_k`
-   x R90); path length / R90; the same for the main component's points.
-i. renders        -- the fixed trajectory-derived viewpoint set
-   (`coherence_eval.viewpoints`, sibling lane C2) applied to the variant's own
-   published poses; the number of TRAJ keyframes that had to be substituted
-   (unposed or outside the main component) is itself a coverage number. With
-   ``--renders``, the variant's cameras and sparse points are drawn from every
-   view with C2's renderer (`layer_renders`) into ``<out>/renders/``. Visual
-   evidence only; no number is derived from the images.
+   points) when it has observations, else ONE frame. Sizes, joined /
+   singleton counts, `main_runs` (how often capture order enters the main
+   frame), and the covisibility components inside the main frame.
+b2. islands       -- image-only: the connected components of the world's
+   verified pair graph (base tier). For every pair of islands of >=
+   `island_min_kf` keyframes: the verified pairs linking them by tier (the
+   cross-island SIFT tier: strict = the base floors, relaxed-only; the
+   optional EfficientLoFTR tier) and the variant's rotation / direction errors
+   on the strict ones, or "UNOBSERVED". Tilt: the angle between each island's
+   roll-free up and the main island's (`eval_placement`). See the
+   `eval_placement` docstring for the level-head assumption.
+c. continuity     -- per consecutive published pair (capture order) of one
+   component: step ratio = |dc| / (local median per-keyframe step x index
+   gap) over `jump_window` steps each side, floored at `jump_floor_frac` x the
+   component's median; the same for speed with the world's keyframe receipt
+   times. An index+time JUMP needs both ratios > `jump_ratio` (or a rotation >
+   `rot_jump_deg` per gap and > `rot_jump_deg_per_s`). PHYSICAL (H5): the
+   step in metres (the component's MoGe units_per_metre) above
+   `walk_speed_max_mps` x dt + `walk_margin_m`, or a rotation above
+   `head_turn_max_dps` x dt + `head_turn_margin_deg`, is physically
+   implausible for a walking, head-turning wearer -- whatever the time gap.
+   `jumps` = index+time OR physical. Steps ACROSS A TRACKING LOSS (a tracker
+   segment boundary inside) are counted separately, with how many have no
+   strict verified image pair linking the `evidence_window` keyframes before
+   the step to those after it ("without image evidence": their relative
+   placement is the solver's guess). SPIKE = jumps on both sides.
+d. scale          -- per keyframe, a log-ratio r = log(z_variant / z_MoGe)
+   from TWO sources, each centred per component:
+   * `depth` (variant points): median over its own observations
+     (reprojection <= `reproj_gate_px`, >= `depth_min_samples`); needs
+     points.npz;
+   * `depth_tri` (harness triangulation, H3): the cached image-only pair
+     inliers triangulated with the variant's relative poses (Sampson <=
+     `tri_sampson_gate_px`, triangulation angle >= `tri_min_angle_deg`);
+     available for EVERY variant with poses, and not curatable by it.
+   Per source: coverage (keyframes with a ratio / accepted), robust spread,
+   Theil-Sen TREND (a step also produces a trend; `trend_factor_over_span`
+   is not "drift"), two-window steps, levels, fixed-denominator coherence,
+   per tracker segment (p10-p90 over segments with >= `segment_min_kf`),
+   per region. LEVELS (H2): the level is the MODE of a Gaussian KDE of the
+   main component's r (bandwidth `level_kde_bw_log`); on-level = within the
+   band; two bands, x1.5 and x1.25. A x1.5 step is invisible to the x1.5 band
+   by construction and is caught by the x1.25 band. FIXED DENOMINATOR (H1):
+   coherent_all = keyframes published, in main, with a ratio and on-level /
+   ALL accepted keyframes; longest_bad_run over all accepted keyframes.
+   Limitation: MoGe's per-image metric error (a few %) is noise in r; only
+   multi-keyframe statistics mean anything; mirrors and very near clutter can
+   bias one region's level.
+e. revisits       -- against the world's verified pair set (base tier), per
+   pair with both keyframes published in ONE component: relative-rotation
+   error, translation-direction error where the pair's own parallax (the
+   image-only measure of baseline over scene depth) is >= `t_min_parallax_deg`,
+   and Sampson error. Buckets (H4), all world-defined so every variant is
+   scored on the same pairs: adjacent (gap 1); near (gap 2..`revisit_window`);
+   revisit (DIFFERENT tracker segment AND >= `revisit_min_dt_s` apart AND gap
+   > `revisit_window`); lingering (gap > `revisit_window` but not a revisit:
+   same segment or too little time -- e.g. a slow final pass). `joined` =
+   both published in one component / all pairs of the bucket. The travelled
+   path is not a bucket criterion (it would make the pair set depend on the
+   variant); the variant's metric path between revisit pairs is reported.
+   `annotated`: C0's hand-annotated ranges (evaluation only).
+f. reprojection   -- the variant's own observations: median, p90, p99, max,
+   >3 px fraction, behind-camera count.
+g. regions        -- per C0 region: posed / published / in main / clean (in
+   main, not a spike, not an outlier camera, AND on the main scale level at
+   x1.5, triangulated ratio) and scale factor vs main.
+h. sanity         -- per component: camera distances from their geometric
+   median; R90, max/R90, outlier cameras (> `outlier_k` x R90); points.
+i. renders        -- C2's viewpoint rule on the variant's published poses,
+   and (``--renders``) cameras / sparse points drawn with C2's renderer.
 j. runtime        -- the world's recorded timings, or the variant's
    `meta.runtime` (see `measure_command`).
+k. integrity      -- keyframe references the variant made that do not
+   resolve in this world (unresolved rows, unmatched COLMAP images).
 """
 
 from __future__ import annotations
@@ -121,7 +124,13 @@ from pathlib import Path
 
 import numpy as np
 
-HARNESS = "wb-coherence-metrics/1"
+from tower.world_builder.coherence_eval.eval_placement import (
+    PLACEMENT_PARAMS,
+    island_report,
+    triangulated_depth_ratios,
+)
+
+HARNESS = "wb-coherence-metrics/2"
 
 PARAMS = {
     "jump_window": 10,
@@ -130,22 +139,33 @@ PARAMS = {
     "rot_jump_deg": 30.0,
     "rot_jump_deg_per_s": 250.0,
     "dt_floor_s": 0.05,
+    "walk_speed_max_mps": 2.0,
+    "walk_margin_m": 0.3,
+    "head_turn_max_dps": 300.0,
+    "head_turn_margin_deg": 30.0,
+    "evidence_window": 5,
     "outlier_k": 3.0,
     "revisit_window": 30,
-    "t_min_parallax_deg": 3.0,
+    "revisit_min_dt_s": 10.0,
+    "t_min_parallax_deg": 5.0,
     "reproj_gate_px": 4.0,
     "depth_min_samples": 10,
     "depth_valid_m": [0.05, 50.0],
     "scale_step_window": 8,
     "scale_step_log": round(math.log(1.25), 6),
-    "coherent_band_factor": 1.5,
-    "coherent_grid": 400,
+    "level_bands": [1.5, 1.25],
+    "level_kde_bw_log": 0.05,
+    "level_kde_grid_log": 0.0025,
     "d3_step_window": 15,
+    "segment_min_kf": 10,
     "covis_min_shared": 15,
     "min_component_for_stats": 5,
     "rot_err_thresholds_deg": [2.0, 5.0, 10.0],
     "t_err_thresholds_deg": [10.0, 30.0],
     "worst_list": 15,
+    "compare_coverage_tol": 0.02,
+    "compare_ratio_coverage_tol": 0.05,
+    **{f"placement.{k}": v for k, v in PLACEMENT_PARAMS.items()},
 }
 
 # ---------------------------------------------------------------------------
@@ -173,19 +193,24 @@ def vec_angle_deg(a, b) -> np.ndarray:
 
 def geometric_median(X, iters: int = 200, tol: float = 1e-10) -> np.ndarray:
     """Weiszfeld. Equivariant under rotation, translation and scale (unlike a
-    coordinate-wise median), which keeps the sanity metrics gauge-invariant."""
+    coordinate-wise median), which keeps the sanity metrics gauge-invariant.
+    Iterates on the centred cloud so the stopping tolerance does not depend
+    on the absolute translation (review V2, L5)."""
     X = np.asarray(X, dtype=np.float64)
-    y = X.mean(0)
+    c0 = X.mean(0)
+    Xc = X - c0
+    y = np.zeros(3)
+    scale = np.abs(Xc).max() + 1e-300
     for _ in range(iters):
-        d = np.linalg.norm(X - y, axis=1)
-        d = np.maximum(d, 1e-12 * (np.abs(X).max() + 1.0))
+        d = np.linalg.norm(Xc - y, axis=1)
+        d = np.maximum(d, 1e-12 * scale)
         w = 1.0 / d
-        y_new = (X * w[:, None]).sum(0) / w.sum()
-        if np.linalg.norm(y_new - y) <= tol * (np.linalg.norm(y) + 1e-12):
+        y_new = (Xc * w[:, None]).sum(0) / w.sum()
+        if np.linalg.norm(y_new - y) <= tol * scale:
             y = y_new
             break
         y = y_new
-    return y
+    return y + c0
 
 
 def stats(values, *, thresholds=None, prefix_over="over_") -> dict | None:
@@ -217,6 +242,14 @@ def _ranges(indices) -> list[list[int]]:
         else:
             out.append([i, i])
     return out
+
+
+def _longest_run(bad) -> int:
+    run = best = 0
+    for b in bad:
+        run = run + 1 if b else 0
+        best = max(best, run)
+    return int(best)
 
 
 def round_sig(obj, sig: int = 6):
@@ -464,7 +497,21 @@ def _local_median(x: np.ndarray, W: int, floor: float) -> np.ndarray:
     return out
 
 
-def _continuity_for(p: Prepared, members: np.ndarray) -> dict:
+def evidence_matrix(n: int, arrays_list) -> np.ndarray:
+    """n x n symmetric boolean matrix of STRICT verified image pairs (all tiers)."""
+    M = np.zeros((n, n), bool)
+    for A in arrays_list:
+        if A is None or not len(A["i"]):
+            continue
+        sel = np.asarray(A["strict"], bool) if "strict" in A else np.ones(len(A["i"]), bool)
+        I = np.asarray(A["i"])[sel].astype(int)
+        J = np.asarray(A["j"])[sel].astype(int)
+        M[I, J] = True
+        M[J, I] = True
+    return M
+
+
+def _continuity_for(p: Prepared, members: np.ndarray, upm: float | None, evidence: np.ndarray | None) -> dict:
     W = PARAMS["jump_window"]
     T = PARAMS["jump_ratio"]
     if len(members) < 3:
@@ -493,11 +540,20 @@ def _continuity_for(p: Prepared, members: np.ndarray) -> dict:
     else:
         dt = sratio = None
         tj, rj = tj_idx, rj_idx
-    any_j = tj | rj
+    # physical bound (H5): metres via the component's own MoGe scale
+    d_m = None
+    phys = np.zeros(len(d), bool)
+    if timed and upm is not None and upm > 0:
+        d_m = d / upm
+        phys_t = d_m > PARAMS["walk_speed_max_mps"] * dt + PARAMS["walk_margin_m"]
+        phys_r = rot > PARAMS["head_turn_max_dps"] * dt + PARAMS["head_turn_margin_deg"]
+        phys = phys_t | phys_r
+    any_j = tj | rj | phys
     any_idx = tj_idx | rj_idx
     spikes = [int(members[j]) for j in range(1, len(members) - 1) if any_j[j - 1] and any_j[j]]
     endpoints = sorted({int(members[j]) for j in np.nonzero(any_j)[0]}
                        | {int(members[j + 1]) for j in np.nonzero(any_j)[0]})
+    E = PARAMS["evidence_window"]
 
     def boundary(j):
         if p.segment_of is None:
@@ -505,59 +561,88 @@ def _continuity_for(p: Prepared, members: np.ndarray) -> dict:
         a, b = int(members[j]), int(members[j + 1])
         return len(set(p.segment_of[a:b + 1])) > 1
 
+    def has_evidence(j):
+        if evidence is None:
+            return None
+        a, b = int(members[j]), int(members[j + 1])
+        return bool(evidence[max(0, a - E):a + 1, b:b + E + 1].any())
+
+    loss = [j for j in range(len(d)) if boundary(j)]
+    loss_noev = [j for j in loss if has_evidence(j) is False]
+    listed = sorted(set(np.nonzero(any_idx | any_j)[0].tolist()) | set(loss))
     jumps = []
-    for j in np.nonzero(any_idx)[0]:
+    for j in listed:
         a, b = int(members[j]), int(members[j + 1])
         jumps.append({"from": a, "to": b, "from_id": p.ids[a], "to_id": p.ids[b], "gap": int(b - a),
                       "ratio": float(ratio[j]),
                       "speed_ratio": None if sratio is None else float(sratio[j]),
                       "dt_s": None if dt is None else float(dt[j]),
+                      "step_m": None if d_m is None else float(d_m[j]),
                       "rot_deg": float(rot[j]),
                       "counted": bool(any_j[j]),
-                      "kind": "+".join(k for k, f in (("translation", tj_idx[j]), ("rotation", rj_idx[j])) if f),
-                      "segment_boundary_inside": boundary(j)})
+                      "physically_implausible": bool(phys[j]),
+                      "kind": "+".join(k for k, f in (("translation", tj_idx[j]), ("rotation", rj_idx[j]),
+                                                     ("physical", phys[j])) if f),
+                      "segment_boundary_inside": boundary(j),
+                      "image_evidence_across": has_evidence(j)})
     counted = [x for x in jumps if x["counted"]]
     r90 = float(np.percentile(np.linalg.norm(C - geometric_median(C), axis=1), 90))
     return {
-        "criterion": "index-and-time" if timed else "index-only",
+        "criterion": ("index+time or physical" if timed and d_m is not None else
+                      "index+time" if timed else "index-only"),
         "steps": int(len(d)),
         "jumps": int(any_j.sum()),
+        "jumps_index_time": int((tj | rj).sum()),
         "translation_jumps": int(tj.sum()),
         "rotation_jumps": int(rj.sum()),
+        "physically_implausible": None if d_m is None else int(phys.sum()),
         "jumps_within_segments": int(sum(1 for x in counted if x["segment_boundary_inside"] is False)),
         "jumps_at_segment_boundary": int(sum(1 for x in counted if x["segment_boundary_inside"])),
+        "tracking_loss_steps": len(loss) if p.segment_of is not None else None,
+        "tracking_loss_steps_without_image_evidence": (len(loss_noev) if evidence is not None
+                                                       and p.segment_of is not None else None),
+        "tracking_loss_steps_without_evidence_implausible": (
+            int(sum(1 for j in loss_noev if phys[j])) if d_m is not None else None),
         "spikes": len(spikes),
         "index_jumps": int(any_idx.sum()),
-        "index_jumps_at_segment_boundary": int(sum(1 for x in jumps if x["segment_boundary_inside"])),
         "max_ratio": float(np.max(ratio)) if len(ratio) else None,
         "ratio": stats(ratio),
         "speed_ratio": None if sratio is None else stats(sratio),
+        "step_m": None if d_m is None else stats(d_m),
+        "units_per_metre_used": upm,
         "rot_step_deg": stats(rot),
         "path_length_over_r90": float(d.sum() / r90) if r90 > 0 else None,
-        "jump_list": jumps[:80],
+        "path_length_m": None if d_m is None else float(d_m.sum()),
+        "jump_list": jumps[:100],
         "spike_keyframes": spikes,
         "_endpoints": endpoints,
     }
 
 
-def continuity(p: Prepared) -> dict:
+def continuity(p: Prepared, upm_by_comp: dict, evidence) -> dict:
     per = {}
     for c in p.order:
         m = p.members(c)
         if len(m) >= 3:
-            per[c] = _continuity_for(p, m)
+            per[c] = _continuity_for(p, m, upm_by_comp.get(c), evidence)
     main = per.get(p.main) if p.main is not None else None
-    out = {"main": main,
-           "all_components": {
-               "components_evaluated": len(per),
-               "jumps": int(sum(x["jumps"] for x in per.values())),
-               "spikes": int(sum(x["spikes"] for x in per.values())),
-               "translation_jumps": int(sum(x["translation_jumps"] for x in per.values())),
-               "rotation_jumps": int(sum(x["rotation_jumps"] for x in per.values())),
-           },
-           "per_component": {c: {k: x[k] for k in ("steps", "jumps", "spikes", "max_ratio")}
-                             for c, x in per.items()}}
-    return out
+
+    def total(key):
+        vals = [x.get(key) for x in per.values()]
+        return None if any(v is None for v in vals) else int(sum(vals))
+
+    return {"main": main,
+            "all_components": {
+                "components_evaluated": len(per),
+                "jumps": total("jumps"),
+                "spikes": total("spikes"),
+                "physically_implausible": total("physically_implausible"),
+                "tracking_loss_steps": total("tracking_loss_steps"),
+                "tracking_loss_steps_without_image_evidence": total("tracking_loss_steps_without_image_evidence"),
+            },
+            "per_component": {c: {k: x.get(k) for k in ("steps", "jumps", "spikes", "max_ratio",
+                                                        "physically_implausible")}
+                              for c, x in per.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +772,8 @@ def reprojection(p: Prepared, table) -> dict:
 
 
 def keyframe_depth_ratios(p: Prepared, table, depth_fn) -> dict | None:
-    """Per published keyframe: median log(z_sfm / z_mono), sample count, and the
-    within-keyframe spread (1.4826 MAD) of the log-ratio."""
+    """Per published keyframe: median log(z_sfm / z_mono) over the variant's own
+    observations, sample count, and the within-keyframe spread (1.4826 MAD)."""
     if table is None or depth_fn is None:
         return None
     lo, hi = PARAMS["depth_valid_m"]
@@ -759,65 +844,73 @@ def _steps(x_idx, y, w, thr):
             for j in sorted(taken)]
 
 
-def level_stats(y_ordered) -> dict | None:
-    """Research lane D3's three scale-coherence numbers on a log-scale sequence
-    in capture order (sign convention irrelevant: every statistic is symmetric).
+def level_mode(y) -> float:
+    """The scale LEVEL: the mode of a Gaussian KDE of y (bandwidth
+    `level_kde_bw_log`, grid `level_kde_grid_log`; ties -> the lowest grid
+    value). Unlike "the band placement that covers most keyframes", a mode
+    cannot sit BETWEEN two levels, so a band around it separates them
+    (review V2, H2)."""
+    y = np.asarray(y, dtype=np.float64)
+    h = PARAMS["level_kde_bw_log"]
+    g = np.arange(y.min() - 2 * h, y.max() + 2 * h + PARAMS["level_kde_grid_log"], PARAMS["level_kde_grid_log"])
+    dens = np.zeros(len(g))
+    for k in range(0, len(y), 512):
+        dens += np.exp(-0.5 * ((g[:, None] - y[None, k:k + 512]) / h) ** 2).sum(1)
+    return float(g[int(np.argmax(dens))])
 
-    * coherent_fraction: share within x`coherent_band_factor` of the DOMINANT
-      level, the grid value (``coherent_grid`` points spanning min..max) whose
-      band holds the most keyframes;
-    * longest_off_level_run: longest run of consecutive off-level keyframes;
+
+def level_stats(y_ordered) -> dict | None:
+    """Scale-level numbers on a log-scale sequence in capture order (shift-
+    invariant, hence gauge-invariant on one component).
+
+    * level: `level_mode`;
+    * per band B in `level_bands`: coherent_fraction = share within xB of the
+      level; longest_off_level_run = longest run of consecutive off-level
+      entries;
     * max_step_15kf: exp of the largest |median(next w) - median(previous w)|,
-      w = `d3_step_window`, and where it happens.
-    Shift-invariant, hence gauge-invariant on one component."""
+      w = `d3_step_window`, over every split (research lane D3's number).
+    The fractions here are over the entries GIVEN; the fixed-denominator
+    versions (over all accepted keyframes) are in `scale_block`."""
     y = np.asarray(y_ordered, dtype=np.float64)
     if len(y) < 3:
         return None
-    band = math.log(PARAMS["coherent_band_factor"])
-    grid = np.linspace(y.min(), y.max(), PARAMS["coherent_grid"])
-    cnt = [(np.abs(y - g) <= band).sum() for g in grid]
-    g = grid[int(np.argmax(cnt))]
-    ok = np.abs(y - g) <= band
-    run = best = 0
-    for o in ok:
-        run = 0 if o else run + 1
-        best = max(best, run)
+    mode = level_mode(y)
+    out = {"level_log": mode, "bands": {}}
+    for b in PARAMS["level_bands"]:
+        ok = np.abs(y - mode) <= math.log(b)
+        out["bands"][f"x{b:g}"] = {"coherent_fraction": float(ok.mean()), "off_level": int((~ok).sum()),
+                                   "longest_off_level_run": _longest_run(~ok)}
     w = PARAMS["d3_step_window"]
     step, at = 0.0, None
-    for i in range(w, len(y) - w):
+    for i in range(w, len(y) - w + 1):
         d = abs(float(np.median(y[i:i + w]) - np.median(y[i - w:i])))
         if d > step and d > 1e-9:  # float noise is not a step
             step, at = d, i
-    return {"coherent_fraction": float(ok.mean()), "off_level": int((~ok).sum()),
-            "longest_off_level_run": int(best), "max_step_15kf_factor": float(math.exp(step)),
-            "_max_step_pos": at}
+    out["max_step_15kf_factor"] = float(math.exp(step))
+    out["_max_step_pos"] = at
+    return out
 
 
-def scale(p: Prepared, ratios, regions: dict | None) -> dict:
-    out: dict = {}
-    segs = p.v.segments
-    if segs:
-        sc = np.array([float(s["scale"]) for s in segs
-                       if s.get("scale") not in (None, 0) and s.get("state", "registered") == "registered"])
-        if len(sc):
-            ls = np.log(sc)
-            out["placement_scales"] = {
-                "segments": int(len(sc)), "log_std": float(ls.std()),
-                "max_over_min": float(sc.max() / sc.min()),
-                "note": ("all exactly 1: every registered segment is a rigid piece of one global model"
-                         if np.allclose(sc, 1.0) else "Sim(3) placement scales differ between segments")}
+def scale_block(p: Prepared, ratios, regions: dict | None, source: str) -> dict:
+    """Every scale statistic for one per-keyframe log-ratio source."""
     if ratios is None:
-        out["depth"] = {"available": False,
-                        "why": "no observations in the variant, or no depth cache for the world"}
-        return out
+        return {"available": False, "source": source}
     r = ratios["r"]
-    depth: dict = {"available": True, "keyframes_with_ratio": int(np.isfinite(r).sum()),
-                   "median_samples_per_keyframe": float(np.median(ratios["n"][np.isfinite(r)]))
-                   if np.isfinite(r).any() else None,
-                   "within_keyframe_spread_median": float(np.nanmedian(ratios["spread"]))
-                   if np.isfinite(ratios["spread"]).any() else None,
-                   "per_component": {}}
+    n_acc = max(p.n, 1)
+    has = np.isfinite(r)
+    blk: dict = {"available": True, "source": source,
+                 "keyframes_with_ratio": int(has.sum()),
+                 "ratio_coverage": float(has.sum() / n_acc),
+                 "ratio_coverage_published": float((has & p.published).sum() / max(1, p.published.sum())),
+                 "median_samples_per_keyframe": float(np.median(ratios["n"][has])) if has.any() else None,
+                 "within_keyframe_spread_median": (float(np.nanmedian(ratios["spread"]))
+                                                   if np.isfinite(ratios["spread"]).any() else None),
+                 "per_component": {}}
+    for k in ("pairs_used", "inliers_total", "inliers_gated"):
+        if k in ratios:
+            blk[k] = int(ratios[k])
     centred = np.full(p.n, np.nan)
+    upm = {}
     for c in p.order:
         m = p.members(c)
         m = m[np.isfinite(r[m])]
@@ -826,15 +919,16 @@ def scale(p: Prepared, ratios, regions: dict | None) -> dict:
         med = float(np.median(r[m]))
         y = r[m] - med
         centred[m] = y
+        upm[c] = float(math.exp(med))
         row = {"keyframes": int(len(m)), "spread_mad": mad(y),
                "p05_p95": [float(np.percentile(y, 5)), float(np.percentile(y, 95))],
                "units_per_metre_informative": float(math.exp(med))}
         if len(m) >= 10:
             slope, lo, hi = _theil_sen(m.astype(float), y)
             span = float(m.max() - m.min())
-            row["drift_slope_per_100kf"] = slope * 100.0
-            row["drift_slope_ci95_per_100kf"] = [lo * 100.0, hi * 100.0]
-            row["drift_factor_over_span"] = float(math.exp(abs(slope * span)))
+            row["trend_slope_per_100kf"] = slope * 100.0
+            row["trend_slope_ci95_per_100kf"] = [lo * 100.0, hi * 100.0]
+            row["trend_factor_over_span"] = float(math.exp(abs(slope * span)))
             steps = _steps(m, y, PARAMS["scale_step_window"], PARAMS["scale_step_log"])
             row["steps"] = len(steps)
             row["max_step_factor"] = max((s["factor"] for s in steps), default=1.0)
@@ -844,44 +938,84 @@ def scale(p: Prepared, ratios, regions: dict | None) -> dict:
             pos = lv.pop("_max_step_pos")
             lv["max_step_15kf_at_index"] = int(m[pos]) if pos is not None else None
             row["levels"] = lv
-        depth["per_component"][c] = row
-    main = depth["per_component"].get(p.main)
-    depth["main"] = main
-    # Research lane D3's pilot pooled every fitted keyframe of the world,
-    # whatever its component. Across components that is gauge-DEPENDENT
-    # (each component has its own scale); kept only to reproduce D3's numbers.
-    allp = np.nonzero(p.published & np.isfinite(r))[0]
+        blk["per_component"][c] = row
+    main = blk["per_component"].get(p.main)
+    blk["main"] = main
+    # FIXED DENOMINATOR (H1): over ALL accepted keyframes; anything not
+    # published-in-main-with-a-ratio-on-level counts as a failure.
+    fixed = {"definition": "good = published & in main & has ratio & |r - level| <= log(band); "
+                           "denominator = all accepted keyframes", "bands": {}}
+    on = {}
+    if main is not None and "levels" in main:
+        mode = main["levels"]["level_log"]
+        for b in PARAMS["level_bands"]:
+            good = p.in_main & has & (np.abs(np.where(has, centred, np.inf) - mode) <= math.log(b))
+            on[b] = good
+            fixed["bands"][f"x{b:g}"] = {"coherent_all": float(good.sum() / n_acc),
+                                         "longest_bad_run": _longest_run(~good)}
+    else:
+        for b in PARAMS["level_bands"]:
+            fixed["bands"][f"x{b:g}"] = {"coherent_all": 0.0, "longest_bad_run": int(p.n)}
+            on[b] = np.zeros(p.n, bool)
+    blk["fixed_denominator"] = fixed
+    # D3's pilot pooled every fitted keyframe of the world, whatever its
+    # component: gauge-DEPENDENT across components; kept only for D3 parity.
+    allp = np.nonzero(p.published & has)[0]
     lv = level_stats(r[allp]) if len(allp) >= 3 else None
     if lv is not None:
         pos = lv.pop("_max_step_pos")
         lv["max_step_15kf_at_index"] = int(allp[pos]) if pos is not None else None
         lv["keyframes"] = int(len(allp))
         lv["note"] = "all published keyframes pooled across components (gauge-dependent; D3-comparable)"
-    depth["d3_pooled_informative"] = lv
+    blk["d3_pooled_informative"] = lv
     if main is not None and p.segment_of is not None:
         by_seg: dict[int, list[float]] = {}
         for i in p.members(p.main):
             if np.isfinite(centred[i]):
                 by_seg.setdefault(int(p.segment_of[i]), []).append(centred[i])
-        seg_med = {s: float(np.median(v)) for s, v in by_seg.items() if len(v) >= 3}
+        seg_med = {s: float(np.median(v)) for s, v in by_seg.items() if len(v) >= PARAMS["segment_min_kf"]}
         if seg_med:
             vals = np.array(list(seg_med.values()))
-            depth["by_tracker_segment"] = {
-                "segments": len(seg_med), "log_spread_mad": mad(vals),
+            blk["by_tracker_segment"] = {
+                "segments": len(seg_med), "min_keyframes_per_segment": PARAMS["segment_min_kf"],
+                "log_spread_mad": mad(vals),
+                "p10_p90_factor": float(math.exp(np.percentile(vals, 90) - np.percentile(vals, 10))),
                 "max_over_min_factor": float(math.exp(vals.max() - vals.min())),
                 "median_log_by_segment": {str(s): seg_med[s] for s in sorted(seg_med)}}
     if main is not None and regions:
-        by_reg: dict[str, list[float]] = {}
-        for i in p.members(p.main):
+        by_reg: dict[str, list[int]] = {}
+        for i in range(p.n):
             reg = regions.get(p.ids[i])
-            if reg and np.isfinite(centred[i]):
-                by_reg.setdefault(reg["region"], []).append(centred[i])
-        depth["by_region"] = {g: {"keyframes": len(v), "median_log": float(np.median(v)),
-                                  "factor_vs_main": float(math.exp(np.median(v))), "spread_mad": mad(v)}
-                              for g, v in sorted(by_reg.items())}
-    out["depth"] = depth
-    out["_centred"] = centred
-    return out
+            if reg:
+                by_reg.setdefault(reg["region"], []).append(i)
+        rows = {}
+        for g, idx in sorted(by_reg.items()):
+            idx = np.array(idx)
+            v = centred[idx][np.isfinite(centred[idx]) & p.in_main[idx]]
+            rows[g] = {"keyframes": int(len(idx)), "with_ratio_in_main": int(len(v)),
+                       "median_log": float(np.median(v)) if len(v) else None,
+                       "factor_vs_main": float(math.exp(np.median(v))) if len(v) else None,
+                       "spread_mad": mad(v) if len(v) else None,
+                       **{f"on_level_x{b:g}_of_region": float(on[b][idx].mean()) for b in PARAMS["level_bands"]}}
+        blk["by_region"] = rows
+    blk["_centred"] = centred
+    blk["_on_level"] = on
+    blk["_upm"] = upm
+    return blk
+
+
+def placement_scales(p: Prepared) -> dict | None:
+    segs = p.v.segments
+    if not segs:
+        return None
+    sc = np.array([float(s["scale"]) for s in segs
+                   if s.get("scale") not in (None, 0) and s.get("state", "registered") == "registered"])
+    if not len(sc):
+        return None
+    ls = np.log(sc)
+    return {"segments": int(len(sc)), "log_std": float(ls.std()), "max_over_min": float(sc.max() / sc.min()),
+            "note": ("all exactly 1: every registered segment is a rigid piece of one global model"
+                     if np.allclose(sc, 1.0) else "Sim(3) placement scales differ between segments")}
 
 
 # ---------------------------------------------------------------------------
@@ -902,14 +1036,31 @@ def _sampson_px(R, t, x1, x2, f):
     return float(np.median(np.sqrt(num / np.maximum(den, 1e-30)))) * f
 
 
-def revisits(p: Prepared, pairs, regions: dict | None, focal_px: float | None) -> dict:
+BUCKETS = ("adjacent", "near", "lingering", "revisit")
+
+
+def pair_buckets(I, J, segment_of, times) -> np.ndarray:
+    """World-defined buckets (H4): the same for every variant of a world."""
+    I = np.asarray(I, int)
+    J = np.asarray(J, int)
+    gap = J - I
+    W = PARAMS["revisit_window"]
+    far = gap > W
+    if segment_of is not None and times is not None:
+        seg = np.asarray(segment_of)
+        tt = np.asarray(times, dtype=np.float64)
+        rev = far & (seg[I] != seg[J]) & (np.abs(tt[J] - tt[I]) >= PARAMS["revisit_min_dt_s"])
+    else:
+        rev = far
+    return np.where(gap == 1, "adjacent", np.where(~far, "near", np.where(rev, "revisit", "lingering")))
+
+
+def revisits(p: Prepared, pairs, regions: dict | None, focal_px: float | None, path_m=None) -> dict:
     if pairs is None or not getattr(pairs, "available", False):
         return {"available": False, "why": "no verified pair cache for this world"}
     A = pairs.arrays
     I, J = A["i"].astype(int), A["j"].astype(int)
-    W = PARAMS["revisit_window"]
-    gap = J - I
-    bucket = np.where(gap == 1, "adjacent", np.where(gap <= W, "near", "distant"))
+    bucket = pair_buckets(I, J, p.segment_of, p.times)
     both = p.published[I] & p.published[J]
     same = both & (p.comp[I] == p.comp[J])
     main = same & (p.comp[I] == p.main)
@@ -931,9 +1082,14 @@ def revisits(p: Prepared, pairs, regions: dict | None, focal_px: float | None) -
                 if b - a >= 5:
                     samp[k] = _sampson_px(R_ji, t_ji, A["inlier_xy_i"][a:b].astype(np.float64),
                                           A["inlier_xy_j"][a:b].astype(np.float64), focal_px)
-    out: dict = {"available": True, "pairs": int(len(I)), "window": W,
-                 "pair_cache_digest": pairs.digest()}
-    for b in ("adjacent", "near", "distant"):
+    out: dict = {"available": True, "pairs": int(len(I)), "pair_cache_digest": pairs.digest(),
+                 "bucket_definition": {
+                     "adjacent": "capture-order gap 1",
+                     "near": f"gap 2..{PARAMS['revisit_window']}",
+                     "revisit": (f"gap > {PARAMS['revisit_window']} AND different tracker segment AND "
+                                 f">= {PARAMS['revisit_min_dt_s']:g} s apart"),
+                     "lingering": f"gap > {PARAMS['revisit_window']} but not a revisit"}}
+    for b in BUCKETS:
         sel = bucket == b
         nb = int(sel.sum())
         row = {"pairs": nb, "evaluated": int((sel & same).sum()),
@@ -945,35 +1101,39 @@ def revisits(p: Prepared, pairs, regions: dict | None, focal_px: float | None) -
                "t_err_deg": stats(t_err[sel], thresholds=PARAMS["t_err_thresholds_deg"]),
                "sampson_px": stats(samp[sel])}
         out[b] = row
-    # worst distant pairs
-    dist = np.nonzero((bucket == "distant") & same)[0]
-    # rounded so that numerically-equal errors order by index, not by float noise
-    worst = sorted(dist, key=lambda k: (-round(float(rot_err[k]), 3), int(I[k]), int(J[k])))[: PARAMS["worst_list"]]
-    out["worst_distant"] = [
+    if path_m is not None:
+        rv = np.nonzero((bucket == "revisit") & main)[0]
+        pm = np.array([path_m(int(I[k]), int(J[k])) for k in rv], dtype=np.float64)
+        pm = pm[np.isfinite(pm)] if len(pm) else pm
+        out["revisit"]["variant_path_m"] = stats(pm)
+        out["revisit"]["variant_path_under_1m"] = int((pm < 1.0).sum()) if len(pm) else 0
+    rv = np.nonzero((bucket == "revisit") & same)[0]
+    worst = sorted(rv, key=lambda k: (-round(float(rot_err[k]), 3), int(I[k]), int(J[k])))[: PARAMS["worst_list"]]
+    out["worst_revisit"] = [
         {"i": int(I[k]), "j": int(J[k]), "rot_err_deg": float(rot_err[k]),
          "t_err_deg": (float(t_err[k]) if np.isfinite(t_err[k]) else None),
-         "inliers": int(A["n_inliers"][k]),
+         "inliers": int(A["n_inliers"][k]), "parallax_deg": float(A["parallax_deg"][k]),
          "regions": ([regions.get(p.ids[I[k]], {}).get("region"), regions.get(p.ids[J[k]], {}).get("region")]
                      if regions else None)}
         for k in worst]
     if regions:
         by: dict[str, list[int]] = {}
-        for k in np.nonzero(bucket == "distant")[0]:
+        for k in np.nonzero(np.isin(bucket, ("revisit", "lingering")))[0]:
             ri = (regions.get(p.ids[I[k]]) or {}).get("region")
             rj = (regions.get(p.ids[J[k]]) or {}).get("region")
-            key = ri if ri == rj and ri else "cross-region"
+            key = (ri if ri == rj and ri else "cross-region") + f" ({bucket[k]})"
             by.setdefault(key, []).append(k)
-        out["distant_by_region"] = {
+        out["by_region"] = {
             g: {"pairs": len(ks), "joined_fraction": float(np.mean(same[ks])),
-                "main_joined_fraction": float(np.mean(main[ks])),
                 "rot_err_median_deg": (float(np.nanmedian(rot_err[ks])) if np.isfinite(rot_err[ks]).any() else None),
-                "t_err_median_deg": (float(np.nanmedian(t_err[ks])) if np.isfinite(t_err[ks]).any() else None)}
+                "t_err_median_deg": (float(np.nanmedian(t_err[ks])) if np.isfinite(t_err[ks]).any() else None),
+                "t_err_count": int(np.isfinite(t_err[ks]).sum())}
             for g, ks in sorted(by.items())}
-    out["_arrays"] = {"I": I, "J": J, "same": same, "rot_err": rot_err, "t_err": t_err}
+    out["_arrays"] = {"I": I, "J": J, "same": same, "rot_err": rot_err, "t_err": t_err, "bucket": bucket}
     return out
 
 
-def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None) -> dict:
+def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None, island_lab=None) -> dict:
     if not rows:
         return {"available": False, "why": "no annotated revisit ranges for this world"}
     main = p.members(p.main) if p.main is not None else np.zeros(0, int)
@@ -982,14 +1142,18 @@ def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None) -
     arr = (rev or {}).get("_arrays")
     for row in rows:
         a0, a1, b0, b1 = row["a"][0], row["a"][1], row["b"][0], row["b"][1]
-        A = np.arange(a0, a1 + 1)
-        B = np.arange(b0, b1 + 1)
+        A = np.arange(a0, min(a1, p.n - 1) + 1)
+        B = np.arange(b0, min(b1, p.n - 1) + 1)
         Am = A[p.in_main[A]] if len(A) else A
         Bm = B[p.in_main[B]] if len(B) else B
         rec = {"a": [int(a0), int(a1)], "b": [int(b0), int(b1)], "region": row.get("region"),
                "confidence": row.get("confidence"),
                "a_in_main": float(len(Am) / len(A)) if len(A) else None,
                "b_in_main": float(len(Bm) / len(B)) if len(B) else None}
+        if island_lab is not None and len(A) and len(B):
+            ia = sorted({int(x) for x in island_lab[A]})
+            ib = sorted({int(x) for x in island_lab[B]})
+            rec["same_image_island"] = bool(set(ia) & set(ib))
         if len(Am) and len(Bm) and r90:
             D = np.linalg.norm(p.C[Am][:, None, :] - p.C[Bm][None, :, :], axis=2)
             rec["closest_over_r90"] = float(D.min() / r90)
@@ -997,7 +1161,6 @@ def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None) -
         else:
             rec["closest_over_r90"] = None
             rec["centroid_over_r90"] = None
-            rec["joined"] = False
         if arr is not None:
             inA = (arr["I"] >= a0) & (arr["I"] <= a1) & (arr["J"] >= b0) & (arr["J"] <= b1)
             inA |= (arr["J"] >= a0) & (arr["J"] <= a1) & (arr["I"] >= b0) & (arr["I"] <= b1)
@@ -1007,9 +1170,13 @@ def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None) -
             rec["rot_err_median_deg"] = float(np.median(e)) if len(e) else None
         out.append(rec)
     closest = [r["closest_over_r90"] for r in out if r["closest_over_r90"] is not None]
-    return {"available": True, "ranges": len(out), "joined": len(closest),
+    unobserved = sum(1 for r in out if r.get("same_image_island") is False)
+    return {"available": True, "ranges": len(out), "both_in_main": len(closest),
+            "ranges_in_different_image_islands": unobserved,
             "closest_over_r90_median": float(np.median(closest)) if closest else None,
             "closest_over_r90_max": float(max(closest)) if closest else None,
+            "note": ("closest/centroid distances between ranges in DIFFERENT image islands are the solver's "
+                     "guess, not a measurement; two ranges can see one place from different positions"),
             "list": out}
 
 
@@ -1017,7 +1184,7 @@ def annotated_revisits(p: Prepared, rows: list[dict] | None, rev: dict | None) -
 # g. regions
 
 
-def region_coverage(p: Prepared, regions: dict | None, spikes, outliers, endpoints) -> dict:
+def region_coverage(p: Prepared, regions: dict | None, spikes, outliers, endpoints, on_level, level_src) -> dict:
     if not regions:
         return {"available": False, "why": "no region labels for this world"}
     spikes, outliers, endpoints = set(spikes), set(outliers), set(endpoints)
@@ -1031,14 +1198,19 @@ def region_coverage(p: Prepared, regions: dict | None, spikes, outliers, endpoin
         idx = np.array(idx)
         n = len(idx)
         in_main = p.in_main[idx]
-        clean = np.array([in_main[k] and idx[k] not in spikes and idx[k] not in outliers for k in range(n)])
+        lvl = on_level[idx] if on_level is not None else np.zeros(n, bool)
+        clean = np.array([in_main[k] and idx[k] not in spikes and idx[k] not in outliers and lvl[k]
+                          for k in range(n)])
         out[g] = {"keyframes": n, "posed": float(p.posed[idx].mean()),
                   "published": float(p.published[idx].mean()),
                   "in_main": float(in_main.mean()), "in_main_clean": float(clean.mean()),
+                  "on_level": float(lvl.mean()),
                   "jump_endpoints": int(sum(1 for i in idx if i in endpoints)),
                   "spikes": int(sum(1 for i in idx if i in spikes)),
                   "outlier_cameras": int(sum(1 for i in idx if i in outliers))}
-    return {"available": True, "regions": out}
+    return {"available": True, "clean_definition": (
+        f"in main, not a spike, not an outlier camera, and on the main scale level within x1.5 ({level_src})"),
+            "regions": out}
 
 
 # ---------------------------------------------------------------------------
@@ -1105,19 +1277,24 @@ def covisibility_labels(variant, keyframe_ids, min_shared: int) -> dict[str, str
     return {k: f"covis{int(labels[i])}" for k, i in local.items()}
 
 
-def evaluate(variant, keyframe_ids, *, segment_of=None, times=None, pairs=None, depth_fn=None, regions=None,
-             revisit_ranges=None, focal_px=None) -> dict:
+def _strip(d: dict) -> dict:
+    return {k: v for k, v in d.items() if not k.startswith("_")}
+
+
+def evaluate(variant, keyframe_ids, *, segment_of=None, times=None, pairs=None, depth_fn=None,
+             depth_sample=None, K=None, regions=None, revisit_ranges=None, focal_px=None) -> dict:
     """Every pose/structure metric for one variant. Pure: no IO.
 
     keyframe_ids / segment_of / times describe the WORLD (capture order, the
     frontend's tracker segments, keyframe receipt times); they are the same for
-    every variant of that world.
+    every variant of that world. `depth_fn(i, uv_variant_pixels, cam)` samples
+    the depth cache for the variant's own observations; `depth_sample(i,
+    uv_canonical)` samples it at canonical pixels (triangulation); `K` is the
+    canonical camera the pair inliers are normalised in.
 
     A variant that does not STATE its components gets them from its
     observations (connected components of the covisibility graph, >=
-    `covis_min_shared` shared points), else all its poses are one frame. State
-    components (even all "0") when the poses share one frame by construction
-    (e.g. a pose graph whose odometry joins what no shared point does)."""
+    `covis_min_shared` shared points), else all its poses are one frame."""
     if not variant.component_stated:
         labels = covisibility_labels(variant, keyframe_ids, PARAMS["covis_min_shared"])
         if labels is not None:
@@ -1128,35 +1305,68 @@ def evaluate(variant, keyframe_ids, *, segment_of=None, times=None, pairs=None, 
             variant.meta = dict(variant.meta, _component_definition=(
                 f"not stated: covisibility components (>= {PARAMS['covis_min_shared']} shared points)"))
     p = Prepared(variant, keyframe_ids, segment_of, times)
+    have_pairs = pairs is not None and getattr(pairs, "available", False)
     table = observation_table(p)
-    ratios = keyframe_depth_ratios(p, table, depth_fn)
-    cont = continuity(p)
+    r_obs = keyframe_depth_ratios(p, table, depth_fn)
+    r_tri = None
+    if have_pairs and depth_sample is not None and K is not None:
+        r_tri = triangulated_depth_ratios(p, pairs.arrays, depth_sample, np.asarray(K, dtype=np.float64),
+                                          min_samples=PARAMS["depth_min_samples"],
+                                          valid_m=PARAMS["depth_valid_m"])
+    sc_obs = scale_block(p, r_obs, regions, "variant observations")
+    sc_tri = scale_block(p, r_tri, regions, "harness triangulation of cached pair inliers")
+    # metric scale per component for the physical bound: the variant's own
+    # observations when present, else the triangulation
+    upm = dict(sc_tri.get("_upm") or {})
+    upm.update(sc_obs.get("_upm") or {})
+    evidence = None
+    isl = None
+    if have_pairs:
+        evidence = evidence_matrix(p.n, [pairs.arrays, getattr(pairs, "xarrays", None),
+                                         getattr(pairs, "larrays", None)])
+        isl = island_report(p, pairs, rot_angle_deg, vec_angle_deg, PARAMS["t_min_parallax_deg"])
+    cont = continuity(p, upm, evidence)
     san = sanity(p)
-    sc = scale(p, ratios, regions)
-    rev = revisits(p, pairs, regions, focal_px)
-    ann = annotated_revisits(p, revisit_ranges, rev)
+
+    def path_m(i, j):
+        c = p.comp[i]
+        u = upm.get(c)
+        if u is None or c != p.comp[j]:
+            return float("nan")
+        m = p.members(c)
+        m = m[(m >= i) & (m <= j)]
+        return float(np.linalg.norm(np.diff(p.C[m], axis=0), axis=1).sum() / u) if len(m) > 1 else float("nan")
+
+    rev = revisits(p, pairs, regions, focal_px, path_m=path_m if upm else None)
+    ann = annotated_revisits(p, revisit_ranges, rev, isl.get("_labels") if isl else None)
     main_c = cont.get("main") or {}
+    lvl_src = sc_tri if sc_tri.get("available") and sc_tri.get("main") else sc_obs
+    on_level = (lvl_src.get("_on_level") or {}).get(1.5)
     reg = region_coverage(p, regions, main_c.get("spike_keyframes", []), san.get("_outliers_main", []),
-                          main_c.get("_endpoints", []))
+                          main_c.get("_endpoints", []), on_level, lvl_src.get("source"))
     if isinstance(rev, dict):
-        rev = {k: v for k, v in rev.items() if not k.startswith("_")}
+        rev = _strip(rev)
         rev["annotated"] = ann
-    for block in (cont.get("main") or {},):
-        block.pop("_endpoints", None)
+    if cont.get("main"):
+        cont["main"].pop("_endpoints", None)
     san.pop("_outliers_main", None)
-    sc.pop("_centred", None)
-    per_kf = None
-    if ratios is not None:
-        per_kf = {"depth_log_ratio": [None if not np.isfinite(x) else float(x) for x in ratios["r"]]}
+    per_kf = {"depth_log_ratio_obs": (None if r_obs is None else
+                                      [None if not np.isfinite(x) else float(x) for x in r_obs["r"]]),
+              "depth_log_ratio_tri": (None if r_tri is None else
+                                      [None if not np.isfinite(x) else float(x) for x in r_tri["r"]])}
+    scale_out = {"placement_scales": placement_scales(p), "depth": _strip(sc_obs), "depth_tri": _strip(sc_tri)}
     return {
         "registration": registration(p),
         "components": components(p),
+        "islands": _strip(isl) if isl else {"available": False, "why": "no verified pair cache for this world"},
         "continuity": cont,
-        "scale": sc,
+        "scale": scale_out,
         "revisits": rev,
         "reprojection": reprojection(p, table),
         "regions": reg,
         "sanity": san,
+        "integrity": {"unresolved_keyframes": int(variant.meta.get("unresolved_keyframes") or 0),
+                      "unmatched_images": int(variant.meta.get("unmatched_images") or 0)},
         "_per_keyframe": per_kf,
     }
 
@@ -1167,23 +1377,36 @@ def _git_head(path: Path) -> dict:
     try:
         head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
                               text=True, timeout=20).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(path), "status", "--porcelain", "--", "tower/tower/world_builder/coherence_eval",
-                                "tower/scripts/world_coherence_eval.py"],
+        dirty = subprocess.run(["git", "-C", str(path), "status", "--porcelain", "--",
+                                "tower/tower/world_builder/coherence_eval", "tower/scripts/world_coherence_eval.py"],
                                capture_output=True, text=True, timeout=20).stdout.strip()
         return {"commit": head or None, "harness_files_uncommitted": bool(dirty)}
     except Exception:  # noqa: BLE001
         return {"commit": None}
 
 
+HARNESS_FILES = ("metrics.py", "viewpoints.py", "layer_renders.py")
+
+
 def _harness_digest() -> str:
+    """SHA-1 over every file the numbers and renders depend on: metrics.py,
+    every eval_*.py, C2's viewpoints.py and layer_renders.py, and the CLI
+    (review V2, L4)."""
     h = hashlib.sha1()
     here = Path(__file__).resolve().parent
-    for name in sorted(p.name for p in here.glob("*.py") if p.name == "metrics.py" or p.name.startswith("eval_")):
+    names = sorted(p.name for p in here.glob("*.py") if p.name in HARNESS_FILES or p.name.startswith("eval_"))
+    for name in names:
+        h.update(name.encode())
         h.update((here / name).read_bytes())
+    cli = here.parents[2] / "scripts" / "world_coherence_eval.py"
+    if cli.is_file():
+        h.update(b"world_coherence_eval.py")
+        h.update(cli.read_bytes())
     return h.hexdigest()[:16]
 
 
-def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, renders=False, out_dir=None) -> dict:
+def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, renders=False, out_dir=None,
+                           viewpoints_from=None) -> dict:
     """Glue: caches + labels + runtime around `evaluate`."""
     from tower.world_builder.coherence_eval.eval_depth import DepthCache, depth_dir
     from tower.world_builder.coherence_eval.eval_pairs import PairSet, pairs_dir
@@ -1192,9 +1415,10 @@ def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, rend
     depth = DepthCache(depth_dir(cache_root, world.world_id))
     pairs = PairSet(pairs_dir(cache_root, world.world_id))
     depth_fn = None
+    depth_sample = None
     depth_note = None
+    K_can = world.canonical_K()
     if depth.available:
-        K_can = world.canonical_K()
         if variant.image_space == CANONICAL:
             def to_can(uv, cam):
                 return uv
@@ -1212,8 +1436,11 @@ def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, rend
 
         def depth_fn(i, uv, cam):
             return depth.sample(world.image_name(i), to_can(np.asarray(uv), cam))
+
+        def depth_sample(i, uv):
+            return depth.sample(world.image_name(i), uv)
     else:
-        depth_note = "depth cache missing: run `world_coherence_eval.py cache --what depth`"
+        depth_note = "depth cache missing or incomplete: run `world_coherence_eval.py cache --what depth`"
     regions = revisit_rows = None
     if regions_dir is not None:
         regions = read_regions(Path(regions_dir) / f"{world.world_id}_regions.csv")
@@ -1223,26 +1450,37 @@ def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, rend
              for k in world.keyframes]
     t0 = time.time()
     body = evaluate(variant, world.keyframe_ids, segment_of=segment_of, times=times,
-                    pairs=pairs if pairs.available else None, depth_fn=depth_fn, regions=regions,
-                    revisit_ranges=revisit_rows, focal_px=float(world.canonical_camera["fx"]))
+                    pairs=pairs if pairs.available else None, depth_fn=depth_fn, depth_sample=depth_sample,
+                    K=K_can, regions=regions, revisit_ranges=revisit_rows,
+                    focal_px=float(world.canonical_camera["fx"]))
     eval_seconds = time.time() - t0
     if depth_note:
-        body["scale"].setdefault("depth", {})["note"] = depth_note
-    body["renders"] = render_block(world, variant, out_dir, renders, regions=regions)
+        body["scale"]["depth"]["note"] = depth_note
+        body["scale"]["depth_tri"]["note"] = depth_note
+    body["renders"] = render_block(world, variant, out_dir, renders, regions=regions,
+                                   viewpoints_from=viewpoints_from)
     body["runtime"] = {"world_recorded": world.runtime_evidence() if variant.meta.get("adapter") == "world" else None,
                        "variant_measured": variant.meta.get("runtime")}
-    meta = {k: v for k, v in variant.meta.items() if k not in ("runtime",)}
+    meta = {k: v for k, v in variant.meta.items() if k not in ("runtime",) and not k.startswith("_")}
     repo = Path(__file__).resolve().parents[4]
     result = {
         "harness": {"version": HARNESS, "params": PARAMS, "code_digest": _harness_digest(), **_git_head(repo)},
         "world": {"world_id": world.world_id, "session_id": world.session_id, "keyframes": world.n,
                   "world_dir": str(world.world_dir), "canonical_camera": world.canonical_camera,
                   "caches": {"depth": {"available": depth.available,
-                                       "params": (depth.manifest or {}).get("params")},
+                                       "params": (depth.manifest or {}).get("params"),
+                                       "digest": depth.digest() if depth.available else None},
                              "pairs": {"available": pairs.available, "count": len(pairs),
                                        "digest": pairs.digest(),
                                        "counts": (pairs.manifest or {}).get("counts"),
-                                       "params": (pairs.manifest or {}).get("params")}},
+                                       "params": (pairs.manifest or {}).get("params"),
+                                       "cross_island_sift": (None if pairs.xmanifest is None else
+                                                             {"digest": pairs.xdigest(),
+                                                              "counts": pairs.xmanifest.get("counts"),
+                                                              "params": pairs.xmanifest.get("params")}),
+                                       "cross_island_loftr": (None if pairs.lmanifest is None else
+                                                              {"counts": pairs.lmanifest.get("counts"),
+                                                               "params": pairs.lmanifest.get("params")})}},
                   "labels": {"regions": regions is not None, "revisit_ranges": revisit_rows is not None}},
         "variant": {"name": variant.name, "image_space": variant.image_space, "meta": meta,
                     "posed": len(variant.poses), "points": 0 if variant.xyz is None else int(len(variant.xyz)),
@@ -1258,14 +1496,16 @@ def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, rend
 # i. renders (sibling lane C2's tools)
 
 
-def render_block(world, variant, out_dir, do_render: bool, regions=None) -> dict:
-    """Viewpoints from C2's deterministic rule; renders when its renderer exists.
+def render_block(world, variant, out_dir, do_render: bool, regions=None, viewpoints_from=None) -> dict:
+    """Viewpoints from C2's deterministic rule (`viewpoints`, rule /2), and
+    renders of the variant's main component with C2's renderer.
 
-    `coherence_eval.viewpoints.viewpoint_set` is applied to THIS variant's
-    published poses (the rule is keyed by keyframe id and Sim(3)-invariant in
-    its keyframe choice). The TRAJ substitution count is itself a coverage
-    signal: a TRAJ keyframe outside the main component is replaced by the
-    nearest posed one."""
+    Native mode applies the rule to THIS variant's published poses. For A/B
+    renders pass `viewpoints_from` (a viewpoint-set JSON, e.g. the baseline's
+    `viewpoints.json`): the reference set is carried into this variant's gauge
+    by `viewpoints.transfer_viewpoints` (a Sim(3) on shared keyframes), so both
+    variants are rendered from the same physical viewpoints. The TRAJ
+    substitution count is itself a coverage signal."""
     block: dict = {}
     try:
         from tower.world_builder.coherence_eval import viewpoints as vp
@@ -1274,14 +1514,23 @@ def render_block(world, variant, out_dir, do_render: bool, regions=None) -> dict
     poses = {k: np.asarray(T) for k, T in variant.poses.items() if variant.status.get(k) == "published"}
     comp = {k: variant.component.get(k, "0") for k in poses}
     cam = world.canonical_camera
+    intr = {k: cam[k] for k in ("fx", "fy", "cx", "cy", "width", "height")}
     try:
-        vs = vp.viewpoint_set(poses, world.keyframe_ids, comp,
-                              {k: cam[k] for k in ("fx", "fy", "cx", "cy", "width", "height")})
+        if viewpoints_from:
+            ref = vp.load_viewpoints(viewpoints_from)
+            vs = vp.transfer_viewpoints(ref, None, poses, component_of_to=comp, intrinsics_to=intr)
+            mode = "transferred"
+        else:
+            vs = vp.viewpoint_set(poses, world.keyframe_ids, comp, intr)
+            mode = "native"
     except Exception as exc:  # noqa: BLE001
-        return {"available": False, "why": f"viewpoint_set failed: {type(exc).__name__}: {exc}"}
+        return {"available": False, "why": f"viewpoints failed: {type(exc).__name__}: {exc}"}
     views = vs.get("views") or []
     subs = sorted({str(v.get("requested_keyframe_id")) for v in views if v.get("substituted")})
     block["viewpoints"] = {"rule": vs.get("rule") or getattr(vp, "RULE_VERSION", None),
+                           "rule_version": getattr(vp, "RULE_VERSION", None),
+                           "mode": mode, "reference": str(viewpoints_from) if viewpoints_from else None,
+                           "transfer": vs.get("transfer"),
                            "views": len(views),
                            "traj_keyframes": len({v.get("requested_keyframe_id") for v in views
                                                   if str(v.get("family", "")).startswith("TRAJ")}),
@@ -1306,41 +1555,43 @@ def render_block(world, variant, out_dir, do_render: bool, regions=None) -> dict
 RENDER_LAYERS = ("cameras", "sparse", "sparse_time")
 
 
-def render_variant(world, variant, vs, out_dir, *, regions=None, layers=RENDER_LAYERS) -> dict:
-    """Render the variant's PUBLISHED cameras and points from the fixed viewpoint
-    set with sibling lane C2's renderer (`coherence_eval.layer_renders`).
+def render_variant(world, variant, vs, out_dir, *, regions=None, layers=RENDER_LAYERS,
+                   include_minor: bool = False) -> dict:
+    """Render the variant's PUBLISHED cameras and points of its MAIN component
+    (default) from viewpoint set `vs` with C2's renderer (`layer_renders`).
 
-    The variant is wrapped in C2's `WorldLayers` shape, so any variant -- not
-    only world-shaped directories -- renders identically. Components are
-    renumbered by size (0 = largest) for colouring; minor components are drawn
-    in their own gauge, exactly as C2 draws the saved world. With region labels
-    the `_region` layers are added (evaluation-only colouring). Surface layers
-    are not rendered here: a variant is a pose/point reconstruction, and the
-    saved world's surface renders are C2's (`world_layer_renders.py`).
-    """
+    Minor components live in their own gauge; drawing them over the main one
+    places them arbitrarily (C2's MINOR_GAUGE_NOTE), so they are left out
+    unless `include_minor`. Colours come from `layer_renders.component_rgb` /
+    `region_rgb`, which never wrap. With region labels the `_region` layers are
+    added (evaluation-only colouring). Surfaces are not rendered here."""
     from tower.world_builder.coherence_eval import layer_renders as lr
 
     out_dir = Path(out_dir)
     pub = [k for k in world.keyframe_ids if variant.status.get(k) == "published" and k in variant.poses]
     counts: dict[str, int] = {}
-    for k in pub:
-        counts[variant.component.get(k, "0")] = counts.get(variant.component.get(k, "0"), 0) + 1
-    rank = {c: i for i, c in enumerate(sorted(counts, key=lambda c: (-counts[c], c)))}
-    poses = {k: np.asarray(variant.poses[k]) for k in pub}
-    comp_of = {k: rank[variant.component.get(k, "0")] for k in pub}
+    first: dict[str, int] = {}
+    for n_, k in enumerate(pub):
+        c = variant.component.get(k, "0")
+        counts[c] = counts.get(c, 0) + 1
+        first.setdefault(c, n_)
+    rank = {c: i for i, c in enumerate(sorted(counts, key=lambda c: (-counts[c], first[c])))}
+    keep_ids = [k for k in pub if include_minor or rank[variant.component.get(k, "0")] == 0]
+    poses = {k: np.asarray(variant.poses[k]) for k in keep_ids}
+    comp_of = {k: rank[variant.component.get(k, "0")] for k in keep_ids}
     X = np.zeros((0, 3))
     pcomp = np.zeros(0, np.int32)
     first_kid: list = []
-    if variant.has_observations:
+    if variant.has_observations and poses:
         order_of = {k: i for i, k in enumerate(world.keyframe_ids)}
         obs_world = np.array([order_of.get(k, -1) for k in variant.obs_keyframe_ids])[variant.obs_keyframe]
-        pubset = np.array([world.keyframe_ids[i] in poses if i >= 0 else False for i in range(world.n)] + [False])
-        ok = (obs_world >= 0) & pubset[np.where(obs_world >= 0, obs_world, world.n)]
-        first = np.full(len(variant.xyz), np.iinfo(np.int64).max)
-        np.minimum.at(first, variant.obs_point[ok], obs_world[ok])
-        keep = first < np.iinfo(np.int64).max
+        drawn = np.array([world.keyframe_ids[i] in poses for i in range(world.n)] + [False])
+        ok = (obs_world >= 0) & drawn[np.where(obs_world >= 0, obs_world, world.n)]
+        firsto = np.full(len(variant.xyz), np.iinfo(np.int64).max)
+        np.minimum.at(firsto, variant.obs_point[ok], obs_world[ok])
+        keep = firsto < np.iinfo(np.int64).max
         X = variant.xyz[keep]
-        first_kid = [world.keyframe_ids[i] for i in first[keep]]
+        first_kid = [world.keyframe_ids[i] for i in firsto[keep]]
         pcomp = np.array([comp_of[k] for k in first_kid], np.int32)
     wl = lr.WorldLayers(
         world_dir=world.world_dir, session_id=world.session_id, solution={}, poses=poses,
@@ -1354,19 +1605,19 @@ def render_variant(world, variant, vs, out_dir, *, regions=None, layers=RENDER_L
     if regions:
         layers += ["cameras_region", "sparse_region"]
     kid_rank = {k: i / max(1, world.n - 1) for i, k in enumerate(world.keyframe_ids)}
-    col_comp = np.array([lr.COMPONENT_RGB[int(c) % len(lr.COMPONENT_RGB)] for c in pcomp], np.uint8).reshape(-1, 3)
+    col_comp = np.array([lr.component_rgb(int(c)) for c in pcomp], np.uint8).reshape(-1, 3)
     col_time = lr.turbo(np.array([kid_rank.get(k, 0.0) for k in first_kid])) if len(first_kid) else col_comp
-    col_reg = np.array([lr.REGION_RGB.get(wl.regions.get(k), lr.REGION_RGB[None]) for k in first_kid],
-                       np.uint8).reshape(-1, 3)
-    index = {"viewpoint_rule": vs.get("rule"), "layers": {}, "published_cameras": len(poses),
-             "points_drawn": int(len(X)), "component_colour_rank": {c: i for c, i in rank.items()}}
+    col_reg = np.array([lr.region_rgb(wl.regions.get(k)) for k in first_kid], np.uint8).reshape(-1, 3)
+    index = {"viewpoint_rule": vs.get("rule"), "layers": {}, "published_cameras_drawn": len(poses),
+             "points_drawn": int(len(X)), "include_minor": include_minor,
+             "component_colour_rank": {c: i for c, i in rank.items()}}
     for layer in layers:
         tiles = []
         for view in vs["views"]:
             if layer == "cameras":
-                img = lr.render_cameras(view, wl, r, "component")
+                img = lr.render_cameras(view, wl, r, "component", include_minor=include_minor)
             elif layer == "cameras_region":
-                img = lr.render_cameras(view, wl, r, "region")
+                img = lr.render_cameras(view, wl, r, "region", include_minor=include_minor)
             elif layer == "sparse":
                 img = lr.render_points(view, X, col_comp)
             elif layer == "sparse_time":
@@ -1387,63 +1638,85 @@ def render_variant(world, variant, vs, out_dir, *, regions=None, layers=RENDER_L
         index["layers"][layer] = len(tiles)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "index.json").write_text(json.dumps(index, indent=1, sort_keys=True), encoding="utf-8")
-    return {"available": True, "dir": "renders", "layers": index["layers"],
-            "published_cameras": len(poses), "points_drawn": int(len(X))}
+    return {"available": True, "dir": "renders", "layers": index["layers"], "main_component_only": not include_minor,
+            "published_cameras_drawn": len(poses), "points_drawn": int(len(X))}
 
 
 # ---------------------------------------------------------------------------
 # outputs
 
-
+# (label, path, better): better is "higher" / "lower" for a variant quality,
+# "world" for a property of the world's image-only caches (identical for every
+# variant of the world; never a verdict).
 HEADLINE = [
-    # (label, path, better)
+    ("unresolved / unmatched keyframe refs", "integrity.total", "lower"),
     ("published / accepted", "registration.published_fraction", "higher"),
     ("in largest component / accepted", "registration.in_largest_fraction", "higher"),
     ("components (with published kf)", "components.count", "lower"),
     ("main-component runs in capture order", "components.main_runs", "lower"),
     ("covisibility comps in main", "components.covisibility_components_in_main.count", "lower"),
-    ("jumps (main; index+time)", "continuity.main.jumps", "lower"),
+    ("image islands >= 10 kf (world)", "islands.large_islands", "world"),
+    ("largest image island / accepted (world)", "islands.largest_island_share", "world"),
+    ("island pairs with placement UNOBSERVED (world)", "islands.large_island_pairs_unobserved", "world"),
+    ("islands split across variant components", "islands.islands_split_by_variant", "lower"),
+    ("max island tilt (abs median roll under main-island up, deg)", "islands.max_tilt_vs_main_island_deg", "lower"),
+    ("jumps (main; index+time or physical)", "continuity.main.jumps", "lower"),
+    ("  physically implausible steps (main)", "continuity.main.physically_implausible", "lower"),
     ("  of which within a tracker segment", "continuity.main.jumps_within_segments", "lower"),
+    ("tracking-loss steps (main)", "continuity.main.tracking_loss_steps", "info"),
+    ("  without image evidence across (main)", "continuity.main.tracking_loss_steps_without_image_evidence", "lower"),
     ("index-only jumps (main)", "continuity.main.index_jumps", "lower"),
     ("spikes (main)", "continuity.main.spikes", "lower"),
     ("max step ratio (main)", "continuity.main.max_ratio", "lower"),
-    ("p99 step ratio (main)", "continuity.main.ratio.p99", "lower"),
     ("jumps (all components)", "continuity.all_components.jumps", "lower"),
-    ("depth log-ratio spread MAD (main)", "scale.depth.main.spread_mad", "lower"),
-    ("scale drift factor over span (main)", "scale.depth.main.drift_factor_over_span", "lower"),
-    ("scale steps > 1.25x (main)", "scale.depth.main.steps", "lower"),
-    ("max scale step factor (main)", "scale.depth.main.max_step_factor", "lower"),
-    ("scale-coherent fraction x1.5 (main, D3)", "scale.depth.main.levels.coherent_fraction", "higher"),
-    ("longest off-level run (main, D3)", "scale.depth.main.levels.longest_off_level_run", "lower"),
-    ("max 15-kf scale step factor (main, D3)", "scale.depth.main.levels.max_step_15kf_factor", "lower"),
-    ("segment scale max/min (main)", "scale.depth.by_tracker_segment.max_over_min_factor", "lower"),
+    ("TRI: kf with scale ratio / accepted", "scale.depth_tri.ratio_coverage", "higher"),
+    ("TRI: coherent_all x1.5 (all accepted)", "scale.depth_tri.fixed_denominator.bands.x1.5.coherent_all", "higher"),
+    ("TRI: coherent_all x1.25 (all accepted)", "scale.depth_tri.fixed_denominator.bands.x1.25.coherent_all", "higher"),
+    ("TRI: longest bad run x1.25 (all accepted)", "scale.depth_tri.fixed_denominator.bands.x1.25.longest_bad_run", "lower"),
+    ("TRI: max scale step factor (main)", "scale.depth_tri.main.max_step_factor", "lower"),
+    ("TRI: segment scale p10-p90 factor (main)", "scale.depth_tri.by_tracker_segment.p10_p90_factor", "lower"),
+    ("OBS: kf with scale ratio / accepted", "scale.depth.ratio_coverage", "higher"),
+    ("OBS: coherent_all x1.5 (all accepted)", "scale.depth.fixed_denominator.bands.x1.5.coherent_all", "higher"),
+    ("OBS: coherent_all x1.25 (all accepted)", "scale.depth.fixed_denominator.bands.x1.25.coherent_all", "higher"),
+    ("OBS: longest bad run x1.25 (all accepted)", "scale.depth.fixed_denominator.bands.x1.25.longest_bad_run", "lower"),
+    ("OBS: coherent x1.5 among ratio kf (main)", "scale.depth.main.levels.bands.x1.5.coherent_fraction", "higher"),
+    ("OBS: coherent x1.25 among ratio kf (main)", "scale.depth.main.levels.bands.x1.25.coherent_fraction", "higher"),
+    ("OBS: max scale step factor (main)", "scale.depth.main.max_step_factor", "lower"),
+    ("OBS: max 15-kf scale step factor (main, D3)", "scale.depth.main.levels.max_step_15kf_factor", "lower"),
+    ("OBS: scale trend factor over span (main)", "scale.depth.main.trend_factor_over_span", "lower"),
+    ("OBS: segment scale p10-p90 factor (main)", "scale.depth.by_tracker_segment.p10_p90_factor", "lower"),
     ("adjacent pairs joined", "revisits.adjacent.joined_fraction", "higher"),
-    ("adjacent rot err median (deg)", "revisits.adjacent.rot_err_deg.median", "lower"),
     ("adjacent rot err p90 (deg)", "revisits.adjacent.rot_err_deg.p90", "lower"),
     ("near rot err p90 (deg)", "revisits.near.rot_err_deg.p90", "lower"),
-    ("distant pairs joined (any comp)", "revisits.distant.joined_fraction", "higher"),
-    ("distant pairs joined (main)", "revisits.distant.main_joined_fraction", "higher"),
-    ("distant rot err median (deg)", "revisits.distant.rot_err_deg.median", "lower"),
-    ("distant rot err p90 (deg)", "revisits.distant.rot_err_deg.p90", "lower"),
-    ("distant rot err > 5 deg", "revisits.distant.rot_err_deg.over_5", "lower"),
-    ("distant t-dir err median (deg)", "revisits.distant.t_err_deg.median", "lower"),
-    ("distant Sampson median (px)", "revisits.distant.sampson_px.median", "lower"),
-    ("annotated revisits joined", "revisits.annotated.joined", "higher"),
-    ("annotated closest/R90 median", "revisits.annotated.closest_over_r90_median", "lower"),
+    ("revisit pairs (world)", "revisits.revisit.pairs", "world"),
+    ("revisit pairs joined (within islands only)", "revisits.revisit.joined_fraction", "higher"),
+    ("revisit rot err median (deg)", "revisits.revisit.rot_err_deg.median", "lower"),
+    ("revisit rot err p90 (deg)", "revisits.revisit.rot_err_deg.p90", "lower"),
+    ("revisit t-dir err median (deg; parallax >= 5)", "revisits.revisit.t_err_deg.median", "lower"),
+    ("lingering pairs rot err p90 (deg)", "revisits.lingering.rot_err_deg.p90", "lower"),
+    ("annotated revisits in different image islands (world)",
+     "revisits.annotated.ranges_in_different_image_islands", "world"),
     ("reprojection median (px)", "reprojection.overall.median", "lower"),
-    ("reprojection p90 (px)", "reprojection.overall.p90", "lower"),
     ("reprojection p99 (px)", "reprojection.overall.p99", "lower"),
     ("outlier cameras (main)", "sanity.main.outlier_cameras", "lower"),
     ("camera max/R90 (main)", "sanity.main.max_over_r90", "lower"),
-    ("outlier point fraction (main)", "sanity.main_points.outlier_fraction", "lower"),
 ]
 
 
 def get_path(d, path):
     cur = d
-    for part in path.split("."):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur[part]
+    parts = path.split(".")
+    k = 0
+    while k < len(parts):
+        if not isinstance(cur, dict):
+            return None
+        # keys may contain dots ("x1.5"): try the longest key first
+        for span in range(len(parts) - k, 0, -1):
+            key = ".".join(parts[k:k + span])
+            if key in cur:
+                cur = cur[key]
+                k += span
+                break
         else:
             return None
     return cur
@@ -1468,12 +1741,42 @@ def _fmt(x) -> str:
 
 
 def headline(result: dict) -> list[tuple[str, object, str]]:
-    m = result["metrics"]
+    m = dict(result["metrics"])
+    integ = m.get("integrity") or {}
+    m["integrity"] = dict(integ, total=int(integ.get("unresolved_keyframes") or 0) + int(integ.get("unmatched_images") or 0))
     rows = [(label, get_path(m, path), better) for label, path, better in HEADLINE]
     regs = get_path(m, "regions.regions") or {}
+    by_reg = get_path(m, "scale.depth_tri.by_region") or {}
     for g, r in regs.items():
-        rows.append((f"region {g}: in main & clean", r.get("in_main_clean"), "higher"))
+        rows.append((f"region {g}: in main & clean (incl. on-level)", r.get("in_main_clean"), "higher"))
+        rows.append((f"region {g}: TRI scale factor vs main", (by_reg.get(g) or {}).get("factor_vs_main"), "info"))
     return rows
+
+
+def _island_lines(m) -> list[str]:
+    isl = m.get("islands") or {}
+    if not isl or isl.get("available") is False:
+        return ["", "**Image islands**: n/a (no pair cache)."]
+    L = ["", f"**Image islands** (world property; {isl['definition']}): {isl['islands']} islands, "
+             f"{isl['singletons']} singletons, {isl['large_islands']} with >= {isl['large_island_min_kf']} keyframes; "
+             f"largest holds {_fmt(isl['largest_island_share'])} of the accepted keyframes. "
+             f"Cross-island tiers present: {', '.join(isl.get('cross_island_tiers_available') or []) or 'none'}.", ""]
+    L += ["| island | keyframes | ranges | in variant main | variant components | tilt: median roll (deg) | "
+          "roll scatter MAD (deg) |",
+          "|---|---|---|---|---|---|---|"]
+    for r in isl["large_island_list"]:
+        t = (isl.get("tilt") or {}).get(str(r["island"])) or {}
+        ref = " (reference)" if r["island"] == isl["large_island_list"][0]["island"] else ""
+        L.append(f"| {r['island']} | {r['keyframes']} | {r['ranges'][:4]}{'...' if len(r['ranges']) > 4 else ''} | "
+                 f"{r['in_main']} | {r['variant_components']} | {_fmt(t.get('tilt_deg'))}{ref} | "
+                 f"{_fmt(t.get('roll_under_reference_mad_deg'))} |")
+    L += ["", "| island pair | verified pairs by tier | placement | variant on strict pairs |", "|---|---|---|---|"]
+    for r in isl["island_pairs"]:
+        v = r.get("variant") or {}
+        L.append(f"| {r['islands'][0]}-{r['islands'][1]} | {r['pairs'] or 'no cross-island tier'} | "
+                 f"**{'placement between islands: UNOBSERVED' if r['placement'] == 'UNOBSERVED' else 'observed'}** | "
+                 f"{('joined ' + _fmt(v.get('joined_fraction')) + ', rot err med ' + _fmt(v.get('rot_err_median_deg')) + ' deg, t err med ' + _fmt(v.get('t_err_median_deg'))) if v else '-'} |")
+    return L
 
 
 def markdown(result: dict) -> str:
@@ -1488,46 +1791,60 @@ def markdown(result: dict) -> str:
     L.append(f"Harness {h['version']} code {h['code_digest']} at commit {str(h.get('commit'))[:12]}"
              f"{' (+uncommitted harness files)' if h.get('harness_files_uncommitted') else ''}. "
              f"Pair cache {w['caches']['pairs'].get('digest')} ({w['caches']['pairs'].get('count')} pairs); "
-             f"depth cache {'present' if w['caches']['depth']['available'] else 'MISSING'}.")
+             f"depth cache {w['caches']['depth'].get('digest') or 'MISSING'}.")
+    integ = m.get("integrity") or {}
+    if integ.get("unresolved_keyframes") or integ.get("unmatched_images"):
+        L.append(f"**WARNING: {integ.get('unresolved_keyframes')} unresolved keyframe rows, "
+                 f"{integ.get('unmatched_images')} unmatched images.**")
     L += ["", "| metric | value |", "|---|---|"]
     for label, val, better in headline(result):
-        L.append(f"| {label} ({better} is better) | {_fmt(val)} |")
+        tag = {"world": "world property", "info": "info"}.get(better, f"{better} is better")
+        L.append(f"| {label} ({tag}) | {_fmt(val)} |")
+    L += _island_lines(m)
     main = get_path(m, "continuity.main") or {}
     if main.get("jump_list"):
-        L += ["", "**Index-rule jump candidates in the main component** (capture index from->to; step ratio, "
-              "speed ratio, dt, rotation; COUNTED = also fails the time test):", ""]
-        for j in main["jump_list"][:30]:
+        L += ["", "**Step candidates in the main component** (index rule, physical rule, and every step across a "
+              "tracking loss; COUNTED = a jump; step_m via the component's MoGe scale):", ""]
+        for j in main["jump_list"][:40]:
             L.append(f"- {j['from']}->{j['to']} gap {j['gap']}: ratio {_fmt(j['ratio'])}, speed ratio "
-                     f"{_fmt(j.get('speed_ratio'))}, dt {_fmt(j.get('dt_s'))} s, rot {_fmt(j['rot_deg'])} deg"
-                     f" [{j['kind']}]{' (segment boundary)' if j.get('segment_boundary_inside') else ''}"
+                     f"{_fmt(j.get('speed_ratio'))}, dt {_fmt(j.get('dt_s'))} s, step {_fmt(j.get('step_m'))} m, "
+                     f"rot {_fmt(j['rot_deg'])} deg [{j['kind'] or '-'}]"
+                     f"{' (tracking loss' + ('; NO image evidence across' if j.get('image_evidence_across') is False else '') + ')' if j.get('segment_boundary_inside') else ''}"
                      f"{' COUNTED' if j.get('counted') else ''}")
-    steps = get_path(m, "scale.depth.main.step_list") or []
-    if steps:
-        L += ["", "**Scale steps (main component, depth log-ratio)**: " +
-              ", ".join(f"at {s['at_index']} x{_fmt(s['factor'])}" for s in steps)]
+    for src, key in (("TRI", "depth_tri"), ("OBS", "depth")):
+        steps = get_path(m, f"scale.{key}.main.step_list") or []
+        if steps:
+            L += ["", f"**Scale steps ({src}, main component)**: " +
+                  ", ".join(f"at {s['at_index']} x{_fmt(s['factor'])}" for s in steps)]
     regs = get_path(m, "regions.regions")
     if regs:
-        L += ["", "| region | kf | posed | published | in main | in main & clean | jump endpoints | scale vs main |",
-              "|---|---|---|---|---|---|---|---|"]
-        by_reg = get_path(m, "scale.depth.by_region") or {}
+        by_t = get_path(m, "scale.depth_tri.by_region") or {}
+        by_o = get_path(m, "scale.depth.by_region") or {}
+        L += ["", f"Regions (C0 labels, evaluation only). Clean = {get_path(m, 'regions.clean_definition')}.", "",
+              "| region | kf | posed | published | in main | on-level | in main & clean | jump endpoints | "
+              "scale vs main TRI | scale vs main OBS |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
         for g, r in regs.items():
-            f = (by_reg.get(g) or {}).get("factor_vs_main")
             L.append(f"| {g} | {r['keyframes']} | {_fmt(r['posed'])} | {_fmt(r['published'])} | {_fmt(r['in_main'])} | "
-                     f"{_fmt(r['in_main_clean'])} | {r['jump_endpoints']} | {_fmt(f)} |")
-    dbr = get_path(m, "revisits.distant_by_region")
+                     f"{_fmt(r.get('on_level'))} | {_fmt(r['in_main_clean'])} | {r['jump_endpoints']} | "
+                     f"{_fmt((by_t.get(g) or {}).get('factor_vs_main'))} | {_fmt((by_o.get(g) or {}).get('factor_vs_main'))} |")
+    dbr = get_path(m, "revisits.by_region")
     if dbr:
-        L += ["", "| distant pairs by region | pairs | joined | joined (main) | rot err median | t err median |",
-              "|---|---|---|---|---|---|"]
+        L += ["", "| long-gap pairs by region (bucket) | pairs | joined | rot err median | t err median (n) |",
+              "|---|---|---|---|---|"]
         for g, r in dbr.items():
-            L.append(f"| {g} | {r['pairs']} | {_fmt(r['joined_fraction'])} | {_fmt(r['main_joined_fraction'])} | "
-                     f"{_fmt(r['rot_err_median_deg'])} | {_fmt(r['t_err_median_deg'])} |")
+            L.append(f"| {g} | {r['pairs']} | {_fmt(r['joined_fraction'])} | {_fmt(r['rot_err_median_deg'])} | "
+                     f"{_fmt(r['t_err_median_deg'])} ({r['t_err_count']}) |")
     ann = get_path(m, "revisits.annotated")
     if ann and ann.get("available"):
-        L += ["", "| annotated revisit (C0) | region | A in main | B in main | closest/R90 | centroid/R90 | verified pairs (joined) | rot err med |",
+        L += ["", f"Annotated revisits (C0): {ann['note']}.", "",
+              "| annotated revisit (C0) | region | same image island | A in main | B in main | closest/R90 | "
+              "verified pairs (joined) | rot err med |",
               "|---|---|---|---|---|---|---|---|"]
         for r in ann["list"]:
-            L.append(f"| {r['a'][0]}-{r['a'][1]} vs {r['b'][0]}-{r['b'][1]} | {r.get('region')} | {_fmt(r['a_in_main'])} | "
-                     f"{_fmt(r['b_in_main'])} | {_fmt(r['closest_over_r90'])} | {_fmt(r['centroid_over_r90'])} | "
+            L.append(f"| {r['a'][0]}-{r['a'][1]} vs {r['b'][0]}-{r['b'][1]} | {r.get('region')} | "
+                     f"{r.get('same_image_island')} | {_fmt(r['a_in_main'])} | {_fmt(r['b_in_main'])} | "
+                     f"{_fmt(r['closest_over_r90'])}{'' if r.get('same_image_island', True) else ' (unobserved)'} | "
                      f"{r.get('verified_pairs_between')} ({r.get('verified_pairs_joined')}) | {_fmt(r.get('rot_err_median_deg'))} |")
     rt = m.get("runtime") or {}
     wr = rt.get("world_recorded") or {}
@@ -1543,8 +1860,8 @@ def markdown(result: dict) -> str:
     L += ["", f"**Renders**: viewpoints {get_path(rb, 'viewpoints.views')} "
               f"(TRAJ substitutions {get_path(rb, 'viewpoints.traj_substitutions')}); "
               f"renders: {get_path(rb, 'renders.why') or 'see renders/'}"]
-    L += ["", "Definitions, thresholds and limitations: `tower/world_builder/coherence_eval/metrics.py` docstring; "
-              "every threshold is in `harness.params` of metrics.json."]
+    L += ["", "Definitions, thresholds and limitations: `tower/world_builder/coherence_eval/metrics.py` and "
+              "`eval_placement.py` docstrings; every threshold is in `harness.params` of metrics.json."]
     return "\n".join(L) + "\n"
 
 
@@ -1574,35 +1891,88 @@ def table_markdown(results: list[dict], names: list[str] | None = None) -> str:
     return "\n".join(L) + "\n"
 
 
+def coverage_changes(a: dict, b: dict) -> list[str]:
+    """Coverage differences large enough to invalidate row-by-row verdicts (H1)."""
+    out = []
+    for path, tol in (("registration.published_fraction", PARAMS["compare_coverage_tol"]),
+                      ("registration.in_largest_fraction", PARAMS["compare_coverage_tol"]),
+                      ("scale.depth_tri.ratio_coverage", PARAMS["compare_ratio_coverage_tol"]),
+                      ("scale.depth.ratio_coverage", PARAMS["compare_ratio_coverage_tol"])):
+        va, vb = get_path(a["metrics"], path), get_path(b["metrics"], path)
+        if va is None and vb is None:
+            continue
+        if path == "scale.depth.ratio_coverage" and (va is None or vb is None):
+            continue  # a variant WITHOUT points: its OBS rows are n/a and count as losses instead
+        if va is None or vb is None or abs(float(va) - float(vb)) > tol:
+            out.append(f"{path}: {_fmt(va)} -> {_fmt(vb)} (tolerance {tol:g})")
+    return out
+
+
 def compare_markdown(a: dict, b: dict) -> str:
+    """Row-by-row diff with a verdict per row and an overall line.
+
+    * A row whose value is n/a on ONE side is a loss for that side (a variant
+      cannot win by making a metric disappear, review V2 H3).
+    * Rows marked "world" are properties of the world's caches: no verdict.
+    * When coverage changed beyond tolerance (published / in-main fractions,
+      scale-ratio coverage) every verdict is WITHHELD: a variant that
+      publishes less is not comparable row by row (review V2 H1)."""
     na, nb = a["variant"]["name"], b["variant"]["name"]
     L = [f"# Compare: A = {na} ({a['world']['world_id'][:8]}) vs B = {nb} ({b['world']['world_id'][:8]})", ""]
     if a["world"]["world_id"] != b["world"]["world_id"]:
         L.append("**WARNING: different worlds; the numbers are not comparable pair by pair.**\n")
-    for key in ("pairs", "depth"):
-        da = get_path(a, f"world.caches.{key}.digest") if key == "pairs" else get_path(a, f"world.caches.{key}.params")
-        db = get_path(b, f"world.caches.{key}.digest") if key == "pairs" else get_path(b, f"world.caches.{key}.params")
+    for key, field in (("pairs", "digest"), ("depth", "digest")):
+        da = get_path(a, f"world.caches.{key}.{field}")
+        db = get_path(b, f"world.caches.{key}.{field}")
         if da != db:
-            L.append(f"**WARNING: the {key} cache differs between A and B.**\n")
+            L.append(f"**WARNING: the {key} cache differs between A and B ({da} vs {db}).**\n")
     if a["harness"].get("code_digest") != b["harness"].get("code_digest"):
         L.append("_Note: harness code digests differ._\n")
+    cov = coverage_changes(a, b)
+    if cov:
+        L.append("**COVERAGE CHANGED -- row verdicts withheld:** " + "; ".join(cov) + "\n")
     L += ["| metric | A | B | B - A | better |", "|---|---|---|---|---|"]
     ra = {label: (val, better) for label, val, better in headline(a)}
     rb = {label: (val, better) for label, val, better in headline(b)}
+    wins = {"A": 0, "B": 0}
+    na_losses = {"A": 0, "B": 0}
+    ties = 0
     for label in list(ra) + [x for x in rb if x not in ra]:
         va, better = ra.get(label, (None, None))
         vb, better_b = rb.get(label, (None, None))
         better = better or better_b
         delta = None
         verdict = ""
-        if isinstance(va, (int, float)) and isinstance(vb, (int, float)) and not isinstance(va, bool):
+        num_a = isinstance(va, (int, float)) and not isinstance(va, bool)
+        num_b = isinstance(vb, (int, float)) and not isinstance(vb, bool)
+        if num_a and num_b:
             delta = vb - va
-            # a verdict only for a difference above float noise (1e-3 relative)
-            if abs(delta) > 1e-9 + 1e-3 * max(abs(va), abs(vb)):
-                verdict = "B" if (delta > 0) == (better == "higher") else "A"
-            else:
+            if abs(delta) <= 1e-9 + 1e-3 * max(abs(va), abs(vb)):
                 delta = 0 if isinstance(delta, int) else 0.0
+        if better in ("higher", "lower"):
+            if num_a and num_b:
+                if delta == 0:
+                    ties += 1
+                else:
+                    verdict = "B" if (delta > 0) == (better == "higher") else "A"
+            elif num_a != num_b:
+                verdict = "A" if num_a else "B"
+                na_losses["B" if num_a else "A"] += 1
+                verdict += " (n/a loses)"
+            if verdict and not cov:
+                wins[verdict[0]] += 1
+            elif verdict and cov:
+                verdict = f"withheld ({verdict})"
+        elif better == "world":
+            verdict = "world" if va == vb else "WORLD DIFFERS"
         L.append(f"| {label} | {_fmt(va)} | {_fmt(vb)} | {_fmt(delta)} | {verdict} |")
+    if cov:
+        L.append("\n**Overall: no verdict -- coverage changed** (see above); compare the fixed-denominator rows "
+                 "(coherent_all, longest bad run) and registration first.")
+    else:
+        L.append(f"\n**Overall: B better on {wins['B']} rows, A better on {wins['A']}, {ties} equal "
+                 f"(n/a counted as a loss: A {na_losses['A']}, B {na_losses['B']}).** Rows are not equally "
+                 "important; read the scale and placement rows first.")
     return "\n".join(L) + "\n"
 
 

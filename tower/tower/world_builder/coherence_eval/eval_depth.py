@@ -62,7 +62,18 @@ class DepthCache:
 
     @property
     def available(self) -> bool:
-        return bool(self.manifest and self.manifest.get("complete"))
+        m = self.manifest or {}
+        return bool(m.get("complete")) and not m.get("failed_frames")
+
+    def digest(self) -> str | None:
+        """The maps' content digest (recorded by the build; recomputed when an
+        older manifest lacks it)."""
+        m = self.manifest or {}
+        if m.get("content_digest"):
+            return m["content_digest"]
+        names = [n for n, _ in sorted(((n, r.get("index", 0)) for n, r in (m.get("frames") or {}).items()),
+                                      key=lambda x: x[1])]
+        return content_digest(self.root, names) if names else None
 
     def camera(self) -> dict | None:
         return (self.manifest or {}).get("camera")
@@ -96,6 +107,18 @@ class DepthCache:
         ok = (iu >= 0) & (iu < w) & (iv >= 0) & (iv < h) & np.isfinite(uv).all(1)
         out[ok] = d[iv[ok], iu[ok]]
         return out
+
+
+def content_digest(root: Path, image_names) -> str | None:
+    """SHA-1 over the stored maps' bytes, in capture order (16 hex chars)."""
+    h = hashlib.sha1()
+    for name in image_names:
+        p = Path(root) / (Path(name).stem + ".npy")
+        if not p.is_file():
+            return None
+        h.update(name.encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()[:16]
 
 
 def _sha1(path: Path) -> str:
@@ -132,10 +155,14 @@ def build_depth_cache(world: WorldInfo, cache_root, *, backend: str = DEFAULT_BA
                      "complete": False})
     frames = manifest.setdefault("frames", {})
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    from moge.model.v2 import MoGeModel
+    model = None
 
-    model = dense.load_hub_weights(spec.name, model_id,
-                                   lambda: MoGeModel.from_pretrained(model_id)).to(device).eval()
+    def load_model():
+        from moge.model.v2 import MoGeModel
+
+        return dense.load_hub_weights(spec.name, model_id,
+                                      lambda: MoGeModel.from_pretrained(model_id)).to(device).eval()
+
     t0 = time.time()
     done = 0
     todo = range(world.n) if limit is None else range(min(limit, world.n))
@@ -154,6 +181,8 @@ def build_depth_cache(world: WorldInfo, cache_root, *, backend: str = DEFAULT_BA
         if image is None:
             frames[name] = {"index": i, "ok": False, "why": kind}
             continue
+        if model is None:  # loaded only when a map is actually missing
+            model = load_model()
         rgb = image[:, :, ::-1].copy()
         t = torch.tensor(rgb / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
         with torch.no_grad():
@@ -172,14 +201,19 @@ def build_depth_cache(world: WorldInfo, cache_root, *, backend: str = DEFAULT_BA
         if done % 50 == 0:
             log(f"[depth] {world.world_id[:8]} {done} new maps, {time.time() - t0:.0f}s")
             mpath.write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
-    manifest["complete"] = all((frames.get(world.image_name(i)) or {}).get("ok") is not None
-                               for i in range(world.n))
+    # complete = EVERY keyframe has a map (a failed frame is not complete;
+    # review V2 L3), and the content digest pins the maps themselves.
+    failed = sorted(world.image_name(i) for i in range(world.n)
+                    if not (frames.get(world.image_name(i)) or {}).get("ok"))
+    manifest["failed_frames"] = failed
+    manifest["complete"] = not failed
+    manifest["content_digest"] = content_digest(root, [world.image_name(i) for i in range(world.n)])
     manifest["new_maps_this_run"] = done
     manifest["seconds_this_run"] = round(time.time() - t0, 2)
     if device == "cuda":
         manifest["peak_vram_mb_this_run"] = round(torch.cuda.max_memory_allocated() / 2**20, 1)
     mpath.write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
-    del model
+    model = None
     if device == "cuda":
         torch.cuda.empty_cache()
     return manifest

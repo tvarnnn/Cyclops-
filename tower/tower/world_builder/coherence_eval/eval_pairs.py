@@ -92,6 +92,21 @@ PAIR_PARAMS = {
 
 SOURCE_ADJACENT = 0
 SOURCE_RETRIEVAL = 1
+SOURCE_XISLAND_EXHAUSTIVE = 2
+SOURCE_XISLAND_RETRIEVAL = 3
+
+XISLAND_ARRAYS = "xisland.npz"
+XISLAND_MANIFEST = "xisland_manifest.json"
+XISLAND_PARAMS = {
+    "version": 1,
+    "islands_from": "base tier (pairs.npz)",
+    "exhaustive_min_island": 3,
+    "exhaustive_max_pairs": 250000,
+    "retrieval_top_k_small": 50,
+    "strict": "the base tier's own floors (min_inliers_local/distant, min_inlier_ratio, min_bbox_fraction)",
+    "relaxed_min_inliers": 20,
+    "relaxed_min_inlier_ratio": 0.35,
+}
 
 
 def pairs_dir(cache_root, world_id: str) -> Path:
@@ -99,41 +114,95 @@ def pairs_dir(cache_root, world_id: str) -> Path:
 
 
 class PairSet:
-    """Read side of the cache."""
+    """Read side of the cache: the base tier (`pairs.npz`, the comparable one)
+    and, when built, the flagged cross-island tier (`xisland.npz`)."""
 
     def __init__(self, root) -> None:
         self.root = Path(root)
         self.manifest = None
         self.arrays = None
+        self.xmanifest = None
+        self.xarrays = None
         m = self.root / "manifest.json"
         z = self.root / "pairs.npz"
         if m.is_file() and z.is_file():
             self.manifest = json.loads(m.read_text(encoding="utf-8"))
             with np.load(z, allow_pickle=False) as f:
                 self.arrays = {k: f[k] for k in f.files}
+        xm = self.root / XISLAND_MANIFEST
+        xz = self.root / XISLAND_ARRAYS
+        if xm.is_file() and xz.is_file():
+            self.xmanifest = json.loads(xm.read_text(encoding="utf-8"))
+            with np.load(xz, allow_pickle=False) as f:
+                self.xarrays = {k: f[k] for k in f.files}
+        # the optional learned-matcher cross-island tier (EfficientLoFTR)
+        self.lmanifest = None
+        self.larrays = None
+        lm = self.root / LOFTR_MANIFEST
+        lz = self.root / LOFTR_ARRAYS
+        if lm.is_file() and lz.is_file():
+            self.lmanifest = json.loads(lm.read_text(encoding="utf-8"))
+            with np.load(lz, allow_pickle=False) as f:
+                self.larrays = {k: f[k] for k in f.files}
 
     @property
     def available(self) -> bool:
         return self.arrays is not None and bool(self.manifest.get("complete"))
 
+    @property
+    def xavailable(self) -> bool:
+        return self.xarrays is not None and bool((self.xmanifest or {}).get("complete"))
+
     def __len__(self) -> int:
         return 0 if self.arrays is None else int(len(self.arrays["i"]))
 
     @classmethod
-    def from_arrays(cls, arrays: dict, manifest: dict | None = None) -> "PairSet":
+    def from_arrays(cls, arrays: dict, manifest: dict | None = None, xarrays: dict | None = None) -> "PairSet":
         obj = cls.__new__(cls)
         obj.root = None
         obj.manifest = dict(manifest or {"complete": True, "params": PAIR_PARAMS})
         obj.arrays = arrays
+        obj.xarrays = xarrays
+        obj.xmanifest = {"complete": True} if xarrays is not None else None
+        obj.lmanifest = None
+        obj.larrays = None
         return obj
 
     def digest(self) -> str | None:
-        if self.arrays is None:
-            return None
-        h = hashlib.sha1()
-        for k in ("i", "j", "R", "t", "t_reliable"):
-            h.update(np.ascontiguousarray(self.arrays[k]).tobytes())
-        return h.hexdigest()[:16]
+        return _digest(self.arrays)
+
+    def xdigest(self) -> str | None:
+        return _digest(self.xarrays)
+
+
+def _digest(arrays) -> str | None:
+    if arrays is None:
+        return None
+    h = hashlib.sha1()
+    for k in ("i", "j", "R", "t", "t_reliable"):
+        h.update(np.ascontiguousarray(arrays[k]).tobytes())
+    return h.hexdigest()[:16]
+
+
+def islands(n: int, I, J) -> np.ndarray:
+    """Connected components ("islands") of the verified pair graph over the n
+    keyframes; labels ordered by size (0 = largest), ties by first keyframe.
+    Image-only: the same for every variant of a world."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    I = np.asarray(I, dtype=np.int64)
+    J = np.asarray(J, dtype=np.int64)
+    A = coo_matrix((np.ones(len(I)), (I, J)), shape=(n, n))
+    _, lab = connected_components(A, directed=False)
+    sizes = np.bincount(lab)
+    first = np.full(len(sizes), n)
+    for i in range(n - 1, -1, -1):
+        first[lab[i]] = i
+    order = sorted(range(len(sizes)), key=lambda c: (-sizes[c], first[c]))
+    remap = np.empty(len(sizes), np.int64)
+    remap[order] = np.arange(len(sizes))
+    return remap[lab]
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +314,23 @@ def verify_pair(xy1, d1, xy2, d2, K, size, params, distant: bool):
     rotation is the rotation-only (Wahba) fit to the inlier bearings instead
     and the translation direction is flagged unreliable.
     """
+    m = _match(d1, d2, params["ratio"])
+    floor = params["min_inliers_distant"] if distant else params["min_inliers_local"]
+    if len(m) < floor:
+        return None
+    return verify_points(xy1[m[:, 0]], xy2[m[:, 1]], K, size, params, distant)
+
+
+def verify_points(p1, p2, K, size, params, distant: bool):
+    """`verify_pair` from already-matched pixel correspondences (any matcher)."""
     import cv2
 
-    m = _match(d1, d2, params["ratio"])
-    n_matches = len(m)
+    p1 = np.asarray(p1, dtype=np.float64).reshape(-1, 2)
+    p2 = np.asarray(p2, dtype=np.float64).reshape(-1, 2)
+    n_matches = len(p1)
     floor = params["min_inliers_distant"] if distant else params["min_inliers_local"]
-    if n_matches < floor:
+    if n_matches < max(floor, 5):
         return None
-    p1 = xy1[m[:, 0]].astype(np.float64)
-    p2 = xy2[m[:, 1]].astype(np.float64)
     E, mask = cv2.findEssentialMat(p1, p2, K, method=cv2.RANSAC, prob=params["ransac_conf"],
                                    threshold=params["ransac_px"])
     if E is None or mask is None or E.shape[0] < 3 or E.shape[1] != 3:
@@ -398,4 +475,263 @@ def build_pair_cache(world: WorldInfo, cache_root, *, workers: int | None = None
                             "features": round(t_feat, 2), "total": round(time.time() - t0, 2)}}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
     log(f"[pairs] {world.world_id[:8]}: kept {P} ({counts['verified_distant']} distant) in {time.time() - t0:.0f}s")
+    return manifest
+
+
+def _pack(keep) -> dict:
+    P = len(keep)
+    offsets = np.zeros(P + 1, np.int64)
+    for k, (_, r) in enumerate(keep):
+        offsets[k + 1] = offsets[k] + len(r["xy1"])
+    return {
+        "i": np.array([c[0] for c, _ in keep], np.int32),
+        "j": np.array([c[1] for c, _ in keep], np.int32),
+        "source": np.array([c[2] for c, _ in keep], np.int8),
+        "similarity": np.array([c[3] for c, _ in keep], np.float32),
+        "R": np.array([r["R"] for _, r in keep], np.float64).reshape(-1, 3, 3),
+        "t": np.array([r["t"] for _, r in keep], np.float64).reshape(-1, 3),
+        "t_reliable": np.array([r["t_reliable"] for _, r in keep], bool),
+        "n_matches": np.array([r["n_matches"] for _, r in keep], np.int32),
+        "n_inliers": np.array([r["n_inliers"] for _, r in keep], np.int32),
+        "parallax_deg": np.array([r["parallax_deg"] for _, r in keep], np.float32),
+        "n_cheirality": np.array([r["n_cheirality"] for _, r in keep], np.int32),
+        "inlier_offsets": offsets,
+        "inlier_xy_i": (np.concatenate([r["xy1"] for _, r in keep]) if keep else np.zeros((0, 2), np.float32)),
+        "inlier_xy_j": (np.concatenate([r["xy2"] for _, r in keep]) if keep else np.zeros((0, 2), np.float32)),
+    }
+
+
+def build_cross_island_tier(world: WorldInfo, cache_root, *, workers: int | None = None, log=print) -> dict:
+    """A SEPARATE, flagged tier that tries to link the islands of the base tier.
+
+    The base tier's retrieval (top-20 per keyframe) can leave the verified pair
+    graph split into islands -- on the target world the desk, the closet and
+    the 265-382 block share NO verified pair -- and then where one island sits
+    relative to another is unobservable. This tier re-matches ACROSS islands:
+
+    * exhaustively: every keyframe pair between two different islands of at
+      least ``exhaustive_min_island`` keyframes (capped at
+      ``exhaustive_max_pairs``; above the cap it falls back to retrieval);
+    * for keyframes in smaller islands: their ``retrieval_top_k_small`` most
+      similar keyframes in OTHER islands (the base tier's DINOv2 descriptors).
+
+    Every candidate goes through the same `verify_pair` (RootSIFT, mutual
+    ratio test, essential RANSAC). A kept pair is `strict` when it passes the
+    base tier's own floors -- the same bar as a base pair -- and relaxed-only
+    when it passes just ``relaxed_min_inliers`` with an inlier ratio of at
+    least ``relaxed_min_inlier_ratio``. Placement metrics use strict pairs;
+    relaxed ones are reported separately. The base tier (`pairs.npz`) is not
+    touched, so every number computed on it stays comparable.
+    """
+    import cv2
+
+    params = dict(PAIR_PARAMS)
+    xp = dict(XISLAND_PARAMS)
+    root = pairs_dir(cache_root, world.world_id)
+    base = PairSet(root)
+    if not base.available:
+        raise RuntimeError("build the base pair tier first (cache --what pairs)")
+    workers = workers or max(1, (os.cpu_count() or 2) - 2)
+    t0 = time.time()
+    lab = islands(world.n, base.arrays["i"], base.arrays["j"])
+    sizes = np.bincount(lab)
+    desc = np.load(root / "descriptors.npy")
+    sim = desc @ desc.T
+    big = [int(c) for c in np.nonzero(sizes >= xp["exhaustive_min_island"])[0]]
+    members = {c: np.nonzero(lab == c)[0] for c in big}
+    n_exh = sum(len(members[a]) * len(members[b]) for k, a in enumerate(big) for b in big[k + 1:])
+    cand: dict[tuple[int, int], tuple[int, float]] = {}
+    if n_exh <= xp["exhaustive_max_pairs"]:
+        for k, a in enumerate(big):
+            for b in big[k + 1:]:
+                for i in members[a]:
+                    for j in members[b]:
+                        x, y = (int(i), int(j)) if i < j else (int(j), int(i))
+                        cand[(x, y)] = (SOURCE_XISLAND_EXHAUSTIVE, float(sim[x, y]))
+        small = np.nonzero(sizes[lab] < xp["exhaustive_min_island"])[0]
+        xp["mode"] = "exhaustive between islands + retrieval for small islands"
+    else:
+        small = np.arange(world.n)
+        xp["mode"] = f"retrieval only ({n_exh} exhaustive pairs exceed the cap)"
+    idx = np.arange(world.n)
+    for i in small:
+        srow = sim[i].copy()
+        srow[lab == lab[i]] = -np.inf
+        for j in np.lexsort((idx, -srow))[: xp["retrieval_top_k_small"]]:
+            if not np.isfinite(srow[j]):
+                continue
+            x, y = (int(i), int(j)) if i < j else (int(j), int(i))
+            cand.setdefault((x, y), (SOURCE_XISLAND_RETRIEVAL, float(sim[x, y])))
+    cands = [(a, b, src, sv) for (a, b), (src, sv) in sorted(cand.items())]
+    log(f"[xisland] {world.world_id[:8]}: {len(sizes)} islands ({len(big)} with >= "
+        f"{xp['exhaustive_min_island']} kf), {len(cands)} cross-island candidates ({xp['mode']})")
+    images = []
+    for i in range(world.n):
+        img, kind = world.canonical_image(i, gray=True)
+        if img is None:
+            raise RuntimeError(f"keyframe {i}: no canonical image ({kind})")
+        images.append(img)
+    cv2.setNumThreads(1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        feats = list(pool.map(lambda im: _features(im, params["sift_features"]), images))
+    del images
+    relaxed = dict(params, min_inliers_local=xp["relaxed_min_inliers"],
+                   min_inliers_distant=xp["relaxed_min_inliers"],
+                   min_inlier_ratio=min(params["min_inlier_ratio"], xp["relaxed_min_inlier_ratio"]))
+    K = world.canonical_K()
+    size = (int(world.canonical_camera["width"]), int(world.canonical_camera["height"]))
+
+    def work(c):
+        i, j = c[0], c[1]
+        return verify_pair(feats[i][0], feats[i][1], feats[j][0], feats[j][1], K, size, relaxed, distant=False)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(work, cands))
+    cv2.setNumThreads(-1)
+    keep, strict_flags = [], []
+    for c, r in zip(cands, results):
+        if r is None:
+            continue
+        ratio = r["n_inliers"] / max(r["n_matches"], 1)
+        floor = params["min_inliers_distant"] if (c[1] - c[0]) > params["distant_gap"] else params["min_inliers_local"]
+        strict = r["n_inliers"] >= floor and ratio >= params["min_inlier_ratio"]
+        if not strict and ratio < xp["relaxed_min_inlier_ratio"]:
+            continue
+        keep.append((c, r))
+        strict_flags.append(bool(strict))
+    arrays = _pack(keep)
+    arrays["strict"] = np.array(strict_flags, bool)
+    arrays["island_i"] = lab[arrays["i"]].astype(np.int32)
+    arrays["island_j"] = lab[arrays["j"]].astype(np.int32)
+    np.savez_compressed(root / XISLAND_ARRAYS, **arrays)
+    link: dict[str, dict] = {}
+    for (c, _), st in zip(keep, strict_flags):
+        a, b = sorted((int(lab[c[0]]), int(lab[c[1]])))
+        row = link.setdefault(f"{a}-{b}", {"strict": 0, "relaxed_only": 0})
+        row["strict" if st else "relaxed_only"] += 1
+    manifest = {"world_id": world.world_id, "session_id": world.session_id, "params": xp,
+                "base_params": params, "base_digest": base.digest(),
+                "islands": {"count": int(len(sizes)), "sizes": [int(x) for x in sizes],
+                            "labels": [int(x) for x in lab]},
+                "counts": {"candidates": len(cands),
+                           "candidates_exhaustive": sum(1 for c in cands if c[2] == SOURCE_XISLAND_EXHAUSTIVE),
+                           "candidates_retrieved": sum(1 for c in cands if c[2] == SOURCE_XISLAND_RETRIEVAL),
+                           "verified_strict": int(sum(strict_flags)),
+                           "verified_relaxed_only": int(len(keep) - sum(strict_flags))},
+                "links_by_island_pair": dict(sorted(link.items())),
+                "complete": True, "seconds": round(time.time() - t0, 2)}
+    (root / XISLAND_MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+    log(f"[xisland] {world.world_id[:8]}: {manifest['counts']} in {time.time() - t0:.0f}s")
+    return manifest
+
+
+LOFTR_ARRAYS = "xisland_loftr.npz"
+LOFTR_MANIFEST = "xisland_loftr_manifest.json"
+LOFTR_PARAMS = {
+    "version": 1,
+    "matcher": "zju-community/efficientloftr (Apache-2.0) via transformers",
+    "input_size": [608, 352],
+    "match_threshold": 0.2,
+    "min_island": 10,
+    "top_k_per_island_pair": 200,
+    "verification": "verify_points with the base tier's own floors (strict) -- same RANSAC, same thresholds",
+}
+
+
+def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str | None = None, log=print,
+                                    top_k: int | None = None) -> dict:
+    """Optional, flagged tier: a detector-free learned matcher (EfficientLoFTR,
+    Apache-2.0) on the most similar cross-island candidates.
+
+    SIFT finds no strict cross-island pair on the target even exhaustively;
+    this asks whether a stronger matcher does. Candidates: for every pair of
+    base-tier islands with at least ``min_island`` keyframes, the
+    ``top_k_per_island_pair`` most DINOv2-similar keyframe pairs across them.
+    Matches are verified by `verify_points` with the base tier's floors, so a
+    pair kept here meets the same geometric bar as a base pair; only the
+    correspondence source differs. The weights must be in the Hugging Face
+    cache (set HF_HOME); nothing is downloaded when HF_HUB_OFFLINE=1.
+    """
+    import cv2
+    import torch
+    from transformers import AutoImageProcessor, AutoModelForKeypointMatching
+
+    params = dict(PAIR_PARAMS)
+    lp = dict(LOFTR_PARAMS)
+    if top_k is not None:
+        lp["top_k_per_island_pair"] = int(top_k)
+    root = pairs_dir(cache_root, world.world_id)
+    base = PairSet(root)
+    if not base.available:
+        raise RuntimeError("build the base pair tier first (cache --what pairs)")
+    t0 = time.time()
+    lab = islands(world.n, base.arrays["i"], base.arrays["j"])
+    sizes = np.bincount(lab)
+    desc = np.load(root / "descriptors.npy")
+    sim = desc @ desc.T
+    big = [int(c) for c in np.nonzero(sizes >= lp["min_island"])[0]]
+    cands = []
+    for k, a in enumerate(big):
+        for b in big[k + 1:]:
+            A = np.nonzero(lab == a)[0]
+            B = np.nonzero(lab == b)[0]
+            S = sim[np.ix_(A, B)]
+            flat = np.lexsort((np.arange(S.size), -S.ravel()))[: lp["top_k_per_island_pair"]]
+            for f in flat:
+                i, j = int(A[f // len(B)]), int(B[f % len(B)])
+                x, y = (i, j) if i < j else (j, i)
+                cands.append((x, y, 4, float(sim[x, y])))
+    cands = sorted(set(cands))
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    proc = AutoImageProcessor.from_pretrained("zju-community/efficientloftr")
+    model = AutoModelForKeypointMatching.from_pretrained("zju-community/efficientloftr").to(device).eval()
+    log(f"[loftr] {world.world_id[:8]}: {len(big)} islands >= {lp['min_island']} kf, {len(cands)} candidates on {device}")
+    K = world.canonical_K()
+    size = (int(world.canonical_camera["width"]), int(world.canonical_camera["height"]))
+    cache: dict[int, np.ndarray] = {}
+
+    def rgb(i):
+        if i not in cache:
+            img, kind = world.canonical_image(i)
+            if img is None:
+                raise RuntimeError(f"keyframe {i}: no canonical image ({kind})")
+            cache[i] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return cache[i]
+
+    keep = []
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    for n_done, (i, j, src, sv) in enumerate(cands):
+        a, b = rgb(i), rgb(j)
+        inputs = proc([a, b], return_tensors="pt", size={"height": lp["input_size"][0],
+                                                          "width": lp["input_size"][1]}).to(device)
+        with torch.inference_mode():
+            out = model(**inputs)
+        res = proc.post_process_keypoint_matching(out, [[a.shape[:2], b.shape[:2]]],
+                                                  threshold=lp["match_threshold"])[0]
+        p0 = res["keypoints0"].cpu().numpy().astype(np.float64)
+        p1 = res["keypoints1"].cpu().numpy().astype(np.float64)
+        r = verify_points(p0, p1, K, size, params, distant=(j - i) > params["distant_gap"])
+        if r is not None:
+            keep.append(((i, j, src, sv), r))
+        if (n_done + 1) % 200 == 0:
+            log(f"[loftr] {n_done + 1}/{len(cands)} ({len(keep)} verified) {time.time() - t0:.0f}s")
+    arrays = _pack(keep)
+    arrays["strict"] = np.ones(len(keep), bool)
+    arrays["island_i"] = lab[arrays["i"]].astype(np.int32)
+    arrays["island_j"] = lab[arrays["j"]].astype(np.int32)
+    np.savez_compressed(root / LOFTR_ARRAYS, **arrays)
+    link: dict[str, int] = {}
+    for (c, _) in keep:
+        x, y = sorted((int(lab[c[0]]), int(lab[c[1]])))
+        link[f"{x}-{y}"] = link.get(f"{x}-{y}", 0) + 1
+    manifest = {"world_id": world.world_id, "session_id": world.session_id, "params": lp,
+                "base_params": params, "base_digest": base.digest(),
+                "counts": {"candidates": len(cands), "verified_strict": len(keep)},
+                "links_by_island_pair": dict(sorted(link.items())),
+                "complete": True, "seconds": round(time.time() - t0, 2),
+                "peak_vram_mb": (round(torch.cuda.max_memory_allocated() / 2**20, 1) if device == "cuda" else None)}
+    (root / LOFTR_MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+    log(f"[loftr] {world.world_id[:8]}: {manifest['counts']} links {manifest['links_by_island_pair']} "
+        f"in {time.time() - t0:.0f}s")
     return manifest

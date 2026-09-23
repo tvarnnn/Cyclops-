@@ -140,15 +140,34 @@ def quat_wxyz_to_R(q) -> np.ndarray:
     ])
 
 
-def _as_T(value) -> np.ndarray:
+class VariantMismatch(ValueError):
+    """The variant does not belong to the world it is evaluated against."""
+
+
+ROTATION_TOL = 1e-4
+
+
+def _as_T(value, where: str = "") -> np.ndarray:
+    """A 4x4 rigid T_world_camera, REFUSING anything that is not one: a Sim(3)
+    scale folded into R, a mirrored frame (det -1) or a skewed matrix would
+    silently corrupt every rotation error and projection (review V2, L1)."""
     a = np.asarray(value, dtype=np.float64)
     if a.size == 16:
-        return a.reshape(4, 4)
-    if a.size == 12:
+        T = a.reshape(4, 4)
+    elif a.size == 12:
         T = np.eye(4)
         T[:3, :] = a.reshape(3, 4)
-        return T
-    raise ValueError(f"T_world_camera must have 16 (or 12) numbers, got {a.size}")
+    else:
+        raise ValueError(f"{where}T_world_camera must have 16 (or 12) numbers, got {a.size}")
+    R = T[:3, :3]
+    if not np.isfinite(T).all():
+        raise ValueError(f"{where}T_world_camera is not finite")
+    err = float(np.abs(R.T @ R - np.eye(3)).max())
+    det = float(np.linalg.det(R))
+    if err > ROTATION_TOL or det <= 0:
+        raise ValueError(f"{where}T_world_camera rotation is not a proper rotation (|R^T R - I| = {err:.2e}, "
+                         f"det = {det:.4f}); a scale must not be folded into R and the frame must be right-handed")
+    return T
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +190,7 @@ def save_variant(variant: Variant, out_dir) -> Path:
         "format": FORMAT,
         "world_id": variant.world_id,
         "session_id": variant.session_id,
-        "meta": dict(variant.meta, variant=variant.name),
+        "meta": _meta_for_save(variant),
         "image_space": variant.image_space,
         "component_stated": bool(variant.component_stated),
         "cameras": variant.cameras,
@@ -195,7 +214,20 @@ def save_variant(variant: Variant, out_dir) -> Path:
     return out_dir
 
 
-def load_variant(path, world: WorldInfo | None = None) -> Variant:
+def _meta_for_save(variant: Variant) -> dict:
+    """The adapter that PRODUCED the variant is provenance, not what the file
+    is: a saved variant reads back as adapter "interchange" with
+    `adapted_from`, so an edited copy of the saved world is never labelled
+    "world" and never inherits the world's recorded runtime (review V2, L2)."""
+    meta = {k: v for k, v in variant.meta.items() if not k.startswith("_")}
+    adapter = meta.pop("adapter", None)
+    if adapter and adapter != "interchange":
+        meta["adapted_from"] = adapter
+    meta["variant"] = variant.name
+    return meta
+
+
+def load_variant(path, world: WorldInfo | None = None, *, force: bool = False) -> Variant:
     """Read an interchange directory. Keyframe references are resolved through
     `world` when given (image names, indices); unresolved rows are counted in
     ``meta['unresolved_keyframes']`` and dropped."""
@@ -204,6 +236,15 @@ def load_variant(path, world: WorldInfo | None = None) -> Variant:
     if doc.get("format") != FORMAT:
         raise ValueError(f"{path}: format {doc.get('format')!r}, expected {FORMAT!r}")
     meta = dict(doc.get("meta") or {})
+    meta["adapter"] = "interchange"
+    if world is not None:
+        wrong = [f"{k} {doc.get(k)!r} != {getattr(world, k)!r}" for k in ("world_id", "session_id")
+                 if doc.get(k) and doc.get(k) != getattr(world, k)]
+        if wrong and not force:
+            raise VariantMismatch(f"{path}: variant belongs to another world ({'; '.join(wrong)}); "
+                                  "pass --force to evaluate it anyway")
+        if wrong:
+            meta["world_mismatch_forced"] = wrong
     v = Variant(name=str(meta.get("variant") or path.name), world_id=doc.get("world_id"),
                 session_id=doc.get("session_id"), meta=meta,
                 image_space=doc.get("image_space") or CANONICAL,
@@ -216,7 +257,7 @@ def load_variant(path, world: WorldInfo | None = None) -> Variant:
         if kid is None:
             unresolved += 1
             continue
-        v.poses[kid] = _as_T(row["T_world_camera"])
+        v.poses[kid] = _as_T(row["T_world_camera"], f"{path} keyframe {kid}: ")
         if "component" in row:
             stated_any = True
         v.component[kid] = str(row.get("component", "0"))
@@ -426,7 +467,7 @@ def is_colmap_path(path) -> bool:
 def variant_from_colmap(path, world: WorldInfo, *, name: str | None = None,
                         publish_min_observations: int = DEFAULT_PUBLISH_MIN_OBSERVATIONS,
                         publish_min_model_images: int = DEFAULT_PUBLISH_MIN_MODEL_IMAGES,
-                        image_space: str | None = None) -> Variant:
+                        image_space: str | None = None, force: bool = False) -> Variant:
     """A COLMAP reconstruction (one model, or numbered sub-models) as a variant.
 
     Each model is one component, named by its directory ("0", "1", ...).
@@ -501,6 +542,21 @@ def variant_from_colmap(path, world: WorldInfo, *, name: str | None = None,
         base += n_pts
     v.meta.pop("_nreg", None)
     v.meta["unmatched_images"] = unmatched
+    registered = len(v.poses) + unmatched
+    if registered and unmatched / registered > 0.5 and not force:
+        raise VariantMismatch(f"{path}: {unmatched} of {registered} registered images do not name a keyframe of "
+                              f"world {world.world_id} -- wrong world? pass --force to evaluate anyway")
+    if xyz and ok_:
+        # a keyframe registered in two models keeps the larger model's pose;
+        # the other model's observations of it must go with it (review V2, L7)
+        ok_a = np.asarray(ok_, dtype=np.int64)
+        op_a = np.asarray(op_, dtype=np.int64)
+        pc_a = np.asarray(pcomp)
+        own = np.array([v.component.get(obs_ids[k]) for k in ok_a], dtype=object)
+        keep = pc_a[op_a] == own
+        ok_ = list(ok_a[keep])
+        op_ = list(op_a[keep])
+        ouv = [u for u, kk in zip(ouv, keep) if kk]
     if xyz:
         v.xyz = np.asarray(xyz).reshape(-1, 3)
         v.point_component = np.asarray(pcomp)
@@ -521,15 +577,20 @@ def variant_from_colmap(path, world: WorldInfo, *, name: str | None = None,
     return v
 
 
-def load_any(path, world: WorldInfo, **colmap_kwargs) -> Variant:
-    """Interchange dir, COLMAP model, or a world-shaped directory."""
+def load_any(path, world: WorldInfo, *, force: bool = False, **colmap_kwargs) -> Variant:
+    """Interchange dir, COLMAP model, or a world-shaped directory. Refuses a
+    variant of another world/session unless `force` (review V2, M1)."""
     path = Path(path)
     if (path / "reconstruction.json").is_file():
-        return load_variant(path, world)
+        return load_variant(path, world, force=force)
     if (path / "world.json").is_file():
         from tower.world_builder.coherence_eval.eval_world import open_world
 
-        return variant_from_world(open_world(path, world.session_id), name=path.name)
+        other = open_world(path, world.session_id if (path / "sessions" / world.session_id).is_dir() else None)
+        if (other.world_id, other.session_id) != (world.world_id, world.session_id) and not force:
+            raise VariantMismatch(f"{path}: world {other.world_id}/{other.session_id} is not "
+                                  f"{world.world_id}/{world.session_id}; pass --force to evaluate anyway")
+        return variant_from_world(other, name=path.name)
     if is_colmap_path(path):
-        return variant_from_colmap(path, world, **colmap_kwargs)
+        return variant_from_colmap(path, world, force=force, **colmap_kwargs)
     raise ValueError(f"{path}: not a variant directory (reconstruction.json), a COLMAP model, or a world")
