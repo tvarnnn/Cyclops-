@@ -5,8 +5,13 @@ order, extras interleave, chained captures continue the sequence); staging
 undistorts exactly as `global_solve.prepare_images` and refuses a
 non-canonical extra; the rigid gate on a synthetic two-island model (zero
 shared points -> split; strongly shared and seed-stable -> kept; shared but
-seed-unstable -> split; one seed -> spread unmeasured); the keyframes-only
-export; the VariantConfig JSON round trip; the product-recipe predicate.
+seed-unstable -> split; one seed -> spread unmeasured); the evidence rule
+(GateParams(rule="evidence"): a redundantly linked, stable, same-scale island
+stays; one floor-level verified pair splits; a star through one image needs a
+closing triangle; an internal x4 metric scale step splits; seed-unstable
+splits; fallbacks without links / metric scale; the verified-link reader);
+the keyframes-only export; the VariantConfig JSON round trip; the
+product-recipe predicate.
 """
 
 import json
@@ -286,6 +291,154 @@ def test_gate_with_one_seed_uses_shared_points_only():
     assert set(out["labels"].values()) == {0}
     out = G.apply_rigid_gate([two_islands(0)], G.GateParams(k_shared=3, min_obs=5))
     assert len(set(out["labels"].values())) == 2
+
+
+# ---------------------------------------------------------------------------
+# the evidence rule (GateParams(rule="evidence"))
+
+EV = dict(rule="evidence", min_obs=5)
+
+
+def ladder_links(n_a=30, n_b=20, cross=(), inliers=100):
+    """Verified pairs: each island a ladder (i, i+1), (i, i+2) -- biconnected -- plus `cross` (a, b, inliers)."""
+    names = [f"{i:06d}_k.jpg" for i in range(n_a + n_b)]
+    out = {}
+    for lo, hi in ((0, n_a), (n_a, n_a + n_b)):
+        for i in range(lo, hi):
+            for j in (i + 1, i + 2):
+                if j < hi:
+                    out[(names[i], names[j])] = inliers
+    for a, b, n in cross:
+        out[tuple(sorted((names[a], names[b])))] = n
+    return out
+
+
+def metric(level_a, level_b, n_a=30, n_b=20, seed=0):
+    """Per camera log(z_sfm / z_metric): island A at level_a, island B at level_b, 3 % noise."""
+    rng = np.random.default_rng(seed)
+    v = np.r_[np.full(n_a, math.log(level_a)), np.full(n_b, math.log(level_b))] + rng.normal(0, 0.03, n_a + n_b)
+    return {f"{i:06d}_k.jpg": float(x) for i, x in enumerate(v)}
+
+
+def _n_labels(out):
+    return len(set(out["labels"].values()))
+
+
+def test_evidence_keeps_a_redundantly_linked_stable_same_scale_island():
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    links = ladder_links(cross=[(k, 30 + k, 50) for k in range(5)])      # 5 vertex-disjoint pairs
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=links, metric_log=metric(4.0, 4.0))
+    assert _n_labels(out) == 1 and out["splits"] == 0
+    assert "verified pairs" in out["evidence"]["links"] and "cameras" in out["evidence"]["metric_scale"]
+
+
+def test_evidence_splits_an_island_held_by_one_floor_level_pair():
+    """One verified pair at the verification floor (15 inliers), seed-stable, carrying 15 shared points: the
+    shared-point rule keeps it (15 >= K = 10); the evidence rule splits it -- one pair is a single point of
+    failure (P2-M: 991e5a15 kf 13-25)."""
+    models = [two_islands(s, shared_between=15, dispersed=False) for s in range(3)]
+    links = ladder_links(cross=[(29, 30, 15)])
+    old = G.apply_rigid_gate(models, G.GateParams(k_shared=10, min_obs=5))
+    assert _n_labels(old) == 1
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=links, metric_log=metric(4.0, 4.0))
+    labels = np.array([out["labels"][n] for n in models[0].names])
+    assert set(labels[:30]) == {0} and set(labels[30:]) == {1}
+    why = [d["why"] for r in out["rounds"] for d in r["decisions"] if not d["kept"]]
+    assert why and "not redundant" in why[0]
+
+
+def test_evidence_star_through_one_image_needs_a_closing_triangle():
+    """Several pairs through ONE camera: kept when two of their other ends are themselves verified (a closed
+    triangle, the control's case), split when they are not."""
+    models = [two_islands(s, shared_between=30) for s in range(3)]
+    closed = ladder_links(cross=[(29, 30, 40), (29, 31, 40)])            # (30, 31) is a ladder link
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=closed, metric_log=metric(4.0, 4.0))
+    assert _n_labels(out) == 1
+    open_ = ladder_links(cross=[(29, 30, 40), (29, 40, 40)])             # (30, 40) is not
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=open_, metric_log=metric(4.0, 4.0))
+    assert _n_labels(out) == 2
+
+
+def test_evidence_splits_a_group_at_an_internal_metric_scale_step():
+    """One block (redundantly linked, seed-stable) whose second half sits at x4 the metric scale of the first
+    (the target's bathroom inside its corner / final-pass group): two components. x1.1 is noise: one."""
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    links = ladder_links(cross=[(k, 30 + k, 50) for k in range(10)])
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=links, metric_log=metric(4.0, 16.0))
+    labels = np.array([out["labels"][n] for n in models[0].names])
+    assert set(labels[:30]) == {0} and set(labels[30:]) == {1}
+    why = [d["why"] for r in out["rounds"] for d in r["decisions"] if not d["kept"]]
+    assert why and "metric scale x" in why[0]
+    factor = [g.get("scale_factor") for r in out["rounds"] for g in r["groups"].values() if g.get("scale_factor")]
+    assert factor and 3.5 < factor[0] < 4.5
+    assert _n_labels(G.apply_rigid_gate(models, G.GateParams(**EV), links=links,
+                                         metric_log=metric(4.0, 4.4))) == 1
+    # without metric scale the rule refuses, unless told to run blind -- then the step is invisible, and the
+    # report says so
+    with pytest.raises(ValueError, match="metric_log"):
+        G.apply_rigid_gate(models, G.GateParams(**EV), links=links)
+    out = G.apply_rigid_gate(models, G.GateParams(**EV, require_metric=False), links=links)
+    assert _n_labels(out) == 1 and out["evidence"]["metric_scale"].startswith("unavailable")
+
+
+def test_scale_split_rejoins_segments_at_one_level():
+    p = G.GateParams(**EV)
+    r = np.r_[np.full(15, 0.0), np.full(15, math.log(4.0)), np.full(15, 0.02)]
+    parts = G.scale_split(np.arange(45), r, np.arange(45), p)
+    assert sorted(len(q) for q in parts) == [15, 30]
+    assert set(parts[0].tolist()) == set(range(15)) | set(range(30, 45))
+
+
+def test_evidence_splits_a_seed_unstable_island():
+    """Held through one image with a closing triangle (redundant), but its placement moves between seeds."""
+    models = [two_islands(0, shared_between=60), two_islands(1, shared_between=60, b_offset=np.array([0, 5.0, 0]))]
+    links = ladder_links(cross=[(29, 30, 40), (29, 31, 40)])
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), links=links, metric_log=metric(4.0, 4.0))
+    assert _n_labels(out) == 2
+    why = [d["why"] for r in out["rounds"] for d in r["decisions"] if not d["kept"]]
+    assert why and "seed spread" in why[0]
+
+
+def test_evidence_without_links_falls_back_to_shared_point_groups():
+    models = [two_islands(s) for s in range(2)]                           # zero shared points: two groups
+    out = G.apply_rigid_gate(models, G.GateParams(**EV), metric_log=metric(4.0, 4.0))
+    assert _n_labels(out) == 2 and out["evidence"]["links"].startswith("unavailable")
+
+
+def test_gate_params_rule_and_per_rule_default_spread():
+    assert G.GateParams().rule == "shared_k" and G.GateParams().max_spread == 0.02
+    ev = G.GateParams(rule="evidence")
+    assert ev.max_spread == 0.075 and G.GateParams(rule="evidence", max_spread=0.1).max_spread == 0.1
+    assert G.GateParams.from_json(json.loads(json.dumps(ev.to_json()))) == ev
+    with pytest.raises(ValueError):
+        G.GateParams(rule="maybe")
+
+
+def test_biconnected_blocks_split_at_articulation_vertices_and_bridges():
+    # two triangles sharing vertex 2, and a bridge 4-5
+    adj = [set() for _ in range(6)]
+    for a, b in [(0, 1), (1, 2), (0, 2), (2, 3), (3, 4), (2, 4), (4, 5)]:
+        adj[a].add(b)
+        adj[b].add(a)
+    blocks = sorted(sorted(b) for b in G.biconnected_blocks(adj))
+    assert blocks == [[0, 1, 2], [2, 3, 4], [4, 5]]
+
+
+def test_read_verified_links_skips_unverified_and_floor(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "database.db"
+    con = sqlite3.connect(db)
+    con.execute("create table images (image_id integer primary key, name text, camera_id integer)")
+    con.execute("create table two_view_geometries (pair_id integer primary key, rows integer, cols integer, "
+                "data blob, config integer)")
+    con.executemany("insert into images values (?, ?, 1)", [(1, "a.jpg"), (2, "b.jpg"), (3, "c.jpg")])
+    base = 2147483647
+    con.executemany("insert into two_view_geometries values (?, ?, 2, null, ?)",
+                    [(1 * base + 2, 40, 2), (1 * base + 3, 14, 2), (2 * base + 3, 60, 1)])
+    con.commit()
+    con.close()
+    assert G.read_verified_links(db) == {("a.jpg", "b.jpg"): 40}
 
 
 def test_seed_spread_is_zero_for_identical_seeds():

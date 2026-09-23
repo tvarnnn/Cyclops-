@@ -35,11 +35,57 @@ b2a75ab4's noise floor and from physics, never from the target; the
 derivation is in RUN/experiments/P2-E1/GATE-THRESHOLDS.md and summarised on
 `GateParams`.
 
-numpy / scipy only; no pycolmap, no file IO.
+THE EVIDENCE RULE (`GateParams(rule="evidence")`; P2-GT, manager 006.2)
+
+The shared-point rule above fixed K = 10 after the first target runs and
+could not be re-derived leave-one-world-out. Scored against independent
+ground truth on 7 worlds x 4 arms (image-only pair rotations, image-only
+vertical-vanishing-point roll, harness tilt / eye height), it left the
+most misplaced keyframes attached. The evidence rule replaces the support
+count with the three things that make a placement a measurement:
+
+  (a) CANDIDATE GROUPS are the biconnected blocks of the solver's VERIFIED
+      view graph (`links`: image pairs with >= `min_link_inliers` verified
+      inliers, COLMAP's floor) over a component's supported cameras.
+      Inside a block no single image is a single point of failure; a block
+      that hangs on the rest by one pair, or through one image, is its own
+      group. (One floor-level pair attached 991e5a15's kf 13-25, 55 deg off
+      in image-only roll; one pair attaches the target's bathroom.)
+  (b) METRIC SCALE: with `metric_log` (per camera log(z_sfm / z_metric),
+      e.g. the harness's TRI ratio), each group is split in capture order
+      where its level steps by more than `scale_step_factor` with at least
+      `scale_min_cameras` cameras on each side; segments that return to the
+      same level re-join. One similarity cannot hold a x4 scale step.
+  (c) ATTACHMENT, peeled from the largest group: a group joins the kept set
+      only if its links to the kept set are REDUNDANT (two vertex-disjoint
+      verified pairs, or two pairs through one image whose other ends are
+      themselves verified -- a closed triangle), it is SEED-STABLE (spread
+      <= `max_spread`, the measure above) and its metric level agrees with
+      the kept set's (x `scale_step_factor`, both sides >= `scale_min_cameras`
+      cameras with a ratio).
+
+Without `links` the candidate groups fall back to rigid groups at the
+physical floor of 3 shared points and redundancy is not evaluated. Without
+`metric_log` the rule REFUSES to run unless `require_metric=False` (then the
+scale tests are skipped): the scale tests do most of its work. The report
+records which evidence ran. The driver does not pass either input yet.
+
+THRESHOLDS (derivation and scores: RUN/experiments/P2-GT/out/ -- grid.json,
+lowo_v4.txt, ablation.txt, lowo_ablation.txt, final_table.txt):
+`scale_step_factor` 1.25 and `scale_min_cameras` 10 are the harness's
+physical plausibility bounds (PLAUSIBILITY scale_max_factor, min_group_kf),
+and each is also the leave-one-world-out choice in 6/7 folds.
+`max_spread` 0.075 = the harness's 0.3 m position tolerance over the
+control's metric extent (3.95 m); in 6/7 leave-one-world-out folds any
+value in [0.04, 0.3] is optimal (the target fold leaves it unconstrained).
+
+numpy / scipy only; no pycolmap. The gate functions do no file IO;
+`read_verified_links` is the one IO helper (stdlib sqlite3, read-only).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -47,8 +93,16 @@ import numpy as np
 INF = float("inf")
 
 
+RULES = ("shared_k", "evidence")
+# Per-rule default of `max_spread` (see GateParams).
+DEFAULT_MAX_SPREAD = {"shared_k": 0.02, "evidence": 0.075}
+
+
 @dataclass(frozen=True)
 class GateParams:
+    # "shared_k": the shared-point rule (the default, unchanged); "evidence":
+    # verified-graph blocks + metric scale + redundant, seed-stable attachment.
+    rule: str = "shared_k"
     # Minimum shared 3-D points that couple two cameras (a) and two groups (c).
     # Physics floor: a Sim(3) between two rigid bodies has 7 DOF and a 3-D
     # point seen by both gives 3 constraints, so 3 non-collinear points is the
@@ -58,11 +112,17 @@ class GateParams:
     # floor (RUN/experiments/P2-E1/GATE-THRESHOLDS.md).
     k_shared: int = 10
     # Maximum seed spread (fraction of component extent) of a coupled group.
-    # Control noise floor: its genuinely coupled parts (capture-order blocks,
-    # K=50 sub-groups) move <= 0.0014 of extent between seeds (whole main
-    # component: median 0.0002). 0.02 is ~14x that floor, and on a 5-8 m walk
-    # ~0.10-0.16 m -- inside the harness's own 0.3 m eye-height tolerance.
-    max_spread: float = 0.02
+    # None = the rule's default (DEFAULT_MAX_SPREAD).
+    # shared_k, 0.02: control noise floor: its genuinely coupled parts
+    # (capture-order blocks, K=50 sub-groups) move <= 0.0014 of extent between
+    # seeds (whole main component: median 0.0002). 0.02 is ~14x that floor.
+    # evidence, 0.075: the harness's 0.3 m position tolerance (eye-height band)
+    # over the control's metric extent (18.8 units / 4.76 units per metre =
+    # 3.95 m). 0.02 split the target's closet, which six image-only pairs
+    # place within 0.6 deg (seed spread 0.024-0.031); the false-glued groups
+    # it must split move 0.59-0.86. Leave-one-world-out: any value in
+    # [0.04, 0.3] is optimal in 6/7 folds (P2-GT out/lowo_v4.txt).
+    max_spread: float | None = None
     # global_solve.MIN_IMAGE_OBSERVATIONS: fewer observations is not a pose.
     min_obs: int = 30
     # A group counts as present in a seed's reference component when at least
@@ -70,6 +130,26 @@ class GateParams:
     min_present_frac: float = 0.5
     # Fewer common reference cameras than this and a seed cannot be aligned.
     min_align_cameras: int = 5
+    # evidence rule: a verified pair counts as a link at COLMAP's verification
+    # floor (two_view_geometry min_num_inliers; bridge.MIN_VERIFIED_INLIERS).
+    min_link_inliers: int = 15
+    # evidence rule: a metric scale step / mismatch beyond this factor splits
+    # (harness PLAUSIBILITY scale_max_factor: MoGe's per-image error is a few
+    # %, region bias ~10 %; x1.25 is a reconstruction error, not noise).
+    scale_step_factor: float = 1.25
+    # evidence rule: cameras with a metric ratio needed on EACH side of a scale
+    # comparison (harness PLAUSIBILITY min_group_kf).
+    scale_min_cameras: int = 10
+    # evidence rule: refuse to run without metric_log. The scale tests carry most of the rule (without them it
+    # left 947 misplaced keyframes attached over 24 world-arms vs 133 with them, and the shared-point rule 579),
+    # so a caller that cannot supply metric scale must opt out explicitly.
+    require_metric: bool = True
+
+    def __post_init__(self):
+        if self.rule not in RULES:
+            raise ValueError(f"gate rule {self.rule!r} not in {RULES}")
+        if self.max_spread is None:
+            object.__setattr__(self, "max_spread", DEFAULT_MAX_SPREAD[self.rule])
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -231,13 +311,18 @@ def group_spread(models: list[SeedModel], ref_group_names, group_names, ext: flo
 # the gate
 
 
-def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None) -> dict:
+def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None, *,
+                     links=None, metric_log=None) -> dict:
     """Final component per camera of the reference seed (models[0]).
 
     Returns {"labels": {name: int}, "components": [...], "rounds": [...],
     "params": ...}. Component labels are renumbered by supported size
-    (0 = most supported cameras)."""
+    (0 = most supported cameras). `params.rule` selects the rule; `links` and
+    `metric_log` are used by the evidence rule only (see
+    `apply_evidence_gate`)."""
     params = params or GateParams()
+    if params.rule == "evidence":
+        return apply_evidence_gate(models, params, links=links, metric_log=metric_log)
     ref = models[0]
     M = incidence(ref)
     C = shared_counts(M)
@@ -310,7 +395,11 @@ def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None) 
         for i in rest:
             row = C[i, labelled].toarray().ravel()
             labels[i] = labels[labelled[int(np.argmax(row))]] if row.max() > 0 else first
-    # renumber by supported size
+    return _finish(ref, labels, supported, rounds, params)
+
+
+def _finish(ref: SeedModel, labels: np.ndarray, supported: np.ndarray, rounds: list, params: GateParams) -> dict:
+    """Renumber final labels by supported size and build the report."""
     counts = {int(lab): int(((labels == lab) & supported).sum()) for lab in np.unique(labels)}
     order = sorted(counts, key=lambda lab: (-counts[lab], -int((labels == lab).sum()), lab))
     remap = {old: new for new, old in enumerate(order)}
@@ -327,6 +416,324 @@ def apply_rigid_gate(models: list[SeedModel], params: GateParams | None = None) 
     return {"labels": {ref.names[i]: int(final[i]) for i in range(ref.n)},
             "components": comps, "rounds": rounds, "params": params.to_json(),
             "splits": int(splits)}
+
+
+# ---------------------------------------------------------------------------
+# the evidence rule
+
+
+def read_verified_links(database_path, min_inliers: int = 15) -> dict:
+    """{(name_a, name_b) sorted: inliers} for every verified two-view geometry of a COLMAP database
+    (config not UNDEFINED / DEGENERATE, >= `min_inliers` inliers). Opened read-only and immutable, so a
+    frozen database is never touched."""
+    import sqlite3
+    from pathlib import Path
+
+    uri = Path(database_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True)
+    try:
+        names = dict(con.execute("select image_id, name from images").fetchall())
+        out = {}
+        for pid, rows, config in con.execute("select pair_id, rows, config from two_view_geometries"):
+            if config in (0, 1) or rows < min_inliers:
+                continue
+            b = int(pid) % _COLMAP_PAIR_BASE
+            a = (int(pid) - b) // _COLMAP_PAIR_BASE
+            if a in names and b in names:
+                out[tuple(sorted((names[a], names[b])))] = int(rows)
+        return out
+    finally:
+        con.close()
+
+
+_COLMAP_PAIR_BASE = 2147483647
+
+
+def biconnected_blocks(adj: list[set]) -> list[set]:
+    """Biconnected blocks (Hopcroft-Tarjan, iterative) of an undirected graph given as adjacency sets.
+    Blocks share at most one vertex (an articulation vertex); an isolated vertex is a block of its own."""
+    n = len(adj)
+    disc = [-1] * n
+    low = [0] * n
+    t = 0
+    blocks: list[set] = []
+    edges: list = []
+    for root in range(n):
+        if disc[root] != -1:
+            continue
+        disc[root] = low[root] = t
+        t += 1
+        if not adj[root]:
+            blocks.append({root})
+            continue
+        stack = [(root, -1, iter(sorted(adj[root])))]
+        while stack:
+            v, parent, it = stack[-1]
+            advanced = False
+            for w in it:
+                if disc[w] == -1:
+                    edges.append((v, w))
+                    disc[w] = low[w] = t
+                    t += 1
+                    stack.append((w, v, iter(sorted(adj[w]))))
+                    advanced = True
+                    break
+                if w != parent and disc[w] < disc[v]:
+                    edges.append((v, w))
+                    low[v] = min(low[v], disc[w])
+            if advanced:
+                continue
+            stack.pop()
+            if stack:
+                u = stack[-1][0]
+                low[u] = min(low[u], low[v])
+                if low[v] >= disc[u]:
+                    blk = set()
+                    while edges:
+                        e = edges.pop()
+                        blk.update(e)
+                        if e == (u, v):
+                            break
+                    blocks.append(blk)
+    return blocks
+
+
+def _disjoint_blocks(n: int, blocks: list[set]) -> list[np.ndarray]:
+    """Each vertex goes to its largest block (an articulation vertex joins the larger side)."""
+    order = sorted(range(len(blocks)), key=lambda b: (-len(blocks[b]), min(blocks[b])))
+    owner = [-1] * n
+    for b in order:
+        for v in blocks[b]:
+            if owner[v] == -1:
+                owner[v] = b
+    groups: dict = {}
+    for v, b in enumerate(owner):
+        groups.setdefault(b, []).append(v)
+    out = [np.asarray(sorted(g), dtype=np.int64) for g in groups.values()]
+    out.sort(key=lambda g: (-len(g), int(g[0])))
+    return out
+
+
+def redundant_links(cross: list[tuple[int, int]], adj: list[set]) -> bool:
+    """`cross` = links (group camera, kept camera). Redundant when two of them share no image, or when two of
+    them share an image and their other ends are themselves linked (a closed triangle). One pair, or a star
+    whose ends are unrelated, is a single point of failure."""
+    for i in range(len(cross)):
+        for j in range(i + 1, len(cross)):
+            (a1, b1), (a2, b2) = cross[i], cross[j]
+            if a1 != a2 and b1 != b2:
+                return True
+            if a1 == a2 and b2 in adj[b1]:
+                return True
+            if b1 == b2 and a2 in adj[a1]:
+                return True
+    return False
+
+
+def _level(r: np.ndarray, idx) -> tuple[float | None, int]:
+    v = r[np.asarray(idx, dtype=np.int64)]
+    v = v[np.isfinite(v)]
+    return (float(np.median(v)), int(len(v))) if len(v) else (None, 0)
+
+
+def scale_levels_differ(R: np.ndarray, a, b, params: GateParams) -> bool | None:
+    """Do camera sets a and b sit at different metric levels? Every estimator (row of R) with >=
+    scale_min_cameras ratios on both sides must see |delta| > log(scale_step_factor), all with one sign.
+    None when no estimator can measure."""
+    signs = []
+    for r in np.atleast_2d(R):
+        la, na = _level(r, a)
+        lb, nb = _level(r, b)
+        if la is None or lb is None or min(na, nb) < params.scale_min_cameras:
+            continue
+        d = lb - la
+        if abs(d) <= math.log(params.scale_step_factor):
+            return False
+        signs.append(np.sign(d))
+    if not signs:
+        return None
+    return all(s == signs[0] for s in signs)
+
+
+def scale_split(group: np.ndarray, R: np.ndarray, rank: np.ndarray, params: GateParams) -> list[np.ndarray]:
+    """Split a group, in capture order (`rank`), at metric scale steps: binary segmentation on the first
+    estimator, each cut confirmed by `scale_levels_differ`; then segments that sit at one level (A | B | A)
+    re-join. As in the harness's step finder, a cut is a candidate when the MEDIANS of the two sides differ
+    by more than log(scale_step_factor) (robust detection) and is placed where the MEANS differ most (the
+    median difference is flat around a clean step; the mean difference peaks on it)."""
+    R = np.atleast_2d(R)
+    parts = _scale_split(np.asarray(group, dtype=np.int64), R, rank, params)
+    if len(parts) <= 1:
+        return parts
+    root = list(range(len(parts)))
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            if scale_levels_differ(R, parts[i], parts[j], params) is False:
+                ri, rj = root[i], root[j]
+                root = [ri if x == rj else x for x in root]
+    merged: dict = {}
+    for k, q in zip(root, parts):
+        merged.setdefault(k, []).append(q)
+    out = [np.sort(np.concatenate(v)) for v in merged.values()]
+    out.sort(key=lambda g: (-len(g), int(g.min())))
+    return out
+
+
+def _scale_split(g: np.ndarray, R: np.ndarray, rank: np.ndarray, params: GateParams) -> list[np.ndarray]:
+    g = g[np.argsort(rank[g], kind="stable")]
+    gi = g[np.isfinite(R[0][g])]
+    m = params.scale_min_cameras
+    if len(gi) < 2 * m:
+        return [g]
+    y = R[0][gi]
+    cands = []
+    for j in range(m, len(gi) - m + 1):
+        if abs(float(np.median(y[j:]) - np.median(y[:j]))) > math.log(params.scale_step_factor):
+            cands.append((abs(float(y[j:].mean() - y[:j].mean())), j))
+    for _, j in sorted(cands, key=lambda c: (-c[0], c[1])):
+        cut = rank[gi[j]]
+        left, right = g[rank[g] < cut], g[rank[g] >= cut]
+        if scale_levels_differ(R, left, right, params):
+            return _scale_split(left, R, rank, params) + _scale_split(right, R, rank, params)
+    return [g]
+
+
+def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = None, *,
+                        links=None, metric_log=None) -> dict:
+    """The evidence rule (module docstring). Cameras of the reference seed (models[0]).
+
+    links: {(name_a, name_b): inliers} verified pairs (`read_verified_links`), or None.
+    metric_log: {name: log(z_sfm / z_metric)} or a list of such maps (every estimator must agree), or None.
+    Staged names must sort in capture order (driver.staged_name)."""
+    params = params or GateParams(rule="evidence")
+    ref = models[0]
+    names = ref.names
+    idx = ref.index()
+    M = incidence(ref)
+    C = shared_counts(M)
+    centres = ref.centres
+    supported = ref.n_obs >= params.min_obs
+    rank = np.argsort(np.argsort(np.asarray(names)))
+    maps = [] if not metric_log else (list(metric_log) if isinstance(metric_log, (list, tuple)) else [metric_log])
+    R = np.full((max(1, len(maps)), ref.n), np.nan)
+    for e, mp in enumerate(maps):
+        for nm, v in mp.items():
+            if nm in idx and v is not None and np.isfinite(v):
+                R[e, idx[nm]] = float(v)
+    have_metric = bool(maps) and bool(np.isfinite(R).any())
+    if params.require_metric and not have_metric:
+        raise ValueError("the evidence gate needs metric_log (per-camera log(z_sfm / z_metric), e.g. the harness "
+                         "TRI ratio) and should get links (read_verified_links); pass require_metric=False to run "
+                         "without scale evidence")
+    edges = []
+    if links is not None:
+        for (a, b), inl in dict(links).items():
+            ia, ib = idx.get(a), idx.get(b)
+            if ia is not None and ib is not None and ia != ib and inl >= params.min_link_inliers:
+                edges.append((ia, ib))
+    no_links = "unavailable: candidate groups = rigid groups at 3 shared points; redundancy not tested"
+    evidence = {"links": (f"{len(edges)} verified pairs >= {params.min_link_inliers} inliers" if links is not None
+                          else no_links),
+                "metric_scale": (f"{int(np.isfinite(R).any(0).sum())} cameras, {len(maps)} estimator(s)"
+                                 if have_metric else "unavailable: scale split / scale agreement not tested")}
+    labels = np.full(ref.n, -1, dtype=np.int64)
+    rounds = []
+    next_label = 0
+    for comp in _components_by_size(ref):
+        members = np.flatnonzero(ref.component == comp)
+        sup = members[supported[members]]
+        ext = extent(centres[sup]) if len(sup) >= 2 else extent(centres[members])
+        local = {int(v): k for k, v in enumerate(sup)}
+        adj = [set() for _ in range(len(sup))]
+        for a, b in edges:
+            if a in local and b in local:
+                adj[local[a]].add(local[b])
+                adj[local[b]].add(local[a])
+        if links is not None:
+            groups = [sup[g] for g in _disjoint_blocks(len(sup), biconnected_blocks(adj))]
+        else:
+            groups = rigid_groups(ref, sup, 3, C=C) if len(sup) else []
+        if have_metric:
+            groups = [part for g in groups for part in scale_split(g, R, rank, params)]
+        groups.sort(key=lambda g: (-len(g), int(g.min())))
+        pending = list(groups)
+        while pending:
+            reference = pending.pop(0)
+            kept = [reference]
+            kept_set = set(int(i) for i in reference)
+            ref_names = [names[i] for i in reference]
+            info = {}
+            for g in pending:
+                sp = group_spread(models, ref_names, [names[i] for i in g], ext, params)
+                info[int(g.min())] = {"cameras": int(len(g)), "first_camera": names[int(g.min())], **sp}
+            decisions = []
+            changed = True
+            while changed and pending:
+                changed = False
+                best, best_n = None, -1
+                for j, g in enumerate(pending):
+                    d = info[int(g.min())]
+                    gs = set(int(i) for i in g)
+                    cross = []
+                    for a, b in edges:
+                        if a in gs and b in kept_set:
+                            cross.append((local[a], local[b]))
+                        elif b in gs and a in kept_set:
+                            cross.append((local[b], local[a]))
+                    d["cross_links"] = len(cross)
+                    sp = d.get("spread")
+                    stable = sp is None or sp <= params.max_spread
+                    redundant = True if links is None else redundant_links(cross, adj)
+                    coupled = len(cross) > 0 or bool(C[list(gs)][:, sorted(kept_set)].nnz)
+                    scale_ok = True
+                    if have_metric:
+                        kept_idx = np.fromiter(kept_set, dtype=np.int64)
+                        lg, _ = _level(R[0], g)
+                        lk, _ = _level(R[0], kept_idx)
+                        if lg is not None and lk is not None:
+                            d["scale_factor"] = math.exp(lg - lk)
+                        scale_ok = scale_levels_differ(R, kept_idx, g, params) is not True
+                    d.update(stable=bool(stable), redundant=bool(redundant), scale_ok=bool(scale_ok))
+                    if stable and redundant and coupled and scale_ok and len(cross) > best_n:
+                        best, best_n = j, len(cross)
+                if best is not None:
+                    g = pending.pop(best)
+                    kept.append(g)
+                    kept_set |= set(int(i) for i in g)
+                    decisions.append({"group": int(g.min()), "kept": True, "cross_links": best_n})
+                    changed = True
+            for g in pending:
+                d = info[int(g.min())]
+                why = []
+                if not d.get("redundant", True):
+                    why.append(f"{d.get('cross_links', 0)} verified link(s) to the kept groups, not redundant")
+                if not d.get("stable", True):
+                    why.append(f"seed spread {d['spread']:.3f} > {params.max_spread}")
+                if not d.get("scale_ok", True):
+                    why.append(f"metric scale x{d.get('scale_factor', float('nan')):.2f} vs the kept groups")
+                decisions.append({"group": int(g.min()), "kept": False, "why": "; ".join(why) or "not coupled"})
+            ids = np.concatenate(kept)
+            labels[ids] = next_label
+            rounds.append({
+                "source_component": int(comp), "label": next_label,
+                "reference_group": {"cameras": int(len(reference)), "first_camera": names[int(reference.min())]},
+                "kept_groups": len(kept), "kept_cameras": int(len(ids)),
+                "extent": ext, "groups": _json_clean(info), "decisions": decisions,
+            })
+            next_label += 1
+        rest = members[~supported[members]]
+        labelled = members[labels[members] >= 0]
+        if not len(labelled):
+            labels[members] = next_label
+            next_label += 1
+            continue
+        first = _first_label_of(rounds, comp)
+        for i in rest:
+            row = C[i, labelled].toarray().ravel()
+            labels[i] = labels[labelled[int(np.argmax(row))]] if row.max() > 0 else first
+    out = _finish(ref, labels, supported, rounds, params)
+    out["evidence"] = evidence
+    return out
 
 
 def _components_by_size(model: SeedModel) -> list[int]:
