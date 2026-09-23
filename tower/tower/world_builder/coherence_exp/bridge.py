@@ -1244,6 +1244,55 @@ def restore_keyframe_graph(database_path, reference_db, *, is_keyframe=None, scr
     return {"keyframes": len(kf), "keypoints_differ": bad, "removed": removed, "added": added}
 
 
+def restrict_gap_links(database_path, chains: list[Chain], mode: str) -> dict:
+    """Ablation: which verified pairs touching a solver-only (gap) frame survive.
+
+    - ``all``: every pair (the arm as designed);
+    - ``chain_only``: only pairs whose two images both belong to that gap
+      frame's own chain (its gap frames and the context keyframes around it) --
+      removes the sequential-window and loop-detection pairs between a gap
+      frame and anything else in the walk;
+    - ``none``: no pair touching a gap frame (gap frames staged but isolated;
+      the graph is then the reference's, so the result measures what merely
+      staging extra images does to the mapper).
+    Only two-view geometries are removed; raw matches stay.
+    """
+    if mode not in ("all", "chain_only", "none"):
+        raise ValueError(f"unknown gap_links mode {mode!r}")
+    if mode == "all":
+        return {"mode": mode, "removed": 0}
+    import sqlite3
+
+    members: dict[str, set] = defaultdict(set)
+    for c in chains:
+        cs = set(c.names)
+        for n in c.names:
+            if n.endswith(f"_{KIND_GAP}.jpg"):
+                members[n] |= cs
+    con = sqlite3.connect(str(database_path))
+    try:
+        names = dict(con.execute("select image_id, name from images"))
+        kill = []
+        for (pid,) in con.execute("select pair_id from two_view_geometries").fetchall():
+            b = pid % COLMAP_PAIR_BASE
+            a = (pid - b) // COLMAP_PAIR_BASE
+            na, nb = names.get(a, ""), names.get(b, "")
+            ga, gb = na.endswith(f"_{KIND_GAP}.jpg"), nb.endswith(f"_{KIND_GAP}.jpg")
+            if not (ga or gb):
+                continue
+            if mode == "none":
+                kill.append((pid,))
+                continue
+            ok = (not ga or nb in members[na]) and (not gb or na in members[nb])
+            if not ok:
+                kill.append((pid,))
+        con.executemany("delete from two_view_geometries where pair_id=?", kill)
+        con.commit()
+    finally:
+        con.close()
+    return {"mode": mode, "removed": len(kill)}
+
+
 def received_at_by_name(frames_csv) -> dict:
     """staged name (both kinds) -> receipt time, from a labelled frame table."""
     import pandas as pd
@@ -1311,7 +1360,8 @@ def workspace_mask_reader(workspace) -> Callable[[str], np.ndarray | None]:
 def augment_hook(database_path, name_to_image_id, images_dir, workspace, *, chains_path, eloftr_cache=None,
                  cycle_bound_deg: float = DEFAULT_CYCLE_BOUND_DEG, quant_px: float = DEFAULT_QUANT_PX,
                  max_skip: int = 2, use_workspace_masks: bool = True, report_name: str = "bridge_report.json",
-                 report_copy=None, gap_consensus: bool = False, frames_csv=None, reference_db=None) -> dict:
+                 report_copy=None, gap_consensus: bool = False, frames_csv=None, reference_db=None,
+                 gap_links: str = "all") -> dict:
     """``VariantConfig.augment`` entry point (``coherence_exp.bridge:augment_hook``).
 
     Reads the chains (`save_chains`) and the precomputed ELoFTR correspondences
@@ -1332,12 +1382,14 @@ def augment_hook(database_path, name_to_image_id, images_dir, workspace, *, chai
         rat = received_at_by_name(frames_csv) if frames_csv else {}
         rep["gap_consensus"] = gap_link_consensus(database_path, lambda n: n.endswith(f"_{KIND_GAP}.jpg"), rat,
                                                   cycle_bound_deg=float(cycle_bound_deg))
+    rep["gap_links"] = restrict_gap_links(database_path, chains, gap_links)
     rep["seconds"] = round(time.perf_counter() - t0, 2)
     rep["masks_used"] = mask_for is not None
     rep["keyframe_graph_restored"] = restored
     rep["summary"] = summarize_bridging(rep)
     if restored is not None:
         rep["summary"]["keyframe_graph_restored"] = restored
+    rep["summary"]["gap_links"] = rep["gap_links"]
     if gap_consensus:
         gc = rep["gap_consensus"]
         rep["summary"]["gap_consensus"] = {k: gc[k] for k in ("gap_pairs", "kept", "refused", "refused_by_reason")}

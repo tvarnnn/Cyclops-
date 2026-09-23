@@ -326,3 +326,27 @@ def test_quantiser_absorbs_integer_truncation():
     qb.set_base(1, 0)
     assert np.array_equal(qa.indices(1, xy), qb.indices(1, np.floor(xy)))
     assert np.array_equal(qa.new_keypoints(1), qb.new_keypoints(1))
+
+
+def test_restrict_gap_links_keeps_chain_pairs_and_drops_the_rest(tmp_path):
+    import pycolmap
+
+    db_path = tmp_path / "database.db"
+    ids, names, chain, eloftr, _ = _synthetic_database(db_path)
+    B.bridge_augment(db_path, ids, [chain], eloftr, cycle_bound_deg=2.0)
+    db = pycolmap.Database.open(str(db_path))
+    far = db.write_image(pycolmap.Image(name="000900_k.jpg", camera_id=1))
+    db.write_keypoints(far, db.read_keypoints(ids[names[0]]))
+    g = db.read_two_view_geometry(ids[names[0]], ids[names[1]])
+    db.write_two_view_geometry(far, ids[names[1]], g)                 # a far keyframe <-> gap frame pair
+    db.close()
+    import shutil
+    shutil.copyfile(db_path, tmp_path / "copy.db")
+    assert B.restrict_gap_links(db_path, [chain], "chain_only") == {"mode": "chain_only", "removed": 1}
+    assert B.restrict_gap_links(tmp_path / "copy.db", [chain], "none")["removed"] == 4
+    db = pycolmap.Database.open(str(db_path))
+    try:
+        assert db.exists_two_view_geometry(ids[names[0]], ids[names[1]])
+        assert not db.exists_two_view_geometry(far, ids[names[1]])
+    finally:
+        db.close()
