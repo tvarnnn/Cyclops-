@@ -195,3 +195,14 @@ def test_only_links_the_solve_honours_are_evidence():
     with pytest.raises(ValueError, match="link_rotations"):
         G.apply_rigid_gate(models, G.GateParams(rule="evidence", min_obs=5, max_link_disagreement_deg=25.0),
                            links=links, metric_log=level)
+
+
+def test_attach_groups_false_keeps_only_the_anchor():
+    """The masks-unavailable fail-safe (manager 011): no group is attached to a component's anchor block."""
+    links = ladder_links(cross=[(29, 30, 50), (28, 30, 50)])
+    models = [two_islands(s, shared_between=60, noise=0.001) for s in range(3)]
+    level = metric(4.0, 4.0)
+    for attach, n_groups in ((True, 1), (False, 2)):
+        gp = G.GateParams(rule="evidence", min_obs=5, attach_groups=attach)
+        out = G.apply_rigid_gate(models, gp, links=links, metric_log=level)
+        assert len(set(out["labels"].values())) == n_groups, attach

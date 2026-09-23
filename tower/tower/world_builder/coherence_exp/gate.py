@@ -152,7 +152,19 @@ class GateParams:
     # solve contradicts by 34-96 deg. The bound is the CONTROL's: p95 of link-vs-solve disagreement over all
     # b2a75ab4 links, 25.2 deg (p90 16.8). GT's 24 cases, masked arms: 6839 7 -> 0 misplaced attached, control
     # and target unchanged (RUN/experiments/P2-LM/gatefix/gt_agree.txt).
+    # THE PRODUCT VALUE IS 16.8, THE CONTROL'S p90, CHOSEN DELIBERATELY (manager 011): p90 and p95 were both
+    # derived from the control alone and both declared before any result; the costs are asymmetric -- a false
+    # attachment is confidently wrong geometry, a false split is coverage shown honestly as an area -- so the
+    # stricter of the two is the default. Masked arms at 16.8: 30 -> 24 misplaced attached, 0 correct split.
     max_link_disagreement_deg: float | None = None
+    # evidence rule: False = attach NO group to a component's anchor block: everything outside the anchor is
+    # left unplaced. The fail-safe when the transient masks are unavailable (manager 011): without masks,
+    # dropping the seed-stability test costs 103 -> 131 misplaced and 10 -> 93 scale-misplaced keyframes on
+    # GT's unmasked arms, so no group may be attached on evidence that masks would have cleaned. Measured on
+    # the unmasked arms with honoured links (16.8): misplaced attached 16, scale-misplaced 0, correct keyframes
+    # split 134 (vs 16 / 82 / 117 attaching, and 103 / 10 / 45 for the rule with its stability test) --
+    # RUN/experiments/P2-LM/gatefix/gt_noattach.txt.
+    attach_groups: bool = True
     # evidence rule: a metric scale step / mismatch beyond this factor splits
     # (harness PLAUSIBILITY scale_max_factor: MoGe's per-image error is a few
     # %, region bias ~10 %; x1.25 is a reconstruction error, not noise).
@@ -786,7 +798,7 @@ def apply_evidence_gate(models: list[SeedModel], params: GateParams | None = Non
                         scale_ok = differ is False if params.require_group_scale else differ is not True
                         d["scale_measured"] = differ is not None
                     d.update(stable=bool(stable), redundant=bool(redundant), scale_ok=bool(scale_ok))
-                    if stable and redundant and coupled and scale_ok and len(cross) > best_n:
+                    if params.attach_groups and stable and redundant and coupled and scale_ok and len(cross) > best_n:
                         best, best_n = j, len(cross)
                 if best is not None:
                     g = pending.pop(best)

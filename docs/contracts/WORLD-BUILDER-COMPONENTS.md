@@ -77,11 +77,21 @@ placed whatever its level, so the link reasons come first.
 
 | `reason` | The gate decision it reports (`coherence_exp/gate.py`, `rule="evidence"`) | Seen on |
 |---|---|---|
+| `masks-unavailable` | The final solve ran **without** its hand/arm/held-phone masks (detector unavailable, model load failure, GPU out of memory, CPU fallback — recorded as `transients.state` in the solve manifest, §2.5). Masks are a hard dependency of the gate (manager 011): without them the gate attaches **no** piece to the room, so every piece outside the room's anchor block carries this reason and no other. Measured fail-safe on GT's unmasked arms: misplaced keyframes left attached 103 → 16, scale-misplaced 10 → 0, at a coverage cost of 134 correct keyframes shown as areas (lane `experiments/P2-LM/gatefix/gt_noattach.txt`) | forced in tests; no walk yet |
 | `solved-separately` | The solver itself returned this piece as a separate model, so the gate never tested it against the room. For such a piece this is the **only** reason: refusals inside another solver model are relative to that model, not to the room, and are not reported | target, arm A1: the solver separates the closet (V4a) |
 | `no-verified-link` | In the room's solver model, but no verified image pair (≥ `min_link_inliers`, 15 inliers, COLMAP's floor) links it to the room — "not coupled", or `cross_links == 0` | no case checked by name in this run |
 | `single-unconfirmed-link` | It has verified links to the room, but they are **one point of failure**: a single pair, or several pairs through one image whose other ends are not themselves linked (no closed triangle) — `redundant_links()` false with ≥ 1 link | target bathroom: one non-redundant link; 991e5a15 kf 13–25: one floor-level pair, 55° off in image-only roll |
 | `scale-mismatch` | Its metric level (per-camera MoGe TRI ratio, median over ≥ 10 cameras on each side) differs from the room's by more than ×1.25 — including a part the gate split off its own group at an internal scale step | target bathroom: ×4.27 |
 | `link-contradicted` | It has verified links to the room, but the solve **contradicts** them: each pair's own two-view rotation disagrees with the solve's relative rotation by more than the control-measured bound (`max_link_disagreement_deg`, the control's p90 of link-vs-solve disagreement, 16.8°), so they are not evidence that it was placed right. Reported when setting those links aside is what left the piece without redundant links; otherwise the link reason above applies | 6839fb8f kf 92–98: four UNCALIBRATED 15–18-inlier links, contradicted by 34–96° (precondition b, lane `9ffe043`) |
+
+**Why τ is the control's p90 (16.8°), not its p95 (25.2°).** Both were
+derived from the known-good control alone and both were declared before any
+result was seen. The product's costs are asymmetric: a false attachment is
+confidently wrong geometry, the failure this whole change exists to remove; a
+false split costs coverage, and is shown honestly as an area. So the stricter of
+the two pre-declared values is the default (manager 011). It is a named
+parameter, `max_link_disagreement_deg`, recorded in the gate's params digest
+and in the solve manifest, so a physical test or a later world can audit it.
 
 **Not reasons, deliberately.** `seed-unstable`: the seed-stability test is
 dropped from the product gate (its 0.075 threshold was set by the target alone,
@@ -144,6 +154,18 @@ recomputes it from `keyframes` or `capture_spans_s`.
    the generic unplaced copy. An unknown `shown_as` is treated as `none`. A
    list in which the phone finds no `placed` entry it understands is treated
    as `null` — the phone behaves as today.
+
+### 2.5 What the solve manifest records (Tower-side, for audit)
+
+Not on the wire to the phone; written with the published solve so a later
+reader, the physical test or the harness can tell what produced `components`:
+
+| Key | Meaning |
+|---|---|
+| `transients.state` | `applied` (every solver image masked), `partial` (some images unmasked; counts given), or `unavailable` (with `detail`: detector unavailable, model load failure, GPU out of memory, CPU fallback). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable` |
+| `transients.rule` | the mask rule's id (the same union rule the surface stage uses) |
+| `gate.params` | the gate's parameters, including `max_link_disagreement_deg` (16.8) and `attach_groups`, and their digest |
+| `solve.seed`, `solve.threads` | the seeded single-thread solve that produced the model |
 
 ## 3. Where `components` appears
 
