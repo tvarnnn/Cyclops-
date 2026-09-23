@@ -20,7 +20,11 @@ import logging
 import math
 import os
 
-from tower.world_builder.records import FINAL_SOLVE_SOLVED, FINALIZATION_COMPLETE
+from tower.world_builder.records import (
+    FINAL_SOLVE_SOLVED,
+    FINALIZATION_COMPLETE,
+    FINALIZATION_PENDING,
+)
 # The settled photographic vocabulary, at module scope for the same reason
 # `results/world_builder.py` imports it at module scope: `photographic`
 # pulls in nothing but `records`, which this module already imports on the
@@ -59,6 +63,34 @@ def _world_is_live(store: WorldStore, world_id: str) -> bool:
         holder is not None
         and holder["alive"]
         and holder["pid"] != os.getpid()
+    )
+
+
+def lock_speaks_for(session) -> bool:
+    """Whether the WORLD's writer lock is evidence about THIS session.
+
+    The lock is per world; a session is written by at most one holder, and
+    only while its record is open or its finalization is still pending.
+    Outside that window the lock belongs to somebody else's work -- a walk
+    into a new session of the same world, or the recovery finisher on a
+    sibling session -- and reading it as this session's "finalizing" told the
+    wearer a finished, or historical, walk was being improved (review,
+    2026-09-23: with the finisher now running at every idle moment, that was
+    six to sixteen minutes of false "Improving" on each sibling). The same
+    rule `world_builder_render.session_build_running` already applies.
+
+    A session with NO finalization record keeps the lock as its evidence: a
+    builder that writes none (the pre-2026-09-06 builder, a replay) holds the
+    lock through its finalization and has nothing else to show it. The lock
+    is set aside only where the session's own record says its finalization
+    SETTLED -- `complete` or `interrupted` -- because then the lock is
+    somebody else's.
+    """
+    finalization = getattr(session, "finalization", None)
+    return (
+        getattr(session, "ended_at", None) is None
+        or not finalization
+        or finalization.get("state") == FINALIZATION_PENDING
     )
 
 
@@ -367,7 +399,7 @@ def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
         # the status producer. `running`, `owed` and `unobservable` are the
         # three words in it and none of them is a world a wearer can be told
         # is finished: one has a process on it now, one is waiting for the
-        # Tower's next start to finish it, and one is a question nobody
+        # Tower's next idle moment to finish it, and one is a question nobody
         # could answer. Before this, all three read `complete` here.
         return SESSION_FINALIZING
     # `failed` DELIBERATELY FALLS THROUGH TO THE SETTLED ARMS, and this is
@@ -668,7 +700,8 @@ def build_world_listing(store: WorldStore) -> dict:
                 # interrupted | unbuilt.
                 "state": session_state(
                     session,
-                    live=live,
+                    # The world's lock, only where it speaks for THIS session.
+                    live=live and lock_speaks_for(session),
                     has_geometry=has_geometry,
                     manifest=manifest,
                     # ASKED ONLY WHERE IT CAN CHANGE THE ANSWER. `live` and

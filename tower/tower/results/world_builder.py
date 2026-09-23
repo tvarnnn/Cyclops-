@@ -40,7 +40,7 @@ from pathlib import Path
 
 from tower.logging_config import client_safe_reason
 from tower.results.contracts import TIME_BASIS
-from tower.results.world_builder_library import _sortable
+from tower.results.world_builder_library import _sortable, lock_speaks_for
 from tower.storage import read_json_closed, read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
 from tower.world_builder.records import FINAL_SOLVE_SOLVED, format_distance
@@ -825,7 +825,10 @@ class WorldBuilderStatusProducer:
             else None
         )
         lifecycle = _lifecycle(
-            holder=holder,
+            # The WORLD's lock, only where it speaks for THIS session: a
+            # finisher or a new walk holding it says nothing about a sibling
+            # whose record is closed (`world_builder_library.lock_speaks_for`).
+            holder=holder if lock_speaks_for(session) else None,
             stopped=stopped,
             session=session,
             # The files the phone opens, for THIS session -- not the
@@ -1613,8 +1616,8 @@ def _still_building(base: dict, building: str | None,
                 # promise attached to it was the part that was not.
                 "this world does not have the photographic representation it "
                 "is owed yet: " + owed_reason + ". A Tower with the "
-                "photographic stages enabled finishes owed work at its next "
-                "start; one that has them switched off will not, and this "
+                "photographic stages enabled finishes owed work the next time "
+                "it is idle; one that has them switched off will not, and this "
                 "world then stays as it is until somebody runs "
                 "scripts/world_finish_pending.py by hand"
                 if photo_state == PHOTOGRAPHIC_OWED else

@@ -143,11 +143,19 @@ TIER_TOWER = "tower"
 
 
 class AppearanceUnavailable(RuntimeError):
-    """The appearance cannot be built for this session, and why."""
+    """The appearance cannot be built for this session, and why.
 
-    def __init__(self, reason: str) -> None:
+    `retryable` separates the refusals that say something about THIS MOMENT
+    -- another build of the session holds its lock, the redaction label moved
+    under the build -- from the ones that say something about the session or
+    the host and will say it again. The first kind is recorded as an
+    interrupted stage and finished later; the second is a failed build.
+    """
+
+    def __init__(self, reason: str, *, retryable: bool = False) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)

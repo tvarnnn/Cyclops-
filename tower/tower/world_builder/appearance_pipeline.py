@@ -95,6 +95,9 @@ class AppearanceResult:
     chunks: int = 0
     bytes: int = 0
     seconds: dict = field(default_factory=dict)
+    # `unavailable` because of the moment, not the session: see
+    # `appearance.AppearanceUnavailable`. The caller records it as interrupted.
+    retryable: bool = False
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -230,7 +233,7 @@ def build_appearance(store, world_id: str, session_id: str, *,
     if not lock.acquire():
         detail = "another appearance build of this session is already running"
         logger.info("[Tower][WorldBuilder][appearance] %s/%s: %s", world_id, session_id, detail)
-        return AppearanceResult(state=STATE_UNAVAILABLE, detail=detail)
+        return AppearanceResult(state=STATE_UNAVAILABLE, detail=detail, retryable=True)
     try:
         _sweep_unnamed(root)
         return _build(store, world_id, session_id, root, params, should_stop, progress,
@@ -239,7 +242,8 @@ def build_appearance(store, world_id: str, session_id: str, *,
         logger.warning("[Tower][WorldBuilder][appearance] %s/%s not built: %s",
                        world_id, session_id, exc.reason)
         _status(root, state=STATE_UNAVAILABLE, detail=exc.reason)
-        return AppearanceResult(state=STATE_UNAVAILABLE, detail=exc.reason)
+        return AppearanceResult(state=STATE_UNAVAILABLE, detail=exc.reason,
+                                retryable=getattr(exc, "retryable", False))
     except Exception as exc:  # noqa: BLE001 -- recorded, never swallowed silently
         logger.exception("[Tower][WorldBuilder][appearance] %s/%s failed", world_id, session_id)
         _status(root, state=STATE_FAILED, detail=str(exc))
@@ -623,7 +627,8 @@ def _build(store, world_id, session_id, root, params, should_stop, progress, for
         raise A.AppearanceUnavailable(
             f"the session's redaction label changed during the build "
             f"({policy.session_redaction!r} -> {now_label!r}, keyframe set "
-            f"{built_set!r} -> {now_set!r}); not published")
+            f"{built_set!r} -> {now_set!r}); not published",
+            retryable=True)
     if _stopped(should_stop):
         return _stop(root, STAGE_ENCODE, seconds, discard=(root, written))
 

@@ -1867,11 +1867,19 @@ class TestTheFinalChain:
 
     def test_each_stage_is_recorded_running_and_then_with_its_outcome(
             self, tmp_path, calls):
+        """The appearance's `running` comes BEFORE the surface's `ok`.
+
+        CHANGED ON 2026-09-23. The other order left one record write in which
+        the session said `{surface: ok}` and nothing about the appearance --
+        finished, to every reader, and "Saved" on the phone -- and a builder
+        that died right there left a grey mesh saying "Saved" for ever, which
+        the recovery finisher would never select (two independent reviewers).
+        """
         self._run(tmp_path, calls)
         assert calls["recorded"] == [
             ("surface", "running", True, None),
-            ("surface", "ok", True, None),
             ("appearance", "running", True, None),
+            ("surface", "ok", True, None),
             ("appearance", "ok", True, None),
         ]
 
@@ -1909,7 +1917,8 @@ class TestTheFinalChain:
         monkeypatch.setattr(appearance_pipeline, "build_appearance", boom)
         with pytest.raises(ValueError, match="no redactor"):
             self._run(tmp_path, calls)
-        assert calls["recorded"][1] == ("surface", "ok", True, None)
+        assert calls["recorded"][1] == ("appearance", "running", True, None)
+        assert calls["recorded"][2] == ("surface", "ok", True, None)
         assert calls["recorded"][3] == (
             "appearance", "failed", True, "ValueError: no redactor")
 
@@ -1933,11 +1942,22 @@ class TestTheFinalChain:
         assert [r[:3] for r in calls["recorded"]] == [
             ("surface", "unavailable", False), ("appearance", "unavailable", False)]
 
-    def test_an_unwanted_appearance_is_not_recorded_at_all(self, tmp_path, calls):
-        """`--appearance` off: `main` records that separately, once, rather
-        than this function claiming an outcome for a stage it was not given."""
+    def test_an_unwanted_appearance_is_recorded_as_not_requested(self, tmp_path, calls):
+        """`--appearance` off: recorded HERE, first, as not requested.
+
+        CHANGED ON 2026-09-23. It used to be recorded by `main`, after this
+        returned -- so the recovery finisher, which calls this with
+        `appearance=False` on a Tower whose appearance is off, never wrote it,
+        and an appearance left `stopped` by an earlier Tower stayed `stopped`
+        through every rebuilt surface: owed for ever, the surface rebuilt until
+        the attempt bound retired it (review)."""
         self._run(tmp_path, calls, appearance=False)
-        assert [r[0] for r in calls["recorded"]] == ["surface", "surface"]
+        assert [r[:3] for r in calls["recorded"]] == [
+            ("appearance", "unavailable", False),
+            ("surface", "running", True),
+            ("surface", "ok", True),
+        ]
+        assert calls["recorded"][0][3] == "not requested (--appearance was not passed)"
 
     def test_the_recorder_is_optional(self, tmp_path, calls):
         """Every existing caller passes no recorder and must be unchanged."""

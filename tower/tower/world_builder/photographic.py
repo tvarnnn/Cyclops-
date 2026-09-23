@@ -101,7 +101,8 @@ PHOTOGRAPHIC_COMPLETE = "complete"
 # A process is working on it right now, on evidence of a live pid.
 PHOTOGRAPHIC_RUNNING = "running"
 # It is unfinished and nothing is working on it. Recoverable: this is what
-# `scripts/world_finish_pending.py` picks up at the next Tower start.
+# `scripts/world_finish_pending.py` picks up the next time the Tower is
+# idle -- no stream open, no capture worker alive -- and at every start.
 PHOTOGRAPHIC_OWED = "owed"
 # A stage ran and failed. NOT recoverable by simply waiting -- the wearer
 # should be told, because waiting is what they would otherwise do.
@@ -143,6 +144,27 @@ _INTERRUPTED_RECORD_STATES = (STAGE_STATE_RUNNING, STAGE_STATE_STOPPED)
 
 class _Unobservable(Exception):
     """A probe could not answer. Carries the sentence a client may read."""
+
+
+# WHY A PROBE FAILED, IN THE LOG, ONCE PER DISTINCT REASON. `unobservable`
+# holds a world on "Finishing" for as long as the probe keeps failing, and
+# the block a client sees carries only the exception's type -- so without
+# this the only evidence of WHY was in no log at all (review, 2026-09-23).
+# Bounded like `results.world_builder._warn_probe_failure`, which this
+# module cannot import: a 2 Hz poll must not become a log flood or a leak.
+_UNOBSERVABLE_SEEN: set = set()
+
+
+def _warn_unobservable(message: str, exc: BaseException | None) -> None:
+    if message in _UNOBSERVABLE_SEEN:
+        logger.debug(message, exc_info=exc)
+        return
+    if len(_UNOBSERVABLE_SEEN) < 64:
+        _UNOBSERVABLE_SEEN.add(message)
+    logger.warning(
+        "[Tower][WorldBuilder] photographic state unobservable: %s", message,
+        exc_info=exc,
+    )
 
 
 def _stage_entry(session, stage):
@@ -238,9 +260,6 @@ def _interrupted_stage_on_disk(store, world_id, session_id):
     directory, and it was the interrupted one.
     """
     from tower.storage import read_json_closed  # noqa: PLC0415
-    from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
-        status_is_stale,
-    )
 
     world_dir = store.world_dir(world_id)
     for stage in PHOTOGRAPHIC_STAGES:
@@ -254,8 +273,19 @@ def _interrupted_stage_on_disk(store, world_id, session_id):
         state = status.get("state")
         if state == STAGE_STATE_STOPPED:
             return stage
-        if state == STAGE_STATE_RUNNING and status_is_stale(status):
-            return stage
+        if state == STAGE_STATE_RUNNING:
+            # Imported ONLY when there is a `running` status to judge. At the
+            # top of this function, a `surface_pipeline` that failed to import
+            # -- it has happened, when another lane broke `surface.py` at
+            # import -- turned EVERY historical world `unobservable`, which is
+            # "Finishing" on the phone, with no log line (review, 2026-09-23).
+            # The historical world has no status file and never reaches here.
+            from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+                status_is_stale,
+            )
+
+            if status_is_stale(status):
+                return stage
     return None
 
 
@@ -283,6 +313,7 @@ def _liveness(store, world_id, session_id, stage_hint):
         # photographic stage. "Nothing is running" would be the T4 claim,
         # asserted on no evidence, and it is the one answer that renders as
         # "Saved".
+        _warn_unobservable(f"{world_id}/{session_id}: {exc}", exc.__cause__ or exc)
         return {
             "state": PHOTOGRAPHIC_UNOBSERVABLE,
             "stage": stage_hint,
@@ -440,6 +471,9 @@ def photographic_state(store, world_id: str, session_id: str, session) -> dict:
     try:
         stage = _interrupted_stage_on_disk(store, world_id, session_id)
     except Exception as exc:  # noqa: BLE001
+        _warn_unobservable(
+            f"{world_id}/{session_id}: the photographic stage artifacts could "
+            f"not be read: {type(exc).__name__}", exc)
         return {
             "state": PHOTOGRAPHIC_UNOBSERVABLE,
             "stage": None,

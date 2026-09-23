@@ -2403,9 +2403,16 @@ class TestABootFaultThatIsNotAnAbsence:
             "only with layers in hand: it can never un-hide an empty page")
         assert "if (bootFailed) reopenAfterBootFailure();" in poll
         assert poll.index("reopenAfterBootFailure();") < poll.index("await finishOpening();")
-        # the context-restore failure is NOT a boot failure and stays terminal
+        # A context-restore failure is followable ONLY after the GL side came
+        # back (review, 2026-09-23): a `buildGL()` that throws stays terminal,
+        # and a data-path fault after it keeps the poller and forgets the
+        # revision so the next answer is a `load` rather than "unchanged".
         restored = _section(text, 'canvas.addEventListener("webglcontextrestored"', "/* -------- input")
-        assert "fail(" in restored and "bootFailed" not in restored
+        assert "fail(" in restored
+        assert restored.index("buildGL();") < restored.index("rebuilt = true;") < (
+            restored.index("await loadRevision(S.revision);"))
+        assert "if (rebuilt){ bootFailed = true; S.revision = null; }" in restored
+        assert restored.index("fail(") < restored.index("if (rebuilt){ bootFailed = true;")
 
     def test_a_failed_boot_keeps_asking_and_loads_the_build_when_it_comes(self):
         """Under node: the faults change nothing and back off to the existing

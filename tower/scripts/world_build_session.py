@@ -1423,6 +1423,16 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
     report: dict = {}
     record = record or (lambda *a, **kw: None)
 
+    if not appearance:
+        # NOT REQUESTED IS A FACT, written HERE rather than by the builder
+        # after this returns, so the recovery finisher -- which calls this with
+        # `appearance=False` on a Tower whose appearance is switched off --
+        # writes it too. Without it an appearance left `stopped` by an earlier
+        # Tower stayed `stopped` through every rebuilt surface: owed for ever,
+        # rebuilt until the attempt bound retired a perfectly good surface.
+        record(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
+               detail="not requested (--appearance was not passed)")
+
     def _skip(reason: str, state: str) -> dict:
         """Neither stage ran. Both say why, rather than the appearance being
         absent and indistinguishable from a Tower that never recorded it."""
@@ -1473,6 +1483,17 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
             record(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
                    detail="the surface stage raised; there was nothing to shade")
         raise
+    # THE APPEARANCE IS OWED FROM THIS INSTANT, and it is written down BEFORE
+    # the surface's `ok`. The other order left a moment -- two record writes
+    # and the appearance modules' cold import -- in which the record said
+    # `{surface: ok}` and nothing about the appearance: a finished world to
+    # every reader, "Saved" on the phone, and, if the process died right
+    # there, a grey mesh that said "Saved" for ever and that the recovery
+    # finisher would never select (two independent reviewers, 2026-09-23).
+    # Written first, a death anywhere from here leaves `running` under a pid
+    # that is gone, which is exactly the signature the finisher recovers.
+    if appearance and surface_result.state == "ok":
+        record(STAGE_APPEARANCE, state=STAGE_STATE_RUNNING)
     # `detail` on the session record is for a reader asking WHY, and on a
     # successful build the pipeline's `detail` is its entire report -- about
     # ten kilobytes of JSON-inside-a-string, already written verbatim to
@@ -1505,7 +1526,7 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                 build_appearance,
             )
 
-            record(STAGE_APPEARANCE, state=STAGE_STATE_RUNNING)
+            # `running` was recorded above, before the surface's `ok`.
             try:
                 appearance_result = build_appearance(
                     store, world_id, session_id, params=AppearanceParams(),
@@ -1514,10 +1535,24 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
             except BaseException:
                 _record_raise(record, STAGE_APPEARANCE)
                 raise
-            record(STAGE_APPEARANCE, state=appearance_result.state,
-                   detail=_terminal_detail(appearance_result))
+            if (appearance_result.state == STAGE_STATE_UNAVAILABLE
+                    and getattr(appearance_result, "retryable", False)):
+                # A refusal about the MOMENT -- another build holding the
+                # session's lock, the redaction label moving under the build
+                # -- is an interrupted stage, not a failed one. Recorded
+                # `unavailable` with `attempted`, it read as a photographic
+                # build that FAILED: terminal, never retried, "Saved" on the
+                # phone over a grey mesh. `stopped` is picked up again by the
+                # recovery finisher and is bounded by its attempt ledger.
+                record(STAGE_APPEARANCE, state=STAGE_STATE_STOPPED,
+                       detail=f"{appearance_result.detail}; not a failure of "
+                              "the build -- it is tried again")
+                appearance_interrupted = True
+            else:
+                record(STAGE_APPEARANCE, state=appearance_result.state,
+                       detail=_terminal_detail(appearance_result))
+                appearance_interrupted = appearance_result.state == "stopped"
             report["appearance"] = {"attempted": True, **appearance_result.as_dict()}
-            appearance_interrupted = appearance_result.state == "stopped"
             appearance_built = appearance_result.state == "ok"
     # Decided by what the appearance REPORTED as well as by asking again: a
     # stop predicate need not stay true once the stage it stopped has returned
@@ -2444,10 +2479,8 @@ def main(argv=None) -> int:
         for stage in (STAGE_SURFACE, STAGE_APPEARANCE):
             record_stage(stage, state=STAGE_STATE_UNAVAILABLE, attempted=False,
                          detail="not requested (--surface was not passed)")
-    if args.surface and not args.appearance:
-        record_stage(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE,
-                     attempted=False,
-                     detail="not requested (--appearance was not passed)")
+    # `--surface` without `--appearance` is recorded by `final_surface_stages`
+    # itself, so the recovery finisher records it too.
 
     # Dense reconstruction last (after the surface, which shares its depth
     # stage), because it is the most expensive thing here

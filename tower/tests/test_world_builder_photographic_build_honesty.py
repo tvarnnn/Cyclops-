@@ -48,6 +48,7 @@ from tower.world_builder.events import WorldEvent
 from tower.world_builder.records import (
     FINAL_SOLVE_SOLVED,
     FINALIZATION_COMPLETE,
+    FINALIZATION_PENDING,
     Session,
 )
 
@@ -378,10 +379,20 @@ def test_a_dead_lock_over_a_running_stage_still_says_wait(derived_world):
     """A lock naming a dead pid AND a live surface: the builder died and the
     surface stage was run since. `interrupted` renders as "Needs retry", which
     invites the wearer to redo the walk -- and the retry is what kills the
-    build that is running. The present-tense fact wins, and the dead lock is
-    still in the evidence."""
+    build that is running. The present-tense fact wins.
+
+    CHANGED ON 2026-09-23. The dead lock is evidence only about a session it
+    could have been writing -- one still open, or with its finalization
+    pending (`world_builder_library.lock_speaks_for`). Over a session whose
+    finalization COMPLETED it said "the process finalizing this world exited
+    before it finished", which the record contradicts, and it said it on the
+    panel while the Saved Worlds row said `complete` for the same session (a
+    reviewer's finding). Here the finalization is pending, so the lock speaks.
+    """
     store, world_id, session_id = derived_world
-    _finalized(store, world_id, session_id)
+    _finalized(store, world_id, session_id, finalization={
+        **_COMPLETE_SOLVED, "state": FINALIZATION_PENDING,
+    })
     store.lock_path(world_id).write_text(
         json.dumps({"pid": _dead_pid()}), encoding="utf-8"
     )
@@ -394,6 +405,24 @@ def test_a_dead_lock_over_a_running_stage_still_says_wait(derived_world):
     assert lifecycle["state"] == LIFECYCLE_FINALIZING
     assert lifecycle["build_in_progress"] is True
     assert "no longer running" in lifecycle["evidence"], lifecycle["evidence"]
+
+
+def test_a_dead_lock_says_nothing_about_a_finished_session(derived_world):
+    """The other half: finalization complete, a dead lock left behind."""
+    store, world_id, session_id = derived_world
+    _finalized(store, world_id, session_id)
+    before, _ = _lifecycle_of(store, world_id, session_id)
+    store.lock_path(world_id).write_text(
+        json.dumps({"pid": _dead_pid()}), encoding="utf-8"
+    )
+    after, _ = _lifecycle_of(store, world_id, session_id)
+    assert after["state"] == before["state"]
+
+    _write_status(store, world_id, session_id, "surface",
+                  state="running", pid=os.getpid(), updated_at=time.time())
+    lifecycle, _ = _lifecycle_of(store, world_id, session_id)
+    assert lifecycle["state"] == LIFECYCLE_FINALIZING
+    assert lifecycle["build_in_progress"] is True
 
 
 # -- M5: a status that cannot go stale must still be bounded ----------------

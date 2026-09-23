@@ -2541,11 +2541,12 @@ async function main(){
      is not shown; the wearer's only escape was noticing the toolbar Reload.
 
      So the error stays on screen, `fail()` still runs, and the follower is
-     started anyway with this flag set. It is set at EXACTLY ONE PLACE (the
-     boot catch, and only once `glReady` says the page could draw at all) and
-     cleared the instant a build opens, so it cannot keep a page alive that
-     fails LATER for a reason nothing can follow: a lost context that would not
-     come back still ends the page, as before. */
+     started anyway with this flag set. It is set at EXACTLY TWO PLACES, each
+     only once the GL side is known good: the boot catch, behind `glReady`,
+     and the context-restore catch, behind a `buildGL()` that succeeded
+     (2026-09-23). It is cleared the instant a build opens, so it cannot keep
+     a page alive that fails LATER for a reason nothing can follow: a lost
+     context that would not come back still ends the page, as before. */
   let bootFailed = false;
   /* Undo what `fail()` did to the DOM, so a build that arrives after a failed
      boot can actually be shown: `fail` hides the canvas, the bar and the
@@ -4236,8 +4237,15 @@ async function main(){
     manifest = null;
     layers.length = 0;
     serial(async () => {
+      // Whether the GL side came back. After it has, a fault in placing the
+      // imagery is the data path -- a fetch that failed, a chunk that did not
+      // decode -- and exactly as followable as the same fault at boot
+      // (review, 2026-09-23: this used to end the page, and with it the only
+      // poller; the revision had not changed, so nothing would ever reload it).
+      let rebuilt = false;
       try {
         buildGL();
+        rebuilt = true;
         await loadRevision(S.revision);
         if (S.phase !== "withdrawn") $("msg").classList.remove("on");
         restoreSettled();
@@ -4250,7 +4258,12 @@ async function main(){
           restoreSettled();
           return;
         }
-        fail("The graphics context came back but the images could not be placed again: " + e.message);
+        fail("The graphics context came back but the images could not be placed again: " + e.message
+             + (rebuilt ? " This view will try again on its own." : ""));
+        // A context that would not rebuild stays terminal; one that did is
+        // followed. The revision is forgotten so the next answer the follower
+        // gets is a `load`, not "unchanged".
+        if (rebuilt){ bootFailed = true; S.revision = null; }
         restoreSettled();
       }
     });
