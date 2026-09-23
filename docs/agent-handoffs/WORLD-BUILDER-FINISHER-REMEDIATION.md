@@ -1,5 +1,21 @@
 # The finisher that never finished, and the three false "Saved"s
 
+> **CORRECTED 2026-09-23 — read `WORLD-BUILDER-FINISHER-ROOT-CAUSE.md` first.**
+>
+> §1's mechanism is wrong. The stall was not a loader-lock race: the stop
+> watcher's parked `os.read(0, 1)` held descriptor 0, and any library that
+> touches descriptor 0 at load waited for it. It reproduces every time, on
+> this host and on the real capture.
+>
+> §2's prewarm covered only the libraries it names; pycolmap still hangs
+> after it. The fix is now `tower/stdin_stop.py`.
+>
+> Two other statements here were superseded by the review in that document:
+>
+> - §3's "stage-boundary gap" was closed at the first boundary only.
+> - §4's "no wall-clock timeout" still holds, but a stall is now killed and
+>   counted by the Tower.
+
 The Windows/Tower answer to the Mac/iOS validation of
 `WORLD-BUILDER-LIVE-WORLD-VISUALIZATION-MAC-VALIDATION.md` (§7, T1–T5).
 
