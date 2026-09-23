@@ -201,7 +201,8 @@ def island_tilt(Rwc: np.ndarray, u_ref: np.ndarray) -> dict | None:
             "cameras": int(len(x))}
 
 
-def island_report(p, pairs, rot_angle_deg, vec_angle_deg, t_min_parallax_deg: float) -> dict:
+def island_report(p, pairs, rot_angle_deg, vec_angle_deg, t_min_parallax_deg: float,
+                  r_log=None, r_source: str | None = None) -> dict:
     """Islands of the image-only pair graph and what the variant does between them.
 
     `p` is the harness's Prepared view of the variant; `pairs` the world's PairSet."""
@@ -303,6 +304,11 @@ def island_report(p, pairs, rot_angle_deg, vec_angle_deg, t_min_parallax_deg: fl
             max_tilt = row["tilt_deg"] if max_tilt is None else max(max_tilt, row["tilt_deg"])
         tilt[str(c)] = row
     n_big = len(big)
+    plaus = None
+    if big:
+        groups = {str(c): np.nonzero(lab == c)[0] for c in big}
+        ref = max(big, key=lambda c: (int((p.in_main & (lab == c)).sum()), -c))
+        plaus = group_placement(p, groups, str(ref), r_log, r_source, kind="image islands")
     return {
         "definition": "connected components of the image-only verified pair graph (base tier)",
         "islands": int(len(sizes)), "singletons": int((sizes == 1).sum()),
@@ -316,6 +322,7 @@ def island_report(p, pairs, rot_angle_deg, vec_angle_deg, t_min_parallax_deg: fl
         "cross_island_tiers_available": [t[0] for t in tiers],
         "island_pairs": pair_rows,
         "islands_split_by_variant": int(sum(1 for r in islands_out if r["split_by_variant"])),
+        "placement_plausibility": plaus,
         "tilt_definition": (
             "tilt = |median over the island's cameras of asin(x_axis . up_ref)|: the roll its cameras would "
             "need under up_ref, the roll-free up of the main island (level-head assumption). Blind to a "
@@ -430,3 +437,170 @@ def triangulated_depth_ratios(p, arrays, depth_sample, K, *, min_samples: int, v
         spread[i] = float(1.4826 * np.median(np.abs(lr - np.median(lr))))
     return {"r": r, "n": cnt, "spread": spread,
             "pairs_used": used_pairs, "inliers_total": total, "inliers_gated": gated}
+
+
+# ---------------------------------------------------------------------------
+# placement plausibility between groups (image islands, rigid groups)
+
+PLAUSIBILITY = {
+    "min_group_kf": 10,
+    "min_ratio_kf": 5,
+    "tilt_max_deg": 10.0,
+    "scale_max_factor": 1.25,
+    "height_offset_max_m": 0.3,
+}
+
+PLAUSIBILITY_BASIS = {
+    "assumptions": [
+        "the wearer's head is roughly level (small roll) -- tilt",
+        "one room is one rigid, uniformly scaled structure; monocular metric depth is unbiased up to a few % -- scale",
+        "the floor is level and the wearer walks or stands at one posture (eye height fixed within a band) -- height",
+    ],
+    "tilt_max_deg": ("head roll while walking/looking around stays within a few degrees; the measured noise "
+                     "floor on the known-good control is <= 2.4 deg; 10 deg is ~4x that and a generic "
+                     "human bound, not a property of any room"),
+    "scale_max_factor": ("MoGe-2's per-image metric error is a few %, the within-keyframe spread measured here "
+                         "is 3-6 % and region content can bias a level by ~10 %; a factor beyond x1.25 is a "
+                         "reconstruction scale error, not measurement noise (the same band as the x1.25 level band)"),
+    "height_offset_max_m": ("on a level floor a walking/standing wearer's eye height moves by the gait bob "
+                            "(~5 cm) plus head nods; the main group's own p10-p90 band already absorbs its "
+                            "posture changes, so a group whose median eye height lies 0.3 m OUTSIDE that band "
+                            "means a different floor, a crouch/sit the band did not see, or a misplaced group. "
+                            "Limitation: a group walked seated vs a standing main group (~0.4-0.5 m) fails"),
+    "unobservable_without_image_links": [
+        "yaw about the vertical (no gravity or compass reference distinguishes a rotated room)",
+        "horizontal position (two rooms can be slid apart or overlapped without changing tilt, scale or height)",
+    ],
+}
+
+
+def _pf(ok):
+    return None if ok is None else ("PASS" if ok else "FAIL")
+
+
+def group_placement(p, groups: dict, ref: str, r_log, r_source: str | None, *, kind: str) -> dict:
+    """Tilt / scale / eye-height of each group against a reference group, all in
+    the variant's main component (placement across components is undefined).
+
+    groups: name -> keyframe indices (only those published in the main
+    component are used); r_log: per-keyframe log(z_variant / z_MoGe), uncentred
+    (triangulated source preferred; its median over a group is the group's
+    units-per-metre in log). See PLAUSIBILITY_BASIS for the assumptions and why
+    each bound is physical."""
+    B = PLAUSIBILITY
+    members = {g: np.asarray([i for i in idx if p.in_main[i]], dtype=int) for g, idx in groups.items()}
+    if ref not in members or len(members[ref]) < B["min_group_kf"]:
+        return {"available": False, "kind": kind,
+                "why": f"reference group has fewer than {B['min_group_kf']} keyframes in the main component"}
+    ref_idx = members[ref]
+    est = roll_free_up(p.Rwc[ref_idx])
+    up_src = "reference group roll-free up"
+    if est is None or not est["well_conditioned"]:
+        allm = np.nonzero(p.in_main)[0]
+        est = roll_free_up(p.Rwc[allm]) if len(allm) else None
+        up_src = "main-component roll-free up (reference group ill-conditioned)"
+    if est is None:
+        return {"available": False, "kind": kind, "why": "no up direction (too few cameras)"}
+    up = est["up"]
+    r = None if r_log is None else np.asarray(r_log, dtype=np.float64)
+    rr_ref = r[ref_idx][np.isfinite(r[ref_idx])] if r is not None else np.zeros(0)
+    med_ref = float(np.median(rr_ref)) if len(rr_ref) >= B["min_ratio_kf"] else None
+    upm_ref = math.exp(med_ref) if med_ref is not None else None
+    h_ref = p.C[ref_idx] @ up
+    h0 = float(np.median(h_ref))
+    rows = {}
+    for g, idx in members.items():
+        row = {"keyframes_in_main": int(len(idx)), "reference": g == ref}
+        if len(idx) < B["min_group_kf"]:
+            row.update({"checkable": False,
+                        "why": f"fewer than {B['min_group_kf']} keyframes in the main component"})
+            rows[g] = row
+            continue
+        row["checkable"] = True
+        roll = np.degrees(np.arcsin(np.clip(p.Rwc[idx][:, :, 0] @ up, -1, 1)))
+        tilt = float(abs(np.median(roll)))
+        row["tilt_deg"] = tilt
+        row["tilt_ok"] = bool(tilt <= B["tilt_max_deg"])
+        rr = r[idx][np.isfinite(r[idx])] if r is not None else np.zeros(0)
+        if med_ref is not None and len(rr) >= B["min_ratio_kf"]:
+            f = math.exp(float(np.median(rr)) - med_ref)
+            row["scale_factor"] = f
+            row["scale_iqr"] = [math.exp(float(np.percentile(rr, 25)) - med_ref),
+                                math.exp(float(np.percentile(rr, 75)) - med_ref)]
+            row["scale_keyframes"] = int(len(rr))
+            row["scale_ok"] = bool(abs(math.log(f)) <= math.log(B["scale_max_factor"]))
+        else:
+            row["scale_factor"] = None
+            row["scale_ok"] = None
+        if upm_ref is not None:
+            hm = (p.C[idx] @ up - h0) / upm_ref
+            band = ((np.percentile(h_ref, 10) - h0) / upm_ref, (np.percentile(h_ref, 90) - h0) / upm_ref)
+            med = float(np.median(hm))
+            beyond = max(0.0, med - band[1], band[0] - med)
+            row.update({"height_median_m": med, "reference_band_m": [float(band[0]), float(band[1])],
+                        "height_offset_beyond_band_m": float(beyond),
+                        "height_spread_p10_p90_m": float(np.percentile(hm, 90) - np.percentile(hm, 10)),
+                        "height_ok": bool(beyond <= B["height_offset_max_m"])})
+        else:
+            row.update({"height_offset_beyond_band_m": None, "height_ok": None})
+        checks = [row["tilt_ok"], row["scale_ok"], row["height_ok"]]
+        row["plausible"] = None if any(c is None for c in checks) else all(checks)
+        if row["plausible"] is None and any(c is False for c in checks):
+            row["plausible"] = False
+        sf = row.get("scale_factor")
+        ho = row.get("height_offset_beyond_band_m")
+        row["line"] = (f"tilt {tilt:.1f} deg {_pf(row['tilt_ok'])} / "
+                       f"scale {'n/a' if sf is None else f'x{sf:.2f}'} {_pf(row['scale_ok']) or 'n/a'} / "
+                       f"height {'n/a' if ho is None else f'{ho:.2f} m beyond band'} {_pf(row['height_ok']) or 'n/a'}")
+        rows[g] = row
+    checked = [g for g, r_ in rows.items() if r_.get("checkable") and not r_["reference"]]
+
+    def count(key):
+        return int(sum(1 for g in checked if rows[g].get(key) is False))
+
+    devs = [max(rows[g]["scale_factor"], 1 / rows[g]["scale_factor"]) for g in checked
+            if rows[g].get("scale_factor")]
+    offs = [rows[g]["height_offset_beyond_band_m"] for g in checked
+            if rows[g].get("height_offset_beyond_band_m") is not None]
+    return {"available": True, "kind": kind, "reference": ref, "up_source": up_src,
+            "scale_source": r_source, "units_per_metre_reference": upm_ref,
+            "bounds": {k: B[k] for k in ("tilt_max_deg", "scale_max_factor", "height_offset_max_m")},
+            "groups_checked": len(checked),
+            "groups_failing": int(sum(1 for g in checked if rows[g].get("plausible") is False)),
+            "failing_tilt": count("tilt_ok"), "failing_scale": count("scale_ok"), "failing_height": count("height_ok"),
+            "max_scale_deviation_factor": max(devs) if devs else None,
+            "max_height_offset_beyond_band_m": max(offs) if offs else None,
+            "groups": rows,
+            "unobservable_without_image_links": PLAUSIBILITY_BASIS["unobservable_without_image_links"]}
+
+
+def rigid_groups(p, min_shared: int = 1) -> dict | None:
+    """The variant's RIGID groups: connected components of its own covisibility
+    graph (>= `min_shared` shared 3-D points) over its published main-component
+    keyframes. Two groups sharing no point are held together only by the
+    solver's global step (rotation averaging / positioning), so their relative
+    placement is exactly what the plausibility checks test. None without
+    observations."""
+    v = p.v
+    if not v.has_observations or p.main is None:
+        return None
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    main = np.nonzero(p.in_main)[0]
+    local = {int(k): j for j, k in enumerate(main)}
+    world_idx = np.array([p.index_of.get(k, -1) for k in v.obs_keyframe_ids])[v.obs_keyframe]
+    keep = np.isin(world_idx, main)
+    if not keep.any():
+        return None
+    rows = np.array([local[int(k)] for k in world_idx[keep]])
+    pts, inv = np.unique(v.obs_point[keep], return_inverse=True)
+    M = coo_matrix((np.ones(len(rows)), (rows, inv)), shape=(len(main), len(pts))).tocsr()
+    M.data[:] = 1.0
+    S = (M @ M.T).tocoo()
+    mask = (S.data >= min_shared) & (S.row != S.col)
+    A = coo_matrix((np.ones(int(mask.sum())), (S.row[mask], S.col[mask])), shape=S.shape)
+    _, lab = connected_components(A, directed=False)
+    sizes = np.bincount(lab)
+    order = sorted(range(len(sizes)), key=lambda c: (-sizes[c], int(main[lab == c].min())))
+    return {f"rigid{rank}": main[lab == c] for rank, c in enumerate(order)}

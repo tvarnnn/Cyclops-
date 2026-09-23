@@ -47,6 +47,17 @@ b2. islands       -- image-only: the connected components of the world's
    on the strict ones, or "UNOBSERVED". Tilt: the angle between each island's
    roll-free up and the main island's (`eval_placement`). See the
    `eval_placement` docstring for the level-head assumption.
+   PLACEMENT PLAUSIBILITY per island (and per RIGID group of the variant:
+   components of its own shared-3-D-point graph at >= 1 point, main
+   component), against the island / group with the most main-component
+   keyframes: tilt (|median roll| under the reference's roll-free up, <= 10
+   deg), scale (triangulated log-ratio median vs the reference, within x1.25,
+   with IQR), eye height (median camera height along the reference up, in
+   metres via the reference's MoGe units-per-metre, <= 0.3 m beyond the
+   reference's p10-p90 band; own spread reported). The assumptions (level
+   head, level floor, one posture) and why each bound is physical are in
+   `eval_placement.PLAUSIBILITY_BASIS`. Yaw about the vertical and horizontal
+   position stay UNOBSERVABLE without image links.
 c. continuity     -- per consecutive published pair (capture order) of one
    component: step ratio = |dc| / (local median per-keyframe step x index
    gap) over `jump_window` steps each side, floored at `jump_floor_frac` x the
@@ -126,7 +137,11 @@ import numpy as np
 
 from tower.world_builder.coherence_eval.eval_placement import (
     PLACEMENT_PARAMS,
+    PLAUSIBILITY,
+    PLAUSIBILITY_BASIS,
+    group_placement,
     island_report,
+    rigid_groups,
     triangulated_depth_ratios,
 )
 
@@ -166,6 +181,7 @@ PARAMS = {
     "compare_coverage_tol": 0.02,
     "compare_ratio_coverage_tol": 0.05,
     **{f"placement.{k}": v for k, v in PLACEMENT_PARAMS.items()},
+    **{f"plausibility.{k}": v for k, v in PLAUSIBILITY.items()},
 }
 
 # ---------------------------------------------------------------------------
@@ -1324,9 +1340,23 @@ def evaluate(variant, keyframe_ids, *, segment_of=None, times=None, pairs=None, 
     if have_pairs:
         evidence = evidence_matrix(p.n, [pairs.arrays, getattr(pairs, "xarrays", None),
                                          getattr(pairs, "larrays", None)])
-        isl = island_report(p, pairs, rot_angle_deg, vec_angle_deg, PARAMS["t_min_parallax_deg"])
+        use = r_tri if r_tri is not None and np.isfinite(r_tri["r"]).any() else r_obs
+        isl = island_report(p, pairs, rot_angle_deg, vec_angle_deg, PARAMS["t_min_parallax_deg"],
+                            r_log=None if use is None else use["r"],
+                            r_source=None if use is None else ("triangulated" if use is r_tri else "variant points"))
     cont = continuity(p, upm, evidence)
     san = sanity(p)
+    rig = rigid_groups(p)
+    use = r_tri if r_tri is not None and np.isfinite(r_tri["r"]).any() else r_obs
+    if rig is None:
+        rigid = {"available": False, "why": "the variant has no observations (rigid groups need shared 3-D points)"}
+    else:
+        rigid = {"count": len(rig), "sizes": [int(len(v)) for v in rig.values()][:20],
+                 "min_shared_points": 1,
+                 "placement_plausibility": group_placement(
+                     p, rig, "rigid0", None if use is None else use["r"],
+                     None if use is None else ("triangulated" if use is r_tri else "variant points"),
+                     kind="rigid groups (shared 3-D points >= 1, main component)")}
 
     def path_m(i, j):
         c = p.comp[i]
@@ -1359,6 +1389,7 @@ def evaluate(variant, keyframe_ids, *, segment_of=None, times=None, pairs=None, 
         "registration": registration(p),
         "components": components(p),
         "islands": _strip(isl) if isl else {"available": False, "why": "no verified pair cache for this world"},
+        "rigid_groups": rigid,
         "continuity": cont,
         "scale": scale_out,
         "revisits": rev,
@@ -1660,6 +1691,16 @@ HEADLINE = [
     ("island pairs with placement UNOBSERVED (world)", "islands.large_island_pairs_unobserved", "world"),
     ("islands split across variant components", "islands.islands_split_by_variant", "lower"),
     ("max island tilt (abs median roll under main-island up, deg)", "islands.max_tilt_vs_main_island_deg", "lower"),
+    ("image islands checked for placement plausibility", "islands.placement_plausibility.groups_checked", "info"),
+    ("  failing (tilt / scale / height)", "islands.placement_plausibility.groups_failing", "lower"),
+    ("  failing tilt > 10 deg", "islands.placement_plausibility.failing_tilt", "lower"),
+    ("  failing scale beyond x1.25 (TRI)", "islands.placement_plausibility.failing_scale", "lower"),
+    ("  failing eye height > 0.3 m beyond main band", "islands.placement_plausibility.failing_height", "lower"),
+    ("  max island scale deviation vs main island (x)", "islands.placement_plausibility.max_scale_deviation_factor", "lower"),
+    ("  max island eye-height offset beyond main band (m)",
+     "islands.placement_plausibility.max_height_offset_beyond_band_m", "lower"),
+    ("rigid groups (shared points >= 1, main comp)", "rigid_groups.count", "info"),
+    ("  rigid groups >= 10 kf failing plausibility", "rigid_groups.placement_plausibility.groups_failing", "lower"),
     ("jumps (main; index+time or physical)", "continuity.main.jumps", "lower"),
     ("  physically implausible steps (main)", "continuity.main.physically_implausible", "lower"),
     ("  of which within a tracker segment", "continuity.main.jumps_within_segments", "lower"),
@@ -1753,6 +1794,32 @@ def headline(result: dict) -> list[tuple[str, object, str]]:
     return rows
 
 
+def _plaus_lines(pl: dict, what: str, col: str) -> list[str]:
+    if not pl.get("available"):
+        return ["", f"**Placement plausibility of {what}**: n/a ({pl.get('why', 'not computed')})."] if pl else []
+    L = ["", f"**Placement plausibility of {what}** (vs {col} {pl['reference']}; up: {pl['up_source']}; "
+             f"scale: {pl['scale_source']}; bounds: tilt <= {pl['bounds']['tilt_max_deg']:g} deg, scale within "
+             f"x{pl['bounds']['scale_max_factor']:g}, eye height <= {pl['bounds']['height_offset_max_m']:g} m "
+             "beyond the reference band; see PLAUSIBILITY_BASIS):", "",
+         f"| {col} | kf in main | tilt (deg) | scale vs ref (IQR) | eye height median / beyond band / own spread (m) | verdict |",
+         "|---|---|---|---|---|---|"]
+    for g, r in pl["groups"].items():
+        if not r.get("checkable"):
+            continue
+        iqr = r.get("scale_iqr")
+        L.append(f"| {g}{' (ref)' if r['reference'] else ''} | {r['keyframes_in_main']} | {_fmt(r['tilt_deg'])} | "
+                 f"{_fmt(r.get('scale_factor'))}{' (' + _fmt(iqr[0]) + '-' + _fmt(iqr[1]) + ')' if iqr else ''} | "
+                 f"{_fmt(r.get('height_median_m'))} / {_fmt(r.get('height_offset_beyond_band_m'))} / "
+                 f"{_fmt(r.get('height_spread_p10_p90_m'))} | "
+                 f"{'reference' if r['reference'] else r['line']} |")
+    small = sum(1 for r in pl["groups"].values() if not r.get("checkable"))
+    if small:
+        L.append(f"\n({small} smaller {what} not checkable: fewer than {PLAUSIBILITY['min_group_kf']} keyframes in the main component.)")
+    L += ["", "Unobservable without image links, whatever these checks say: "
+          + "; ".join(pl["unobservable_without_image_links"]) + "."]
+    return L
+
+
 def _island_lines(m) -> list[str]:
     isl = m.get("islands") or {}
     if not isl or isl.get("available") is False:
@@ -1770,6 +1837,7 @@ def _island_lines(m) -> list[str]:
         L.append(f"| {r['island']} | {r['keyframes']} | {r['ranges'][:4]}{'...' if len(r['ranges']) > 4 else ''} | "
                  f"{r['in_main']} | {r['variant_components']} | {_fmt(t.get('tilt_deg'))}{ref} | "
                  f"{_fmt(t.get('roll_under_reference_mad_deg'))} |")
+    L += _plaus_lines(isl.get("placement_plausibility") or {}, "image islands", "island")
     L += ["", "| island pair | verified pairs by tier | placement | variant on strict pairs |", "|---|---|---|---|"]
     for r in isl["island_pairs"]:
         v = r.get("variant") or {}
@@ -1801,6 +1869,13 @@ def markdown(result: dict) -> str:
         tag = {"world": "world property", "info": "info"}.get(better, f"{better} is better")
         L.append(f"| {label} ({tag}) | {_fmt(val)} |")
     L += _island_lines(m)
+    rg = m.get("rigid_groups") or {}
+    if rg.get("available") is False:
+        L += ["", f"**Rigid groups**: n/a ({rg.get('why')})."]
+    elif rg:
+        L += ["", f"**Rigid groups** of the variant (connected by >= 1 shared 3-D point, main component): {rg['count']} "
+                  f"groups, sizes {rg['sizes'][:10]}."]
+        L += _plaus_lines(rg.get("placement_plausibility") or {}, "rigid groups", "group")
     main = get_path(m, "continuity.main") or {}
     if main.get("jump_list"):
         L += ["", "**Step candidates in the main component** (index rule, physical rule, and every step across a "

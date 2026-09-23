@@ -953,6 +953,9 @@ GOLDEN_KEYS = [
     "scale.depth.fixed_denominator.bands.x1.25.coherent_all", "scale.depth.main.max_step_factor",
     "scale.depth_tri.fixed_denominator.bands.x1.25.coherent_all", "scale.depth_tri.main.max_step_factor",
     "revisits.revisit.pairs", "revisits.revisit.rot_err_deg.median", "reprojection.overall.median",
+    "islands.placement_plausibility.groups_failing", "islands.placement_plausibility.max_scale_deviation_factor",
+    "islands.placement_plausibility.max_height_offset_beyond_band_m", "rigid_groups.count",
+    "rigid_groups.placement_plausibility.groups_failing",
 ]
 
 
@@ -976,3 +979,125 @@ def test_golden_target_world():
             assert got[k] == want, k
     assert res["world"]["caches"]["pairs"]["digest"] == golden["pairs_digest"]
     assert res["world"]["caches"]["depth"]["digest"] == golden["depth_digest"]
+
+
+# ---------------------------------------------------------------------------
+# placement plausibility between islands / rigid groups (tilt, scale, height)
+
+
+def two_rooms():
+    """Two rooms 20 m apart, 40 level cameras each (yaw -30..30 deg, small
+    pitch), every camera at eye height 0 (world y down), each room facing its
+    own wall at z = 5: no shared point, no image pair between the rooms."""
+    rng = np.random.default_rng(4)
+    poses = []
+    for k in range(80):
+        room, j = divmod(k, 40)
+        yaw = math.radians(-30 + 60 * j / 39)
+        pitch = math.radians(3.0 if j % 2 else -3.0)
+        T = np.eye(4)
+        T[:3, :3] = _rot_y(yaw) @ _rot_axis([1, 0, 0], pitch)
+        T[:3, 3] = [20.0 * room - 3 + 6 * j / 39, 0.0, 0.0]  # 15 cm steps: triangulable
+        poses.append(T)
+    X = np.concatenate([np.c_[rng.uniform(-10, 9.5, 900), rng.uniform(-1.5, 1.5, 900), np.full(900, 5.0)],
+                        np.c_[rng.uniform(10.5, 30, 900), rng.uniform(-1.5, 1.5, 900), np.full(900, 5.0)]])
+    return poses, X
+
+
+def _plane_depth(poses):
+    def fn(i, uv):
+        T = poses[i]
+        uv = np.asarray(uv, float).reshape(-1, 2)
+        d = np.c_[(uv[:, 0] - CX) / FX, (uv[:, 1] - CY) / FY, np.ones(len(uv))] @ T[:3, :3].T
+        return (5.0 - T[2, 3]) / d[:, 2]
+    return fn
+
+
+def _room_pairs(poses, X):
+    I, J, Rs, ts, xi, xj, offs = [], [], [], [], [], [], [0]
+    for g in (1, 2):
+        for i in range(80 - g):
+            j = i + g
+            if i < 40 <= j:
+                continue
+            Pi, Pj = _cam(poses[i], X), _cam(poses[j], X)
+            ui = Pi[:, :2] / np.maximum(Pi[:, 2:], 1e-9)
+            uj = Pj[:, :2] / np.maximum(Pj[:, 2:], 1e-9)
+            vis = np.nonzero((Pi[:, 2] > 0.2) & (Pj[:, 2] > 0.2) & (np.abs(ui[:, 0]) < 0.4) & (np.abs(uj[:, 0]) < 0.4)
+                             & (np.abs(ui[:, 1]) < 0.7) & (np.abs(uj[:, 1]) < 0.7))[0][:64]
+            Ri, Rj = poses[i][:3, :3].T, poses[j][:3, :3].T
+            t = Rj @ (poses[i][:3, 3] - poses[j][:3, 3])
+            I.append(i), J.append(j), Rs.append(Rj @ Ri.T), ts.append(t / np.linalg.norm(t))
+            xi.append(ui[vis]), xj.append(uj[vis]), offs.append(offs[-1] + len(vis))
+    P = len(I)
+    return PairSet.from_arrays({
+        "i": np.array(I, np.int32), "j": np.array(J, np.int32), "R": np.array(Rs), "t": np.array(ts),
+        "t_reliable": np.ones(P, bool), "parallax_deg": np.full(P, 10.0, np.float32),
+        "n_inliers": np.full(P, 100, np.int32), "n_matches": np.full(P, 120, np.int32),
+        "inlier_offsets": np.array(offs, np.int64), "inlier_xy_i": np.concatenate(xi).astype(np.float32),
+        "inlier_xy_j": np.concatenate(xj).astype(np.float32)})
+
+
+def _move_room_b(poses, X, M3, t):
+    """Apply x -> M3 (x - pivot) + pivot + t to room B's cameras and points
+    (pivot = room B's median camera centre); rotations only through M3's
+    rotation part."""
+    pivot = np.median([T[:3, 3] for T in poses[40:]], axis=0)
+    s = abs(np.linalg.det(M3)) ** (1 / 3)
+    R = M3 / s
+    out = [T.copy() for T in poses]
+    for T in out[40:]:
+        T[:3, :3] = R @ T[:3, :3]
+        T[:3, 3] = M3 @ (T[:3, 3] - pivot) + pivot + t
+    X2 = X.copy()
+    X2[900:] = (M3 @ (X[900:] - pivot).T).T + pivot + t
+    return out, X2
+
+
+def _room_obs(poses_true, X):
+    kf, pt, uv = [], [], []
+    for k, T in enumerate(poses_true):
+        Pc = _cam(T, X)
+        z = Pc[:, 2]
+        u = FX * Pc[:, 0] / np.where(z > 0, z, 1) + CX
+        v = FY * Pc[:, 1] / np.where(z > 0, z, 1) + CY
+        idx = np.nonzero((z > 0.2) & (u > 0) & (u < W) & (v > 0) & (v < H))[0]
+        kf.append(np.full(len(idx), k)), pt.append(idx), uv.append(np.c_[u[idx], v[idx]])
+    return np.concatenate(kf), np.concatenate(pt), np.concatenate(uv), None
+
+
+@pytest.mark.parametrize("case, fails", [
+    ("clean", set()),
+    ("tilted", {"tilt"}),
+    ("scaled", {"scale"}),
+    ("raised", {"height"}),
+])
+def test_placement_plausibility_fails_the_right_check(case, fails):
+    poses, X = two_rooms()
+    move = {"clean": (np.eye(3), np.zeros(3)),
+            "tilted": (_rot_axis([0, 0, 1], math.radians(20.0)), np.zeros(3)),   # horizontal axis
+            "scaled": (2.0 * np.eye(3), np.zeros(3)),
+            "raised": (np.eye(3), np.array([0.0, -0.6, 0.0]))}[case]            # world y is DOWN
+    vposes, vX = _move_room_b(poses, X, *move)
+    obs = _room_obs(poses, X)  # the images: observations of the TRUE scene
+    v, ids = make_variant(vposes, vX, obs)
+    out = run(v, ids, pairs=_room_pairs(poses, X), depth_sample=_plane_depth(poses))
+    for block in (out["islands"]["placement_plausibility"],
+                  out["rigid_groups"]["placement_plausibility"]):
+        assert block["available"] and block["groups_checked"] == 1
+        (other,) = [g for g, r in block["groups"].items() if not r["reference"]]
+        r = block["groups"][other]
+        got = {name for name, key in (("tilt", "tilt_ok"), ("scale", "scale_ok"), ("height", "height_ok"))
+               if r[key] is False}
+        assert got == fails, (block["kind"], case, r["line"])
+        assert r["plausible"] is (not fails)
+        assert block["units_per_metre_reference"] == pytest.approx(1.0, rel=0.02)
+    r = out["islands"]["placement_plausibility"]["groups"]
+    other = [g for g in r if not r[g]["reference"]][0]
+    if case == "scaled":
+        assert r[other]["scale_factor"] == pytest.approx(2.0, rel=0.02)
+    if case == "raised":
+        assert r[other]["height_offset_beyond_band_m"] == pytest.approx(0.6, abs=0.02)
+    if case == "tilted":
+        assert r[other]["tilt_deg"] > 15.0
+    assert out["islands"]["placement_plausibility"]["unobservable_without_image_links"]
