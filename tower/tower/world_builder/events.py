@@ -46,6 +46,26 @@ EVENT_KINDS = frozenset(
         # renumbered from there. Payload: `source_seq`, `renumbered_to`.
         # Informational; no consumer switches on it.
         "source_seq_restarted",
+        # The live look-back relocalizer (world_builder/relocalizer.py,
+        # WORLD-BUILDER-COMPONENTS.md s6.7). Written only when the setting
+        # `world_relocalizer` is not `off`; `tracking.recovery` is summarised
+        # from them and is null for a journal without `relocalizer_started`.
+        # `tracking_lost` itself is unchanged and opens an episode.
+        #   relocalizer_started {acceptance, limiter, prompts_enabled}
+        #   recovery_prompted   {prompt_id, episode}
+        #   recovery_withheld   {episode, why: limiter|disabled, layer}
+        #   recovery_accepted   {episode, by, links, closure_deg, frame, anchor}
+        #   recovery_timed_out  {episode[, why: session_stopped]}
+        #   recovery_anchored   {episode, frame, anchor, links}
+        # The last is not a state change: an accepted scan frame that was not
+        # a keyframe, tied afterwards to a keyframe the final solve can match
+        # (relocalizer.revisit_pairs). The payload block ignores it.
+        "relocalizer_started",
+        "recovery_prompted",
+        "recovery_withheld",
+        "recovery_accepted",
+        "recovery_timed_out",
+        "recovery_anchored",
     }
 )
 

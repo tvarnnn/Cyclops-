@@ -567,6 +567,18 @@ class Solution:
     observation_xy: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), np.float32))  # (M, 2) undistorted px
     camera: dict | None = None  # the pinhole camera the observations are expressed in
     timing: dict = field(default_factory=dict)
+    # WHAT RAN, for the evidence gate and the harness (contract
+    # WORLD-BUILDER-COMPONENTS §2.5). Both None on a solution written before
+    # 2026-09-23 (and on any written by hand), which a reader must take as
+    # "today's solve: unmasked, unseeded" -- never as an error.
+    #   transients: the solver-image masks (`solve_masks`): `state` applied /
+    #               partial / unavailable, `detail`, `rule`, `cache_hits`,
+    #               `computed`, images masked and unmasked.
+    #   solve:      `seed` (None = unseeded), `threads` (the mapper's; 1 when
+    #               seeded, -1 = every core), the other steps' threads, the
+    #               two-view RANSAC seed, and which feature database was used.
+    transients: dict | None = None
+    solve: dict | None = None
 
     @property
     def horizon(self) -> set[str]:
@@ -596,6 +608,10 @@ def sweep_workspace(workspace: SolveWorkspace) -> int:
     swept = sweep_abandoned_staging(workspace.root)
     if workspace.images_dir.is_dir():
         swept += sweep_abandoned_staging(workspace.images_dir)
+    # The solver's COLMAP masks (`solve_masks`), written the same atomic way.
+    masks = workspace.root / "masks"
+    if masks.is_dir():
+        swept += sweep_abandoned_staging(masks)
     return swept
 
 
@@ -627,20 +643,24 @@ def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
             observation_xy=solution.observation_xy.astype(np.float32).reshape(-1, 2),
         ),
     )
-    write_json_atomic(
-        workspace.solution_path,
-        {
-            "schema_version": SOLUTION_SCHEMA_VERSION,
-            "solver": solution.solver,
-            "solved_at": solution.solved_at,
-            "input_digest": solution.input_digest,
-            "keyframe_ids": solution.keyframe_ids,
-            "components": solution.components,
-            "poses": solution.poses,
-            "camera": solution.camera,
-            "timing": solution.timing,
-        },
-    )
+    meta = {
+        "schema_version": SOLUTION_SCHEMA_VERSION,
+        "solver": solution.solver,
+        "solved_at": solution.solved_at,
+        "input_digest": solution.input_digest,
+        "keyframe_ids": solution.keyframe_ids,
+        "components": solution.components,
+        "poses": solution.poses,
+        "camera": solution.camera,
+        "timing": solution.timing,
+    }
+    # Additive, and only when recorded: the schema version is unchanged, so
+    # every reader of a solution written before these fields still reads it.
+    if solution.transients is not None:
+        meta["transients"] = solution.transients
+    if solution.solve is not None:
+        meta["solve"] = solution.solve
+    write_json_atomic(workspace.solution_path, meta)
 
 
 def load_solution(store, world_id: str, session_id: str) -> Solution | None:
@@ -677,6 +697,8 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
                                 if "observation_xy" in arrays else np.zeros((0, 2), np.float32)),
                 camera=meta.get("camera"),
                 timing=dict(meta.get("timing") or {}),
+                transients=meta.get("transients"),
+                solve=meta.get("solve"),
             )
     except Exception as exc:  # noqa: BLE001 -- see below; the narrow tuple IS the bug
         # DELIBERATELY BROAD, and the breadth is the fix rather than a
@@ -751,6 +773,38 @@ def _quiet_pycolmap():
         pass
 
 
+class _FromSettings:
+    """`solve(seed=...)` not given: the final solve reads `TOWER_WORLD_SOLVE_SEED`."""
+
+    def __repr__(self) -> str:
+        return "FROM_SETTINGS"
+
+
+FROM_SETTINGS = _FromSettings()
+
+
+def resolve_run_options(*, final: bool, masks: bool | None, seed) -> tuple[bool, int | None]:
+    """(masks, seed) for one solve.
+
+    The two settings belong to the FINAL solve only. The background solves of
+    a walk keep today's recipe whatever the settings say: masks need the GPU the
+    live surface is using, and a single-thread mapper would slow the live
+    world's convergence 3.3x (research D1). An explicit argument wins either
+    way, so a script or a test can ask for exactly what it wants.
+    """
+    from tower.config import world_solve_masks_setting, world_solve_seed_setting  # noqa: PLC0415
+
+    if masks is None:
+        masks = bool(final) and world_solve_masks_setting()
+    if seed is FROM_SETTINGS:
+        seed = world_solve_seed_setting() if final else None
+    if seed is not None:
+        seed = int(seed)
+        if seed < 0:
+            raise ValueError(f"a solve seed is a non-negative integer, not {seed}")
+    return bool(masks), seed
+
+
 def solve(
     store,
     world_id: str,
@@ -763,6 +817,10 @@ def solve(
     overlap: int = SEQUENTIAL_OVERLAP,
     loop_detection: bool | None = None,
     input_digest: str | None = None,
+    masks: bool | None = None,
+    seed=FROM_SETTINGS,
+    transient_backend_factory=None,
+    mask_device_probe=None,
 ) -> dict:
     """Run the recipe over the session's current keyframes and persist the
     solution. Returns a summary dict (what the CLI prints).
@@ -772,10 +830,38 @@ def solve(
     pycolmap respectively. The MODEL is rebuilt from scratch every call --
     GLOMAP is fast enough (E8: 43 s for 438 keyframes) and a from-scratch
     solve has no way to inherit a wrong decision.
+
+    TWO OPTIONS, BOTH OFF BY DEFAULT, BOTH FOR THE FINAL SOLVE
+    (`resolve_run_options`; the settings are `world_solve_masks` and
+    `world_solve_seed` in `tower/config.py`). Off, every call into pycolmap is
+    exactly today's.
+
+      * `masks`: the wearer's hands, arms and held phone are masked out of
+        feature extraction on every solver image (`solve_masks.py`), into a
+        feature database of its own. When the detector cannot run the solve
+        runs unmasked on today's database and `transients.state` says why.
+      * `seed`: every mapper seed, pycolmap's global seed and the two-view
+        RANSAC seed are set and mapping runs on one thread -- the determinism
+        hygiene of the run's experiment driver (lane `coherence_exp/driver.py`),
+        without which GLOMAP is not reproducible (research D1 §2.4).
+        Extraction and matching keep their threads, as in the driver. What is
+        reproducible is the MAPPING, given its feature database -- measured
+        on the target walk (run P3-PM): two seeded one-thread GLOMAP runs on
+        one database were bit-identical, two unseeded ones were not. The
+        database itself is not reproducible: SIFT extraction is, but
+        multi-threaded matching is not (62 of 7,450 sequential pairs matched
+        differently twice; one thread matched all 7,450 identically, about 6x
+        slower), and loop detection re-run on an existing database proposes
+        new pairs. Without masks the database is also the one the walk's
+        background solves accumulated.
+
+    Both are recorded in the solution (`transients`, `solve`) and in the
+    returned summary, so the evidence gate and the harness can tell what ran.
     """
     available, reason = solver_available()
     if not available:
         return {"solved": False, "reason": reason}
+    want_masks, seed = resolve_run_options(final=final, masks=masks, seed=seed)
     sweep_workspace(workspace_for(store, world_id, session_id))
     import pycolmap
 
@@ -802,11 +888,24 @@ def solve(
     reader = pycolmap.ImageReaderOptions()
     reader.camera_model = "PINHOLE"
     reader.camera_params = ",".join(str(v) for v in (camera.fx, camera.fy, camera.cx, camera.cy))
+
+    # THE FEATURE DATABASE, and the masks that decide which one. Without masks
+    # it is `database.db`, shared with the walk's background solves -- today.
+    database_path = workspace.database_path
+    database_existed = database_path.exists()
+    masks_record = _masks_off_record()
+    if want_masks:
+        database_path, masks_record = _apply_solver_masks(
+            workspace, reader, present, keyframes, camera,
+            backend_factory=transient_backend_factory, device_probe=mask_device_probe)
+        database_existed = masks_record.get("database_reused", database_path.exists())
+    masked = time.perf_counter()
+
     extraction = pycolmap.FeatureExtractionOptions()
     extraction.num_threads = threads
     extraction.sift.max_num_features = MAX_FEATURES
     pycolmap.extract_features(
-        workspace.database_path, workspace.images_dir, image_names=present,
+        database_path, workspace.images_dir, image_names=present,
         camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
         extraction_options=extraction,
     )
@@ -848,22 +947,44 @@ def solve(
         )
         wanted = False
     pairing.loop_detection = wanted
-    pycolmap.match_sequential(
-        workspace.database_path, matching_options=matching, pairing_options=pairing
-    )
+    seeded = seed is not None
+    if seeded:
+        # The two-view RANSAC is seeded too (the experiment driver's
+        # `verification_seed`): otherwise the verified inlier sets, and so
+        # the view graph GLOMAP averages, differ run to run.
+        verification = pycolmap.TwoViewGeometryOptions()
+        verification.ransac.random_seed = seed
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing,
+            verification_options=verification,
+        )
+    else:
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing
+        )
+    revisits = {"listed": 0, "verified": 0, "detail": None}
+    if final:
+        revisits = _match_revisit_pairs(
+            pycolmap, store, world_id, session_id, workspace, database_path, present,
+            matching, verification if seeded else None)
     matched = time.perf_counter()
 
     shutil.rmtree(workspace.sparse_dir, ignore_errors=True)
     workspace.sparse_dir.mkdir(parents=True)
+    # ONE thread when seeded: GLOMAP is reproducible only then (D1 §2.4).
+    map_threads = 1 if seeded else threads
     solver = SOLVER_GLOMAP
     options = pycolmap.GlobalPipelineOptions()
-    options.num_threads = threads
+    options.num_threads = map_threads
     options.mapper.bundle_adjustment.refine_focal_length = False
     options.mapper.bundle_adjustment.refine_principal_point = False
     options.mapper.bundle_adjustment.refine_extra_params = False
+    if seeded:
+        _seed_global_options(options, seed)
+        pycolmap.set_random_seed(seed)
     try:
         reconstructions = pycolmap.global_mapping(
-            workspace.database_path, workspace.images_dir, workspace.sparse_dir, options=options
+            database_path, workspace.images_dir, workspace.sparse_dir, options=options
         )
     except Exception as exc:  # a solver failure is a refusal, not a crash
         logger.warning("global solve: global mapping raised %s", exc)
@@ -871,13 +992,16 @@ def solve(
     if not reconstructions:
         solver = SOLVER_INCREMENTAL
         inc = pycolmap.IncrementalPipelineOptions()
-        inc.num_threads = threads
+        inc.num_threads = map_threads
         inc.ba_refine_focal_length = False
         inc.ba_refine_principal_point = False
         inc.ba_refine_extra_params = False
+        if seeded:
+            _seed_incremental_options(inc, seed)
+            pycolmap.set_random_seed(seed)
         try:
             reconstructions = pycolmap.incremental_mapping(
-                workspace.database_path, workspace.images_dir, workspace.sparse_dir, options=inc
+                database_path, workspace.images_dir, workspace.sparse_dir, options=inc
             )
         except Exception as exc:
             logger.warning("global solve: incremental mapping raised %s", exc)
@@ -890,11 +1014,30 @@ def solve(
     )
     solution.timing = {
         "prepare_s": round(prepared - started, 3),
-        "extract_s": round(extracted - prepared, 3),
+        "extract_s": round(extracted - masked, 3),
         "match_s": round(matched - extracted, 3),
         "map_s": round(mapped - matched, 3),
         "images_undistorted": written,
         "final": bool(final),
+    }
+    if want_masks:
+        solution.timing["masks_s"] = round(masked - prepared, 3)
+    solution.transients = masks_record
+    solution.solve = {
+        "seed": seed,
+        # The MAPPER's threads, which is what reproducibility turns on: 1 when
+        # seeded; otherwise pycolmap's -1, "every core", or the caller's count.
+        "threads": map_threads,
+        "seeded": seeded,
+        "extraction_threads": threads,
+        "matching_threads": threads,
+        "verification_seed": seed if seeded else None,
+        "database": database_path.name,
+        "database_existed": bool(database_existed),
+        "final": bool(final),
+        "pycolmap": getattr(pycolmap, "__version__", None),
+        # The live relocalizer's verified revisit links, matched explicitly.
+        "revisit_pairs": revisits,
     }
     write_solution(workspace, solution)
     return {
@@ -906,7 +1049,146 @@ def solve(
         "points": int(len(solution.xyz)),
         "timing": solution.timing,
         "workspace": str(workspace.root),
+        "transients": solution.transients,
+        "solve": solution.solve,
     }
+
+
+def _seed_global_options(options, seed: int) -> None:
+    """Every random number generator GLOMAP's pipeline owns, and one thread.
+    The experiment driver's `_mapper_options` for `glomap`, verbatim."""
+    options.mapper.num_threads = 1
+    options.random_seed = seed
+    options.mapper.random_seed = seed
+    options.mapper.rotation_averaging.random_seed = seed
+    options.mapper.global_positioning.random_seed = seed
+    options.mapper.retriangulation.random_seed = seed
+
+
+def _seed_incremental_options(inc, seed: int) -> None:
+    """The same for the incremental fallback (driver `_mapper_options`), plus
+    the mapper's own thread count, which the driver left to `num_threads`."""
+    inc.mapper.num_threads = 1
+    inc.random_seed = seed
+    inc.mapper.random_seed = seed
+    inc.triangulation.random_seed = seed
+
+
+REVISIT_PAIRS_FILENAME = "revisit_pairs.txt"
+# A revisit pair counts as verified at COLMAP's own two-view floor
+# (`TwoViewGeometryOptions.min_num_inliers`, 15), the floor the solve's view
+# graph uses for every other pair.
+REVISIT_VERIFIED_MIN_INLIERS = 15
+
+
+def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, database_path,
+                         present, matching, verification) -> dict:
+    """Match the live relocalizer's revisit links (`relocalizer.revisit_pairs`)
+    explicitly, in the final solve's database, with its matching and
+    verification options -- and its masks, which apply to every pair because
+    they applied at extraction.
+
+    Sequential matching reaches 20 keyframes either side and loop detection
+    queries every tenth keyframe; a look-back revisit is exactly the pair
+    neither is sure to propose. No links (no relocalizer, an old session, a
+    walk that never lost tracking) is today's solve, with no call made.
+    Never raises: a failure costs the links, and the record says so.
+    """
+    record = {"listed": 0, "verified": 0, "detail": None}
+    try:
+        from tower.world_builder.relocalizer import revisit_pairs  # noqa: PLC0415
+
+        pairs = revisit_pairs(store.session_dir(world_id, session_id))
+    except Exception as exc:  # noqa: BLE001 -- no links is today's solve
+        record["detail"] = f"revisit links unreadable ({type(exc).__name__}: {exc})"
+        return record
+    have = set(present)
+    pairs = [(a, b) for a, b in pairs if a in have and b in have and a != b]
+    record["listed"] = len(pairs)
+    if not pairs:
+        return record
+    path = workspace.root / REVISIT_PAIRS_FILENAME
+    data = "".join(f"{a} {b}\n" for a, b in pairs).encode("utf-8")
+    try:
+        write_bytes_atomic(path, lambda handle: handle.write(data))
+        imported = pycolmap.ImportedPairingOptions()
+        imported.match_list_path = str(path)
+        if verification is not None:
+            pycolmap.match_image_pairs(database_path, matching_options=matching,
+                                       pairing_options=imported,
+                                       verification_options=verification)
+        else:
+            pycolmap.match_image_pairs(database_path, matching_options=matching,
+                                       pairing_options=imported)
+    except Exception as exc:  # noqa: BLE001 -- recorded, the solve goes on
+        logger.warning("global solve: matching %d revisit links failed: %s", len(pairs), exc)
+        record["detail"] = f"matching failed ({type(exc).__name__}: {exc})"
+        return record
+    record["verified"] = _verified_pair_count(database_path, pairs)
+    return record
+
+
+def _verified_pair_count(database_path, pairs) -> int | None:
+    """How many of `pairs` (image names) the database holds as verified pairs,
+    or None when the database cannot be read."""
+    import sqlite3  # noqa: PLC0415
+
+    base = 2147483647  # COLMAP's kMaxNumImages: pair_id = min_id * base + max_id
+    try:
+        con = sqlite3.connect(f"file:{Path(database_path).as_posix()}?mode=ro", uri=True)
+        try:
+            ids = {name: iid for iid, name in con.execute("select image_id, name from images")}
+            count = 0
+            for a, b in pairs:
+                if a not in ids or b not in ids:
+                    continue
+                lo, hi = sorted((ids[a], ids[b]))
+                row = con.execute("select rows from two_view_geometries where pair_id = ?",
+                                  (lo * base + hi,)).fetchone()
+                if row is not None and (row[0] or 0) >= REVISIT_VERIFIED_MIN_INLIERS:
+                    count += 1
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return count
+
+
+def _masks_off_record() -> dict:
+    from tower.world_builder.solve_masks import off_record  # noqa: PLC0415
+
+    return off_record()
+
+
+def _apply_solver_masks(workspace, reader, present, keyframes, camera, *,
+                        backend_factory=None, device_probe=None):
+    """Masks for every solver image; on success the masked database and the
+    reader's `mask_path`, else today's database and a record saying why.
+
+    Never raises: whatever the mask step does, the solve runs, and the record
+    says whether it ran masked (`applied`)."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    ids = {keyframe_image_name(k): k.keyframe_id for k in keyframes}
+    try:
+        result = solve_masks.ensure_solver_masks(
+            workspace, present, keyframe_ids=ids, shape=(camera.height, camera.width),
+            backend_factory=backend_factory, device_probe=device_probe)
+        record = result.record()
+        if not result.available:
+            logger.warning(
+                "global solve: transient masks were requested for the final solve and "
+                "are NOT applied (%s: %s); this solve is unmasked and says so",
+                result.state, result.detail)
+            return workspace.database_path, dict(record, database=workspace.database_path.name)
+        database, info = solve_masks.masked_database(workspace, result, all_names=present)
+    except Exception as exc:  # noqa: BLE001 -- a mask failure is an unmasked solve, recorded
+        logger.exception("global solve: the transient mask step failed; this solve is unmasked")
+        record = solve_masks.failed_record(f"{type(exc).__name__}: {exc}")
+        return workspace.database_path, dict(record, database=workspace.database_path.name)
+    reader.mask_path = str(solve_masks.masks_dir(workspace))
+    return database, dict(record, database=info["database"], database_reused=info["reused"],
+                          database_rebuilt_because=info["rebuilt_because"])
 
 
 def _solution_from_reconstructions(
@@ -1306,6 +1588,13 @@ def merge(
         "components": components_out,
         **counts,
     }
+    # What ran (contract WORLD-BUILDER-COMPONENTS §2.5), into the published
+    # manifest's `global_solve` beside the rest -- only when the solution
+    # recorded it, so a world solved before these records builds as it did.
+    if solution.transients is not None:
+        summary["transients"] = solution.transients
+    if solution.solve is not None:
+        summary["solve"] = solution.solve
     return MergeResult(
         pose_rows=new_pose_rows, point_rows=new_point_rows, support_rows=new_support_rows,
         placements=placements, segments=per_segment, summary=summary,

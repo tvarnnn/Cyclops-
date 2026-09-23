@@ -44,6 +44,7 @@ from tower.results.world_builder_library import _sortable, lock_speaks_for
 from tower.storage import read_json_closed, read_raw_jsonl
 from tower.results.envelope import Snapshot, compute_revision
 from tower.world_builder.records import FINAL_SOLVE_SOLVED, format_distance
+from tower.world_builder.relocalizer import RecoveryJournalReader
 from tower.world_builder.schema import (
     INTRINSICS_SOURCE_UNKNOWN,
     POSE_STATUS_ANCHOR,
@@ -1595,6 +1596,34 @@ def _still_building(base: dict, building: str | None,
                 "build_in_progress_unavailable_reason": unobservable,
             }
         owed_reason = photographic.get("detail") or "the photographic build is unfinished"
+        from tower.world_builder.photographic import (  # noqa: PLC0415
+            PHOTOGRAPHIC_RUNNING,
+        )
+
+        if photo_state == PHOTOGRAPHIC_RUNNING:
+            # `running` IS A LIVE PROCESS, WHOEVER'S IT IS (C1 E13). The word
+            # is only ever `running` on evidence of a live pid, but the
+            # present-tense probe above reads the ROOM's stage files alone, so
+            # a running AREA build (`scope: "area"`, its status files under
+            # `areas/<session>/<area>/`) arrived here with `building` None and
+            # was reported `build_in_progress: False` -- "Finalizing" with
+            # "the Tower does not report whether a build is running" on the
+            # phone. The word and the boolean now cannot disagree.
+            area = photographic.get("scope") == "area"
+            return {
+                **base,
+                "state": LIFECYCLE_FINALIZING,
+                "evidence": f"{base['evidence']}, and {owed_reason}",
+                "reason": (
+                    "the room is saved and an area of this walk is still being "
+                    "built: " + owed_reason
+                    if area else
+                    "the photographic build for this world is still running: "
+                    + owed_reason
+                ),
+                "build_in_progress": True,
+                "build_in_progress_unavailable_reason": None,
+            }
         return {
             **base,
             # NOT merely `build_in_progress`. iOS reaches "Improving" from
@@ -2163,8 +2192,12 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
     chain_breaks = 0
     rejected_wrong_size = 0
     rejected_malformed = 0
+    # `tracking.recovery` (WORLD-BUILDER-COMPONENTS.md s6), folded in the
+    # same single pass. It holds a fixed-arity block, never events.
+    recovery = RecoveryJournalReader()
     for event in events:
         kind = event.get("kind")
+        recovery.feed(event)
         if kind == "frame_rejected":
             # ONLY the rejections the engine journals -- an ordinary
             # rejected frame writes no event (engine.py `observe`), and
@@ -2202,7 +2235,7 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
             chain_breaks += 1
         elif kind == "session_stopped":
             stopped = True
-    return {
+    summary = {
         "keyframes_accepted": accepted,
         "last_tracking": last_tracking,
         "stopped": stopped,
@@ -2228,6 +2261,12 @@ def _summarise_events(events, corrupt_lines: int = 0) -> dict:
         "frames_rejected_wrong_size": rejected_wrong_size,
         "frames_rejected_malformed": rejected_malformed,
     }
+    # ONLY when the journal records a relocalizer: every older journal keeps
+    # exactly the summary it had (and its scalar-only shape). The block is
+    # fixed-arity -- its size does not grow with the session.
+    if recovery.recorded:
+        summary["recovery"] = recovery.block()
+    return summary
 
 
 def _progress_block(session, events, counts_are_final: bool, now: float) -> dict:
@@ -2306,24 +2345,34 @@ def _tracking_block(events) -> dict:
     defined. Inventing one would put a state on screen that looks measured
     and is not -- and iOS explicitly refuses a percentage for that same
     reason.
+
+    `recovery` is the live look-back relocalizer's block
+    (WORLD-BUILDER-COMPONENTS.md s6.2), or None when the journal records no
+    relocalizer -- every session today, and every older world. None means
+    "not recorded", never "no losses". It carries no volatile field, so an
+    unchanged episode never moves `revision`, and a new prompt always does.
     """
     last = events["last_tracking"]
+    recovery = events.get("recovery")
     if last == "tracking_lost":
         return {
             "state": TRACKING_LOST,
             "evidence": "the most recent tracking event was tracking_lost",
             "limited_ever_reported": False,
+            "recovery": recovery,
         }
     if last == "keyframe_accepted":
         return {
             "state": TRACKING_GOOD,
             "evidence": "the most recent tracking event was keyframe_accepted",
             "limited_ever_reported": False,
+            "recovery": recovery,
         }
     return {
         "state": TRACKING_UNKNOWN,
         "evidence": "no keyframe has been accepted and no loss recorded",
         "limited_ever_reported": False,
+        "recovery": recovery,
     }
 
 

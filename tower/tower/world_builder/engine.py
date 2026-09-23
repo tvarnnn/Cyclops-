@@ -179,8 +179,16 @@ class WorldBuilderEngine:
         backend_name: str = BACKEND_AUTO,
         clock=time.time,
         redactor_factory=None,
+        relocalizer: str | None = None,
     ) -> None:
         self._store = store
+        # The look-back relocalizer's mode (`off` / `prompt` / `silent`,
+        # relocalizer.py). None reads `TOWER_WORLD_RELOCALIZER` at each
+        # session start -- the builder process inherits the Tower's
+        # environment -- and unset is `off`: nothing runs, nothing is
+        # journaled, and every journal is byte-identical to before.
+        self._relocalizer_mode = relocalizer
+        self._reloc = None
         self._policy = policy or KeyframePolicy()
         self._backend_name = backend_name
         # A factory rather than an instance: a redactor holds a loaded
@@ -291,6 +299,7 @@ class WorldBuilderEngine:
         self._segments_used: set[int] = set()
         self._rejected = {}
         self._events.append("session_started", {"frame_source": frame_source})
+        self._start_relocalizer(session)
         self._open_live_solve(session)
         return session.session_id
 
@@ -411,13 +420,23 @@ class WorldBuilderEngine:
             if self._live is not None:
                 self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
-            self._events.append(
+            lost = self._events.append(
                 "tracking_lost", {"segment_index": self._segment_index}
+            )
+            # The look-back relocalizer: a loss with no episode open opens
+            # one (the lost frame is its first scan); one inside an open
+            # episode joins it. Never waits on the matcher.
+            self._recovery(
+                lambda r: r.note_lost(lost.at)
+                + r.note_frame(gray, source_seq, None, self._clock())
             )
             return self._result(decision.outcome, decision.reason)
 
         if not decision.accepted:
             self._note_rejected(decision.reason)
+            self._recovery(
+                lambda r: r.note_frame(gray, source_seq, None, self._clock())
+            )
             return self._result(decision.outcome, decision.reason)
 
         keyframe, image_bytes = self._persist_keyframe(
@@ -516,6 +535,18 @@ class WorldBuilderEngine:
                 "segment_index": keyframe.segment_index,
             },
         )
+        # A reference for the NEXT loss, an anchor candidate for an open
+        # episode, and -- while one is open -- a scan frame that anchors
+        # itself. The relocalizer holds pixels in memory only; it journals
+        # numbers and keyframe ids, never imagery.
+        self._recovery(
+            lambda r: (
+                r.note_keyframe(keyframe.keyframe_id, source_seq, gray)
+                or r.note_frame(
+                    gray, source_seq, keyframe.keyframe_id, self._clock()
+                )
+            )
+        )
         return self._result(
             decision.outcome, decision.reason, keyframe_id=keyframe.keyframe_id
         )
@@ -586,6 +617,11 @@ class WorldBuilderEngine:
         stopped_payload = {"end_reason": reason}
         if capture_end_reason is not None:
             stopped_payload["capture_end_reason"] = capture_end_reason
+        # An episode still open when the walk ends can no longer recover:
+        # it is closed `timed_out` (why: session_stopped) BEFORE the stop
+        # line, so a stopped session never reads "searching" forever.
+        self._recovery(lambda r: r.close(self._clock()))
+        self._reloc = None
         self._events.append("session_stopped", stopped_payload)
         if not hold_lock:
             self._store.release_writer_lock(session.world_id)
@@ -1128,6 +1164,71 @@ class WorldBuilderEngine:
         )
 
     # -- internals -----------------------------------------------------
+
+    def _start_relocalizer(self, session) -> None:
+        """The session's look-back relocalizer, when the setting asks for one.
+
+        `relocalizer_started` is journaled right after `session_started`
+        and records what THIS builder runs with (contract s6.2: the payload
+        reads the limiter and acceptance from here, never from the web
+        process's configuration). No relocalizer -- `off`, no calibration,
+        or a failure to build one -- journals nothing, and the session's
+        `tracking.recovery` is null exactly as for every older session.
+        """
+        if self._reloc is not None:
+            try:
+                self._reloc.close(self._clock())
+            except Exception:
+                logger.exception("[Tower][WorldBuilder] closing a stale relocalizer failed")
+            self._reloc = None
+        mode = self._relocalizer_mode
+        if mode is None:
+            from tower.config import world_relocalizer_setting
+
+            mode = world_relocalizer_setting()
+        if mode not in ("prompt", "silent"):
+            return
+        try:
+            from tower.world_builder import relocalizer
+
+            reloc = relocalizer.from_session(session.intrinsics, mode=mode)
+        except Exception:
+            logger.exception(
+                "[Tower][WorldBuilder] look-back relocalizer unavailable for "
+                "session %s; the walk continues without it",
+                session.session_id,
+            )
+            return
+        if reloc is None:
+            return
+        self._events.append("relocalizer_started", reloc.started_payload())
+        self._reloc = reloc
+
+    def _recovery(self, step) -> None:
+        """Run one relocalizer step and journal what it decided, in order.
+
+        The relocalizer never writes the journal itself; its worker never
+        touches it at all. A relocalizer that raises is dropped for the rest
+        of the session -- it must never cost the walk a frame or a keyframe.
+        """
+        reloc = self._reloc
+        if reloc is None:
+            return
+        try:
+            events = step(reloc)
+        except Exception:
+            logger.exception(
+                "[Tower][WorldBuilder] look-back relocalizer failed; it is off "
+                "for the rest of this session"
+            )
+            self._reloc = None
+            try:
+                reloc.close(self._clock())
+            except Exception:
+                pass
+            return
+        for kind, payload in events or ():
+            self._events.append(kind, payload)
 
     def _open_live_solve(self, session) -> None:
         """Start the solve that observe() will extend.

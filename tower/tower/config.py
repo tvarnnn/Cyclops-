@@ -519,6 +519,33 @@ class Settings:
     # solver produced a solution.
     world_solve: bool = True
 
+    # Transient masks on the FINAL global solve's own images. OFF, and off is
+    # exactly today's solve; the lead and the manager flip it, measured.
+    #
+    # The wearer's hands, arms and the phone held in them are in most
+    # keyframes and move WITH the camera, so SIFT matches on them are
+    # geometrically consistent across rooms that share no scene at all. On
+    # the 2026-09-23 coherence run's target walk the only glue between two
+    # rigid islands was 7 verified pairs whose inliers sat on the held phone;
+    # masking hands, arms and held phones before extraction removed 117 of its
+    # 136 inliers and left 0 cross-island pairs (run FORENSICS H-A, candidate
+    # architecture module M). The masks are `transients.py`'s union recipe,
+    # computed once per solver image on the GPU (about 0.6 s a keyframe) and
+    # reused by the surface stage, which computes the same masks today.
+    #
+    # Only the final solve reads it: the background solves during a walk keep
+    # today's unmasked recipe. A machine that cannot run the detector still
+    # solves, unmasked, and the solution says so (`transients.state`).
+    world_solve_masks: bool = False
+    # The seeded single-thread final solve. None (unset) is today's solve:
+    # every core, and GLOMAP's own unseeded randomness. An integer seeds every
+    # mapper random number generator, pycolmap's global one and the two-view
+    # RANSAC, and maps on ONE thread, because GLOMAP is reproducible only
+    # then (run research D1 §2.4: bit-identical seeded single-thread runs;
+    # about 3.3x today's mapping time). Recorded in the solution as
+    # `solve.seed` and `solve.threads`.
+    world_solve_seed: int | None = None
+
     # Dense reconstruction after Stop. OFF, and the default is the decision.
     #
     # The stage turns the sparse solve into a per-pixel point cloud and is what
@@ -581,6 +608,18 @@ class Settings:
     # not start themselves.
     world_finish_pending: bool = True
 
+    # The live look-back relocalizer and its spoken prompt
+    # (tower/world_builder/relocalizer.py; WORLD-BUILDER-COMPONENTS.md s6).
+    # `off` (the default, and today's behaviour): nothing runs, nothing new is
+    # journaled, `tracking.recovery` is null. `prompt`: after a tracking loss
+    # the builder matches incoming frames against the keyframes before it,
+    # journals a verified revisit link when it relocalizes, and asks the
+    # wearer to look back when it does not -- at most 2 prompts a minute.
+    # `silent`: the relocalizer runs and records, prompts are never issued
+    # (the physical test's prompt-off arm). Read by the BUILDER process,
+    # which inherits the Tower's environment. Garbage reads as `off`.
+    world_relocalizer: str = "off"
+
 
 def get_settings() -> Settings:
     observation_enabled = _flag("TOWER_OBSERVATION_ENABLED", default=True)
@@ -627,10 +666,13 @@ def get_settings() -> Settings:
         ),
         world_register=_flag("TOWER_WORLD_REGISTER", default=True),
         world_solve=_flag("TOWER_WORLD_SOLVE", default=True),
+        world_solve_masks=world_solve_masks_setting(),
+        world_solve_seed=world_solve_seed_setting(),
         world_densify=_flag("TOWER_WORLD_DENSIFY", default=False),
         world_surface=_flag("TOWER_WORLD_SURFACE", default=True),
         world_appearance=_flag("TOWER_WORLD_APPEARANCE", default=True),
         world_finish_pending=_flag("TOWER_WORLD_FINISH_PENDING", default=True),
+        world_relocalizer=world_relocalizer_setting(),
         scene_understanding=_scene_enabled(scene_mode),
         scene_understanding_mode=scene_mode,
         scene_device=_device(os.environ.get("TOWER_SCENE_DEVICE"), default="auto"),
@@ -866,6 +908,99 @@ def _flag(name: str, *, default: bool) -> bool:
     # which would silently disable a cartridge whose flag defaults
     # ON. A spelling of true must never mean false.
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# The final solve's two settings, by name. Public, and read through the two
+# functions below rather than through `get_settings()`, because the reader is
+# the solve itself: a `world_solve.py` child (or `world_finalize.py`) that
+# inherits the Tower's environment and must not need the rest of the Tower's
+# configuration -- `get_settings()` raises on a malformed `TOWER_PORT`, which is
+# no reason for a solve to fail.
+WORLD_SOLVE_MASKS_ENV = "TOWER_WORLD_SOLVE_MASKS"
+WORLD_SOLVE_SEED_ENV = "TOWER_WORLD_SOLVE_SEED"
+
+
+def world_solve_masks_setting() -> bool:
+    """`TOWER_WORLD_SOLVE_MASKS`: transient masks on the final solve. Off."""
+    return _flag(WORLD_SOLVE_MASKS_ENV, default=False)
+
+
+def world_solve_seed_setting() -> int | None:
+    """`TOWER_WORLD_SOLVE_SEED`: the seed of the single-thread final solve.
+
+    Unset, blank, `off` or anything that is not a non-negative integer is
+    None -- today's multi-threaded, unseeded solve. A typo therefore turns the
+    seeded solve OFF rather than taking a solve down, the same reasoning as
+    `_non_negative_int`, and the solution's `solve.seed` record shows which
+    one ran.
+    """
+    value = os.environ.get(WORLD_SOLVE_SEED_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+# The final solve's evidence gate (`world_builder/coherence_publish.py`): depth
+# before publish, the gate, the relabelled components and
+# `solve/<session>/components.json`. Read like the two above, by the solve
+# itself. Off: today's final solve, published as the solver returned it.
+WORLD_SOLVE_GATE_ENV = "TOWER_WORLD_SOLVE_GATE"
+
+
+def world_solve_gate_setting() -> bool:
+    """`TOWER_WORLD_SOLVE_GATE`: the evidence gate on the final solve. Off.
+
+    Masks are a hard dependency of the gate (manager 011): with this on and
+    `TOWER_WORLD_SOLVE_MASKS` off, every final solve takes the gate's fail-safe
+    and attaches nothing outside the room's anchor block."""
+    return _flag(WORLD_SOLVE_GATE_ENV, default=False)
+
+
+# The AREA builds (`world_builder/area_build.py`, WORLD-BUILDER-COMPONENTS.md
+# §5.4): a surface and an appearance for each component the gate showed as an
+# area, built by `scripts/world_finish_pending.py` at the Tower's next idle
+# moment, 45-90 s each. Read by the finisher itself. Off, and off is today's
+# behaviour exactly: no area is ever built, and an area a components record
+# names is recorded as declined ("could not be built" on the phone) rather than
+# left owed. Only reachable at all when `TOWER_WORLD_SOLVE_GATE` has written a
+# components record; `scripts/world_refinish.py` builds areas regardless.
+WORLD_AREA_BUILDS_ENV = "TOWER_WORLD_AREA_BUILDS"
+
+
+def world_area_builds_setting() -> bool:
+    """`TOWER_WORLD_AREA_BUILDS`: build the areas a components record names. Off."""
+    return _flag(WORLD_AREA_BUILDS_ENV, default=False)
+
+
+WORLD_RELOCALIZER_ENV = "TOWER_WORLD_RELOCALIZER"
+
+
+def world_relocalizer_setting() -> str:
+    """`TOWER_WORLD_RELOCALIZER`: `off` (default), `prompt` or `silent`.
+
+    Unset or blank is `off`. `on`/`true`/`yes`/`1` mean `prompt`. Anything
+    else is `off`, and logged: a typo must never start asking the wearer to
+    turn around.
+    """
+    value = os.environ.get(WORLD_RELOCALIZER_ENV)
+    if value is None or not value.strip():
+        return "off"
+    word = value.strip().lower()
+    if word in ("prompt", "on", "1", "true", "yes"):
+        return "prompt"
+    if word == "silent":
+        return "silent"
+    if word not in ("off", "0", "false", "no"):
+        logger.warning(
+            "[Tower][Config] %s=%r is not off, prompt or silent; treating it "
+            "as off",
+            WORLD_RELOCALIZER_ENV, value,
+        )
+    return "off"
 
 
 def _torch_threads(value: str | None) -> int | str:
