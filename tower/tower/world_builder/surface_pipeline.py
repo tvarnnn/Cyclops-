@@ -403,6 +403,30 @@ def _dilate_fill(fill, px: int):
         fill.to(torch.float32)[None, None], k, 1, int(px)).squeeze(0).squeeze(0) > 0.5
 
 
+# The frame-admission rule's identity, carried into the surface params digest:
+# a surface fused while inverted or unscorable depth fits were admitted is NOT
+# what this code builds, so a cached one must not be answered "already built".
+FIT_GATE_ID = "fit-gate:a>0+scored"
+
+
+def fit_is_physical(a, b) -> bool:
+    """Whether a depth fit's (a, b) can be fused at all.
+
+    The depth stage fits `pred ~= a * z + b` ("depth" backends) or
+    `pred ~= a / z + b` ("disparity" backends), and depth is recovered by
+    inverting it (`dense.depth_from_prediction`). In both a > 0 is physics, not
+    tuning: the prediction must grow (depth) or shrink (disparity) with the
+    true distance. `a <= 0` turns near into far -- the frame's depth comes back
+    INVERTED, its surface lands behind the camera's own view and is stretched
+    by 1/|a| -- and a non-finite a or b is no fit at all.
+    """
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(a) and math.isfinite(b) and a > 0.0
+
+
 class _Frames:
     """The gated, posed frames of one session, with their depth on disk."""
 
@@ -425,10 +449,36 @@ class _Frames:
         self.correction = None
         self.consistency = None
         held = []
+        # Keyframe indices refused because their depth fit is not physical:
+        # inverted (`fit_is_physical`), or unscorable because the held-out
+        # half's own fit is (held_out_rel None; see below).
+        self.refused_inverted: list[int] = []
+        self.refused_unscorable: list[int] = []
         for r in align.get("records", []):
             if not r.get("ok"):
                 continue
+            # DEPTH MUST NOT INVERT. This gate used to read a None held-out
+            # score as "unscored, admit at the weight floor" -- and None is
+            # exactly what an inverted fit produces: `dense._relative_residual`
+            # refuses a held-out half whose slope is <= 0, or under whose fit
+            # fewer than 5 held-out anchors get a positive depth. The depth
+            # stage's min_sparse_points (20) guarantees both halves exist, so
+            # in this pipeline None ALWAYS means "the held-out half's own fit
+            # is not physical"; there is no benign None. Measured
+            # (wb-coherence-run-2026-09-23, P2-G0): on the target walk all 24
+            # None records had a <= 0 on the full fit too, and fused as
+            # near-for-far depth -- the sliver sheets and a 2x voxel coarsening
+            # of the WHOLE world; on 2f447162, 11 of 16 did, and the other 5
+            # (full-fit a > 0) were sign-unstable fits with in-sample errors of
+            # 0.07-18.6 and depth stretched up to 1200x. So the rule is the
+            # dense stage's own (`run_fuse_stage`: scored, <= gate_rel, a > 0).
             ho = r.get("held_out_rel")
+            if not fit_is_physical(r.get("a"), r.get("b")):
+                self.refused_inverted.append(int(r["ki"]))
+                continue
+            if ho is None:
+                self.refused_unscorable.append(int(r["ki"]))
+                continue
             if ho is not None:
                 held.append(ho)
                 if ho > params.gate_rel:
@@ -446,6 +496,12 @@ class _Frames:
                                np.array(pose["translation"], float),
                                1.0 if ho is None else float(ho),
                                r.get("z_sparse_max")))
+        if self.refused_inverted or self.refused_unscorable:
+            logger.warning(
+                "[Tower][WorldBuilder][surface] depth fits that are not physical are not "
+                "fused: %d inverted (a <= 0) %s, %d whose held-out half is (no held-out "
+                "score) %s", len(self.refused_inverted), self.refused_inverted[:40],
+                len(self.refused_unscorable), self.refused_unscorable[:40])
         self.median_held_out = float(np.median(held)) if held else None
         self.offered = len(align.get("records", []))
         # The fusion bound, attached by `surfacify` once the scene scale is
@@ -653,6 +709,9 @@ def surfacify(store, world_id: str, session_id: str, *,
 
         tparams = TransientParams(mode=params.transient_detector)
         pdigest += "|transients:" + tparams.rule_id()
+        # Which depth fits may be fused (`fit_is_physical`). A surface built
+        # before inverted fits were refused must be rebuilt, not reused.
+        pdigest += "|" + FIT_GATE_ID
         if is_raw(params.imagery_source):
             # §6.6. `_params_digest` already carries it through
             # `digest_fields`; this is the spelling a human reads in
@@ -866,6 +925,8 @@ def _outlier_record(frames: "_Frames", voxel: float = 0.0, coarsened: float = 1.
         return {}
     record = dict(frames.pose_gate)
     record.update({
+        "frames_refused_inverted_fit": len(getattr(frames, "refused_inverted", [])),
+        "frames_refused_unscorable_fit": len(getattr(frames, "refused_unscorable", [])),
         "frames_clipped_by_bound": int(frames.clipped_by_bound),
         "frames_emptied_by_bound": int(frames.emptied_by_bound),
         "pixels_clipped_by_bound": int(frames.pixels_clipped_by_bound),
