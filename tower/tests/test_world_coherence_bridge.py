@@ -306,3 +306,23 @@ def test_restore_keyframe_graph_transplants_the_reference_pairs_and_keeps_gap_pa
         assert arm.exists_two_view_geometry(ids[names[0]], ids[names[1]])          # keyframe-gap pair untouched
     finally:
         arm.close()
+
+
+def test_eloftr_keypoints_stay_sub_pixel():
+    kps = np.array([[[0.5013, 0.25], [0.1, 0.9]], [[0.5031, 0.2507], [0.2, 0.8]]])   # (2, N, 2) normalised
+    matches = np.array([[0, -1], [0, -1]])
+    scores = np.array([[0.9, 0.9], [0.9, 0.9]])
+    k0, k1, sc = B.matched_keypoints_float(kps, matches, scores, (639, 359), (639, 359), threshold=0.2)
+    assert k0.shape == (1, 2) and k1.shape == (1, 2) and sc.tolist() == [pytest.approx(0.9)]
+    assert np.allclose(k0[0], [0.5013 * 359, 0.25 * 639])        # 179.97, not truncated to 179
+    assert np.allclose(k1[0], [0.5031 * 359, 0.2507 * 639])
+
+
+def test_quantiser_absorbs_integer_truncation():
+    rng = np.random.default_rng(3)
+    xy = rng.uniform(0, 640, size=(5000, 2))
+    qa, qb = B.KeypointQuantiser(2.0), B.KeypointQuantiser(2.0)
+    qa.set_base(1, 0)
+    qb.set_base(1, 0)
+    assert np.array_equal(qa.indices(1, xy), qb.indices(1, np.floor(xy)))
+    assert np.array_equal(qa.new_keypoints(1), qb.new_keypoints(1))

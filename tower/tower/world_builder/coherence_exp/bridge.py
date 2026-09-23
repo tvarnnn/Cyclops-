@@ -103,7 +103,11 @@ ELOFTR_THRESHOLD = 0.2
 # COLMAP build a track of >= 3 views through that image (GLOMAP drops shorter
 # tracks: GlobalMapperOptions.track_min_num_views_per_track = 3). A 2 px cell
 # keeps the snap error (<= 1.41 px) well inside COLMAP's own 4 px two-view
-# RANSAC bound (TwoViewGeometryOptions.ransac.max_error).
+# RANSAC bound (TwoViewGeometryOptions.ransac.max_error). Cells are centred on
+# even integers, so their boundaries sit on odd integers: every x in [n, n+1)
+# falls in the cell of n. Keypoints truncated to int (transformers'
+# post-processing does that) therefore quantise to exactly the same cells as
+# the sub-pixel ones -- pinned by `test_quantiser_absorbs_integer_truncation`.
 DEFAULT_QUANT_PX = 2.0
 
 # The verified-pair rule every other coherence tool uses (trace.py): >= 15
@@ -571,17 +575,38 @@ class EloftrMatcher:
         self._torch = torch
 
     def match(self, image_a_rgb, image_b_rgb):
-        """(kp_a (N,2) float64, kp_b (N,2) float64, score (N,) float32)."""
+        """(kp_a (N,2) float64, kp_b (N,2) float64, score (N,) float32), sub-pixel.
+
+        NOT ``processor.post_process_keypoint_matching``: transformers casts the
+        scaled keypoints to int32 there (truncation, up to 1 px). Same scaling
+        and filtering, kept in float (`matched_keypoints_float`). One pair per
+        call (batching > 1 is also known to scramble matches across pairs).
+        """
         torch = self._torch
         inputs = self.processor([image_a_rgb, image_b_rgb], return_tensors="pt", size=self.size).to(self.device)
         with torch.inference_mode():
             out = self.model(**inputs)
-        res = self.processor.post_process_keypoint_matching(
-            out, [[image_a_rgb.shape[:2], image_b_rgb.shape[:2]]], threshold=self.threshold)[0]
-        ka = res["keypoints0"].cpu().numpy().astype(np.float64)
-        kb = res["keypoints1"].cpu().numpy().astype(np.float64)
-        sc = res["matching_scores"].cpu().numpy().astype(np.float32)
-        return ka, kb, sc
+        return matched_keypoints_float(
+            out.keypoints.float().cpu().numpy()[0], out.matches.cpu().numpy()[0],
+            out.matching_scores.float().cpu().numpy()[0], image_a_rgb.shape[:2], image_b_rgb.shape[:2],
+            self.threshold)
+
+
+def matched_keypoints_float(keypoints, matches, scores, hw0, hw1, threshold: float = ELOFTR_THRESHOLD):
+    """transformers' EfficientLoFTR post-processing without its int32 cast.
+
+    ``keypoints`` (2, N, 2) normalised to [0, 1] of each image; ``matches``
+    and ``scores`` (2, N). Row n of image 0 corresponds to row n of image 1.
+    Returns (kp0, kp1, score) in pixels of the ORIGINAL image sizes (h, w).
+    """
+    keypoints = np.asarray(keypoints, np.float64)
+    valid0 = (np.asarray(scores[0]) > threshold) & (np.asarray(matches[0]) > -1)
+    valid1 = (np.asarray(scores[1]) > threshold) & (np.asarray(matches[1]) > -1)
+    k0 = keypoints[0][valid0] * np.array([hw0[1], hw0[0]], np.float64)
+    k1 = keypoints[1][valid1] * np.array([hw1[1], hw1[0]], np.float64)
+    if len(k0) != len(k1):
+        raise ValueError(f"unpaired EfficientLoFTR output: {len(k0)} vs {len(k1)} keypoints")
+    return k0, k1, np.asarray(scores[0], np.float32)[valid0]
 
 
 @dataclass(frozen=True)
@@ -679,7 +704,8 @@ def precompute_eloftr(chains: list[Chain], images_dir, cache_path, *, matcher: E
     summary = {"pairs": len(pairs), "seconds": round(dt, 1), "ms_per_pair": round(1000 * dt / max(len(pairs), 1), 1),
                "peak_vram_mib": (round(torch.cuda.max_memory_allocated() / 2 ** 20)
                                  if device.startswith("cuda") else None),
-               "model": ELOFTR_MODEL_ID, "size": ELOFTR_SIZE, "threshold": matcher.threshold}
+               "model": ELOFTR_MODEL_ID, "size": ELOFTR_SIZE, "threshold": matcher.threshold,
+               "keypoints": "float (no int32 truncation)"}
     cache_path.with_suffix(".json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
@@ -988,6 +1014,7 @@ def _pad_descriptors(database_path, image_ids) -> None:
             if nk is None or row is None or row[0] >= nk[0]:
                 continue
             rows, cols, data = row
+            data = data or b""                      # an image with 0 descriptors stores NULL
             dtype = np.uint8 if len(data) == rows * cols else np.float32
             d = np.frombuffer(data, dtype).reshape(rows, cols)
             pad = np.zeros((nk[0] - rows, cols), dtype)
@@ -1145,7 +1172,7 @@ def restore_keyframe_graph(database_path, reference_db, *, is_keyframe=None, scr
             con = sqlite3.connect(str(path))
             try:
                 names = dict(con.execute("select image_id, name from images"))
-                kp = {names[i]: (r, bytes(d)) for i, r, d in con.execute("select image_id, rows, data from keypoints")
+                kp = {names[i]: (r, bytes(d or b"")) for i, r, d in con.execute("select image_id, rows, data from keypoints")
                       if is_keyframe(names[i])}
                 return {n: i for i, n in names.items()}, kp
             finally:
@@ -1156,10 +1183,15 @@ def restore_keyframe_graph(database_path, reference_db, *, is_keyframe=None, scr
         kf = sorted(n for n in ref_kp if n in arm_kp)
         # identical, or the reference's rows followed by appended (learned) ones
         bad = [n for n in kf if arm_kp[n][0] < ref_kp[n][0] or not arm_kp[n][1].startswith(ref_kp[n][1])]
-        if bad or len(kf) != len(ref_kp):
+        # Keyframes whose SIFT keypoints differ (measured once: a redacted keyframe whose transient mask
+        # differed between two runs) cannot take the reference's index-based pairs; they keep the arm's
+        # own pairs. Refuse only when most keyframes differ -- then this is the wrong reference.
+        if len(bad) > 0.05 * max(len(kf), 1) or len(kf) < 0.95 * len(ref_kp):
             raise RuntimeError(f"keyframe keypoints differ from the reference ({len(bad)} differ, "
                                f"{len(ref_kp) - len(kf)} missing): cannot transplant its pair graph")
+        kf = [n for n in kf if n not in set(bad)]
         kf_arm = {arm_ids[n] for n in kf}
+        kf_names = set(kf)
         rev_ref = {i: n for n, i in ref_ids.items()}
         # drop the arm's own keyframe-keyframe rows
         con = sqlite3.connect(str(database_path))
@@ -1193,6 +1225,8 @@ def restore_keyframe_graph(database_path, reference_db, *, is_keyframe=None, scr
                     na, nb = rev_ref.get(a), rev_ref.get(b)
                     if na is None or nb is None or not (is_keyframe(na) and is_keyframe(nb)):
                         continue
+                    if na not in kf_names or nb not in kf_names:
+                        continue
                     if kind == "matches":
                         db.write_matches(arm_ids[na], arm_ids[nb], np.asarray(ref.read_matches(a, b), np.uint32))
                     else:
@@ -1207,7 +1241,7 @@ def restore_keyframe_graph(database_path, reference_db, *, is_keyframe=None, scr
         Path(ref_copy).unlink(missing_ok=True)
         for side in ("-wal", "-shm"):
             Path(str(ref_copy) + side).unlink(missing_ok=True)
-    return {"keyframes": len(kf), "removed": removed, "added": added}
+    return {"keyframes": len(kf), "keypoints_differ": bad, "removed": removed, "added": added}
 
 
 def received_at_by_name(frames_csv) -> dict:
