@@ -85,6 +85,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.native_prewarm import prewarm_world_builder  # noqa: E402
+from tower.stdin_stop import watch_stdin_close  # noqa: E402
 from tower.capture import (  # noqa: E402
     END_REASON_DISCONNECT as END_REASON_CAPTURE_DISCONNECT,
     END_REASON_BOUNDED_LIMIT as END_REASON_CAPTURE_BOUNDED,
@@ -504,37 +505,21 @@ class StopRequest:
     def _watch_stdin(self) -> None:
         """Soft stop when the parent closes the pipe it holds.
 
-        A daemon thread blocked on a one-byte read: nothing is ever
-        written to this pipe, the request IS the close, and a pipe needs
-        no console -- which is why it is the channel that works under a
-        pseudoconsole, a service, or a job object.
+        Nothing is ever written to this pipe, the request IS the close, and
+        a pipe needs no console -- which is why it is the channel that works
+        under a pseudoconsole, a service, or a job object.
+
+        NOT A PARKED READ. This used to be a daemon thread blocked in
+        `os.read(0, 1)` for the whole run, and on Windows that read is half
+        of a deterministic deadlock with any library whose load-time code
+        touches descriptor 0 -- numpy's and scipy's OpenBLAS, pycolmap's
+        libgfortran. It is what held world 2f447162 for 95 minutes. See
+        `tower/stdin_stop.py` for the two native paths, measured.
         """
-
-        def wait_for_close() -> None:
-            # The RAW descriptor, never `sys.stdin.buffer.read(1)`. A read
-            # through the buffered object holds that object's lock for as
-            # long as it blocks, and when this process exits NORMALLY --
-            # the capture closed, the supervisor still holding the pipe --
-            # interpreter shutdown tries to take the same lock to close
-            # stdin and aborts: "Fatal Python error: _enter_buffered_busy:
-            # could not acquire lock for <_io.BufferedReader name='<stdin>'>",
-            # a non-zero exit for a run that succeeded. `os.read` takes no
-            # Python lock; the pending ReadFile dies with the process.
-            try:
-                fd = sys.stdin.fileno() if sys.stdin is not None else None
-            except (AttributeError, ValueError, OSError):
-                return
-            if fd is None:
-                return
-            try:
-                os.read(fd, 1)
-            except Exception:  # noqa: BLE001 -- an unreadable pipe is itself the request
-                pass
-            self.request(self.SOFT, "stdin-closed")
-
-        threading.Thread(
-            target=wait_for_close, name="world-builder-stop-watch", daemon=True
-        ).start()
+        watch_stdin_close(
+            lambda: self.request(self.SOFT, "stdin-closed"),
+            name="world-builder-stop-watch",
+        )
 
     def bounded(self, frames):
         """`frames`, ending at the next frame after a stop was asked for.

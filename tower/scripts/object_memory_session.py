@@ -77,7 +77,6 @@ import json
 import os
 import signal
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -86,6 +85,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.capture import CaptureFollower, FRAMES_FILENAME  # noqa: E402
 from tower.native_prewarm import prewarm_object_memory  # noqa: E402
+from tower.stdin_stop import watch_stdin_close  # noqa: E402
 from tower.capture_workers import (  # noqa: E402
     ATTACH_MODE_FROM_NOW,
     ATTACH_MODE_FROM_START,
@@ -410,38 +410,21 @@ class _StopRequest:
         pipe -- the request is the close -- so waiting for a newline would
         wait for something that is never coming, and a parent that did
         write something has still said the only thing this pipe can mean.
+
+        NOT A PARKED READ, on Windows. This used to be a daemon thread
+        blocked in `os.read(0, 1)`, and that read is half of a deterministic
+        deadlock with any library whose load-time code touches descriptor 0
+        -- the OpenBLAS that `scipy.linalg` loads for the OWLv2 verifier was
+        the 2026-09-06 zero-frame walk. `tower/stdin_stop.py` has the
+        mechanism and asks the pipe instead of reading it.
         """
 
-        def wait_for_close() -> None:
-            # The RAW descriptor, never `sys.stdin.buffer.read(1)`. A read
-            # through the buffered object holds that object's lock for as
-            # long as it blocks, and when this process exits NORMALLY --
-            # the capture closed, the supervisor still holding the pipe --
-            # interpreter shutdown tries to take the same lock to close
-            # stdin and aborts: "Fatal Python error: _enter_buffered_busy:
-            # could not acquire lock for <_io.BufferedReader name='<stdin>'>",
-            # a non-zero exit for a run that succeeded. `os.read` takes no
-            # Python lock; the pending ReadFile dies with the process.
-            try:
-                fd = sys.stdin.fileno() if sys.stdin is not None else None
-            except (AttributeError, ValueError, OSError):
-                return
-            if fd is None:
-                return
-            try:
-                os.read(fd, 1)
-            except Exception:
-                # A closed or unreadable pipe is itself the request. The
-                # alternative -- treating an unreadable stdin as "keep
-                # going" -- is a producer nobody can stop.
-                pass
+        def closed() -> None:
             self.requested = True
             if self.signal_name is None:
                 self.signal_name = "stdin-closed"
 
-        threading.Thread(
-            target=wait_for_close, name="object-memory-stop-watch", daemon=True
-        ).start()
+        watch_stdin_close(closed, name="object-memory-stop-watch")
 
     def bounded(self, frames):
         """`frames`, ending at the next frame after a stop was asked for.
@@ -472,7 +455,14 @@ class _StopRequest:
 def _prewarm_native_libraries() -> None:
     """Load the OpenBLAS-backed native stack BEFORE any watcher thread runs.
 
-    THE ZERO-FRAME DEADLOCK, AND WHY THIS ONE LINE PREVENTS IT.
+    CORRECTED ON 2026-09-23. The account below blames the Windows loader
+    lock and a DLL that spawns threads; the mechanism, reproduced on demand,
+    is the stop watcher's parked `os.read(0, 1)` holding descriptor 0 while
+    OpenBLAS's libgfortran touches descriptor 0 at load. The fix that covers
+    every library, not only this one, is `tower/stdin_stop.py`. This warm is
+    kept as belt and braces; see `tower/native_prewarm.py`.
+
+    THE ZERO-FRAME DEADLOCK, AND WHY THIS ONE LINE PREVENTED IT.
 
     The physical run on 2026-09-06 recorded a healthy capture -- 244
     frames, ~21 s -- and this producer, attached `from-start`, observed
@@ -661,10 +651,10 @@ def main(argv=None) -> int:
     if len(chosen) != 1:
         parser.error("exactly one of --frames or --follow-capture is required")
 
-    # BEFORE the stdin watcher is armed, and that order is load-bearing on
-    # Windows: warming the OpenBLAS-backed native stack while no thread is
-    # parked in a blocking pipe read is what stops the loader-lock deadlock
-    # that made a real walk observe zero frames. See
+    # BEFORE the stdin watcher is armed. It was the fix for the deadlock that
+    # made a real walk observe zero frames; since 2026-09-23 the watcher
+    # itself no longer parks a read (`tower/stdin_stop.py`), which is the
+    # fix, and this is kept as belt and braces. See
     # `_prewarm_native_libraries`.
     _prewarm_native_libraries()
 

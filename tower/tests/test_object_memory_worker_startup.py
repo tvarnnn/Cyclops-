@@ -9,10 +9,12 @@ deadlocked inside its own model load and never reached the frame loop.
 
 Dissected with py-spy on this host: the main thread is loading OpenBLAS
 (pulled in by `transformers` -> `scipy.linalg` while the OWLv2 verifier
-loads) under the Windows loader lock, and the `object-memory-stop-watch`
-daemon thread is blocked in a synchronous `ReadFile` on the stdin pipe the
-supervisor holds. A thread parked in a blocking pipe read while the loader
-brings up a DLL that creates threads is a hard hang: 0% CPU, forever.
+loads), and the `object-memory-stop-watch` daemon thread is blocked in a
+synchronous `ReadFile` on the stdin pipe the supervisor holds. A hard hang:
+0% CPU, forever. (Corrected on 2026-09-23: the two meet on descriptor 0,
+which OpenBLAS's libgfortran touches at load and the parked read holds, not
+on the loader lock. `tower/stdin_stop.py` no longer parks a read, which is
+the fix; the warm guarded here is kept as belt and braces.)
 
 It was invisible to the whole suite because every OTHER subprocess test
 pins `--verifier none` to avoid downloading weights -- so nothing loaded

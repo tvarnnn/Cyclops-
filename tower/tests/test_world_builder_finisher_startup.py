@@ -26,12 +26,21 @@ py-spy `--native` on the live process named it exactly:
         wait_for_close (scripts/world_build_session.py:529)
 
 That is the SAME deadlock Object Memory hit on 2026-09-06 and fixed in its
-own file: a DLL that spawns threads in `DllMain` cannot finish loading under
-the Windows loader lock while another thread is parked in a blocking pipe
-read. The fix had been written where the first bug was found, so World
-Builder inherited the bug rather than the fix. `tower/native_prewarm.py` is
-that fix extracted to one place; these tests are what keep both callers on
-it.
+own file by warming OpenBLAS before arming its watcher. The fix had been
+written where the first bug was found, so World Builder inherited the bug
+rather than the fix. `tower/native_prewarm.py` is that warm extracted to one
+place; these tests are what keep both callers on it.
+
+CORRECTED ON 2026-09-23. The mechanism is not the loader lock and not a
+race: the watcher's parked `os.read(0, 1)` holds descriptor 0, and any
+library that touches descriptor 0 at load waits for it -- every time, warm or
+cold. The warm covers the libraries it names; `tower/stdin_stop.py` removes
+the parked read and is the fix, and `tests/test_stdin_stop.py` is where the
+deadlock is actually formed, and refused, on a Windows host. The gated
+"real spawned worker" test below uses an EMPTY root, so the finisher exits
+before it ever arms its watcher; it proves the process exits, not that the
+deadlock cannot form.
+
 
 The ordering tests below need no GPU and no weights: the defect is the ORDER
 of two calls, and a fake for each records when it happened. The real
@@ -373,7 +382,7 @@ class TestARealSpawnedWorkerGetsPastItsNativeLoad:
             out, err = process.communicate()
             pytest.fail(
                 "the finisher never returned from its native load with the "
-                "stdin watcher armed -- the loader-lock deadlock is back. "
+                "stdin watcher armed -- the descriptor-0 deadlock is back. "
                 "Dump it with `py-spy dump --pid <pid> --native` and look "
                 "for LdrLoadDll on MainThread beside a ReadFile on "
                 "world-builder-stop-watch.\nstderr tail:\n"

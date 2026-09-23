@@ -155,9 +155,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 # `forgive_attempt` gives the attempt back whenever a stop was REQUESTED, and
 # that is right for the event it was written for. It is also unconditional,
 # and on 2026-09-22 that made the attempt bound unreachable IN THE ONE CASE IT
-# EXISTS FOR. The finisher deadlocked on a Windows loader lock -- `surfacify`
-# pulling OpenBLAS in through moge -> scipy.linalg while the stdin watcher sat
-# in a blocking `ReadFile` -- and sat at 0% CPU making no progress whatever.
+# EXISTS FOR. The finisher deadlocked loading OpenBLAS -- `surfacify` pulling
+# it in through moge -> scipy.linalg -- behind its own stdin watcher's parked
+# read on descriptor 0 (`tower/stdin_stop.py` has the mechanism and the fix),
+# and sat at 0% CPU making no progress whatever.
 # Every Tower start ran it again, every start ended in a stop, and every stop
 # handed the attempt back. The ledger on disk read, after all of them:
 #
