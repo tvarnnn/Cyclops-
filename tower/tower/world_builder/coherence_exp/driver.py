@@ -125,6 +125,10 @@ class VariantConfig:
     # Which seed's model is published and anchors the gate: "medoid" = the seed whose main
     # component agrees best with the others (generic, most reproducible); or an int seed.
     reference_seed: object = "medoid"
+    # The evidence gate's metric scale (gate.GateParams(rule="evidence")): the harness cache root holding
+    # <world_id>/depth (MoGe) and <world_id>/pairs (image-only pairs) the TRI ratio is measured from.
+    # None = default_metric_cache_root(). Unused by every other rule.
+    metric_cache: str | None = None
 
     def __post_init__(self):
         if self.masks not in MASKS:
@@ -904,6 +908,77 @@ def default_cache_root() -> Path:
                                r"C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\experiments\cache"))
 
 
+def default_metric_cache_root() -> Path:
+    return Path(os.environ.get("WB_COHERENCE_METRIC_CACHE",
+                               r"C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\baseline\metrics\cache"))
+
+
+def metric_log_tri(model: gate_mod.SeedModel, staging: dict, world_dir, metric_cache) -> tuple[dict, dict]:
+    """Per keyframe: the harness TRI ratio log(z_triangulated / z_MoGe) with `model`'s poses, within its own
+    components -- the metric scale the evidence gate tests (`GateParams.rule == "evidence"`).
+
+    The same measurement the harness scores (`eval_placement.triangulated_depth_ratios` over the cached
+    image-only pairs and MoGe depth, `metrics.PARAMS` floors) and the one the rule was validated with
+    (RUN P2-GT scripts/gt_lib.py `tri_ratios`). Keyed by staged image name; keyframes without a finite
+    ratio are absent (the gate then has no scale evidence for them). Solver-only frames are never measured.
+    """
+    from tower.world_builder.coherence_eval import eval_variant as ev
+    from tower.world_builder.coherence_eval.eval_depth import DepthCache, depth_dir
+    from tower.world_builder.coherence_eval.eval_pairs import PairSet, pairs_dir
+    from tower.world_builder.coherence_eval.eval_placement import triangulated_depth_ratios
+    from tower.world_builder.coherence_eval.eval_world import open_world as open_eval_world
+    from tower.world_builder.coherence_eval.metrics import PARAMS, Prepared
+
+    hw = open_eval_world(world_dir)
+    depth = DepthCache(depth_dir(metric_cache, hw.world_id))
+    pairs = PairSet(pairs_dir(metric_cache, hw.world_id))
+    if not depth.available or not pairs.available:
+        raise RuntimeError(
+            f"the evidence gate needs the harness depth and pair caches for {hw.world_id} under {metric_cache} "
+            f"(depth available: {depth.available}, pairs available: {pairs.available}); build them with "
+            "scripts/world_coherence_eval.py cache")
+    kidx = {k: i for i, k in enumerate(hw.keyframe_ids)}
+    kf_of_name = {r["name"]: kidx[r["keyframe_id"]] for r in staging["images"]
+                  if r["kind"] == "keyframe" and r.get("keyframe_id") in kidx}
+    v = ev.Variant(name="evidence-gate-tri", world_id=hw.world_id, session_id=hw.session_id)
+    for i, n in enumerate(model.names):
+        k = kf_of_name.get(n)
+        if k is None:
+            continue
+        kid = hw.keyframe_ids[k]
+        v.poses[kid] = _T_world_camera(model.R_cw[i], model.t_cw[i])
+        v.component[kid] = str(int(model.component[i]))
+        v.status[kid] = "published" if model.n_obs[i] >= gs.MIN_IMAGE_OBSERVATIONS else "posed"
+    segment_of = [int(k.get("segment_index", -1)) for k in hw.keyframes]
+    times = np.array([float(k["received_at"]) if k.get("received_at") is not None else np.nan
+                      for k in hw.keyframes])
+    p = Prepared(v, hw.keyframe_ids, segment_of, times)
+    r = triangulated_depth_ratios(p, pairs.arrays, lambda i, uv: depth.sample(hw.image_name(i), uv),
+                                  hw.canonical_K(), min_samples=PARAMS["depth_min_samples"],
+                                  valid_m=PARAMS["depth_valid_m"])["r"]
+    out = {n: float(r[k]) for n, k in kf_of_name.items() if np.isfinite(r[k])}
+    info = {"source": "harness TRI ratio (eval_placement.triangulated_depth_ratios)",
+            "metric_cache": str(metric_cache), "depth_digest": depth.digest(), "pairs_digest": pairs.digest(),
+            "seed": model.seed, "keyframes": len(kf_of_name), "keyframes_with_ratio": len(out)}
+    return out, info
+
+
+def gate_inputs(gp: gate_mod.GateParams, models: list, staging: dict, world_dir, database_path,
+                metric_cache) -> tuple[dict, dict]:
+    """Keyword arguments for `gate.apply_rigid_gate` beyond (models, params), and a record of them.
+
+    The shared-point rule needs nothing more. The evidence rule needs the solver's own verified view graph
+    (`links`, read-only from the database the seeds were mapped from) and a per-keyframe metric scale
+    (`metric_log`, the reference model's TRI ratio; `metric_log_tri`)."""
+    if gp.rule != "evidence":
+        return {}, {"rule": gp.rule}
+    links = gate_mod.read_verified_links(database_path, min_inliers=gp.min_link_inliers)
+    metric_log, minfo = metric_log_tri(models[0], staging, world_dir, metric_cache)
+    return ({"links": links, "metric_log": metric_log},
+            {"rule": gp.rule, "links": len(links), "links_min_inliers": gp.min_link_inliers,
+             "database": str(database_path), "metric_log": minfo})
+
+
 def run_variant(world_dir, captures_root, out_dir, config: VariantConfig, *, cache_root=None,
                 regions_dir=None, log=print) -> dict:
     t_start = time.perf_counter()
@@ -996,12 +1071,17 @@ def run_variant(world_dir, captures_root, out_dir, config: VariantConfig, *, cac
     t = time.perf_counter()
     labels = None
     gate_report = None
+    gate_inputs_info = None
     if config.gate == "rigid":
         gp = gate_mod.GateParams.from_json(config.gate_params)
-        gate_report = gate_mod.apply_rigid_gate(models, gp)
+        metric_cache = Path(config.metric_cache) if config.metric_cache else default_metric_cache_root()
+        extra, gate_inputs_info = gate_inputs(gp, models, staging, world_dir, db_cache / "database.db",
+                                              metric_cache)
+        gate_report = gate_mod.apply_rigid_gate(models, gp, **extra)
         labels = gate_report["labels"]
         (out_dir / "gate.json").write_text(json.dumps(gate_mod._json_clean(
-            {k: v for k, v in gate_report.items() if k != "labels"}), indent=1), encoding="utf-8")
+            dict({k: v for k, v in gate_report.items() if k != "labels"}, inputs=gate_inputs_info)),
+            indent=1), encoding="utf-8")
     timings["gate_s"] = round(time.perf_counter() - t, 3)
 
     ref = models[0]
@@ -1024,7 +1104,8 @@ def run_variant(world_dir, captures_root, out_dir, config: VariantConfig, *, cac
                 mask_summary=None if mask_stats is None else masks_mod.area_summary(mask_stats),
                 mask_rule=mask_rule, reference_seed=ref.seed, reference_choice=ref_choice,
                 seed_runs={str(k): v for k, v in seed_runs.items()},
-                gate_splits=None if gate_report is None else gate_report["splits"])
+                gate_splits=None if gate_report is None else gate_report["splits"],
+                gate_inputs=gate_inputs_info)
     export = export_variant(ref, labels, staging, world, out_dir / "variant", config, name=config.name, meta=meta)
     meta["export"] = export
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
