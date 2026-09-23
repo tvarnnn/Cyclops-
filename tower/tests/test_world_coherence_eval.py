@@ -1136,3 +1136,74 @@ def test_eloftr_float_matches_are_the_library_postprocess_without_truncation():
     assert torch.equal(ours["matching_scores"], lib["matching_scores"])
     frac = (ours["keypoints0"] - ours["keypoints0"].floor()).abs()
     assert float(frac.max()) > 0.1   # sub-pixel information survives
+
+
+def _minimal_pair_arrays(i, j):
+    n = len(i)
+    return {"i": np.asarray(i, np.int32), "j": np.asarray(j, np.int32),
+            "R": np.repeat(np.eye(3)[None], n, 0), "t": np.tile([0.0, 0.0, 1.0], (n, 1)),
+            "t_reliable": np.ones(n, bool)}
+
+
+def test_pairset_never_reads_the_grid_snapped_eloftr_tier(tmp_path):
+    """V4b: the transformers EfficientLoFTR tier (versions 1-2) snapped every
+    match to an 8-px grid. Its files stay on disk but must not feed metrics;
+    only the ALIKED+LightGlue tier (version 3) is read."""
+    from tower.world_builder.coherence_eval import eval_pairs as EP
+
+    np.savez_compressed(tmp_path / EP.LOFTR_ARRAYS, **_minimal_pair_arrays([0], [5]))
+    (tmp_path / EP.LOFTR_MANIFEST).write_text(json.dumps({"complete": True}), encoding="utf-8")
+    assert PairSet(tmp_path).larrays is None
+    np.savez_compressed(tmp_path / EP.LEARNED_ARRAYS, **_minimal_pair_arrays([1], [7]))
+    (tmp_path / EP.LEARNED_MANIFEST).write_text(json.dumps({"complete": True}), encoding="utf-8")
+    ps = PairSet(tmp_path)
+    assert ps.larrays["i"].tolist() == [1] and ps.larrays["j"].tolist() == [7]
+
+
+def test_learned_tier_verifies_the_matchers_points_across_islands(tmp_path):
+    """The tier asks the matcher for every cross-island candidate and keeps
+    exactly the pairs verify_points accepts, under the version-3 files."""
+    from types import SimpleNamespace
+
+    from tower.world_builder.coherence_eval import eval_pairs as EP
+
+    rng = np.random.default_rng(5)
+    Xw = np.c_[rng.uniform(-2, 2, 400), rng.uniform(-3, 3, 400), rng.uniform(4, 8, 400)]
+    Rj = _rot_axis([0.1, 1, 0.05], 0.15)
+    Cj = np.array([0.6, 0.05, 0.1])
+    Pj = (Rj.T @ (Xw - Cj).T).T
+    ui = (K @ (Xw / Xw[:, 2:]).T).T[:, :2]
+    uj = (K @ (Pj / Pj[:, 2:]).T).T[:, :2]
+    ok = (ui[:, 0] > 0) & (ui[:, 0] < W) & (ui[:, 1] > 0) & (ui[:, 1] < H) & \
+         (uj[:, 0] > 0) & (uj[:, 0] < W) & (uj[:, 1] > 0) & (uj[:, 1] < H)
+    ui, uj = ui[ok], uj[ok]
+
+    class Matcher:
+        calls = []
+
+        def match(self, a, b, key_a, key_b):
+            self.calls.append((key_a, key_b))
+            if (key_a, key_b) == (3, 14):
+                return ui, uj, np.ones(len(ui), np.float32)
+            return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, np.float32)
+
+    n = 20
+    world = SimpleNamespace(world_id="w", session_id="s", n=n, canonical_K=lambda: K,
+                            canonical_camera={"width": W, "height": H},
+                            canonical_image=lambda i: (np.zeros((H, W, 3), np.uint8), "fake"))
+    root = EP.pairs_dir(tmp_path, "w")
+    root.mkdir(parents=True)
+    chain = [(k, k + 1) for k in range(9)] + [(k, k + 1) for k in range(10, 19)]
+    np.savez_compressed(root / "pairs.npz", **_minimal_pair_arrays(*zip(*chain)))
+    (root / "manifest.json").write_text(json.dumps({"complete": True}), encoding="utf-8")
+    desc = rng.normal(size=(n, 8)).astype(np.float32)
+    np.save(root / "descriptors.npy", desc / np.linalg.norm(desc, axis=1, keepdims=True))
+    matcher = Matcher()
+    m = EP.build_learned_cross_island_tier(world, tmp_path, matcher=matcher, log=lambda s: None)
+    assert len(matcher.calls) == 100          # every 10 x 10 cross-island candidate
+    assert m["params"]["version"] == 3
+    assert m["counts"] == {"candidates": 100, "verified_strict": 1}
+    assert m["links_by_island_pair"] == {"0-1": 1}
+    ps = PairSet(root)
+    assert ps.larrays["i"].tolist() == [3] and ps.larrays["j"].tolist() == [14]
+    assert not (root / EP.LOFTR_ARRAYS).exists()

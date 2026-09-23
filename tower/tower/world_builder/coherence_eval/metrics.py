@@ -1509,9 +1509,9 @@ def evaluate_world_variant(world, variant, *, cache_root, regions_dir=None, rend
                                                              {"digest": pairs.xdigest(),
                                                               "counts": pairs.xmanifest.get("counts"),
                                                               "params": pairs.xmanifest.get("params")}),
-                                       "cross_island_loftr": (None if pairs.lmanifest is None else
-                                                              {"counts": pairs.lmanifest.get("counts"),
-                                                               "params": pairs.lmanifest.get("params")})}},
+                                       "cross_island_learned": (None if pairs.lmanifest is None else
+                                                                {"counts": pairs.lmanifest.get("counts"),
+                                                                 "params": pairs.lmanifest.get("params")})}},
                   "labels": {"regions": regions is not None, "revisit_ranges": revisit_rows is not None}},
         "variant": {"name": variant.name, "image_space": variant.image_space, "meta": meta,
                     "posed": len(variant.poses), "points": 0 if variant.xyz is None else int(len(variant.xyz)),

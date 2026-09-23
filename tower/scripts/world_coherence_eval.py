@@ -14,8 +14,8 @@ SUBCOMMANDS
                              SIFT + essential-matrix RANSAC (CPU) -- the base tier
              --what xisland  flagged cross-island tier: exhaustive SIFT between
                              the base tier's islands (CPU)
-             --what xisland_loftr  optional EfficientLoFTR cross-island tier (GPU;
-                             weights in the HF cache named by HF_HOME)
+             --what xisland_learned  optional ALIKED+LightGlue cross-island tier
+                             (GPU; `lightglue` on sys.path, weights under TORCH_HOME)
   eval     metrics.json + metrics.md for one variant of one world
   compare  a diff table of two metrics.json
   table    headline metrics of several metrics.json side by side
@@ -79,7 +79,7 @@ def cmd_cache(args) -> int:
 
         m = build_cross_island_tier(world, root, workers=args.workers, log=lambda s: print(s, flush=True))
         print(json.dumps({k: m[k] for k in ("counts", "links_by_island_pair", "seconds") if k in m}, indent=1))
-    if "xisland_loftr" in what:
+    if "xisland_learned" in what:
         from tower.world_builder.coherence_eval.eval_pairs import build_learned_cross_island_tier
 
         m = build_learned_cross_island_tier(world, root, log=lambda s: print(s, flush=True))
@@ -218,9 +218,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("cache", help="build per-world caches (depth: GPU; pairs: CPU)")
     world_args(c)
     cache_arg(c)
-    c.add_argument("--what", choices=("depth", "pairs", "xisland", "xisland_loftr", "all"), default="all",
-                   help="xisland = the flagged cross-island SIFT tier (needs pairs first); xisland_loftr = "
-                        "the optional learned-matcher tier (GPU; EfficientLoFTR weights via HF_HOME); "
+    c.add_argument("--what", choices=("depth", "pairs", "xisland", "xisland_learned", "all"), default="all",
+                   help="xisland = the flagged cross-island SIFT tier (needs pairs first); xisland_learned = "
+                        "the optional learned-matcher tier (GPU; ALIKED+LightGlue, weights via TORCH_HOME); "
                         "all = pairs + xisland + depth")
     c.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     c.add_argument("--allow-descriptor-fallback", action="store_true",

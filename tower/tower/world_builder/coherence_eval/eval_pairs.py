@@ -135,11 +135,13 @@ class PairSet:
             self.xmanifest = json.loads(xm.read_text(encoding="utf-8"))
             with np.load(xz, allow_pickle=False) as f:
                 self.xarrays = {k: f[k] for k in f.files}
-        # the optional learned-matcher cross-island tier (EfficientLoFTR)
+        # the optional learned-matcher cross-island tier (ALIKED+LightGlue).
+        # The EfficientLoFTR files of versions 1-2 (LOFTR_ARRAYS) are never
+        # read: that matcher snapped every match to its 8-px grid (V4b).
         self.lmanifest = None
         self.larrays = None
-        lm = self.root / LOFTR_MANIFEST
-        lz = self.root / LOFTR_ARRAYS
+        lm = self.root / LEARNED_MANIFEST
+        lz = self.root / LEARNED_ARRAYS
         if lm.is_file() and lz.is_file():
             self.lmanifest = json.loads(lm.read_text(encoding="utf-8"))
             with np.load(lz, allow_pickle=False) as f:
@@ -625,16 +627,22 @@ def build_cross_island_tier(world: WorldInfo, cache_root, *, workers: int | None
     return manifest
 
 
+# Versions 1-2 of the learned tier (EfficientLoFTR through transformers 5.16)
+# wrote these files. That port returns its matches on the 8-px coarse grid,
+# so they are left on disk and never read (`PairSet` loads LEARNED_*).
 LOFTR_ARRAYS = "xisland_loftr.npz"
 LOFTR_MANIFEST = "xisland_loftr_manifest.json"
-LOFTR_PARAMS = {
-    "version": 2,
-    "matcher": "zju-community/efficientloftr (Apache-2.0) via transformers",
-    "input_size": [608, 352],
-    "match_threshold": 0.2,
+
+LEARNED_ARRAYS = "xisland_learned.npz"
+LEARNED_MANIFEST = "xisland_learned_manifest.json"
+LEARNED_PARAMS = {
+    "version": 3,
+    "matcher": "aliked-n16+lightglue (learned_match.AlikedLightGlue; Apache-2.0 / BSD-3)",
+    "matcher_params": None,  # filled from learned_match.ALIKED_LG_PARAMS at build time
+    "input_size": "native (the canonical undistorted keyframe, no resize)",
     "min_island": 10,
     "top_k_per_island_pair": 200,
-    "keypoints": "float (eloftr_matches_float: post_process_keypoint_matching minus its int32 cast)",
+    "keypoints": "float, sub-pixel (validated: P2-LM subpixel_check, median 0.04-0.23 px on synthetic shifts)",
     "verification": "verify_points with the base tier's own floors (strict) -- same RANSAC, same thresholds",
 }
 
@@ -662,9 +670,9 @@ def eloftr_matches_float(outputs, target_sizes, threshold: float = 0.0) -> list[
 
 
 def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str | None = None, log=print,
-                                    top_k: int | None = None) -> dict:
-    """Optional, flagged tier: a detector-free learned matcher (EfficientLoFTR,
-    Apache-2.0) on the most similar cross-island candidates.
+                                    top_k: int | None = None, matcher=None) -> dict:
+    """Optional, flagged tier: a learned matcher (ALIKED+LightGlue,
+    `learned_match.AlikedLightGlue`) on the most similar cross-island candidates.
 
     SIFT finds no strict cross-island pair on the target even exhaustively;
     this asks whether a stronger matcher does. Candidates: for every pair of
@@ -672,15 +680,14 @@ def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str
     ``top_k_per_island_pair`` most DINOv2-similar keyframe pairs across them.
     Matches are verified by `verify_points` with the base tier's floors, so a
     pair kept here meets the same geometric bar as a base pair; only the
-    correspondence source differs. The weights must be in the Hugging Face
-    cache (set HF_HOME); nothing is downloaded when HF_HUB_OFFLINE=1.
+    correspondence source differs. Needs ``lightglue`` on sys.path and its
+    weights in the torch hub cache (TORCH_HOME). ``matcher``: anything with
+    ``match(rgb_a, rgb_b, key_a, key_b) -> (kp_a, kp_b, score)`` (tests).
     """
     import cv2
-    import torch
-    from transformers import AutoImageProcessor, AutoModelForKeypointMatching
 
     params = dict(PAIR_PARAMS)
-    lp = dict(LOFTR_PARAMS)
+    lp = dict(LEARNED_PARAMS)
     if top_k is not None:
         lp["top_k_per_island_pair"] = int(top_k)
     root = pairs_dir(cache_root, world.world_id)
@@ -705,10 +712,18 @@ def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str
                 x, y = (i, j) if i < j else (j, i)
                 cands.append((x, y, 4, float(sim[x, y])))
     cands = sorted(set(cands))
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    proc = AutoImageProcessor.from_pretrained("zju-community/efficientloftr")
-    model = AutoModelForKeypointMatching.from_pretrained("zju-community/efficientloftr").to(device).eval()
-    log(f"[loftr] {world.world_id[:8]}: {len(big)} islands >= {lp['min_island']} kf, {len(cands)} candidates on {device}")
+    torch = None
+    if matcher is None:
+        import torch
+
+        from tower.world_builder.coherence_eval.learned_match import ALIKED_LG_PARAMS, AlikedLightGlue
+
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        matcher = AlikedLightGlue(device=device)
+        lp["matcher_params"] = dict(ALIKED_LG_PARAMS)
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+    log(f"[learned] {world.world_id[:8]}: {len(big)} islands >= {lp['min_island']} kf, {len(cands)} candidates")
     K = world.canonical_K()
     size = (int(world.canonical_camera["width"]), int(world.canonical_camera["height"]))
     cache: dict[int, np.ndarray] = {}
@@ -719,41 +734,36 @@ def build_learned_cross_island_tier(world: WorldInfo, cache_root, *, device: str
             if img is None:
                 raise RuntimeError(f"keyframe {i}: no canonical image ({kind})")
             cache[i] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if len(cache) > 256:
+                cache.pop(next(iter(cache)))
         return cache[i]
 
     keep = []
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
     for n_done, (i, j, src, sv) in enumerate(cands):
-        a, b = rgb(i), rgb(j)
-        inputs = proc([a, b], return_tensors="pt", size={"height": lp["input_size"][0],
-                                                          "width": lp["input_size"][1]}).to(device)
-        with torch.inference_mode():
-            out = model(**inputs)
-        res = eloftr_matches_float(out, [[a.shape[:2], b.shape[:2]]], threshold=lp["match_threshold"])[0]
-        p0 = res["keypoints0"].cpu().numpy().astype(np.float64)
-        p1 = res["keypoints1"].cpu().numpy().astype(np.float64)
-        r = verify_points(p0, p1, K, size, params, distant=(j - i) > params["distant_gap"])
+        p0, p1, _ = matcher.match(rgb(i), rgb(j), i, j)
+        r = verify_points(np.asarray(p0, np.float64), np.asarray(p1, np.float64), K, size, params,
+                          distant=(j - i) > params["distant_gap"])
         if r is not None:
             keep.append(((i, j, src, sv), r))
         if (n_done + 1) % 200 == 0:
-            log(f"[loftr] {n_done + 1}/{len(cands)} ({len(keep)} verified) {time.time() - t0:.0f}s")
+            log(f"[learned] {n_done + 1}/{len(cands)} ({len(keep)} verified) {time.time() - t0:.0f}s")
     arrays = _pack(keep)
     arrays["strict"] = np.ones(len(keep), bool)
     arrays["island_i"] = lab[arrays["i"]].astype(np.int32)
     arrays["island_j"] = lab[arrays["j"]].astype(np.int32)
-    np.savez_compressed(root / LOFTR_ARRAYS, **arrays)
+    np.savez_compressed(root / LEARNED_ARRAYS, **arrays)
     link: dict[str, int] = {}
     for (c, _) in keep:
         x, y = sorted((int(lab[c[0]]), int(lab[c[1]])))
         link[f"{x}-{y}"] = link.get(f"{x}-{y}", 0) + 1
+    cuda = torch is not None and device == "cuda"
     manifest = {"world_id": world.world_id, "session_id": world.session_id, "params": lp,
                 "base_params": params, "base_digest": base.digest(),
                 "counts": {"candidates": len(cands), "verified_strict": len(keep)},
                 "links_by_island_pair": dict(sorted(link.items())),
                 "complete": True, "seconds": round(time.time() - t0, 2),
-                "peak_vram_mb": (round(torch.cuda.max_memory_allocated() / 2**20, 1) if device == "cuda" else None)}
-    (root / LOFTR_MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
-    log(f"[loftr] {world.world_id[:8]}: {manifest['counts']} links {manifest['links_by_island_pair']} "
+                "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 2**20, 1) if cuda else None}
+    (root / LEARNED_MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+    log(f"[learned] {world.world_id[:8]}: {manifest['counts']} links {manifest['links_by_island_pair']} "
         f"in {time.time() - t0:.0f}s")
     return manifest
