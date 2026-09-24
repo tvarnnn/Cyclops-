@@ -183,8 +183,13 @@ final class WorldComponentsWordsTests: XCTestCase {
 
     func testSpansAreMinutesAndSecondsOfTheWalkWithAnEnDash() {
         let spans = [WorldCaptureSpan(start: 29.4, end: 33.2), WorldCaptureSpan(start: 109.0, end: 131.6)]
-        // The start floors and the end ceilings: an envelope never shrinks.
-        XCTAssertEqual(WorldComponentsPresentation.spans(spans), "0:29–0:34 and 1:49–2:12")
+        // Truncated, as the Tower's `walk_time` and the contract's examples are.
+        XCTAssertEqual(WorldComponentsPresentation.spans(spans), "0:29–0:33 and 1:49–2:11")
+        // §8's own example, from the target's bed corner [[29.6, 33.1], [109.7, 132.4]].
+        XCTAssertEqual(
+            WorldComponentsPresentation.spans([WorldCaptureSpan(start: 29.6, end: 33.1),
+                                               WorldCaptureSpan(start: 109.7, end: 132.4)]),
+            "0:29–0:33 and 1:49–2:12")
         XCTAssertEqual(WorldComponentsPresentation.spans([WorldCaptureSpan(start: 86.0, end: 109.0)]), "1:26–1:49")
         XCTAssertEqual(
             WorldComponentsPresentation.spans([WorldCaptureSpan(start: 0, end: 5), WorldCaptureSpan(start: 60, end: 61),
@@ -192,7 +197,7 @@ final class WorldComponentsWordsTests: XCTestCase {
             "0:00–0:05, 1:00–1:01 and 2:00–2:05")
         XCTAssertNil(WorldComponentsPresentation.spans([]))
         // No hours, and minutes are not wrapped past 59.
-        XCTAssertEqual(WorldComponentsPresentation.span(WorldCaptureSpan(start: 3725.0, end: 3726.2)), "62:05–62:07")
+        XCTAssertEqual(WorldComponentsPresentation.span(WorldCaptureSpan(start: 3725.0, end: 3726.2)), "62:05–62:06")
     }
 
     func testTheAreasRowFooterAndCaptionSuffix() throws {
@@ -200,7 +205,7 @@ final class WorldComponentsWordsTests: XCTestCase {
         XCTAssertEqual(WorldComponentsPresentation.areasHeading(components),
                        "2 more areas — captured on this walk but not placed in this room.")
         XCTAssertEqual(WorldComponentsPresentation.areaLine(number: 1, area: components.areas[0]),
-                       "Area 1 · 0:29–0:34 and 1:49–2:12 · 66 photos")
+                       "Area 1 · 0:29–0:33 and 1:49–2:11 · 66 photos")
         XCTAssertEqual(WorldComponentsPresentation.footer(components),
                        "1 short stretch (21 photos) could not be placed or shown.")
         XCTAssertEqual(WorldComponentsPresentation.roomCaptionSuffix(components), " · 2 more areas shown separately")
@@ -243,11 +248,13 @@ final class WorldComponentsWordsTests: XCTestCase {
             + "position, direction and size are not comparable with the room's. Not to scale.")
         let surface = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans)
         XCTAssertTrue(surface.hasPrefix("Surfaces the Tower reconstructed from the walk, from 1:26 to 1:49"), surface)
-        XCTAssertEqual(
-            WorldComponentsPresentation.spansInProse([WorldCaptureSpan(start: 29.4, end: 33.2),
-                                                      WorldCaptureSpan(start: 109.0, end: 131.6)]),
-            "0:29 to 0:34 and 1:49 to 2:12")
-        XCTAssertNil(WorldComponentsPresentation.spansInProse([]))
+        // §5.4's own example: the target's bathroom, several spans, ONE range --
+        // first start to last end, truncated, exactly as the Tower's page says it.
+        let bathroom = [WorldCaptureSpan(start: 86.7, end: 97.1), WorldCaptureSpan(start: 106.4, end: 109.6)]
+        XCTAssertEqual(WorldComponentsPresentation.envelopeInProse(bathroom), "1:26 to 1:49")
+        XCTAssertTrue(WorldComponentsPresentation.areaCaption(representation: .appearance, spans: bathroom)
+            .contains("from 1:26 to 1:49 of this walk."))
+        XCTAssertNil(WorldComponentsPresentation.envelopeInProse([]))
         let tilted = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans, levelled: false)
         XCTAssertTrue(tilted.contains("Its vertical could not be estimated, so it may look tilted."), tilted)
         for caption in [appearance, surface, tilted] {

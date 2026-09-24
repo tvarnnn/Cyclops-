@@ -203,22 +203,26 @@ nonisolated struct WorldComponents: Equatable, Sendable {
 /// like `WorldListingPresentation`, so every sentence is tested without a view.
 nonisolated enum WorldComponentsPresentation {
 
-    /// `m:ss` of the walk: minutes are not wrapped past 59 and hours are never
-    /// used (§8, C1 E14). The start of a span is floored and the end is
-    /// ceilinged, because a span is an envelope: "captured between A and B"
-    /// must not shrink when it is rounded.
-    static func clock(_ seconds: Double, roundingUp: Bool) -> String {
-        let whole = max(0, Int(roundingUp ? seconds.rounded(.up) : seconds.rounded(.down)))
+    /// `m:ss` of the walk: minutes are not wrapped past 59, hours are never used
+    /// (§8, C1 E14), and seconds are **truncated** -- exactly the Tower's
+    /// `surface_render.walk_time`, which writes the area page's own caption,
+    /// so the phone and the page never differ by a second. It is also what
+    /// the contract's own examples show: §8's "0:29–0:33 and 1:49–2:12" and
+    /// §5.4's "from 1:26 to 1:49" for spans ending at 33.1 s, 132.4 s and
+    /// 109.6 s. (It was ceilinged at the end before G1, which put "0:34" and
+    /// "2:13" beside a page saying "0:33" and "2:12".)
+    static func clock(_ seconds: Double) -> String {
+        let whole = max(0, Int(seconds.rounded(.down)))
         return "\(whole / 60):" + String(format: "%02d", whole % 60)
     }
 
     /// `0:29–0:33`, with an en dash.
     static func span(_ span: WorldCaptureSpan) -> String {
-        clock(span.start, roundingUp: false) + "–" + clock(span.end, roundingUp: true)
+        clock(span.start) + "–" + clock(span.end)
     }
 
     /// `0:29–0:33 and 1:49–2:12`; three or more are joined with commas and a
-    /// final "and". `nil` for no spans.
+    /// final "and". `nil` for no spans. The ROWS' form (§8): every span.
     static func spans(_ spans: [WorldCaptureSpan]) -> String? {
         let parts = spans.map(span)
         switch parts.count {
@@ -229,19 +233,15 @@ nonisolated enum WorldComponentsPresentation {
         }
     }
 
-    /// The same spans in prose, for the area viewer's caption, exactly as
-    /// §5.4 words it: *from 1:26 to 1:49*. Several are *from 0:29 to 0:33 and
-    /// 1:49 to 2:12*. The rows keep §8's en-dash form (`spans`).
-    static func spansInProse(_ spans: [WorldCaptureSpan]) -> String? {
-        let parts = spans.map {
-            clock($0.start, roundingUp: false) + " to " + clock($0.end, roundingUp: true)
-        }
-        switch parts.count {
-        case 0: return nil
-        case 1: return parts[0]
-        case 2: return "\(parts[0]) and \(parts[1])"
-        default: return parts.dropLast().joined(separator: ", ") + " and " + parts[parts.count - 1]
-        }
+    /// The area viewer's range, exactly as §5.4 words it and the Tower's page
+    /// writes it (`surface_render.area_caption`): ONE envelope, from the first
+    /// span's start to the last span's end -- *from 1:26 to 1:49* for the
+    /// target's bathroom `[[86.7, 97.1], [106.4, 109.6]]`. The spans are
+    /// ascending (§2.1). `nil` for none. (G1-F1: the phone listed every span
+    /// here, so the native caption and the page's disagreed on one screen.)
+    static func envelopeInProse(_ spans: [WorldCaptureSpan]) -> String? {
+        guard let first = spans.first, let last = spans.last else { return nil }
+        return clock(first.start) + " to " + clock(last.end)
     }
 
     static func photos(_ count: Int) -> String {
@@ -318,7 +318,7 @@ nonisolated enum WorldComponentsPresentation {
     static func areaCaption(
         representation: WorldRenderRepresentation?, spans spanList: [WorldCaptureSpan], levelled: Bool? = nil
     ) -> String {
-        let when = spansInProse(spanList).map { " from \($0) of this walk" } ?? " of this walk"
+        let when = envelopeInProse(spanList).map { " from \($0) of this walk" } ?? " of this walk"
         let first: String
         switch representation {
         case .appearance: first = "The camera's own images, faces redacted,\(when)."
