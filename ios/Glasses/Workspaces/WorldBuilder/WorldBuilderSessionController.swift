@@ -79,7 +79,10 @@ final class WorldBuilderSessionController: ObservableObject {
 
     /// One line for under the capture control. Every sentence is a claim the
     /// phone can support from what it sent and what came back.
-    var footnote: String {
+    var footnote: String { Self.footnote(for: status) }
+
+    /// The footnote for a status. Pure, so the guarded sentences are tested.
+    static func footnote(for status: Status) -> String {
         switch status {
         case .notAsked:
             return "World Builder has not been asked for on the Tower yet."
@@ -90,11 +93,12 @@ final class WorldBuilderSessionController: ObservableObject {
         case .active:
             return "World Builder is active on the Tower."
         case .refused(let message):
-            return "The Tower refused to activate World Builder: \(message)"
+            // The Tower's own 409 sentence, guarded (G1-F4).
+            return "The Tower refused to activate World Builder: \(WorldTowerText.clause(message))"
         case .noSessionControl:
             return "This Tower offers no World Builder session control, so a builder cannot be asked for from here."
         case .failed(let detail):
-            return "World Builder could not be asked for on the Tower: \(detail)"
+            return "World Builder could not be asked for on the Tower: \(WorldTowerText.clause(detail))"
         case .stopping:
             return "Telling the Tower World Builder is no longer wanted…"
         }

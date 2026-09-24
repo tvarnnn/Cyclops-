@@ -11,6 +11,7 @@
 //  written from the contract text, section by section, and says which.
 //
 
+import CryptoKit
 import XCTest
 
 @testable import Glasses
@@ -183,8 +184,13 @@ final class WorldComponentsWordsTests: XCTestCase {
 
     func testSpansAreMinutesAndSecondsOfTheWalkWithAnEnDash() {
         let spans = [WorldCaptureSpan(start: 29.4, end: 33.2), WorldCaptureSpan(start: 109.0, end: 131.6)]
-        // The start floors and the end ceilings: an envelope never shrinks.
-        XCTAssertEqual(WorldComponentsPresentation.spans(spans), "0:29–0:34 and 1:49–2:12")
+        // Truncated, as the Tower's `walk_time` and the contract's examples are.
+        XCTAssertEqual(WorldComponentsPresentation.spans(spans), "0:29–0:33 and 1:49–2:11")
+        // §8's own example, from the target's bed corner [[29.6, 33.1], [109.7, 132.4]].
+        XCTAssertEqual(
+            WorldComponentsPresentation.spans([WorldCaptureSpan(start: 29.6, end: 33.1),
+                                               WorldCaptureSpan(start: 109.7, end: 132.4)]),
+            "0:29–0:33 and 1:49–2:12")
         XCTAssertEqual(WorldComponentsPresentation.spans([WorldCaptureSpan(start: 86.0, end: 109.0)]), "1:26–1:49")
         XCTAssertEqual(
             WorldComponentsPresentation.spans([WorldCaptureSpan(start: 0, end: 5), WorldCaptureSpan(start: 60, end: 61),
@@ -192,7 +198,7 @@ final class WorldComponentsWordsTests: XCTestCase {
             "0:00–0:05, 1:00–1:01 and 2:00–2:05")
         XCTAssertNil(WorldComponentsPresentation.spans([]))
         // No hours, and minutes are not wrapped past 59.
-        XCTAssertEqual(WorldComponentsPresentation.span(WorldCaptureSpan(start: 3725.0, end: 3726.2)), "62:05–62:07")
+        XCTAssertEqual(WorldComponentsPresentation.span(WorldCaptureSpan(start: 3725.0, end: 3726.2)), "62:05–62:06")
     }
 
     func testTheAreasRowFooterAndCaptionSuffix() throws {
@@ -200,7 +206,7 @@ final class WorldComponentsWordsTests: XCTestCase {
         XCTAssertEqual(WorldComponentsPresentation.areasHeading(components),
                        "2 more areas — captured on this walk but not placed in this room.")
         XCTAssertEqual(WorldComponentsPresentation.areaLine(number: 1, area: components.areas[0]),
-                       "Area 1 · 0:29–0:34 and 1:49–2:12 · 66 photos")
+                       "Area 1 · 0:29–0:33 and 1:49–2:11 · 66 photos")
         XCTAssertEqual(WorldComponentsPresentation.footer(components),
                        "1 short stretch (21 photos) could not be placed or shown.")
         XCTAssertEqual(WorldComponentsPresentation.roomCaptionSuffix(components), " · 2 more areas shown separately")
@@ -243,11 +249,13 @@ final class WorldComponentsWordsTests: XCTestCase {
             + "position, direction and size are not comparable with the room's. Not to scale.")
         let surface = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans)
         XCTAssertTrue(surface.hasPrefix("Surfaces the Tower reconstructed from the walk, from 1:26 to 1:49"), surface)
-        XCTAssertEqual(
-            WorldComponentsPresentation.spansInProse([WorldCaptureSpan(start: 29.4, end: 33.2),
-                                                      WorldCaptureSpan(start: 109.0, end: 131.6)]),
-            "0:29 to 0:34 and 1:49 to 2:12")
-        XCTAssertNil(WorldComponentsPresentation.spansInProse([]))
+        // §5.4's own example: the target's bathroom, several spans, ONE range --
+        // first start to last end, truncated, exactly as the Tower's page says it.
+        let bathroom = [WorldCaptureSpan(start: 86.7, end: 97.1), WorldCaptureSpan(start: 106.4, end: 109.6)]
+        XCTAssertEqual(WorldComponentsPresentation.envelopeInProse(bathroom), "1:26 to 1:49")
+        XCTAssertTrue(WorldComponentsPresentation.areaCaption(representation: .appearance, spans: bathroom)
+            .contains("from 1:26 to 1:49 of this walk."))
+        XCTAssertNil(WorldComponentsPresentation.envelopeInProse([]))
         let tilted = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans, levelled: false)
         XCTAssertTrue(tilted.contains("Its vertical could not be estimated, so it may look tilted."), tilted)
         for caption in [appearance, surface, tilted] {
@@ -638,5 +646,539 @@ final class WorldRoomComponentsTests: XCTestCase {
             target: WorldRenderTarget(worldID: "w1", sessionID: "s1", areaID: V2.bathroomID),
             client: client(), components: seeded)
         XCTAssertNil(area.components, "an area viewer never shows an areas row")
+    }
+}
+
+// MARK: - `finalization.notice` (contract v6, G1-F2)
+
+@MainActor
+final class WorldFinalizationNoticeTests: XCTestCase {
+
+    /// §3.1's sentence for masks that are off, as a row would carry it.
+    private let masksOff = "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); "
+        + "an operator can turn them on, then an owner can re-finish this walk"
+
+    private func row(finalization: Any?, components: Any? = nil) throws -> WorldListingSession {
+        var json = V2.row(components: components)
+        json["finalization"] = finalization
+        return try XCTUnwrap(WorldListingSession(json: json))
+    }
+
+    func testTheNoticeIsReadVerbatim() throws {
+        let joined = masksOff + "; the evidence gate could not measure metric scale (depth did not finish); "
+            + "the Tower re-runs the gate when it is idle"
+        let session = try row(finalization: ["state": "complete", "final_solve": "solved", "detail": NSNull(),
+                                             "notice": joined])
+        XCTAssertEqual(session.finalization?.notice, joined, "verbatim: joined causes, punctuation and all")
+        XCTAssertEqual(session.finalization?.finalSolve, "solved")
+    }
+
+    /// Absent is today's row, byte for byte (§7 rule 1).
+    func testAbsentOrUnusableIsNoNotice() throws {
+        XCTAssertNil(try row(finalization: ["state": "complete", "final_solve": "solved"]).finalization?.notice)
+        for value in [NSNull(), "", "   \n", 7, ["text": "x"], true] as [Any] {
+            let session = try row(finalization: ["state": "complete", "final_solve": "solved", "notice": value])
+            XCTAssertNil(session.finalization?.notice, "\(value)")
+            XCTAssertNotNil(session.finalization, "a bad notice does not cost the finalization record")
+        }
+        XCTAssertNil(try row(finalization: NSNull()).finalization)
+    }
+
+    /// `detail` keeps its meaning and is never shown in the notice's place.
+    func testDetailIsNotTheNotice() throws {
+        let session = try row(finalization: ["state": "complete", "final_solve": "solved",
+                                             "detail": "Traceback (most recent call last): …"])
+        XCTAssertNil(session.finalization?.notice)
+        XCTAssertNil(WorldPickerView.notice(forOpened: session, target: WorldRenderTarget(worldID: "w1", sessionID: "s1")))
+    }
+
+    /// Shown for the ROOM, whatever `components` says -- a walk whose gate
+    /// raised has `components: null` and can still carry one -- and never on
+    /// an area's screen.
+    func testTheNoticeBelongsToTheRoomRegardlessOfComponents() throws {
+        let room = WorldRenderTarget(worldID: "w1", sessionID: "s1")
+        let gateRaised = try row(finalization: ["state": "complete", "final_solve": "solved",
+                                                "notice": "the evidence gate failed (a Tower error); the Tower re-runs it when it is idle"],
+                                 components: nil)
+        XCTAssertNil(gateRaised.components)
+        XCTAssertEqual(WorldPickerView.notice(forOpened: gateRaised, target: room),
+                       "the evidence gate failed (a Tower error); the Tower re-runs it when it is idle")
+        let withAreas = try row(finalization: ["state": "complete", "final_solve": "solved", "notice": masksOff],
+                                components: V2.components)
+        XCTAssertEqual(WorldPickerView.notice(forOpened: withAreas, target: room), masksOff)
+        XCTAssertNil(WorldPickerView.notice(forOpened: withAreas, target: room.area(V2.bathroomID)),
+                     "an area's screen does not repeat the walk's notice")
+        XCTAssertNil(WorldPickerView.notice(forOpened: nil, target: room), "a world row that named no session")
+    }
+
+    /// The same record on the status channel (`lifecycle.finalization`) decodes
+    /// the notice too, for the live screen's room.
+    func testTheStatusChannelsFinalizationCarriesItToo() {
+        let payload: [String: Any] = ["lifecycle": ["finalization": [
+            "state": "complete", "final_solve": "solved", "notice": masksOff]]]
+        XCTAssertEqual(WorldBuilderResultDecoder.finalization(from: payload)?.notice, masksOff)
+    }
+
+    /// A notice arriving or leaving is a change the view model republishes
+    /// (the report is `Equatable` over it), so it cannot stick on screen after
+    /// the owed work is done.
+    func testANoticeArrivingOrLeavingIsAChange() {
+        let owed = WorldFinalizationReport(state: .complete, finalSolve: "solved", notice: masksOff)
+        let done = WorldFinalizationReport(state: .complete, finalSolve: "solved")
+        XCTAssertNotEqual(owed, done)
+    }
+}
+
+// MARK: - Contract v7's reason `seed-unstable` (rule 8: unknown reasons are generic)
+
+@MainActor
+final class WorldComponentsUnknownReasonTests: XCTestCase {
+
+    /// v7 (H2 consensus) adds `seed-unstable`. This build has no copy for any
+    /// reason -- §8 shows none -- so a new one changes nothing a wearer sees:
+    /// the entry decodes, the area opens, the line is the same.
+    func testSeedUnstableIsCarriedAndChangesNothingOnScreen() throws {
+        var list = V2.components
+        list[1]["reason"] = "seed-unstable"
+        list[1]["reasons"] = ["seed-unstable", "single-unconfirmed-link"]
+        list[3]["reason"] = "seed-unstable"
+        list[3]["reasons"] = ["seed-unstable"]
+        let components = try XCTUnwrap(WorldComponents(json: list))
+        XCTAssertEqual(components.areas.map(\.id), [V2.bedID, V2.bathroomID])
+        XCTAssertEqual(components.areas[0].reason, "seed-unstable")
+        XCTAssertEqual(components.areas[0].reasons, ["seed-unstable", "single-unconfirmed-link"])
+        XCTAssertEqual(WorldComponentsPresentation.availability(of: components.areas[0]), .opens)
+        let baseline = try XCTUnwrap(WorldComponents(json: V2.components))
+        XCTAssertEqual(WorldComponentsPresentation.areaLine(number: 1, area: components.areas[0]),
+                       WorldComponentsPresentation.areaLine(number: 1, area: baseline.areas[0]))
+        XCTAssertEqual(WorldComponentsPresentation.footer(components), WorldComponentsPresentation.footer(baseline))
+        XCTAssertEqual(WorldComponentsPresentation.areasHeading(components),
+                       WorldComponentsPresentation.areasHeading(baseline))
+    }
+
+    /// A `placed` entry is only ever the room: a reason on it (which the Tower
+    /// never sends) does not stop the list being trusted.
+    func testAReasonWordNeverDecidesWhetherTheListIsTrusted() throws {
+        var list = V2.components
+        list[0]["reason"] = "seed-unstable"
+        XCTAssertNotNil(WorldComponents(json: list))
+    }
+}
+
+// MARK: - The notice guard (G1-F3: defence in depth)
+
+@MainActor
+final class WorldNoticeGuardTests: XCTestCase {
+
+    /// Every §3.1 sentence (v6), with plausible `<why>` phrases, alone and
+    /// joined as the Tower joins them: shown exactly as sent.
+    private let contractSentences = [
+        "masks were not applied (GPU out of memory); an owner can re-finish this walk",
+        "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk",
+        "masks were not applied (the transient detector did not load); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+        "masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk",
+        "the evidence gate could not measure metric scale (depth did not finish); the Tower re-runs the gate when it is idle",
+        "the evidence gate had too little metric scale to place pieces by it (too few cameras had a level); the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk",
+        "the evidence gate failed (an error in the gate); the Tower re-runs it when it is idle",
+        "the evidence gate could not measure metric scale (depth did not finish); the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; an owner can re-finish this walk",
+        "the phone and/or the Tower lost 1/2 of the frames; an owner can re-capture this walk",
+    ]
+
+    func testEveryOwnerFacingSentenceIsShownVerbatim() {
+        for sentence in contractSentences {
+            XCTAssertEqual(WorldNoticeGuard.displayText(sentence), sentence, sentence)
+        }
+        // The worst honest case: every cause joined.
+        let joined = contractSentences[3] + "; " + contractSentences[5] + "; " + contractSentences[7]
+        XCTAssertEqual(WorldNoticeGuard.displayText(joined), joined)
+        XCTAssertLessThan(joined.count, WorldNoticeGuard.maximumLength)
+    }
+
+    func testMachineOutputIsReplacedByTheGenericSentence() {
+        let machine = [
+            #"masks were not applied (C:\Users\tvllo\Projects\Glasses\tower\data\w1\solve); an owner can re-finish this walk"#,
+            #"could not read \\tower\share\worlds\w1"#,
+            "the evidence gate failed (/Users/tristan/Projects/Glasses/tower/tower/world_builder/gate.py); the Tower re-runs it",
+            "the evidence gate failed (see ~/Projects/Glasses-scratch/run/log.txt)",
+            "failed opening path=/var/lib/tower/worlds/w1",
+            "Traceback (most recent call last):\n  File \"gate.py\", line 12, in run\nValueError: bad",
+            "gate crashed: File \"/opt/tower/gate.py\", line 88, in solve",
+            "ValueError: shapes (3,4) and (5,) not aligned",
+            "RuntimeError(CUDA out of memory)",
+            // G1-F4: an exception class anywhere (v8: a notice never carries one).
+            "the evidence gate failed (RuntimeError); the Tower re-runs it when it is idle",
+            "tower.world_builder.coherence.GateError: the gate raised",
+            "Error: the depth stage returned 0 cameras",
+            "Exception in the depth stage",
+            "masks were not applied\nsecond line",
+            String(repeating: "masks were not applied; ", count: 40),
+        ]
+        for text in machine {
+            XCTAssertEqual(WorldNoticeGuard.displayText(text), WorldNoticeGuard.genericSentence, text)
+        }
+    }
+
+    func testTheGenericSentenceIsOwnerFacingAndStable() {
+        let generic = WorldNoticeGuard.genericSentence
+        XCTAssertFalse(WorldNoticeGuard.looksLikeMachineOutput(generic))
+        XCTAssertEqual(WorldNoticeGuard.displayText(generic), generic, "idempotent")
+        XCTAssertTrue(generic.contains("owner"))
+    }
+
+    func testNoNoticeStaysNoNotice() {
+        for value in [nil, NSNull(), "", "  ", 5] as [Any?] {
+            XCTAssertNil(WorldNoticeGuard.displayText(value))
+        }
+    }
+
+    /// The room's notice goes through the guard wherever it is shown.
+    func testTheRoomShowsTheGuardedText() throws {
+        var json = V2.row(components: nil)
+        json["finalization"] = ["state": "complete", "final_solve": "solved",
+                                "notice": #"the evidence gate failed (C:\tower\gate.py)"#]
+        let session = try XCTUnwrap(WorldListingSession(json: json))
+        XCTAssertEqual(session.finalization?.notice, #"the evidence gate failed (C:\tower\gate.py)"#,
+                       "the decoded record keeps what was sent")
+        XCTAssertEqual(WorldPickerView.notice(forOpened: session, target: WorldRenderTarget(worldID: "w1", sessionID: "s1")),
+                       WorldNoticeGuard.genericSentence)
+    }
+}
+
+// MARK: - The closed notice set (contract v9, lead-009): every sentence verbatim
+
+/// Contract v8 §3.1 makes `finalization.notice` a CLOSED set: the Tower writes
+/// only these sentences, joined by "; " (masks first, then scale or the gate),
+/// and the only variable text is integers and `{what}` (a gate clause). The
+/// set below is `notice-set-4a95a0d.json` (contract v9, lead-009: four
+/// sentences revised so none promises a re-run that cannot fix its cause),
+/// extracted by the Windows lane from the product code at `4a95a0d`, and
+/// embedded **byte for byte**: `testThePinnedCopyIsTheFileWindowsSent` checks
+/// its sha256 (`d1f5c0c3…`) with the file's CRLF line endings restored. Every sentence, every expansion and every composition the rule
+/// allows must render exactly as sent through `WorldNoticeGuard` -- the guard
+/// is defence in depth against machine output, never a rewrite of these.
+@MainActor
+final class WorldNoticeClosedSetTests: XCTestCase {
+
+    private static let setJSON = #"""
+{
+ "NOTICE_SENTENCES": {
+  "masks-gpu-oom": "masks were not applied (GPU out of memory); an owner can re-finish this walk",
+  "masks-off": "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk",
+  "masks-no-gpu": "masks were not applied (no GPU could run the transient detector); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-not-installed": "masks were not applied (the transient detector is not installed on this Tower); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-detector-failed": "masks were not applied (the transient detector failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-step-failed": "masks were not applied (the mask step failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-no-image": "masks were not applied (no solver image could be masked); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-none": "masks were not applied (no solver image could be masked); an owner can re-finish this walk",
+  "masks-unavailable": "masks were not applied (the transient detector could not run); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-fallback": "masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk",
+  "masks-partial": "masks were not applied to {unmasked} of {images} images; an owner can re-finish this walk",
+  "masks-partial-uncounted": "masks were not applied to some of its images; an owner can re-finish this walk",
+  "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve; an owner can re-finish this walk",
+  "masks-excluded-uncounted": "some images could not be masked and were left out of the solve; an owner can re-finish this walk",
+  "gate-failed": "the evidence gate failed (an internal error); the Tower re-runs it when it is idle",
+  "gate-failed-database": "the evidence gate failed (the solve's feature database could not be read); the Tower re-runs it when it is idle",
+  "gate-failed-memory": "the evidence gate failed (out of memory); the Tower re-runs it when it is idle",
+  "depth-unavailable": "the evidence gate could not measure metric scale (the depth stage did not finish); the Tower re-runs the gate when it is idle",
+  "depth-stopped": "the evidence gate could not measure metric scale (the depth stage was stopped); the Tower re-runs the gate when it is idle",
+  "depth-gpu-oom": "the evidence gate could not measure metric scale (GPU out of memory); the Tower re-runs the gate when it is idle",
+  "depth-model-missing": "the evidence gate could not measure metric scale (the depth model is not installed on this Tower); an operator can install the depth model on this Tower, then the Tower re-runs the gate when it is idle",
+  "depth-surface-busy": "the evidence gate could not measure metric scale (another surface build of this walk was running); the Tower re-runs the gate when it is idle",
+  "depth-no-intrinsics": "the evidence gate could not measure metric scale (the walk has no camera intrinsics); re-running the gate would not change this; an owner can re-capture this walk",
+  "depth-no-camera": "the evidence gate could not measure metric scale (the solve has no camera); re-running the gate would not change this; an owner can re-finish this walk",
+  "scale-short": "the evidence gate had too little metric scale to place pieces by it; the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk",
+  "consensus-deferred": "the evidence gate's consensus of mapper seeds did not finish; the Tower re-runs it when it is idle"
+ },
+ "WFP.REFINISH_PARKED_NOTICE": "a re-finish of this walk stopped part-way and the Tower could not put the previous result back; an owner can re-run the re-finish",
+ "WFP.REGATE_GIVEN_UP": "{what}; the idle Tower re-ran the gate {attempts} times without finishing it and has stopped trying; an owner can re-finish this walk",
+ "WFP.REGATE_REFUSED_NOTICE": "{what}; the idle Tower cannot re-run the gate on this solve; an owner can re-finish this walk",
+ "NOTICE_CLAUSES": {
+  "masks-gpu-oom": "masks were not applied (GPU out of memory)",
+  "masks-off": "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS)",
+  "masks-no-gpu": "masks were not applied (no GPU could run the transient detector)",
+  "masks-not-installed": "masks were not applied (the transient detector is not installed on this Tower)",
+  "masks-detector-failed": "masks were not applied (the transient detector failed)",
+  "masks-step-failed": "masks were not applied (the mask step failed)",
+  "masks-no-image": "masks were not applied (no solver image could be masked)",
+  "masks-none": "masks were not applied (no solver image could be masked)",
+  "masks-unavailable": "masks were not applied (the transient detector could not run)",
+  "masks-fallback": "masks were applied by OneFormer alone, not by the union rule the evidence gate needs",
+  "masks-partial": "masks were not applied to {unmasked} of {images} images",
+  "masks-partial-uncounted": "masks were not applied to some of its images",
+  "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve",
+  "masks-excluded-uncounted": "some images could not be masked and were left out of the solve",
+  "gate-failed": "the evidence gate failed (an internal error)",
+  "gate-failed-database": "the evidence gate failed (the solve's feature database could not be read)",
+  "gate-failed-memory": "the evidence gate failed (out of memory)",
+  "depth-unavailable": "the evidence gate could not measure metric scale (the depth stage did not finish)",
+  "depth-stopped": "the evidence gate could not measure metric scale (the depth stage was stopped)",
+  "depth-gpu-oom": "the evidence gate could not measure metric scale (GPU out of memory)",
+  "depth-model-missing": "the evidence gate could not measure metric scale (the depth model is not installed on this Tower)",
+  "depth-surface-busy": "the evidence gate could not measure metric scale (another surface build of this walk was running)",
+  "depth-no-intrinsics": "the evidence gate could not measure metric scale (the walk has no camera intrinsics)",
+  "depth-no-camera": "the evidence gate could not measure metric scale (the solve has no camera)",
+  "scale-short": "the evidence gate had too little metric scale to place pieces by it",
+  "consensus-deferred": "the evidence gate's consensus of mapper seeds did not finish"
+ }
+}
+"""#
+
+    private struct NoticeSet {
+        let sentences: [String: String]
+        let clauses: [String: String]
+        let givenUp: String
+        let refused: String
+        let parked: String
+    }
+
+    private func load() throws -> NoticeSet {
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(Self.setJSON.utf8)) as? [String: Any])
+        return NoticeSet(
+            sentences: try XCTUnwrap(json["NOTICE_SENTENCES"] as? [String: String]),
+            clauses: try XCTUnwrap(json["NOTICE_CLAUSES"] as? [String: String]),
+            givenUp: try XCTUnwrap(json["WFP.REGATE_GIVEN_UP"] as? String),
+            refused: try XCTUnwrap(json["WFP.REGATE_REFUSED_NOTICE"] as? String),
+            parked: try XCTUnwrap(json["WFP.REFINISH_PARKED_NOTICE"] as? String))
+    }
+
+    /// The integers fill `{unmasked}`, `{images}`, `{excluded}`, `{attempts}`.
+    private func fill(_ template: String, _ n: Int) -> String {
+        template.replacingOccurrences(of: "{unmasked}", with: String(n))
+            .replacingOccurrences(of: "{images}", with: String(n * 10))
+            .replacingOccurrences(of: "{excluded}", with: String(n))
+            .replacingOccurrences(of: "{attempts}", with: String(n))
+    }
+
+    private func assertVerbatim(_ text: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(text.contains("{"), "an unfilled placeholder: \(text)", file: file, line: line)
+        XCTAssertEqual(WorldNoticeGuard.displayText(text), text, file: file, line: line)
+    }
+
+    func testTheSetIsTheOneWindowsSent() throws {
+        let set = try load()
+        XCTAssertEqual(set.sentences.count, 26, "26 cause sentences")
+        XCTAssertEqual(set.clauses.count, 26)
+        XCTAssertEqual(set.sentences["masks-off"],
+                       "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk")
+        // v9's four revisions (lead-009).
+        XCTAssertEqual(set.sentences["consensus-deferred"],
+                       "the evidence gate's consensus of mapper seeds did not finish; the Tower re-runs it when it is idle")
+        XCTAssertEqual(set.sentences["depth-model-missing"],
+                       "the evidence gate could not measure metric scale (the depth model is not installed on this Tower); an operator can install the depth model on this Tower, then the Tower re-runs the gate when it is idle")
+        XCTAssertEqual(set.sentences["depth-no-camera"],
+                       "the evidence gate could not measure metric scale (the solve has no camera); re-running the gate would not change this; an owner can re-finish this walk")
+        XCTAssertEqual(set.sentences["depth-no-intrinsics"],
+                       "the evidence gate could not measure metric scale (the walk has no camera intrinsics); re-running the gate would not change this; an owner can re-capture this walk")
+    }
+
+    /// The embedded copy is the file Windows sent, byte for byte: the file has
+    /// CRLF line endings and no final newline, and a Swift multi-line literal
+    /// normalises line endings to LF, so they are restored before hashing.
+    func testThePinnedCopyIsTheFileWindowsSent() {
+        let bytes = Data(Self.setJSON.replacingOccurrences(of: "\n", with: "\r\n").utf8)
+        let hex = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(hex, "d1f5c0c3ddb84a586f99fa1db87dcc119610fee5f463fd6486914c0449c3bdbd")
+    }
+
+    /// Each of the 26 cause sentences, and the finisher's three, alone.
+    func testEverySentenceAloneIsShownVerbatim() throws {
+        let set = try load()
+        for (cause, sentence) in set.sentences {
+            for n in [1, 12, 999_999] {
+                assertVerbatim(fill(sentence, n))
+            }
+            _ = cause
+        }
+        assertVerbatim(set.parked)
+        // Every clause (a sentence up to its first ";"), filled where it has
+        // integers -- the masks clauses carry `{unmasked}` / `{excluded}`.
+        for (_, clause) in set.clauses {
+            assertVerbatim(fill(clause, 12))
+        }
+        // `{what}` is only ever a gate clause (lead-008): gate-failed*, depth-*,
+        // scale-short, consensus-deferred.
+        for (key, clause) in set.clauses where !key.hasPrefix("masks") {
+            for n in [1, 3, 99] {
+                assertVerbatim(fill(set.givenUp, n).replacingOccurrences(of: "{what}", with: clause))
+            }
+            assertVerbatim(set.refused.replacingOccurrences(of: "{what}", with: clause))
+        }
+    }
+
+    /// Every composition the rule allows: a masks sentence, then a scale or
+    /// gate sentence (or a given-up / refused re-gate, or the parked re-finish).
+    func testEveryCompositionIsShownVerbatimAndStaysUnderTheLengthBound() throws {
+        let set = try load()
+        let masks = set.sentences.filter { $0.key.hasPrefix("masks") }.values.flatMap { s in
+            [1, 12, 999_999].map { fill(s, $0) }
+        }
+        let gateKeys = set.sentences.keys.filter { !$0.hasPrefix("masks") }
+        var second = gateKeys.compactMap { set.sentences[$0] }
+        for key in gateKeys {
+            let what = try XCTUnwrap(set.clauses[key], key)
+            second += [1, 3, 99].map { fill(set.givenUp, $0).replacingOccurrences(of: "{what}", with: what) }
+            second.append(set.refused.replacingOccurrences(of: "{what}", with: what))
+        }
+        second.append(set.parked)
+        var longest = 0
+        var count = 0
+        for text in masks + second {
+            assertVerbatim(text)
+            longest = max(longest, text.count)
+            count += 1
+        }
+        for first in masks {
+            for then in second {
+                let joined = first + "; " + then
+                assertVerbatim(joined)
+                longest = max(longest, joined.count)
+                count += 1
+            }
+        }
+        XCTAssertGreaterThan(count, 2_000)
+        XCTAssertLessThan(longest, WorldNoticeGuard.maximumLength, "the longest honest notice")
+    }
+
+    /// lead-008's two worked composite examples, exactly as written.
+    func testTheTwoWorkedExamplesAreShownVerbatim() {
+        assertVerbatim("masks were not applied to 12 of 400 images; an owner can re-finish this walk; "
+            + "the evidence gate could not measure metric scale (the depth stage did not finish); "
+            + "the Tower re-runs the gate when it is idle")
+        assertVerbatim("the evidence gate could not measure metric scale (GPU out of memory); "
+            + "the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; "
+            + "an owner can re-finish this walk")
+    }
+}
+
+// MARK: - Tower prose on the World Builder screens (G1-F4)
+
+/// Review V10: `finalization.detail` could reach the phone through
+/// `lifecycle.reason` -> `model_state_reason`, which the canvas shows for an
+/// interrupted world. Every place the World Builder screens show Tower-written
+/// prose now goes through `WorldTowerText`: machine output is replaced, and
+/// every normal sentence is shown exactly as sent.
+@MainActor
+final class WorldTowerTextTests: XCTestCase {
+
+    /// Real Tower sentences (from `tower/tower/results/world_builder.py` and the
+    /// B0 captures), which must never be rewritten.
+    private let towerSentences = [
+        "the process building this world exited without stopping its session; its keyframes are persisted but the session was never closed",
+        "no world root is configured on this Tower",
+        "this world does not have the photographic representation it is owed yet: the appearance stage is unfinished and no process is working on it. A Tower with the photographic stages enabled finishes owed work the next time it is idle; one that has them switched off will not, and this world then stays as it is until somebody runs scripts/world_finish_pending.py by hand",
+        "the finalization of this session was interrupted: the final solve did not finish",
+        "set TOWER_WORLD_ROOT=off to stop offering it",
+        "fixture: the appearance encode raised",
+        "no geometry yet",
+    ]
+
+    /// What V10 found leaking, and its cousins.
+    private let machine = [
+        "the finalization of this session was interrupted: RuntimeError: CUDA out of memory",
+        "the finalization of this session was interrupted: [Errno 2] No such file or directory: '/home/tower/worlds/w1/solve/s1/db.sqlite'",
+        #"the finalization failed: C:\Users\tvllo\Projects\Glasses\tower\data\w1"#,
+        "Traceback (most recent call last):\n  File \"x.py\", line 3",
+        "KeyError: 'session'",
+        "the gate stopped: inliers=37 ratio=4.27",
+        #"the gate stopped: {"state": "failed"}"#,
+    ]
+
+    func testNormalTowerSentencesAreShownVerbatimEverywhere() {
+        for sentence in towerSentences {
+            XCTAssertFalse(WorldTowerText.looksLikeMachineOutput(sentence), sentence)
+            XCTAssertEqual(WorldTowerText.sentence(sentence), sentence)
+            XCTAssertEqual(WorldTowerText.clause(sentence), sentence)
+        }
+    }
+
+    func testMachineOutputIsReplaced() {
+        for text in machine {
+            XCTAssertTrue(WorldTowerText.looksLikeMachineOutput(text), text)
+            XCTAssertEqual(WorldTowerText.sentence(text), WorldTowerText.genericSentence, text)
+            XCTAssertEqual(WorldTowerText.clause(text), WorldTowerText.genericClause, text)
+        }
+        XCTAssertNil(WorldTowerText.sentence(nil))
+        XCTAssertFalse(WorldTowerText.looksLikeMachineOutput(WorldTowerText.genericSentence))
+    }
+
+    // MARK: Each display site
+
+    private func payload(_ modelState: String, reason: String) -> [String: Any] {
+        [
+            "model_state": modelState, "model_state_reason": reason,
+            "world_snapshot": ["world_id": "w1", "keyframe_count": 24, "revision": "r",
+                               "geometry": ["representation": "sparse point cloud", "element_count": 900,
+                                            "is_incremental": false],
+                               "trajectory": ["pose_count": 24]],
+        ]
+    }
+
+    /// `model_state_reason` (`lifecycle.reason`): the canvas's interrupted,
+    /// unsupported and failed text, and the recoverability sentence.
+    func testTheModelStateReasonIsGuardedAtTheDecoder() {
+        let leaked = machine[0]
+        guard case .interrupted(_, let reason)? = WorldBuilderResultDecoder.modelState(
+            from: payload("interrupted", reason: leaked)) else { return XCTFail("interrupted did not decode") }
+        XCTAssertEqual(reason, WorldTowerText.genericSentence)
+        guard case .interrupted(_, let normal)? = WorldBuilderResultDecoder.modelState(
+            from: payload("interrupted", reason: towerSentences[0])) else { return XCTFail() }
+        XCTAssertEqual(normal, towerSentences[0])
+
+        guard case .unsupported(let unsupported)? = WorldBuilderResultDecoder.modelState(
+            from: payload("unsupported", reason: machine[3])) else { return XCTFail() }
+        XCTAssertEqual(unsupported, WorldTowerText.genericSentence)
+        guard case .unsupported(let plain)? = WorldBuilderResultDecoder.modelState(
+            from: payload("unsupported", reason: towerSentences[1])) else { return XCTFail() }
+        XCTAssertEqual(plain, towerSentences[1])
+
+        guard case .failed(let failure)? = WorldBuilderResultDecoder.modelState(
+            from: payload("failed", reason: machine[2])) else { return XCTFail() }
+        XCTAssertEqual(failure.message, WorldTowerText.genericSentence)
+
+        // The recoverability sentence composes the (already guarded) reason.
+        let sentence = WorldRecoverability.of(stage: .needsRetry, evidence: nil, reason: reason).sentence
+        XCTAssertEqual(sentence?.contains("CUDA"), false)
+        XCTAssertEqual(sentence?.contains(WorldTowerText.genericSentence), true)
+    }
+
+    /// A photographic block's `detail` on the canvas ("The Tower's reason: …").
+    func testThePhotographicReasonIsGuarded() {
+        XCTAssertEqual(WorldPhotographicCopy.failedReason("fixture: the appearance encode raised"),
+                       "The Tower's reason: fixture: the appearance encode raised")
+        XCTAssertEqual(WorldPhotographicCopy.failedReason("OSError: [Errno 28] No space left on device"),
+                       WorldTowerText.genericSentence)
+    }
+
+    /// A render route's 404 `detail` in the viewer's failure sentence -- while
+    /// retry and terminal decisions still compare the raw text.
+    func testARoutesDetailIsGuardedOnlyWhereItIsShown() {
+        XCTAssertEqual(WorldRenderFetchError.absent(detail: "no geometry yet").message,
+                       "The Tower has no picture for this world: no geometry yet.")
+        let leaked = WorldRenderFetchError.absent(detail: "KeyError: 'w1'")
+        XCTAssertEqual(leaked.message, "The Tower has no picture for this world: \(WorldTowerText.genericClause).")
+        XCTAssertTrue(leaked.isRetryable)
+        XCTAssertFalse(WorldRenderFetchError.absent(detail: WorldAreaRouteAnswer.noSuchArea).isRetryable)
+    }
+
+    /// The session controller's refusal and failure footnotes.
+    func testTheSessionFootnoteIsGuarded() {
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .refused("this Tower has no world_builder producer configured, so there is nothing to start")),
+            "The Tower refused to activate World Builder: this Tower has no world_builder producer configured, so there is nothing to start")
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .refused("RuntimeError: producer died at /opt/tower/x/y.py")),
+            "The Tower refused to activate World Builder: \(WorldTowerText.genericClause)")
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .failed("Traceback (most recent call last):")),
+            "World Builder could not be asked for on the Tower: \(WorldTowerText.genericClause)")
+    }
+
+    /// The geometry fetch's failure sentence ("the transport's or the Tower's
+    /// own words").
+    func testTheGeometryFailureDetailIsGuarded() {
+        XCTAssertEqual(WorldGeometryFailure(kind: .unreachable, detail: "The request timed out.").message,
+                       "The Tower's geometry could not be fetched: The request timed out.")
+        XCTAssertEqual(WorldGeometryFailure(kind: .unreachable, detail: "ValueError: bad manifest").message,
+                       "The Tower's geometry could not be fetched: \(WorldTowerText.genericClause)")
     }
 }

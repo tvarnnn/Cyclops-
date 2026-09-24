@@ -121,20 +121,32 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
     var startedAt: Double?
     var updatedAt: Double?
     /// The builder's prose — an error text when the state is `interrupted`.
+    /// **Not for display** (`WORLD-BUILDER-COMPONENTS.md` §3.1, v6): it can
+    /// carry an error string. `notice` is the sentence meant for the owner.
     var detail: String?
+    /// `finalization.notice` (v6, `WORLD-BUILDER-COMPONENTS.md` §3.1, §8):
+    /// what the evidence gate could not do for this walk, and who can fix it
+    /// -- an owner, an operator, the idle Tower, or a new walk. Shown
+    /// **verbatim** below the room caption, as a plain note, never matched
+    /// on: the wording is the Tower's and may change between Towers. `nil`
+    /// when absent -- every older session, and every gated session with
+    /// nothing owed -- and for anything that is not a non-empty string.
+    var notice: String?
 
     init(
         state: WorldFinalizationState,
         finalSolve: String? = nil,
         startedAt: Double? = nil,
         updatedAt: Double? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        notice: String? = nil
     ) {
         self.state = state
         self.finalSolve = finalSolve
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.detail = detail
+        self.notice = notice
     }
 
     /// `nil` for `null`, for an absent key, and for a block with no `state`
@@ -149,6 +161,137 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
         self.startedAt = json["started_at"] as? Double
         self.updatedAt = json["updated_at"] as? Double
         self.detail = json["detail"] as? String
+        self.notice = Self.notice(json["notice"])
+    }
+
+    /// The notice as sent, or `nil`: absent, `null`, not a string, or nothing
+    /// but whitespace. The text itself is kept exactly as the Tower wrote it.
+    nonisolated static func notice(_ value: Any?) -> String? {
+        guard let text = value as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return text
+    }
+}
+
+// MARK: - The notice, guarded
+
+/// What the room shows for a walk's `finalization.notice` (G1-F3): the Tower's
+/// sentence verbatim, **unless it looks like machine output**, in which case a
+/// generic owner-facing sentence stands in its place.
+///
+/// ## Why the phone guards a field the Tower promises is owner-facing
+///
+/// Defence in depth. A Tower review found notices carrying raw exception text,
+/// local file paths and internal figures; the Tower is moving to a closed set
+/// of fixed sentences (contract v6 §3.1, with diagnostics in `detail`), but a
+/// Tower older or newer than that promise must not put a traceback or a path
+/// of its own disk on a wearer's screen. So the guard is deliberately
+/// **conservative**: it refuses only what no owner-facing sentence contains --
+///
+/// - a backslash (`C:\…`, `\\server`), or an absolute path with at least two
+///   segments (`/Users/…/`, `/tmp/x/`, `~/…/`);
+/// - a Python traceback (`Traceback`, `File "…", line N`), or text that opens
+///   like an exception (`Error:`, `ValueError:`, `Exception(`…);
+/// - a line break, which no joined sentence has (causes are joined by "; ");
+/// - more than `maximumLength` characters: every sentence in §3.1, all three
+///   causes joined, stays well under it.
+///
+/// Everything else is shown exactly as sent -- normal sentences are never
+/// rewritten, and the phone still never MATCHES on the text: it recognises
+/// shapes of machine output, not wordings.
+nonisolated enum WorldNoticeGuard {
+    /// Longer than any honest joined notice (the longest v8 §3.1 composition
+    /// is 410 characters).
+    static let maximumLength = WorldTowerText.maximumLength
+
+    /// Said instead of text that looks like machine output.
+    static let genericSentence = "The Tower could not finish everything it should have for this walk. "
+        + "An owner can look on the Tower for the details."
+
+    /// The text to show, or `nil` for no notice (absent, not a string, blank).
+    static func displayText(_ value: Any?) -> String? {
+        guard let text = WorldFinalizationReport.notice(value) else { return nil }
+        return looksLikeMachineOutput(text) ? genericSentence : text
+    }
+
+    static func looksLikeMachineOutput(_ text: String) -> Bool {
+        WorldTowerText.looksLikeMachineOutput(text)
+    }
+}
+
+// MARK: - Any Tower prose the World Builder screens show (G1-F4)
+
+/// The one rule for Tower-written free text on the World Builder screens --
+/// `model_state_reason` (which carries `lifecycle.reason`), a cartridge's
+/// `unavailable_reason`, a photographic block's `detail`, a route's 404
+/// `detail`, a session refusal, a segment's refusal reason -- and for
+/// `finalization.notice` through `WorldNoticeGuard`.
+///
+/// Review V10 found `finalization.detail` reaching the phone inside
+/// `lifecycle.reason`. The Tower is scrubbing it; this is defence in depth:
+/// text that looks like **machine output** is replaced, and every normal
+/// sentence is shown exactly as sent. It recognises shapes, never wordings:
+///
+/// - a backslash, or an absolute path of two or more segments (`/Users/…/`,
+///   `~/…/`, `/var/…/`) -- a relative `scripts/x.py` is not a disk path;
+/// - a Python traceback (`Traceback`, `File "…", line N`);
+/// - text that opens like an exception (`Error:`, `ValueError: …`, `X(…`,
+///   `Exception…`), or a CamelCase exception class anywhere in it
+///   (`… RuntimeError …`, `OutOfMemoryError`);
+/// - a lower-case `key=value` pair or a JSON object -- program state, not
+///   prose (an operator hint's `TOWER_X=off` is prose);
+/// - a line break, or more than `maximumLength` characters.
+nonisolated enum WorldTowerText {
+    static let maximumLength = 700
+
+    /// Standing alone, in place of a whole reason.
+    static let genericSentence = "The Tower gave a technical reason, which is not shown here."
+    /// After a colon, in place of the Tower's part of an app sentence.
+    static let genericClause = "a technical reason, which is not shown here"
+
+    /// `text` when it is prose, the generic sentence when it is machine
+    /// output, `nil` for no text.
+    static func sentence(_ text: String?) -> String? {
+        guard let text else { return nil }
+        return looksLikeMachineOutput(text) ? genericSentence : text
+    }
+
+    /// `text` when it is prose, the generic clause when it is machine output.
+    static func clause(_ text: String) -> String {
+        looksLikeMachineOutput(text) ? genericClause : text
+    }
+
+    static func looksLikeMachineOutput(_ text: String) -> Bool {
+        if text.count > maximumLength { return true }
+        if text.contains("\\") { return true }
+        if text.contains("\n") || text.contains("\r") { return true }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("Traceback") || text.contains("Traceback (most recent call last)") { return true }
+        if text.range(of: #"File "[^"]*", line \d+"#, options: .regularExpression) != nil { return true }
+        // Opens like an exception: `Error:`, `Exception:`, `ValueError: …`,
+        // `OSError(…`, `tower.world_builder.GateError: …`.
+        if trimmed.range(of: #"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)\s*[:(]"#, options: .regularExpression) != nil {
+            return true
+        }
+        if trimmed.range(of: #"^(Error|Exception)\b"#, options: .regularExpression) != nil { return true }
+        // A CamelCase exception class anywhere: `failed: RuntimeError: …`,
+        // `(KeyError)`, `torch.OutOfMemoryError`. Prose says "an error".
+        if text.range(of: #"\b[A-Z][A-Za-z0-9]*(Error|Exception)\b"#, options: .regularExpression) != nil {
+            return true
+        }
+        // Program state: `keyframes=24`, `path=/x`, `{"state": …}`. Lower-case
+        // keys only: an operator hint such as "set TOWER_WORLD_ROOT=off" is a
+        // sentence the Tower means a person to read.
+        if text.range(of: #"\b[a-z_][a-z0-9_]*=\S"#, options: .regularExpression) != nil { return true }
+        if text.range(of: #"\{\s*["']"#, options: .regularExpression) != nil { return true }
+        // An absolute path of two or more segments, at the start of the text
+        // or after a space, a quote or a bracket: `/Users/x/…`, `/tmp/a/b`,
+        // `~/Projects/…`. "and/or", "1/2" and "Tower/phone" are not.
+        if text.range(of: #"(^|[\s("'\[=])~?/[A-Za-z0-9._-]+/"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
     }
 }
 

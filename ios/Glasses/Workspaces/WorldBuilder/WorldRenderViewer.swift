@@ -689,8 +689,9 @@ nonisolated extension WorldRenderFetchError {
         case .absent(let detail?):
             // No "yet": the detail says which — a world still being built
             // answers "no geometry yet", and a world that does not exist
-            // answers "no world", and only the Tower knows which.
-            return "The Tower has no picture for this world: \(detail)."
+            // answers "no world", and only the Tower knows which. Guarded
+            // (G1-F4): the route's `detail` is Tower prose, and only shown.
+            return "The Tower has no picture for this world: \(WorldTowerText.clause(detail))."
         case .absent(nil):
             return "The Tower has no picture for this world — no geometry has been built for it, or the world is gone."
         case .badAddress:
@@ -1904,17 +1905,21 @@ struct WorldRenderViewerView: View {
     private let target: WorldRenderTarget
     private let title: String?
     private let note: String?
+    /// The walk's `finalization.notice`, for the room (v6).
+    private let notice: String?
     private let client: WorldRenderClient
 
     init(
         target: WorldRenderTarget,
         title: String? = nil,
         note: String? = nil,
+        notice: String? = nil,
         client: WorldRenderClient = WorldRenderClient()
     ) {
         self.target = target
         self.title = title
         self.note = note
+        self.notice = notice
         self.client = client
     }
 
@@ -1933,6 +1938,7 @@ struct WorldRenderViewerView: View {
                 title: current.isArea ? nil : title,
                 note: current.isArea ? nil : note,
                 client: client,
+                notice: current.isArea ? nil : notice,
                 area: current.isArea ? shownArea : nil,
                 openArea: { area, opening in
                     shownArea = opening
@@ -1997,6 +2003,11 @@ struct WorldRenderScene: View {
     /// debugger.
     @State private var isShowingDetails = false
 
+    /// `finalization.notice` for the walk this room belongs to (v6, §8): what
+    /// the Tower could not do and who can fix it, shown verbatim below the
+    /// room caption as a plain note. `nil` shows nothing -- every older world,
+    /// and every walk with nothing owed -- and an area viewer never shows it.
+    private let notice: String?
     /// For an area viewer: its number, the walk's area count and its capture
     /// spans, from the list it was opened from (C1 M7). `nil` for the room.
     private let area: WorldAreaOpening?
@@ -2012,6 +2023,7 @@ struct WorldRenderScene: View {
         note: String? = nil,
         client: WorldRenderClient = WorldRenderClient(),
         components: WorldComponents? = nil,
+        notice: String? = nil,
         area: WorldAreaOpening? = nil,
         openArea: ((WorldRenderTarget, WorldAreaOpening) -> Void)? = nil,
         backToRoom: (() -> Void)? = nil
@@ -2020,6 +2032,8 @@ struct WorldRenderScene: View {
             target: target, client: client, components: components))
         self.title = title
         self.note = note
+        // Guarded (G1-F3): machine output never reaches the wearer verbatim.
+        self.notice = target.isArea ? nil : WorldNoticeGuard.displayText(notice)
         self.area = area
         self.openArea = openArea
         self.backToRoom = backToRoom
@@ -2104,6 +2118,15 @@ struct WorldRenderScene: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            // The walk's notice (v6, §8): verbatim, below the room caption, a
+            // plain note and not an error -- no icon, no tint, no control.
+            if let notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("world-render-notice")
+            }
             if model.target.isArea {
                 areaControls
             }

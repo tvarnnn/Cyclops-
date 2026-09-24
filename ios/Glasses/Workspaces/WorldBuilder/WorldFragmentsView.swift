@@ -123,7 +123,8 @@ struct WorldFragmentsModel: Equatable {
     nonisolated static func placementCaption(for segment: WorldSegmentSummary) -> String? {
         guard let state = segment.placement.state else { return nil }
         if let reason = segment.placement.refusalReason, !reason.isEmpty {
-            return "\(state.rawValue) — \(reason)"
+            // Verbatim unless it is machine output (G1-F4).
+            return "\(state.rawValue) — \(WorldTowerText.clause(reason))"
         }
         return state.rawValue
     }
