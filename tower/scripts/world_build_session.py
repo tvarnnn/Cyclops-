@@ -1613,6 +1613,25 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
     return report
 
 
+def finalization_notice(summary: dict | None) -> str | None:
+    """`finalization.notice` for a final solve that was just published (contract
+    WORLD-BUILDER-COMPONENTS.md v6, §3.1): `coherence_publish.publish_notice`'s sentences
+    -- what the evidence gate could not do and who can fix it -- or None, which REMOVES
+    the key.
+
+    ONLY FOR A SOLVE THE GATE RAN ON (a `gate` record in the summary). `publish_notice`
+    also words a GPU-out-of-memory masks sentence for a masked solve with the gate off,
+    and that stays where it has always been, in `detail`; §3.1 is explicit that the
+    notice is written only for a session whose final solve went through the gate. So
+    every ungated world -- every world before the gate, and every Tower with it off --
+    keeps a finalization block byte for byte as before."""
+    if not isinstance(summary, dict) or not isinstance(summary.get("gate"), dict):
+        return None
+    from tower.world_builder.coherence_publish import publish_notice  # noqa: PLC0415
+
+    return publish_notice(summary)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
@@ -2046,6 +2065,10 @@ def main(argv=None) -> int:
     finalization_state = FINALIZATION_COMPLETE
     final_solve_state = None
     finalization_detail = None
+    # `finalization.notice` (contract v6, §3.1): set only when a gated final solve is
+    # published and owes something; None writes no key. `stop_session` has just given the
+    # record a fresh `pending` block, so there is no older notice here to keep.
+    finalization_notice_text = None
     try:
         for frame in stop_request.bounded(frames):
             outcome = engine.observe(
@@ -2273,6 +2296,9 @@ def main(argv=None) -> int:
                     )
 
                     finalization_detail = publish_notice(solve_report) or finalization_detail
+                    # And the phone's copy of it (v6, §3.1; `detail` keeps its meaning and
+                    # still carries the sentence).
+                    finalization_notice_text = finalization_notice(solve_report)
                 elif solve_report.get("interrupted"):
                     final_solve_state = FINAL_SOLVE_SKIPPED
                     finalization_detail = (
@@ -2349,6 +2375,7 @@ def main(argv=None) -> int:
                 state=finalization_state,
                 final_solve=final_solve_state,
                 detail=finalization_detail,
+                notice=finalization_notice_text,
             )
         except Exception:  # noqa: BLE001
             logger.exception("[Tower][WorldBuilder] could not record the finalization")

@@ -60,7 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder import global_solve  # noqa: E402
-from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
+from tower.world_builder.engine import NOTICE_KEEP, WorldBuilderEngine  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
     FINAL_SOLVE_FAILED,
     FINAL_SOLVE_SKIPPED,
@@ -135,6 +135,12 @@ def main(argv=None) -> int:
 
     final_solve_state: str | None = None
     detail: str | None = None
+    # `finalization.notice` (contract v6, §3.1) describes the PUBLISHED solve, so it moves
+    # only when this run publishes one: then it is that solve's (a string, or None -- which
+    # removes it: a re-finish whose new solve owes nothing clears the old notice). A run
+    # that publishes nothing -- `--skip-solve`, a solve that failed or found no model --
+    # leaves the published solve as it was, and its notice with it (`NOTICE_KEEP`).
+    notice = NOTICE_KEEP
     try:
         if args.skip_solve:
             final_solve_state = FINAL_SOLVE_SKIPPED
@@ -155,9 +161,11 @@ def main(argv=None) -> int:
                 final_solve_state = FINAL_SOLVE_SOLVED
                 # What the published solve still owes, on the row (review V7, H2 and L-c):
                 # masks lost to GPU memory (an owner re-finishes), a gate to re-run.
+                from scripts.world_build_session import finalization_notice  # noqa: PLC0415
                 from tower.world_builder.coherence_publish import publish_notice  # noqa: PLC0415
 
                 detail = publish_notice(summary) or detail
+                notice = finalization_notice(summary)
             elif summary.get("error"):
                 final_solve_state = FINAL_SOLVE_FAILED
                 detail = f"final solve failed: {summary['error']}"
@@ -260,6 +268,9 @@ def main(argv=None) -> int:
             # and its detail: this run has nothing truer to say about it.
             final_solve_state = (before.finalization or {}).get("final_solve")
             detail_to_record = (before.finalization or {}).get("detail")
+            # Except the notice, which follows the published solve rather than this
+            # run's outcome: kept as it was unless this run published a new solve
+            # before it failed, and then that solve's (see `notice` above).
         else:
             detail_to_record = detail
         detail = detail_to_record
@@ -273,6 +284,7 @@ def main(argv=None) -> int:
             engine.mark_finalization(
                 args.world, session_id,
                 state=state, final_solve=final_solve_state, detail=detail,
+                notice=notice,
             )
         except Exception as exc:  # noqa: BLE001
             report["record_error"] = f"{type(exc).__name__}: {exc}"

@@ -124,6 +124,9 @@ def _gated(root, world_id="w1", session_id="s1", *, stages, gate=DEPTH_LOST, dat
         detail = CP.publish_notice({"gate": gate, "transients": transients or {"state": "applied"}})
         session = store.read_session(world_id, session_id)
         fin = dict(session.finalization, detail=detail)
+        if detail:
+            # And the phone's copy, as the builder writes it since contract v6 (§3.1).
+            fin["notice"] = detail
         from dataclasses import replace
 
         store.write_session(replace(session, finalization=fin))
@@ -374,19 +377,23 @@ def test_m1b_the_given_up_notice_keeps_the_masks_sentence(tmp_path):
 
 def test_m1b_a_detail_rewritten_after_the_give_up_is_given_up_again(tmp_path, stage_runner):
     """The record IS the sentence: anything that puts the promise back (a hand-run
-    `world_finalize.py` on the same solve) is corrected at the next run."""
+    `world_finalize.py` on the same solve) is corrected at the next run. Since contract v6
+    the sentence the record is read from is `finalization.notice`, which such a publish
+    rewrites together with `detail`."""
     store = _gated(tmp_path, stages=ROOM_OK)
     _at_the_bound(store)
     assert _run(tmp_path) == 0
     given_up = store.read_session("w1", "s1").finalization["detail"]
     from dataclasses import replace
 
+    promise = CP.publish_notice({"gate": DEPTH_LOST})
     session = store.read_session("w1", "s1")
     store.write_session(replace(session, finalization=dict(
-        session.finalization, detail=CP.publish_notice({"gate": DEPTH_LOST}))))
+        session.finalization, detail=promise, notice=promise)))
     assert wfp.assess(store, "w1", "s1").exhausted
     assert _run(tmp_path) == 0
     assert store.read_session("w1", "s1").finalization["detail"] == given_up
+    assert store.read_session("w1", "s1").finalization["notice"] == given_up
 
 
 # ---------------------------------------------------------------------------

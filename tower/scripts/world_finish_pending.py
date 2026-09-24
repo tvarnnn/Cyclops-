@@ -969,13 +969,17 @@ def _assess_regate(store: WorldStore, world_id: str, session_id: str, session, *
         # What the row said until now was `publish_notice`'s promise that the idle Tower
         # re-runs the gate, which is no longer true -- so the bound is `exhausted` until
         # `_retire_regate` has put the given-up sentence in its place. THE RECORD IS THE
-        # SENTENCE: once the finalization detail says it, the re-gate owes nothing and
-        # `assess` asks the room and the areas behind it, which it used to hide for ever.
-        # Anything that puts the promise back (a hand-run `world_finalize.py`) is corrected
-        # at the next run.
+        # SENTENCE: once the finalization's `notice` (contract v6, §3.1 -- the phone's
+        # copy; `detail` carries it too) says it, the re-gate owes nothing and `assess`
+        # asks the room and the areas behind it, which it used to hide for ever.
+        # `notice`, not `detail`: a re-mark that has nothing to say about the solve (a
+        # `--skip-solve` repair) writes its own `detail` and keeps the notice, and must
+        # not undo the give-up. A new publish that puts the promise back (a hand-run
+        # `world_finalize.py`) is corrected at the next run; so is a give-up recorded
+        # before v6, in `detail` alone.
         notice = regate_given_up_notice(_published_meta(store, world_id, session_id),
                                         attempts)
-        if (session.finalization or {}).get("detail") == notice:
+        if (session.finalization or {}).get("notice") == notice:
             return None
         return Verdict(world_id, session_id, False,
                        f"this tool has already re-run the gate of this session {attempts} "
@@ -1013,22 +1017,17 @@ def _regate_refusal(store: WorldStore, world_id: str, session_id: str) -> str | 
     """Why `coherence_publish.regate_published` would refuse this session, or None. Reads
     only.
 
-    THE SAME TWO REFUSALS, WORD FOR WORD: the published solve does not load as a gated
-    solution, or the feature database it was solved from is gone. Restated here rather than
-    shared because `coherence_publish.py` is another lane's file; a test holds the two to
-    one answer on every shape (`test_the_read_only_refusal_agrees_with_regate_published`).
-    `regate_published` still refuses under the lock, and `finish_regate` still gives that
-    attempt back -- this only moves the common case in front of the lock."""
-    from tower.world_builder.global_solve import load_solution, workspace_for  # noqa: PLC0415
+    `coherence_publish.regate_refusal` -- the ONE statement of the refusals, which
+    `regate_published` asks too (H2, 2897bf2): the published solve does not load as a
+    gated solution, or the feature database it was solved from is gone. It used to be
+    restated here word for word; tests still hold every copy to one answer on every shape
+    (`test_the_read_only_refusal_agrees_with_regate_published`,
+    `test_world_builder_regate_refusal.py`). `regate_published` still refuses under the
+    lock, and `finish_regate` still gives that attempt back -- this only moves the common
+    case in front of the lock."""
+    from tower.world_builder.coherence_publish import regate_refusal  # noqa: PLC0415
 
-    solution = load_solution(store, world_id, session_id)
-    if solution is None or not isinstance(solution.gate, dict):
-        return "no gated solution is published for this session"
-    workspace = workspace_for(store, world_id, session_id)
-    name = (solution.solve or {}).get("database") or workspace.database_path.name
-    if not (workspace.root / name).is_file():
-        return f"the solve's database {name} is gone; an owner can re-finish this walk"
-    return None
+    return regate_refusal(store, world_id, session_id)
 
 
 # The row's sentence once the finisher has stopped re-running a gate: the cause, as
@@ -1071,30 +1070,32 @@ def regate_given_up_notice(meta: dict, attempts: int) -> str:
 # from a solve that was set aside or not yet rebuilt, and holding the lock the re-finish's
 # next step then could not take.
 #
-# WHAT "IN PROGRESS" MEANS, from PF's `world_refinish.py` as it is: its ledger,
-# `<world>/refinish/<stamp>/refinish.json`, and the room marker it writes.
+# WHAT "IN PROGRESS" MEANS, from PF's `world_refinish.py` (3abe763): its ledger,
+# `<world>/refinish/<stamp>/refinish.json` -- `state`, and the `process` (pid and start
+# time) that wrote it -- and the room marker it writes. Per ledger, in this order:
 #
-# * `state: setting-aside` -- step 1 has not completed. Under the world's lock while it
-#   runs; left behind, it means a set-aside that never finished, and nothing should build
-#   on that world until its owner looks.
-# * otherwise, the room of a session of this world still carries THIS stamp's marker
-#   (`REFINISH_IN_PROGRESS`, `stopped`). The marker is written under the step-1 lock and is
-#   gone as soon as step 3 records the rebuilt room, or a put-back restores the session
-#   record -- so it covers precisely the gaps. The ledger's `state` alone cannot say this:
-#   a re-finish that SUCCEEDED leaves it `set-aside` for ever (nothing writes a terminal
-#   state), and reading that as live would park the world for good.
+# 1. A TERMINAL state (`LEDGER_TERMINAL_STATES`: `done`, `stopped`, rolled back, restored)
+#    is a finished re-finish: today's path, whatever the room says. `stopped` after the room
+#    could not be rebuilt leaves the room `stopped` with the marker still on it, and that
+#    room is owed -- the rebuild the re-finish promises the finisher will do.
+# 2. Otherwise, THE PROCESS DECIDES (`refinish_process_alive`, the writer lock's own
+#    pid-and-start-time test, so a recycled pid is not taken for the re-finish): alive is
+#    in progress, whatever state it is at and whatever the room says; gone is a re-finish
+#    that DIED there, which no longer parks the world -- its `stopped` room is owed like any
+#    other (logged, because an owner should know a re-finish died part-way).
+# 3. A ledger that cannot say (written before the process was recorded, or malformed:
+#    unreadable, not an object) falls back to what the files show: `setting-aside` -- step
+#    1 has not completed -- or the room of a session of this world still carrying THIS
+#    stamp's marker (`REFINISH_IN_PROGRESS`, `stopped`: written under the step-1 lock, gone
+#    once step 3 records the rebuilt room or a put-back restores the record, so it covers
+#    precisely the lock gaps).
 #
-# A MALFORMED LEDGER (unreadable, not an object, an unknown state) is therefore decided by
-# the marker too, and that is the fail-safe choice in both directions: with the marker on
-# the room the finisher stays out (a live re-finish is never interfered with, which is the
-# failure that can end in a half-restored world), and without it the world takes today's
-# path (a corrupt file cannot park a world on "Improving" for ever).
-#
-# THE COST, stated: a re-finish that DIED between its steps looks exactly like a live one
-# on disk -- the ledger records no pid -- so the finisher leaves that world alone until its
-# owner runs the re-finish again (which is what a set-aside solve needs anyway). OPEN for
-# the re-finish's owner: a pid and a terminal state in the ledger would let this tell the
-# two apart.
+# A MALFORMED LEDGER is therefore decided by the marker, and that is the fail-safe choice
+# in both directions: with the marker on the room the finisher stays out (a live re-finish
+# is never interfered with, which is the failure that can end in a half-restored world),
+# and without it the world takes today's path (a corrupt file cannot park a world on
+# "Improving" for ever). Only the pre-3abe763 ledger that died between its steps still
+# looks live; its owner re-runs the re-finish, which a set-aside solve needs anyway.
 
 
 def refinish_in_progress(store: WorldStore, world_id: str) -> str | None:
@@ -1122,10 +1123,23 @@ def refinish_in_progress(store: WorldStore, world_id: str) -> str | None:
             ledger = read_json_closed(ledger_path)
         except (OSError, ValueError):
             ledger = None
-        state = ledger.get("state") if isinstance(ledger, dict) else None
+        if not isinstance(ledger, dict):
+            ledger = None
+        state = ledger.get("state") if ledger is not None else None
+        where = f"{WR.REFINISH_DIRNAME}/{aside.name}/{WR.LEDGER_FILENAME}"
+        if state in WR.LEDGER_TERMINAL_STATES:
+            continue
+        alive = WR.refinish_process_alive(ledger) if ledger is not None else None
+        if alive:
+            pid = (ledger.get("process") or {}).get("pid")
+            return f"re-finish {aside.name} is running (pid {pid}, ledger {state}; {where})"
+        if alive is False:
+            logger.info("[Tower][WorldBuilder] re-finish %s of %s ended at %r without "
+                        "finishing (its process is gone); the world is not held for it",
+                        aside.name, world_id, state)
+            continue
         if state == WR.LEDGER_SETTING_ASIDE:
-            return (f"re-finish {aside.name} is setting the previous result aside "
-                    f"({WR.REFINISH_DIRNAME}/{aside.name}/{WR.LEDGER_FILENAME})")
+            return f"re-finish {aside.name} is setting the previous result aside ({where})"
         marker = WR.REFINISH_IN_PROGRESS.format(stamp=aside.name)
         marked = _room_marked(store, world_id, marker)
         if marked is not None:
@@ -1279,12 +1293,16 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
                                verdict.session_id, exc_info=True)
             report.update({"finished": False, "waiting": True, "reason": str(exc)})
             return report
-        # The row's sentence follows the re-gate: cleared, or the new reason.
+        # The row's sentence follows the re-gate: cleared, or the new reason -- in `detail`
+        # as before, and in `notice` (contract v6, §3.1), which a re-gate that owes nothing
+        # any more REMOVES (`None`). The re-gate ran the gate, so this is always a gated
+        # solve's notice.
         fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
         if fin.get("state"):
+            notice = (report["regate"] or {}).get("notice")
             engine.mark_finalization(verdict.world_id, verdict.session_id, state=fin["state"],
-                                     final_solve=fin.get("final_solve"),
-                                     detail=(report["regate"] or {}).get("notice"))
+                                     final_solve=fin.get("final_solve"), detail=notice,
+                                     notice=notice)
         if stop_request.asked:
             # The room stays `stopped` -- owed -- and the next run rebuilds it from the new
             # partition (M1c).
@@ -1464,7 +1482,7 @@ def _retire_regate(store: WorldStore, verdict: Verdict, max_attempts: int) -> di
         fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
         WorldBuilderEngine(store).mark_finalization(
             verdict.world_id, verdict.session_id, state=fin["state"],
-            final_solve=fin.get("final_solve"), detail=notice)
+            final_solve=fin.get("final_solve"), detail=notice, notice=notice)
         out["notice"] = notice
     finally:
         store.release_writer_lock(verdict.world_id)

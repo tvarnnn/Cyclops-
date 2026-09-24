@@ -171,6 +171,12 @@ class BuildResult:
 # baseline and grows the largest single coherent piece 28656 -> 32756.
 MAX_BARREN_SEGMENTS = 1
 
+# `mark_finalization(notice=...)`'s default: leave the record's `finalization.notice`
+# as it is (contract WORLD-BUILDER-COMPONENTS.md v6, §3.1). A sentinel rather than None,
+# because None is a real instruction there -- "nothing is owed any more: remove it".
+NOTICE_KEEP = object()
+
+
 class WorldBuilderEngine:
     def __init__(
         self,
@@ -674,6 +680,7 @@ class WorldBuilderEngine:
         state: str,
         final_solve: str | None,
         detail: str | None = None,
+        notice: "str | None | object" = NOTICE_KEEP,
     ) -> None:
         """Rewrite the session's finalization block, and nothing else.
 
@@ -682,24 +689,46 @@ class WorldBuilderEngine:
         finalization moves. `started_at` is preserved from the pending
         record when there is one, so "how long did finalization take" stays
         answerable from the record alone.
+
+        `notice` (contract WORLD-BUILDER-COMPONENTS.md v6, §3.1): the one
+        sentence per cause the phone may show -- what the evidence gate could
+        not do for this walk, and who can fix it. A non-empty string writes
+        it; `None` (or "") REMOVES it, and removed means the key is absent,
+        never null, so a record with nothing owed is byte for byte what it
+        was before v6.
+
+        THE DEFAULT KEEPS WHATEVER THE RECORD ALREADY SAYS (`NOTICE_KEEP`).
+        The notice describes the PUBLISHED solve, so only the writers that
+        publish one -- the builder's and `world_finalize.py`'s final solve,
+        the finisher's re-gate -- or that resolve its owed work (the
+        finisher giving a re-gate up) know what it should be, and they pass
+        it. Any other re-mark -- a `--skip-solve` repair, a record kept as
+        it was, a call written tomorrow that has never heard of notices --
+        leaves a still-valid notice standing instead of silently dropping
+        it. Recomputing it here from the published solve was the other
+        option and is the wrong one: the finisher's given-up sentence is not
+        a function of the solve at all (it is the attempt ledger's), and the
+        engine would have to know the evidence gate to do it.
         """
         if state not in FINALIZATION_STATES:
             raise ValueError(f"unknown finalization state {state!r}")
         session = self._store.read_session(world_id, session_id)
         now = self._clock()
         previous = session.finalization or {}
-        self._store.write_session(
-            replace(
-                session,
-                finalization={
-                    "state": state,
-                    "final_solve": final_solve,
-                    "started_at": previous.get("started_at", now),
-                    "updated_at": now,
-                    "detail": detail,
-                },
-            )
-        )
+        finalization = {
+            "state": state,
+            "final_solve": final_solve,
+            "started_at": previous.get("started_at", now),
+            "updated_at": now,
+            "detail": detail,
+        }
+        if notice is NOTICE_KEEP:
+            notice = previous.get("notice")
+        if isinstance(notice, str) and notice:
+            # Last, and only when there is one: every key before it is where
+            # it always was.
+            finalization["notice"] = notice
+        self._store.write_session(replace(session, finalization=finalization))
 
     def mark_stage(
         self,
