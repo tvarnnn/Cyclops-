@@ -239,7 +239,7 @@ struct WorldPickerView: View {
     /// walk whose gate raised has `components: null` and can still carry one.
     static func notice(forOpened session: WorldListingSession?, target: WorldRenderTarget) -> String? {
         guard !target.isArea else { return nil }
-        return session?.finalization?.notice
+        return WorldNoticeGuard.displayText(session?.finalization?.notice)
     }
 
     private var openedEntry: WorldListingEntry? {

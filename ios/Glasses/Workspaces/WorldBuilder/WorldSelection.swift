@@ -174,6 +174,70 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
     }
 }
 
+// MARK: - The notice, guarded
+
+/// What the room shows for a walk's `finalization.notice` (G1-F3): the Tower's
+/// sentence verbatim, **unless it looks like machine output**, in which case a
+/// generic owner-facing sentence stands in its place.
+///
+/// ## Why the phone guards a field the Tower promises is owner-facing
+///
+/// Defence in depth. A Tower review found notices carrying raw exception text,
+/// local file paths and internal figures; the Tower is moving to a closed set
+/// of fixed sentences (contract v6 §3.1, with diagnostics in `detail`), but a
+/// Tower older or newer than that promise must not put a traceback or a path
+/// of its own disk on a wearer's screen. So the guard is deliberately
+/// **conservative**: it refuses only what no owner-facing sentence contains --
+///
+/// - a backslash (`C:\…`, `\\server`), or an absolute path with at least two
+///   segments (`/Users/…/`, `/tmp/x/`, `~/…/`);
+/// - a Python traceback (`Traceback`, `File "…", line N`), or text that opens
+///   like an exception (`Error:`, `ValueError:`, `Exception(`…);
+/// - a line break, which no joined sentence has (causes are joined by "; ");
+/// - more than `maximumLength` characters: every sentence in §3.1, all three
+///   causes joined, stays well under it.
+///
+/// Everything else is shown exactly as sent -- normal sentences are never
+/// rewritten, and the phone still never MATCHES on the text: it recognises
+/// shapes of machine output, not wordings.
+nonisolated enum WorldNoticeGuard {
+    /// Longer than any honest joined notice (the longest §3.1 combination is
+    /// about 500 characters).
+    static let maximumLength = 700
+
+    /// Said instead of text that looks like machine output.
+    static let genericSentence = "The Tower could not finish everything it should have for this walk. "
+        + "An owner can look on the Tower for the details."
+
+    /// The text to show, or `nil` for no notice (absent, not a string, blank).
+    static func displayText(_ value: Any?) -> String? {
+        guard let text = WorldFinalizationReport.notice(value) else { return nil }
+        return looksLikeMachineOutput(text) ? genericSentence : text
+    }
+
+    static func looksLikeMachineOutput(_ text: String) -> Bool {
+        if text.count > maximumLength { return true }
+        if text.contains("\\") { return true }
+        if text.contains("\n") || text.contains("\r") { return true }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("Traceback") || text.contains("Traceback (most recent call last)") { return true }
+        if text.range(of: #"File "[^"]*", line \d+"#, options: .regularExpression) != nil { return true }
+        // Opens like an exception: `Error:`, `Exception:`, `ValueError: …`,
+        // `OSError(…`, `tower.world_builder.GateError: …`.
+        if trimmed.range(of: #"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)\s*[:(]"#, options: .regularExpression) != nil {
+            return true
+        }
+        if trimmed.range(of: #"^(Error|Exception)\b"#, options: .regularExpression) != nil { return true }
+        // An absolute path of two or more segments, at the start of the text
+        // or after a space, a quote or a bracket: `/Users/x/…`, `/tmp/a/b`,
+        // `~/Projects/…`. "and/or", "1/2" and "Tower/phone" are not.
+        if text.range(of: #"(^|[\s("'\[=])~?/[A-Za-z0-9._-]+/"#, options: .regularExpression) != nil {
+            return true
+        }
+        return false
+    }
+}
+
 // MARK: - The last saved world, offered rather than drawn
 
 /// A stored world the Tower offered in place of a live one, kept as a

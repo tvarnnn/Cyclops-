@@ -2031,7 +2031,8 @@ struct WorldRenderScene: View {
             target: target, client: client, components: components))
         self.title = title
         self.note = note
-        self.notice = target.isArea ? nil : WorldFinalizationReport.notice(notice)
+        // Guarded (G1-F3): machine output never reaches the wearer verbatim.
+        self.notice = target.isArea ? nil : WorldNoticeGuard.displayText(notice)
         self.area = area
         self.openArea = openArea
         self.backToRoom = backToRoom

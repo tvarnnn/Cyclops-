@@ -763,3 +763,81 @@ final class WorldComponentsUnknownReasonTests: XCTestCase {
         XCTAssertNotNil(WorldComponents(json: list))
     }
 }
+
+// MARK: - The notice guard (G1-F3: defence in depth)
+
+@MainActor
+final class WorldNoticeGuardTests: XCTestCase {
+
+    /// Every §3.1 sentence (v6), with plausible `<why>` phrases, alone and
+    /// joined as the Tower joins them: shown exactly as sent.
+    private let contractSentences = [
+        "masks were not applied (GPU out of memory); an owner can re-finish this walk",
+        "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk",
+        "masks were not applied (the transient detector did not load); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+        "masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk",
+        "the evidence gate could not measure metric scale (depth did not finish); the Tower re-runs the gate when it is idle",
+        "the evidence gate had too little metric scale to place pieces by it (too few cameras had a level); the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk",
+        "the evidence gate failed (an error in the gate); the Tower re-runs it when it is idle",
+        "the evidence gate could not measure metric scale (depth did not finish); the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; an owner can re-finish this walk",
+        "the evidence gate failed (RuntimeError); the Tower re-runs it when it is idle",
+        "the phone and/or the Tower lost 1/2 of the frames; an owner can re-capture this walk",
+    ]
+
+    func testEveryOwnerFacingSentenceIsShownVerbatim() {
+        for sentence in contractSentences {
+            XCTAssertEqual(WorldNoticeGuard.displayText(sentence), sentence, sentence)
+        }
+        // The worst honest case: every cause joined.
+        let joined = contractSentences[3] + "; " + contractSentences[5] + "; " + contractSentences[7]
+        XCTAssertEqual(WorldNoticeGuard.displayText(joined), joined)
+        XCTAssertLessThan(joined.count, WorldNoticeGuard.maximumLength)
+    }
+
+    func testMachineOutputIsReplacedByTheGenericSentence() {
+        let machine = [
+            #"masks were not applied (C:\Users\tvllo\Projects\Glasses\tower\data\w1\solve); an owner can re-finish this walk"#,
+            #"could not read \\tower\share\worlds\w1"#,
+            "the evidence gate failed (/Users/tristan/Projects/Glasses/tower/tower/world_builder/gate.py); the Tower re-runs it",
+            "the evidence gate failed (see ~/Projects/Glasses-scratch/run/log.txt)",
+            "failed opening path=/var/lib/tower/worlds/w1",
+            "Traceback (most recent call last):\n  File \"gate.py\", line 12, in run\nValueError: bad",
+            "gate crashed: File \"/opt/tower/gate.py\", line 88, in solve",
+            "ValueError: shapes (3,4) and (5,) not aligned",
+            "RuntimeError(CUDA out of memory)",
+            "tower.world_builder.coherence.GateError: the gate raised",
+            "Error: the depth stage returned 0 cameras",
+            "Exception in the depth stage",
+            "masks were not applied\nsecond line",
+            String(repeating: "masks were not applied; ", count: 40),
+        ]
+        for text in machine {
+            XCTAssertEqual(WorldNoticeGuard.displayText(text), WorldNoticeGuard.genericSentence, text)
+        }
+    }
+
+    func testTheGenericSentenceIsOwnerFacingAndStable() {
+        let generic = WorldNoticeGuard.genericSentence
+        XCTAssertFalse(WorldNoticeGuard.looksLikeMachineOutput(generic))
+        XCTAssertEqual(WorldNoticeGuard.displayText(generic), generic, "idempotent")
+        XCTAssertTrue(generic.contains("owner"))
+    }
+
+    func testNoNoticeStaysNoNotice() {
+        for value in [nil, NSNull(), "", "  ", 5] as [Any?] {
+            XCTAssertNil(WorldNoticeGuard.displayText(value))
+        }
+    }
+
+    /// The room's notice goes through the guard wherever it is shown.
+    func testTheRoomShowsTheGuardedText() throws {
+        var json = V2.row(components: nil)
+        json["finalization"] = ["state": "complete", "final_solve": "solved",
+                                "notice": #"the evidence gate failed (C:\tower\gate.py)"#]
+        let session = try XCTUnwrap(WorldListingSession(json: json))
+        XCTAssertEqual(session.finalization?.notice, #"the evidence gate failed (C:\tower\gate.py)"#,
+                       "the decoded record keeps what was sent")
+        XCTAssertEqual(WorldPickerView.notice(forOpened: session, target: WorldRenderTarget(worldID: "w1", sessionID: "s1")),
+                       WorldNoticeGuard.genericSentence)
+    }
+}
