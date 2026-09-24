@@ -728,18 +728,22 @@ def test_an_image_whose_mask_changed_rebuilds_the_masked_database(session, colma
     assert record["computed"] == 1 and record["cache_hits"] == N - 1
 
 
-def test_an_image_the_detector_cannot_read_makes_the_solve_partial(session, colmap):
+def test_an_image_the_detector_cannot_read_is_excluded_from_the_solve(session, colmap):
+    """Review V8, M2b: excluded (an explicit "extract nothing" mask), so the solve holds
+    no unmasked evidence and stays `applied`; it used to be `partial`, the gate's
+    fail-safe for the whole walk. More in `test_world_builder_mask_failsafes.py`."""
     _solve(session, final=True)            # undistort once
     colmap.log.clear()
     bad = session.workspace.images_dir / "00000001.jpg"
     bad.write_bytes(b"not a jpeg")
     summary = _masked(session, StubDetector())
     record = summary["transients"]
-    assert record["state"] == SM.RECORD_PARTIAL
+    assert record["state"] == SM.RECORD_APPLIED
     assert record["images_masked"] == N - 1 and record["images_unmasked"] == 1
     assert record["unmasked_examples"] == ["00000001.jpg"]
-    # An explicit "use everything" mask, not a missing file.
-    assert (colmap.masks_read["00000001.jpg"] == 255).all()
+    assert record["images_excluded"] == 1
+    # An explicit "extract nothing" mask, not a missing file.
+    assert (colmap.masks_read["00000001.jpg"] == 0).all()
 
 
 # ---------------------------------------------------------------------------

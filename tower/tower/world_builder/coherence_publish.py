@@ -31,7 +31,10 @@ After `write_solution`:
 
 FAIL-SAFES (contract §2.2): masks not `applied` -> nothing attached, reason `masks-unavailable`; depth
 unavailable, stopped or no camera with a ratio -> nothing attached, reason `scale-unavailable`. Both still
-write components (the room = the anchor block; every other piece unplaced). A failure of the gate ITSELF
+write components (the room = the anchor block; every other piece unplaced), and neither is silent: the row's
+finalization detail says what is missing and who can fix it (`publish_notice`, review V8 M2). Only a depth
+stage that did not finish owes a re-gate in place (`retryable`); a shortfall with depth in hand, and the
+masks fail-safe, do not (a re-gate would reproduce them). A failure of the gate ITSELF
 (an exception) publishes the solve exactly as the solver returned it, with `gate.state: "failed"` and no
 components record -- `components: null`, "not computed", which is what every older world says.
 
@@ -551,9 +554,17 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
         counts["placed" if e["state"] == CG_PLACED else e["shown_as"]] += 1
     # RETRYABLE (review V7, H1b): the scale fail-safe caused by the DEPTH STAGE -- the network
     # missing, CUDA out of memory, the surface lock held, a stop -- is not the world's
-    # fault, and the finisher owes it a re-gate in place. A fail-safe with depth in hand
-    # (too few cameras with a level) would come out the same, and the masks fail-safe is
-    # the solve's, so neither is retried here.
+    # fault, and the finisher owes it a re-gate in place. The masks fail-safe is the
+    # solve's: a re-gate in place cannot mask it (an owner re-finishes; `publish_notice`).
+    #
+    # A fail-safe WITH DEPTH IN HAND (fewer than `min_metric_fraction` of the supported
+    # cameras with a level) is deliberately NOT retryable (review V8, M2a). The depth
+    # stage ran to the end, and it is deterministic on the same keyframes: the frames it
+    # leaves without a prediction are missing, undecodable or re-sized images, never a
+    # transient; and the ratios come from this solve's own inlier pairs. A re-gate in place
+    # would reproduce the shortfall and spend the finisher's attempts for nothing. It is
+    # not silent either: the row says what is missing and that a new walk is what fixes it
+    # (`NOTICE_SCALE_SHORT`).
     retryable = bool(masks_applied and depth is None)
     record = {
         "state": GATE_STATE_APPLIED,
@@ -705,25 +716,80 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
 # ---------------------------------------------------------------------------
 # what the row says (review V7, H2 and L-c)
 
+#
+# EVERY FAIL-SAFE SAYS SO (review V8, M2). A published gated solve that is not "masks
+# applied and metric scale available" attaches nothing to the room, and the row says
+# what is missing and WHO can fix it -- the idle Tower (a re-gate in place), an owner
+# (a re-finish, or a new walk), or an operator first (a Tower that cannot run the
+# masks) -- in contract §2.2's order: masks, then scale. One sentence per cause, in the
+# style of §2.2's own example (*masks were not applied (GPU out of memory); an owner can
+# re-finish this walk*). No metric figure (§2.4 rule 6).
+
 NOTICE_MASKS_OOM = ("masks were not applied (GPU out of memory); an owner can re-finish this walk")
+NOTICE_MASKS_OFF = ("masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); "
+                    "an operator can turn them on, then an owner can re-finish this walk")
+NOTICE_MASKS_UNAVAILABLE = ("masks were not applied ({why}); an operator can make the transient "
+                            "detector run on this Tower, then an owner can re-finish this walk")
+NOTICE_MASKS_FALLBACK = ("masks were applied by OneFormer alone, not by the union rule the "
+                         "evidence gate needs; an operator can make Grounding DINO and SAM "
+                         "available on this Tower, then an owner can re-finish this walk")
+NOTICE_MASKS_PARTIAL = ("masks were not applied to {unmasked} of {images} images; "
+                        "an owner can re-finish this walk")
 NOTICE_REGATE = ("the evidence gate could not measure metric scale ({why}); "
                  "the Tower re-runs the gate when it is idle")
+NOTICE_SCALE_SHORT = ("the evidence gate had too little metric scale to place pieces by it "
+                      "({why}); the depth stage ran to the end, so re-running the gate would not "
+                      "change this; an owner can re-capture this walk")
 NOTICE_GATE_FAILED = "the evidence gate failed ({why}); the Tower re-runs it when it is idle"
+
+
+def _masks_notice(transients: dict, gate: dict) -> str | None:
+    """The masks fail-safe's sentence, or None. The GPU-out-of-memory one is said whatever
+    the gate did (as before); every other only when the gate ran and did not have masks."""
+    if transients.get("retryable") and transients.get("cause") == "gpu-oom":
+        return NOTICE_MASKS_OOM
+    if gate.get("state") != GATE_STATE_APPLIED or gate.get("masks_applied") is not False:
+        return None
+    state = transients.get("state")
+    if not transients or transients.get("requested") is False:
+        return NOTICE_MASKS_OFF
+    if state == "applied":
+        return None                 # an inconsistent record: nothing true to say
+    if state == "partial":
+        if transients.get("rule_fallback"):
+            return NOTICE_MASKS_FALLBACK
+        return NOTICE_MASKS_PARTIAL.format(unmasked=transients.get("images_unmasked", "some"),
+                                           images=transients.get("images", "its"))
+    return NOTICE_MASKS_UNAVAILABLE.format(
+        why=transients.get("detail") or transients.get("cause") or "the detector did not run")
+
+
+def _scale_short_with_depth(gate: dict) -> bool:
+    """The gate ran with its depth stage in hand and still had no usable metric scale."""
+    return (gate.get("state") == GATE_STATE_APPLIED and gate.get("metric_available") is False
+            and not gate.get("retryable")
+            and (gate.get("depth") or {}).get("state") == DEPTH_OK)
 
 
 def publish_notice(summary: dict | None) -> str | None:
     """One sentence for the session's finalization `detail` (the row carries it), when the
-    published solve owes something an owner or the idle Tower will do, else None."""
+    published solve owes something an owner, an operator or the idle Tower will do, or
+    took a fail-safe nobody can undo but a new walk, else None."""
     if not isinstance(summary, dict):
         return None
     transients = summary.get("transients") or {}
     gate = summary.get("gate") or {}
     parts = []
-    if transients.get("retryable") and transients.get("cause") == "gpu-oom":
-        parts.append(NOTICE_MASKS_OOM)
+    masks = _masks_notice(transients, gate)
+    if masks:
+        parts.append(masks)
     if gate.get("state") == GATE_STATE_FAILED:
         parts.append(NOTICE_GATE_FAILED.format(why=gate.get("detail") or "an error"))
     elif gate.get("retryable"):
         why = (gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"
         parts.append(NOTICE_REGATE.format(why=why))
+    elif _scale_short_with_depth(gate):
+        why = ((gate.get("evidence") or {}).get("metric_scale")
+               or "too few cameras had a metric level")
+        parts.append(NOTICE_SCALE_SHORT.format(why=why))
     return "; ".join(parts) or None

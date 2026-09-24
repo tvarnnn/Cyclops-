@@ -1600,7 +1600,7 @@ def _still_building(base: dict, building: str | None,
             PHOTOGRAPHIC_RUNNING,
         )
 
-        if photo_state == PHOTOGRAPHIC_RUNNING:
+        if photo_state == PHOTOGRAPHIC_RUNNING and "scope" in photographic:
             # `running` IS A LIVE PROCESS, WHOEVER'S IT IS (C1 E13). The word
             # is only ever `running` on evidence of a live pid, but the
             # present-tense probe above reads the ROOM's stage files alone, so
@@ -1609,6 +1609,12 @@ def _still_building(base: dict, building: str | None,
             # was reported `build_in_progress: False` -- "Finalizing" with
             # "the Tower does not report whether a build is running" on the
             # phone. The word and the boolean now cannot disagree.
+            #
+            # ONLY FOR A SESSION WITH COMPONENTS (review V8, LOW-c). `scope` is
+            # on the word exactly when the session has a components record
+            # (`components.combine_photographic`); a `components: null`
+            # session -- every saved world today -- gets the answer below,
+            # exactly as before this branch existed (contract §7 rule 1, §3.4).
             area = photographic.get("scope") == "area"
             return {
                 **base,

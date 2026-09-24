@@ -410,12 +410,15 @@ def build_render_revision(store: WorldStore, world_id: str,
 
 def _room_captions(store: WorldStore, world_id: str, session_id: str) -> dict | None:
     """`{"more_areas": N}` when this session has at least one area that is, or will
-    be, SHOWN separately, else None. An area whose build failed or was declined is not
-    shown anywhere, so it is not counted (review V6, L6): a room whose every area was
-    declined says nothing about areas. Never raises: a caption must not cost the room
-    its page."""
+    be, SHOWN separately, else None. An area whose build failed or was declined with
+    nothing drawable is not shown anywhere, so it is not counted (review V6, L6): a
+    room whose every area was declined says nothing about areas. But an area whose word
+    is settled while its surface IS drawable -- its appearance failed or was not asked
+    for -- is shown (`has_geometry`, the areas row opens it), so it is counted (review
+    V8, LOW-b). Never raises: a caption must not cost the room its page."""
     try:
         from tower.world_builder.components import (  # noqa: PLC0415
+            area_has_geometry,
             area_words,
             read_components_record,
         )
@@ -429,9 +432,17 @@ def _room_captions(store: WorldStore, world_id: str, session_id: str) -> dict | 
         if record is not None and record.areas():
             session = store.read_session(world_id, session_id)
             words = area_words(store, world_id, session_id, session, record)
-            count = sum(1 for w in words.values()
-                        if w.get("state") not in (PHOTOGRAPHIC_FAILED,
-                                                  PHOTOGRAPHIC_UNATTEMPTED))
+            world = None
+            for area_id, w in words.items():
+                if w.get("state") not in (PHOTOGRAPHIC_FAILED, PHOTOGRAPHIC_UNATTEMPTED):
+                    count += 1
+                    continue
+                # Settled with no build to come: shown only if something is drawable
+                # now, by the same artifact checks as the area route and the row.
+                if world is None:
+                    world = store.read_world(world_id)
+                if area_has_geometry(store, world_id, session_id, area_id, world=world):
+                    count += 1
     except Exception:  # noqa: BLE001
         logger.debug("[Tower][WorldBuilder] components caption probe failed", exc_info=True)
         return None
