@@ -47,11 +47,13 @@ the lock):
     `TOWER_WORLD_SOLVE_SEED=<--seed>` (the seeded single-thread solve) and
     `TOWER_WORLD_SOLVE_GATE=1` (depth before publish, the evidence gate, and
     `solve/<session>/components.json`). It takes the lock itself, re-derives the tree
-    and records the finalization. It is given the session's raw capture as
-    `--capture-dir` when one is resolvable (`--capture-dir`, else the capture the
-    session records under `TOWER_CAPTURE_ROOT`; `--no-capture` for neither), as the
-    builder gives its own final solve; the ledger's `solver_frames` says where the
-    solver's frames came from (`resolve_capture_dirs`, `tally_solver_frames`).
+    and records the finalization. Before it, each keyframe's OWN raw frame -- found
+    by its capture identity (`source_seq` + `received_at`) in the journals of the
+    captures named by `--capture-dir`, else of the session's capture chain under
+    `TOWER_CAPTURE_ROOT`; `--no-capture` for neither -- is written into the fresh
+    solve directory's `sources.json`, as the builder records it; a keyframe with no
+    unambiguous frame keeps its stored redacted copy. The ledger's `solver_frames`
+    says where every solver frame comes from (`plan_solver_frames`).
 3.  THE ROOM: the builder's own final surface and appearance
     (`world_build_session.final_surface_stages`) under the lock.
 4.  THE AREAS: every `shown_as: "area"` component, built on its own and levelled
@@ -517,35 +519,56 @@ REFINISH_IN_PROGRESS = (
 
 # WHERE THE SOLVER'S FRAMES COME FROM (P3 finding 6: 991e5a15 and af47007c were
 # re-finished from the face-redacted session keyframes although their raw captures
-# were on disk). The builder hands its final solve the capture it followed
-# (`--capture-dir`, and `sources.json` per keyframe); a re-finish of a world with no
-# `sources.json` passed nothing, so `global_solve._source_frame` fell back to the
-# session copies. It now passes the capture on the same terms as the builder:
+# were on disk). The builder records, per keyframe, the raw frame it observed
+# (`sources.json`); a world without that record fell back to the session copies.
 #
-# * `--capture-dir DIR` (repeatable): the owner names it;
-# * otherwise the capture this session RECORDS (`session.capture_id`, set only for a
-#   live-capture session, whose frame names are the capture's own) under the
-#   owner's configured capture root, `TOWER_CAPTURE_ROOT` -- the setting that arms
-#   the raw recorder at all, so there is raw imagery on disk only where the owner
-#   configured it. A relative root is anchored where `sources.json` paths are
-#   (`global_solve.resolve_source_path`: the Tower directory, or
-#   `TOWER_SOURCES_ROOT`), never the cwd. The captures that CONTINUE it after a
-#   reconnect (`continues_capture`) follow it, as the builder followed them
-#   (`_capture_chain`);
-# * `--no-capture`, or neither resolvable: today's behaviour, the session copies.
+# WHICH CAPTURES. `--capture-dir DIR` (repeatable) when the owner names them;
+# otherwise the capture this session RECORDS (`session.capture_id`, set only for a
+# live-capture session) under the owner's configured capture root,
+# `TOWER_CAPTURE_ROOT` -- the setting that arms the raw recorder at all, so there is
+# raw imagery on disk only where the owner configured it -- together with every
+# capture that CONTINUES it after a reconnect (`continues_capture`), as the builder's
+# follower walked them (`_capture_chain`). A relative root is anchored where
+# `sources.json` paths are (`global_solve.resolve_source_path`), never the cwd.
+# `--no-capture`, or nothing resolvable: today's behaviour.
 #
-# The raw frames are solver input only, exactly as the builder's: they never leave
-# this machine, point colours are withheld (`global_solve.WITHHELD_POINT_RGB`), and
-# the room's surface and appearance still read the redacted keyframes. A per-frame
-# `sources.json` still wins over a capture directory, frame by frame.
+# WHICH FRAME, AND NEVER ANOTHER CAPTURE'S (review of 3abe763, ACC). A reconnect
+# restarts the phone's frame numbering, so the captures of one walk REUSE frame
+# names: on the live walk adc75972 (3 captures, 353 keyframes) 152 keyframes have a
+# same-named frame in another capture of the chain, and 20 keyframe ids occur twice
+# in the session itself. Matching by name gave 67 keyframes another moment's image.
+# So a keyframe's raw frame is found by ITS OWN IDENTITY in the captures' journals
+# (`frames.jsonl`): the one journal record with the keyframe's `source_seq` AND its
+# `received_at` (the Tower's receipt time, which the follower copies from that very
+# record into the keyframe -- measured equal to the microsecond for 353 of 353 on
+# adc75972) and, where both carry one, its `wire_seq`. No record, or more than one:
+# that keyframe keeps its stored redacted copy. A keyframe id (or image name) that
+# occurs more than once in the session cannot be told apart by anything the solver
+# is given, so those keyframes keep the stored copy too. A capture directory with no
+# journal is not searched at all: a bare directory of frames has names only.
+#
+# HOW THE SOLVE GETS THEM. As `sources.json` in the fresh solve directory, keyframe
+# id -> exact frame -- the same record the builder writes -- and NEVER as
+# `--capture-dir`, whose by-name lookup (`global_solve._source_frame`) is the defect.
+# An entry the walk's builder recorded is kept (it observed the frame), except for an
+# ambiguous keyframe id. The raw frames are solver input only, exactly as the
+# builder's: they never leave this machine, point colours are withheld
+# (`global_solve.WITHHELD_POINT_RGB`), and the room's surface and appearance still
+# read the redacted keyframes.
 CAPTURE_ROOT_ENV = "TOWER_CAPTURE_ROOT"
 CAPTURE_FROM_ARGUMENT = "--capture-dir"
 CAPTURE_FROM_SESSION = "TOWER_CAPTURE_ROOT + the session's capture_id"
+CAPTURE_MANIFEST = "capture.json"
+CAPTURE_JOURNAL = "frames.jsonl"
+# `received_at` is compared at microsecond resolution: the follower copies the float
+# from the journal, so equal frames are equal to the last digit; a microsecond only
+# absorbs a float's text round-trip. Two frames of one capture are milliseconds apart.
+RECEIVED_AT_DECIMALS = 6
 
 
 def resolve_capture_dirs(store: WorldStore, world_id: str, session_id: str,
                          explicit=(), *, use_capture: bool = True) -> dict:
-    """The raw capture directories to hand the final solve, and why. Reads only."""
+    """The raw capture directories to SEARCH, by frame identity, and why. Reads only."""
     if not use_capture:
         return {"capture_dirs": [], "from": None, "why": "--no-capture"}
     if explicit:
@@ -569,27 +592,21 @@ def resolve_capture_dirs(store: WorldStore, world_id: str, session_id: str,
     if not (candidate / "frames").is_dir():
         return {"capture_dirs": [], "from": None, "capture_id": capture_id,
                 "why": f"no capture frames at {candidate}"}
-    chain, note = _capture_chain(captures_root, capture_id)
-    out = {"capture_dirs": [str(captures_root / c["capture_id"]) for c in chain],
-           "from": CAPTURE_FROM_SESSION, "capture_id": capture_id, "captures": chain}
-    if note:
-        out["chain_note"] = note
-    return out
+    chain = _capture_chain(captures_root, capture_id)
+    return {"capture_dirs": [str(captures_root / c["capture_id"]) for c in chain],
+            "from": CAPTURE_FROM_SESSION, "capture_id": capture_id, "captures": chain}
 
 
-def _capture_chain(captures_root: Path, first: str) -> tuple[list[dict], str | None]:
-    """The session's capture and every capture that CONTINUES it, in order.
-
-    A walk whose link drops mid-way goes on in a successor capture whose manifest names
-    its predecessor in `continues_capture`, and the builder follows it
-    (`tower.capture.CaptureFollower`, "follows a capture ACROSS a reconnect") -- but
-    the session records only the capture it started on. Measured on the run's frozen
-    captures: 991e5a15's session spans 69a4e59d -> 28f544af -> 01e4c64f (132 of its
-    229 keyframes are in the first), af47007c's 023b5d84 -> 95831c34 -> e3e8fd2e (164
-    of 218). Frames are found BY NAME (the source sequence number), so a chain in
-    which one name occurs twice is ambiguous: then only the session's own capture is
-    used, and the note says why. A fork (two captures continuing one) stops the chain
-    there. Reads only."""
+def _capture_chain(captures_root: Path, first: str) -> list[dict]:
+    """The session's capture and every capture that CONTINUES it (transitively), in
+    walk order. A walk whose link drops goes on in a successor capture whose manifest
+    names its predecessor in `continues_capture`, and the builder follows it
+    (`tower.capture.CaptureFollower`) -- but the session records only the capture it
+    started on. Measured on the run's frozen captures: 991e5a15's session spans 3
+    captures (132 of its 229 keyframes in the first), af47007c's 3 (164 of 218).
+    Every descendant is included, a fork's branches too: frames are matched by
+    identity (`map_raw_frames`), so a capture that holds none of the session's frames
+    contributes none. Reads only."""
     manifests: dict[str, dict] = {}
     try:
         with os.scandir(captures_root) as entries:
@@ -597,7 +614,7 @@ def _capture_chain(captures_root: Path, first: str) -> tuple[list[dict], str | N
                 if not entry.is_dir():
                     continue
                 try:
-                    manifest = json.loads((Path(entry.path) / "capture.json")
+                    manifest = json.loads((Path(entry.path) / CAPTURE_MANIFEST)
                                           .read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     continue
@@ -605,35 +622,91 @@ def _capture_chain(captures_root: Path, first: str) -> tuple[list[dict], str | N
                     manifests[entry.name] = manifest
     except OSError:
         pass
+    chain, frontier = [first], [first]
+    while frontier:
+        parent = frontier.pop(0)
+        children = sorted((c for c, m in manifests.items()
+                           if m.get("continues_capture") == parent and c not in chain),
+                          key=lambda c: (_as_float(manifests[c].get("started_at")), c))
+        chain.extend(children)
+        frontier.extend(children)
+    return [{"capture_id": c,
+             "continues_capture": manifests.get(c, {}).get("continues_capture"),
+             "retains_raw_imagery": manifests.get(c, {}).get("retains_raw_imagery"),
+             "redaction": manifests.get(c, {}).get("redaction")} for c in chain]
 
-    def describe(capture_id: str) -> dict:
-        m = manifests.get(capture_id, {})
-        return {"capture_id": capture_id,
-                "continues_capture": m.get("continues_capture"),
-                "retains_raw_imagery": m.get("retains_raw_imagery"),
-                "redaction": m.get("redaction")}
 
-    chain, note = [first], None
-    while len(chain) <= len(manifests):
-        successors = [c for c, m in manifests.items()
-                      if m.get("continues_capture") == chain[-1] and c not in chain
-                      and (captures_root / c / "frames").is_dir()]
-        if len(successors) > 1:
-            note = f"{len(successors)} captures continue {chain[-1]}; the chain stops there"
-            break
-        if not successors:
-            break
-        chain.append(successors[0])
-    if len(chain) > 1:
-        seen: set = set()
-        for capture_id in chain:
-            names = {p.name for p in (captures_root / capture_id / "frames").iterdir()}
-            if seen & names:
-                return ([describe(first)],
-                        f"frame names repeat across the continued captures {chain}; "
-                        "only the session's own capture is used")
-            seen |= names
-    return [describe(c) for c in chain], note
+def _as_float(value) -> float:
+    return float(value) if isinstance(value, (int, float)) else float("inf")
+
+
+def _frame_key(source_seq, received_at) -> tuple | None:
+    try:
+        return int(source_seq), round(float(received_at), RECEIVED_AT_DECIMALS)
+    except (TypeError, ValueError):
+        return None
+
+
+def _journal_index(capture_dirs) -> tuple[dict, list[str]]:
+    """(source_seq, received_at) -> every journal record with that identity, across
+    `capture_dirs`, as `{"path", "wire_seq", "time_basis", "capture"}`; and notes on
+    directories that could not be searched."""
+    index: dict = {}
+    notes: list[str] = []
+    for capture_dir in capture_dirs:
+        capture_dir = Path(capture_dir)
+        journal = capture_dir / CAPTURE_JOURNAL
+        try:
+            lines = journal.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            notes.append(f"{capture_dir}: no {CAPTURE_JOURNAL}; not searched (a frame "
+                         "cannot be matched to a keyframe by name alone)")
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or not rec.get("relpath"):
+                continue
+            key = _frame_key(rec.get("source_seq"), rec.get("received_at"))
+            if key is None:
+                continue
+            index.setdefault(key, []).append({
+                "path": capture_dir / str(rec["relpath"]), "wire_seq": rec.get("wire_seq"),
+                "time_basis": rec.get("time_basis"), "capture": capture_dir.name})
+    return index, notes
+
+
+def map_raw_frames(keyframes, capture_dirs) -> tuple[dict, dict]:
+    """keyframe_id -> its OWN raw frame, found by identity (see above), for every
+    keyframe that has exactly one; and why the others have none. Reads only."""
+    from collections import Counter  # noqa: PLC0415
+
+    from tower.world_builder.global_solve import keyframe_image_name  # noqa: PLC0415
+
+    index, notes = _journal_index(capture_dirs)
+    ids = Counter(k.keyframe_id for k in keyframes)
+    names = Counter(keyframe_image_name(k) for k in keyframes)
+    mapping: dict = {}
+    why: dict = {"ambiguous_in_session": [], "no_frame": [], "several_frames": []}
+    for kf in keyframes:
+        if ids[kf.keyframe_id] > 1 or names[keyframe_image_name(kf)] > 1:
+            why["ambiguous_in_session"].append(kf.keyframe_id)
+            continue
+        key = _frame_key(kf.source_seq, kf.received_at)
+        hits = [h for h in index.get(key, []) if h["path"].is_file()
+                and (h["wire_seq"] is None or kf.wire_seq is None
+                     or int(h["wire_seq"]) == int(kf.wire_seq))
+                and (h["time_basis"] is None or h["time_basis"] == kf.time_basis)]
+        if len(hits) == 1:
+            mapping[kf.keyframe_id] = str(hits[0]["path"])
+        elif hits:
+            why["several_frames"].append(kf.keyframe_id)
+        else:
+            why["no_frame"].append(kf.keyframe_id)
+    why["notes"] = notes
+    return mapping, why
 
 
 SOURCE_WALK_IMAGES = "walk-solver-images"
@@ -642,15 +715,18 @@ SOURCE_REDACTED = "redacted-session-keyframes"
 SOURCE_MIXED = "mixed"
 
 
-def tally_solver_frames(store: WorldStore, world_id: str, session_id: str,
-                        capture_dirs) -> dict:
-    """Where each keyframe's solver image would come from, the way
-    `global_solve.prepare_images` decides it (`_source_frame`): already undistorted in
-    the solve directory (the walk's own solver images, reused), the raw frame
-    `sources.json` names, the raw frame in a capture directory, or the face-redacted
-    session copy. Reads only."""
+def plan_solver_frames(store: WorldStore, world_id: str, session_id: str,
+                       capture_dirs) -> dict:
+    """Where each keyframe's solver image will come from, and the `sources.json` that
+    makes it so. Reads only: `sources` in the result is what `apply_solver_frames`
+    writes, `sources_changed` whether it differs from the record on disk.
+
+    Per keyframe record, in `global_solve.prepare_images`' own order: already
+    undistorted in the solve directory (the walk's solver images, reused); the raw
+    frame the builder recorded (`raw_from_sources_json`); the raw frame found by
+    identity in the captures (`raw_from_capture_dir`); else the stored redacted
+    keyframe (`redacted_session_copies`, split by why)."""
     from tower.world_builder.global_solve import (  # noqa: PLC0415
-        _source_frame,
         keyframe_image_name,
         read_sources,
         resolve_source_path,
@@ -658,42 +734,76 @@ def tally_solver_frames(store: WorldStore, world_id: str, session_id: str,
     )
 
     workspace = workspace_for(store, world_id, session_id)
-    sources = read_sources(workspace)
-    session_dir = store.session_dir(world_id, session_id)
+    recorded = read_sources(workspace)
+    keyframes = store.read_keyframes(world_id, session_id)
+    mapping, why = map_raw_frames(keyframes, capture_dirs)
+    ambiguous = set(why["ambiguous_in_session"])
+    several = set(why["several_frames"])
+    sources = {kid: path for kid, path in recorded.items() if kid not in ambiguous}
     counts = {"keyframes": 0, "already_undistorted": 0, "raw_from_sources_json": 0,
-              "raw_from_capture_dir": 0, "redacted_session_copies": 0}
-    for keyframe in store.read_keyframes(world_id, session_id):
+              "raw_from_capture_dir": 0, "redacted_session_copies": 0,
+              "redacted_ambiguous_in_session": 0, "redacted_no_capture_frame": 0,
+              "redacted_several_capture_frames": 0}
+    for kf in keyframes:
         counts["keyframes"] += 1
-        if (workspace.images_dir / keyframe_image_name(keyframe)).exists():
+        kid = kf.keyframe_id
+        builder = None if kid in ambiguous else resolve_source_path(recorded.get(kid))
+        builder_ok = builder is not None and builder.is_file()
+        if not builder_ok and kid in mapping:
+            sources[kid] = mapping[kid]
+        if (workspace.images_dir / keyframe_image_name(kf)).exists():
             counts["already_undistorted"] += 1
-            continue
-        source = _source_frame(keyframe, session_dir, capture_dirs, sources)
-        recorded = resolve_source_path(sources.get(keyframe.keyframe_id))
-        if recorded is not None and source == recorded:
+        elif builder_ok:
             counts["raw_from_sources_json"] += 1
-        elif source == session_dir / keyframe.image_relpath:
-            counts["redacted_session_copies"] += 1
-        else:
+        elif kid in mapping:
             counts["raw_from_capture_dir"] += 1
+        else:
+            counts["redacted_session_copies"] += 1
+            counts["redacted_ambiguous_in_session" if kid in ambiguous else
+                   "redacted_several_capture_frames" if kid in several else
+                   "redacted_no_capture_frame"] += 1
     raw = counts["raw_from_sources_json"] + counts["raw_from_capture_dir"]
     redacted = counts["redacted_session_copies"]
     counts["source"] = (None if counts["keyframes"] == 0 else
                         SOURCE_WALK_IMAGES if raw + redacted == 0 else
                         SOURCE_RAW if redacted == 0 else
                         SOURCE_REDACTED if raw == 0 else SOURCE_MIXED)
+    counts["matched_by"] = "source_seq + received_at (+ wire_seq) in the captures' journals"
+    counts["ambiguous_keyframe_ids"] = sorted(ambiguous)
+    counts["dropped_builder_entries"] = sorted(k for k in recorded if k in ambiguous)
+    if why["notes"]:
+        counts["capture_notes"] = why["notes"]
+    counts["sources"] = sources
+    counts["sources_changed"] = ({k: str(v) for k, v in sources.items()}
+                                 != {k: str(v) for k, v in recorded.items()})
     return counts
 
 
+def apply_solver_frames(store: WorldStore, world_id: str, session_id: str,
+                        planned: dict) -> bool:
+    """Write the planned `sources.json` into the (fresh) solve directory when it
+    differs from the one there. True when written."""
+    from tower.world_builder.global_solve import (  # noqa: PLC0415
+        workspace_for,
+        write_sources_records,
+    )
+
+    if not planned.get("sources_changed"):
+        return False
+    write_sources_records(workspace_for(store, world_id, session_id), planned["sources"])
+    return True
+
+
 def run_final_solve(root: Path, world_id: str, session_id: str, *, seed: int,
-                    threads: int, capture_dirs=(), runner=subprocess.run) -> dict:
-    """Step 2: `world_finalize.py` with the product solve settings, in a child."""
+                    threads: int, runner=subprocess.run) -> dict:
+    """Step 2: `world_finalize.py` with the product solve settings, in a child. No
+    `--capture-dir`, ever: its lookup is by frame name, which a walk's captures reuse
+    (the raw frames go in `sources.json`, `plan_solver_frames`)."""
     env = dict(os.environ)
     env.update(PRODUCT_SOLVE_ENV)
     env["TOWER_WORLD_SOLVE_SEED"] = str(int(seed))
     argv = [sys.executable, str(FINALIZE_SCRIPT), "--root", str(root), "--world", world_id,
             "--session", session_id, "--threads", str(int(threads)), "--format", "json"]
-    for capture_dir in capture_dirs:
-        argv += ["--capture-dir", str(capture_dir)]
     done = runner(argv, env=env, capture_output=True, text=True)
     try:
         report = json.loads(done.stdout) if done.stdout.strip() else {}
@@ -814,14 +924,19 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
             for stage in ("surface", "appearance"):
                 engine.mark_stage(world_id, session_id, stage, state="stopped",
                                   detail=detail)
+            # The solver's raw frames, each found by its own capture identity and
+            # written as `sources.json` into the fresh solve directory -- under the
+            # same lock. Never handed to the solve as a capture directory.
+            step = "resolving the solver's frames"
+            capture = resolve_capture_dirs(store, world_id, session_id, capture_dirs,
+                                           use_capture=use_capture)
+            planned = plan_solver_frames(store, world_id, session_id,
+                                         capture["capture_dirs"])
+            capture["sources_json_written"] = apply_solver_frames(
+                store, world_id, session_id, planned)
         finally:
             engine.release_world(world_id)
-
-        step = "resolving the solver's frames"
-        capture = resolve_capture_dirs(store, world_id, session_id, capture_dirs,
-                                       use_capture=use_capture)
-        capture.update(tally_solver_frames(store, world_id, session_id,
-                                           capture["capture_dirs"]))
+        capture.update({k: v for k, v in planned.items() if k != "sources"})
         report["solver_frames"] = ledger["solver_frames"] = capture
         _write_ledger(store.world_dir(world_id) / REFINISH_DIRNAME / stamp, ledger)
 
@@ -829,7 +944,6 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
         step = "running the final solve"
         report["final_solve"] = run_final_solve(
             root, world_id, session_id, seed=seed, threads=threads,
-            capture_dirs=capture["capture_dirs"],
             **({"runner": solve_runner} if solve_runner is not None else {}))
         step = "reading the published solution"
         from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
@@ -931,13 +1045,14 @@ def main(argv=None) -> int:
                         help="do not prune the per-frame depth work afterwards")
     capture = parser.add_mutually_exclusive_group()
     capture.add_argument("--capture-dir", action="append", default=[],
-                         help="where the session's raw capture frames live (repeatable); "
-                              "passed to world_finalize.py. Default: the capture the "
-                              "session records, under TOWER_CAPTURE_ROOT, when it is on "
-                              "disk; else the redacted session keyframes")
+                         help="a capture directory (with its frames.jsonl) to search for "
+                              "each keyframe's own raw frame, by source_seq and receipt "
+                              "time (repeatable). Default: the session's capture and "
+                              "those continuing it, under TOWER_CAPTURE_ROOT. A keyframe "
+                              "with no unambiguous frame keeps its redacted copy")
     capture.add_argument("--no-capture", action="store_true",
-                         help="never hand the solve a capture directory: the session's "
-                              "own sources.json, else its redacted keyframes")
+                         help="search no capture: the walk's own sources.json, else the "
+                              "redacted session keyframes")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be set aside and run; write nothing")
     parser.add_argument("--format", choices=("json", "text"), default="json")
@@ -953,8 +1068,8 @@ def main(argv=None) -> int:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         frames = resolve_capture_dirs(store, args.world, session_id, args.capture_dir,
                                       use_capture=not args.no_capture)
-        frames.update(tally_solver_frames(store, args.world, session_id,
-                                          frames["capture_dirs"]))
+        planned = plan_solver_frames(store, args.world, session_id, frames["capture_dirs"])
+        frames.update({k: v for k, v in planned.items() if k != "sources"})
         _emit({"dry_run": True, "world_id": args.world, "session_id": session_id,
                "plan": plan(store, args.world, session_id, stamp),
                "final_solve_env": {**PRODUCT_SOLVE_ENV,

@@ -691,32 +691,74 @@ def test_when_the_lock_is_taken_meanwhile_the_ledger_says_nothing_was_put_back(
 
 # ---------------------------------------------------------------------------
 # P3 (PF): the session's raw capture reaches the final solve (finding 6: 991e5a15 and
-# af47007c were re-finished from the redacted keyframes with their captures on disk)
+# af47007c were re-finished from the redacted keyframes with their captures on disk),
+# and each keyframe gets ITS OWN capture's frame, never another's (review of 3abe763,
+# ACC: the captures of the live walk adc75972 reuse frame names; by name, 67 of 353
+# keyframes got another moment's image)
 # ---------------------------------------------------------------------------
 
 CAPTURE_ID = "c0ffee00c0ffee00c0ffee00c0ffee00"
+CAP_B, CAP_C = "b" * 32, "c" * 32
 
 
-def _live_capture_world(tmp_path, *, capture_id=CAPTURE_ID, n=3):
-    """An old world whose session was a live capture: keyframes named by source_seq,
-    no usable sources.json, and the capture's frames on disk under <root>/captures/."""
+def _frame_bytes(capture_id, seq, t):
+    """A raw frame's bytes name its capture and its moment, so an assignment is
+    checked exactly."""
+    return f"{capture_id}|{seq}|{t!r}".encode()
+
+
+def _write_capture(root, capture_id, frames, *, continues=None, started_at=None,
+                   journal=True):
+    """One capture directory as the recorder leaves it: `capture.json`, `frames/` and
+    the `frames.jsonl` journal (`frames` = [(source_seq, received_at)])."""
+    d = root / "captures" / capture_id
+    (d / "frames").mkdir(parents=True, exist_ok=True)
+    (d / "capture.json").write_text(json.dumps({
+        "capture_id": capture_id, "continues_capture": continues,
+        "started_at": started_at if started_at is not None else
+        (min(t for _s, t in frames) - 1.0 if frames else 0.0),
+        "retains_raw_imagery": True, "redaction": "none"}))
+    lines = []
+    for seq, t in frames:
+        (d / "frames" / f"{seq:08d}.jpg").write_bytes(_frame_bytes(capture_id, seq, t))
+        lines.append(json.dumps({
+            "schema_version": 1, "source_seq": seq, "wire_seq": seq, "tx_seq": None,
+            "received_at": t, "time_basis": "tower-receipt",
+            "relpath": f"frames/{seq:08d}.jpg", "byte_count": 1, "width": 240,
+            "height": 180}))
+    if journal:
+        (d / "frames.jsonl").write_text("\n".join(lines) + "\n")
+    return d
+
+
+def _walk(tmp_path, captures, keyframes):
+    """An old world whose session followed a live capture chain. `captures` =
+    [(capture_id, continues, [(seq, t), ...])]; `keyframes` = [(capture_id, seq, t)],
+    each a frame of that capture -- the id and image name come from `seq` alone, as the
+    builder makes them, so a restarted numbering collides exactly as on adc75972."""
     import dataclasses
 
     from tower.world_builder.records import Keyframe
 
     store, kids = _old_world(tmp_path)
     store.write_session(dataclasses.replace(store.read_session(W1, S1),
-                                            capture_id=capture_id))
-    for i in range(1, n + 1):
+                                            capture_id=captures[0][0]))
+    root = tmp_path / "caproot"
+    for capture_id, continues, frames in captures:
+        _write_capture(root, capture_id, frames, continues=continues)
+    for _capture_id, seq, t in keyframes:
         store.append_keyframe(W1, Keyframe(
-            keyframe_id=f"{S1}:{i:08d}", session_id=S1, source_seq=i, received_at=float(i),
-            image_relpath=f"images/{i:08d}.jpg", width=240, height=180, byte_count=1))
-    capture_root = tmp_path / "caproot"
-    frames = capture_root / "captures" / capture_id / "frames"
-    frames.mkdir(parents=True)
-    for i in range(1, n + 1):
-        (frames / f"{i:08d}.jpg").write_bytes(b"raw frame")
-    return store, kids, capture_root
+            keyframe_id=f"{S1}:{seq:08d}", session_id=S1, source_seq=seq, received_at=t,
+            image_relpath=f"images/{seq:08d}.jpg", width=240, height=180, byte_count=1,
+            wire_seq=seq))
+    return store, kids, root
+
+
+def _live_capture_world(tmp_path, *, n=3):
+    """One capture, n keyframes, frames 1..n at t = 100 + seq."""
+    frames = [(i, 100.0 + i) for i in range(1, n + 1)]
+    return _walk(tmp_path, [(CAPTURE_ID, None, frames)],
+                 [(CAPTURE_ID, s, t) for s, t in frames])
 
 
 def _capture_args(argv):
@@ -728,21 +770,146 @@ def _ledger(store, stamp):
                       .read_text())
 
 
-def test_the_sessions_capture_under_the_capture_root_goes_to_the_solve(tmp_path, stages,
-                                                                        monkeypatch):
+def _written_sources(store):
+    from tower.world_builder.global_solve import read_sources, workspace_for
+
+    return read_sources(workspace_for(store, W1, S1))
+
+
+def _assert_every_frame_is_its_own(store, keyframes):
+    """Every raw frame the solve will read belongs to that keyframe's own capture AND
+    moment; returns how many keyframes have one."""
+    own = {f"{S1}:{seq:08d}": _frame_bytes(c, seq, t) for c, seq, t in keyframes}
+    sources = _written_sources(store)
+    for kid, path in sources.items():
+        assert Path(path).read_bytes() == own[kid], (kid, path)
+    return len(sources)
+
+
+def test_the_sessions_capture_reaches_the_solve_as_sources_never_as_a_capture_dir(
+        tmp_path, stages, monkeypatch):
     store, kids, capture_root = _live_capture_world(tmp_path)
     monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
     solve = _Solve(store, kids)
     report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
     assert report["done"] is True
     expected = str(capture_root / "captures" / CAPTURE_ID)
-    assert _capture_args(solve.calls[0]["argv"]) == [expected]
+    # The by-name `--capture-dir` lookup is never handed to the solve.
+    assert _capture_args(solve.calls[0]["argv"]) == []
     frames = _ledger(store, "c")["solver_frames"]
     assert frames["from"] == wr.CAPTURE_FROM_SESSION
     assert frames["capture_id"] == CAPTURE_ID and frames["capture_dirs"] == [expected]
     assert frames["raw_from_capture_dir"] == 3 and frames["redacted_session_copies"] == 0
-    assert frames["source"] == wr.SOURCE_RAW
+    assert frames["source"] == wr.SOURCE_RAW and frames["sources_json_written"] is True
+    assert "sources" not in frames                     # the record is on disk, not here
     assert report["solver_frames"] == frames
+    assert _assert_every_frame_is_its_own(
+        store, [(CAPTURE_ID, i, 100.0 + i) for i in (1, 2, 3)]) == 3
+    # The set-aside walk record is untouched.
+    aside = store.world_dir(W1) / "refinish" / "c" / "solve" / S1 / "sources.json"
+    assert json.loads(aside.read_text()) == {"k": "v"}
+
+
+def test_colliding_frame_names_across_three_captures_never_cross(tmp_path, stages,
+                                                                 monkeypatch):
+    """The reviewer's case: a reconnect restarts the numbering, so all three captures
+    hold frames 1..4. Every keyframe gets the frame of ITS OWN capture and moment, and
+    the two keyframes whose ids collide in the session keep their stored copies."""
+    a = [(s, 10.0 + s) for s in (1, 2, 3, 4)]
+    b = [(s, 20.0 + s) for s in (1, 2, 3, 4)]
+    c = [(s, 30.0 + s) for s in (1, 2, 3, 4)]
+    keyframes = [(CAPTURE_ID, 1, 11.0), (CAPTURE_ID, 3, 13.0), (CAP_B, 2, 22.0),
+                 (CAP_B, 4, 24.0), (CAP_C, 1, 31.0)]          # id :00000001 twice
+    store, kids, root = _walk(tmp_path, [(CAPTURE_ID, None, a), (CAP_B, CAPTURE_ID, b),
+                                         (CAP_C, CAP_B, c)], keyframes)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(root))
+    solve = _Solve(store, kids)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
+    assert _capture_args(solve.calls[0]["argv"]) == []
+    frames = report["solver_frames"]
+    assert [x["capture_id"] for x in frames["captures"]] == [CAPTURE_ID, CAP_B, CAP_C]
+    assert _assert_every_frame_is_its_own(store, keyframes) == 3
+    assert set(_written_sources(store)) == {f"{S1}:00000003", f"{S1}:00000002",
+                                            f"{S1}:00000004"}
+    assert frames["raw_from_capture_dir"] == 3
+    assert frames["redacted_session_copies"] == 2
+    assert frames["redacted_ambiguous_in_session"] == 2
+    assert frames["ambiguous_keyframe_ids"] == [f"{S1}:00000001"]
+    assert frames["source"] == wr.SOURCE_MIXED
+
+
+def test_an_adc75972_shaped_walk_gives_no_keyframe_another_captures_frame(
+        tmp_path, stages, monkeypatch):
+    """Regression, the live walk's structure at small scale: three captures after two
+    reconnects, each restarting at 1 and journalling every other frame; the builder
+    kept every third journalled frame. The old by-name lookup gives some keyframes a
+    frame of another capture -- the identity lookup gives none."""
+    from tower.world_builder.global_solve import _source_frame
+
+    captures, keyframes = [], []
+    for cid, parent, t0, pick in ((CAPTURE_ID, None, 1000.0, slice(0, None, 3)),
+                                  (CAP_B, CAPTURE_ID, 1100.0, slice(1, None, 3)),
+                                  (CAP_C, CAP_B, 1200.0, slice(0, None, 4))):
+        frames = [(s, t0 + 0.033 * s) for s in range(1, 60, 2)]
+        captures.append((cid, parent, frames))
+        keyframes += [(cid, s, t) for s, t in frames[pick]]
+    store, kids, root = _walk(tmp_path, captures, keyframes)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(root))
+    kf_records = store.read_keyframes(W1, S1)
+    ids = [k.keyframe_id for k in kf_records]
+    ambiguous = {k for k in ids if ids.count(k) > 1}
+    assert ambiguous                                   # ids collide, as on adc75972
+    # The hazard is real: by name, some keyframe gets another capture's frame.
+    dirs = [root / "captures" / c for c in (CAPTURE_ID, CAP_B, CAP_C)]
+    own = {(k.keyframe_id, k.received_at): _frame_bytes(c, s, t)
+           for k, (c, s, t) in zip(kf_records, keyframes)}
+    by_name_wrong = sum(
+        1 for k in kf_records
+        if _source_frame(k, store.session_dir(W1, S1), dirs, {}).read_bytes()
+        != own[(k.keyframe_id, k.received_at)])
+    assert by_name_wrong > 0
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="c")
+    frames = report["solver_frames"]
+    mapped = _assert_every_frame_is_its_own(store, keyframes)
+    assert mapped == frames["raw_from_capture_dir"] > 0
+    assert frames["redacted_ambiguous_in_session"] == sum(1 for k in ids if k in ambiguous)
+    assert mapped + frames["redacted_session_copies"] == len(keyframes)
+    assert not set(_written_sources(store)) & ambiguous
+
+
+def test_no_journal_record_or_two_of_them_keeps_the_stored_copy(tmp_path, stages,
+                                                                monkeypatch):
+    a = [(1, 11.0), (2, 12.0), (3, 13.0)]
+    # CAP_B journals frame 3 at the SAME moment as CAPTURE_ID (two claims to one
+    # identity); keyframe 2's receipt time matches no record at all.
+    b = [(3, 13.0)]
+    keyframes = [(CAPTURE_ID, 1, 11.0), (CAPTURE_ID, 2, 12.5), (CAPTURE_ID, 3, 13.0)]
+    store, kids, root = _walk(tmp_path, [(CAPTURE_ID, None, a), (CAP_B, CAPTURE_ID, b)],
+                              keyframes)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(root))
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="c")
+    frames = report["solver_frames"]
+    assert set(_written_sources(store)) == {f"{S1}:00000001"}
+    assert frames["raw_from_capture_dir"] == 1
+    assert frames["redacted_no_capture_frame"] == 1
+    assert frames["redacted_several_capture_frames"] == 1
+
+
+def test_a_directory_without_a_journal_is_not_searched_by_name(tmp_path, stages,
+                                                                monkeypatch):
+    store, kids, _root = _live_capture_world(tmp_path / "one")
+    monkeypatch.delenv(wr.CAPTURE_ROOT_ENV, raising=False)
+    bare = _write_capture(tmp_path / "bare", "x" * 32, [(1, 101.0), (2, 102.0)],
+                          journal=False)
+    report = wr.refinish(store, tmp_path / "one", W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="c", capture_dirs=[bare])
+    frames = report["solver_frames"]
+    assert frames["from"] == wr.CAPTURE_FROM_ARGUMENT
+    assert frames["raw_from_capture_dir"] == 0 and frames["redacted_session_copies"] == 3
+    assert "frames.jsonl" in frames["capture_notes"][0]
+    assert frames["sources_json_written"] is False
 
 
 def test_without_a_capture_root_the_solve_gets_the_session_copies_as_today(tmp_path, stages,
@@ -756,47 +923,55 @@ def test_without_a_capture_root_the_solve_gets_the_session_copies_as_today(tmp_p
     assert frames["from"] is None and wr.CAPTURE_ROOT_ENV in frames["why"]
     assert frames["redacted_session_copies"] == 3
     assert frames["source"] == wr.SOURCE_REDACTED
+    assert frames["sources_json_written"] is False
+    # the walk's record, copied back, is exactly what it was
+    assert json.loads((store.world_dir(W1) / "solve" / S1 / "sources.json").read_text()) \
+        == {"k": "v"}
 
 
-def test_an_explicit_capture_dir_wins_and_no_capture_turns_it_off(tmp_path, stages,
-                                                                  monkeypatch):
+def test_an_explicit_capture_dir_is_searched_by_identity_and_no_capture_turns_it_off(
+        tmp_path, stages, monkeypatch):
     store, kids, capture_root = _live_capture_world(tmp_path / "one")
     monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
-    other = tmp_path / "elsewhere"
-    (other / "frames").mkdir(parents=True)
-    (other / "frames" / "00000002.jpg").write_bytes(b"raw frame")
-    solve = _Solve(store, kids)
-    wr.refinish(store, tmp_path / "one", W1, S1, solve_runner=solve, stamp="c",
-                capture_dirs=[other])
-    assert _capture_args(solve.calls[0]["argv"]) == [str(other)]
+    other = _write_capture(tmp_path / "elsewhere", "e" * 32, [(2, 102.0)])
+    wr.refinish(store, tmp_path / "one", W1, S1, solve_runner=_Solve(store, kids),
+                stamp="c", capture_dirs=[other])
     frames = _ledger(store, "c")["solver_frames"]
     assert frames["from"] == wr.CAPTURE_FROM_ARGUMENT
     assert frames["raw_from_capture_dir"] == 1 and frames["redacted_session_copies"] == 2
     assert frames["source"] == wr.SOURCE_MIXED
+    assert _assert_every_frame_is_its_own(store, [("e" * 32, 2, 102.0)]) == 1
 
     store2, kids2, capture_root2 = _live_capture_world(tmp_path / "two")
     monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root2))
-    solve2 = _Solve(store2, kids2)
-    wr.refinish(store2, tmp_path / "two", W1, S1, solve_runner=solve2, stamp="d",
-                use_capture=False)
-    assert _capture_args(solve2.calls[0]["argv"]) == []
-    assert _ledger(store2, "d")["solver_frames"]["why"] == "--no-capture"
+    wr.refinish(store2, tmp_path / "two", W1, S1, solve_runner=_Solve(store2, kids2),
+                stamp="d", use_capture=False)
+    frames2 = _ledger(store2, "d")["solver_frames"]
+    assert frames2["why"] == "--no-capture" and frames2["redacted_session_copies"] == 3
 
 
-def test_a_frame_sources_json_names_still_wins_over_the_capture(tmp_path, stages,
-                                                                monkeypatch):
-    store, kids, capture_root = _live_capture_world(tmp_path)
-    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
-    raw = tmp_path / "walk-raw" / "00000001.jpg"
+def test_the_builders_record_wins_except_for_an_ambiguous_keyframe_id(tmp_path, stages,
+                                                                      monkeypatch):
+    a = [(1, 11.0), (2, 12.0)]
+    b = [(1, 21.0)]
+    keyframes = [(CAPTURE_ID, 1, 11.0), (CAPTURE_ID, 2, 12.0), (CAP_B, 1, 21.0)]
+    store, kids, root = _walk(tmp_path, [(CAPTURE_ID, None, a), (CAP_B, CAPTURE_ID, b)],
+                              keyframes)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(root))
+    raw = tmp_path / "walk-raw" / "00000002.jpg"
     raw.parent.mkdir()
     raw.write_bytes(b"raw frame the builder recorded")
-    (store.world_dir(W1) / "solve" / S1 / "sources.json").write_text(
-        json.dumps({"sources": {f"{S1}:00000001": str(raw)}}))
+    (store.world_dir(W1) / "solve" / S1 / "sources.json").write_text(json.dumps(
+        {"sources": {f"{S1}:00000002": str(raw),
+                     f"{S1}:00000001": str(root / "captures" / CAP_B / "frames" /
+                                           "00000001.jpg")}}))
     report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
                          stamp="c")
     frames = report["solver_frames"]
-    assert frames["raw_from_sources_json"] == 1 and frames["raw_from_capture_dir"] == 2
-    assert frames["source"] == wr.SOURCE_RAW
+    assert _written_sources(store) == {f"{S1}:00000002": str(raw)}
+    assert frames["raw_from_sources_json"] == 1
+    assert frames["redacted_ambiguous_in_session"] == 2
+    assert frames["dropped_builder_entries"] == [f"{S1}:00000001"]
 
 
 def test_already_undistorted_walk_images_are_counted_as_reused(tmp_path, stages,
@@ -840,6 +1015,37 @@ def test_capture_resolution_rules(tmp_path, monkeypatch):
                                             capture_id="../" + CAPTURE_ID))
     got = wr.resolve_capture_dirs(store, W1, S1)
     assert got["capture_dirs"] == [] and "plain" in got["why"]
+
+
+def test_the_chain_is_every_capture_continuing_the_sessions_and_nothing_else(tmp_path,
+                                                                            monkeypatch):
+    store, _kids, root = _live_capture_world(tmp_path)
+    _write_capture(root, CAP_B, [(1, 201.0)], continues=CAPTURE_ID, started_at=200.0)
+    _write_capture(root, CAP_C, [(1, 301.0)], continues=CAP_B, started_at=300.0)
+    _write_capture(root, "f" * 32, [(1, 251.0)], continues=CAP_B, started_at=250.0)  # fork
+    _write_capture(root, "d" * 32, [(1, 401.0)], started_at=400.0)                   # unrelated
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(root))
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert [c["capture_id"] for c in got["captures"]] == [CAPTURE_ID, CAP_B, "f" * 32, CAP_C]
+    assert all(c["retains_raw_imagery"] is True for c in got["captures"])
+
+
+def test_the_cli_dry_run_names_the_frames_and_writes_nothing(tmp_path, capsys, monkeypatch):
+    store, _kids, capture_root = _live_capture_world(tmp_path)
+    monkeypatch.delenv(wr.CAPTURE_ROOT_ENV, raising=False)
+    cap = capture_root / "captures" / CAPTURE_ID
+    before = _files(tmp_path)
+    assert wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
+                    "--capture-dir", str(cap)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["solver_frames"]["from"] == wr.CAPTURE_FROM_ARGUMENT
+    assert out["solver_frames"]["raw_from_capture_dir"] == 3
+    assert out["solver_frames"]["sources_changed"] is True
+    assert "sources" not in out["solver_frames"]
+    assert _files(tmp_path) == before
+    with pytest.raises(SystemExit):
+        wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
+                 "--capture-dir", str(cap), "--no-capture"])
 
 
 # ---------------------------------------------------------------------------
@@ -900,67 +1106,3 @@ def test_a_refinish_restarts_the_regate_counter_too(tmp_path, stages):
         assert sessions[key]["attempts"] == 0, key
     assert _ledger(store, "p")["previous"]["finish_attempts"][wfp.regate_ledger_key(S1)] \
         == exhausted
-
-
-def _capture(root, capture_id, seqs, *, continues=None):
-    d = root / "captures" / capture_id
-    (d / "frames").mkdir(parents=True, exist_ok=True)
-    (d / "capture.json").write_text(json.dumps({
-        "capture_id": capture_id, "continues_capture": continues,
-        "retains_raw_imagery": True, "redaction": "none"}))
-    for i in seqs:
-        (d / "frames" / f"{i:08d}.jpg").write_bytes(b"raw frame")
-    return d
-
-
-def test_the_captures_that_continue_the_sessions_capture_are_followed(tmp_path, stages,
-                                                                      monkeypatch):
-    """991e5a15 and af47007c: the walk went on in two successor captures after a
-    reconnect, and the session records only the first -- 132 of 229 and 164 of 218
-    keyframes were in it."""
-    import shutil
-
-    store, kids, capture_root = _live_capture_world(tmp_path, n=5)
-    shutil.rmtree(capture_root / "captures" / CAPTURE_ID)          # tmp_path fixture
-    first = _capture(capture_root, CAPTURE_ID, (1, 2))
-    second = _capture(capture_root, "b" * 32, (3, 4), continues=CAPTURE_ID)
-    third = _capture(capture_root, "c" * 32, (5,), continues="b" * 32)
-    _capture(capture_root, "d" * 32, (9,))                           # unrelated
-    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
-    solve = _Solve(store, kids)
-    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
-    assert _capture_args(solve.calls[0]["argv"]) == [str(first), str(second), str(third)]
-    frames = report["solver_frames"]
-    assert [c["capture_id"] for c in frames["captures"]] == [CAPTURE_ID, "b" * 32, "c" * 32]
-    assert all(c["retains_raw_imagery"] is True for c in frames["captures"])
-    assert frames["raw_from_capture_dir"] == 5 and frames["redacted_session_copies"] == 0
-
-
-def test_a_continued_capture_whose_frame_names_repeat_is_not_followed(tmp_path, monkeypatch):
-    import shutil
-
-    store, _kids, capture_root = _live_capture_world(tmp_path)
-    shutil.rmtree(capture_root / "captures" / CAPTURE_ID)
-    first = _capture(capture_root, CAPTURE_ID, (1, 2))
-    _capture(capture_root, "b" * 32, (2, 3), continues=CAPTURE_ID)  # 00000002 twice
-    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
-    got = wr.resolve_capture_dirs(store, W1, S1)
-    assert got["capture_dirs"] == [str(first)]
-    assert "repeat" in got["chain_note"]
-
-
-def test_the_cli_passes_capture_dirs_and_the_dry_run_names_the_frames(tmp_path, capsys,
-                                                                      monkeypatch):
-    store, _kids, capture_root = _live_capture_world(tmp_path)
-    monkeypatch.delenv(wr.CAPTURE_ROOT_ENV, raising=False)
-    cap = capture_root / "captures" / CAPTURE_ID
-    before = _files(tmp_path)
-    assert wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
-                    "--capture-dir", str(cap)]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["solver_frames"]["from"] == wr.CAPTURE_FROM_ARGUMENT
-    assert out["solver_frames"]["raw_from_capture_dir"] == 3
-    assert _files(tmp_path) == before
-    with pytest.raises(SystemExit):
-        wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
-                 "--capture-dir", str(cap), "--no-capture"])
