@@ -689,8 +689,9 @@ nonisolated extension WorldRenderFetchError {
         case .absent(let detail?):
             // No "yet": the detail says which — a world still being built
             // answers "no geometry yet", and a world that does not exist
-            // answers "no world", and only the Tower knows which.
-            return "The Tower has no picture for this world: \(detail)."
+            // answers "no world", and only the Tower knows which. Guarded
+            // (G1-F4): the route's `detail` is Tower prose, and only shown.
+            return "The Tower has no picture for this world: \(WorldTowerText.clause(detail))."
         case .absent(nil):
             return "The Tower has no picture for this world — no geometry has been built for it, or the world is gone."
         case .badAddress:

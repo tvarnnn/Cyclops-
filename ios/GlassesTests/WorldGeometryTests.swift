@@ -1146,6 +1146,25 @@ final class WorldFragmentsModelTests: XCTestCase {
         XCTAssertEqual(model.unresolvedCount, 3)
     }
 
+    /// G1-F4: a refusal reason that is machine output (an exception, a path)
+    /// is not repeated verbatim; a sentence still is.
+    func testATilesMachineOutputReasonIsNotRepeated() {
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: refused(reason: "ValueError: too few inliers at /Users/tristan/solve/db")
+            )),
+            "refused — " + WorldTowerText.genericClause
+        )
+        XCTAssertEqual(
+            WorldFragmentsModel.placementCaption(for: summary(
+                index: 0, points: 10, state: .resolved, bounds: box,
+                placement: refused(reason: "fewer than 15 inliers to the reference segment")
+            )),
+            "refused — fewer than 15 inliers to the reference segment"
+        )
+    }
+
     /// The tile caption is the Tower's registration word and, when it gave
     /// one, its refusal reason verbatim. No state, no caption: a Tower that
     /// predates `registration_state` has said nothing to repeat.

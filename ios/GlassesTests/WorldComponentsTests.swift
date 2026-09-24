@@ -780,7 +780,6 @@ final class WorldNoticeGuardTests: XCTestCase {
         "the evidence gate had too little metric scale to place pieces by it (too few cameras had a level); the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk",
         "the evidence gate failed (an error in the gate); the Tower re-runs it when it is idle",
         "the evidence gate could not measure metric scale (depth did not finish); the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; an owner can re-finish this walk",
-        "the evidence gate failed (RuntimeError); the Tower re-runs it when it is idle",
         "the phone and/or the Tower lost 1/2 of the frames; an owner can re-capture this walk",
     ]
 
@@ -805,6 +804,8 @@ final class WorldNoticeGuardTests: XCTestCase {
             "gate crashed: File \"/opt/tower/gate.py\", line 88, in solve",
             "ValueError: shapes (3,4) and (5,) not aligned",
             "RuntimeError(CUDA out of memory)",
+            // G1-F4: an exception class anywhere (v8: a notice never carries one).
+            "the evidence gate failed (RuntimeError); the Tower re-runs it when it is idle",
             "tower.world_builder.coherence.GateError: the gate raised",
             "Error: the depth stage returned 0 cameras",
             "Exception in the depth stage",
@@ -1025,5 +1026,138 @@ final class WorldNoticeClosedSetTests: XCTestCase {
         assertVerbatim("the evidence gate could not measure metric scale (GPU out of memory); "
             + "the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; "
             + "an owner can re-finish this walk")
+    }
+}
+
+// MARK: - Tower prose on the World Builder screens (G1-F4)
+
+/// Review V10: `finalization.detail` could reach the phone through
+/// `lifecycle.reason` -> `model_state_reason`, which the canvas shows for an
+/// interrupted world. Every place the World Builder screens show Tower-written
+/// prose now goes through `WorldTowerText`: machine output is replaced, and
+/// every normal sentence is shown exactly as sent.
+@MainActor
+final class WorldTowerTextTests: XCTestCase {
+
+    /// Real Tower sentences (from `tower/tower/results/world_builder.py` and the
+    /// B0 captures), which must never be rewritten.
+    private let towerSentences = [
+        "the process building this world exited without stopping its session; its keyframes are persisted but the session was never closed",
+        "no world root is configured on this Tower",
+        "this world does not have the photographic representation it is owed yet: the appearance stage is unfinished and no process is working on it. A Tower with the photographic stages enabled finishes owed work the next time it is idle; one that has them switched off will not, and this world then stays as it is until somebody runs scripts/world_finish_pending.py by hand",
+        "the finalization of this session was interrupted: the final solve did not finish",
+        "set TOWER_WORLD_ROOT=off to stop offering it",
+        "fixture: the appearance encode raised",
+        "no geometry yet",
+    ]
+
+    /// What V10 found leaking, and its cousins.
+    private let machine = [
+        "the finalization of this session was interrupted: RuntimeError: CUDA out of memory",
+        "the finalization of this session was interrupted: [Errno 2] No such file or directory: '/home/tower/worlds/w1/solve/s1/db.sqlite'",
+        #"the finalization failed: C:\Users\tvllo\Projects\Glasses\tower\data\w1"#,
+        "Traceback (most recent call last):\n  File \"x.py\", line 3",
+        "KeyError: 'session'",
+        "the gate stopped: inliers=37 ratio=4.27",
+        #"the gate stopped: {"state": "failed"}"#,
+    ]
+
+    func testNormalTowerSentencesAreShownVerbatimEverywhere() {
+        for sentence in towerSentences {
+            XCTAssertFalse(WorldTowerText.looksLikeMachineOutput(sentence), sentence)
+            XCTAssertEqual(WorldTowerText.sentence(sentence), sentence)
+            XCTAssertEqual(WorldTowerText.clause(sentence), sentence)
+        }
+    }
+
+    func testMachineOutputIsReplaced() {
+        for text in machine {
+            XCTAssertTrue(WorldTowerText.looksLikeMachineOutput(text), text)
+            XCTAssertEqual(WorldTowerText.sentence(text), WorldTowerText.genericSentence, text)
+            XCTAssertEqual(WorldTowerText.clause(text), WorldTowerText.genericClause, text)
+        }
+        XCTAssertNil(WorldTowerText.sentence(nil))
+        XCTAssertFalse(WorldTowerText.looksLikeMachineOutput(WorldTowerText.genericSentence))
+    }
+
+    // MARK: Each display site
+
+    private func payload(_ modelState: String, reason: String) -> [String: Any] {
+        [
+            "model_state": modelState, "model_state_reason": reason,
+            "world_snapshot": ["world_id": "w1", "keyframe_count": 24, "revision": "r",
+                               "geometry": ["representation": "sparse point cloud", "element_count": 900,
+                                            "is_incremental": false],
+                               "trajectory": ["pose_count": 24]],
+        ]
+    }
+
+    /// `model_state_reason` (`lifecycle.reason`): the canvas's interrupted,
+    /// unsupported and failed text, and the recoverability sentence.
+    func testTheModelStateReasonIsGuardedAtTheDecoder() {
+        let leaked = machine[0]
+        guard case .interrupted(_, let reason)? = WorldBuilderResultDecoder.modelState(
+            from: payload("interrupted", reason: leaked)) else { return XCTFail("interrupted did not decode") }
+        XCTAssertEqual(reason, WorldTowerText.genericSentence)
+        guard case .interrupted(_, let normal)? = WorldBuilderResultDecoder.modelState(
+            from: payload("interrupted", reason: towerSentences[0])) else { return XCTFail() }
+        XCTAssertEqual(normal, towerSentences[0])
+
+        guard case .unsupported(let unsupported)? = WorldBuilderResultDecoder.modelState(
+            from: payload("unsupported", reason: machine[3])) else { return XCTFail() }
+        XCTAssertEqual(unsupported, WorldTowerText.genericSentence)
+        guard case .unsupported(let plain)? = WorldBuilderResultDecoder.modelState(
+            from: payload("unsupported", reason: towerSentences[1])) else { return XCTFail() }
+        XCTAssertEqual(plain, towerSentences[1])
+
+        guard case .failed(let failure)? = WorldBuilderResultDecoder.modelState(
+            from: payload("failed", reason: machine[2])) else { return XCTFail() }
+        XCTAssertEqual(failure.message, WorldTowerText.genericSentence)
+
+        // The recoverability sentence composes the (already guarded) reason.
+        let sentence = WorldRecoverability.of(stage: .needsRetry, evidence: nil, reason: reason).sentence
+        XCTAssertEqual(sentence?.contains("CUDA"), false)
+        XCTAssertEqual(sentence?.contains(WorldTowerText.genericSentence), true)
+    }
+
+    /// A photographic block's `detail` on the canvas ("The Tower's reason: …").
+    func testThePhotographicReasonIsGuarded() {
+        XCTAssertEqual(WorldPhotographicCopy.failedReason("fixture: the appearance encode raised"),
+                       "The Tower's reason: fixture: the appearance encode raised")
+        XCTAssertEqual(WorldPhotographicCopy.failedReason("OSError: [Errno 28] No space left on device"),
+                       WorldTowerText.genericSentence)
+    }
+
+    /// A render route's 404 `detail` in the viewer's failure sentence -- while
+    /// retry and terminal decisions still compare the raw text.
+    func testARoutesDetailIsGuardedOnlyWhereItIsShown() {
+        XCTAssertEqual(WorldRenderFetchError.absent(detail: "no geometry yet").message,
+                       "The Tower has no picture for this world: no geometry yet.")
+        let leaked = WorldRenderFetchError.absent(detail: "KeyError: 'w1'")
+        XCTAssertEqual(leaked.message, "The Tower has no picture for this world: \(WorldTowerText.genericClause).")
+        XCTAssertTrue(leaked.isRetryable)
+        XCTAssertFalse(WorldRenderFetchError.absent(detail: WorldAreaRouteAnswer.noSuchArea).isRetryable)
+    }
+
+    /// The session controller's refusal and failure footnotes.
+    func testTheSessionFootnoteIsGuarded() {
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .refused("this Tower has no world_builder producer configured, so there is nothing to start")),
+            "The Tower refused to activate World Builder: this Tower has no world_builder producer configured, so there is nothing to start")
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .refused("RuntimeError: producer died at /opt/tower/x/y.py")),
+            "The Tower refused to activate World Builder: \(WorldTowerText.genericClause)")
+        XCTAssertEqual(
+            WorldBuilderSessionController.footnote(for: .failed("Traceback (most recent call last):")),
+            "World Builder could not be asked for on the Tower: \(WorldTowerText.genericClause)")
+    }
+
+    /// The geometry fetch's failure sentence ("the transport's or the Tower's
+    /// own words").
+    func testTheGeometryFailureDetailIsGuarded() {
+        XCTAssertEqual(WorldGeometryFailure(kind: .unreachable, detail: "The request timed out.").message,
+                       "The Tower's geometry could not be fetched: The request timed out.")
+        XCTAssertEqual(WorldGeometryFailure(kind: .unreachable, detail: "ValueError: bad manifest").message,
+                       "The Tower's geometry could not be fetched: \(WorldTowerText.genericClause)")
     }
 }

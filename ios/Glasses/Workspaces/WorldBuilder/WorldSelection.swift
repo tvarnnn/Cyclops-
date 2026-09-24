@@ -201,9 +201,9 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
 /// rewritten, and the phone still never MATCHES on the text: it recognises
 /// shapes of machine output, not wordings.
 nonisolated enum WorldNoticeGuard {
-    /// Longer than any honest joined notice (the longest §3.1 combination is
-    /// about 500 characters).
-    static let maximumLength = 700
+    /// Longer than any honest joined notice (the longest v8 §3.1 composition
+    /// is 410 characters).
+    static let maximumLength = WorldTowerText.maximumLength
 
     /// Said instead of text that looks like machine output.
     static let genericSentence = "The Tower could not finish everything it should have for this walk. "
@@ -213,6 +213,53 @@ nonisolated enum WorldNoticeGuard {
     static func displayText(_ value: Any?) -> String? {
         guard let text = WorldFinalizationReport.notice(value) else { return nil }
         return looksLikeMachineOutput(text) ? genericSentence : text
+    }
+
+    static func looksLikeMachineOutput(_ text: String) -> Bool {
+        WorldTowerText.looksLikeMachineOutput(text)
+    }
+}
+
+// MARK: - Any Tower prose the World Builder screens show (G1-F4)
+
+/// The one rule for Tower-written free text on the World Builder screens --
+/// `model_state_reason` (which carries `lifecycle.reason`), a cartridge's
+/// `unavailable_reason`, a photographic block's `detail`, a route's 404
+/// `detail`, a session refusal, a segment's refusal reason -- and for
+/// `finalization.notice` through `WorldNoticeGuard`.
+///
+/// Review V10 found `finalization.detail` reaching the phone inside
+/// `lifecycle.reason`. The Tower is scrubbing it; this is defence in depth:
+/// text that looks like **machine output** is replaced, and every normal
+/// sentence is shown exactly as sent. It recognises shapes, never wordings:
+///
+/// - a backslash, or an absolute path of two or more segments (`/Users/…/`,
+///   `~/…/`, `/var/…/`) -- a relative `scripts/x.py` is not a disk path;
+/// - a Python traceback (`Traceback`, `File "…", line N`);
+/// - text that opens like an exception (`Error:`, `ValueError: …`, `X(…`,
+///   `Exception…`), or a CamelCase exception class anywhere in it
+///   (`… RuntimeError …`, `OutOfMemoryError`);
+/// - a lower-case `key=value` pair or a JSON object -- program state, not
+///   prose (an operator hint's `TOWER_X=off` is prose);
+/// - a line break, or more than `maximumLength` characters.
+nonisolated enum WorldTowerText {
+    static let maximumLength = 700
+
+    /// Standing alone, in place of a whole reason.
+    static let genericSentence = "The Tower gave a technical reason, which is not shown here."
+    /// After a colon, in place of the Tower's part of an app sentence.
+    static let genericClause = "a technical reason, which is not shown here"
+
+    /// `text` when it is prose, the generic sentence when it is machine
+    /// output, `nil` for no text.
+    static func sentence(_ text: String?) -> String? {
+        guard let text else { return nil }
+        return looksLikeMachineOutput(text) ? genericSentence : text
+    }
+
+    /// `text` when it is prose, the generic clause when it is machine output.
+    static func clause(_ text: String) -> String {
+        looksLikeMachineOutput(text) ? genericClause : text
     }
 
     static func looksLikeMachineOutput(_ text: String) -> Bool {
@@ -228,6 +275,16 @@ nonisolated enum WorldNoticeGuard {
             return true
         }
         if trimmed.range(of: #"^(Error|Exception)\b"#, options: .regularExpression) != nil { return true }
+        // A CamelCase exception class anywhere: `failed: RuntimeError: …`,
+        // `(KeyError)`, `torch.OutOfMemoryError`. Prose says "an error".
+        if text.range(of: #"\b[A-Z][A-Za-z0-9]*(Error|Exception)\b"#, options: .regularExpression) != nil {
+            return true
+        }
+        // Program state: `keyframes=24`, `path=/x`, `{"state": …}`. Lower-case
+        // keys only: an operator hint such as "set TOWER_WORLD_ROOT=off" is a
+        // sentence the Tower means a person to read.
+        if text.range(of: #"\b[a-z_][a-z0-9_]*=\S"#, options: .regularExpression) != nil { return true }
+        if text.range(of: #"\{\s*["']"#, options: .regularExpression) != nil { return true }
         // An absolute path of two or more segments, at the start of the text
         // or after a space, a quote or a bracket: `/Users/x/…`, `/tmp/a/b`,
         // `~/Projects/…`. "and/or", "1/2" and "Tower/phone" are not.

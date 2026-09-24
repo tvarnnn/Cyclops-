@@ -156,7 +156,8 @@ struct WorldGeometryFailure: Equatable {
         switch kind {
         case .unreachable:
             if let detail, !detail.isEmpty {
-                return "The Tower's geometry could not be fetched: \(detail)"
+                // "The transport's or the Tower's own words": guarded (G1-F4).
+                return "The Tower's geometry could not be fetched: \(WorldTowerText.clause(detail))"
             }
             return "The Tower's geometry could not be fetched."
         case .undecodable:

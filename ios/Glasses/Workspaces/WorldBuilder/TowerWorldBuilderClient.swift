@@ -145,7 +145,11 @@ enum WorldBuilderResultDecoder {
     /// rather than as an empty world.
     static func modelState(from payload: [String: Any]) -> WorldModelState? {
         guard let word = payload["model_state"] as? String else { return nil }
-        let reason = payload["model_state_reason"] as? String
+        // Guarded (G1-F4): this is `lifecycle.reason`, which review V10 found
+        // could embed `finalization.detail` -- exception text, a path. Shown on
+        // the canvas for `unsupported`, `interrupted` and `failed`, in the
+        // unavailable panel, and inside the recoverability sentence.
+        let reason = WorldTowerText.sentence(payload["model_state_reason"] as? String)
         // `if let` rather than `Optional.map(snapshot(from:))`, for the reason
         // `TowerCartridgeDeclaration.init` gives: a function reference passed
         // to `map` is called from a nonisolated context under this target's
@@ -978,7 +982,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // The Tower's own prose is the only honest explanation available,
             // so it is shown verbatim.
             state = .unsupported(
-                reason: offer.unavailableReason ?? WorldBuilderResultDecoder.unexplainedUnsupported
+                reason: WorldTowerText.sentence(offer.unavailableReason)
+                    ?? WorldBuilderResultDecoder.unexplainedUnsupported
             )
             return
         }

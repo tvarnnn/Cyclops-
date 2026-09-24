@@ -204,6 +204,9 @@ nonisolated enum WorldPhotographicCopy {
     /// The Tower's own reason, when it gave one. Its prose, verbatim.
     static func failedReason(_ detail: String?) -> String? {
         guard let detail, !detail.isEmpty else { return nil }
+        // Guarded (G1-F4): a stage's `detail` is Tower prose, and a failed
+        // build's is the likeliest place for an exception's text to land.
+        if WorldTowerText.looksLikeMachineOutput(detail) { return WorldTowerText.genericSentence }
         return "The Tower's reason: \(detail)"
     }
 
