@@ -642,8 +642,12 @@ Read §2.2 for what each one means.
     whole Tower for about a minute.
     - A line over `SCRUB_MAX_CHARS` (4000) is cut to whole words
       (`coherence_publish._bounded`). Traceback frames, quoted paths and this machine's user
-      names are removed from the whole line first, so the cut splits no name or path
-      (V13 LOW-1).
+      names are removed from the whole line first, so the cut splits no name (V13 LOW-1).
+    - **Known, open (V14 LOW-1).** On such a line, a user name replaced inside a POSIX, `~`
+      or relative path stops the path patterns at the placeholder's bracket, and the file
+      names after it survive. Nothing the Tower writes comes near 4000 characters; the
+      longest real text is 522. The fix is P3.12, in the handoff's backlog
+      (`docs/agent-handoffs/WORLD-BUILDER-COHERENCE.md` §6).
     - The backslash pattern is anchored to a token start, and no pattern backtracks
       exponentially.
     - Every output on shorter text is unchanged: 62,366 texts compared with `a5001ab`, no

@@ -6,7 +6,7 @@ the next run's starting point.
 
 | | |
 |---|---|
-| Integration | `world-builder/live-world-visualization-v1` at `<SHA>` (the test runs this) |
+| Integration | `world-builder/live-world-visualization-v1` at `<SHA>`, its tip at hand-over (the test runs this). A commit cannot name its own SHA, so the lead records it in `RUN\physical-test\TEST-SHA.txt`; every `<SHA>` below means that value |
 | Tower lane | `world-builder/coherence-product-v1` (worktree `Glasses-worktrees\wb-coherence-product`) |
 | iOS lane | `ios/wb-coherence-areas-v1`, at the Mac tip merged into `<SHA>` (`0e1c78d`, manager 035 §5) |
 | Contract | `docs/contracts/WORLD-BUILDER-COMPONENTS.md` (v9) |
@@ -21,13 +21,27 @@ it was before (`tower/tower/config.py`).
 - **[acc]** means acceptance at the tested code. That is `RUN\acc2\TABLE.md`, run on
   `e5f7151`, and carried forward to `<SHA>` under manager 029's conditions.
   - One of those conditions is the same-seed check (d). At `315b6bf` it re-finished the
-    control and the target **warm, on identical inputs** (acc2's w0).
-    - `components.json` and `solution.npz` were identical apart from `solved_at` and
-      `solve_identity`.
-    - `solution.json` differed only in fields listed as by design
-      (`RUN\dchk\logs\*.compare-final.txt`).
-  - P3.9 then changed the draw-0 gate path, so (d) is being re-run at `a5001ab`
-    (`RUN\dchk2`): <D-AT-SHA>.
+    control and the target **warm, on identical inputs** (acc2's w0). Each file was
+    compared as `RUN\lead\dchk\compare_dchk.py` compares it:
+    - `components.json` and `solution.json` key by key, leaving out, wherever it occurs,
+      the script's `ALWAYS` set (its line 10): `solved_at`, `solve_identity`, `timing`, `seconds`, `gate_seconds`, `map_s`, `gate_s`, `database`, `swept`, `frozen_at`, `workspace`, `started_at`, `updated_at`, `at`, `path` and `detail_path`.
+      `components.json` then matched; `solution.json` differed only in fields listed as by
+      design.
+    - `solution.npz` array by array, with nothing left out: fully identical.
+    - Source: `RUN\dchk\logs\*.compare-final.txt`.
+  - P3.9 then changed the draw-0 gate path, so (d) was re-run at `a5001ab` (`RUN\dchk2`),
+    compared the same way. Both worlds gave the same result as before:
+    - `components.json` matched with the `ALWAYS` set left out, and `solution.npz` was fully
+      identical;
+    - `solution.json` differed only in the by-design fields: the prediction and mask cache
+      counts (with the mask device and GPU peak, which are empty when every mask came from
+      the cache), the frozen-matching record and the digest-rule text
+      (`RUN\dchk2\logs\*.compare.txt`, and `*.compare-final.txt` with those fields left out;
+      verdicts in `RUN\dchk2\logs\dchk.log`, 12:13 on 2026-09-24).
+  - P3.10 (`60b0704`) and P3.11 (`8eb2cc3`) changed only the text scrubber. Its output on
+    every text under 4000 characters, the 138 real finalization texts among them, is
+    unchanged (`RUN\lead\p310\diff_scrub.out`, `diff_scrub_p311.out`: 0 differences in
+    62,366).
 - **[earlier]** means an earlier phase of the run. The source is named each time.
 
 ---
@@ -38,7 +52,7 @@ it was before (`tower/tower/config.py`).
 had its bathroom and a bed block glued into the bedroom at a wrong tilt, scale and
 position. The glue was feature matches on the phone in his hand.
 - The two islands were held together by 7 verified pairs with 136 inliers. 85 % of those
-  inliers, about 116, lay on the held phone [earlier: `RUN\baseline\FORENSICS.md` H-A].
+  inliers, about 116, lay on the held phone [earlier: `RUN\baseline\FORENSICS.md` §0 item 2].
 - Masking hands, arms and held phones removed 117 of the 136 and left 0 cross-island pairs
   [earlier: `RUN\mailbox\to-manager\20260923-1813-candidate-architecture.md` §1].
 
@@ -60,20 +74,36 @@ the walk joins the room only on independent, consistent evidence. Anything else 
 
 **How it was checked:**
 
-- **Reviews V5 to V12**, all fresh and adversarial, ended APPROVE or READY WITH CHANGES.
+- **Reviews V5 to V14**, all fresh and adversarial, ended APPROVE or READY WITH CHANGES
+  (`RUN\baseline\review\V8\V8-REVIEW.md` … `V13\V13-REVIEW.md`, and `V14\`).
   - Every must-fix was fixed. V11's MED-B is fixed at `6ae08c1` and `a5001ab`.
-  - V12 found the P3.9 code sound, and asked for doc changes only
-    (`RUN\baseline\review\V8\V8-REVIEW.md` … `V12\V12-REVIEW.md`).
-- **The full suite** at `a5001ab`, the final product-lane code: 5454 passed, 87 skipped,
-  1 xfailed, 0 failed (`RUN\lead\suite-a5001ab.log`).
-  - The run at `2febf3a` had one known Windows timing flake, the finisher-chore kill test
-    (`RUN\status.md`).
+  - V12 found the P3.9 code sound. Its sub-reviewer RV12-B led to P3.10 (`60b0704`): the
+    client-safe scrubber runs in bounded time.
+  - V13 led to P3.11 (`8eb2cc3`) and to guide fixes.
+  - V14 left no HIGH or MED open. The manager's convergence rule (038) sends its LOWs and
+    NOTEs to §6, first among them V14 LOW-1.
+- **The full suite** at the final product-lane code, `8cca192`: 5487 passed, 80 skipped,
+  1 xfailed and 1 failed (`RUN\lead\suite-8cca192.log`). The failure is
+  `test_capture_continuity::test_finding_a_successor_does_not_read_every_capture_on_the_disk`,
+  a timing flake in code the P3.11 delta does not touch: it failed 1 of 8 in isolated re-runs
+  of that file on the same code (§6).
+  - At `60b0704` the suite gave 5479 passed and 0 failed.
+  - The run at `2febf3a` had another known Windows timing flake, the finisher-chore kill
+    test.
+  - The integration suite at `<SHA>` is recorded beside the SHA in
+    `RUN\physical-test\TEST-SHA.txt`.
 - **The acceptance run:** `RUN\acc2\TABLE.md`, with the control and the target complete.
   - At 11:44 on 2026-09-24 the chain's early-stop gate stopped it on 2f447162, another walk of
     the same bedroom. The room differs by 1 to 5 keyframes between seeds (at most 2.51 %), with
-    GT 0 misplaced in all five runs (`RUN\acc2\STOP`;
-    `RUN\mailbox\to-manager\20260924-1207-acc2-gate-stop-2f447162.md`).
-  - It waits for a manager ruling. 6839fb8f and phases R, B and H have not run.
+    GT 0 misplaced in all five runs (`RUN\mailbox\to-manager\20260924-1207-*` and `-1226-*`).
+  - Manager 038 ruled on both findings:
+    - kf 306 is an **EXCEPTION (safe direction)**, of the same class as the target's closet;
+    - kf 682–690 lead to a **rule clarification**: keyframes the solver left below the
+      `min_obs` publication floor in some runs are reported separately, not as room
+      differences, in every world.
+  - Both rulings are in `RUN\acc2\RULINGS.json`, and the table was re-scored. The chain then
+    went on with `-ForceContinue` through 6839fb8f and phases R, B and H
+    (`RUN\acc2\logs\chain.log`; progress in `RUN\status.md`).
 
 ## 2. The switches
 
@@ -115,9 +145,16 @@ measurements. Its source is 1813 §7.3, as amended by manager 010 decision 4.
 $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\deploy'
 ```
 
-1. **Pause the acceptance run, for GPU exclusivity.** Create `RUN\acc2\STOP`, then wait until
-   `RUN\acc2\logs\chain.log` shows that the chain stopped after its current run. It
-   resumes where it left off, after the checks in §4.1.
+1. **Pause the acceptance run, for GPU exclusivity.**
+   - Create the pause note only if there is no `STOP`. This command refuses when one
+     exists, so it can never overwrite a gate stop that waits for a ruling:
+     `New-Item -ItemType File 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\acc2\STOP' -Value "lead $(Get-Date -Format s): pause for the physical test (GPU exclusivity)"`.
+     If it refuses, the `STOP` already there is the chain's own. Read it: a gate stop needs
+     a ruling before the chain goes on (§4.1, step 4). The chain is stopped either way.
+   - Then wait until `RUN\acc2\logs\chain.log` ends with a `CHAIN-END` line. The chain stops
+     after its current run. A relaunch refused because of `STOP` ends with `REFUSED` lines
+     instead, and does not run either.
+   - It resumes only after the checks in §4.1, step 4.
 2. **Re-finish the 06:01 walk in place,** with no Tower running:
    `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\refinish-target.ps1" -Sha <SHA>`.
    - It holds the GPU for about 15 min: the acceptance's cold re-finishes of this walk took
@@ -129,14 +166,24 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
    - It is Tristan's `.env`, byte for byte, plus the switches of §2. It is written to the
      integration worktree's gitignored `tower\.env`.
    - The canonical `tower\.env` is never written.
-4. **Start the test Tower, prompt arm:**
+4. **Only if the Tower will be started over SSH,** run the CUDA pre-flight over that same
+   SSH session first. A launch from an SSH session is not proven (`DEPLOY-PLAN.md` §8).
+   1. Move the old result aside, with a move, never a delete. Otherwise an old PASS
+      survives a probe that died:
+      `$P = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\preflight'; Move-Item "$P\cuda-wmi.json" "$P\cuda-wmi.$(Get-Date -Format yyyyMMdd-HHmmss).json"`.
+   2. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\preflight-cuda-wmi.ps1" -WaitMinutes 30 -EnvFile C:\Users\tvllo\Projects\Glasses-worktrees\wb-live-visualization-v1\tower\.env`.
+      It needs the `.env` of step 3. The default `-WaitMinutes 0` returns right after the
+      launch, without the result.
+   3. Check that a new `cuda-wmi.json` exists, says PASS, and that its `env.at` is today's
+      run.
+5. **Start the test Tower, prompt arm:**
    `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\start-test-tower.ps1" -Sha <SHA> -Relocalizer prompt`.
    - It runs the integration worktree on port 8000, against Tristan's live store, detached,
      so it survives SSH.
    - It refuses when :8000 is taken, HEAD is not `<SHA>` or the tree is dirty, the `.env`
      lacks a switch, `import tower` does not load the worktree, the run's GPU lock is held,
      or the finisher finds owed work on his worlds.
-5. **Confirm that the Tower is on the right SHA and switches:**
+6. **Confirm that the Tower is on the right SHA and switches:**
    - `git -C C:\Users\tvllo\Projects\Glasses-worktrees\wb-live-visualization-v1 rev-parse HEAD`
      prints `<SHA>`.
    - The last line of `RUN\physical-test\tower-starts.jsonl` shows `sha`, `relocalizer`,
@@ -152,15 +199,7 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
 - **The dry runs** (`DEPLOY-PLAN.md` §8), and **CUDA under the detached (WMI) launch**: it
   passed on the RTX 5070, with masks `applied` on cuda (`RUN\physical-test\preflight\cuda-wmi.json`).
   Both were checked at earlier SHAs, and both are **re-run at `<SHA>`** before the hand-over.
-- **A launch from an SSH session is not proven.** If the Tower will be started over SSH,
-  run the pre-flight over that same SSH session first:
-  1. Move the old result aside, with a move, never a delete. Otherwise an old PASS
-     survives a probe that died:
-     `$P = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\preflight'; Move-Item "$P\cuda-wmi.json" "$P\cuda-wmi.$(Get-Date -Format yyyyMMdd-HHmmss).json"`.
-  2. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\preflight-cuda-wmi.ps1" -WaitMinutes 30 -EnvFile C:\Users\tvllo\Projects\Glasses-worktrees\wb-live-visualization-v1\tower\.env`.
-     The default `-WaitMinutes 0` returns right after the launch, without the result.
-  3. Check that a new `cuda-wmi.json` exists, says PASS, and that its `env.at` is today's
-     run.
+- **A launch from an SSH session is not proven.** Step 4 is the check for that case.
 - **The validation Tower on :8020 can stay up.** It is serve-only, on the CPU
   (`TOWER_CV_DEVICE=cpu`), with no finisher (`TOWER_WORLD_FINISH_PENDING=false`;
   `RUN\v8020\start_tower.ps1`).
@@ -239,13 +278,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$D\stop-test-tower.ps1" -Wa
 powershell -NoProfile -ExecutionPolicy Bypass -File "$D\start-test-tower.ps1" -Sha <SHA> -Relocalizer silent
 ```
 
-- **The stop script** refuses while a walk is recording or finalizing, or while the
-  finisher runs. `-WaitMinutes 30` polls until the Tower is idle.
-  - DEPLOY is changing it to count owed area work as busy too (V12, RV12-A LOW-1). Until
-    that lands, check the phone for *Improving* yourself.
-- **If `start-test-tower.ps1` refuses** because the finisher's dry run finds a test walk's
-  owed areas, re-run it with `-AllowOwed`. The new Tower then builds those areas.
-- **Never use `-Force` while a walk is finalizing.**
+- **The stop script** refuses while a walk is recording or finalizing, while the finisher
+  runs, and while the finisher still has **owed** work, such as the last walk's areas
+  (`stop-test-tower.ps1`, lines 17–19 and 95–105; `RUN\lead\deploy\dryrun-stop-test-tower-v12.txt`
+  shows `busy=1` for `owed`).
+  - `-WaitMinutes 30` polls until the Tower is idle, and so waits through `owed` as well.
+  - `-Force` is the way out of a long backoff of owed work. Use it only when the one reason
+    it prints is `areas still owed`: it also cuts off a running area build, which then
+    counts as one of the session's 3 attempts (`stop-test-tower.ps1`, lines 15–16), and it
+    stops a Tower on :8000 that is not the test Tower. **Never use it while a walk is
+    recording or finalizing.**
+- **If `start-test-tower.ps1` refuses** because the finisher's dry run finds owed work:
+  - first read what the refusal lists: world-id prefixes, each with a stage and a code. The
+    session ids are in the `logs\finisher-dryrun-<stamp>.json` it names. `-AllowOwed` lets
+    **every** owed session in the store through, not only the test walks';
+  - if they are all test walks, re-run it with `-AllowOwed`. The new Tower then builds
+    that work.
 
 **Group 2, prompt OFF** (the relocalizer only logs): **W-B ×3**, route A with the whip pans.
 
@@ -319,59 +367,116 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
    - Today's code serves re-finished worlds as rooms without areas. This was checked on
      v8020's three, this walk among them [earlier:
      `RUN\lead\deploy\probe-canonical-83534e2-on-v8020.json`].
-4. **The lead resumes the acceptance run.** First read `RUN\acc2\STOP`, and the last `STOP`
-   or `GATE-STOP` line of `RUN\acc2\logs\chain.log`.
-   - If the chain's own gate stopped a world during the pause, do **not** force-continue:
-     that needs a manager ruling.
-   - Otherwise:
-     `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\launch-acc2-detached.ps1 -ForceContinue`.
+4. **The lead resumes the acceptance run, but only when every stop has a ruling.**
+   1. Read `RUN\acc2\STOP`, and every stop line the chain logged after the last
+      `FORCE-CONTINUE` line of `RUN\acc2\logs\chain.log`: `GATE-STOP`, `STOP-CHECK`,
+      `STOP-INVALID` and `GATE-ERROR`.
+   2. A `GATE-STOP` is ruled only when `RUN\acc2\RULINGS.json` has an entry for that world
+      whose `findings.gate_rules` are the rules now in `RUN\acc2\gates\<w8>.json`, and whose
+      ruling lets the chain go on. Any other stop, whether it came before the pause or
+      during it, has no ruling: **do not force-continue.** Tell the manager instead. (The
+      11:44:55 gate stop for 2f447162 was ruled by manager 038, and both findings are
+      recorded.)
+   3. `-ForceContinue` is not selective. It moves whatever `STOP` is there aside, and
+      records the current findings of **every** stopping gate as overridden (`chain.sh`,
+      lines 76–97). Use it only when `STOP` is the lead's own pause note or a ruled gate
+      stop. When that holds:
+      `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\launch-acc2-detached.ps1 -ForceContinue`.
 
 ### 4.2 Restore the original `6e6d3fc3`: only with Tristan's explicit go
 
 Stop every Tower on the live store first. Both routes **move** data; nothing is deleted.
 
+**Route 1: from the set-aside.** Follow the `restore` field in `$A\refinish.json`; read it
+at `<SHA>`. `<s>` below is the target's only session, `a37f675a52e0479086e31cc62a9aeec2`.
+Paste this block whole. It sets `$A` only when `refinish\` holds exactly one set-aside with
+the original solve still in it: the re-finish of §3.1 step 2, whose stamp is
+`set_aside.stamp` in `RUN\physical-test\refinish-6e6d3fc3-<time>.json`.
+
 ```powershell
-$W = 'C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649'
-$A = "$W\refinish\<STAMP>"
+. {
+  $W = 'C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649'
+  $s = 'a37f675a52e0479086e31cc62a9aeec2'
+  $A = $null
+  $all = @(Get-ChildItem -LiteralPath "$W\refinish" -Directory -ErrorAction Stop | Sort-Object Name)
+  $L = Get-Content -LiteralPath "$($all[-1].FullName)\refinish.json" -Raw -ErrorAction Stop | ConvertFrom-Json
+  if ($all.Count -ne 1 -or $L.state -notin @('done', 'stopped') -or -not (Test-Path -LiteralPath "$($all[-1].FullName)\solve\$s")) {
+    throw "refinish\ holds $($all.Count) set-aside(s); the newest, $($all[-1].Name), is '$($L.state)'. Stop: match it to the hand-over stamp by hand."
+  }
+  $A = $all[-1].FullName; "A = $A"
+}
 ```
 
-**Route 1: from the set-aside.** Follow the `restore` field in `$A\refinish.json`; read it
-at `<SHA>`.
+`. { }`, not `& { }`, keeps `$W`, `$s` and `$A` for steps 1–4. `done` and `stopped` are the
+two ledger states after the publish, and both leave the original in `$A\solve\<s>`. Every
+path below that starts from `$A` is built with `Join-Path $A …`, so with `$A` unset it
+refuses and nothing moves. Steps 2 to 4 each run as one block that stops at the first
+failure.
 
 1. Make the destination folders:
-   `New-Item -ItemType Directory "$A\rebuild\solve", "$A\rebuild\surface", "$A\rebuild\appearance", "$A\rebuild\dense", "$A\rebuild\sessions\<s>"`.
+   `New-Item -ItemType Directory -Path (Join-Path $A 'rebuild\solve'), (Join-Path $A 'rebuild\surface'), (Join-Path $A 'rebuild\appearance'), (Join-Path $A 'rebuild\dense'), (Join-Path $A "rebuild\sessions\$s")`.
+   With `$A` unset, `Join-Path` refuses and nothing is created.
 2. Move each of the rebuild's trees to its own destination:
 
-   | from | to |
-   |---|---|
-   | `$W\solve\<s>` | `$A\rebuild\solve\<s>` |
-   | `$W\surface\<s>` | `$A\rebuild\surface\<s>` |
-   | `$W\appearance\<s>` | `$A\rebuild\appearance\<s>` |
-   | `$W\dense\<s>` | `$A\rebuild\dense\<s>` |
-   | `$W\areas` | `$A\rebuild\areas` |
-   | `$W\derived` | `$A\rebuild\derived` |
-   | `$W\sessions\<s>\session.json` | `$A\rebuild\sessions\<s>\session.json` |
-3. Move `$A\solve\<s>` back to `$W\solve\<s>`, and every other `moved` entry of the ledger
+   ```powershell
+   & {
+     $ErrorActionPreference = 'Stop'
+     Move-Item -LiteralPath "$W\solve\$s"      -Destination (Join-Path $A "rebuild\solve\$s")
+     Move-Item -LiteralPath "$W\surface\$s"    -Destination (Join-Path $A "rebuild\surface\$s")
+     Move-Item -LiteralPath "$W\appearance\$s" -Destination (Join-Path $A "rebuild\appearance\$s")
+     Move-Item -LiteralPath "$W\dense\$s"      -Destination (Join-Path $A "rebuild\dense\$s")
+     Move-Item -LiteralPath "$W\areas"         -Destination (Join-Path $A 'rebuild\areas')
+     Move-Item -LiteralPath "$W\derived"       -Destination (Join-Path $A 'rebuild\derived')
+     Move-Item -LiteralPath "$W\sessions\$s\session.json" -Destination (Join-Path $A "rebuild\sessions\$s\session.json")
+   }
+   ```
+3. Move the original solve back:
+   `& { $ErrorActionPreference = 'Stop'; Move-Item -LiteralPath (Join-Path $A "solve\$s") -Destination "$W\solve\$s" }`.
+   If the ledger's `moved` list names anything else, move each entry back the same way,
    from its `to` to its `from`.
-4. Move the snapshots back: `surface`, `appearance`, `dense` (which has no `predictions\`)
-   and `derived`, then `$A\session.json` back to `sessions\<s>\session.json`.
+4. Move the snapshots back (`dense` has no `predictions\`):
 
-`world.json` then differs only in `updated_at` (`DEPLOY-PLAN.md` §5).
+   ```powershell
+   & {
+     $ErrorActionPreference = 'Stop'
+     Move-Item -LiteralPath (Join-Path $A "surface\$s")    -Destination "$W\surface\$s"
+     Move-Item -LiteralPath (Join-Path $A "appearance\$s") -Destination "$W\appearance\$s"
+     Move-Item -LiteralPath (Join-Path $A "dense\$s")      -Destination "$W\dense\$s"
+     Move-Item -LiteralPath (Join-Path $A 'derived')       -Destination "$W\derived"
+     Move-Item -LiteralPath (Join-Path $A 'session.json')  -Destination "$W\sessions\$s\session.json"
+   }
+   ```
+
+`world.json` then differs only in `updated_at` (`DEPLOY-PLAN.md` §5). `$W\refinish\` stays
+behind, holding the set-aside and `rebuild\`: moved, never deleted. Also left:
+`$W\finish_attempts.json`, if a finisher wrote one; the counters from before the re-finish,
+if any, are in the ledger's `previous.finish_attempts`.
 
 **Route 2: exact, from the frozen evidence.** The live world was byte-identical to it
 before the test: 861 files (`RUN\lead\deploy\target-live-vs-frozen.json`).
 
+Paste the whole block at once. Inside `& { … }`, a failed step or the `throw` ends
+everything, so nothing runs after a failure:
+
 ```powershell
-$ErrorActionPreference = 'Stop'
-$D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\deploy'
-$W = 'C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649'
-$F = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\baseline\frozen\worlds\6e6d3fc30e7b45f3a7521e618386b649'
-Move-Item $W 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\aside-6e6d3fc3-<STAMP>'
-if (Test-Path $W) { throw "$W still exists: the move did not complete; stop here" }
-Copy-Item -Recurse $F $W
-attrib -R "$W\*" /S /D      # the copy only; never the frozen evidence
-C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.py" $W $F   # expect: all identical
+& {
+  $ErrorActionPreference = 'Stop'
+  $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\deploy'
+  $W = 'C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649'
+  $F = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\baseline\frozen\worlds\6e6d3fc30e7b45f3a7521e618386b649'
+  $aside = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\aside-6e6d3fc3-' + (Get-Date -Format yyyyMMdd-HHmmss)
+  Move-Item $W $aside
+  "moved aside to $aside"
+  if (Test-Path $W) { throw "$W still exists: the move did not complete; stop here" }
+  Copy-Item -Recurse $F $W
+  attrib -R "$W\*" /S /D      # the copy only; never the frozen evidence
+  & C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.py" $W $F
+}
 ```
+
+`compare_tree.py` prints JSON and no verdict line. The restore is exact when
+`files_left`, `files_right` and `identical` are all 861, and `only_left`, `only_right` and
+`differ` are all empty.
 
 ## 5. Known limitations and residual risks
 
@@ -393,9 +498,11 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
    - Once a walk is finished, re-opening shows the saved result, and the same seed maps
      the same frozen database.
      - The (d) check re-finished this target warm, on identical inputs.
-       `components.json` and `solution.npz` were identical apart from `solved_at` and
-       `solve_identity` [acc: `RUN\dchk\logs`].
-     - Its re-run at `a5001ab`: <D-AT-SHA>.
+       `solution.npz` was fully identical, array by array, and `components.json` matched
+       with the comparison's `ALWAYS` set of timestamps, identities, timings, file names and
+       paths left out
+       [acc: `RUN\dchk\logs`; `RUN\lead\dchk\compare_dchk.py`].
+     - Its re-run at `a5001ab` gave the same result [acc: `RUN\dchk2\logs`].
 3. **Marginal pieces inside the anchor block** (V9 M-2). The vote never withholds the
    room's anchor group, so a marginal piece absorbed into it is not re-verified. This is a
    named residual risk (manager 025, decision 2). `gate.consensus.held_against_majority`
@@ -408,10 +515,11 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
 5. **The coverage cost.** What is placed in the room falls where pieces become areas.
    - **Target:** 59.0 % placed, or 38.6 % when the closet flips, against 91.4 % in-main in
      the frozen, wrongly glued world. 90.6 % is shown somewhere [acc for the product;
-     earlier for the frozen figure, `P3-VAL\TABLE.md`].
+     earlier for the frozen figure, `RUN\experiments\P3-VAL\TABLE.md`].
    - **Control:** 96.2–97.7 % [acc].
    - **Other worlds** [earlier, e2e7582]: 2f447162 94 → 52 %, and 52ed8e0a 85.5 → 37 %
-     (`P3-VAL\TABLE.md`; V8 M6). The 85.5 is agent R's recipe run, not the frozen world.
+     (`RUN\experiments\P3-VAL\TABLE.md`; V8 M6). The 85.5 is agent R's recipe run, not the
+     frozen world.
 6. **Face-redactor false positives.** The redactor blacks out wallpaper, screens and
    furniture. On af47007c, 66 of 218 frames were ≥ 2 % filled (median 22 %), and filled
    frames were lost at 42 % against 14 % [earlier:
@@ -431,6 +539,22 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
 
 ## 6. Next-run backlog, ranked
 
+0. **Land P3.12, V14 LOW-1, with a V15. It is a privacy regression in over-long text only.**
+   - **The fault.** `8eb2cc3` scrubs this machine's user names before it cuts a
+     finalization line over 4000 characters. The `[user]` it leaves inside a POSIX, `~` or
+     relative path stops the path patterns at its bracket. So the file and folder names
+     under that user's home survive, for example `[path][user]/secret_plan.txt`. The user
+     name itself does not.
+   - **Why it is not urgent.** The longest real finalization text is 522 characters, so
+     nothing the Tower writes today reaches this.
+   - **The fix is ready.** It moves the cut back before a name instead of replacing the
+     name, and puts the `...` on after the scrub. It is
+     `RUN\lead\p310\P3.12-bounded-no-name-prepass.patch`, which applies cleanly to
+     `8cca192`. It is checked against RV14's probes: 68 of 68 clean, fuzz 0 of 3000
+     leaked, RV13's 24 of 24 (`RUN\lead\p310\p1_on_p312.txt`, `p6_on_p312.txt`,
+     `d2_on_p312.txt`).
+   - **Land it with** V14 LOW-2's tests, which pin each part of the cut
+     (`RUN\baseline\review\V14\` has the shapes).
 1. **Thin but correct attachments** (the closet; manager 035 §3). Options (ii) and (iii) are
    GT-scored on all 24 cases before either is adopted:
    - **(i) capture-time evidence through the look-back prompt.** It is the right lever,
@@ -465,3 +589,22 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
     handoff (`RUN\status.md`; the record is in `RUN\acc2\aside\`).
 11. **A learned matcher** for revisit links. It is deferred, since the doorway gap is
     capture-limited (1813 §7.2).
+12. **Record per-keyframe publication in the consensus record** (manager 038). On
+    2f447162 the record showed a unanimous room while three desk keyframes had 2 of 3
+    votes at the `min_obs` floor. The tally was never saved
+    (`RUN\lead\acc2-2f447162-flipcheck.md`).
+13. **The scrubber's remaining LOWs and NOTEs:**
+    - RV12-B LOW-C: other users' names in forward-slash UNC, `file://`, colon-glued and
+      spaced relative paths;
+    - RV12-B NOTE-1 to NOTE-4, and V12 NOTE 4: over-scrubbed dates and `e.g.`, a frame
+      path holding an apostrophe, re-scrub growth, and non-string values sent raw;
+    - V14 NOTE-1: a file name at the cut, glued to its `...`;
+    - V13 NOTE-5: `refinish-target.ps1` header nits, already fixed.
+
+    Record: `RUN\baseline\review\V12\` to `V14\`.
+14. **Test flakes on Windows:**
+    - `test_capture_continuity::test_finding_a_successor_does_not_read_every_capture_on_the_disk`:
+      1 of 8 isolated runs, and once in the `8cca192` suite;
+    - the finisher-chore survives-its-kill test.
+
+    Both are timing-dependent, in code this run did not change.
