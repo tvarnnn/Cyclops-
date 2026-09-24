@@ -5,7 +5,8 @@ stalls the whole Tower. At a5001ab a 100,000-character unbroken token took about
 backslash pattern, the per-character bracket count in `_given_back`, the dotted exception-name search), and
 `_CLASS_PREFIX` backtracked exponentially on a 33-character run of capitals. The fixes keep every output on
 text shorter than `SCRUB_MAX_CHARS`: a differential run over 62,366 texts, 138 of them real finalization texts,
-found no difference (`RUN\\lead\\p310\\diff_scrub.out`).
+found no difference (`RUN\\lead\\p310\\diff_scrub.out`). Longer text is cut, and review V13 (LOW-1) found the
+first cut could split a user name or a path; `_bounded` removes those first, over the whole text.
 """
 from __future__ import annotations
 
@@ -45,6 +46,54 @@ def test_a_run_of_capitals_before_a_colon_does_not_backtrack():
     for tail in ("!", ": x", ""):
         CP.owner_facing_detail("Ab" + "A" * 60 + tail)
     assert time.perf_counter() - t0 < SECONDS
+
+
+def test_each_fixed_pattern_is_linear_on_its_own():
+    """The cut bounds the whole scrub, so these check the fixes themselves (review V13, NOTE-2): undoing the
+    backslash anchor, the once-only bracket count or the flat `_CLASS_PREFIX` fails here."""
+    t0 = time.perf_counter()
+    assert CP._UNQUOTED_PATHS[-1].findall("x" * 100_000) == []
+    assert CP._given_back("C:\\x" + ")" * 100_000) == ("C:\\x", ")" * 100_000)
+    assert CP._CLASS_PREFIX.search("Ab" + "A" * 60 + "!") is None
+    assert time.perf_counter() - t0 < SECONDS
+
+
+def test_spaced_text_under_user_directories_is_bounded():
+    text = " x\\Users\\A B" * 8000       # the user-directory growth in `_scrub_paths` is quadratic on this
+    t0 = time.perf_counter()
+    CP.owner_facing_detail(text)
+    CP.owner_facing_detail(text.replace("\\", "/"))
+    assert time.perf_counter() - t0 < SECONDS
+
+
+def _at_cut(pad_word: str, needle: str, offset: int, after: str = " more words") -> str:
+    """`needle` starting `offset` characters before the cut (`SCRUB_MAX_CHARS - 3`), after a long path."""
+    start = CP.SCRUB_MAX_CHARS - 3 - offset
+    head = "C:\\" + "d" * 3000 + " "
+    head += (pad_word * (start - len(head)))[:start - len(head) - 1] + " "
+    assert len(head) == start
+    return head + needle + after
+
+
+@pytest.mark.parametrize(("text", "leak"), [
+    ("C:\\" + "d" * 3988 + '",tvllo,more text', "tvll"),                   # no space before the cut
+    (_at_cut("w ", "John Smith", 6), "john"),                               # a spaced account name split
+    (_at_cut("w ", "tvllo", 2), "tv"),                                      # a name split mid-word
+    (_at_cut("w ", "data/jdoe/report.txt", 8), "jdoe"),                     # a relative path split before .txt
+    (_at_cut("w ", "'/data/x/Jane Doe/report.txt'", 16), "jane"),           # a quoted path losing its quote
+    (_at_cut("w ", 'File "/srv/jdoe/x.py", line 3, in f', 20), "jdoe"),   # a frame losing its line number
+])
+def test_the_cut_leaves_no_part_of_a_name_or_a_path(monkeypatch, text, leak):
+    monkeypatch.setattr(CP, "_user_names", lambda: {"tvllo", "John Smith"})
+    assert len(text) > CP.SCRUB_MAX_CHARS
+    row = CP.client_safe_finalization({"state": "complete", "detail": text})
+    for out in (CP.client_safe_detail(text), row["detail"], CP.owner_facing_detail(text)):
+        assert leak not in out.lower()
+
+
+def test_a_traceback_with_a_long_message_keeps_its_exception():
+    tb = "Traceback (most recent call last): torch.OutOfMemoryError: CUDA out of memory " + "z" * 3985
+    assert CP.client_safe_detail(tb).startswith("torch.OutOfMemoryError: CUDA out of memory")
 
 
 @pytest.mark.parametrize(("raw", "owner"), [

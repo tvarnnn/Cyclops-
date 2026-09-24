@@ -1749,11 +1749,14 @@ _NAME_WORDS = re.compile(r"""(?:\s+[A-Z][^\s'"\\/]*)+""")
 # path itself opened (`C:\Program Files (x86)`).
 _CLOSING = {")": "(", "]": "[", "}": "{"}
 _TRAILING = ")]},;.:"
-# The longest one-line text the path and name patterns run on. Several of them are quadratic in the length of an
-# unbroken run of text (review V12, RV12-B LOW-A: 100,000 characters held the whole Tower for about a minute,
-# `re` keeping the GIL). Every text the Tower writes itself is far shorter, and a client's copy is at most
-# `FINALIZATION_TEXT_MAX_CHARS` anyway. The rest is dropped before scrubbing, at a word boundary.
+# The longest one-line text the path and class-name patterns run on. Several of them are quadratic in the length
+# of the text (review V12, RV12-B LOW-A: 100,000 characters held the whole Tower for about a minute, `re` keeping
+# the GIL; review V13 NOTE-2: so is the user-directory growth in `_scrub_paths` on spaced text). Every text the
+# Tower writes itself is far shorter, and a client's copy is at most `FINALIZATION_TEXT_MAX_CHARS` anyway. Longer
+# text is cut by `_bounded`, after the passes that are linear in its length.
 SCRUB_MAX_CHARS = 4000
+# The end of an exception class name: where `_one_line` looks back for the name (review V13, NOTE-1).
+_EXCEPTION_SUFFIX = re.compile(r"(?:Error|Exception|Interrupt|Exit|Warning)\b")
 
 
 USER_PLACEHOLDER = "[user]"
@@ -1813,10 +1816,14 @@ def _one_line(text: str) -> str:
             kept = _exception_lines(rest)
             last = kept[-1] if kept else ""
         else:
-            # the exception is at the end: looked for in the last `SCRUB_MAX_CHARS` only (RV12-B LOW-A)
-            tail = rest[-SCRUB_MAX_CHARS:]
-            hits = list(_EXCEPTION_NAME.finditer(tail))
-            last = tail[hits[-1].start():].strip() if hits else ""
+            # the exception is the last class name. `_EXCEPTION_NAME` is quadratic on a long dotted run, so it runs
+            # only on the `SCRUB_MAX_CHARS` before the last class-name ending, however long the message after it
+            # (RV12-B LOW-A; review V13, NOTE-1)
+            end = None
+            for m in _EXCEPTION_SUFFIX.finditer(rest):
+                end = m.end()
+            hits = [] if end is None else list(_EXCEPTION_NAME.finditer(rest, max(0, end - SCRUB_MAX_CHARS), end))
+            last = rest[hits[-1].start():].strip() if hits else ""
         return ": ".join(part for part in (head, last) if part) or "a traceback"
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[0] if lines else ""
@@ -1884,6 +1891,32 @@ def _shorten(text: str, max_chars: int) -> str:
     return cut.rstrip(" ,;:(") + "..."
 
 
+def _scrub_names(text: str) -> str:
+    """`text` with this machine's user names as `USER_PLACEHOLDER`, wherever they stand."""
+    for name in _user_names():
+        text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", USER_PLACEHOLDER, text, flags=re.IGNORECASE)
+    return text
+
+
+def _bounded(text: str) -> str:
+    """One line of text at most `SCRUB_MAX_CHARS` long, for the patterns that are not linear in its length (review
+    V12, RV12-B LOW-A). Text within the bound is returned as it is. Longer text first goes through the passes that
+    ARE linear and that a cut could defeat, over its whole length: traceback frames, quoted paths (a cut could take
+    the closing quote) and this machine's user names (a cut could split one). Then it keeps its whole words up to
+    the bound; a word the bound would split goes with the rest, so no path or name is left half-cut (review V13,
+    LOW-1)."""
+    if len(text) <= SCRUB_MAX_CHARS:
+        return text
+    text = _scrub_names(_QUOTED_PATH.sub(r"\1" + PATH_PLACEHOLDER + r"\1", _without_frames(text)))
+    if len(text) <= SCRUB_MAX_CHARS:
+        return text
+    end = SCRUB_MAX_CHARS - 3
+    if not text[end].isspace():
+        while end > 0 and not text[end - 1].isspace():
+            end -= 1
+    return text[:end].rstrip() + "..."
+
+
 def client_safe_detail(text, *, max_chars: int | None = None) -> str:
     """Raw diagnostic text made safe for a client (review V10, MED-5): ONE line (a traceback is
     reduced to the text before it and its last line, the exception; other multi-line text to its
@@ -1892,18 +1925,17 @@ def client_safe_detail(text, *, max_chars: int | None = None) -> str:
     them the user names they carry), NO USER NAME left anywhere else (this machine's,
     `USER_PLACEHOLDER`), and, with `max_chars`, at most that long. The exception class and its message
     stay: this is the diagnostic text. "" for no text. Single-line text with none of those, at most
-    `max_chars` long, is returned unchanged. The one line is first cut to `SCRUB_MAX_CHARS` (review V12,
-    RV12-B LOW-A), far longer than any text the Tower writes."""
+    `max_chars` long, is returned unchanged. A line longer than `SCRUB_MAX_CHARS`, far longer than any
+    text the Tower writes, is first made safe to cut and cut there (`_bounded`)."""
     if text is None:
         return ""
     text = str(text).translate(_OTHER_LINE_BREAKS)
     if "\n" in text or "\r" in text or _TRACEBACK in text:
         text = _one_line(text)
-    text = _shorten(text, SCRUB_MAX_CHARS)
+    text = _bounded(text)
     text = _without_frames(text)
     text = _scrub_paths(text)
-    for name in _user_names():
-        text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", USER_PLACEHOLDER, text, flags=re.IGNORECASE)
+    text = _scrub_names(text)
     if max_chars is not None:
         text = _shorten(text, int(max_chars))
     return text
@@ -1917,7 +1949,7 @@ def owner_facing_detail(text) -> str:
     memory". And WITHOUT SQUARE BRACKETS (review V11, LOW-17: that guard reads brackets as JSON): a
     path reads "a path" and a user name "a user name", `[Errno N]` goes the way `[WinError N]` does,
     and no "(: " is left where a class name was. Text with no path, traceback, line break, class name
-    or bracket is returned unchanged."""
+    or bracket, at most `SCRUB_MAX_CHARS` long, is returned unchanged."""
     safe = client_safe_detail(text)
     owner = _WIN_ERROR.sub("", safe)
     owner = _ERRNO.sub("", owner)
