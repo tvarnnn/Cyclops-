@@ -127,6 +127,17 @@ protocol WorldBuilderClient: CartridgeClient {
     /// view model was built.
     var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> { get }
 
+    /// The Tower's `lifecycle.photographic` from the last report: whether the
+    /// world still owes its photographic room, and whether that build failed
+    /// (`WORLD-BUILDER-IOS.md` §3a). `nil` for a client with no Tower behind it
+    /// and for a Tower that sent none. Published beside `finalization`, for
+    /// the reason given there.
+    var photographic: WorldPhotographicReport? { get }
+
+    /// Every photographic report after the one `photographic` held when the
+    /// view model was built.
+    var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> { get }
+
     /// Every value after the one `recentWorld` held when the view model was
     /// built.
     var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { get }
@@ -180,6 +191,13 @@ extension WorldBuilderClient {
     /// Never emits, for the reason every other default here does not: a
     /// constant has no changes to announce.
     var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// No Tower, no photographic word -- and never a fabricated `complete`.
+    var photographic: WorldPhotographicReport? { nil }
+
+    var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 
@@ -310,6 +328,11 @@ final class WorldBuilderViewModel: ObservableObject {
     /// The builder's account of finalization, republished from the client.
     /// See `finalization` below for what reading it live cost.
     @Published private(set) var finalization: WorldFinalizationReport?
+
+    /// The Tower's photographic word, republished from the client, for the
+    /// reason `finalization` is: an `owed` → `complete` flip can leave the
+    /// snapshot, and so `state`, unchanged.
+    @Published private(set) var photographic: WorldPhotographicReport?
 
     /// The world whose interactive picture can be opened, or `nil` when none
     /// has been named yet.
@@ -466,6 +489,7 @@ final class WorldBuilderViewModel: ObservableObject {
         self.inspection = client.inspection
         self.recentWorld = client.recentWorld
         self.finalization = client.finalization
+        self.photographic = client.photographic
         self.geometry = geometry
         self.library = library
 
@@ -514,6 +538,14 @@ final class WorldBuilderViewModel: ObservableObject {
                 // for the length of a final solve.
                 guard let self, self.finalization != report else { return }
                 self.finalization = report
+            }
+            .store(in: &cancellables)
+        client.photographicUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] report in
+                // Deduped here as well as at the source, as `finalization` is.
+                guard let self, self.photographic != report else { return }
+                self.photographic = report
             }
             .store(in: &cancellables)
         client.geometryUpdates
@@ -1167,14 +1199,17 @@ final class WorldBuilderViewModel: ObservableObject {
     /// What this world is doing, in the normal surface's vocabulary. `nil` for
     /// the states that have no world in them.
     var stage: WorldStage? {
-        WorldStage.stage(for: state, evidence: evidence, finalization: finalization)
+        WorldStage.stage(
+            for: state, evidence: evidence, finalization: finalization, photographic: photographic
+        )
     }
 
     /// Which 3D reconstruction can be shown, best first. The primary thing on
     /// screen for a saved world.
     var reconstruction: WorldReconstruction {
         WorldReconstruction.ladder(
-            target: renderTarget, stage: stage, finalSolve: finalSolve, evidence: evidence
+            target: renderTarget, stage: stage, finalSolve: finalSolve, evidence: evidence,
+            photographic: photographic
         )
     }
 
@@ -1203,7 +1238,8 @@ final class WorldBuilderViewModel: ObservableObject {
             finalSolve: finalSolve,
             reconstruction: reconstruction,
             account: geometryAccount,
-            recoverability: recoverability
+            recoverability: recoverability,
+            photographic: photographic
         )
     }
 

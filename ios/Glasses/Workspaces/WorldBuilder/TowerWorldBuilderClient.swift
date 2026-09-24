@@ -276,6 +276,16 @@ enum WorldBuilderResultDecoder {
         return WorldFinalizationReport(json: lifecycle["finalization"])
     }
 
+    /// `lifecycle.photographic` → `WorldPhotographicReport`, or `nil` for
+    /// `null` (a lifecycle computed from the record alone), for an absent key
+    /// (every Tower before 2026-09-22), and for a payload with no `lifecycle`.
+    /// `WORLD-BUILDER-IOS.md` §3a: read, because plain "Saved" over a failed
+    /// photographic build is the T3 defect.
+    static func photographic(from payload: [String: Any]) -> WorldPhotographicReport? {
+        let lifecycle = payload["lifecycle"] as? [String: Any] ?? [:]
+        return WorldPhotographicReport(json: lifecycle["photographic"])
+    }
+
     /// `world.updated_at`, when the payload carries the Tower-native `world`
     /// block. Read for the "last saved world" line only — it is a clock
     /// reading, not a figure, and it is never drawn as a duration.
@@ -620,6 +630,21 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         finalizationSubject.eraseToAnyPublisher()
     }
 
+    /// The Tower's photographic word from the last report, or `nil`. Stored and
+    /// published for exactly the reason `finalization` is: `state` drops
+    /// repeats at the source, and `owed` → `complete` (or → `failed`) can
+    /// arrive with the snapshot standing still.
+    private(set) var photographic: WorldPhotographicReport? {
+        didSet {
+            guard photographic != oldValue else { return }
+            photographicSubject.send(photographic)
+        }
+    }
+
+    var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> {
+        photographicSubject.eraseToAnyPublisher()
+    }
+
     /// The pin the next `result_subscribe` carries, or `nil` to follow the
     /// live world. Kept across reconnects on purpose: a reader looking at a
     /// stored world who loses WiFi is still looking at that world when it
@@ -631,6 +656,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
     private let recentWorldSubject = PassthroughSubject<WorldRecentReference?, Never>()
     private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
+    private let photographicSubject = PassthroughSubject<WorldPhotographicReport?, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -667,6 +693,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         var session: WorldSessionReport?
         var selection: WorldSelection
         var finalization: WorldFinalizationReport?
+        /// `lifecycle.photographic`, or `nil` when the Tower sent none.
+        var photographic: WorldPhotographicReport? = nil
         /// `world_snapshot.world_id` / `session.session_id`, as decoded — the
         /// same two strings `WorldGeometryCoordinates` is addressed by.
         var worldID: String?
@@ -703,6 +731,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // `didSet` drops repeats, so a two-second heartbeat carrying an
             // unchanged finalization publishes nothing.
             finalization = lastReport?.finalization
+            photographic = lastReport?.photographic
         }
     }
 
@@ -1307,6 +1336,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             session: session,
             selection: selection,
             finalization: WorldBuilderResultDecoder.finalization(from: payload),
+            photographic: WorldBuilderResultDecoder.photographic(from: payload),
             worldID: (payload["world_snapshot"] as? [String: Any])?["world_id"] as? String,
             sessionID: session?.sessionID,
             recentWorld: selection.isHistoryOfferedAsLive
