@@ -336,11 +336,15 @@ def test_m1b_at_the_bound_the_interrupted_room_is_finished_in_the_same_run(tmp_p
     assert "re-runs" in promise
     assert _run(tmp_path) == 0
     assert [c["world"] for c in stage_runner] == ["w1"], "the room behind the bound is built"
-    detail = store.read_session("w1", "s1").finalization["detail"]
-    assert "re-runs" not in detail and "stopped trying" in detail
-    # The cause by its fixed phrase, never the gate's raw text (review V9, M-4).
-    assert "moge" not in detail and "DepthModelUnavailable" not in detail
-    assert CP.notice_cause_phrase(DEPTH_LOST) in detail and "re-finish" in detail
+    fin = store.read_session("w1", "s1").finalization
+    notice, detail = fin["notice"], fin["detail"]
+    assert "re-runs" not in notice and "stopped trying" in notice
+    # The cause by its fixed phrase, never the gate's raw text (review V9, M-4) -- on the
+    # phone's `notice`. `detail` is that sentence AND the gate's own reason, scrubbed
+    # (review V10, L-10b: it used to equal the notice, so the reason was in neither field).
+    assert "moge" not in notice and "DepthModelUnavailable" not in notice
+    assert CP.notice_cause_phrase(DEPTH_LOST) in notice and "re-finish" in notice
+    assert detail == f"{notice} (the gate's record: DepthModelUnavailable: moge is not installed)"
     v = wfp.assess(store, "w1", "s1")
     assert not v.owed and v.code == "nothing-interrupted", v
     # Settled: a second run finds nothing and writes nothing.
@@ -400,7 +404,7 @@ def test_m1b_a_detail_rewritten_after_the_give_up_is_given_up_again(tmp_path, st
     store = _gated(tmp_path, stages=ROOM_OK)
     _at_the_bound(store)
     assert _run(tmp_path) == 0
-    given_up = store.read_session("w1", "s1").finalization["detail"]
+    given_up = store.read_session("w1", "s1").finalization
     from dataclasses import replace
 
     promise = CP.publish_notice({"gate": DEPTH_LOST})
@@ -409,8 +413,8 @@ def test_m1b_a_detail_rewritten_after_the_give_up_is_given_up_again(tmp_path, st
         session.finalization, detail=promise, notice=promise)))
     assert wfp.assess(store, "w1", "s1").exhausted
     assert _run(tmp_path) == 0
-    assert store.read_session("w1", "s1").finalization["detail"] == given_up
-    assert store.read_session("w1", "s1").finalization["notice"] == given_up
+    assert store.read_session("w1", "s1").finalization["detail"] == given_up["detail"]
+    assert store.read_session("w1", "s1").finalization["notice"] == given_up["notice"]
 
 
 # ---------------------------------------------------------------------------

@@ -347,7 +347,10 @@ def test_the_give_up_is_the_notice(tmp_path, stage_runner):
     _at_the_bound(store)
     assert _run(tmp_path) == 0
     fin = _fin(store)
-    assert "stopped trying" in fin["notice"] and fin["detail"] == fin["notice"]
+    # `detail` is the notice and the gate's own reason (review V10, L-10b: it used to be the
+    # notice alone, and the reason was in neither field).
+    assert "stopped trying" in fin["notice"]
+    assert fin["detail"].startswith(fin["notice"] + " (the gate's record: ")
     assert "re-runs" not in fin["notice"]
 
 

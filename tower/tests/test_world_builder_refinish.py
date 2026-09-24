@@ -641,23 +641,31 @@ def test_an_interrupt_after_the_set_aside_puts_it_back_and_is_re_raised(tmp_path
 def test_a_restore_that_cannot_finish_still_moves_everything_it_can_and_says_so(
         tmp_path, stages, fake_depth, monkeypatch):  # noqa: F811
     store, kids = _world_with_areas(tmp_path)
+    session_derived = store.world_dir(W1) / "derived" / S1
+    session_derived.mkdir(parents=True)
+    (session_derived / "poses.json").write_text('{"poses": "old"}')
     before = _snapshot(store, derived=False)
 
-    def cannot_start(argv, env=None, capture_output=True, text=True):
+    def rebuilt_then_cannot_finish(argv, env=None, capture_output=True, text=True):
+        # the rebuild's derived tree for this session (review V10, MED-3: the put-back puts
+        # back only this session's, and only where it differs from the snapshot)
+        (session_derived / "poses.json").write_text('{"poses": "rebuilt"}')
         raise OSError("no child")
 
     real_copytree = wr.shutil.copytree
     calls = {"n": 0}
+    snapshot = store.world_dir(W1) / "refinish" / "b" / "derived" / S1
 
     def copytree_fails_on_restore(src, dst, *a, **k):
-        # the set-aside's own copies succeed; the restore's derived copy does not
-        if Path(dst) == store.world_dir(W1) / "derived":
+        # the set-aside's own copies succeed; the put-back's copy of the snapshot does not
+        if Path(src) == snapshot:
             calls["n"] += 1
             raise OSError(28, "No space left on device")
         return real_copytree(src, dst, *a, **k)
 
     monkeypatch.setattr(wr.shutil, "copytree", copytree_fails_on_restore)
-    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=cannot_start, stamp="b")
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=rebuilt_then_cannot_finish,
+                         stamp="b")
     assert calls["n"] == 1
     assert report["done"] is False and "stopped part-way" in report["reason"]
     ledger = json.loads((store.world_dir(W1) / "refinish" / "b" / wr.LEDGER_FILENAME)
@@ -666,6 +674,8 @@ def test_a_restore_that_cannot_finish_still_moves_everything_it_can_and_says_so(
     assert any("derived" in e for e in ledger["restore_report"]["errors"])
     # every other step still ran: the solve, the areas and the session are back
     assert _snapshot(store, derived=False) == before
+    # ... and the rebuild's derived tree was not moved before its replacement was copied
+    assert (session_derived / "poses.json").read_text() == '{"poses": "rebuilt"}'
     assert store.lock_holder(W1) is None
 
 

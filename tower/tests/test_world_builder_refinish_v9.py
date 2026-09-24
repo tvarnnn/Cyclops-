@@ -681,12 +681,24 @@ def test_m7_a_withheld_image_loses_its_features_in_the_copied_database(tmp_path,
     assert report["solver_frames"]["walk_images"]["features_to_clear"] == 1
 
 
-def test_m7_the_provenance_record_is_the_one_global_solve_reads():
-    """The format is agreed with SOL (`global_solve.prepare_images` honours it)."""
-    name = getattr(GS, "SOLVER_IMAGE_PROVENANCE_FILENAME", wr.SOLVER_IMAGES_PROVENANCE)
-    record = getattr(GS, "SOLVER_IMAGE_PROVENANCE_RECORD", wr.PROVENANCE_RECORD)
-    assert (wr.SOLVER_IMAGES_PROVENANCE, wr.PROVENANCE_RECORD) == (name, record)
+def test_m7_the_provenance_record_is_the_one_global_solve_reads(tmp_path):
+    """The format is agreed with SOL (`global_solve.prepare_images` honours it). Review V10,
+    L-10: this used to read SOL's names through `getattr(GS, ..., <REF's own>)`, so without
+    them it compared REF with itself. Now SOL's names are required, and each side READS what
+    the other WRITES."""
+    assert wr.SOLVER_IMAGES_PROVENANCE == GS.SOLVER_IMAGE_PROVENANCE_FILENAME
+    assert wr.PROVENANCE_RECORD == GS.SOLVER_IMAGE_PROVENANCE_RECORD
+    assert (wr.IMAGE_SOURCE_RAW, wr.IMAGE_SOURCE_REDACTED) == (GS.IMAGE_SOURCE_RAW,
+                                                              GS.IMAGE_SOURCE_REDACTED)
     assert wr.SOLVER_IMAGES_PROVENANCE not in wr.SOLVE_COPY_BACK   # written, not copied
+    entry = {"keyframe_id": f"{S1}:00000001", "source": "raw", "frame": "c/frames/1.jpg",
+             "sha1": "a" * 40, "verified": "record"}
+    wr._write_provenance_record(tmp_path, {"00000001.jpg": entry})
+    assert GS.read_image_provenance(SimpleNamespace(root=tmp_path)) == {"00000001.jpg": entry}
+    written = {"00000002.jpg": {"keyframe_id": f"{S1}:00000002", "source": "redacted",
+                                "frame": "images/00000002.jpg", "sha1": "b" * 40}}
+    GS.write_image_provenance(SimpleNamespace(root=tmp_path), written)
+    assert wr.read_image_provenance(tmp_path) == written
 
 
 # ---------------------------------------------------------------------------

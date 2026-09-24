@@ -1091,6 +1091,33 @@ def regate_refused_notice(meta: dict) -> str:
     return _regate_sentence(meta, REGATE_REFUSED_NOTICE)
 
 
+def regate_retired_detail(notice: str, label: str, why) -> str:
+    """The finalization's `detail` for a re-gate given up or refused: its `notice`, and WHY
+    -- the refusal, or the gate's own record -- which used to be in neither field (review
+    V10, L-10b: `detail` was written equal to `notice`). The reason is SCRUBBED as every
+    diagnostic that can reach a client is (`coherence_publish.client_safe_detail`: one
+    line, no path, short); `notice` keeps only fixed phrases (review V9, M-4)."""
+    from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
+
+    safe = CP.client_safe_detail(why, max_chars=CP.WHY_MAX_CHARS) if why else ""
+    return f"{notice} ({label}: {safe})" if safe else notice
+
+
+def _gate_why(meta: dict) -> str | None:
+    """The published gate record's own raw reason: the failed gate's `detail`, else the
+    depth stage's, else its cause. None when it has none."""
+    from tower.world_builder.coherence_publish import GATE_STATE_FAILED  # noqa: PLC0415
+
+    gate = (meta or {}).get("gate")
+    gate = gate if isinstance(gate, dict) else {}
+    depth = gate.get("depth") if isinstance(gate.get("depth"), dict) else {}
+    for value in ((gate.get("detail") if gate.get("state") == GATE_STATE_FAILED else None),
+                  depth.get("detail"), gate.get("detail"), gate.get("cause")):
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 # -- a re-finish in progress (review V8, M3b) --------------------------
 #
 # `scripts/world_refinish.py` rebuilds one session in steps, and between them it holds no
@@ -1160,10 +1187,18 @@ def refinish_in_progress(store: WorldStore, world_id: str) -> str | None:
         where = f"{WR.REFINISH_DIRNAME}/{aside.name}/{WR.LEDGER_FILENAME}"
         if state in WR.LEDGER_TERMINAL_STATES:
             continue
-        alive = WR.refinish_process_alive(ledger) if ledger is not None else None
+        # The re-finish's own process OR the final solve's child it started (review V10,
+        # Q3): a child running on after its parent was killed may still publish.
+        liveness = (WR.refinish_liveness(ledger) if ledger is not None
+                    else {"alive": None, "process": None, "child": None})
+        alive = liveness["alive"]
         if alive:
-            pid = (ledger.get("process") or {}).get("pid")
-            return f"re-finish {aside.name} is running (pid {pid}, ledger {state}; {where})"
+            if liveness["process"]:
+                pid = (ledger.get("process") or {}).get("pid")
+                return f"re-finish {aside.name} is running (pid {pid}, ledger {state}; {where})"
+            pid = (ledger.get("child") or {}).get("pid")
+            return (f"re-finish {aside.name} ended, but its final solve (pid {pid}) is still "
+                    f"running (ledger {state}; {where})")
         if alive is False:
             logger.info("[Tower][WorldBuilder] re-finish %s of %s ended at %r without "
                         "finishing (its process is gone); the world is not held for it",
@@ -1337,15 +1372,24 @@ def finish_refinish_restore(store: WorldStore, verdict: Verdict) -> dict:
         if dead is None:
             report.update({"finished": True, "reason": "nothing is owed back any more"})
             return report
+        # AN ATTEMPT THAT CANNOT BE COUNTED IS STILL MADE, HERE (review V10, L-7). Elsewhere
+        # an uncounted attempt is refused, because an uncounted six-minute GPU stage is the
+        # loop the bound exists for. A put-back is not that: no GPU, a few moves, and it
+        # reads the disk, so every run that gets anywhere leaves less to do and a killed one
+        # is finished by the next. Refusing it for a read-only `finish_attempts.json` left
+        # the world with its solve set aside, exited 1 at every run, and the chore's backoff
+        # starved every other world. The bound still applies wherever it can be counted.
+        counted = True
         try:
             report["attempts"] = record_attempt(
                 store, verdict.world_id, key,
                 detail=f"putting back what re-finish {dead['stamp']} set aside")
         except Exception as exc:  # noqa: BLE001
-            report.update({"finished": False,
-                           "reason": f"the attempt could not be counted, so it was not "
-                                     f"started: {type(exc).__name__}: {exc}"})
-            return report
+            counted = False
+            report["attempts_error"] = (f"the attempt could not be counted; the put-back is "
+                                        f"made anyway: {type(exc).__name__}: {exc}")
+            logger.warning("[Tower][WorldBuilder] %s/%s: %s", verdict.world_id,
+                           verdict.session_id, report["attempts_error"])
         out = WR.recover_dead_refinish(store, verdict.world_id, dead["stamp"])
         report["recovery"] = out
         report["finished"] = bool(out.get("recovered"))
@@ -1358,9 +1402,13 @@ def finish_refinish_restore(store: WorldStore, verdict: Verdict) -> dict:
                 _say_parked(store, engine, verdict.world_id, verdict.session_id)
             except Exception as exc:  # noqa: BLE001 -- `_retire_refinish` says it later
                 report["notice_error"] = f"{type(exc).__name__}: {exc}"
-        elif report["finished"]:
-            _give_back_attempt(store, verdict.world_id, key,
-                               detail=f"re-finish {dead['stamp']}: {out.get('state')}")
+        elif report["finished"] and counted:
+            try:
+                _give_back_attempt(store, verdict.world_id, key,
+                                   detail=f"re-finish {dead['stamp']}: {out.get('state')}")
+            except Exception as exc:  # noqa: BLE001 -- the put-back is done; the count is not
+                report["attempts_error"] = (f"the attempt could not be given back: "
+                                            f"{type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 -- recorded, then reported
         report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
     finally:
@@ -1559,6 +1607,21 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
                                verdict.session_id, exc_info=True)
             report.update({"finished": False, "waiting": True, "reason": str(exc)})
             return report
+        if _regate_wrote_nothing(report["regate"]):
+            # A stop reached the re-gate's draw-0 depth stage, and `regate_published` wrote
+            # NOTHING (review V10, MED-1b): the published solve, its room and its row stand as
+            # they were, and the re-gate is still owed. So nothing is written here either --
+            # not the row's sentence, and the room's mark goes back as for a refusal. The
+            # attempt is the stop's, given back by `forgive_attempt` on the way out.
+            try:
+                _put_room_record_back(store, verdict.world_id, verdict.session_id, before)
+            except Exception:  # noqa: BLE001 -- the room then stays owed: rebuilt, not stale
+                logger.warning("[Tower][WorldBuilder] could not put the room's stage record "
+                               "of %s/%s back after a stopped re-gate", verdict.world_id,
+                               verdict.session_id, exc_info=True)
+            report.update({"finished": False,
+                           "reason": f"stopped ({stop_request.source}); nothing was written"})
+            return report
         # The row's sentence follows the re-gate: cleared, or the new reason -- in `detail`
         # as before, and in `notice` (contract v6, §3.1), which a re-gate that owes nothing
         # any more REMOVES (`None`). The re-gate ran the gate, so this is always a gated
@@ -1597,6 +1660,16 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
                                 max_forgiven=max_forgiven)
         engine.release_world(verdict.world_id)
     return report
+
+
+def _regate_wrote_nothing(result) -> bool:
+    """Whether `regate_published` returned without writing anything: the result of a stop
+    that reached draw 0's depth stage (`stopped`, `publish.written` False; review V10,
+    MED-1b). A result without those keys (any re-gate before V10) wrote what it returned."""
+    if not isinstance(result, dict) or not result.get("stopped"):
+        return False
+    publish = result.get("publish")
+    return isinstance(publish, dict) and publish.get("written") is False
 
 
 def build_session_areas(store: WorldStore, world_id: str, session_id: str, *,
@@ -1753,12 +1826,16 @@ def _retire_regate(store: WorldStore, verdict: Verdict, max_attempts: int) -> di
             # Nothing was attempted; the row stops promising what cannot happen.
             out["refused"] = True
             notice = regate_refused_notice(meta)
+            detail = regate_retired_detail(notice, "refused",
+                                           _regate_refusal(store, verdict.world_id,
+                                                           verdict.session_id))
         else:
             notice = regate_given_up_notice(meta, again.attempts)
+            detail = regate_retired_detail(notice, "the gate's record", _gate_why(meta))
         fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
         WorldBuilderEngine(store).mark_finalization(
             verdict.world_id, verdict.session_id, state=fin["state"],
-            final_solve=fin.get("final_solve"), detail=notice, notice=notice)
+            final_solve=fin.get("final_solve"), detail=detail, notice=notice)
         out["notice"] = notice
     finally:
         store.release_writer_lock(verdict.world_id)
@@ -2227,10 +2304,15 @@ def main(argv=None, *, stop_request=None) -> int:
             if outcome.get("world_busy"):
                 held.add(verdict.world_id)
             continue
-        if verdict.stage == REFINISH_STAGE and outcome.get("finished"):
-            # A put-back is moves and a record, not a build (M-5): it does not spend the
-            # run's budget, and whatever the restored session owes is asked now, in this
-            # run (appended, so this loop reaches it).
+        if verdict.stage == REFINISH_STAGE:
+            # A put-back is moves and a record, not a build (M-5): WHATEVER it did, it does
+            # not spend the run's budget (review V10, L-7: one that failed used to, at every
+            # run, and the next owed world never came up). One that did not finish is a
+            # failure of this run (exit 1); whatever a restored session owes is asked now, in
+            # this run (appended, so this loop reaches it).
+            if not outcome.get("finished"):
+                failures += 1
+                continue
             try:
                 again = assess(store, verdict.world_id, verdict.session_id,
                                max_attempts=args.max_attempts)
