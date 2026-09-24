@@ -46,14 +46,23 @@ the ENGINE on the frame thread -- the worker never touches the journal:
 
 An accepted relocalization is a VERIFIED REVISIT LINK between keyframes the
 final solve can match explicitly: `revisit_pairs(session_dir)` reads them
-back as image-name pairs. (Not wired into global_solve here: that module has
-another owner.)
+back as image-name pairs, and `global_solve._match_revisit_pairs` matches
+them in the final solve's database. Which solves import them, and at what
+COLMAP floor, is that module's decision; what this module guarantees is
+that every pair it returns met `REVISIT_MIN_INLIERS` on every live leg --
+the reference link AND the link tying the scanned frame to its anchor
+keyframe (review V8 M4).
 
 THE FRAME PATH NEVER WAITS. The matcher runs on one daemon thread that is
 idle (blocked on a condition, 0 % CPU) unless an episode is open. The frame
 thread hands it at most one frame per 1/scan_hz seconds through a one-slot
 mailbox and never waits for it: a frame that arrives while the worker is
-busy replaces the pending one. Results are collected on the next frame.
+busy replaces the pending one. Results are collected on the next frame --
+or on the next frame the engine REJECTED, which ticks the clock without
+handing the worker anything (`tick`, review V8 LOW-1). A worker that fails
+`MAX_WORKER_FAILURES` times in a row exits, and the frame thread's next
+call raises `RelocalizerWorkerFailed`, which the engine journals as
+`relocalizer_stopped {why: error}` (review V8 LOW-2).
 """
 
 from __future__ import annotations
@@ -156,6 +165,29 @@ class AcceptanceParams:
         }
 
 
+# THE REVISIT FLOOR (review V8 M4): the fewest RANSAC inliers any live leg
+# of a revisit pair may have -- the reference->frame link, and the
+# frame->anchor link unless the scanned frame IS the anchor keyframe. It is
+# the live path's own floor, not a new number: the per-leg 50 of `tri2_50`
+# (contract 6.3, P2-LOOKBACK), the smallest link that can make an
+# acceptance at all (a strong link needs 100). `verify()` on its own
+# accepts 30 (VerifyParams.min_inliers), and a single link under 100 was
+# wrong 20 of 99 times (contract 6.3) -- which is why the anchor leg, one
+# single link, may not sit below the legs it extends. The final solve's
+# import floor in `global_solve` should cite this constant, not copy it.
+REVISIT_MIN_INLIERS = AcceptanceParams().triangle_min_link_inliers
+
+
+class RelocalizerWorkerFailed(RuntimeError):
+    """The worker failed `MAX_WORKER_FAILURES` scans in a row and exited.
+
+    Raised on the FRAME thread, by the relocalizer's next call, so the
+    engine drops it and journals `relocalizer_stopped {why: error, error:
+    "RelocalizerWorkerFailed"}` exactly as for any other failure (review V5
+    M4-1). The worker's own exceptions are in the log, one per attempt.
+    """
+
+
 @dataclass(frozen=True)
 class LimiterParams:
     """The prompt-rate limiter (contract 6.4). Read-only on the wire.
@@ -208,42 +240,102 @@ class LimiterParams:
 # -- the limiter -------------------------------------------------------------
 
 
-class PromptLimiter:
-    """The cap, then the mechanism. Pure; the clock is the caller's."""
+class _IssueHistory:
+    """The issue times of the prompts on ONE clock, and the two checks on it."""
 
-    def __init__(self, params: LimiterParams) -> None:
-        self._params = params
-        self._issued: deque[float] = deque()
-        self._last: float | None = None
+    def __init__(self) -> None:
+        self.issued: deque[float] = deque()
+        self.last: float | None = None
 
-    def refusal(self, now: float) -> str | None:
-        """None if a prompt may be issued at `now`, else the layer refusing.
+    def clear(self) -> None:
+        self.issued.clear()
+        self.last = None
 
-        The mechanism is asked first, so `"cap"` means exactly "the cap
-        refused a prompt the mechanism would have let through" -- the event
-        the design says should be rare, counted on its own.
-        """
-        p = self._params
-        while self._issued and self._issued[0] < now - p.window_s:
-            self._issued.popleft()
+    def cooldown_refuses(self, p: LimiterParams, now: float) -> bool:
         # INCLUSIVE: a prompt exactly `cooldown_s` after the last is still
         # refused. With cooldown_s = window_s / max_prompts that is what makes
         # the cooldown alone imply the CLOSED-window cap: three prompts each
         # more than 30 s apart span more than 60 s.
-        if (
+        return (
             p.mechanism == MECHANISM_COOLDOWN
             and p.cooldown_s is not None
-            and self._last is not None
-            and now - self._last <= p.cooldown_s
+            and self.last is not None
+            and now - self.last <= p.cooldown_s
+        )
+
+    def cap_refuses(self, p: LimiterParams, now: float) -> bool:
+        while self.issued and self.issued[0] < now - p.window_s:
+            self.issued.popleft()
+        return len(self.issued) >= p.max_prompts
+
+    def record(self, now: float) -> None:
+        self.issued.append(now)
+        self.last = now
+
+
+class PromptLimiter:
+    """The cap, then the mechanism. Pure; the clocks are the caller's.
+
+    EACH CHECK ON ONE CLOCK (review V8 LOW-3). The bound is decided on the
+    builder's DURATION clock (review V5 M4-4: what the wearer hears, immune
+    to a wall-clock step) but SHOWN on the Tower clock: the wire's
+    `prompt.issued_at` is the journal line's `at`. The two are separate
+    clocks, each quantised to 15.6 ms on this Windows machine
+    (GetTickCount64 and GetSystemTimeAsFileTime), so a duration-clock gap of
+    30 s plus one tick can be exactly 30 s on the wire -- the bound held
+    there with a margin of one tick, not by construction. So the limiter
+    keeps two histories and asks each check of each clock with that clock's
+    OWN readings, never a difference across the two:
+      * the duration clock: the `now` of every issue;
+      * the Tower clock: the `at` the journal actually wrote for each
+        prompt (`record_journaled`, fed back by the engine), against a
+        Tower-clock reading taken BEFORE the new line is written -- so the
+        new line's `at` is no earlier than the reading, and every bound
+        holds on the wire's own numbers exactly.
+    The Tower clock can only WITHHOLD, never issue: a prompt goes out only
+    when both clocks allow it, so a wall-clock step can never cause one
+    (M4-4 kept). A Tower clock read BEHIND the last journaled prompt has
+    stepped back; its history is then void (the wire's order is already
+    broken by the step) and the duration clock alone decides.
+    Without a Tower clock (a replay, a caller with no journal) the limiter is
+    the duration clock's alone, exactly as before.
+    """
+
+    def __init__(self, params: LimiterParams) -> None:
+        self._params = params
+        self._duration = _IssueHistory()
+        self._tower = _IssueHistory()
+
+    def refusal(self, now: float, tower_now: float | None = None) -> str | None:
+        """None if a prompt may be issued at `now` (duration clock) and
+        `tower_now` (Tower clock, optional), else the layer refusing.
+
+        The mechanism is asked first, on both clocks, so `"cap"` means
+        exactly "the cap refused a prompt the mechanism would have let
+        through" -- the event the design says should be rare, counted on
+        its own.
+        """
+        p = self._params
+        tower = self._tower if tower_now is not None else None
+        if tower is not None and tower.last is not None and tower_now < tower.last:
+            tower.clear()  # the Tower clock stepped back past the last prompt
+        if self._duration.cooldown_refuses(p, now) or (
+            tower is not None and tower.cooldown_refuses(p, tower_now)
         ):
             return "cooldown"
-        if len(self._issued) >= p.max_prompts:
+        if self._duration.cap_refuses(p, now) or (
+            tower is not None and tower.cap_refuses(p, tower_now)
+        ):
             return "cap"
         return None
 
     def record(self, now: float) -> None:
-        self._issued.append(now)
-        self._last = now
+        """A prompt was issued at duration-clock `now`."""
+        self._duration.record(now)
+
+    def record_journaled(self, at: float) -> None:
+        """The journal wrote that prompt with Tower-clock `at`."""
+        self._tower.record(at)
 
 
 # -- the state machine ---------------------------------------------------------
@@ -274,7 +366,9 @@ class RecoveryStateMachine:
     machine is a duration clock (`time.monotonic` in the builder); the
     Tower-clock times on the wire come from the journal lines themselves,
     never from here, so a wall-clock step cannot open, prompt or time out an
-    episode.
+    episode. The one use of the Tower clock (`wall_clock`, review V8 LOW-3)
+    is the limiter's second history, which can only WITHHOLD a prompt that
+    would break the cap as the wire shows it; see `PromptLimiter`.
 
     ORDER OF A TICK (review V5 M4-2). The timeout is evaluated FIRST, and a
     prompt is issued only while `now - lost_at <= prompt_after_s +
@@ -297,6 +391,7 @@ class RecoveryStateMachine:
         *,
         prompts_enabled: bool,
         late_grace_s: float | None = None,
+        wall_clock=None,
     ) -> None:
         self.limiter_params = limiter
         self.prompts_enabled = bool(prompts_enabled)
@@ -304,6 +399,9 @@ class RecoveryStateMachine:
             1.0 / AcceptanceParams().scan_hz if late_grace_s is None else float(late_grace_s)
         )
         self._limiter = PromptLimiter(limiter)
+        # The clock the journal stamps `at` with (the engine's Tower clock),
+        # read only when the limiter decides. None: the duration clock alone.
+        self._wall_clock = wall_clock
         self.state = STATE_NONE
         self.episode = 0
         self.lost_at: float | None = None
@@ -384,7 +482,10 @@ class RecoveryStateMachine:
             return [(EVENT_WITHHELD, {
                 "episode": self.episode, "why": WITHHELD_LATE, "layer": None,
             })]
-        layer = self._limiter.refusal(now)
+        # Read BEFORE the prompt line is journaled, so that line's `at` can
+        # only be the same or later (review V8 LOW-3).
+        tower_now = self._wall_clock() if self._wall_clock is not None else None
+        layer = self._limiter.refusal(now, tower_now)
         if layer is not None:
             # Never issued later: a late "look back" is wrong advice.
             self.counts["withheld_by_limiter"] += 1
@@ -397,6 +498,12 @@ class RecoveryStateMachine:
         self.counts["prompts"] += 1
         self.state = STATE_PROMPTING
         return [(EVENT_PROMPTED, {"prompt_id": self.prompt_id, "episode": self.episode})]
+
+    def prompt_journaled(self, at: float) -> None:
+        """The journal wrote the last `recovery_prompted` with Tower-clock
+        `at` -- the wire's `issued_at`. The limiter's Tower-clock history is
+        these numbers, not a reading of its own (review V8 LOW-3)."""
+        self._limiter.record_journaled(float(at))
 
     def close(self, now: float, *, why: str = "session_stopped") -> list:
         """The session stopped (or the relocalizer did): an open episode can
@@ -594,6 +701,15 @@ def revisit_pairs(session_dir) -> list[tuple[str, str]]:
     `Path(image_relpath).name`, i.e. `global_solve.keyframe_image_name`,
     in journal order, each pair once, reference first.
 
+    THE FLOOR (review V8 M4). A pair is returned only when every live leg
+    met `REVISIT_MIN_INLIERS` (inclusive) as journaled: the reference
+    link's `inliers` in `recovery_accepted.links[]`, and the anchor's
+    `inliers` (`recovery_accepted.anchor` or `recovery_anchored.anchor`)
+    unless the anchor is the scanned frame itself (`identity: true`). A leg
+    with no count is below the floor. The live path no longer anchors below
+    it; this read applies it to every journal, older ones included, so a
+    caller never needs a marker: below the floor is simply absent.
+
     An absent journal, an old session, or a session without a relocalizer
     returns `[]` -- never an error (contract 7). An acceptance never
     anchored is not returned: its scanned frame is not on disk, so the
@@ -611,12 +727,20 @@ def revisit_pairs(session_dir) -> list[tuple[str, str]]:
             names[kid] = Path(rel).name
     pairs: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    accepted_refs: dict = {}  # episode -> reference ids of its accepted link
+    accepted_refs: dict = {}  # episode -> reference ids of its accepted link, at the floor
+
+    def at_floor(inliers) -> bool:
+        return (
+            isinstance(inliers, (int, float)) and not isinstance(inliers, bool)
+            and inliers >= REVISIT_MIN_INLIERS
+        )
 
     def add(refs, anchor):
         anchor_name = names.get(anchor.get("keyframe_id")) if isinstance(anchor, dict) else None
         if anchor_name is None:
             return
+        if anchor.get("identity") is not True and not at_floor(anchor.get("inliers")):
+            return  # the scanned frame -> anchor leg is below the floor
         for ref in refs:
             ref_name = names.get(ref)
             if ref_name is None or ref_name == anchor_name:
@@ -631,12 +755,14 @@ def revisit_pairs(session_dir) -> list[tuple[str, str]]:
         if kind not in (EVENT_ACCEPTED, EVENT_ANCHORED):
             continue
         payload = _payload(event)
-        refs = [
-            link.get("ref_keyframe_id")
-            for link in payload.get("links") or ()
-            if isinstance(link, dict)
-        ]
         if kind == EVENT_ACCEPTED:
+            # Only the accepted event carries each reference link's count;
+            # `recovery_anchored` re-lists the ids, never the evidence.
+            refs = [
+                link.get("ref_keyframe_id")
+                for link in payload.get("links") or ()
+                if isinstance(link, dict) and at_floor(link.get("inliers"))
+            ]
             accepted_refs[payload.get("episode")] = refs
             add(refs, payload.get("anchor"))
         elif payload.get("episode") in accepted_refs:
@@ -876,8 +1002,19 @@ class _PendingAnchor:
 # that is not on disk, and the final solve has nothing to match. The number
 # is OPEN (no walk measured it): three keyframes is about a second of
 # walking at the selector's usual cadence, the span over which the view is
-# still the one the scanned frame saw.
+# still the one the scanned frame saw. A keyframe whose link to the scanned
+# frame is below REVISIT_MIN_INLIERS is a failed try (review V8 M4).
 MAX_ANCHOR_TRIES = 3
+
+# A worker whose jobs (scans or anchor checks) raise this many times IN A
+# ROW exits, and the relocalizer is stopped (`relocalizer_stopped {why:
+# error}`, review V8 LOW-2); one job that completes resets the count.
+# OPEN: no walk has ever produced a failing worker, so nothing measured
+# this. It is the module's existing retry bound (MAX_ANCHOR_TRIES). At
+# `scan_hz` 2 a matcher that fails on every scan is stopped about 1.5 s
+# after the loss, normally before `prompt_after_s` (5 s), so it does not
+# prompt a look-back it could never recognise.
+MAX_WORKER_FAILURES = MAX_ANCHOR_TRIES
 
 
 class LookBackRelocalizer:
@@ -889,14 +1026,21 @@ class LookBackRelocalizer:
     * `note_keyframe(keyframe_id, source_seq, gray)` on every acceptance;
     * `note_lost(at)` on every journaled `tracking_lost`;
     * `note_frame(gray, source_seq, keyframe_id, now)` on every decoded frame;
+    * `tick(now)` on every frame the engine REJECTS before tracking
+      (undecodable, or at another size): time only, no matching;
+    * `prompt_journaled(at)` with the `at` of every `recovery_prompted`
+      line it wrote;
     * `close(now, why=...)` at stop, or when the engine drops it.
 
     Every time handed in is the builder's MONOTONIC clock (review V5
     M4-4); the Tower-clock times on the wire are the journal lines' own.
+    `wall_clock` is the engine's Tower clock, read only by the limiter
+    (review V8 LOW-3).
 
     Each returns the journal events to write, in order. Only while an
     episode is open (or an accepted link still waits for its anchor) does
-    any of them hand work to the worker.
+    any of them hand work to the worker. All but `close` raise
+    `RelocalizerWorkerFailed` once the worker has given up.
     """
 
     def __init__(
@@ -910,6 +1054,7 @@ class LookBackRelocalizer:
         limiter: LimiterParams | None = None,
         verifier=None,
         synchronous: bool = False,
+        wall_clock=None,
     ) -> None:
         self.acceptance = acceptance or AcceptanceParams()
         self.limiter = limiter or LimiterParams()
@@ -917,6 +1062,7 @@ class LookBackRelocalizer:
         self.machine = RecoveryStateMachine(
             self.limiter, prompts_enabled=prompts_enabled,
             late_grace_s=1.0 / self.acceptance.scan_hz,
+            wall_clock=wall_clock,
         )
         self._verifier = verifier or SiftVerifier(camera_matrix, dist_coeffs)
         self._size = tuple(frame_size)  # (width, height)
@@ -942,6 +1088,10 @@ class LookBackRelocalizer:
         self.attempt_wall_s: list[float] = []
         self.attempt_cpu_s: list[float] = []
         self.dropped_frames = 0
+        # Worker jobs that raised: in total, and in a row (review V8 LOW-2).
+        self.failed_attempts = 0
+        self._consecutive_failures = 0
+        self._worker_error: BaseException | None = None
 
     # -- engine API ---------------------------------------------------------
 
@@ -956,6 +1106,7 @@ class LookBackRelocalizer:
         return tuple(gray.shape[:2]) == (self._size[1], self._size[0])
 
     def note_keyframe(self, keyframe_id: str, source_seq: int, gray) -> None:
+        self._raise_if_worker_failed()
         if not self._fits(gray):
             self._size_mismatch = True
             return  # a frame this calibration does not describe
@@ -971,6 +1122,7 @@ class LookBackRelocalizer:
 
     def note_lost(self, at: float) -> list:
         """`at` is the builder's MONOTONIC time of the journaled loss."""
+        self._raise_if_worker_failed()
         can_accept = bool(self._refs) and not self._size_mismatch
         opened, events = self.machine.lost(at, can_accept=can_accept)
         if opened:
@@ -986,6 +1138,7 @@ class LookBackRelocalizer:
 
     def note_frame(self, gray, source_seq: int, keyframe_id: str | None, now: float) -> list:
         """`now` is the builder's MONOTONIC time of this frame."""
+        self._raise_if_worker_failed()
         events = self._drain(now)
         if self.machine.is_open:
             if not self._fits(gray):
@@ -1005,25 +1158,53 @@ class LookBackRelocalizer:
             self._finish_episode()
         return events
 
+    def tick(self, now: float) -> list:
+        """A frame the engine REJECTED before tracking (review V8 LOW-1).
+
+        Time only: results already in are collected and the episode's clock
+        moves (prompt, `late`, timeout), so an episode can never stay
+        `searching` for ever behind a stream of undecodable or resized
+        frames. Nothing is scanned and nothing is handed to the worker: the
+        frame is not one the relocalizer can match, and the frame path never
+        waits. `now` is the builder's MONOTONIC time of the frame.
+        """
+        self._raise_if_worker_failed()
+        events = self._drain(now)
+        if self.machine.is_open:
+            events += self.machine.tick(now)
+        if not self.machine.is_open:
+            self._finish_episode()
+        return events
+
+    def prompt_journaled(self, at: float) -> None:
+        """The engine wrote a `recovery_prompted` line with Tower-clock `at`."""
+        self.machine.prompt_journaled(at)
+
     def close(self, now: float, *, why: str = "session_stopped") -> list:
         """Stop for good: close an open episode, then `relocalizer_stopped`.
 
         `why` is `session_stopped` at a normal stop and `error` when the
-        engine drops a relocalizer that raised (review V5 M4-1). Idempotent:
-        a second call journals nothing.
+        engine drops a relocalizer that raised (review V5 M4-1). A worker
+        that had already given up (review V8 LOW-2) makes it `error` either
+        way. Idempotent: a second call journals nothing.
         """
         if self._closed:
             return []
         self._closed = True
+        stopped = {"why": why}
+        with self._lock:
+            worker_failed = self._worker_error is not None
+        if worker_failed:
+            stopped = {"why": "error", "error": RelocalizerWorkerFailed.__name__}
         events = []
         try:
             events += self._drain(now)
         except Exception:  # the terminal lines below must be written regardless
             logger.exception("[Tower][WorldBuilder] relocalizer: collecting results at close failed")
         events += self.machine.close(
-            now, why="session_stopped" if why == "session_stopped" else "relocalizer_stopped"
+            now, why="session_stopped" if stopped["why"] == "session_stopped" else "relocalizer_stopped"
         )
-        events.append((EVENT_STOPPED, {"why": why}))
+        events.append((EVENT_STOPPED, stopped))
         self._finish_episode()
         with self._lock:
             self._stop = True
@@ -1106,8 +1287,36 @@ class LookBackRelocalizer:
                     self._pending = None
             try:
                 work(arg)
-            except Exception:  # the relocalizer must never cost the session
+            except Exception as exc:  # the relocalizer must never cost the session
                 logger.exception("[Tower][WorldBuilder] relocalizer attempt failed")
+                with self._lock:
+                    self.failed_attempts += 1
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= MAX_WORKER_FAILURES:
+                        # Give up (review V8 LOW-2). The worker never touches
+                        # the journal: the frame thread's next call raises,
+                        # and the engine journals the stop.
+                        self._worker_error = exc
+                        logger.error(
+                            "[Tower][WorldBuilder] relocalizer worker failed %d scans in a "
+                            "row; stopping the relocalizer for this session",
+                            self._consecutive_failures,
+                        )
+                        return
+            else:
+                with self._lock:
+                    self._consecutive_failures = 0
+
+    def _raise_if_worker_failed(self) -> None:
+        """On the frame thread: the worker gave up, so the relocalizer stops."""
+        with self._lock:
+            error = self._worker_error
+            failures = self._consecutive_failures
+        if error is not None:
+            raise RelocalizerWorkerFailed(
+                f"the relocalizer worker failed {failures} scans in a row; "
+                f"the last: {type(error).__name__}: {error}"
+            ) from error
 
     def _run(self, job: _Job) -> None:
         ep = self._episode
@@ -1157,19 +1366,24 @@ class LookBackRelocalizer:
                 self._results.append(result)
 
     def _anchor(self, ep: _Episode, job: _Job, frame: Features):
-        """The post-loss keyframe the scanned frame is tied to, verified."""
+        """The post-loss keyframe the scanned frame is tied to, verified AT
+        THE REVISIT FLOOR (review V8 M4): the nearest post-loss keyframe
+        whose link to the scanned frame has >= REVISIT_MIN_INLIERS inliers.
+        A nearer one below the floor is passed over; none at it leaves the
+        acceptance to wait for a later keyframe (`_run_anchor`)."""
         if job.keyframe_id is not None:
             return {"keyframe_id": job.keyframe_id, "identity": True}
         with self._lock:
             post = list(ep.post)
         for kid, seq, gray in sorted(post, key=lambda p: abs(p[1] - job.source_seq)):
             link = self._verifier.verify(frame, self._verifier.features(gray), self._size)
-            if link is not None:  # R maps the scanned frame to the anchor
+            if _at_revisit_floor(link):  # R maps the scanned frame to the anchor
                 return {"keyframe_id": kid, "identity": False, "link": link}
         return None
 
     def _run_anchor(self, item) -> None:
-        """Tie a pending accepted frame to a keyframe that arrived after it."""
+        """Tie a pending accepted frame to a keyframe that arrived after it,
+        at the revisit floor: a link below it is a failed try (V8 M4)."""
         import numpy as np
 
         with self._lock:
@@ -1181,7 +1395,7 @@ class LookBackRelocalizer:
         with self._lock:
             if self._pending_anchor is not pa:
                 return
-            if link is None:
+            if not _at_revisit_floor(link):
                 pa.tries += 1
                 if pa.tries >= MAX_ANCHOR_TRIES:
                     self._pending_anchor = None
@@ -1219,6 +1433,11 @@ class LookBackRelocalizer:
                     if self._pending_anchor is not None and self._pending_anchor.episode == episode:
                         self._pending_anchor = None
         return events
+
+
+def _at_revisit_floor(link) -> bool:
+    """A verified link strong enough to be a leg of a revisit pair."""
+    return link is not None and int(link.n_inliers) >= REVISIT_MIN_INLIERS
 
 
 def _accept_detail(job: _Job, links: dict, used: list, closure, anchor) -> dict:

@@ -688,7 +688,8 @@ record written before 2026-09-06 or a session that never stopped.
 | `state` | `"pending"`, `"complete"`, `"interrupted"` | `pending` with a live lock is `finalizing`; `pending` with no live lock is `interrupted` |
 | `final_solve` | `"pending"`, `"solved"`, `"skipped"`, `"failed"`, `"unavailable"`, or null | null when no final solve was configured. `skipped` names why in `detail` (a stop request mid-walk, a hard stop during finalization) |
 | `started_at`, `updated_at` | float | Tower clock |
-| `detail` | string or null | prose: the error, or why the solve was skipped |
+| `detail` | string or null | prose: the error, or why the solve was skipped. For a gated final solve it also carries the diagnostics behind `notice`. **Client-safe** as sent (review V10 MED-5; V11 MED-B): one line, no path, no traceback frame and no user name; the exception class and its message stay. The listing row and this status channel (`lifecycle.finalization`, since `a5001ab`) send the same transform (`coherence_publish.client_safe_finalization`), and both copies are at most 700 characters. The session record keeps the writer's text. On an interrupted session `reason` quotes it owner-facing (no class name, no square brackets), and the phone shows that |
+| `notice` | string, or **absent** | Additive (2026-09-24; `docs/contracts/WORLD-BUILDER-COMPONENTS.md` §3.1, v6, closed set since v8). What the Tower could not do for this walk (a fail-safe of the evidence gate, or a re-finish it could not put back), and who can fix it: one sentence per cause, from a closed set, joined by `"; "`. The Tower writes it only for a session whose final solve went through the gate, and only when that solve took a fail-safe or owes work. It is **absent, never null, whenever nothing is owed**, on every older session, and once the owed work is done, so those payloads are byte for byte as before. It never carries exception text, a path or a measured figure; the diagnostics are in `detail`. The listing row and this channel send `notice` and `detail` made client-safe and bounded as above (review V11 MED-B; `/ws` since `a5001ab`), which leaves every closed-set notice unchanged. The same object as the listing row's `finalization` (`docs/contracts/WORLD-BUILDER-WORLDS.md` §2), and the phone reads it here too: it shows the string verbatim under the room caption and never matches on it |
 
 > **`finalizing` is now a live claim.** The builder keeps the writer lock
 > until its final build is written, so a lock held by a running pid after
@@ -798,8 +799,9 @@ source as an untuned placeholder and is not emitted as an event at all.
 Emitting `limited` from it would present an unmeasured placeholder as a
 calibrated judgment.
 
-**`tracking.recovery`** — **PROPOSED 2026-09-23, awaiting Mac review; nothing
-implemented.** An additive, fixed-arity object, or **`null`** when the
+**`tracking.recovery`** — **Implemented 2026-09-24 behind
+`TOWER_WORLD_RELOCALIZER` (default `off`); reviewed by the Mac (C1); not yet
+validated.** An additive, fixed-arity object, or **`null`** when the
 session's journal records no relocalizer (every session today; `null` means
 *not recorded*, never *no losses*). It reports the live relocalizer's current
 or last episode (`state`: `none` / `searching` / `prompting` / `recovered` /

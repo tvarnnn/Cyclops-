@@ -905,10 +905,28 @@ class BackgroundSolver:
         "solved": False, "interrupted": True, ...}` when `should_stop`
         ended it. Never raises: a walk that reconstructed locally is worth
         keeping even if the global solve failed.
+
+        A CHILD THAT PUBLISHED BEFORE IT ENDED (review V11, MED-A). A consensus
+        final solve publishes draw 0 FIRST and then maps its further draws
+        (`global_solve._publish_draw_0_first`): minutes in which the child has
+        already published a gated final solve, owed its consensus
+        (`consensus-deferred`), and a hard stop -- or a crash -- ends it before
+        it can print a summary. That solve is published, and it is this
+        finalization's: so the answer is then a SOLVED summary built from what it
+        published (`published_consensus_solve`), with `published_before_it_ended`
+        and the way it ended (`interrupted`, `error`) kept beside it. The builder
+        records `final_solve: solved` with that record's notice, and the
+        finisher runs the consensus it owes. It used to record `skipped` with
+        "the last background solution stands", which was false, and the finisher
+        never ran the consensus.
         """
         from tower.world_builder import global_solve  # noqa: PLC0415
 
         started = time.perf_counter()
+        # WALL CLOCK, for the identity of what the child publishes: its `solved_at`
+        # is `time.time()` in the child after it mapped, so anything solved before
+        # this instant is not this child's.
+        launched_at = time.time()
         try:
             global_solve.write_sources(store, self.world_id, self.session_id, sources)
             workspace = global_solve.workspace_for(store, self.world_id, self.session_id)
@@ -956,7 +974,7 @@ class BackgroundSolver:
                     interrupted = True
                     logger.warning(
                         "[Tower][WorldBuilder] final global solve pid %s terminated: a hard "
-                        "stop was requested; the last background solution stands", child.pid,
+                        "stop was requested", child.pid,
                     )
                     self._terminate_child()
                     break
@@ -972,7 +990,9 @@ class BackgroundSolver:
             interrupted = True
         elapsed = round(time.perf_counter() - started, 3)
         if interrupted:
-            return {"attempted": True, "solved": False, "interrupted": True, "seconds": elapsed}
+            return self._published_before_it_ended(
+                store, {"attempted": True, "solved": False, "interrupted": True,
+                        "seconds": elapsed}, launched_at)
         summary: dict = {}
         text = b"".join(chunks).decode("utf-8", errors="replace").strip()
         if text:
@@ -984,6 +1004,10 @@ class BackgroundSolver:
             summary.setdefault("error", f"world_solve.py exited {child.returncode}")
         summary["attempted"] = True
         summary["seconds"] = elapsed
+        if not summary.get("solved"):
+            # A child that died after the early publish (it raised in the further
+            # draws, or was killed from outside) is the same case as the stop above.
+            summary = self._published_before_it_ended(store, summary, launched_at)
         logger.info(
             "[Tower][WorldBuilder] final global solve: solved=%s solver=%s posed=%s/%s "
             "components=%s in %.2fs",
@@ -991,6 +1015,29 @@ class BackgroundSolver:
             summary.get("keyframes"), len(summary.get("components") or []), elapsed,
         )
         return summary
+
+    def _published_before_it_ended(self, store: WorldStore, report: dict,
+                                   launched_at: float) -> dict:
+        """`report` (the child ended without a solved summary), or -- when the child had
+        already published a consensus final solve (`published_consensus_solve`, solved
+        after `launched_at`) -- a SOLVED summary of what it published, with `report`'s
+        own keys (`interrupted`, `error`, `seconds`) kept. See `run_final`. Never
+        raises: an unreadable solution is "nothing published", today's answer."""
+        published = published_consensus_solve(store, self.world_id, self.session_id,
+                                              since=launched_at)
+        if published is None:
+            if report.get("interrupted"):
+                logger.warning("[Tower][WorldBuilder] the final solve published nothing "
+                               "before the stop; the last background solution stands")
+            return report
+        logger.warning(
+            "[Tower][WorldBuilder] the final solve had published a gated solve (consensus "
+            "%s) before it ended (%s); it is recorded as this finalization's final solve, "
+            "and what it owes is the finisher's",
+            (published["gate"].get("consensus") or {}).get("state"),
+            "a hard stop" if report.get("interrupted") else report.get("error"),
+        )
+        return dict(report, **published, solved=True, published_before_it_ended=True)
 
     def close(self) -> None:
         """Leave no child behind. Called from the builder's `finally`."""
@@ -1613,6 +1660,86 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
     return report
 
 
+def finalization_notice(summary: dict | None) -> str | None:
+    """`finalization.notice` for a final solve that was just published (contract
+    WORLD-BUILDER-COMPONENTS.md v6, §3.1): `coherence_publish.publish_notice`'s sentences
+    -- what the evidence gate could not do and who can fix it -- or None, which REMOVES
+    the key.
+
+    ONLY FOR A SOLVE THE GATE RAN ON (a `gate` record in the summary). `publish_notice`
+    also words a GPU-out-of-memory masks sentence for a masked solve with the gate off,
+    and that stays where it has always been, in `detail`; §3.1 is explicit that the
+    notice is written only for a session whose final solve went through the gate. So
+    every ungated world -- every world before the gate, and every Tower with it off --
+    keeps a finalization block byte for byte as before."""
+    if not isinstance(summary, dict) or not isinstance(summary.get("gate"), dict):
+        return None
+    from tower.world_builder.coherence_publish import publish_notice  # noqa: PLC0415
+
+    return publish_notice(summary)
+
+
+def _consensus_requested(gate) -> int | None:
+    """The draws a gate record's consensus asked for, or None when it asked for none (no
+    `consensus` block: N = 1, and every solve before the consensus) or the record is not
+    readable as one."""
+    consensus = gate.get("consensus") if isinstance(gate, dict) else None
+    requested = consensus.get("requested") if isinstance(consensus, dict) else None
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        return None
+    return requested
+
+
+def published_consensus_solve(store, world_id: str, session_id: str, *,
+                              since: float | None = None) -> dict | None:
+    """The session's PUBLISHED solve, as a final-solve summary (`solver`, `solved_at`,
+    `keyframes`, `keyframes_posed`, `components`, `points`, `gate`, `transients`,
+    `solve`, `timing`), when it is a gated CONSENSUS final solve -- else None.
+
+    WHAT IDENTIFIES IT (review V11, MED-A):
+    - a `gate` record: only a FINAL solve runs the evidence gate
+      (`coherence_publish.gate_setting_for`; the walk's background solves never do);
+    - whose consensus asked for two draws or more: the one kind of final solve that
+      PUBLISHES and then goes on working for minutes (`_publish_draw_0_first`). A
+      single draw (N = 1) publishes as its last act and is not asked about here, so its
+      path is exactly as it was;
+    - that loads (`load_solution`: both files, this schema), so a torn or half-written
+      publish is "nothing published";
+    - and, with `since`, that was solved at or after it: `solved_at` is the wall clock
+      in the solving process after it mapped, so a solution solved before `since` was
+      not the child launched at `since`.
+    Reads only; never raises."""
+    try:
+        from tower.world_builder import global_solve  # noqa: PLC0415
+
+        solution = global_solve.load_solution(store, world_id, session_id)
+        if solution is None or not isinstance(solution.gate, dict):
+            return None
+        requested = _consensus_requested(solution.gate)
+        if requested is None or requested < 2:
+            return None
+        if since is not None and not float(solution.solved_at) >= float(since):
+            return None
+        workspace = global_solve.workspace_for(store, world_id, session_id)
+        return {
+            "solver": solution.solver,
+            "solved_at": solution.solved_at,
+            "keyframes": len(solution.keyframe_ids),
+            "keyframes_posed": sum(
+                1 for p in solution.poses.values()
+                if int(p.get("observations") or 0) >= global_solve.MIN_IMAGE_OBSERVATIONS),
+            "components": solution.components,
+            "points": int(len(solution.xyz)),
+            "timing": solution.timing,
+            "workspace": str(workspace.root),
+            "transients": solution.transients,
+            "solve": solution.solve,
+            "gate": solution.gate,
+        }
+    except Exception:  # noqa: BLE001 -- see the docstring
+        return None
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a World Builder mapping session over frames on disk."
@@ -2046,6 +2173,10 @@ def main(argv=None) -> int:
     finalization_state = FINALIZATION_COMPLETE
     final_solve_state = None
     finalization_detail = None
+    # `finalization.notice` (contract v6, §3.1): set only when a gated final solve is
+    # published and owes something; None writes no key. `stop_session` has just given the
+    # record a fresh `pending` block, so there is no older notice here to keep.
+    finalization_notice_text = None
     try:
         for frame in stop_request.bounded(frames):
             outcome = engine.observe(
@@ -2264,16 +2395,27 @@ def main(argv=None) -> int:
                     store, sources, should_stop=stop_request.hard_asked_for
                 )
                 if solve_report.get("solved"):
+                    # Including a child a hard stop (or a crash) ended AFTER it had
+                    # published its consensus's draw 0 (review V11, MED-A;
+                    # `run_final`): that solve is published, and its record owes the
+                    # consensus, which the notice below says and the finisher runs.
                     final_solve_state = FINAL_SOLVE_SOLVED
                     # What the published solve still owes, on the row (review V7, H2 and
                     # L-c): masks lost to GPU memory (an owner re-finishes this walk), a
                     # gate the idle Tower re-runs. None for every ungated solve.
                     from tower.world_builder.coherence_publish import (  # noqa: PLC0415
-                        publish_notice,
+                        publish_detail,
                     )
 
-                    finalization_detail = publish_notice(solve_report) or finalization_detail
+                    # `detail` keeps the diagnostics (review V9 M-4); `notice` is the closed set.
+                    finalization_detail = publish_detail(solve_report) or finalization_detail
+                    # And the phone's copy of it (v6, §3.1; `detail` keeps its meaning and
+                    # still carries the sentence).
+                    finalization_notice_text = finalization_notice(solve_report)
                 elif solve_report.get("interrupted"):
+                    # Only when the child published nothing of a consensus solve
+                    # (`run_final` answers `solved` for one that did): what stands is
+                    # what stood before this finalization. The sentence is today's.
                     final_solve_state = FINAL_SOLVE_SKIPPED
                     finalization_detail = (
                         f"final solve terminated: hard stop ({stop_request.source}) "
@@ -2349,6 +2491,7 @@ def main(argv=None) -> int:
                 state=finalization_state,
                 final_solve=final_solve_state,
                 detail=finalization_detail,
+                notice=finalization_notice_text,
             )
         except Exception:  # noqa: BLE001
             logger.exception("[Tower][WorldBuilder] could not record the finalization")

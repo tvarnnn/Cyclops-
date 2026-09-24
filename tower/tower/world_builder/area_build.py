@@ -25,10 +25,13 @@ target's areas offline in 45-90 s each), moved into the product:
    under `<world>/areas/<area>/`, and each stage's outcome is recorded in
    the area's record rather than in `session.json`.
 
-When the vertical cannot be estimated (fewer normals than `group_up`'s own floor) the
-area is built in the solve's own orientation and `levelled` is false (§5.4). No other
-support floor is applied: the only measured case (the target's Area 2, support 0.058)
-rendered level (OPEN T3).
+When the vertical cannot be estimated (fewer normals than `group_up`'s own floor, and
+too few cameras for the level head) the area is built in the solve's own orientation and
+`levelled` is false (§5.4). When its normals do not support the vertical -- fewer than
+the ROOM's floor, 10 % of them within 30 deg of it (`LEVEL_*`, `surface_render.surface_up`'s
+own test; review V8, LOW-a) -- it is still rotated by its best estimate but `levelled` is
+false and the caption says so. The target's Area 2 (normal support 0.064, 0.139 within
+30 deg) passes, as it rendered level (OPEN T3: a floor for normals of their own).
 
 This module computes no component and decides nothing about placement.
 """
@@ -75,6 +78,19 @@ NORMALS_MAX = 40000
 RF_MIN_CAMERAS = 5
 RF_TRIM_FRACTION = 0.1
 RF_MIN_CONDITIONING = 5.0
+# THE LEVELLING FLOOR (contract §5.4, OPEN T3; review V8, LOW-a): the ROOM's own. The
+# room page levels its horizon with `surface_render.surface_up`, which takes the
+# surface's vertical only when at least `min_horizontal_fraction` (10 %) of the surface
+# lies within `cone_deg` (30 deg) of horizontal. An area is `levelled` on its normals
+# under the same test, with the same constants (a test pins them to `surface_up`'s),
+# applied to its depth normals around the up it chose. Measured on P2-PX's builds (RUN
+# `experiments/P3-PUB/lowa/support.json`): the target's Area 2 -- §5.4's example, normal
+# support 0.064, rendered level -- has 0.139 within 30 deg and passes; the other islands
+# and rooms 0.21-0.41. What it does NOT reject: an isotropic normal field puts 13.4 %
+# (1 - cos 30 deg) in that cone, so the floor refuses a group seen almost only as walls,
+# not noise (OPEN).
+LEVEL_CONE_DEG = 30.0
+LEVEL_MIN_HORIZONTAL_FRACTION = 0.10
 # The unit `levelled` direction, OpenCV y-down: up is -Y.
 LEVEL_UP = np.array([0.0, -1.0, 0.0])
 
@@ -421,9 +437,18 @@ def group_up(Rwc: np.ndarray, normals_world: np.ndarray) -> dict:
         u = _unit((N[w] * np.sign(c[w])[:, None]).sum(0))
     if u @ cu < 0:
         u = -u
-    return {"levelled": True, "up": [float(v) for v in u],
+    # THE FLOOR (review V8, LOW-a): the room's levelling test on the area's own normals.
+    # Below it the up is still used -- rotating by the best estimate is what keeps an area
+    # from coming out upside down (review V6, L5) -- but it is not claimed as measured.
+    horizontal = float((np.abs(N @ u) > math.cos(math.radians(LEVEL_CONE_DEG))).mean())
+    levelled = horizontal >= LEVEL_MIN_HORIZONTAL_FRACTION
+    return {"levelled": bool(levelled), "up": [float(v) for v in u],
             "support": float(sc[j] / len(N)), "ambiguity": amb, "normals": int(len(N)),
-            "source": "level head + level surfaces (P2-R5 group_up)"}
+            "horizontal_fraction": round(horizontal, 4),
+            "source": ("level head + level surfaces (P2-R5 group_up)" if levelled else
+                       f"level head + level surfaces (P2-R5 group_up), below the floor: "
+                       f"{horizontal:.1%} of its normals within {LEVEL_CONE_DEG:.0f} deg of "
+                       f"vertical, the room's floor is {LEVEL_MIN_HORIZONTAL_FRACTION:.0%}")}
 
 
 # ---------------------------------------------------------------------------
@@ -816,7 +841,8 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
         flush_records()
         raise
     report["levelling"] = {k: levelling.get(k) for k in
-                           ("levelled", "support", "ambiguity", "normals", "source")}
+                           ("levelled", "support", "ambiguity", "normals", "horizontal_fraction",
+                            "source")}
     report["prepare_s"] = round(time.time() - t0, 1)
     t1 = time.time()
     try:

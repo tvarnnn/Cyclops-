@@ -604,20 +604,26 @@ def _write_session(tmp_path, keyframe_ids, events):
 
 
 def test_revisit_pairs_round_trip(tmp_path):
+    # The counts the producer journals (`_accept_detail`, `_run_anchor`);
+    # below REVISIT_MIN_INLIERS a leg is dropped (review V8 M4, pinned in
+    # test_world_builder_relocalizer_review_v8.py).
     kf = [f"s:{i:08d}" for i in range(12)]
     session = _write_session(tmp_path / "s", kf, [
         _started(), _ev("tracking_lost", 10.0),
         # anchored at once (the scanned frame was keyframe 8)
         _ev("recovery_accepted", 11.0, {"episode": 1, "by": "triangle",
-            "links": [{"ref_keyframe_id": kf[2]}, {"ref_keyframe_id": kf[3]}],
+            "links": [{"ref_keyframe_id": kf[2], "inliers": 55},
+                      {"ref_keyframe_id": kf[3], "inliers": 61}],
             "anchor": {"keyframe_id": kf[8], "identity": True, "inliers": None}}),
         _ev("tracking_lost", 30.0),
         # anchored afterwards
         _ev("recovery_accepted", 31.0, {"episode": 2, "by": "strong-link",
-            "links": [{"ref_keyframe_id": kf[5]}], "anchor": None}),
-        _ev("recovery_anchored", 31.5, {"episode": 2, "anchor": {"keyframe_id": kf[10]}}),
+            "links": [{"ref_keyframe_id": kf[5], "inliers": 104}], "anchor": None}),
+        _ev("recovery_anchored", 31.5, {"episode": 2, "anchor": {
+            "keyframe_id": kf[10], "identity": False, "inliers": 72}}),
         # an anchor for an episode whose acceptance was never journaled: ignored
-        _ev("recovery_anchored", 40.0, {"episode": 3, "anchor": {"keyframe_id": kf[11]}}),
+        _ev("recovery_anchored", 40.0, {"episode": 3, "anchor": {
+            "keyframe_id": kf[11], "identity": False, "inliers": 90}}),
     ])
     assert R.revisit_pairs(session) == [
         ("00000002.jpg", "00000008.jpg"), ("00000003.jpg", "00000008.jpg"),

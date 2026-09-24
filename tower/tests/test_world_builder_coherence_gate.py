@@ -159,8 +159,10 @@ def test_without_any_metric_scale_nothing_is_attached():
 
 
 def test_every_reason_is_in_the_contract_vocabulary():
-    assert set(CG.REASONS) == {"masks-unavailable", "scale-unavailable", "solved-separately", "no-verified-link",
-                               "single-unconfirmed-link", "scale-mismatch", "link-contradicted"}
+    # `seed-unstable` is the consensus's (review V8 H2; contract v7 re-admits it), and LAST, so the precedence
+    # of every reason before it is unchanged.
+    assert CG.REASONS == ("masks-unavailable", "scale-unavailable", "solved-separately", "no-verified-link",
+                          "single-unconfirmed-link", "link-contradicted", "scale-mismatch", "seed-unstable")
 
 
 def test_the_params_digest_records_the_bound():

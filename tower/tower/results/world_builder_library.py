@@ -328,6 +328,33 @@ def _photographic_state_for_row(store: WorldStore, world_id: str,
         }
 
 
+def _client_safe_finalization(finalization):
+    """The row's `finalization` (review V11, MED-B): `coherence_publish.client_safe_finalization`
+    of the session's record -- `detail` and `notice` one line, with no path, traceback frame or
+    user name, and at most 700 characters, the phone's own bound. The same transform `/ws`
+    applies to `lifecycle.finalization.detail`. A clean record is returned as it is, so every
+    row without raw text is byte for byte what it was; the record on disk is never touched.
+
+    Never raises: this row is outside any handler, and one raise empties Saved Worlds. A
+    record the transform cannot take is sent with neither text rather than raw."""
+    try:
+        from tower.world_builder.coherence_publish import (  # noqa: PLC0415
+            client_safe_finalization,
+        )
+
+        return client_safe_finalization(finalization)
+    except Exception:  # noqa: BLE001 -- withheld, never sent raw
+        logger.warning(
+            "[Tower][Worlds] a finalization record could not be made client-safe; "
+            "the row carries it without its detail and notice", exc_info=True,
+        )
+        if not isinstance(finalization, dict):
+            return None
+        safe = {k: v for k, v in finalization.items() if k != "notice"}
+        safe["detail"] = None
+        return safe
+
+
 def _components_for_row(store: WorldStore, world_id: str, session_id: str, session,
                         world, *, has_geometry: bool, appearance: dict | None):
     """The row's `components` (contract §2), or None -- never an exception.
@@ -776,8 +803,12 @@ def build_world_listing(store: WorldStore) -> dict:
                 # is sending it.
                 "photographic": photographic,
                 # The builder's own account of how finalization went, or
-                # null on a record written before it existed.
-                "finalization": session.finalization,
+                # null on a record written before it existed -- CLIENT-SAFE
+                # (review V11, MED-B): this listing is unauthenticated, and
+                # a writer may have put raw exception text in `detail` (a
+                # `C:\Users\<user>\...` path, a traceback), or an old one in
+                # `notice`. See `_client_safe_finalization`.
+                "finalization": _client_safe_finalization(session.finalization),
                 # Additive, and null on every world built before the dense
                 # stage existed: what dense reconstruction this session holds.
                 "dense": _dense_summary(store, world_id, session_id),

@@ -2,11 +2,22 @@
 
 **Living document.** Added 2026-09-23.
 
-> **Status: PROPOSED 2026-09-23 — awaiting Mac review; nothing implemented.**
-> No Tower code and no iOS code implements anything in this document. It is
-> the contract half of manager decision 010, P3.1 ("contract first"): the Mac
-> Validation Lead reviews it for Apple feasibility **before** any iOS or Tower
-> product code is written. Every "OPEN" reference in the text is a question
+> **Status: IMPLEMENTED 2026-09-24, behind Tower settings that are off by
+> default; not yet validated.** The Mac Validation Lead reviewed it (C1,
+> 2026-09-23; §10). Both halves exist and are merged on the integration branch
+> `world-builder/live-world-visualization-v1` at `1111bb9`: the Tower half from
+> `world-builder/coherence-product-v1` (`d87aa5c`), the iOS half from
+> `ios/wb-coherence-areas-v1` (`50afec3`). Nothing is on `main`. Every Tower
+> behaviour here is off until its setting is on, except the owner's re-finish
+> command (§7 rule 4; `tower/docs/world-builder/COHERENCE-PRODUCT.md`). Not yet
+> accepted: review V8 says READY WITH CHANGES and its fix round is open (the
+> Mac gate G1 passed at `1111bb9`, manager 020), and the physical A/B test has
+> not run. v6 (2026-09-24) adds `finalization.notice` (§3.1, §8).
+> v7 (2026-09-24) adds the reason `seed-unstable` (§2.2; consensus, §2.5), frozen
+> matching, the depth-prediction cache and the re-finish's raw frames by capture identity (§7 rule 4).
+> v8 (2026-09-24): `finalization.notice` is a closed set of sentences (§3.1); P3.6 manifest keys (§2.5).
+> v9 (2026-09-24): four closed-set sentences revised; `detail` client-safe (§3.1).
+> Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
 
@@ -15,8 +26,8 @@
 | Contract | `world_builder.components/2026-09-23` (names this agreement; not sent on the wire, §9) |
 | Adds to | `GET /worlds` session rows (`WORLD-BUILDER-WORLDS.md` §2), `GET /worlds/{id}/render/revision` (WORLDS §4a), the status payload's `tracking` block (`tower/docs/contracts/CARTRIDGE-RESULTS.md` §10.1). All additive; no identifier moves |
 | New routes | `GET /worlds/{w}/areas/{s}/{a}/…` (§5). New paths, which no existing app requests |
-| Tower producer (proposed, P3.2 lane `world-builder/coherence-product-v1`) | a product `world_builder/coherence_gate.py` (ported from `coherence_exp/gate.py`, `rule="evidence"`), `global_solve.merge`, `results/world_builder_library.py`, `results/world_builder_render.py`, `results/world_builder.py::_tracking_block`, `engine.py::observe` (the `decision.lost` branch) |
-| iOS consumer (proposed, Mac lane) | `WorldLibrary.swift`, `WorldRenderViewer.swift`, `WorldAssetTransport.swift`, `TowerWorldBuilderClient.swift`, `WorldModel.swift`, `WorldCanvasView.swift`, `WorldBuilderWorkspaceView.swift`, a new speech helper |
+| Tower producer (implemented, lane `world-builder/coherence-product-v1`; also `coherence_publish.py`, `components.py`, `area_build.py`, `relocalizer.py`, `scripts/world_refinish.py`) | a product `world_builder/coherence_gate.py` (ported from `coherence_exp/gate.py`, `rule="evidence"`), `global_solve.merge`, `results/world_builder_library.py`, `results/world_builder_render.py`, `results/world_builder.py::_tracking_block`, `engine.py::observe` (the `decision.lost` branch) |
+| iOS consumer (implemented, Mac lane `ios/wb-coherence-areas-v1`) | `WorldLibrary.swift`, `WorldRenderViewer.swift`, `WorldAssetTransport.swift`, `TowerWorldBuilderClient.swift`, `WorldModel.swift`, `WorldCanvasView.swift`, `WorldBuilderWorkspaceView.swift`, a new speech helper |
 | Evidence | run `wb-coherence-run-2026-09-23`: `mailbox/to-manager/20260923-1813-candidate-architecture.md`, `experiments/P2-PX/PHONE-EXPERIENCE.md`, `baseline/review/V4a/V4a-REVIEW.md`, `experiments/P2-LOOKBACK/`, `experiments/P2-LM/lookback/` |
 
 ## 1. Why it exists
@@ -78,12 +89,13 @@ placed whatever its level, so the link reasons come first.
 | `reason` | The gate decision it reports (`coherence_exp/gate.py`, `rule="evidence"`) | Seen on |
 |---|---|---|
 | `masks-unavailable` | The final solve ran **without** its hand/arm/held-phone masks (detector unavailable, model load failure, GPU out of memory, CPU fallback — recorded as `transients.state` in the solve manifest, §2.5). Masks are a hard dependency of the gate (manager 011): without them the gate attaches **no** piece to the room, so every piece outside the room's anchor block carries this reason and no other. Measured fail-safe on GT's unmasked arms: misplaced keyframes left attached 103 → 16, scale-misplaced 10 → 0, at a coverage cost of 134 correct keyframes shown as areas (lane `experiments/P2-LM/gatefix/gt_noattach.txt`). A GPU out of memory is retried once in the solve; if it persists the record says `retryable` and the row says so (*masks were not applied (GPU out of memory); an owner can re-finish this walk*). Nothing re-solves it unattended: a re-solve moves the solve aside and could strand the world if stopped (review V7, H2); the owner runs the re-finish command (§7 rule 4) | forced in tests; no walk yet |
-| `scale-unavailable` | Too few cameras of the solve have a metric scale ratio: fewer than `min_metric_fraction` (0.5, a majority rule; OPEN) of the supported cameras, including none (the depth stage failed or produced no physical fit). Metric scale is a hard dependency like the masks: without its scale tests the rule left 947 misplaced keyframes attached over the run's 24 world-arms, against 133 with them. Nothing is attached, and every piece outside the anchor carries this reason and no other. **This is an interim state, not a safe one** (review V7, H1): without scale the room's own anchor block is not split at its internal scale steps (GT's masked arms [129, 89, 120, 44] misplaced / split correct / scale-misplaced / split unobservable, against the gate's [24, 0, 0, 38]). So a gate that lacked scale because depth failed is recorded `retryable`, and the finisher owes the session a **re-gate in place**: the depth stage and the gate re-run on the published solve, nothing moved aside, bounded attempts | forced in tests; no walk yet |
+| `scale-unavailable` | Too few cameras of the solve have a metric scale ratio: fewer than `min_metric_fraction` (0.5, a majority rule; OPEN) of the supported cameras, including none (the depth stage failed or produced no physical fit). Metric scale is a hard dependency like the masks: without its scale tests the rule left 947 misplaced keyframes attached over the run's 24 world-arms, against 133 with them. Nothing is attached, and every piece outside the anchor carries this reason and no other. **This is an interim state, not a safe one** (review V7, H1): without scale the room's own anchor block is not split at its internal scale steps (GT's masked arms [129, 89, 120, 44] misplaced / split correct / scale-misplaced / split unobservable, against the gate's [24, 0, 0, 38]). So a gate that lacked scale because depth failed is recorded `retryable`, and the finisher owes the session a **re-gate in place**: the depth stage and the gate re-run on the published solve, nothing moved aside, bounded attempts. **Except** when the depth stage could not start for the walk's or the solve's own reason, `depth-no-intrinsics` or `depth-no-camera` (review V11, LOW-15): a re-gate in place runs on the same walk and the same solve and would fail the same way, so those are **not** `retryable`, and the notice names who can fix them (§3.1) | forced in tests; no walk yet |
 | `solved-separately` | The solver itself returned this piece as a separate model, so the gate never tested it against the room. For such a piece this is the **only** reason: refusals inside another solver model are relative to that model, not to the room, and are not reported | target, arm A1: the solver separates the closet (V4a) |
 | `no-verified-link` | In the room's solver model, but no verified image pair (≥ `min_link_inliers`, 15 inliers, COLMAP's floor) links it to the room — "not coupled", or `cross_links == 0` | no case checked by name in this run |
 | `single-unconfirmed-link` | It has verified links to the room, but they are **one point of failure**: a single pair, or several pairs through one image whose other ends are not themselves linked (no closed triangle) — `redundant_links()` false with ≥ 1 link | target bathroom: one non-redundant link; 991e5a15 kf 13–25: one floor-level pair, 55° off in image-only roll |
 | `link-contradicted` | It has verified links to the room, but the solve **contradicts** them: each pair's own two-view rotation disagrees with the solve's relative rotation by more than the control-measured bound (`max_link_disagreement_deg`, the control's p90 of link-vs-solve disagreement, 16.8°), so they are not evidence that it was placed right. Reported when setting those links aside is what left the piece without redundant links; otherwise the link reason above applies | 6839fb8f kf 92–98: four UNCALIBRATED 15–18-inlier links, contradicted by 34–96° (precondition b, lane `9ffe043`) |
 | `scale-mismatch` | Its metric level (per-camera MoGe TRI ratio, median over ≥ 10 cameras on each side) differs from the room's by more than ×1.25 — including a part the gate split off its own group at an internal scale step | target bathroom: ×4.27 |
+| `seed-unstable` | **Consensus** (v7, manager 019): the final solve was mapped N times (`TOWER_WORLD_SOLVE_CONSENSUS`, default 1 = off; the acceptance runs use 3), with mapper seeds `s … s+N-1` on ONE frozen matched database, the same masks and the same depth. Each draw was gated, and each keyframe voted attached or not. The published draw attached this piece, but fewer than a strict majority of draws did, so the evidence placing it is marginal and it is withheld from the room. For such a piece this is the **only** reason. It comes last in precedence, so no existing reason moves. The room's anchor group is never withheld | 6839fb8f: the walk-in closet (138 kf) is attached in 4 of 5 mapper seeds on one database, and detached by seed 2 (PF) |
 
 **Why τ is the control's p90 (16.8°), not its p95 (25.2°).** Both were
 derived from the known-good control alone and both were declared before any
@@ -94,11 +106,13 @@ the two pre-declared values is the default (manager 011). It is a named
 parameter, `max_link_disagreement_deg`, recorded in the gate's params digest
 and in the solve manifest, so a physical test or a later world can audit it.
 
-**Not reasons, deliberately.** `seed-unstable`: the seed-stability test is
-dropped from the product gate (its 0.075 threshold was set by the target alone,
-V4a; one seeded single-thread solve replaces the ensemble). `too-small-to-build`
-(proposed by P2-PX): size is not a placement decision, and is `shown_as`'s
-business (§2.3), so a small piece still says *why* it was not placed.
+**Not reasons, deliberately.** `too-small-to-build` (proposed by P2-PX): size is
+not a placement decision, and is `shown_as`'s business (§2.3), so a small piece
+still says *why* it was not placed. (`seed-unstable` was listed here until v6.
+The old seed-stability test had a 0.075 threshold set by the target alone (V4a),
+and it stays dropped. The v7 reason is a strict majority of N mapper-seed draws
+on one frozen database, which has no tuned threshold. Evidence: PF on 6839fb8f,
+where a majority of 3 gave 0 flips of a ≥ 30-kf group over 45 triple pairs.)
 
 ### 2.3 `shown_as` — the room, an area, or counted only
 
@@ -163,14 +177,23 @@ reader, the physical test or the harness can tell what produced `components`:
 
 | Key | Meaning |
 |---|---|
-| `transients.state` | `applied` (every solver image masked with the union rule), `partial` (some images unmasked, or a fallback rule such as OneFormer alone -- `rule_fallback`; counts given), or `unavailable` (with `detail` and `cause`: detector unavailable, model load failure, GPU out of memory, CPU fallback). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable`. A GPU out of memory is retried once; if it persists `retryable` and `cause` are set and the row says an owner can re-finish the walk (attended; nothing re-solves unattended, review V7 H2) |
+| `transients.state` | `applied`: no unmasked evidence reaches the solve. Every solver image was masked with the union rule, or, if it could not be masked (unreadable, mis-sized, or held by another process while it was hashed), it was **excluded**: it gets an all-0 COLMAP mask, and the walk-database filter drops every match that touches it, so it is left unposed. The counts are `images_excluded` and `excluded_examples` (at most 10 names), and the filter's `keypoints_excluded` (review V8 M2b). `partial`: the union rule could not run and a fallback rule did, such as OneFormer alone (`rule_fallback`), or an image could be neither masked nor excluded (no mask shape to write its exclusion with); counts given. `unavailable`: with `detail` and `cause` (detector unavailable, model load failure, `gpu-oom`, CPU fallback, off). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable`. A GPU out of memory is retried once per mask component, over that component's own missing images. If it persists, `retryable` and `cause: gpu-oom` are set. Every fail-safe cause writes a notice (section 3.1, `finalization.notice`) saying who can fix it. Nothing re-solves unattended (review V7 H2) |
 | `transients.rule`, `transients.requested_rule`, `transients.rule_fallback` | the mask rule that ran (the same union rule the surface stage uses) and any fallback |
 | `transients.masking` / `solve.masking`, `solve.walk_database` | `walk-database-filtered` (the walk's own database, matches touching masked keypoints removed and re-verified: the approved arm A1h) or `re-extracted` (no usable walk database: `absent`, `unusable` or `filter-failed`) |
-| `gate.state`, `gate.retryable`, `gate.cause`, `gate.solve_identity` | `applied`, or `failed` (with `detail`; a failed gate publishes no components record and owes a re-gate, `cause: gate-failed`). `retryable` with `cause: depth-unavailable` when the gate ran without metric scale because depth failed: the finisher owes a re-gate in place (§2.2 `scale-unavailable`). `solve_identity` names the solve the gate ran on; it is stamped in the depth stage and in `components.json`, and a record whose identity is not the published solve's is read as absent |
+| `gate.state`, `gate.retryable`, `gate.cause`, `gate.solve_identity` | `applied`, or `failed` (with `detail`; a failed gate publishes no components record and owes a re-gate, `cause: gate-failed`). `retryable` with `cause: depth-unavailable` when the gate ran without metric scale because depth failed: the finisher owes a re-gate in place (§2.2 `scale-unavailable`). **Not** `retryable` when depth could not start for `depth-no-intrinsics` or `depth-no-camera` (`coherence_publish.DEPTH_CAUSES_NOT_RETRYABLE`; review V11, LOW-15): nothing re-runs a gate that would fail the same way. `solve_identity` names the solve the gate ran on; it is stamped in the depth stage and in `components.json`, and a record whose identity is not the published solve's is read as absent |
 | `gate.gate`, `gate.params`, `gate.params_digest` | the rule id and its parameters -- `min_obs`, `min_link_inliers`, `max_link_disagreement_deg` (16.8), `scale_step_factor`, `scale_min_cameras`, `min_metric_fraction` (0.5) -- and their digest. There is no `attach_groups` parameter in the product: the fail-safe is decided by the two keys below |
 | `gate.masks_applied`, `gate.metric_available`, `gate.attach` | whether the masks were applied (`transients.state == "applied"`), whether any camera had a metric ratio, and so whether any piece could be attached at all |
 | `gate.evidence`, `gate.depth`, `gate.metric_scale`, `gate.components_file` | what the gate saw (links, honoured links, cameras with a ratio), the depth stage it used (told the solve camera's field of view), and the record it wrote |
 | `solve.seed`, `solve.threads` | the seeded single-thread solve that produced the model |
+| `solve.matching`, `solve.matching_detail`, `solve.database_digest`, `solve.verified_pairs` | **Frozen matching** (v7, V8 H2): PF measured that matching is not deterministic even on one thread. After a seeded final solve matches, `database.matching.json` beside the walk database records the key: pycolmap version, camera, max features, overlap, loop detection, verification seed and revisit list, plus the image names with their SHA-1 and the walk database's content digest. A later seeded final solve with the same key, images and content skips extraction and matching (`matching: frozen`); anything else matches and re-freezes (`matched`, with `matching_detail`). `database_digest` is the SHA-1 of the database that was mapped, with its two-view matrices at the stated precision named in `database_digest_rule`: F, E, H and qvec up to scale and sign, tvec up to scale, at 10 decimals. Two same-seed re-finishes gave one F as -F and last-bit noise elsewhere, on planar pairs where F is unused. An unseeded solve reads and writes none of this |
+| `solve.revisit_pairs` | The live relocalizer's revisit links (§6). They are imported only when the masks are `applied` and the solve is gated; otherwise `imported: false`, and `detail` says why. A link counts only at ≥ 50 inliers per leg (`relocalizer.REVISIT_MIN_INLIERS`, the per-leg floor of tri2_50, §6.3), and the floor is applied in the mapped database after the mask filter. With no links the record is exactly `{listed: 0, verified: 0, detail: null}` |
+| `gate.consensus` | **Consensus** (v7): `requested` (N), `unit: mapper-seed`, `seeds`, `state` (`applied`, `not-needed`, `deferred`, `not-run` or `not-applied`, with why), per-draw summaries (seed, seconds, `solve_identity`, room keyframes, votes, agreement), the chosen draw, and per group its votes, `ambiguous` (not unanimous) and its decision (`anchor`, `attached`, `seed-unstable` or `unplaced`). Each draw's per-round gate decisions are in `solve/<s>/consensus.json`. A minority piece inside the published anchor block cannot be withheld (the anchor is never withheld) and is reported in `gate.consensus.pieces`. Absent when N = 1 |
+| `solve.frames_ambiguous_by_name` | Present only when > 0: keyframes whose raw frame name was found in more than one capture directory, so the stored keyframe was used instead of a guess (v7). The re-finish never reaches this lookup: it assigns raw frames by capture identity (`source_seq` + `received_at`, section 7 rule 4) |
+| `gate.depth.predictions` | `{token, cached, predicted}`. The gate's MoGe predictions are cached per exact input pixels under `dense/<s>/predictions/<token>/` (v7, V8 H2), so a re-finish does not recompute them on the GPU. The fit to this solve is always recomputed |
+| `transients.images_excluded`, `excluded_reasons`, `retried`, `exclusion_notice_due`, `none_masked` | (v8, V9 M-8) an image that cannot be masked is excluded after one retry of its hash and its read; `excluded_reasons` counts why (`hash-failed`, `read-failed`, `undecodable`, `wrong-size`, `no-mask`); `exclusion_notice_due` when at least max(3, 2 %) of images were excluded (a notice follows); when NO image could be masked the state is `unavailable` with cause `images-unmaskable` and `none_masked` |
+| `gate.consensus` (v8 additions) | `state` also `partial` (fewer voting draws than requested; only draws whose gate attached vote), `not-applied` (the withhold failed its per-keyframe check: the chosen draw is published unchanged) and `deferred` by a stop (draw 0 published, `cause: consensus-deferred`, owed); `held_against_majority` (keyframes the published room holds that a strict majority of voting draws did not attach, anchor included: the M-2 visibility count); a `seed-unstable` group of the room is withheld whole, whatever its keyframes, with `unanimous_keyframes` (how many of them every voting draw attached; audit only). The v8 group decision `kept` was removed by V10 MED-4, and no record written since carries it. A group the vote would have withheld reads `not-withheld` when the consensus is `not-applied` (V10 L-4); `groups[].keyframe_ids` and `pieces[].keyframe_ids` |
+| `solve.revisit_pairs` (v8 additions) | `created_by_import`, `removed_below_floor`, `kept_existing`: the floor removes only pairs the import created; imported pairs live only in the mapped copy, never the walk database |
+| `images.provenance.json` (solve workspace) | (v8, V9 M-7) where each solver image came from (raw frame by capture identity, or the stored redacted keyframe). The re-finish carries an image back only when its provenance matches the plan; a solve rewrites an image whose provenance differs or is unknown |
 
 ## 3. Where `components` appears
 
@@ -189,6 +212,64 @@ The listing already carries unbounded arrays (`worlds`, `sessions`); each entry
 here is a few hundred bytes, and the regression set's worst case is 21
 components in one session (52ed8e0a, history arm A1h, GT's offline evaluation;
 V4a). No cap is proposed (OPEN M9).
+
+**`finalization.notice` — what the gate could not do, and who can fix it (v6; manager 020 G1-F2).**
+This is one more additive key, inside the row's existing `finalization` object (WORLDS §2). It is a
+string, or absent. The Tower writes it only for a session whose final solve went through the evidence gate,
+and only when that solve took a fail-safe or owes work. It holds one sentence per cause, joined by `"; "`,
+in the order masks, scale, gate, and each sentence says who can fix it: an owner, an operator, the idle
+Tower, or a new walk. It is absent on every older session and whenever nothing is owed, so those rows
+are byte for byte as before (§7 rule 1). It **replaces nothing**: `finalization.detail` keeps its own
+meaning. `detail` can carry an error string; `notice` never does.
+
+**The closed set (v8, review V9 M-4, manager 025).** The Tower writes `notice` ONLY from these sentences,
+joined by `"; "` when several causes apply (masks first, then scale or the gate). The fields are
+the only variable text: `{unmasked}`, `{images}` and `{excluded}` are integer image counts, `{attempts}` is an integer, and
+`{what}` is one of the gate clauses of this table (the `gate-failed*`, `depth-*`, `scale-short` and
+`consensus-deferred` sentences up to their first `;`). No exception text, path, username or measured
+figure is ever in a notice; the diagnostics are in `finalization.detail`, which reaches clients made
+client-safe (below). The phone renders each notice verbatim and never matches on it (Mac `de1b045` also replaces anything
+that looks like machine output). The set is exported by the Tower as
+`coherence_publish.NOTICE_SENTENCES` plus the finisher's three sentences.
+(v9: four sentences revised so none promises a re-run that cannot fix its cause; every sentence also passes
+the phone's text guard (Mac `3bb4431`): no lower-case `key=value`, no exception class name, one line.)
+`finalization.detail` is client-safe too (v9, V10 MED-5): one line, no path or user name, a traceback cut
+to its exception line, at most about 200 characters of reason; `lifecycle.reason` is owner-facing.
+
+| Cause | Sentence |
+|---|---|
+| `masks-gpu-oom` | *masks were not applied (GPU out of memory); an owner can re-finish this walk* |
+| `masks-off` | *masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk* |
+| `masks-no-gpu` | *masks were not applied (no GPU could run the transient detector); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-not-installed` | *masks were not applied (the transient detector is not installed on this Tower); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-detector-failed` | *masks were not applied (the transient detector failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-step-failed` | *masks were not applied (the mask step failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-no-image` | *masks were not applied (no solver image could be masked); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-none` | *masks were not applied (no solver image could be masked); an owner can re-finish this walk* |
+| `masks-unavailable` | *masks were not applied (the transient detector could not run); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-fallback` | *masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk* |
+| `masks-partial` | *masks were not applied to {unmasked} of {images} images; an owner can re-finish this walk* |
+| `masks-partial-uncounted` | *masks were not applied to some of its images; an owner can re-finish this walk* |
+| `masks-excluded` | *{excluded} of {images} images could not be masked and were left out of the solve; an owner can re-finish this walk* |
+| `masks-excluded-uncounted` | *some images could not be masked and were left out of the solve; an owner can re-finish this walk* |
+| `gate-failed` | *the evidence gate failed (an internal error); the Tower re-runs it when it is idle* |
+| `gate-failed-database` | *the evidence gate failed (the solve's feature database could not be read); the Tower re-runs it when it is idle* |
+| `gate-failed-memory` | *the evidence gate failed (out of memory); the Tower re-runs it when it is idle* |
+| `depth-unavailable` | *the evidence gate could not measure metric scale (the depth stage did not finish); the Tower re-runs the gate when it is idle* |
+| `depth-stopped` | *the evidence gate could not measure metric scale (the depth stage was stopped); the Tower re-runs the gate when it is idle* |
+| `depth-gpu-oom` | *the evidence gate could not measure metric scale (GPU out of memory); the Tower re-runs the gate when it is idle* |
+| `depth-model-missing` | *the evidence gate could not measure metric scale (the depth model is not installed on this Tower); an operator can install the depth model on this Tower, then the Tower re-runs the gate when it is idle* |
+| `depth-surface-busy` | *the evidence gate could not measure metric scale (another surface build of this walk was running); the Tower re-runs the gate when it is idle* |
+| `depth-no-intrinsics` | *the evidence gate could not measure metric scale (the walk has no camera intrinsics); re-running the gate would not change this; an owner can re-capture this walk* |
+| `depth-no-camera` | *the evidence gate could not measure metric scale (the solve has no camera); re-running the gate would not change this; an owner can re-finish this walk* |
+| `scale-short` | *the evidence gate had too little metric scale to place pieces by it; the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk* |
+| `consensus-deferred` | *the evidence gate's consensus of mapper seeds did not finish; the Tower re-runs it when it is idle* |
+| `regate-given-up` | *{what}; the idle Tower re-ran the gate {attempts} times without finishing it and has stopped trying; an owner can re-finish this walk* |
+| `regate-refused-notice` | *{what}; the idle Tower cannot re-run the gate on this solve; an owner can re-finish this walk* |
+| `refinish-parked-notice` | *a re-finish of this walk stopped part-way and the Tower could not put the previous result back; an owner can re-run the re-finish* |
+
+The key is removed when the owed work is done (for example after a re-gate in place succeeds). The
+listing's `contract` identifier does not move, for the reason above.
 
 ### 3.2 On `GET /worlds/{w}/render/revision` — additive
 
@@ -665,6 +746,23 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
    (the gate may move pieces out of it), so the room's revision changes and an
    open viewer offers *A newer reconstruction is ready* under IOS §10's existing
    rules. (Settled 2026-09-23, contract v3; Tower-internal, no wire change.)
+   **v7 (V8 M3, H2):**
+   - **The solver's frames** are the walk's raw capture frames when they exist. Each keyframe's frame is
+     found by its own capture identity (`source_seq` + `received_at` in that capture's `frames.jsonl`),
+     never by name. A keyframe that is ambiguous or not found uses its stored redacted copy. The captures
+     searched: `--capture-dir`, or else
+     `TOWER_CAPTURE_ROOT/captures/<capture_id>` and every capture that `continues_capture` it (a walk that
+     reconnected lives in 2–3 captures). Otherwise they are the stored redacted keyframes. `--no-capture`
+     forces the latter, and the ledger's `solver_frames` says which was used. The raw frames never leave
+     the Tower.
+   - **Carried back:** the walk database, its matching record (`database.matching.json`) and the mask cache,
+     so a second re-finish with the same seed maps the same database and uses the same masks and depth
+     predictions.
+   - **Rollback:** any error after the set-aside restores the previous result, and the ledger records
+     `restored-after-an-error` or `restore-incomplete`. The ledger records the re-finish's process, so the
+     finisher stays out of a live re-finish and not out of a dead one.
+   - **Stop the Tower first**, or at least its finisher (`TOWER_WORLD_FINISH_PENDING=false`); see
+     `tower/docs/world-builder/COHERENCE-PRODUCT.md`.
 5. **The finisher never computes components for a world that has none.** (It re-runs the gate in place only for a session whose own gate record says `retryable`, §2.5; it never re-solves.) `world_finish_pending.py` and
    the Tower's idle and start-up finishing treat `components: null` as owing
    **nothing**: no world is rebuilt into components on Tower start or when idle.
@@ -691,6 +789,11 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
 - **The room caption** gains *· N more areas shown separately*.
 - With N = 0 and K = 0 nothing new appears: a walk the gate kept whole looks
   exactly as today.
+
+**The notice** (v6, G1-F2): when a session's `finalization.notice` is a non-empty string, show it
+verbatim below the room caption, as a plain note rather than an error. Show nothing when it is absent.
+It says what the Tower could not do for this walk and who can fix it (§3.1). It is independent of
+`components`. A gated session whose gate failed has `components: null` and can still carry a notice.
 
 **The area viewer:** the header and captions of §5.4, and *Back to the room*.
 No arrow toward the room, no distance, no size, no name, no position — none of

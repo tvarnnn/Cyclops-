@@ -63,9 +63,14 @@ REASON_SINGLE_UNCONFIRMED_LINK = "single-unconfirmed-link"
 REASON_SCALE_MISMATCH = "scale-mismatch"
 REASON_LINK_CONTRADICTED = "link-contradicted"
 REASON_SCALE_UNAVAILABLE = "scale-unavailable"
+# The consensus's reason (review V8 H2; manager 019; contract v7, the lead re-admits it): the published draw
+# attached the piece, but fewer than a strict majority of the consensus draws did (mapper seeds on one frozen
+# database), so the evidence placing it is marginal. For such a piece it is the only reason. It is LAST, so the
+# precedence of every reason before it is today's.
+REASON_SEED_UNSTABLE = "seed-unstable"
 # Precedence (review V7, M2; contract v5 §2.2): the link reasons together, then the level.
 REASONS = (REASON_MASKS_UNAVAILABLE, REASON_SCALE_UNAVAILABLE, REASON_SOLVED_SEPARATELY, REASON_NO_VERIFIED_LINK,
-           REASON_SINGLE_UNCONFIRMED_LINK, REASON_LINK_CONTRADICTED, REASON_SCALE_MISMATCH)
+           REASON_SINGLE_UNCONFIRMED_LINK, REASON_LINK_CONTRADICTED, REASON_SCALE_MISMATCH, REASON_SEED_UNSTABLE)
 
 # COLMAP TwoViewGeometry configurations that are not verified evidence.
 NOT_VERIFIED_CONFIGS = (0, 1)  # UNDEFINED, DEGENERATE
@@ -358,17 +363,34 @@ def _rot_deg(R) -> float:
 
 
 def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotations: dict,
-               masks_applied: bool, params: GateParams | None = None) -> dict:
+               masks_applied: bool, params: GateParams | None = None, withhold=None, room=None) -> dict:
     """The rule (module docstring) on one solve.
 
     links: {(name_a, name_b): inliers} (`read_verified_links`); link_rotations: {(name_a, name_b): R_b_from_a}
     (`read_link_rotations`); metric_log: {name: log(z_sfm / z_metric)} (cameras without a finite ratio are
     simply absent); masks_applied: False when the solve's transient masks were not (all) applied.
 
-    Returns {"labels": {name: label}, "components": [...], "rounds": [...], "evidence": {...}, "params": ...,
-    "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is unplaced, with
-    `reason` / `reasons` from the contract's vocabulary."""
+    THE CONSENSUS'S HOOKS (`coherence_publish.gate_by_consensus`), no rule of their own. Groups are named by their
+    first camera (`groups[*].first_camera` of an earlier call on the same solve, whose groups these are: the
+    groups do not depend on either hook). None or empty, both: today's gate, exactly.
+
+      withhold: groups that are SEALED (review V9, H-1). A withheld group joins no round's kept set, in ANY round
+        (the room need not be its component's first round), and when its turn as a reference comes nothing joins
+        it: it is a piece of its own, and its label's only reason is `seed-unstable`. Sealed both ways, so that
+        neither the withheld group nor another piece takes the other's reasons.
+      room: the ALLOW-LIST (review V9, H-1): the groups of the room the withhold is applied to, its anchor
+        included. In a round whose reference is one of them, only they may join -- so a re-gate with a group
+        withheld can never attach a group the room did not hold, whatever the withheld group did to the kept
+        set's metric level or to the routes through it. The caller still checks the outcome per keyframe.
+
+    Returns {"labels": {name: label}, "components": [...], "rounds": [...], "groups": [...], "evidence": {...},
+    "params": ..., "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is
+    unplaced, with `reason` / `reasons` from the contract's vocabulary. `groups` are the candidate groups the rounds
+    decided, with their member cameras (`members`), `first_camera`, final `label`, and whether each was a round's
+    `reference`."""
     params = params or GateParams()
+    withheld_names = frozenset(withhold or ())
+    room_names = frozenset(room) if room else None
     names = model.names
     idx = model.index()
     C = _shared_counts(model)
@@ -414,6 +436,7 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
     labels = np.full(model.n, -1, dtype=np.int64)
     rounds = []
     group_decisions: dict = {}  # group min camera -> decision, for the reasons
+    group_members: list = []    # every decided group: its cameras and round label (the consensus's identity)
     next_label = 0
     comps = [int(v) for v, _ in sorted(zip(*np.unique(model.component, return_counts=True)),
                                        key=lambda vc: (-vc[1], vc[0]))]
@@ -438,6 +461,11 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
         first_round = True
         while pending:
             reference = pending.pop(0)
+            reference_name = names[int(reference.min())]
+            # A withheld reference is a piece of its own; a reference of the allow-listed room admits
+            # only the room's groups (the consensus's hooks; both empty on every other call).
+            sealed = reference_name in withheld_names
+            allowed = room_names if room_names is not None and reference_name in room_names else None
             kept = [reference]
             kept_set = set(int(i) for i in reference)
             decisions = []
@@ -473,7 +501,13 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                         "coupled": bool(coupled), "scale_ok": differ is not True,
                         "scale_factor": (math.exp(lg - lk) if lg is not None and lk is not None else None),
                     }
-                    if attach and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
+                    held = names[int(g.min())] in withheld_names
+                    if held:
+                        d["withheld"] = True
+                    barred = held or sealed or (allowed is not None and names[int(g.min())] not in allowed)
+                    if barred and not held:
+                        d["barred"] = "withheld reference" if sealed else "not a group of the room"
+                    if attach and not barred and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
                         best, best_n = j, len(cross)
                 if best is not None:
                     g = pending.pop(best)
@@ -488,10 +522,16 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                     group_decisions[int(g.min())] = d
             ids = np.concatenate(kept)
             labels[ids] = next_label
+            for i, g in enumerate(kept):
+                group_members.append({"first_camera": names[int(g.min())], "label": next_label,
+                                      "reference": i == 0, "source_component": comp,
+                                      "members": [names[int(v)] for v in g]})
             rounds.append({"source_component": comp, "label": next_label,
                            "reference_group": {"cameras": int(len(reference)),
                                                "first_camera": names[int(reference.min())]},
-                           "kept_groups": len(kept), "kept_cameras": int(len(ids)), "decisions": decisions})
+                           "kept_groups": len(kept), "kept_cameras": int(len(ids)), "decisions": decisions,
+                           **({"withheld": True} if sealed else {}),
+                           **({"room_allow_list": len(allowed)} if allowed is not None else {})})
             next_label += 1
             first_round = False
         rest = members[~supported[members]]
@@ -507,7 +547,7 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
             row = C[i, labelled].toarray().ravel()
             labels[i] = labels[labelled[int(np.argmax(row))]] if row.max() > 0 else first
     return _finish(model, labels, supported, rounds, group_decisions, masks_applied, metric_available, params,
-                   evidence)
+                   evidence, group_members)
 
 
 def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_applied: bool,
@@ -517,6 +557,10 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
         return [REASON_MASKS_UNAVAILABLE]
     if not metric_available:
         return [REASON_SCALE_UNAVAILABLE]
+    if round_.get("withheld"):
+        # A group the consensus withheld, sealed as a piece of its own (`withhold`): its only
+        # reason (contract §2.2), in whatever round it came up.
+        return [REASON_SEED_UNSTABLE]
     if round_["source_component"] != room_component or round_["reference_group"] is None:
         return [REASON_SOLVED_SEPARATELY]
     first = round_["reference_group"]["first_camera"]
@@ -539,13 +583,14 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
 
 
 def _finish(model, labels, supported, rounds, group_decisions, masks_applied, metric_available, params,
-            evidence) -> dict:
+            evidence, group_members=()) -> dict:
     counts = {int(lab): int(((labels == lab) & supported).sum()) for lab in np.unique(labels)}
     order = sorted(counts, key=lambda lab: (-counts[lab], -int((labels == lab).sum()), lab))
     remap = {old: new for new, old in enumerate(order)}
     final = np.array([remap[int(v)] for v in labels], dtype=np.int64)
     for rd in rounds:
         rd["final_label"] = remap.get(rd["label"])
+    groups = [dict(g, label=remap.get(g["label"])) for g in group_members]
     room_round = next(rd for rd in rounds if rd["final_label"] == 0)
     room_component = room_round["source_component"]
     comps = []
@@ -559,7 +604,7 @@ def _finish(model, labels, supported, rounds, group_decisions, masks_applied, me
                       "cameras": int(sel.sum()), "supported": int((sel & supported).sum()),
                       "source_components": sorted({int(c) for c in model.component[sel]})})
     return {"labels": {model.names[i]: int(final[i]) for i in range(model.n)}, "components": comps,
-            "rounds": _json_clean(rounds), "evidence": evidence, "gate": GATE_ID,
+            "rounds": _json_clean(rounds), "groups": _json_clean(groups), "evidence": evidence, "gate": GATE_ID,
             "params": params.to_json(), "params_digest": params.digest(), "masks_applied": bool(masks_applied),
             "metric_available": bool(metric_available)}
 

@@ -552,7 +552,12 @@ def test_the_gates_depth_stage_covers_every_component_is_told_the_fov_and_is_not
     candidate = dc.replace(sol, poses=poses)
     align, work, dparams = CP.run_gate_depth(store, WORLD, SESSION, candidate,
                                              store.read_session(WORLD, SESSION).intrinsics)
-    assert len(backend.fov) == 8, "both solver components' frames were predicted"
+    # Every frame of both components has its prediction. This fixture's eight frames are
+    # three distinct images, and the gate's predictions are kept by the pixels the
+    # network is shown (R3), so the network ran once per distinct image.
+    cache = align["prediction_cache"]
+    assert cache["predicted"] + cache["hits"] == 8, "both solver components' frames were predicted"
+    assert len(backend.fov) == cache["predicted"] == 3
     cam = sol.camera
     fov = math.degrees(2 * math.atan(cam["width"] / (2 * cam["fx"])))
     assert all(f == pytest.approx(fov) for f in backend.fov)
@@ -760,14 +765,21 @@ def test_an_ungated_solution_merges_exactly_as_before(gate):
 
 def _gated_session(tmp_path, *, transients, gate=None, record=True):
     from tests.test_world_builder_finish_pending import _stage, _world
+    from tower.world_builder import global_solve as GS
     from tower.world_builder.records import STAGE_STATE_OK, STAGE_SURFACE
 
     store = _world(tmp_path, stages={STAGE_SURFACE: _stage(STAGE_STATE_OK),
                                      "appearance": _stage(STAGE_STATE_OK)})
-    solve = store.world_dir("w1") / "solve" / "s1"
-    solve.mkdir(parents=True, exist_ok=True)
     gate = gate if gate is not None else {"state": CP.GATE_STATE_APPLIED, "masks_applied": False}
-    (solve / "solution.json").write_text(json.dumps({"transients": transients, "gate": gate}))
+    # A PUBLISHED solve a re-gate can start from: it loads, and the walk's database is there.
+    # (Review V8, M1a: the finisher decides a refusal read-only, so a `solution.json` alone --
+    # which `load_solution` reads as absent -- is `regate-refused`, not owed.)
+    solution = _solution(transients=None)
+    solution.transients, solution.gate = transients, gate
+    workspace = GS.workspace_for(store, "w1", "s1")
+    GS.write_solution(workspace, solution)
+    workspace.database_path.write_bytes(b"not read: the re-gate is a stub in these tests")
+    solve = workspace.root
     if record:
         (solve / CP.COMPONENTS_FILENAME).write_text(json.dumps({"components": []}))
     return store
