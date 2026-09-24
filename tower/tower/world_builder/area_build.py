@@ -67,12 +67,93 @@ UP_MIN_NORMALS = 1000  # below this `group_up` could not use normals: not levell
 PIX_STEP = 8           # depth-map subsampling
 DEPTH_VALID_M = (0.1, 12.0)
 NORMALS_MAX = 40000
+# The harness's roll-free up (`coherence_eval/eval_placement.roll_free_up`,
+# `PLACEMENT_PARAMS` tilt_*), P2-R5's fallback when there are too few normals: at
+# least 5 cameras, the 10 % least level-headed trimmed, well conditioned at an
+# eigenvalue ratio >= 5. Not tuned here.
+RF_MIN_CAMERAS = 5
+RF_TRIM_FRACTION = 0.1
+RF_MIN_CONDITIONING = 5.0
 # The unit `levelled` direction, OpenCV y-down: up is -Y.
 LEVEL_UP = np.array([0.0, -1.0, 0.0])
 
 AREA_BUILDS_OFF_DETAIL = (
     "area builds are switched off on this Tower (TOWER_WORLD_AREA_BUILDS); "
     "scripts/world_refinish.py builds them on request")
+
+
+# WHERE AN AREA IS BUILT, as opposed to where it lives. The area lives at
+# `<world>/areas/<area>/` (contract v3 §5.3), and its stages append
+# `<stage>/<session>/` and their own file names, so the deepest file an area build
+# WRITES -- an appearance chunk's staging name, `c.<32 hex>.bin.p<pid>.<8 hex>.tmp`
+# -- sat at root + 166 characters: 222 on this Tower's live root and 265 in a
+# scratch copy, past Windows' MAX_PATH (260), where every area appearance failed
+# (run wb-coherence-run-2026-09-23, P3-PG re-finish). So the stages run in a SHORT
+# directory at the root of the store, `<root>/.ab/<area>` (root + 21 instead of
+# root + 64), and the finished stage directories are moved into the area's own
+# directory when the build ends, on the same volume. What is written peaks at
+# root + 124; what is left in place, and only ever read, at root + 146.
+AREA_BUILD_DIRNAME = ".ab"
+
+
+def area_build_dir(store, area_id: str) -> Path:
+    """`<root>/.ab/<area id>`: where one area's stages run before being moved into place."""
+    if not C.is_area_id(area_id):
+        raise ValueError("not an area id")
+    return Path(store.root) / AREA_BUILD_DIRNAME / area_id
+
+
+class _BuildView(C.AreaStore):
+    """The area's view with its directory at the short build directory; everything
+    about the session is still the real world's (`components.AreaStore`)."""
+
+    def __init__(self, base, world_id: str, session_id: str, area_id: str, build_dir: Path) -> None:
+        super().__init__(base, world_id, session_id, area_id)
+        self.final_dir = self._area_dir
+        self._area_dir = Path(build_dir)
+
+
+def _fresh_build_dir(store, area_id: str) -> Path:
+    """An empty build directory. What a killed build left there is its own
+    unpublished output, replaced by this build exactly as a stage replaces its own."""
+    bdir = area_build_dir(store, area_id)
+    if bdir.exists():
+        shutil.rmtree(bdir, ignore_errors=True)
+    bdir.mkdir(parents=True, exist_ok=True)
+    return bdir
+
+
+def publish_area_build(store, world_id: str, session_id: str, area_id: str) -> list:
+    """Move every stage directory the build produced into the area's own directory,
+    replacing that stage's previous output (a rebuild replaces its own artifacts,
+    as the stages do in place). Returns the stage names moved. Never raises for a
+    build that produced nothing."""
+    bdir = area_build_dir(store, area_id)
+    if not bdir.is_dir():
+        return []
+    final = C.area_root(store, world_id, session_id, area_id)
+    final.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for child in sorted(bdir.iterdir()):
+        if not child.is_dir():
+            continue
+        target = final / child.name
+        old = None
+        if target.exists():
+            old = bdir.parent / f"{area_id}.old.{child.name}"
+            if old.exists():
+                shutil.rmtree(old, ignore_errors=True)
+            target.replace(old)
+        child.replace(target)
+        moved.append(child.name)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(bdir, ignore_errors=True)
+    try:
+        bdir.parent.rmdir()   # `.ab` itself, when no other build is running
+    except OSError:
+        pass
+    return moved
 
 
 class AreaNotBuildable(Exception):
@@ -137,6 +218,34 @@ def camera_normals(z: np.ndarray, K: np.ndarray, step: int = PIX_STEP,
     return n[np.isfinite(n).all(1)]
 
 
+def roll_free_up(Rwc: np.ndarray) -> dict | None:
+    """The up of a set of cameras from the level head alone (the harness's
+    `eval_placement.roll_free_up`, which P2-R5 falls back to): the direction the
+    camera x axes are most nearly perpendicular to, signed by the mean camera up,
+    re-estimated once without the least level-headed 10 %. None below
+    `RF_MIN_CAMERAS`."""
+    Rwc = np.asarray(Rwc, dtype=np.float64).reshape(-1, 3, 3)
+    if len(Rwc) < RF_MIN_CAMERAS:
+        return None
+    x = Rwc[:, :, 0]
+    cam_up = -Rwc[:, :, 1]
+    keep = np.ones(len(x), bool)
+    u = ev = None
+    for _ in range(2):
+        ev, V = np.linalg.eigh(x[keep].T @ x[keep])
+        u = V[:, 0]
+        if u @ cam_up[keep].mean(0) < 0:
+            u = -u
+        k = int(math.floor(RF_TRIM_FRACTION * len(x)))
+        if k == 0:
+            break
+        keep = np.ones(len(x), bool)
+        keep[np.argsort(-np.abs(x @ u), kind="stable")[:k]] = False
+    cond = float(ev[1] / max(ev[0], 1e-12))
+    return {"up": _unit(u), "conditioning": cond, "well_conditioned": cond >= RF_MIN_CONDITIONING,
+            "cameras": int(len(x))}
+
+
 def group_up(Rwc: np.ndarray, normals_world: np.ndarray) -> dict:
     """The up of a rigid group of cameras (`r5_lib.group_up`), or `levelled: False`.
 
@@ -148,9 +257,20 @@ def group_up(Rwc: np.ndarray, normals_world: np.ndarray) -> dict:
     """
     N = normals_world
     if len(N) < UP_MIN_NORMALS or len(Rwc) < 2:
-        return {"levelled": False, "up": None, "support": None, "ambiguity": None,
-                "normals": int(len(N)),
-                "source": "not estimated: too few depth normals"}
+        # P2-R5's FALLBACK (review V6, L5): the level head alone. Without it such an
+        # area was drawn in GLOMAP's arbitrary frame, possibly upside down. The up's
+        # SIGN is the mean camera up's, so it is never upside down; `levelled` says
+        # whether the head-level estimate is well conditioned (the caption warns
+        # otherwise). Only with too few cameras for even that is it not estimated.
+        rf = roll_free_up(Rwc)
+        if rf is None:
+            return {"levelled": False, "up": None, "support": None, "ambiguity": None,
+                    "normals": int(len(N)),
+                    "source": "not estimated: too few depth normals and too few cameras"}
+        return {"levelled": bool(rf["well_conditioned"]), "up": [float(v) for v in rf["up"]],
+                "support": None, "ambiguity": None, "normals": int(len(N)),
+                "conditioning": rf["conditioning"],
+                "source": "level head only (P2-R5 roll-free up: too few depth normals)"}
     x = Rwc[:, :, 0]
     _ev, V = np.linalg.eigh(x.T @ x)
     e0, e1 = V[:, 0], V[:, 1]
@@ -379,7 +499,8 @@ def stamp_area_manifests(view: C.AreaStore, world_id: str, session_id: str,
 
 def prepare_area(store, world_id: str, session_id: str, area_id: str, record, *,
                  should_stop=None, level: bool = True, depth_known_fov: bool = False,
-                 depth_backend: str | None = None) -> tuple[C.AreaStore, dict]:
+                 depth_backend: str | None = None,
+                 build_dir: Path | None = None) -> tuple[C.AreaStore, dict]:
     """Write the area's own levelled solution under its directory; return the view to
     build it through and the levelling record. Raises `AreaNotBuildable`.
 
@@ -409,7 +530,8 @@ def prepare_area(store, world_id: str, session_id: str, area_id: str, record, *,
     if intrinsics is None or getattr(intrinsics, "fx", None) is None:
         raise AreaNotBuildable("session has no intrinsics")
 
-    view = C.AreaStore(store, world_id, session_id, area_id)
+    view = (C.AreaStore(store, world_id, session_id, area_id) if build_dir is None
+            else _BuildView(store, world_id, session_id, area_id, build_dir))
     src = store.world_dir(world_id) / "solve" / session_id
     dst = view.world_dir(world_id) / "solve" / session_id
     dst.mkdir(parents=True, exist_ok=True)
@@ -450,7 +572,10 @@ def prepare_area(store, world_id: str, session_id: str, area_id: str, record, *,
         if should_stop is not None and should_stop():
             raise AreaNotBuildable("stopped before the area's vertical was estimated")
         levelling.update(estimate_up(first, members, align, work))
-        if levelling.get("levelled"):
+        # Rotated whenever an up was estimated -- a poorly conditioned head-level up
+        # still has the right SIGN, and not rotating is how an area came out upside
+        # down (review V6, L5); `levelled` stays what the estimate supports.
+        if levelling.get("up") is not None:
             rotation = rot_between(np.asarray(levelling["up"]), LEVEL_UP)
     levelled = bool(levelling.get("levelled"))
     final, _members = area_solution(solution, kids, rotation=rotation, centre=centre,
@@ -462,6 +587,20 @@ def prepare_area(store, world_id: str, session_id: str, area_id: str, record, *,
     C.write_area_record(store, world_id, session_id, area_id,
                         components_sha1=record.sha1, levelled=levelled, levelling=levelling)
     return view, levelling
+
+
+def _mark_running(store, world_id: str, session_id: str, area_id: str) -> None:
+    """`running` (stage `level`) in the area's OWN surface directory. Never fatal."""
+    try:
+        from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+            _status as surface_status,
+        )
+        from tower.world_builder.surface_pipeline import surface_dir  # noqa: PLC0415
+
+        surface_status(surface_dir(C.AreaStore(store, world_id, session_id, area_id), world_id,
+                                   session_id), state=STAGE_STATE_RUNNING, stage="level")
+    except Exception:  # noqa: BLE001
+        logger.debug("[Tower][WorldBuilder] could not mark the area running", exc_info=True)
 
 
 def _settle_status(store, world_id: str, session_id: str, area_id: str, state: str,
@@ -499,11 +638,18 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
     report = {"area_id": area_id}
     record_stage(STAGE_SURFACE, state=STAGE_STATE_RUNNING)
     t0 = time.time()
+    # THE SHORT BUILD DIRECTORY (`AREA_BUILD_DIRNAME`). The liveness probe reads the
+    # area's OWN directory, so the `running` status goes there too: a process killed
+    # anywhere from here leaves `running` under a dead pid there -- owed -- whatever
+    # the build directory holds.
+    bdir = _fresh_build_dir(store, area_id)
+    _mark_running(store, world_id, session_id, area_id)
     try:
         view, levelling = prepare_area(store, world_id, session_id, area_id, record,
                                        should_stop=should_stop, level=level,
-                                       depth_known_fov=depth_known_fov)
+                                       depth_known_fov=depth_known_fov, build_dir=bdir)
     except AreaNotBuildable as exc:
+        report["published"] = publish_area_build(store, world_id, session_id, area_id)
         stopped = should_stop()
         state = STAGE_STATE_STOPPED if stopped else STAGE_STATE_UNAVAILABLE
         _settle_status(store, world_id, session_id, area_id, state, exc.reason)
@@ -514,6 +660,10 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
         return report
     except BaseException:
         exc = sys.exc_info()[1]
+        try:
+            publish_area_build(store, world_id, session_id, area_id)
+        except Exception:  # noqa: BLE001 -- the original error is the one to raise
+            logger.exception("[Tower][WorldBuilder] could not move the area's build into place")
         record_stage(STAGE_SURFACE, state=STAGE_STATE_FAILED,
                      detail=f"{type(exc).__name__}: {exc}")
         _settle_status(store, world_id, session_id, area_id, STAGE_STATE_FAILED,
@@ -525,14 +675,19 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
                            ("levelled", "support", "ambiguity", "normals", "source")}
     report["prepare_s"] = round(time.time() - t0, 1)
     t1 = time.time()
-    report["stages"] = final_surface_stages(
-        view, world_id, session_id, solved=True, appearance=appearance,
-        prune_depth_work=prune_depth_work, should_stop=should_stop,
-        stop_source=stop_source, record=record_stage)
-    report["stages_s"] = round(time.time() - t1, 1)
     try:
-        stamp_area_manifests(view, world_id, session_id, bool(levelling.get("levelled")))
-    except Exception:  # noqa: BLE001 -- the key is additive; the artifact stands
-        logger.exception("[Tower][WorldBuilder] could not stamp the area manifests")
+        report["stages"] = final_surface_stages(
+            view, world_id, session_id, solved=True, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=should_stop,
+            stop_source=stop_source, record=record_stage)
+        report["stages_s"] = round(time.time() - t1, 1)
+        try:
+            stamp_area_manifests(view, world_id, session_id, bool(levelling.get("levelled")))
+        except Exception:  # noqa: BLE001 -- the key is additive; the artifact stands
+            logger.exception("[Tower][WorldBuilder] could not stamp the area manifests")
+    finally:
+        # Whatever the stages produced -- finished, stopped or failed, with its status
+        # saying which -- goes into the area's directory, where it is read.
+        report["published"] = publish_area_build(store, world_id, session_id, area_id)
     report["built"] = True
     return report

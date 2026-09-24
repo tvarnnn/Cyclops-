@@ -920,6 +920,10 @@ def solve(
     masks_record = _masks_off_record()
     masks = None
     masking = None
+    # WHY a masked solve took the path it took (review V5, M1-6): the walk's
+    # database was `filtered`, or it was `absent`, `unusable` or its filter
+    # `filter-failed` -- the three reasons a solve re-extracts.
+    walk_database = None
     if want_masks:
         masks, masks_record = _ensure_solver_masks(
             workspace, present, keyframes, camera,
@@ -927,7 +931,9 @@ def solve(
         if masks is not None:
             if _walk_database_usable(database_path):
                 masking = _MASKING_FILTERED
+                walk_database = "filtered"
             else:
+                walk_database = "absent" if not database_path.exists() else "unusable"
                 database_path, masks_record = _reextract_masked(workspace, reader, masks,
                                                                 present, masks_record)
                 database_existed = masks_record.get("database_reused", False)
@@ -1006,6 +1012,7 @@ def solve(
             database_path, masks_record = _reextract_masked(workspace, reader, masks,
                                                             present, masks_record)
             masking = _MASKING_REEXTRACTED
+            walk_database = "filter-failed"
             pycolmap.extract_features(
                 database_path, workspace.images_dir, image_names=present,
                 camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
@@ -1019,6 +1026,7 @@ def solve(
         masks_record["database"] = database_path.name
     if masking is not None:
         masks_record["masking"] = masking
+        masks_record["walk_database"] = walk_database
     matched = time.perf_counter()
 
     shutil.rmtree(workspace.sparse_dir, ignore_errors=True)
@@ -1089,6 +1097,7 @@ def solve(
         # How the masks reached the model: `walk-database-filtered`,
         # `re-extracted`, or None for an unmasked solve.
         "masking": masking,
+        "walk_database": walk_database,
         "final": bool(final),
         "pycolmap": getattr(pycolmap, "__version__", None),
         # The live relocalizer's verified revisit links, matched explicitly.
@@ -1277,12 +1286,14 @@ def _walk_database_usable(path) -> bool:
 
 
 def _reextract_masked(workspace, reader, masks, present, record):
-    """The fallback: the masks go to extraction, into `database.masked.db`."""
+    """The fallback: the masks go to extraction, into this solve's own masked
+    database (`solve_masks.masked_database`)."""
     from tower.world_builder import solve_masks  # noqa: PLC0415
 
     database, info = solve_masks.masked_database(workspace, masks, all_names=present)
     reader.mask_path = str(solve_masks.masks_dir(workspace))
     return database, dict(record, database=info["database"], database_reused=info["reused"],
+                          database_reused_from=info.get("reused_from"),
                           database_rebuilt_because=info["rebuilt_because"])
 
 
@@ -1468,6 +1479,12 @@ def coverage_for(posed: int, keyframes: int, median_observations: float | None, 
     return COVERAGE_PARTIAL
 
 
+def _gate_applied(solution) -> bool:
+    """Whether the evidence gate relabelled this solution's components."""
+    gate = getattr(solution, "gate", None)
+    return isinstance(gate, dict) and gate.get("state") == "applied"
+
+
 def merge(
     keyframes: list[Keyframe],
     pose_rows: list[dict],
@@ -1495,9 +1512,18 @@ def merge(
         wrong keypoints), and its placement is `registered` into the lowest
         segment index of the same component with scale exactly 1.
     A segment whose posed members fall in more than one component takes the
-    component holding most of them; the others become `unregistered` rows.
+    component holding most of them; the others become `unregistered` rows --
+    EXCEPT on a solution the evidence gate relabelled (`solution.gate` state
+    `applied`): there the components are the gate's, and a gate label that
+    splits a tracker segment would lose every keyframe it placed in the
+    minority. So each minority component's posed members become a SPLIT
+    segment of their own (`split_segments`): a new segment index past every
+    tracker segment, anchored at its first posed member, registered into its
+    component's reference like any other, and recorded in `segments` with
+    `split_from`. Ungated solutions merge exactly as before.
     """
     horizon = solution.horizon
+    split_segments = _gate_applied(solution)
     members_by_segment: dict[int, list[tuple[int, Keyframe]]] = {}
     for position, keyframe in enumerate(keyframes):
         members_by_segment.setdefault(keyframe.segment_index, []).append((position, keyframe))
@@ -1539,13 +1565,51 @@ def merge(
             c = solution.poses[k.keyframe_id]["component"]
             by_component[c] = by_component.get(c, 0) + 1
         component = max(by_component, key=lambda c: (by_component[c], -c))
+        minority = {}
+        if split_segments:
+            for pos, k in posed:
+                c = solution.poses[k.keyframe_id]["component"]
+                if c != component:
+                    minority.setdefault(c, []).append((pos, k))
         posed = [(pos, k) for pos, k in posed if solution.poses[k.keyframe_id]["component"] == component]
         anchor_pos, anchor_kf = posed[0]
         r_wa, c_a = _pose_matrices(solution.poses[anchor_kf.keyframe_id])
         decided[segment] = {
             "mode": "replaced", "component": component, "posed": posed,
-            "r_wa": r_wa, "c_a": c_a,
+            "r_wa": r_wa, "c_a": c_a, "minority": minority,
         }
+
+    # SPLIT SEGMENTS (gated solutions only; see the docstring). Indices past
+    # every tracker segment, in (segment, component) order, so a rebuild of
+    # the same solution numbers them the same way.
+    if split_segments:
+        next_index = max(members_by_segment, default=-1) + 1
+        for segment in sorted(decided):
+            d = decided[segment]
+            minority = d.get("minority") or {}
+            if not minority:
+                continue
+            moved = set()
+            for c in sorted(minority):
+                posed_c = minority[c]
+                anchor_pos, anchor_kf = posed_c[0]
+                r_wa, c_a = _pose_matrices(solution.poses[anchor_kf.keyframe_id])
+                decided[next_index] = {"mode": "replaced", "component": c, "posed": posed_c,
+                                       "r_wa": r_wa, "c_a": c_a, "split_from": segment}
+                members_by_segment[next_index] = list(posed_c)
+                moved.update(k.keyframe_id for _, k in posed_c)
+                next_index += 1
+            members_by_segment[segment] = [(p, k) for p, k in members_by_segment[segment]
+                                           if k.keyframe_id not in moved]
+        # A point belongs to the segment of its first observer -- the SPLIT
+        # segment when that observer was moved into one.
+        derived_segment = {}
+        for segment, members in members_by_segment.items():
+            for position, _k in members:
+                derived_segment[position] = segment
+        owner_segment = np.array(
+            [derived_segment.get(int(i), -1) for i in solution.first_keyframe], dtype=np.int64,
+        ) if len(solution.first_keyframe) else np.zeros(0, dtype=np.int64)
 
     reference_by_component: dict[int, int] = {}
     for segment in sorted(decided):
@@ -1681,6 +1745,11 @@ def merge(
             "median_observations": median_obs, "points": n_points,
             "component": component, "reference_segment": reference,
         }
+        if d.get("split_from") is not None:
+            # A tracker segment the gate's components cut in two: this part's
+            # keyframes are the journal's segment `split_from`.
+            per_segment[segment]["split_from"] = d["split_from"]
+            placements[-1].evidence["split_from"] = d["split_from"]
 
     components_out = []
     for component, reference in sorted(reference_by_component.items()):

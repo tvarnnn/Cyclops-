@@ -192,9 +192,35 @@ def test_group_up_finds_a_tilted_floor():
     assert up["support"] > 0.5
 
 
-def test_too_few_normals_is_not_levelled():
+def test_too_few_normals_falls_back_to_the_level_head():
+    """P2-R5's fallback (review V6, L5): the roll-free up of the cameras, never upside down."""
     _poses_, rwcs, _c = _poses()
-    up = AB.group_up(np.array(list(rwcs.values())), np.zeros((10, 3)))
+    R = np.array(list(rwcs.values()))
+    up = AB.group_up(R, np.zeros((10, 3)))
+    assert up["up"] is not None and "roll-free" in up["source"]
+    assert float(np.dot(up["up"], TRUE_UP)) > 0, "never upside down"
+    rf = AB.roll_free_up(R)
+    assert up["levelled"] is bool(rf["well_conditioned"])
+
+
+def test_a_level_headed_group_without_normals_is_levelled_by_its_head():
+    """Cameras panning a level head around a known vertical: the fallback recovers it and levels."""
+    up_true = np.array([0.3, -0.9, 0.2])
+    up_true /= np.linalg.norm(up_true)
+    base = AB.rot_between(np.array([0.0, -1.0, 0.0]), up_true)   # camera -Y -> up_true
+    Rwc = []
+    for yaw in np.radians(np.arange(0, 360, 20)):
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        Ry = np.array([[c, 0, s_], [0, 1, 0], [-s_, 0, c]])      # yaw about camera -Y (up)
+        Rwc.append(base @ Ry)
+    up = AB.group_up(np.array(Rwc), np.zeros((0, 3)))
+    assert up["levelled"] is True
+    assert math.degrees(math.acos(min(1.0, float(np.dot(up["up"], up_true))))) < 0.5
+
+
+def test_too_few_cameras_and_normals_is_not_levelled():
+    _poses_, rwcs, _c = _poses()
+    up = AB.group_up(np.array(list(rwcs.values()))[:4], np.zeros((10, 3)))
     assert up["levelled"] is False and up["up"] is None
 
 
@@ -289,7 +315,7 @@ def test_an_area_stopped_while_levelling_is_owed_again(tmp_path, monkeypatch, fa
                                      record.sha1)["state"] == "owed"
 
 
-def test_an_area_whose_vertical_cannot_be_estimated_keeps_the_solves_orientation(
+def test_an_area_without_depth_normals_is_levelled_by_the_head_not_left_upside_down(
         tmp_path, monkeypatch):
     import tower.world_builder.surface_pipeline as SP
     from tower.world_builder.dense_pipeline import dense_dir
@@ -303,8 +329,10 @@ def test_an_area_whose_vertical_cannot_be_estimated_keeps_the_solves_orientation
     store, kids = _store(tmp_path)
     record = _components(store, kids)
     _view, levelling = AB.prepare_area(store, W1, S1, AREA1, record)
-    assert levelling["levelled"] is False
-    assert np.allclose(levelling["rotation"], np.eye(3))
+    # no depth normals at all: the level head levels it (review V6, L5), never upside down
+    assert levelling["up"] is not None and "roll-free" in levelling["source"]
+    R = np.asarray(levelling["rotation"])
+    assert float(np.dot(R @ np.asarray(levelling["up"]), AB.LEVEL_UP)) > 0.999
 
 
 def test_an_area_the_record_names_no_keyframes_for_is_not_buildable(tmp_path):
@@ -352,10 +380,15 @@ def test_build_area_runs_the_builders_stages_on_the_area_view(tmp_path, fake_dep
     rec = C.read_area_record(store, W1, S1, AREA1)
     assert rec["stages"]["surface"]["state"] == "ok"
     assert rec["stages"]["appearance"]["state"] == "ok"
-    # The additive `area` key on both manifests (§5.3).
+    # The additive `area` key on both manifests (§5.3), in the area's own directory: the
+    # stages ran in the short build directory and were moved into place.
+    final = C.area_root(store, W1, S1, AREA1)
+    assert view.area_dir == AB.area_build_dir(store, AREA1) and not view.area_dir.exists()
+    assert sorted(report["published"]) == ["appearance", "dense", "solve", "surface"]
     for stage in ("surface", "appearance"):
-        man = json.loads((view.area_dir / stage / S1 / "manifest.json").read_text())
+        man = json.loads((final / stage / S1 / "manifest.json").read_text())
         assert man["area"] == {"id": AREA1, "levelled": True}
+    assert (final / "solve" / S1 / "solution.json").exists()
     # Nothing of the room's was written.
     assert not (store.world_dir(W1) / "surface" / S1).exists()
 
@@ -535,3 +568,73 @@ def test_a_stop_between_areas_stops_there(tmp_path, monkeypatch, fake_depth):
     ledger = json.loads((store.world_dir(W1) / wfp.ATTEMPTS_FILENAME).read_text())
     assert ledger["sessions"][wfp.area_ledger_key(S1)]["attempts"] == 0
     assert wfp.assess(store, W1, S1).code == "owed-area"
+
+
+# ---------------------------------------------------------------------------
+# paths: an area build must not near Windows' MAX_PATH (lead, round 2, item 2)
+# ---------------------------------------------------------------------------
+
+# The live Tower's root on this machine, `C:\Users\tvllo\Projects\Glasses\tower\data\world_builder`
+# (57 characters), and a worst case: a Tower under a longer user profile and project path.
+LIVE_ROOT_CHARS = 57
+WORST_ROOT_CHARS = 90
+# The deepest names the real stages write, measured on a real area build (run P3-PG re-finish of the
+# target): the appearance's chunks and proxy (`c.`/`p.` + a 32-hex digest + `.bin`), the transient
+# detector's cache, a surface level. Written through the product's own atomic writer, so its staging
+# names are measured too.
+REAL_DEEPEST = [("appearance", "c." + "f" * 32 + ".bin"), ("appearance", "p." + "e" * 32 + ".bin"),
+                ("dense", "work/depth/00206_transient.oneformer.npz"),
+                ("surface", "mesh_l2." + "d" * 20 + ".bin")]
+
+
+def test_no_path_an_area_build_writes_nears_max_path(tmp_path, monkeypatch, fake_depth):  # noqa: F811
+    import tower.storage as ST
+
+    wid, sid, aid = "a" * 32, "b" * 32, AREA1               # the real id lengths (32, 32, 16)
+    monkeypatch.setitem(globals(), "W1", wid)
+    monkeypatch.setitem(globals(), "S1", sid)
+    store, kids = _store(tmp_path)
+    record = _components(store, kids)
+    written = []
+    real_staging = ST.staging_path
+
+    def spy(path):
+        out = real_staging(path)
+        written.append(Path(out))
+        return out
+
+    monkeypatch.setattr(ST, "staging_path", spy)
+
+    def stages(store_, world_id, session_id, **kwargs):
+        root = store_.world_dir(world_id)
+        for stage, name in REAL_DEEPEST:
+            path = root / stage / session_id / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ST.write_bytes_atomic(path, lambda h: h.write(b"x"))
+        for stage in ("surface", "appearance"):
+            ST.write_json_atomic(root / stage / session_id / "manifest.json", {"x": 1})
+        written.extend(p for p in Path(store_.root).rglob("*") if p.is_file())
+        kwargs["record"](STAGE_SURFACE, state=STAGE_STATE_OK, detail=None)
+        return {"surface": {"attempted": True, "state": "ok"}}
+
+    report = AB.build_area(store, wid, sid, aid, record, final_surface_stages=stages)
+    assert report["built"] is True
+    placed = [p for p in Path(store.root).rglob("*") if p.is_file()]
+    pid_pad = max(0, 10 - len(str(os.getpid())))      # a 10-digit pid in a staging name
+    root_len = len(str(store.root))
+
+    def longest(paths):
+        return max(len(str(p)) - root_len + (pid_pad if ".p" in p.name and p.name.endswith(".tmp") else 0)
+                   for p in paths)
+
+    deepest_written = longest(written)
+    deepest_placed = longest(placed)
+    print("DEEPEST written", deepest_written, "placed", deepest_placed)
+    assert any(".tmp" in p.name for p in written), "the staging names were measured"
+    # what is WRITTEN stays well under 200 on the live root, and under 240 on the worst case
+    assert LIVE_ROOT_CHARS + deepest_written < 200, deepest_written
+    assert WORST_ROOT_CHARS + deepest_written < 240, deepest_written
+    # what is left in place (read, never written again by the build) stays under 240 on the worst case
+    assert WORST_ROOT_CHARS + deepest_placed < 240, deepest_placed
+    assert all("areas" in str(p) or "worlds" in str(p) for p in placed if ".ab" not in str(p))
+    assert not (Path(store.root) / AB.AREA_BUILD_DIRNAME).exists(), "the build directory is gone"

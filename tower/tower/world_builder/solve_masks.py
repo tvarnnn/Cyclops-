@@ -35,10 +35,15 @@ LAYOUT, under the solve workspace `<world>/solve/<session>/`:
     transients/index.json               keyframe id -> solver image + SHA-1: what
                                         the surface stage looks its masks up by
     masks/<image name>.png              COLMAP masks: 0 = transient, 255 = use
-    database.masked.db                  the masked feature database the solve maps
-    database.masked.json                how it was made (`path`), and for the
+    database.masked.p<pid>.<8hex>.db    the masked feature database ONE solve maps:
+                                        a name of its own per solve, so two solves
+                                        of one workspace never share a file (review
+                                        V5, M1-5); `solve.database` names it
+    database.masked.p<pid>.<8hex>.json  how it was made (`path`), and for the
                                         re-extracted path, per image, the image
                                         and mask digests it was extracted under
+    (database.masked.db/.json: the one fixed name of solves before that; read
+    as a re-extraction source, never written)
     reverify_pairs.txt                  the filtered path's re-verified pairs
 
 TWO WAYS TO A MASKED DATABASE (`MASKING_*` below). `database.db` is the walk's
@@ -82,7 +87,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -137,6 +144,12 @@ OFF_DETAIL = ("transient masks on the final solve are off (TOWER_WORLD_SOLVE_MAS
 #     target splits the room (154 + 81, 5 of 5 seeds).
 #
 # Either way, no match touching a masked pixel survives into the solve.
+# `SolverMasks.cause`: why the masks are not applied, for a program.
+CAUSE_GPU_OOM = "gpu-oom"
+CAUSE_DETECTOR_FAILED = "detector-failed"
+# Causes a later run can be expected to clear by itself.
+RETRYABLE_CAUSES = (CAUSE_GPU_OOM,)
+
 MASKING_FILTERED = "walk-database-filtered"
 MASKING_REEXTRACTED = "re-extracted"
 REVERIFY_PAIRS_FILENAME = "reverify_pairs.txt"
@@ -158,7 +171,71 @@ def masks_dir(workspace) -> Path:
 
 
 def masked_database_path(workspace) -> Path:
+    """The fixed name solves used before names were per solve. Read, never written."""
     return Path(workspace.root) / MASKED_DATABASE_NAME
+
+
+MASKED_DATABASE_GLOB = "database.masked.p*.db"
+
+
+def new_masked_database_path(workspace) -> Path:
+    """A masked database name no other solve can be using: the pid (so a stray one
+    is attributable, and sweepable once its writer is gone) and a nonce."""
+    return Path(workspace.root) / f"database.masked.p{os.getpid()}.{uuid.uuid4().hex[:8]}.db"
+
+
+def database_record_path(db) -> Path:
+    """`<db>.json` beside `<db>.db`: what that one database was made from."""
+    return Path(db).with_suffix(".json")
+
+
+def _writer_pid(db) -> int | None:
+    parts = Path(db).name.split(".")
+    if len(parts) >= 5 and parts[2].startswith("p") and parts[2][1:].isdigit():
+        return int(parts[2][1:])
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        import psutil  # noqa: PLC0415
+
+        return psutil.pid_exists(int(pid))
+    except Exception:  # noqa: BLE001 -- unknown is alive: never sweep a live writer's file
+        return True
+
+
+def _published_database(workspace) -> str | None:
+    try:
+        meta = read_json_closed(Path(workspace.root) / "solution.json")
+        return ((meta or {}).get("solve") or {}).get("database")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def sweep_masked_databases(workspace, keep=()) -> list:
+    """Remove per-solve masked databases whose writing solve is gone, except the one
+    the published solution names and `keep`. The walk's `database.db` and the
+    pre-per-solve `database.masked.db` are never touched. Returns the names removed.
+
+    The product's own superseded intermediates, as the fixed name was replaced
+    in place before: a masked database is rebuilt from the walk's database and
+    the mask cache whenever it is needed."""
+    root = Path(workspace.root)
+    keep = {Path(k).name for k in keep} | {_published_database(workspace) or ""}
+    removed = []
+    for db in sorted(root.glob(MASKED_DATABASE_GLOB)):
+        pid = _writer_pid(db)
+        if db.name in keep or pid is None or pid == os.getpid() or _pid_alive(pid):
+            continue
+        for side in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm"), database_record_path(db),
+                     db.with_suffix(".reverify.txt")):
+            try:
+                side.unlink(missing_ok=True)
+            except OSError:
+                pass
+        removed.append(db.name)
+    return removed
 
 
 def component_path(cdir: Path, name: str, component: str, sha1: str) -> Path:
@@ -240,6 +317,12 @@ class SolverMasks:
     device: str | None = None
     seconds: dict = field(default_factory=dict)
     gpu_peak_mb: float | None = None
+    # WHY the masks are not applied, as a code a program can act on (`CAUSE_*`),
+    # beside the sentence in `detail`. `gpu-oom` is TRANSIENT: the finisher
+    # treats a gated session whose final solve lost its masks to it as owed a
+    # re-solve (review V5, M1-2); every other cause is the machine's and stays.
+    cause: str | None = None
+    retries: int = 0
 
     @property
     def available(self) -> bool:
@@ -295,6 +378,9 @@ class SolverMasks:
             "seconds": dict(self.seconds),
             "gpu_peak_mb": self.gpu_peak_mb,
             "mask_dir": MASKS_DIRNAME if self.available else None,
+            "cause": self.cause,
+            "retryable": self.cause in RETRYABLE_CAUSES,
+            "retries": self.retries,
         }
 
 
@@ -407,19 +493,34 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
 
             t2 = time.time()
             try:
-                timings = backend.run(items, params, emit)
+                try:
+                    timings = backend.run(items, params, emit)
+                except Exception as first:  # noqa: BLE001 -- only an OOM is retried
+                    if not is_gpu_oom(first):
+                        raise
+                    # ONE retry, on a cleared cache, of what was not yet emitted: an
+                    # OOM is usually another process's allocation or fragmentation,
+                    # not this batch being too large (review V5, M1-2).
+                    out.retries += 1
+                    logger.warning("[Tower][WorldBuilder][solve-masks] the %s detector ran out "
+                                   "of GPU memory; clearing the cache and retrying once", c)
+                    _empty_cuda_cache()
+                    items = [it for it in items if by_index[it[0]][0] not in computed]
+                    timings = backend.run(items, params, emit)
             except T.TransientDetectorUnavailable as exc:
                 T._log_unavailable_once(str(exc))
                 if T._can_fall_back(params, {c: str(exc)}):
                     params = _fall_back(out, params, {c: str(exc)})
                     continue
                 out.state, out.detail = STATE_UNAVAILABLE, str(exc)
+                out.cause = CAUSE_GPU_OOM if is_gpu_oom(exc) else None
                 out.seconds["total"] = round(time.time() - t0, 3)
                 return out
             except Exception as exc:  # noqa: BLE001 -- OOM, device loss: a solve, unmasked
                 logger.exception("[Tower][WorldBuilder][solve-masks] the %s detector failed; "
                                  "this solve runs unmasked", c)
                 out.state = STATE_FAILED
+                out.cause = CAUSE_GPU_OOM if is_gpu_oom(exc) else CAUSE_DETECTOR_FAILED
                 out.detail = f"the {c} detector failed ({type(exc).__name__}: {exc})"
                 out.seconds["total"] = round(time.time() - t0, 3)
                 return out
@@ -476,6 +577,25 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
     return out
 
 
+def is_gpu_oom(exc: BaseException) -> bool:
+    """A CUDA out-of-memory error, from torch or from a library under it."""
+    if type(exc).__name__ in ("OutOfMemoryError", "OutOfMemory"):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text and ("cuda" in text or "gpu" in text or "cublas" in text)
+
+
+def _empty_cuda_cache() -> None:
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 -- the retry happens either way
+        logger.debug("[Tower][WorldBuilder][solve-masks] could not empty the CUDA cache",
+                     exc_info=True)
+
+
 def _fall_back(out: SolverMasks, params: T.TransientParams, missing: dict) -> T.TransientParams:
     """`union` without Grounding DINO / SAM continues as `oneformer`, and says
     so -- the surface stage's own rule (`transients._fall_back`)."""
@@ -513,50 +633,78 @@ def _merge_index(cdir: Path, index: dict, params: T.TransientParams) -> None:
 
 
 def masked_database(workspace, masks: SolverMasks, *, all_names=()) -> tuple[Path, dict]:
-    """The masked feature database, emptied first if any image it already holds
-    was extracted under a different image or mask. Returns (path, info).
+    """This solve's own masked feature database (a new per-solve name), seeded
+    with a copy of the newest earlier RE-EXTRACTED one when every image it
+    holds was extracted under the same image and mask. Returns (path, info).
 
-    Incremental like `database.db`: an image new since the last masked solve is
-    simply extracted; one whose bytes or mask changed invalidates the file,
-    because COLMAP has no way to re-extract one image in place.
+    Incremental as before: an image new since that database is simply
+    extracted; one whose bytes or mask changed makes it unusable, because
+    COLMAP has no way to re-extract one image in place. The earlier database
+    is read, never modified, so a solve running beside this one is not
+    disturbed (review V5, M1-5).
     """
-    db = masked_database_path(workspace)
-    record_path = Path(workspace.root) / MASKED_DATABASE_RECORD
+    import sqlite3  # noqa: PLC0415
+
+    db = new_masked_database_path(workspace)
     current = {name: [v["image_sha1"], v["mask_sha1"]] for name, v in masks.masked.items()}
     for name in all_names:
         current.setdefault(name, [None, None])
     rule = masks.params.rule_id()
-    previous = None
-    try:
-        previous = read_json_closed(record_path) if record_path.is_file() else None
-    except (OSError, ValueError):
-        previous = None
-    stale_reason = None
-    if db.exists():
-        if not isinstance(previous, dict) or previous.get("rule") != rule:
-            stale_reason = "no record of what the masked database was extracted under"
-            if isinstance(previous, dict):
-                stale_reason = f"mask rule changed from {previous.get('rule')!r}"
-        elif previous.get("path", MASKING_REEXTRACTED) != MASKING_REEXTRACTED:
-            stale_reason = f"it was made by {previous.get('path')!r}, not by re-extraction"
-        else:
-            held = previous.get("images") or {}
-            for name, entry in held.items():
-                if name in current and list(entry) != current[name]:
-                    stale_reason = f"{name} was extracted under a different image or mask"
-                    break
-    reused = db.exists() and stale_reason is None
-    if db.exists() and stale_reason is not None:
-        logger.info("[Tower][WorldBuilder][solve-masks] rebuilding %s: %s", db.name, stale_reason)
-        for side in ("", "-wal", "-shm"):
-            Path(str(db) + side).unlink(missing_ok=True)
-    held = dict((previous or {}).get("images") or {}) if reused else {}
+    source, stale_reason, held = None, None, {}
+    records = [q for q in Path(workspace.root).glob("database.masked*.json")]
+    records.sort(key=lambda q: q.stat().st_mtime, reverse=True)
+    for record_path in records:
+        candidate = record_path.with_suffix(".db")
+        try:
+            previous = read_json_closed(record_path)
+        except (OSError, ValueError):
+            continue
+        if not candidate.is_file() or not isinstance(previous, dict):
+            continue
+        if previous.get("path", MASKING_REEXTRACTED) != MASKING_REEXTRACTED:
+            stale_reason = stale_reason or (f"{candidate.name} was made by {previous.get('path')!r}, "
+                                            "not by re-extraction")
+            continue
+        if previous.get("rule") != rule:
+            stale_reason = stale_reason or f"mask rule changed from {previous.get('rule')!r}"
+            continue
+        changed = next((name for name, entry in (previous.get("images") or {}).items()
+                        if name in current and list(entry) != current[name]), None)
+        if changed is not None:
+            stale_reason = stale_reason or f"{changed} was extracted under a different image or mask"
+            continue
+        source, held = candidate, dict(previous.get("images") or {})
+        break
+    if source is not None:
+        src = _connect_read_only(source)
+        out = sqlite3.connect(str(db))
+        try:
+            src.backup(out)
+        finally:
+            src.close()
+            out.close()
+    elif stale_reason:
+        logger.info("[Tower][WorldBuilder][solve-masks] a fresh masked database: %s", stale_reason)
     held.update(current)
     # Written BEFORE extraction: an interrupted extraction leaves images in the
     # database that the record already names, never the reverse.
-    write_json_atomic(record_path, {"schema": SOLVER_MASK_SCHEMA, "path": MASKING_REEXTRACTED,
-                                    "rule": rule, "images": held})
-    return db, {"database": db.name, "reused": bool(reused), "rebuilt_because": stale_reason}
+    write_json_atomic(database_record_path(db), {"schema": SOLVER_MASK_SCHEMA,
+                                                 "path": MASKING_REEXTRACTED,
+                                                 "rule": rule, "images": held})
+    swept = sweep_masked_databases(workspace, keep=[db] + ([source] if source else []))
+    return db, {"database": db.name, "reused": source is not None,
+                "reused_from": source.name if source is not None else None,
+                "rebuilt_because": None if source is not None else stale_reason,
+                "swept": swept}
+
+
+def _connect_read_only(path):
+    """SQLite `mode=ro`: reads the file and its write-ahead log, never writes
+    either, never checkpoints. (`immutable=1` would ignore the log, which holds
+    whatever COLMAP committed last.)"""
+    import sqlite3  # noqa: PLC0415
+
+    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
 def walk_database_usable(path) -> bool:
@@ -568,7 +716,9 @@ def walk_database_usable(path) -> bool:
     if not path.is_file() or path.stat().st_size == 0:
         return False
     try:
-        con = sqlite3.connect(str(path))
+        # READ-ONLY (review V5, M1-4): this is the walk's database, which the solve
+        # never writes; a read-write connection could checkpoint its WAL.
+        con = _connect_read_only(path)
         try:
             images = con.execute("select count(*) from images").fetchone()[0]
             con.execute("select count(*) from keypoints").fetchone()
@@ -645,15 +795,12 @@ def filter_walk_database(workspace, masks: SolverMasks) -> tuple[Path, Path | No
 
     t0 = time.time()
     walk = Path(workspace.database_path)
-    db = masked_database_path(workspace)
-    record_path = Path(workspace.root) / MASKED_DATABASE_RECORD
-    for side in ("", "-wal", "-shm"):
-        Path(str(db) + side).unlink(missing_ok=True)
-    record_path.unlink(missing_ok=True)
+    db = new_masked_database_path(workspace)
+    record_path = database_record_path(db)
     info = {"source": walk.name, "images_filtered": 0, "images_unfiltered": 0,
             "keypoints_total": 0, "keypoints_in_mask": 0, "matches_dropped": 0,
             "pairs_changed": 0, "pairs_emptied": 0, "geometries_dropped": 0}
-    src = sqlite3.connect(str(walk))
+    src = _connect_read_only(walk)
     out = sqlite3.connect(str(db))
     try:
         src.backup(out)
@@ -708,11 +855,12 @@ def filter_walk_database(workspace, masks: SolverMasks) -> tuple[Path, Path | No
     listed = [(a, b) for a, b in changed.values() if a and b]
     info["pairs_listed"] = len(listed)
     if listed:
-        pairs_path = Path(workspace.root) / REVERIFY_PAIRS_FILENAME
+        pairs_path = db.with_suffix(".reverify.txt")
         data = "".join(f"{a} {b}\n" for a, b in listed).encode("utf-8")
         write_bytes_atomic(pairs_path, lambda handle: handle.write(data))
     write_json_atomic(record_path, {"schema": SOLVER_MASK_SCHEMA, "path": MASKING_FILTERED,
                                     "rule": masks.params.rule_id(), "source": walk.name})
+    info["swept"] = sweep_masked_databases(workspace, keep=[db])
     info["seconds"] = round(time.time() - t0, 3)
     logger.info("[Tower][WorldBuilder][solve-masks] walk database filtered: %d of %d keypoints "
                 "on masks, %d matches in %d pairs removed", info["keypoints_in_mask"],

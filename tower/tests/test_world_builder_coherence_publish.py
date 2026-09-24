@@ -685,3 +685,134 @@ def test_a_real_gate_that_cannot_read_its_database_publishes_todays_solve(sessio
     assert summary["gate"]["state"] == CP.GATE_STATE_FAILED
     assert not (session.workspace.root / CP.COMPONENTS_FILENAME).exists()
     assert GS.load_solution(session.store, session.world_id, session.session_id).gate["state"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# merge honours the gate's labels: a label that splits a tracker segment keeps every keyframe it placed
+
+
+def _split_world(gate):
+    """Two tracker segments: 0 = keyframes 0..7, 1 = keyframes 8..11. The gate put keyframes 6 and 7 (the
+    tail of segment 0) in component 1, with segment 1. Each keyframe first-observes 3 points of its own
+    component."""
+    from tower.world_builder.global_solve import Solution
+    from tower.world_builder.records import Keyframe
+
+    kfs = [Keyframe(keyframe_id=f"{SID}:{i:08d}", session_id=SID, source_seq=i, received_at=float(i),
+                    image_relpath=f"images/{i:08d}.jpg", width=320, height=240, byte_count=1,
+                    segment_index=0 if i < 8 else 1) for i in range(12)]
+    comp = [0] * 6 + [1] * 6
+    poses = {k.keyframe_id: {"component": comp[i], "rotation": _rz(2.0 * i).ravel().tolist(),
+                             "translation": [0.1 * i, 0.0, 0.0], "observations": 50}
+             for i, k in enumerate(kfs)}
+    first = np.repeat(np.arange(12), 3).astype(np.int32)
+    return kfs, Solution(
+        solver="glomap", solved_at=1.0, input_digest="d", keyframe_ids=[k.keyframe_id for k in kfs],
+        poses=poses, components=[], xyz=np.random.default_rng(0).normal(size=(36, 3)).astype(np.float32),
+        rgb=np.zeros((36, 3), np.uint8), component=np.asarray([comp[i] for i in first], np.int32),
+        first_keyframe=first, track_length=np.full(36, 2, np.int32), error=np.zeros(36, np.float32),
+        observations=np.zeros((0, 3), np.int32), gate=gate)
+
+
+def test_merge_splits_a_tracker_segment_the_gate_cut_and_keeps_every_placed_keyframe():
+    from tower.world_builder import global_solve as GS
+
+    kfs, sol = _split_world({"state": CP.GATE_STATE_APPLIED})
+    merged = GS.merge(kfs, [], [], None, sol, input_digest="d")
+    by_kid = {r["keyframe_id"]: r for r in merged.pose_rows}
+    assert len(by_kid) == 12 and all(r["rotation"] is not None for r in by_kid.values()), \
+        "every keyframe the gate placed is published"
+    assert {by_kid[f"{SID}:{i:08d}"]["segment_index"] for i in range(6)} == {0}
+    assert {by_kid[f"{SID}:{i:08d}"]["segment_index"] for i in (6, 7)} == {2}   # a new index past 0 and 1
+    assert merged.segments[2]["split_from"] == 0 and merged.segments[2]["component"] == 1
+    placement = {p.segment_index: p for p in merged.placements}
+    assert placement[2].state == "registered" and placement[2].reference_segment == 1
+    assert placement[2].evidence["split_from"] == 0
+    assert by_kid[f"{SID}:{6:08d}"]["status"] == "anchor"
+    # the split segment's points are the ones its keyframes first observed, in its own frame
+    assert sum(1 for r in merged.point_rows if r["segment_index"] == 2) == 6
+    comps = {c["component"]: c for c in merged.summary["components"]}
+    assert comps[1]["segments"] == [1, 2] and comps[1]["keyframes"] == 6 and comps[0]["keyframes"] == 6
+
+
+@pytest.mark.parametrize("gate", [None, {"state": CP.GATE_STATE_FAILED}])
+def test_an_ungated_solution_merges_exactly_as_before(gate):
+    from tower.world_builder import global_solve as GS
+
+    kfs, sol = _split_world(gate)
+    merged = GS.merge(kfs, [], [], None, sol, input_digest="d")
+    by_kid = {r["keyframe_id"]: r for r in merged.pose_rows}
+    assert {r["segment_index"] for r in merged.pose_rows} == {0, 1}
+    assert by_kid[f"{SID}:{6:08d}"]["rotation"] is None and by_kid[f"{SID}:{6:08d}"]["degeneracy"] == "unregistered"
+    assert set(merged.segments) == {0, 1} and not any("split_from" in v for v in merged.segments.values())
+
+
+# ---------------------------------------------------------------------------
+# review V5 M1-2: a gated solve whose masks were lost to a GPU out-of-memory is owed a re-solve by the
+# finisher -- and a session without a components record is never owed one
+
+
+def _gated_session(tmp_path, *, transients, gate=None, record=True):
+    from tests.test_world_builder_finish_pending import _stage, _world
+    from tower.world_builder.records import STAGE_STATE_OK, STAGE_SURFACE
+
+    store = _world(tmp_path, stages={STAGE_SURFACE: _stage(STAGE_STATE_OK),
+                                     "appearance": _stage(STAGE_STATE_OK)})
+    solve = store.world_dir("w1") / "solve" / "s1"
+    solve.mkdir(parents=True, exist_ok=True)
+    gate = gate if gate is not None else {"state": CP.GATE_STATE_APPLIED, "masks_applied": False}
+    (solve / "solution.json").write_text(json.dumps({"transients": transients, "gate": gate}))
+    if record:
+        (solve / CP.COMPONENTS_FILENAME).write_text(json.dumps({"components": []}))
+    return store
+
+
+OOM = {"state": "unavailable", "cause": "gpu-oom", "retryable": True}
+
+
+def test_a_gated_solve_that_lost_its_masks_to_a_gpu_oom_is_owed_a_re_solve(tmp_path):
+    from scripts import world_finish_pending as wfp
+
+    store = _gated_session(tmp_path, transients=OOM)
+    v = wfp.assess(store, "w1", "s1")
+    assert v.owed and v.code == "owed-masks-retry" and v.stage == wfp.MASKS_RETRY_STAGE
+
+
+@pytest.mark.parametrize("case", ["no-record", "not-retryable", "masks-applied", "gate-failed"])
+def test_nothing_else_is_owed_a_re_solve(tmp_path, case):
+    from scripts import world_finish_pending as wfp
+
+    kw = {"transients": OOM}
+    if case == "no-record":
+        kw["record"] = False                       # never computes components for a world without them
+    elif case == "not-retryable":
+        kw["transients"] = {"state": "unavailable", "cause": "detector-failed", "retryable": False}
+    elif case == "masks-applied":
+        kw["transients"] = {"state": "applied"}
+        kw["gate"] = {"state": CP.GATE_STATE_APPLIED, "masks_applied": True}
+    elif case == "gate-failed":
+        kw["gate"] = {"state": CP.GATE_STATE_FAILED}
+    store = _gated_session(tmp_path, **kw)
+    v = wfp.assess(store, "w1", "s1")
+    assert v.code != "owed-masks-retry" and not v.owed
+
+
+def test_the_re_solve_is_the_refinish_under_its_own_attempt_bound(tmp_path):
+    from scripts import world_finish_pending as wfp
+    from scripts.world_build_session import StopRequest
+
+    store = _gated_session(tmp_path, transients=OOM)
+    calls = []
+
+    def fake_refinish(store_, root, world_id, session_id, **kw):
+        calls.append((world_id, session_id, kw["seed"]))
+        return {"done": True}
+
+    v = wfp.assess(store, "w1", "s1")
+    for _ in range(3):
+        out = wfp.finish_masks_retry(store, v, appearance=False, prune_depth_work=False,
+                                     stop_request=StopRequest(), refinish=fake_refinish)
+        assert out["finished"] is True
+    assert calls == [("w1", "s1", 0)] * 3
+    v = wfp.assess(store, "w1", "s1")
+    assert not v.owed and v.code == "attempt-bound" and not v.exhausted

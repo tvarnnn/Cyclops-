@@ -636,6 +636,14 @@ def assess(
             "needs a global solve and there is none"
         )
 
+    # A GATED SOLVE THAT LOST ITS MASKS TO A TRANSIENT CAUSE (review V5, M1-2). Asked
+    # before the photographic stages because the answer is a whole re-solve, which
+    # rebuilds them too. Never of a session without a components record: this tool
+    # never computes components for a world that has none.
+    retry = _assess_masks_retry(store, world_id, session_id, max_attempts=max_attempts)
+    if retry is not None:
+        return retry
+
     # TWO SIGNALS, IN PRECEDENCE ORDER, AND NEITHER CAN DISCOVER A BACKLOG.
     #
     # THE RECORD FIRST, wherever there is one. `Session.stages` is written
@@ -851,6 +859,132 @@ def _assess_areas(store: WorldStore, world_id: str, session_id: str, session, *,
                    f"{len(owed)} area(s) of this session are unsettled and nothing is "
                    "building them", code="owed-area", stage=AREAS_STAGE,
                    attempts=attempts)
+
+
+# -- a re-solve owed to lost masks (review V5, M1-2) ------------------------
+#
+# The evidence gate treats a solve without its hand/arm/held-phone masks as unsafe and
+# attaches nothing (`masks-unavailable`). When the masks were lost to something that
+# clears by itself -- the GPU was out of memory (`solve_masks.RETRYABLE_CAUSES`) --
+# that fail-safe must not be permanent: the session is owed ONE thing, the product
+# re-solve `scripts/world_refinish.py` runs (masks, the seeded solve, the gate, the
+# room and its areas), under this tool's attempt bound. Only for a session that HAS a
+# components record, i.e. whose final solve ran the gate: this tool still never
+# computes components for a world that has none.
+
+MASKS_RETRY_STAGE = "masks-retry"
+
+
+def masks_retry_ledger_key(session_id: str) -> str:
+    return f"{session_id}#{MASKS_RETRY_STAGE}"
+
+
+def _masks_retry_cause(store: WorldStore, world_id: str, session_id: str) -> str | None:
+    """The transient cause the published gated solve lost its masks to, or None."""
+    from tower.world_builder.components import components_path  # noqa: PLC0415
+    from tower.world_builder.solve_masks import RETRYABLE_CAUSES  # noqa: PLC0415
+
+    if not components_path(store, world_id, session_id).exists():
+        return None                                    # no record: never a re-solve
+    try:
+        meta = read_json_closed(store.world_dir(world_id) / "solve" / session_id / "solution.json")
+    except (OSError, ValueError):
+        return None
+    transients = (meta or {}).get("transients") or {}
+    gate = (meta or {}).get("gate") or {}
+    if gate.get("state") != "applied" or gate.get("masks_applied") is not False:
+        return None
+    if transients.get("state") == "applied" or not transients.get("retryable"):
+        return None
+    cause = transients.get("cause")
+    return cause if cause in RETRYABLE_CAUSES else None
+
+
+def _assess_masks_retry(store: WorldStore, world_id: str, session_id: str, *,
+                        max_attempts: int) -> "Verdict | None":
+    try:
+        cause = _masks_retry_cause(store, world_id, session_id)
+    except Exception as exc:  # noqa: BLE001 -- one session, not the survey
+        logger.warning("[Tower][WorldBuilder] could not read the masks record of %s/%s: %s",
+                       world_id, session_id, exc)
+        return None
+    if cause is None:
+        return None
+    holder = store.lock_holder(world_id)
+    if holder is not None and holder["pid"] == os.getpid():
+        holder = None
+    if holder is not None and (holder["alive"] or holder["unreadable"]):
+        return Verdict(world_id, session_id, False,
+                       "this world's writer lock is held by another process",
+                       code="locked", stage=MASKS_RETRY_STAGE)
+    attempts = read_attempts(store, world_id, masks_retry_ledger_key(session_id)) or 0
+    if attempts >= max_attempts:
+        # Not `exhausted`: there is nothing to retire -- the published solve and its
+        # fail-safe components stand, and say why.
+        return Verdict(world_id, session_id, False,
+                       f"this tool has already re-solved this session {attempts} times "
+                       f"(the bound is {max_attempts}); its masks were lost to {cause} "
+                       "every time", code="attempt-bound", stage=MASKS_RETRY_STAGE,
+                       attempts=attempts)
+    return Verdict(world_id, session_id, True,
+                   f"the final solve ran without its masks ({cause}, transient), so the "
+                   "evidence gate attached nothing; it is owed a re-solve",
+                   code="owed-masks-retry", stage=MASKS_RETRY_STAGE, attempts=attempts)
+
+
+def finish_masks_retry(store: WorldStore, verdict: Verdict, *, appearance: bool,
+                       prune_depth_work: bool, stop_request,
+                       max_forgiven: int = DEFAULT_MAX_FORGIVEN, refinish=None) -> dict:
+    """The owed re-solve: `world_refinish.refinish` (which takes the lock itself, sets
+    the previous result aside and deletes nothing), counted on its own ledger key."""
+    key = masks_retry_ledger_key(verdict.session_id)
+    report: dict = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+                    "stage": MASKS_RETRY_STAGE}
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+        return report
+    try:
+        report["attempts"] = record_attempt(store, verdict.world_id, key,
+                                            detail="re-solving: the masks were lost")
+    except Exception as exc:  # noqa: BLE001
+        report.update({"finished": False,
+                       "reason": f"the attempt could not be counted, so it was not started: "
+                                 f"{type(exc).__name__}: {exc}"})
+        return report
+    finally:
+        store.release_writer_lock(verdict.world_id)
+    disarm = _forgive_on_stop(
+        stop_request,
+        lambda source: forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({source})",
+                                       max_forgiven=max_forgiven))
+    try:
+        if refinish is None:
+            from scripts.world_refinish import PRODUCT_SOLVE_ENV  # noqa: PLC0415
+            from scripts.world_refinish import refinish  # noqa: PLC0415
+
+            # The room's and areas' stages run in THIS process, with the product
+            # settings, like the re-finish command's own.
+            os.environ.update(PRODUCT_SOLVE_ENV)
+        from tower.config import world_solve_seed_setting  # noqa: PLC0415
+
+        seed = world_solve_seed_setting()
+        prewarm_world_builder()
+        report["refinish"] = refinish(
+            store, Path(store.root), verdict.world_id, verdict.session_id,
+            seed=0 if seed is None else seed, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
+            stop_source=lambda: stop_request.source)
+        report["finished"] = bool((report["refinish"] or {}).get("done"))
+    except Exception as exc:  # noqa: BLE001 -- reported; what was set aside stays aside
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+    finally:
+        forgiven = disarm()
+        if not forgiven and stop_request.asked:
+            forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({stop_request.source})",
+                            max_forgiven=max_forgiven)
+    return report
 
 
 def build_session_areas(store: WorldStore, world_id: str, session_id: str, *,
@@ -1124,6 +1258,10 @@ def finish(
         return finish_areas(store, verdict, appearance=appearance,
                             prune_depth_work=prune_depth_work,
                             stop_request=stop_request, max_forgiven=max_forgiven)
+    if verdict.stage == MASKS_RETRY_STAGE:
+        return finish_masks_retry(store, verdict, appearance=appearance,
+                                  prune_depth_work=prune_depth_work,
+                                  stop_request=stop_request, max_forgiven=max_forgiven)
     report: dict = {
         "world_id": verdict.world_id,
         "session_id": verdict.session_id,

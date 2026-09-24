@@ -179,6 +179,13 @@ def session(tmp_path):
                                  workspace=global_solve.workspace_for(store, world_id, session_id))
 
 
+def _is_masked_db(name) -> bool:
+    """This solve's own masked database: `database.masked.p<pid>.<8hex>.db` (review V5, M1-5)."""
+    import re
+
+    return bool(re.fullmatch(r"database\.masked\.p\d+\.[0-9a-f]{8}\.db", str(name)))
+
+
 def _solve(s, **kw):
     return global_solve.solve(s.store, s.world_id, s.session_id, **kw)
 
@@ -386,9 +393,10 @@ def test_a_masked_solve_masks_every_solver_image_before_extraction(session, colm
 
     # The reader is pointed at the masks and extraction writes the MASKED database.
     assert colmap.sets("ImageReaderOptions")["mask_path"] == str(ws.root / SM.MASKS_DIRNAME)
-    assert [c[2] for c in colmap.calls("extract_features")] == [SM.MASKED_DATABASE_NAME]
-    assert colmap.calls("match_sequential")[0][2] == SM.MASKED_DATABASE_NAME
-    assert colmap.calls("global_mapping")[0][2] == SM.MASKED_DATABASE_NAME
+    (extracted,) = [c[2] for c in colmap.calls("extract_features")]
+    assert _is_masked_db(extracted)
+    assert colmap.calls("match_sequential")[0][2] == extracted
+    assert colmap.calls("global_mapping")[0][2] == extracted
     assert not ws.database_path.exists(), "the background solves' database is not touched"
 
     # Every image's COLMAP mask: 0 (never extracted) on the hand, 255 away from it.
@@ -405,7 +413,7 @@ def test_a_masked_solve_masks_every_solver_image_before_extraction(session, colm
     assert record["images"] == record["images_masked"] == N
     assert record["images_unmasked"] == 0
     assert record["computed"] == N and record["cache_hits"] == 0
-    assert record["database"] == SM.MASKED_DATABASE_NAME
+    assert _is_masked_db(record["database"])
     assert summary["transients"] == record
     assert "masks_s" in _solution_json(session)["timing"]
 
@@ -450,7 +458,7 @@ def test_the_final_solve_matches_the_relocalizers_revisit_links(session, colmap,
     assert len(calls) == 1
     _call, _name, database, kwargs, listed = calls[0]
     assert listed == "00000000.jpg 00000003.jpg\n", "only pairs of images this solve has"
-    assert database == (SM.MASKED_DATABASE_NAME if masked else "database.db")
+    assert (_is_masked_db(database) if masked else database == "database.db")
     assert ("verification_options" in kwargs) is (seed is not None)
     order = [e[1] for e in colmap.log if e[0] == "call"]
     assert order.index("match_sequential") < order.index("match_image_pairs") < \
@@ -581,7 +589,8 @@ def test_with_a_walk_database_the_solve_maps_a_filtered_copy_of_it(walked, colma
     assert ws.database_path.read_bytes() == before
 
     # The copy loses every match and inlier on a masked keypoint.
-    masked = SM.masked_database_path(ws)
+    masked = ws.root / summary["transients"]["database"]
+    assert _is_masked_db(masked.name)
     matches = _rows(masked, "matches")
     geometries = _rows(masked, "two_view_geometries")
     assert matches[1 * _B + 2] == [[2, 2], [3, 3]]
@@ -591,7 +600,7 @@ def test_with_a_walk_database_the_solve_maps_a_filtered_copy_of_it(walked, colma
     # The changed pairs are re-verified, under the solve's own two-view options,
     # and the solve maps the copy.
     (_c, _n, database, listed, options), = colmap.calls("verify_matches")
-    assert database == SM.MASKED_DATABASE_NAME
+    assert database == masked.name
     assert sorted(listed.splitlines()) == ["00000000.jpg 00000001.jpg", "00000001.jpg 00000002.jpg"]
     if seed is None:
         assert options._values == {} and options._children == {}
@@ -599,12 +608,13 @@ def test_with_a_walk_database_the_solve_maps_a_filtered_copy_of_it(walked, colma
         assert options.ransac._values == {"random_seed": seed}
     order = [e[1] for e in colmap.log if e[0] == "call"]
     assert order.index("match_sequential") < order.index("verify_matches") < order.index("global_mapping")
-    assert colmap.calls("global_mapping")[0][2] == SM.MASKED_DATABASE_NAME
+    assert colmap.calls("global_mapping")[0][2] == masked.name
 
     record = summary["transients"]
     assert record["state"] == SM.RECORD_APPLIED
     assert record["masking"] == SM.MASKING_FILTERED == summary["solve"]["masking"]
-    assert record["database"] == SM.MASKED_DATABASE_NAME
+    assert record["database"] == database
+    assert record["walk_database"] == "filtered" == summary["solve"]["walk_database"]
     f = record["filter"]
     assert (f["keypoints_total"], f["keypoints_in_mask"]) == (4 * N, 2 * N)
     assert f["matches_dropped"] == 2 and f["pairs_changed"] == 2 and f["pairs_reverified"] == 2
@@ -616,6 +626,7 @@ def test_without_a_walk_database_the_masks_go_to_extraction(session, colmap):
     summary = _masked(session, StubDetector())
     assert summary["solve"]["masking"] == SM.MASKING_REEXTRACTED
     assert summary["transients"]["masking"] == SM.MASKING_REEXTRACTED
+    assert summary["transients"]["walk_database"] == "absent" == summary["solve"]["walk_database"]
     assert colmap.calls("verify_matches") == []
 
 
@@ -623,7 +634,9 @@ def test_an_unreadable_walk_database_is_not_filtered(walked, colmap):
     walked.workspace.database_path.write_bytes(b"not a database at all, not even close")
     summary = _masked(walked, StubDetector())
     assert summary["solve"]["masking"] == SM.MASKING_REEXTRACTED
-    assert [c[2] for c in colmap.calls("extract_features")] == [SM.MASKED_DATABASE_NAME]
+    assert summary["solve"]["walk_database"] == "unusable"
+    (extracted,) = [c[2] for c in colmap.calls("extract_features")]
+    assert _is_masked_db(extracted)
 
 
 def test_a_filter_that_fails_falls_back_to_re_extraction_and_says_so(walked, colmap, monkeypatch):
@@ -633,9 +646,11 @@ def test_a_filter_that_fails_falls_back_to_re_extraction_and_says_so(walked, col
     monkeypatch.setattr(SM, "filter_walk_database", broken)
     summary = _masked(walked, StubDetector())
     assert summary["solved"] is True
-    assert [c[2] for c in colmap.calls("extract_features")] == ["database.db", SM.MASKED_DATABASE_NAME]
+    walk_db, extracted = [c[2] for c in colmap.calls("extract_features")]
+    assert walk_db == "database.db" and _is_masked_db(extracted)
     assert colmap.sets("ImageReaderOptions")["mask_path"] == str(walked.workspace.root / SM.MASKS_DIRNAME)
-    assert colmap.calls("global_mapping")[0][2] == SM.MASKED_DATABASE_NAME
+    assert colmap.calls("global_mapping")[0][2] == extracted
+    assert summary["solve"]["walk_database"] == "filter-failed"
     record = summary["transients"]
     assert record["masking"] == SM.MASKING_REEXTRACTED == summary["solve"]["masking"]
     assert "disk full" in record["filter_failed"]
@@ -648,7 +663,8 @@ def test_with_the_settings_off_a_walk_database_is_used_exactly_as_today(walked, 
     assert colmap.log == _todays_trace(walked)
     assert walked.workspace.database_path.read_bytes() == before
     assert not SM.masked_database_path(walked.workspace).exists()
-    assert summary["solve"]["masking"] is None
+    assert list(walked.workspace.root.glob("database.masked*")) == []
+    assert summary["solve"]["masking"] is None and summary["solve"]["walk_database"] is None
 
 
 def test_a_filtered_database_is_never_reused_as_a_re_extracted_one(walked, colmap):
@@ -950,3 +966,105 @@ def test_the_solver_mask_is_not_lent_once_its_image_changed(tmp_path):
     assert fresh(world.kids[1], T.COMPONENT_GDSAM, params, (H, W)) is None
     # And a world whose solve masked nothing has no donor at all: today.
     assert SM.solve_mask_donor(world.store, WORLD, "another-session") is None
+
+
+# ---------------------------------------------------------------------------
+# review V5: M1-2 (GPU out of memory), M1-4 (read-only walk DB), M1-5 (a database
+# per solve), M1-6 (why a solve re-extracted -- asserted in the path tests above)
+# ---------------------------------------------------------------------------
+
+
+class _OOMOnce(StubDetector):
+    """The detector's first run raises a CUDA OOM after emitting one image; the retry succeeds --
+    or, with `always`, fails again."""
+
+    def __init__(self, always=False):
+        super().__init__()
+        self.always, self.raised = always, 0
+
+    def __call__(self, component):
+        backend = super().__call__(component)
+        stub, run = self, backend.run
+
+        def run_with_oom(items, params, emit, should_stop=None):
+            if stub.raised == 0 or stub.always:
+                stub.raised += 1
+                if items:
+                    i, rgb, _u = items[0]
+                    emit(i, np.zeros(rgb.shape[:2], bool), np.zeros(rgb.shape[:2], bool), 0.001)
+                raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+            return run(items, params, emit, should_stop)
+
+        backend.run = run_with_oom
+        return backend
+
+
+def test_a_gpu_oom_is_retried_once_on_a_cleared_cache(session, colmap, monkeypatch):
+    cleared = []
+    monkeypatch.setattr(SM, "_empty_cuda_cache", lambda: cleared.append(1))
+    summary = _masked(session, _OOMOnce())
+    record = summary["transients"]
+    assert record["state"] == SM.RECORD_APPLIED and record["retries"] >= 1 and cleared
+    assert record["cause"] is None and record["retryable"] is False
+
+
+def test_a_gpu_oom_that_persists_is_recorded_as_retryable(session, colmap, monkeypatch):
+    monkeypatch.setattr(SM, "_empty_cuda_cache", lambda: None)
+    summary = _masked(session, _OOMOnce(always=True))
+    record = summary["transients"]
+    assert record["state"] == SM.RECORD_UNAVAILABLE
+    assert record["cause"] == SM.CAUSE_GPU_OOM and record["retryable"] is True
+    assert record["retries"] == 1
+    # any other detector failure is not retryable
+    summary = _masked(session, StubDetector(run_error=RuntimeError("device lost")))
+    assert summary["transients"]["cause"] == SM.CAUSE_DETECTOR_FAILED
+    assert summary["transients"]["retryable"] is False
+
+
+def test_the_walk_database_is_opened_read_only(walked, monkeypatch):
+    """No connection to the walk's database may write: every one is `mode=ro`."""
+    import sqlite3
+
+    opened = []
+    real = sqlite3.connect
+
+    def spy(target, *a, **kw):
+        opened.append((str(target), kw.get("uri", False)))
+        return real(target, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    walk = walked.workspace.database_path
+    assert SM.walk_database_usable(walk)
+    masks = SM.SolverMasks(state=SM.STATE_OK, params=SM.solver_params(), requested_rule="r")
+    SM.filter_walk_database(walked.workspace, masks)
+    to_walk = [(t, uri) for t, uri in opened if Path(t.split("?")[0].replace("file:///", "")).name
+               == walk.name or t == str(walk)]
+    assert to_walk and all(uri and t.endswith("?mode=ro") for t, uri in to_walk), opened
+
+
+def test_two_solves_never_share_a_masked_database(walked, colmap):
+    a = _masked(walked, StubDetector())["transients"]["database"]
+    b = _masked(walked, StubDetector())["transients"]["database"]
+    assert a != b and _is_masked_db(a) and _is_masked_db(b)
+    # the second solve kept the first's database: its writer (this process) is alive, and the
+    # published solution named it until the second published
+    assert (walked.workspace.root / b).exists()
+
+
+def test_a_dead_solves_masked_database_is_swept_the_published_one_kept(walked, colmap):
+    import subprocess
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    root = walked.workspace.root
+    stale = root / f"database.masked.p{dead.pid}.0123abcd.db"
+    stale.write_bytes(b"x")
+    (root / f"database.masked.p{dead.pid}.0123abcd.json").write_text("{}")
+    published = root / f"database.masked.p{dead.pid}.feedbeef.db"
+    published.write_bytes(b"y")
+    meta = json.loads(walked.workspace.solution_path.read_text(encoding="utf-8"))
+    meta.setdefault("solve", {})["database"] = published.name
+    walked.workspace.solution_path.write_text(json.dumps(meta), encoding="utf-8")
+    removed = SM.sweep_masked_databases(walked.workspace)
+    assert removed == [stale.name]
+    assert not stale.exists() and published.exists() and walked.workspace.database_path.exists()
