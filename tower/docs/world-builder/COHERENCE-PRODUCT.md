@@ -4,15 +4,17 @@ This is the operator's guide to the coherence product: the masked, seeded, gated
 solve with its consensus, components and areas, and the look-back relocalizer. The
 contract is
 [`docs/contracts/WORLD-BUILDER-COMPONENTS.md`](../../../docs/contracts/WORLD-BUILDER-COMPONENTS.md)
-(v7). This file links to it and does not restate it.
+(v8). This file links to it and does not restate it.
 
-- **Code described:** the product lane `world-builder/coherence-product-v1` at `e5d7ccb`
-  (2026-09-24).
+- **Code described:** the product lane `world-builder/coherence-product-v1` at `e5f7151`,
+  the P3.6 candidate (2026-09-24), and contract v8 (`60030cf`, docs only).
 - **Status:** every behaviour here is **off by default**, and off is the Tower as it
   was before (`tower/tower/config.py`).
-  - Review V8 found it safe to keep merged and not ready to switch on
-    (`RUN\baseline\review\V8\V8-REVIEW.md`). Its fixes are in `e5d7ccb`. The fresh review
-    V9 and the acceptance run have not reported yet (`RUN\status.md`).
+  - Review V9 found the P3.5 code safe to keep merged and not ready to switch on
+    (`RUN\baseline\review\V9\rv9-report.txt`).
+  - P3.6 (`0f9cc83`, `30c28c0`, `99420c4`, `c952be4`, `e5f7151`) fixes its findings.
+  - The acceptance run, the full suite and review V10 are running at `e5f7151`, and have
+    not reported yet (`RUN\status.md`).
 - **Evidence:** `RUN` is `C:\Users\<you>\Projects\Glasses-scratch\wb-coherence-run-2026-09-23`.
   A path that starts with `RUN\` is there, not in this repository.
   - Some figures were measured on earlier code. Where that matters, the text names the
@@ -32,12 +34,12 @@ Set them in `tower\.env` (see `tower/.env.example`) or in the Tower's environmen
 
 | setting | default | what it does | what it needs | cost measured in the run |
 | --- | --- | --- | --- | --- |
-| `TOWER_WORLD_SOLVE_MASKS` | `false` | Masks the wearer's hands, arms and held phone in every image of the session's **final** solve. With a walk database, the solve maps from a filtered copy of it (`walk-database-filtered`). Without one, it re-extracts features under the masks (`re-extracted`). The masks are cached per image (§6). The background solves during a walk are unchanged | `TOWER_WORLD_SOLVE` (on by default) and pycolmap. The GPU detectors (Grounding DINO + SAM 2.1, and OneFormer). If they cannot run, the solve runs **unmasked**, `transients.state` in `solution.json` says so, and a gated solve writes a notice (contract §3.1) | 132–451 s a world for 218–795 keyframes, or 0.54–0.60 s a keyframe, with an empty cache (`RUN\experiments\P3-VAL\TABLE.md`, code `e2e7582`). GPU peak 2,678 MB on 383 images (`RUN\experiments\P3-PM\out-masks2.log`). A later solve of the same images computes none: 690 of 690 from the cache (`RUN\experiments\P3-H2\real\B.solution.json`) |
+| `TOWER_WORLD_SOLVE_MASKS` | `false` | Masks the wearer's hands, arms and held phone in every image of the session's **final** solve. With a walk database, the solve maps from a filtered copy of it (`walk-database-filtered`). Without one, it re-extracts features under the masks (`re-extracted`). The masks are cached per image (§6). An image that cannot be masked is left out of the solve (§4, "fail-safes"). The background solves during a walk are unchanged | `TOWER_WORLD_SOLVE` (on by default) and pycolmap. The GPU detectors (Grounding DINO + SAM 2.1, and OneFormer). If they cannot run, the solve runs **unmasked**, `transients.state` in `solution.json` says so, and a gated solve writes a notice (contract §3.1) | 132–451 s a world for 218–795 keyframes, or 0.54–0.60 s a keyframe, with an empty cache (`RUN\experiments\P3-VAL\TABLE.md`, code `e2e7582`). GPU peak 2,678 MB on 383 images (`RUN\experiments\P3-PM\out-masks2.log`). A later solve of the same images computes none: 690 of 690 came from the cache (`RUN\experiments\P3-H2\real\B.solution.json`) |
 | `TOWER_WORLD_SOLVE_SEED` | unset | An integer ≥ 0 seeds every random generator of the final solve's mapper, and the mapper then runs on **one** thread. A seeded final solve also **freezes its matching** (§6). Unset, blank, `off`, or anything that is not a non-negative integer, means today's multi-threaded, unseeded solve. Recorded as `solve.seed` and `solve.threads` | `TOWER_WORLD_SOLVE`. The consensus needs it | Mapping is 3.3× slower: 111 s against 33 s at 383 keyframes (`RUN\research\D1-sfm-slam-posegraph.md` §0, §2.4). The seeded mapping took 23–181 s a world (`P3-VAL\TABLE.md`) |
-| `TOWER_WORLD_SOLVE_GATE` | `false` | Runs on the final solve only. It computes depth before publishing (MoGe-2 ViT-L) and a metric scale per camera, then applies the evidence gate. It relabels the room and the unplaced pieces, and writes `solve\<session>\components.json`. The depth predictions are cached (§6). Off publishes the solve as the solver returned it | **Masks:** if `transients.state` is not `applied`, the gate attaches nothing outside the room's anchor block (reason `masks-unavailable`). **Metric scale:** if fewer than half the supported cameras have a ratio, it attaches nothing (reason `scale-unavailable`). If depth failed, the finisher owes a re-gate in place. An exception in the gate publishes the solve **ungated**, with `components: null` (`coherence_publish.py`). Every fail-safe writes `finalization.notice` (contract §3.1) | 40–164 s a world, of which depth is 39–160 s over 203–712 frames (`P3-VAL\TABLE.md`). With the predictions cached, the gate took 60 s against 190 s on 678 frames (`P3-H2\real\B.solution.json`, `C.solution.json`). The room's final surface reuses the depth (`coherence_publish.py`, step 6). Disk: the prediction cache holds 300 MB for 678 frames (`RUN\experiments\P3-H2\PROGRESS.md`) |
-| `TOWER_WORLD_SOLVE_CONSENSUS` | `1` | With N ≥ 2, a gated, seeded final solve maps N draws, with mapper seeds s … s+N−1, on its one frozen database, with the same masks and depth predictions. It gates each draw, and each keyframe votes: attached to the room or not. It publishes the draw that agrees most with the strict majority; ties go to the lowest seed. If fewer than a strict majority of draws attached a group of that draw's room, the group is withheld as its own piece, reason `seed-unstable`. The room's anchor group is never withheld. Unset, blank, garbage, 0 or negative means 1: a single draw, exactly as before (`config.world_solve_consensus_setting`) | `TOWER_WORLD_SOLVE_GATE` and `TOWER_WORLD_SOLVE_SEED`. Without the seed, the consensus records `not-run`. If the first draw took a fail-safe, there is nothing to vote on: `not-needed`, or `deferred` to the re-gate that the fail-safe owes (`coherence_publish.py`) | About 250–260 s per extra draw on 678 posed keyframes. That is ~190 s of single-thread mapping plus ~60 s of gate, of which ~55 s is the depth stage re-fitting cached predictions; no GPU. N = 3 adds about 8.5 min (`RUN\experiments\P3-H2\PROGRESS.md`) |
+| `TOWER_WORLD_SOLVE_GATE` | `false` | Runs on the final solve only. It computes depth before publishing (MoGe-2 ViT-L) and a metric scale per camera, then applies the evidence gate. It relabels the room and the unplaced pieces, and writes `solve\<session>\components.json`. The depth predictions are cached (§6). Off publishes the solve as the solver returned it | **Masks:** if `transients.state` is not `applied`, the gate attaches nothing outside the room's anchor block (reason `masks-unavailable`). **Metric scale:** if fewer than half the supported cameras have a ratio, it attaches nothing (reason `scale-unavailable`). If depth failed, the finisher owes a re-gate in place. An exception in the gate publishes the solve **ungated**, with `components: null` (`coherence_publish.py`). Every fail-safe writes `finalization.notice`, from a closed set of sentences (contract §3.1, v8) | 40–164 s a world, of which depth is 39–160 s over 203–712 frames (`P3-VAL\TABLE.md`). With the predictions cached, the gate took 60 s against 190 s on 678 frames (`P3-H2\real\B.solution.json`, `C.solution.json`). The room's final surface reuses the depth (`coherence_publish.py`, step 6). Disk: one set of predictions per walk, 311 MB for 678 frames (`dense_pipeline.py`) |
+| `TOWER_WORLD_SOLVE_CONSENSUS` | `1` | With N = 3, 5 or 7, a gated, seeded final solve maps N draws, with mapper seeds s … s+N−1, on its one frozen database, with the same masks and depth predictions. It gates each draw. **Only a draw whose gate attached votes.** Each keyframe votes attached to the room or not. It publishes the draw that agrees most with the strict majority; ties go to the lowest seed. A group of that draw's room that fewer than a strict majority attached is withheld as its own piece, reason `seed-unstable`. A group is never withheld if it holds a keyframe every voting draw attached (`kept`), and the room's anchor group never is. The withhold is re-gated and checked keyframe by keyframe, and if the check fails the chosen draw is published unchanged (`not-applied`). **Accepted values** are 1, 3, 5 and 7. Unset or blank means 1; anything else (even, above 7, garbage) means 1 and is logged (`config.world_solve_consensus_setting`) | `TOWER_WORLD_SOLVE_GATE` and `TOWER_WORLD_SOLVE_SEED`. Without the seed, the consensus records `not-run`. If the first draw took a fail-safe, there is nothing to vote on: `not-needed`, or `deferred` to the re-gate that the fail-safe owes (`coherence_publish.py`). The states are listed in §4 | About 250–260 s per extra draw on 678 posed keyframes. That is ~190 s of single-thread mapping plus ~60 s of gate, of which ~55 s is the depth stage re-fitting cached predictions; no GPU. N = 3 adds about 8.5 min (`RUN\experiments\P3-H2\PROGRESS.md`). The cap exists to bound the cost: at N = 30, a typo, it would have been about 2 h under the writer lock (`config.py`; V9 M-3) |
 | `TOWER_WORLD_AREA_BUILDS` | `false` | The idle finisher builds a surface and an appearance for each `shown_as: "area"` component, in `<world>\areas\<area_id>\`. Off: those areas are recorded as declined, which the phone shows as *could not be built*. `world_refinish.py` builds them either way | A components record, so the gate must be on. The finisher: `TOWER_WORLD_FINISH_PENDING`, `TOWER_WORLD_SURFACE` and `TOWER_WORLD_SOLVE` all on (`components.py`, `areas_nobody_will_build_reason`) | Per area: 8–17 s to prepare, plus 43–201 s of stages. That is 9 areas on 4 worlds; a walk had 0–5 areas (`P3-VAL\TABLE.md`) |
-| `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`: after a tracking loss, the builder matches incoming frames at 2 Hz against the 10 keyframes before the loss. When it relocalizes, it journals a verified revisit link. When it does not, it asks the wearer to look back: at most 2 prompts in any 60 s, with a 30 s cooldown (`relocalizer.py`). `silent`: it runs and records, but never prompts (the test's prompt-off arm). `on`, `true`, `yes` and `1` mean `prompt`. Any other word means `off`, and is logged | The **builder** reads it at each session start, from the environment it inherits from the Tower. It needs the session's calibration (`engine.py`). A final solve imports its revisit links only when the masks are `applied` and the solve is gated, and only at ≥ 50 inliers on every leg (contract §2.5, `solve.revisit_pairs`; `relocalizer.REVISIT_MIN_INLIERS`). The phone speaks prompts only in a DEBUG build (contract §6.5) | 0.09–0.28 of one core at 2 Hz, only while an episode is open. It asked 0.81–1.29 times a minute when replayed on 7 walks (`RUN\experiments\P3-PR\out\PRODUCT.md`, measured before `2dcf680`) |
+| `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`: after a tracking loss, the builder matches incoming frames at 2 Hz against the 10 keyframes before the loss. When it relocalizes, it journals a verified revisit link. When it does not, it asks the wearer to look back: at most 2 prompts in any 60 s, with a 30 s cooldown (`relocalizer.py`). `silent`: it runs and records, but never prompts (the test's prompt-off arm). `on`, `true`, `yes` and `1` mean `prompt`. Any other word means `off`, and is logged | The **builder** reads it at each session start, from the environment it inherits from the Tower. It needs the session's calibration (`engine.py`). A final solve imports the revisit links only when the masks are `applied` and the solve is gated. It imports them only into the database it maps, never the walk database. Of those, it drops only the pairs the import itself created that have fewer than 50 verified inliers there; a pair that loop detection or an earlier solve verified stays (contract §2.5, `solve.revisit_pairs`; V9 M-9, M-10, `99420c4`). The relocalizer writes a link only when every live leg had 50 inliers or more (`relocalizer.REVISIT_MIN_INLIERS`). The phone speaks prompts only in a DEBUG build (contract §6.5) | 0.09–0.28 of one core at 2 Hz, only while an episode is open. It asked 0.81–1.29 times a minute when replayed on 7 walks (`RUN\experiments\P3-PR\out\PRODUCT.md`, measured before `2dcf680`) |
 
 **Spelling.** The masks, gate and area-build settings go through `config._flag`:
 
@@ -66,7 +68,7 @@ The consensus it takes from **its own** environment: the child solve inherits it
 (`RUN\experiments\P3-ACC\chain.sh`).
 
 **Old worlds do not change.** The finisher never computes components for a world that
-has none (contract §7 rule 5). V8 found the pages of old worlds byte-identical.
+has none (contract §7 rule 5). V9 found old worlds unchanged (`rv9-report.txt`).
 
 ## 2. Re-finish a saved world
 
@@ -89,18 +91,29 @@ runs with `TOWER_WORLD_FINISH_PENDING=false`, as the validation Tower in §3 doe
   and 2→3. It would build the room from a solve that was set aside or not yet rebuilt,
   and hold the lock that the next step needs.
 
-**What `e5d7ccb` does about it** (`world_finish_pending.refinish_in_progress`):
+**What `e5f7151` does about it** (`world_finish_pending.refinish_in_progress`,
+`world_refinish.recover_dead_refinish`):
 
-- The ledger records the re-finish's process: its pid and start time.
-- While that process is alive, the finisher stays out of the world.
-- A re-finish whose process is gone no longer holds the world. Its `stopped` room is
-  owed like any other, and the finisher logs that the re-finish died.
-- A ledger in a final state (`done`, `stopped`, rolled back or restored) holds nothing.
+- **A live re-finish.** The ledger records the re-finish's process, its pid and start
+  time. While that process is alive, the finisher stays out of the world.
+- **A re-finish that died before its solve published** (a closed console, a reboot).
+  Its ledger is still at `setting-aside` or `set-aside`, and the finisher owes that
+  session one thing first: `owed-refinish-restore`. Under the lock, it puts back what
+  the re-finish set aside, and the ledger says `restored-after-the-refinish-ended`.
+  - The next run of `world_refinish.py` does the same first.
+  - If the solve child had already published, the new solve stands: the ledger says
+    `published`, and the room is owed to the finisher.
+  - If the put-back cannot complete, the session is **parked**. Its room is never built
+    from what was left, and its notice says *a re-finish of this walk stopped part-way
+    and the Tower could not put the previous result back; an owner can re-run the
+    re-finish* (`REFINISH_PARKED_NOTICE`; V9 M-5, `c952be4`).
+- **A ledger in a final state** holds nothing (`LEDGER_TERMINAL_STATES`).
 
 **Why you still stop the Tower:**
 
-- **Older code does not do this.** The integration branch at `1111bb9`, which the
-  validation Tower on :8020 runs, merged this lane at `d87aa5c`, before any of it.
+- **Older code does not do this.** The validation Tower on :8020 still runs the
+  integration branch at `1111bb9` (`RUN\status.md`), which merged this lane at `d87aa5c`,
+  before any of it.
 - **A ledger written before `3abe763` has no process.** If that re-finish died between
   its steps, it still looks live, and the finisher waits until you run the re-finish
   again.
@@ -139,7 +152,7 @@ cd tower
 | `--threads` | `-1` | passed to `world_finalize.py` |
 | `--appearance` / `--no-appearance` | on | build the room's and the areas' appearance |
 | `--keep-depth-work` | off | keep the per-frame depth work afterwards |
-| `--capture-dir DIR` | the session's capture chain | a capture directory to search for each keyframe's own raw frame (repeatable). It must hold its journal, `frames.jsonl` (§2.5) |
+| `--capture-dir DIR` | the session's capture chain | a capture directory to search for each keyframe's own raw frame (repeatable; a relative path is resolved). It must hold its journal, `frames.jsonl` (§2.5) |
 | `--no-capture` | off | search no capture: the walk's own `sources.json`, else the redacted keyframes. Not with `--capture-dir` |
 | `--dry-run` | off | print what would be set aside, the solve's settings and the planned `solver_frames`; write nothing |
 | `--format` | `json` | `json` or `text` |
@@ -165,23 +178,32 @@ cd tower
 ### 2.3 What it does
 
 1. **Sets the previous result aside (§2.4)** under the world's lock, and marks the
-   room's surface and appearance as `stopped`. Under the same lock, it finds each
-   keyframe's raw frame and writes the fresh solve's `sources.json` (§2.5).
+   room's surface and appearance as `stopped`. Under the same lock, it plans each
+   keyframe's solver frame and writes the fresh solve's `sources.json` (§2.5).
 2. **Runs `world_finalize.py` in a child process,** with `TOWER_WORLD_SOLVE_MASKS=1`,
    `TOWER_WORLD_SOLVE_GATE=1` and `TOWER_WORLD_SOLVE_SEED=<--seed>`. The child inherits
    the rest of the environment, `TOWER_WORLD_SOLVE_CONSENSUS` included.
 3. **Builds the room:** its final surface and appearance.
 4. **Builds the areas:** every `shown_as: "area"` component.
 
-**When something goes wrong** (`3abe763`):
+**When something goes wrong:**
 
-- If the final solve publishes nothing, it puts the previous result back, and keeps
-  what the failed solve left under `refinish\<stamp>\failed-*`.
-- If **any** exception happens between the set-aside and a published solve, it does the
-  same. For example, a read-only `session.json` (§2.6). The ledger then says
-  `restored-after-an-error`, and `error_after_set_aside` names the step and the error.
-- If the previous result cannot all go back, the ledger says `restore-incomplete`, and
-  lists what could not be done.
+- **In step 1** (V9 M-6, `c952be4`): one rollback covers everything from the first move
+  to the last ledger write. A failure anywhere in it moves back what had moved, and
+  the command refuses.
+- **Between the set-aside and a published solve** (`3abe763`): if the final solve
+  publishes nothing, the previous result goes back, and what the failed solve left is
+  kept under `refinish\<stamp>\failed-*`. **Any** exception there, such as a read-only
+  `session.json` (§2.6), does the same: the ledger says `restored-after-an-error`, and
+  `error_after_set_aside` names the step and the error.
+- **If the previous result cannot all go back,** the ledger says `restore-incomplete`,
+  and lists what could not be done.
+- **If the process is killed** before the solve publishes, the finisher, or the next
+  run of the command, puts it back (§2.1).
+- **In steps 3 and 4:** an exception ends the ledger at `stopped`, and the room is owed
+  to the finisher (`c952be4`).
+- **The finisher's attempt counters** restart only once the new solve is published, and
+  a failure to restart them is not fatal. A put-back leaves them as they were.
 
 If the gate wrote no record, the report's `components` is `null`.
 
@@ -194,18 +216,26 @@ Everything goes under `<world>\refinish\<stamp>\`, where `<stamp>` is local time
 | --- | --- | --- |
 | `solve\<session>` | moved | `refinish\<stamp>\solve\<session>` |
 | every `areas\<area_id>` of the session | moved | `refinish\<stamp>\areas\<area_id>` |
-| `surface\<session>`, `appearance\<session>`, `dense\<session>` | copied | `refinish\<stamp>\<kind>\<session>` |
+| `surface\<session>`, `appearance\<session>` | copied | `refinish\<stamp>\<kind>\<session>` |
+| `dense\<session>`, **without `predictions\`** | copied | `refinish\<stamp>\dense\<session>` |
 | `derived\` | copied | `refinish\<stamp>\derived` |
 | the session record | copied | `refinish\<stamp>\session.json` |
 | — | written first | `refinish\<stamp>\refinish.json`: the ledger |
+
+**The depth-prediction cache is left out of the copy** (V9 M-12, `c952be4`). It can be
+re-derived, it is about 20 times the size of the keyframe images, and every re-finish
+would otherwise keep another full copy. The live cache stays in place for the rebuild to
+reuse, and the ledger's copy entry records `skipped: ["predictions"]`
+(`world_refinish.py`).
 
 **The ledger** (`refinish.json`) records:
 
 - what moved or was copied, and from where;
 - the session's previous finalization and stage records;
-- the finisher's previous attempt counters, which the re-finish resets;
+- the finisher's previous attempt counters;
 - `process`: the pid and start time of the re-finish;
-- `solver_frames`: where every solver frame came from (§2.5).
+- `solver_frames`: where every solver frame comes from, and which of the walk's solver
+  images were carried back (§2.5).
 
 **The fresh `solve\<session>`** gets **copies** of the walk's inputs
 (`SOLVE_COPY_BACK`):
@@ -213,10 +243,10 @@ Everything goes under `<world>\refinish\<stamp>\`, where `<stamp>` is local time
 - `database.db`, with its `-wal` and `-shm` files;
 - `database.matching.json`, the record of its frozen matching (§6);
 - the mask cache, `transients\`;
-- `images\`, `sources.json` and `camera.json`.
-
-`dense\<session>` is copied, not moved, so the cached depth predictions stay in place
-(`dense_pipeline.py`).
+- `sources.json` and `camera.json`;
+- **only those solver images that are proven to be what this re-finish plans** (§2.5).
+  The features of every other image are cleared from the copied database, and
+  `images.provenance.json` records where each image came from.
 
 The copy keeps the masked solve on the walk's own database (`walk-database-filtered`).
 Without the copy, the solve re-extracts features, and on the target walk that splits
@@ -230,11 +260,12 @@ the room (`world_refinish.py`, RV1 M1-1).
 | `set-aside` | after step 1, until the solve publishes |
 | `published` | the solve published; the room and areas are being rebuilt |
 | `done` | finished |
-| `stopped` | a stop was asked for, or the room could not be rebuilt (`detail` says which) |
+| `stopped` | a stop was asked for, the room could not be rebuilt, or steps 3–4 raised (`detail` says which) |
 | `rolled-back`, `rollback-incomplete` | step 1 failed |
 | `restored-after-a-failed-solve` | the solve published nothing, and the previous result was put back |
 | `restored-after-an-error` | an exception after the set-aside, and the previous result was put back |
-| `restore-incomplete` | the previous result could not all be put back; see `restore_report` and `restore_errors` |
+| `restored-after-the-refinish-ended` | the re-finish died before its solve published, and the finisher or a re-run put the previous result back |
+| `restore-incomplete` | the previous result could not all be put back; see `restore_report` and `restore_errors`. A session whose re-finish ended here is parked (§2.1) |
 
 **Rolling back a re-finish that succeeded.** There is no rollback command. The ledger's
 own `restore` field gives the procedure:
@@ -245,24 +276,46 @@ own `restore` field gives the procedure:
 3. Move each `moved` entry in the ledger back, from its `to` path to its `from` path.
 4. The `copied` entries are snapshots of what the rebuild replaced in place: the room's
    surface, appearance and dense trees, `derived\`, and `session.json`. Move the rebuilt
-   ones aside, and put the snapshots back.
+   ones aside, and put the snapshots back. The snapshot of `dense\` has no
+   `predictions\`; the live one can stay.
 
 Deleting anything under `refinish\` needs a human's approval (filesystem policy,
 rule 14). Nothing prunes these directories.
 
 ### 2.5 Where the solver's frames come from
 
-Each keyframe's solver image is the first of these that exists (`plan_solver_frames`,
-`global_solve.prepare_images`):
+**Each keyframe's planned frame** is the first of these that exists
+(`plan_solver_frames`, in `global_solve.prepare_images`' own order):
 
-1. the walk's own undistorted solver image, already in `solve\<session>\images\` (copied
-   back, §2.4);
-2. the raw frame that the walk's builder recorded in `sources.json`, if that file is on
+1. the raw frame that the walk's builder recorded in `sources.json`, if that file is on
    disk;
-3. the keyframe's **own** raw frame, found by its capture identity (below);
-4. the session's stored keyframe copy, which is **face-redacted**. This is the fallback
+2. the keyframe's **own** raw frame, found by its capture identity (below);
+3. the session's stored keyframe copy, which is **face-redacted**. This is the fallback
    for each keyframe on its own: when its frame is not found, when more than one frame
    matches it, or when its keyframe id or image name occurs twice in the session.
+
+**Duplicate keyframe ids** come from a reconnect that restarted numbering (§7). Their
+recorded `sources.json` entry is dropped, and they use the stored redacted copy
+(`dropped_builder_entries`, `ambiguous_keyframe_ids`).
+
+**The walk's own solver images are reused only when proven** (V9 M-7, `c952be4`,
+`99420c4`).
+
+- The re-finish carries a walk image back only when its provenance record names the
+  planned frame and matches the file's SHA-1 (`record`), or when undistorting the
+  planned frame gives the very same bytes (`reproduced`).
+- Every other image is **withheld**: `no-keyframe`, `planned-frame-unreadable`,
+  `not-reproducible` or `differs-from-plan`. The solve writes it afresh from its planned
+  frame, and its old features are cleared.
+- So a carried-back raw image is never used for a duplicate-id keyframe, and a walk first
+  solved from redacted copies is re-solved from raw frames when they are found.
+- The solve itself rewrites any image whose `images.provenance.json` entry differs from
+  its plan, or is missing when a raw frame is planned. It counts them in
+  `solve.solver_images_rewritten`. A rewritten image misses the mask cache and the frozen
+  matching, as it must (`global_solve.prepare_images`).
+- On the frozen walks, 6839fb8f carried back 689 of its 690 images, and the other three
+  carried back all of theirs. The one withheld, kf `00000936`, had been made from a
+  redacted copy (`c952be4`).
 
 **Found by capture identity, never by name** (`fe15656`).
 
@@ -293,21 +346,25 @@ Each keyframe's solver image is the first of these that exists (`plan_solver_fra
 **`solver_frames`**, in the report and the ledger, says what happened. The dry run
 prints it too.
 
-- It counts `already_undistorted`, `raw_from_sources_json`, `raw_from_capture_dir` and
-  `redacted_session_copies`.
-- It splits the redacted ones by why: `redacted_ambiguous_in_session`,
-  `redacted_no_capture_frame` and `redacted_several_capture_frames`.
-- `source` sums it up: `walk-solver-images`, `raw-capture`, `redacted-session-keyframes`
-  or `mixed`.
+- It counts `raw_from_sources_json`, `raw_from_capture_dir` and
+  `redacted_session_copies`. It splits the redacted ones by why:
+  `redacted_ambiguous_in_session`, `redacted_no_capture_frame` and
+  `redacted_several_capture_frames`.
+- `already_undistorted` counts the keyframes whose walk image was carried back.
+  `walk_images` says what became of each: `carried_back`, `by_record`,
+  `by_reproduction`, `withheld` (by reason) and `features_to_clear`.
+- `source` sums it up: `raw-capture`, `redacted-session-keyframes` or `mixed`.
+  `walk-solver-images` appears only in ledgers written before `c952be4`.
 - It also records `from` and `why` (which captures), `ambiguous_keyframe_ids`,
-  `capture_notes`, and whether `sources.json` was rewritten (`sources_json_written`).
+  `dropped_builder_entries`, `capture_notes`, and whether `sources.json` was rewritten
+  (`sources_json_written`).
 
 **Without raw captures,** a keyframe's solver image and its masks come from its
 redacted copy, fill boxes and all. That costs keyframes: af47007c, re-finished from its
 redacted copies, posed 168 of its 218 (`RUN\experiments\P3-VAL\TABLE.md`, finding 6, code
 `e2e7582`). On that walk the redactor filled 66 of 218 frames by 2 % or more, with a
-median fill of 22 % (`RUN\mailbox\to-lead\021-h1-decision-p2.md`). `solver_frames` now
-says when this happens.
+median fill of 22 % (`RUN\mailbox\to-lead\021-h1-decision-p2.md`). `solver_frames` says
+when this happens.
 
 **The raw frames are solver input only.**
 
@@ -389,9 +446,15 @@ mapping (`P3-H2\real\C.solution.json`, `P3-H2\PROGRESS.md`).
 
 **Disk and GPU:**
 
-- **Disk.** The set-aside keeps full copies of the room's surface, appearance, dense and
-  derived trees. The run's seven re-finished copies, with their set-asides, took 3.1 GB
-  (`RUN\experiments\P3-VAL\PROGRESS.md`).
+- **Disk.** The set-aside keeps full copies of the room's surface, appearance and dense
+  trees, apart from `predictions\`, and of `derived\`. The run's seven re-finished copies,
+  with their set-asides, took 3.1 GB (`RUN\experiments\P3-VAL\PROGRESS.md`, code
+  `e2e7582`, before the prediction cache existed).
+- **The prediction cache is bounded** (V9 M-12, `0f9cc83`). After each depth stage that
+  completes, the cache keeps one set: the current token's, with one prediction per
+  keyframe. Other tokens' sets, predictions no keyframe names any more, and a dead
+  writer's staging files are pruned, and `prediction_cache.pruned` records it. The
+  bound is the walk's keyframes, once: 311 MB for 678 frames (`dense_pipeline.py`).
 - **GPU.** Run one re-finish at a time. The run serialised GPU jobs with its own lock
   (`RUN\lead\gpulock.py`), which is not part of the product.
 
@@ -547,33 +610,76 @@ It never means "no areas".
 6. `link-contradicted`
 7. `scale-mismatch`
 8. `seed-unstable` (contract v7). The consensus withheld the piece: the published draw
-   attached it, but fewer than a strict majority of draws did. For such a piece it is
-   the **only** reason. The phone never shows reason text (Mac tip `8009854`,
+   attached it, but fewer than a strict majority of the voting draws did. For such a
+   piece it is the **only** reason; the withhold re-gate checks this per keyframe
+   (`30c28c0`). The phone never shows reason text (Mac tip `8009854`,
    `RUN\mailbox\to-lead\022-mac-tip-8009854.md`).
 
 Read §2.2 for what each one means.
 
-**What a fail-safe looks like.** Every piece outside the room carries only
-`masks-unavailable`, or only `scale-unavailable`. Then:
+**Fail-safes, and the notice.**
 
-- read `transients.state` and the `gate` block in `solve\<session>\solution.json`:
-  `gate.masks_applied`, `gate.metric_available`, `gate.retryable` and `gate.cause`
-  (contract §2.5);
-- read the row's `finalization.notice`, which says what the Tower could not do and who
-  can fix it (contract §3.1).
+- A fail-safe shows as every piece outside the room carrying only `masks-unavailable`,
+  or only `scale-unavailable`. Then read `transients.state` and the `gate` block in
+  `solve\<session>\solution.json`: `gate.masks_applied`, `gate.metric_available`,
+  `gate.retryable` and `gate.cause` (contract §2.5).
+- **The row's `finalization.notice`** says what the Tower could not do and who can fix
+  it. It is a **closed set** of fixed sentences (contract §3.1, v8): 26 causes from
+  `coherence_publish.NOTICE_SENTENCES`, plus the finisher's given-up, refused and parked
+  sentences, joined by `"; "`. Its only variable text is integer image counts and a gate
+  clause from the same table. It never carries exception text, a path or a measured
+  figure (V9 M-4, `30c28c0`).
+- **The diagnostics are in `finalization.detail`,** which the phone does not show: the
+  raw reason, error text included (`e5f7151`).
+- **Images that cannot be masked are excluded, with a bound** (V9 M-8, `0f9cc83`;
+  `solve_masks.py`):
+  - A failed hash or read is tried once more.
+  - Each excluded image gets an all-0 mask, and the walk-database filter drops every
+    match that touches it. `transients.images_excluded` counts them, and
+    `excluded_reasons` says why: `hash-failed`, `read-failed`, `undecodable`,
+    `wrong-size` or `no-mask`.
+  - At max(3, 2 % of the images), `exclusion_notice_due` is set, and the notice says
+    *{excluded} of {images} images could not be masked and were left out of the solve*.
+  - If **no** image could be masked, the state is `unavailable`, with cause
+    `images-unmaskable` and `none_masked`. The notice names the images, not the
+    detector.
 
-**Where the consensus votes are** (contract §2.5):
+**Where the consensus votes are** (contract §2.5, v7 and v8):
 
 - **`gate.consensus`, in `solution.json`:**
-  - `requested` (N), `seeds`, and `state`: `applied`, `not-needed`, `deferred`,
-    `not-run`, or `not-applied` (withholding would have changed which piece is the room,
-    so the chosen draw was published as gated), with `why`;
-  - a summary per draw: its seed, time, `solve_identity`, room keyframes and agreement;
+  - `requested` (N), `seeds`, and `state`, with `why` where it applies:
+
+    | state | meaning |
+    | --- | --- |
+    | `applied` | every requested draw voted |
+    | `partial` | fewer draws voted than were requested (`votes.draws`). Only draws whose gate attached vote; with fewer than 2, draw 0 is published as one draw would be |
+    | `not-applied` | the withhold re-gate failed its per-keyframe check; the chosen draw is published unchanged |
+    | `deferred` | owed to the re-gate in place: draw 0's fail-safe is retryable, **or a stop** came before the further draws voted. On a stop, draw 0 is published with `retryable` and cause `consensus-deferred` |
+    | `not-needed` | the first draw attached nothing (a fail-safe that owes nothing) |
+    | `not-run` | it could not run, for example without a seed |
+
+  - a summary per draw: its own seed and mapping time, `solve_identity`, room keyframes
+    and agreement;
   - the `chosen` draw;
-  - per group, its `votes`, whether it is `ambiguous` (not unanimous), and its
-    `decision`: `anchor`, `attached`, `seed-unstable` or `unplaced`;
-  - `pieces`: a minority piece that sits inside the published anchor block. It cannot be
-    withheld, so it is only reported.
+  - **`groups`:** the chosen draw's groups, with their `keyframe_ids`, `votes`,
+    `ambiguous` (not unanimous), and `decision`: `anchor`, `attached`, `kept`,
+    `seed-unstable` or `unplaced`. `kept` is a group fewer than a majority attached but
+    that holds a keyframe every voting draw attached, so it is not withheld;
+  - **`pieces`:** what the chosen draw's groups cannot show (`30c28c0`, `e5f7151`). It
+    lists every other draw's unplaced piece on which the draws disagree, with:
+    - its `keyframe_ids`, `from_draw`, `votes` and `majority_attached`;
+    - `in_published_room`: whether the published room holds it;
+    - `against_majority`: whether the published room disagrees with the majority about
+      it.
+
+    Pieces are reporting only. They are also listed in `ambiguous`. The 6839fb8f closet
+    is the case they exist for: it was its own piece under mapper seed 2, and part of the
+    room's anchor block under seeds 0 and 1 (`coherence_publish.decide_consensus`);
+  - **`held_against_majority`:** how many keyframes the published room holds that a
+    strict majority of the voting draws did not attach, anchor included. It is the
+    visible size of a **named residual risk**. Marginal pieces absorbed into the anchor
+    block are never withheld, so the vote does not re-verify them
+    (`RUN\mailbox\to-lead\025-v9-and-option-a.md`, decision 2).
   - It is absent when N = 1.
 - **`solve\<session>\consensus.json`:** each draw's per-round gate decisions. Written
   only when N ≥ 2.
@@ -589,7 +695,7 @@ Mac:** the DEBUG build, speech, and the device measurements M-a, M-b and M-c.
 
 **Which Tower.**
 
-- The candidate SHA, on a Tower that **records**: `TOWER_CAPTURE_ROOT` and
+- The integrated SHA, on a Tower that **records**: `TOWER_CAPTURE_ROOT` and
   `TOWER_WORLD_ROOT` set, and `TOWER_WORLD_AUTOBUILD` on (the default).
 - Not the serve-only validation Tower in §3, which records nothing.
 - Which port and which world root: **OPEN**. The protocol does not name them.
@@ -605,15 +711,21 @@ Mac:** the DEBUG build, speech, and the device measurements M-a, M-b and M-c.
 | `TOWER_WORLD_AREA_BUILDS` | `true` | so the Tower builds the walk's areas; otherwise they read *could not be built*. The acceptance run sets it; the protocol draft does not say |
 | `TOWER_WORLD_RELOCALIZER` | `prompt` for walks W-A, W-C and W-G; `silent` for W-B | the A/B arm |
 
-Leave `TOWER_WORLD_FINISH_PENDING` on (the default): the areas and any owed re-gate are
-built by the finisher.
+Leave `TOWER_WORLD_FINISH_PENDING` on (the default): the areas, any owed re-gate and any
+deferred consensus are finished by the finisher.
 
 The builder reads the relocalizer setting when each session starts, from the Tower's
 environment. So to switch between arms, restart the Tower with the new value.
 
+**Do not stop the Tower while a walk is finalizing.** With consensus 3, the final solve
+ran about 8.5 min longer on a walk of 678 posed keyframes (§1), and a hard stop then
+loses that final solve (§7, the first item).
+
 **The phone build.** A DEBUG build (contract §6.5), from the Mac lane at `8009854` or
 later. That build shows `finalization.notice` word for word under the room caption,
 never on area screens (contract §8, v6; `RUN\mailbox\to-lead\022-mac-tip-8009854.md`).
+The next integration takes the Mac tip `de1b045`, which also replaces anything that
+looks like machine output (contract §3.1; `RUN\status.md`).
 
 **What to look at, for each walk:**
 
@@ -626,12 +738,14 @@ never on area screens (contract §8, v6; `RUN\mailbox\to-lead\022-mac-tip-800985
 - **The status channel's `tracking.recovery`,** including `prompt.issued_at` for
   measurement M-c (contract §6.2).
 - **`finalization.notice`** on the row, and in the status channel's
-  `lifecycle.finalization` (`d084627`). It is absent when nothing is owed.
+  `lifecycle.finalization` (`tower/docs/contracts/CARTRIDGE-RESULTS.md`). It is absent
+  when nothing is owed.
 - **`solve\<session>\solution.json`:**
   - `transients`, `solve.seed`, `solve.threads`, `solve.matching` and
     `gate.params_digest`. These show that the walk ran with the settings above;
   - `solve.revisit_pairs`: the relocalizer's links that the solve imported;
-  - `gate.consensus`, read as in §4.
+  - `gate.consensus`, read as in §4, with `held_against_majority` next to the harness's
+    placement check.
 - **`solve\<session>\components.json`,** read as in §4.
 - **The run harness,** `tower\scripts\world_coherence_eval.py`, with `--renders`. It lives
   on the lane branch `world-builder/coherence-v1`, not on this one.
@@ -650,7 +764,7 @@ Keep the world directory, the journal and the capture. Raw imagery stays on this
 reproduces the same world. The **first** finish of a walk is one draw of its matching,
 its masks and its depth, and that draw is then kept.
 
-Each source of variation, and what `e5d7ccb` does with it:
+Each source of variation, and what `e5f7151` does with it:
 
 **Masks: cached.**
 
@@ -661,7 +775,10 @@ Each source of variation, and what `e5d7ccb` does with it:
   from the cache (`P3-H2\real\B.solution.json`, `C.solution.json`), and a unit test pins
   it for a re-finish
   (`test_world_builder_frozen_matching.py::test_a_refinish_maps_the_frozen_matching_and_hits_every_cached_mask`).
-- The first masked solve of a walk computes them on the GPU.
+- The first masked solve of a walk computes them on the GPU. So does any solve of an
+  image that was rewritten because its provenance did not match (§2.5).
+- A cache file that is empty, truncated or the wrong shape is a miss, and is rewritten
+  (`0f9cc83`).
 
 **Matching: frozen after the first seeded final solve.**
 
@@ -676,6 +793,10 @@ Each source of variation, and what `e5d7ccb` does with it:
   content skips extraction and matching: `solve.matching: "frozen"`. Anything else
   matches again and re-freezes: `"matched"`, with `solve.matching_detail`
   (`global_solve.py`).
+  - The verification seed is part of the key, so a re-finish with a different `--seed`
+    matches again (`99420c4`).
+  - A walk database that changed after the freeze check is not called frozen: it is
+    re-digested before the filter (V9 Q1, `99420c4`).
 - **So the first finish of a new walk is still one matching draw.** So is the first
   seeded finish of any walk with no record yet: a world finished before `e4d35ee`, or
   one finished unseeded. It matches once more, then it is frozen.
@@ -688,11 +809,18 @@ Each source of variation, and what `e5d7ccb` does with it:
 
 - The gate's MoGe predictions are kept as float16 in
   `dense\<session>\predictions\<token>\`. Each is keyed by the SHA-1 of the exact pixels
-  the network was shown; `token` names the network and its parameters
-  (`dense_pipeline.py`).
-- `dense\<session>` is copied, not moved, by a re-finish, so the cache stays.
+  the network was shown. `token` names the network, its parameters, the weights
+  revision, the library versions, the device and fp16 (cache schema 2, `0f9cc83`).
 - The fit to the solve is always recomputed. A fresh prediction is rounded through
   float16 before it is fitted, so fresh and cached fits are identical.
+- A cache write that fails (a full disk, a sharing violation, MAX_PATH) is counted in
+  `prediction_cache.write_failed`, and the stage goes on with the prediction it has. It
+  no longer loses the depth (V9 M-11, `0f9cc83`).
+- The cache is pruned to one set per walk (§2.7), and it is left out of the re-finish's
+  set-aside copy (§2.4).
+- **One lock for every writer of `dense\<session>\`.** A hand-run densify now also takes
+  the session's surface lock, which the gate's and the surface's depth stages hold. If
+  it cannot, it returns `unavailable` and writes nothing (V9 Q8, `dense_pipeline.py`).
 - `gate.depth.predictions` says how many were `cached` and how many `predicted`. Run B
   predicted 678; run C found all 678 in the cache (`P3-H2\real\B.solution.json`,
   `C.solution.json`).
@@ -708,17 +836,20 @@ Each source of variation, and what `e5d7ccb` does with it:
 - **Consensus answers that** (§1). A majority of 3, simulated over all 10 triples of
   those 5 seeds, flipped no group of 30 or more keyframes in any of 45 triple pairs. The
   control's rooms did not differ by a single keyframe (`P3-PF\PROGRESS.md`, 00:57).
-- **In the product, run B** mapped seeds 0, 1 and 2, with rooms of 526, 525 and 349
-  keyframes. The consensus published seed 0's draw, with a room of 526 and one area of
-  57, and withheld nothing (`P3-H2\PROGRESS.md`).
+- **In the product, run B** (before P3.6) mapped seeds 0, 1 and 2, with rooms of 526,
+  525 and 349 keyframes. The consensus published seed 0's draw, with a room of 526 and
+  one area of 57, and withheld nothing (`P3-H2\PROGRESS.md`).
+- **What the vote cannot reach.** A marginal piece inside the room's anchor block is
+  never withheld. `held_against_majority` counts it (§4, and §7).
 
-**The database digest: at a stated precision** (`d06ebf5`).
+**The database digest: at a stated precision** (`d06ebf5`, `99420c4`).
 
 - `solve.database_digest` is the SHA-1 of the database that was mapped, at the precision
   named in `solve.database_digest_rule`:
   - F, E, H and qvec up to scale and sign;
   - tvec up to scale;
-  - each at 10 decimals of the matrix's largest entry.
+  - each at 10 decimals of the matrix's largest entry, with nothing appended. The pivot
+    is chosen tie-safe.
 - **Why.** The mask filter's re-verification left float noise in F on 3 of 16,793 planar
   pairs, where F is not used, and one F came back as −F.
 - The exact digest (`content`) is still what the frozen matching compares
@@ -727,17 +858,47 @@ Each source of variation, and what `e5d7ccb` does with it:
 **What this adds up to:**
 
 - **Two warm, same-seed final solves** (runs B and C, consensus 3, on one copy of
-  6839fb8f) were compared on 11,975 values of `solution.json` and `components.json`.
-  Timestamps, timings and per-solve file names were left out. Exactly one value
-  differed: the database digest (`P3-H2\PROGRESS.md`).
+  6839fb8f, before P3.6) were compared on 11,975 values of `solution.json` and
+  `components.json`. Timestamps, timings and per-solve file names were left out.
+  Exactly one value differed: the database digest (`P3-H2\PROGRESS.md`).
 - **At the stated precision,** that digest is equal too
   (`RUN\mailbox\to-manager\20260924-0256-024-recovered.md`).
 - **A unit test** makes three re-finishes of one walk and compares them field for field
-  (`test_world_builder_reproducible_finish.py`, `ae734c0`).
-- **The real two-re-finish check** at the candidate SHA is phase R of the acceptance run
-  (`P3-ACC\chain.sh`), and it has not reported yet.
+  (`test_world_builder_reproducible_finish.py`, `ae734c0`). It fakes the mapper and
+  pycolmap, so it checks plumbing, not the real variance (V9, Tests).
+- **The real two-re-finish check** at `e5f7151` is phase R of the acceptance run. Phase R
+  runs the same seed twice on its own copy, so it exercises the frozen path, and the
+  `database_digest` must be equal (`RUN\mailbox\to-manager\20260924-0448-p36-cut.md`). It
+  has not reported yet.
 
 ## 7. OPEN
+
+**Found in P3.6, not fixed:**
+
+- **A stop during the builder's consensus loses the final solve.**
+  - The builder runs its final solve in a `world_solve.py` child. Neither that child nor
+    `world_finalize.py` hands `should_stop` to the solve
+    (`RUN\experiments\P3-SOL\PROGRESS.md`, OPEN).
+  - On a hard stop, the builder terminates the child (`world_build_session.run_final`).
+    Nothing of that final solve is published, and the last background solution stands.
+  - The finisher does not redo a final solve. It builds only after a finalization whose
+    final solve is `solved` (`world_finish_pending.py`, `no-final-solve`). An owner's
+    re-finish does redo it.
+  - A stop reaches the consensus, and publishes draw 0 as `deferred`, only for callers
+    that hand it on: in-process solves, and the finisher's re-gate in place (`99420c4`,
+    `30c28c0`).
+- **The area levelling floor is below chance.** Isotropic normals gave `levelled: true`
+  in 20 of 20 cases, and the *may look tilted* caption was suppressed with the up
+  direction 34° off (`rv9-report.txt`, LOW "Areas and masks"; `area_build.py`).
+
+**A named residual risk** (manager 025, decision 2):
+
+- **A minority piece inside the anchor block cannot be withheld.** Marginal pieces
+  absorbed into the room's anchor block are not re-verified by the vote. The gate's τ
+  (16.8°) is about twice the image-only pair noise.
+- `gate.consensus.held_against_majority` makes the risk visible, and the acceptance
+  reports it per world. Per-group image-only verification inside the anchor is a
+  next-run item (`RUN\mailbox\to-lead\025-v9-and-option-a.md`).
 
 **Backlog, outside this round:**
 
@@ -748,11 +909,8 @@ Each source of variation, and what `e5d7ccb` does with it:
 - **Keyframe ids collide after a reconnect.** The builder derives keyframe ids from
   `source_seq`, so a reconnect that restarts numbering duplicates ids and overwrites
   stored keyframe images: 20 ids on adc75972 (`V8-REVIEW.md`, backlog). A re-finish
-  gives those keyframes their stored redacted copy (40 on adc75972;
-  `P3-PF\PROGRESS.md`, 02:40).
-- **A minority piece inside the anchor block cannot be withheld.** The consensus never
-  withholds the room's anchor group, so such a piece is only reported, in
-  `gate.consensus.pieces` (`P3-H2\PROGRESS.md`).
+  gives those keyframes their stored redacted copy (§2.5): 40 on adc75972
+  (`P3-PF\PROGRESS.md`, 02:40).
 
 **Also still open:**
 
