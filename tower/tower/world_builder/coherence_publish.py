@@ -34,8 +34,9 @@ FAIL-SAFES (contract §2.2): masks not `applied` -> nothing attached, reason `ma
 unavailable, stopped or no camera with a ratio -> nothing attached, reason `scale-unavailable`. Both still
 write components (the room = the anchor block; every other piece unplaced), and neither is silent: the row's
 finalization detail says what is missing and who can fix it (`publish_notice`, review V8 M2). Only a depth
-stage that did not finish owes a re-gate in place (`retryable`); a shortfall with depth in hand, and the
-masks fail-safe, do not (a re-gate would reproduce them). A failure of the gate ITSELF
+stage that did not finish owes a re-gate in place (`retryable`); a shortfall with depth in hand, a walk
+with no camera intrinsics or a solve with no camera (review V11, LOW-15), and the masks fail-safe, do not
+(a re-gate would reproduce them). A failure of the gate ITSELF
 (an exception) publishes the solve exactly as the solver returned it, with `gate.state: "failed"` and no
 components record -- `components: null`, "not computed", which is what every older world says.
 
@@ -46,6 +47,7 @@ contract's proposals (§2.3, §2.4 rule 5; OPEN T2, T4).
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -79,6 +81,10 @@ CAUSE_GATE_FAILED = "gate-failed"
 DEPTH_OK = "ok"
 DEPTH_UNAVAILABLE = "unavailable"
 DEPTH_STOPPED = "stopped"
+# The depth causes (`_depth_cause`) no re-gate in place can cure: it re-runs on the same walk, which still has
+# no camera intrinsics, and the same solve, which still has no camera (review V11, LOW-15). The gate records
+# them NOT `retryable`, so the finisher never re-runs them; the notice says who can fix them (`_OWNERS`).
+DEPTH_CAUSES_NOT_RETRYABLE = ("depth-no-intrinsics", "depth-no-camera")
 
 # Contract §2.3: an unplaced component is an AREA with at least this many keyframes or this much total
 # capture span; below both it is counted only (`none`). Proposed from one case (OPEN T2).
@@ -119,6 +125,11 @@ class GateResult:
     gated: dict | None = None
     candidate: object = None
     consensus_detail: dict | None = None
+    # In memory only (review V11, LOW-1): on a result of `gate_by_consensus`, draw 0's own gate result as its
+    # gate returned it -- before any consensus record, owed cause or publish touched it -- so that a second
+    # pass over the same solve (`global_solve._publish_draw_0_first`) hands it back (`draw_0=`) instead of
+    # gating draw 0 again.
+    draw_0: "GateResult | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +508,23 @@ def retire_components(workspace_root) -> bool:
         return False
 
 
+def retire_consensus(workspace_root) -> bool:
+    """A solution published without a consensus detail moves the previous `consensus.json` aside, to
+    `CONSENSUS_SUPERSEDED_FILENAME` (never deletes it), exactly as `retire_components` does for the
+    components record: an old record of per-draw decisions must not sit beside a new solve (review V11,
+    LOW-4). True when one was moved."""
+    path = Path(workspace_root) / CONSENSUS_FILENAME
+    if not path.exists():
+        return False
+    try:
+        os.replace(path, Path(workspace_root) / CONSENSUS_SUPERSEDED_FILENAME)
+        return True
+    except OSError:
+        logger.warning("[Tower][WorldBuilder] could not retire %s; its solve was replaced", path,
+                       exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # the whole step
 
@@ -626,7 +654,13 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
     # would reproduce the shortfall and spend the finisher's attempts for nothing. It is
     # not silent either: the row says what is missing and that a new walk is what fixes it
     # (`NOTICE_SCALE_SHORT`).
-    retryable = bool(masks_applied and depth is None)
+    #
+    # Nor is a depth stage that could not START for the walk's or the solve's own reason: no camera
+    # intrinsics, no solve camera (review V11, LOW-15; `DEPTH_CAUSES_NOT_RETRYABLE`). The re-gate in place
+    # runs on the same walk and the same solve, so it would fail the same way; its sentence already says
+    # re-running the gate would not change this, and names the owner who can.
+    retryable = bool(masks_applied and depth is None
+                     and _depth_cause(depth_record.get("detail")) not in DEPTH_CAUSES_NOT_RETRYABLE)
     record = {
         "state": GATE_STATE_APPLIED,
         "retryable": retryable,
@@ -709,6 +743,9 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
 # pieces inside the anchor block are not re-verified by the vote.
 
 CONSENSUS_FILENAME = "consensus.json"
+# Where a published solve whose gate wrote no per-draw detail moves an older `consensus.json` (review V11, LOW-4):
+# aside, never deleted, as `SUPERSEDED_FILENAME` is for the components record.
+CONSENSUS_SUPERSEDED_FILENAME = "consensus.superseded.json"
 CONSENSUS_RECORD = "wb-gate-consensus/1"
 DRAW_UNIT_MAPPER_SEED = "mapper-seed"
 CONSENSUS_APPLIED = "applied"          # every requested draw voted; `detached` may be empty
@@ -910,6 +947,20 @@ def _owe_consensus(result: GateResult) -> GateResult:
     return result
 
 
+def _untouched_copy(result: GateResult) -> GateResult:
+    """A copy of a gate result that nothing later done to the original reaches (review V11, LOW-1). The
+    consensus and the publish REPLACE a result's `record`, `consensus_detail`, and its solution's `gate` and
+    `timing` -- none of them is edited in place -- so a copy of the result, its record and its solution is
+    enough; the poses and the arrays are shared, and nothing writes to them."""
+    return dataclasses.replace(result, record=dict(result.record), solution=copy.copy(result.solution),
+                               consensus_detail=None, draw_0=None)
+
+
+def _seconds(value) -> float:
+    """A record's `seconds`, or 0.0 when it has none."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
 def _room_anchor(result) -> str | None:
     return next((g["first_camera"] for g in ((result.gated or {}).get("groups") or [])
                  if g.get("label") == 0 and g.get("reference")), None)
@@ -990,7 +1041,7 @@ def draw_0_stopped(result) -> bool:
 def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: ConsensusPlan, database_path,
                       keyframes, should_stop=None, params: "CG.GateParams | None" = None,
                       gate_runner: Callable | None = None, stopped: bool = False,
-                      why_deferred: str | None = None) -> GateResult:
+                      why_deferred: str | None = None, draw_0: GateResult | None = None) -> GateResult:
     """The consensus (see above) on `solution`, draw 0. Never raises: a draw that cannot be mapped or gated
     does not vote, and with nothing to vote on the first draw is published exactly as `gate_final_solution`
     gave it. The published result's record carries `consensus`; `consensus_detail` holds what
@@ -1004,7 +1055,14 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
 
     `should_stop` is asked between the further draws and reaches their gates: a stop there publishes draw 0,
     `deferred`, and the re-gate in place owes the consensus. So does a further draw whose gate could not
-    finish for a retryable cause (review V10, L-1)."""
+    finish for a retryable cause (review V10, L-1).
+
+    `draw_0` (review V11, LOW-1): draw 0's gate result from an earlier pass over THIS solve -- the `draw_0`
+    of the result that pass returned. Draw 0 is then not gated again: it is the draw the earlier pass gated
+    and published, so a transient failure (the surface lock, GPU memory) can no longer turn it into an
+    anchor-only fail-safe the second time, and what the record says it cost is what it cost -- its
+    `gate_s`, its `predictions` and its share of `seconds` are that gate's. Every result this returns
+    carries draw 0's own gate result, untouched, as its `draw_0`."""
     from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
 
     params = params or CG.GateParams()
@@ -1030,16 +1088,25 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
         return run(store, world_id, session_id, candidate, database_path=database_path, keyframes=keyframes,
                    params=params, **kw)
 
-    # A stop already asked for does not reach draw 0 (MED-1b): it is gated as N = 1 gates it.
-    first = gate(solution, should_stop=None) if stopped else gate(solution)
+    if draw_0 is not None:
+        # DRAW 0 IS GATED ONCE (review V11, LOW-1): the earlier pass's gate of it, as that gate returned it.
+        first = _untouched_copy(draw_0)
+        draw_0_s = _seconds(first.record.get("seconds"))
+    else:
+        # A stop already asked for does not reach draw 0 (MED-1b): it is gated as N = 1 gates it.
+        first = gate(solution, should_stop=None) if stopped else gate(solution)
+        draw_0_s = 0.0
+    untouched = _untouched_copy(first)
 
     def done(result, record, detail=None):
         record = dict(record)
         for key, empty in _no_vote().items():
             record.setdefault(key, empty)
+        # `seconds` counts draw 0's gate where it ran: here, or in the earlier pass that handed it on.
         result.record = dict(result.record, consensus=dict(
-            base, **record, seconds=round(time.perf_counter() - started, 3)))
+            base, **record, seconds=round(time.perf_counter() - started + draw_0_s, 3)))
         result.consensus_detail = detail
+        result.draw_0 = untouched
         return result
 
     if plan.refusal:
@@ -1176,17 +1243,25 @@ def after_publish(store, world_id: str, session_id: str, workspace_root, solutio
                   result: GateResult | None) -> dict:
     """Steps 5-6, after `write_solution` published `solution`. Never raises. Without a gate result (the
     gate off) a previous record is moved aside; with one, the record is written once and the depth is
-    handed to the surface."""
+    handed to the surface. A previous `consensus.json` is moved aside whenever this solve has no
+    per-draw detail to write in its place (review V11, LOW-4)."""
     out: dict = {}
     try:
         if result is None or result.components is None:
             out["components_retired"] = retire_components(workspace_root)
-            if result is None:
-                return out
         else:
             write_components(workspace_root, result.components)
             out["components_written"] = True
-        if result.consensus_detail is not None:
+        if result is None or result.consensus_detail is None:
+            # AN OLDER `consensus.json` DOES NOT DESCRIBE THIS SOLVE (review V11, LOW-4): a solve published
+            # with no per-draw detail -- N = 1, the gate off, a consensus deferred, not needed or not run,
+            # and the solve's early publish of draw 0 (review V10, MED-1a) -- moves it aside, so no reader
+            # pairs the old per-draw decisions with this solve. Said only when there was one.
+            if retire_consensus(workspace_root):
+                out["consensus_retired"] = True
+            if result is None:
+                return out
+        else:
             from tower.storage import write_json_atomic  # noqa: PLC0415
 
             write_json_atomic(Path(workspace_root) / CONSENSUS_FILENAME, result.consensus_detail)
@@ -1203,7 +1278,8 @@ def gate_and_publish(store, world_id: str, session_id: str, workspace, solution,
                      gate: bool | None = None, database_path, keyframes, write: Callable,
                      should_stop=None, consensus: ConsensusPlan | None = None,
                      stopped: bool = False, why_deferred: str | None = None,
-                     keep_on_stop: bool = False) -> tuple[object, dict | None]:
+                     keep_on_stop: bool = False, draw_0: GateResult | None = None,
+                     gate_results: list | None = None) -> tuple[object, dict | None]:
     """The final solve's publish step, in one call (`global_solve.solve` makes it in place of
     `write_solution`): the gate when `gate_setting_for(final, gate)`, then `write(workspace, solution)`,
     then the record and the depth hand-off. Returns (the published solution, its gate record or None).
@@ -1221,16 +1297,24 @@ def gate_and_publish(store, world_id: str, session_id: str, workspace, solution,
     second pass after its early publish): when a stop reached the depth stage of draw 0's gate, nothing is
     written -- not the solution, not the record, not the depth -- and `(None, record)` is returned, the
     record's `publish` saying so (`{"written": False, "why": WHY_KEPT_ON_STOP}`). False, the default, is
-    today's: such a result is published (a stop never loses a finish that has nothing published yet)."""
+    today's: such a result is published (a stop never loses a finish that has nothing published yet).
+
+    `draw_0` and `gate_results` (review V11, LOW-1; the solve's two passes, `_publish_draw_0_first`):
+    `draw_0` is `gate_by_consensus`'s -- draw 0's gate result from the earlier pass, so draw 0 is gated once
+    -- and ignored without a consensus plan. `gate_results`, a list the caller owns, is given the gate
+    result (its `draw_0` is what the second pass hands back). Neither changes what is published."""
     result = None
     if gate_setting_for(final, gate):
         if consensus is not None and int(consensus.draws) >= 2:
             result = gate_by_consensus(store, world_id, session_id, solution, plan=consensus,
                                        database_path=database_path, keyframes=keyframes,
-                                       should_stop=should_stop, stopped=stopped, why_deferred=why_deferred)
+                                       should_stop=should_stop, stopped=stopped, why_deferred=why_deferred,
+                                       draw_0=draw_0)
         else:
             result = gate_final_solution(store, world_id, session_id, solution, database_path=database_path,
                                          keyframes=keyframes, should_stop=should_stop)
+        if gate_results is not None:
+            gate_results.append(result)
         if keep_on_stop and draw_0_stopped(result):
             logger.info("[Tower][WorldBuilder] %s/%s: a stop reached draw 0's depth stage; nothing is "
                         "published, and the solve published before stands", world_id, session_id)
@@ -1466,7 +1550,8 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
 # `publish_detail`, the diagnostic twin for the finalization's `detail`, carries it only as
 # `client_safe_detail` makes it: one line, no path, no traceback, short (review V10, MED-5 --
 # `detail` DOES reach the phone and the unauthenticated socket, inside `lifecycle.finalization`
-# and, for an interrupted session, inside `lifecycle.reason`). The only numbers a sentence
+# and, for an interrupted session, inside `lifecycle.reason`; and the `GET /worlds` row, review
+# V11, MED-B). The only numbers a sentence
 # carries are IMAGE counts, which an owner can read ("12 of 400 images"); the camera counts
 # behind a scale shortfall stay in the detail. Every sentence is one line, with no slash or
 # backslash, no exception class name, no `key=value` pair, and far under the phone's
@@ -1601,7 +1686,9 @@ def _dict(value) -> dict:
 # raw text made client-safe (review V10, MED-5)
 #
 # `finalization.detail` reaches the phone and the unauthenticated `/ws` socket (inside
-# `lifecycle.finalization`, and inside `lifecycle.reason` for an interrupted session), so the raw
+# `lifecycle.finalization`, and inside `lifecycle.reason` for an interrupted session), and the
+# unauthenticated `GET /worlds` listing (the session row's `finalization`, with its `notice`:
+# `client_safe_finalization`, review V11, MED-B), so the raw
 # text it quotes is made client-safe the way `logging_config.client_safe_reason` makes an exception
 # client-safe, but for TEXT, which is what a record holds: no path (and so no user name: the paths
 # that carry one are home directories), no traceback, one line. The full text stays in the
@@ -1621,23 +1708,46 @@ _EXCEPTION_NAME = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|I
 # suffix (`DepthModelUnavailable: ...`).
 _CLASS_PREFIX = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+:\s")
 _WIN_ERROR = re.compile(r"\[WinError -?\d+\]\s*")
-# The words after a space that are still the same path (`C:\Users\John Smith\x`): each holds a separator.
-_PATH_TAIL = r"""(?:\s+[^\s'"]*[\\/][^\s'"]*)*"""
-_PATHS = (
-    # quoted, any form: 'C:\Users\x\a b.py', "/home/x/y", '\\server\share', '~/x'
-    (re.compile(r"""(['"])(?:[A-Za-z]:[\\/]|\\\\|~[\w.-]*[\\/]|/)[^'"\r\n]*\1"""), r"\1" + PATH_PLACEHOLDER + r"\1"),
+_ERRNO = re.compile(r"\[Errno -?\d+\]\s*")
+# Line breaks other than CR and LF (review V11, LOW-16): VT, FF, the file, group and record separators, NEL, and
+# the Unicode line and paragraph separators. Each is a space in a client-safe text.
+_OTHER_LINE_BREAKS = str.maketrans({c: " " for c in "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"})
+# A traceback frame (`File "C:\x.py", line 3, in f`), quoted path and all (review V11, LOW-16).
+_FRAME = re.compile(r"""File\s+(["'])[^"'\r\n]*\1,\s*line\s+\d+(?:,\s*in\s+[^\s,;]+)?""")
+_QUOTED_PATH = re.compile(r"""(['"])(?:[A-Za-z]:[\\/]|\\\\|~[\w.-]*[\\/]|/)[^'"\r\n]*\1""")
+_UNQUOTED_PATHS = (
     # a drive path (C:\... or C:/...), not the scheme of a URL
-    (re.compile(r"""(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    re.compile(r"""(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'"]*"""),
     # a home path: ~/x, ~user/x
-    (re.compile(r"""(?<![\w.-])~[\w.-]*[\\/][^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    re.compile(r"""(?<![\w.-])~[\w.-]*[\\/][^\s'"]*"""),
     # an absolute POSIX path of two or more parts (not a URL's: its slashes follow ':' or '/' or a host)
-    (re.compile(r"""(?<![\w:/.-])/(?:[\w.@+-]+/)+[\w.@+-]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    re.compile(r"""(?<![\w:/.-])/(?:[\w.@+-]+/)+[\w.@+-]*"""),
+    # a RELATIVE POSIX path (review V11, LOW-16): two or more separators (`data/worlds/w/points.json`), or one
+    # before a file name with an extension (`images/00000042.jpg`) -- never a fraction (`3/4`), a model id
+    # (`IDEA-Research/grounding-dino-base`), or a part of a URL or of an absolute path (what precedes it)
+    re.compile(r"""(?<![\w.@+:/~\\-])(?:[\w.@+-]+/){2,}[\w.@+-]*"""),
+    re.compile(r"""(?<![\w.@+:/~\\-])[\w.@+-]+/[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w/])"""),
     # anything else with a backslash in it: a UNC path, a relative Windows path
-    (re.compile(r"""[^\s'"]*\\[^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    re.compile(r"""[^\s'"]*\\[^\s'"]*"""),
 )
+# The words after a space that are still the same path: each holds a separator (`C:\Program Files\x`), or is a
+# file name with an extension (`C:\Users\x\my file.txt`, review V11, LOW-16).
+_PATH_TAIL = re.compile(r"""(?:\s+(?:[^\s'"]*[\\/][^\s'"]*"""
+                        r"""|[^\s'"\\/]*\.[A-Za-z][A-Za-z0-9]{0,7}(?=$|[\s)\]},;:'"]|\.(?:$|\s))))*""")
+# A path that ends at a user's own directory (`C:\Users\John`, `/home/John`) and the capitalised words after it,
+# which are the rest of a spaced name (`C:\Users\John Smith`, review V11, LOW-16).
+_USER_DIR_END = re.compile(r"""(?:^|[\\/])(?:users|home)[\\/][^\\/]+$""", re.IGNORECASE)
+_NAME_WORDS = re.compile(r"""(?:\s+[A-Z][^\s'"\\/]*)+""")
+# Sentence punctuation a path match takes with it (`...\x.py);`): given back, unless it closes a bracket the
+# path itself opened (`C:\Program Files (x86)`).
+_CLOSING = {")": "(", "]": "[", "}": "{"}
+_TRAILING = ")]},;.:"
 
 
 USER_PLACEHOLDER = "[user]"
+# What `owner_facing_detail` says in their place: plain words, no brackets (review V11, LOW-17).
+OWNER_PATH_WORDS = "a path"
+OWNER_USER_WORDS = "a user name"
 
 
 def _user_names() -> set[str]:
@@ -1657,22 +1767,92 @@ def _user_names() -> set[str]:
     return names
 
 
+def _exception_lines(text: str) -> list[str]:
+    """The non-empty lines of a traceback that are not its frames: a `File "...", line N` line, and the
+    indented source and caret lines under it, are left out (review V11, LOW-16), and so is a line of
+    punctuation alone (the header's own colon)."""
+    out, under_frame = [], False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _FRAME.match(line):
+            under_frame = True
+            continue
+        if under_frame and raw[:1].isspace():
+            continue
+        under_frame = False
+        if any(ch.isalnum() for ch in line):
+            out.append(line)
+    return out
+
+
 def _one_line(text: str) -> str:
-    """One line of `text`: a traceback becomes the text before it and its last line (the exception
-    itself); other multi-line text its first line."""
+    """One line of `text`: a traceback -- with its header, or frames without one -- becomes the text
+    before it and its last line that is not a frame (the exception itself); other multi-line text its
+    first line."""
     at = text.find(_TRACEBACK)
-    if at >= 0:
-        head = " ".join(text[:at].split()).rstrip(" :;,-(")
-        rest = text[at + len(_TRACEBACK):]
+    framed = at < 0 and any(_FRAME.match(ln.strip()) for ln in text.splitlines())
+    if at >= 0 or framed:
+        head = " ".join(text[:at].split()).rstrip(" :;,-(") if at >= 0 else ""
+        rest = text[at + len(_TRACEBACK):] if at >= 0 else text
         lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
         if len(lines) > 1:
-            last = lines[-1]
+            kept = _exception_lines(rest)
+            last = kept[-1] if kept else ""
         else:
             hits = list(_EXCEPTION_NAME.finditer(rest))
             last = rest[hits[-1].start():].strip() if hits else ""
         return ": ".join(part for part in (head, last) if part) or "a traceback"
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[0] if lines else ""
+
+
+def _without_frames(text: str) -> str:
+    """`text` without the traceback frames left in one line of it (review V11, LOW-16)."""
+    if not _FRAME.search(text):
+        return text
+    out = re.sub(r"\s{2,}", " ", _FRAME.sub("", text)).strip(" ,;:")
+    return out or "a traceback"
+
+
+def _given_back(path: str) -> tuple[str, str]:
+    """`path` without the sentence punctuation its match took with it, and that punctuation: a closing
+    bracket the path did not open, and `;`, `,`, `.` and `:` at its end (review V11, LOW-16)."""
+    end = len(path)
+    while end > 1 and path[end - 1] in _TRAILING:
+        opener = _CLOSING.get(path[end - 1])
+        if opener is not None and path[:end].count(opener) >= path[:end].count(path[end - 1]):
+            break
+        end -= 1
+    return path[:end], path[end:]
+
+
+def _scrub_paths(text: str) -> str:
+    """Every path in `text` as `PATH_PLACEHOLDER`: quoted ones with their quotes kept; unquoted ones with
+    the words after a space that are still the path (`_PATH_TAIL`, `_NAME_WORDS`), and without the
+    sentence punctuation after them (`_given_back`)."""
+    text = _QUOTED_PATH.sub(r"\1" + PATH_PLACEHOLDER + r"\1", text)
+    for pattern in _UNQUOTED_PATHS:
+        out, at = [], 0
+        for m in pattern.finditer(text):
+            if m.start() < at:
+                continue
+            end = m.end()
+            while True:
+                grown = _PATH_TAIL.match(text, end).end()
+                if _USER_DIR_END.search(text, m.start(), grown):
+                    name = _NAME_WORDS.match(text, grown)
+                    grown = name.end() if name else grown
+                if grown == end:
+                    break
+                end = grown
+            back = _given_back(text[m.start():end])[1]
+            out.append(text[at:m.start()] + PATH_PLACEHOLDER + back)
+            at = end
+        out.append(text[at:])
+        text = "".join(out)
+    return text
 
 
 def _shorten(text: str, max_chars: int) -> str:
@@ -1687,18 +1867,19 @@ def _shorten(text: str, max_chars: int) -> str:
 def client_safe_detail(text, *, max_chars: int | None = None) -> str:
     """Raw diagnostic text made safe for a client (review V10, MED-5): ONE line (a traceback is
     reduced to the text before it and its last line, the exception; other multi-line text to its
-    first line), NO PATH (drive, UNC, home and absolute POSIX paths, quoted or not, become
-    `PATH_PLACEHOLDER`, and with them the user names they carry), NO USER NAME left anywhere else
-    (this machine's, `USER_PLACEHOLDER`), and, with `max_chars`, at most that long. The exception
-    class and its message stay: this is the diagnostic text. "" for no text. Single-line text with
-    none of those, at most `max_chars` long, is returned unchanged."""
+    first line; every other line break is a space, and no traceback frame is left), NO PATH (drive,
+    UNC, home, absolute and relative POSIX paths, quoted or not, become `PATH_PLACEHOLDER`, and with
+    them the user names they carry), NO USER NAME left anywhere else (this machine's,
+    `USER_PLACEHOLDER`), and, with `max_chars`, at most that long. The exception class and its message
+    stay: this is the diagnostic text. "" for no text. Single-line text with none of those, at most
+    `max_chars` long, is returned unchanged."""
     if text is None:
         return ""
-    text = str(text)
+    text = str(text).translate(_OTHER_LINE_BREAKS)
     if "\n" in text or "\r" in text or _TRACEBACK in text:
         text = _one_line(text)
-    for pattern, replacement in _PATHS:
-        text = pattern.sub(replacement, text)
+    text = _without_frames(text)
+    text = _scrub_paths(text)
     for name in _user_names():
         text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", USER_PLACEHOLDER, text, flags=re.IGNORECASE)
     if max_chars is not None:
@@ -1711,18 +1892,52 @@ def owner_facing_detail(text) -> str:
     (`lifecycle.reason`, the phone's `model_state_reason`; review V10, MED-5, and the lead's
     preference given the Mac's `WorldTowerText` guard of 3bb4431, which swaps any Tower text holding a
     class name for a generic sentence). "RuntimeError: CUDA out of memory" reads "CUDA out of
-    memory". Text with no path, traceback, line break or class name is returned unchanged."""
+    memory". And WITHOUT SQUARE BRACKETS (review V11, LOW-17: that guard reads brackets as JSON): a
+    path reads "a path" and a user name "a user name", `[Errno N]` goes the way `[WinError N]` does,
+    and no "(: " is left where a class name was. Text with no path, traceback, line break, class name
+    or bracket is returned unchanged."""
     safe = client_safe_detail(text)
     owner = _WIN_ERROR.sub("", safe)
+    owner = _ERRNO.sub("", owner)
     owner = _CLASS_PREFIX.sub("", owner)
     owner = _EXCEPTION_NAME.sub("", owner)
+    owner = re.sub(r"""(['"]?)""" + re.escape(PATH_PLACEHOLDER) + r"\1", OWNER_PATH_WORDS, owner)
+    owner = re.sub(r"""(['"]?)""" + re.escape(USER_PLACEHOLDER) + r"\1", OWNER_USER_WORDS, owner)
+    owner = owner.replace("[", "").replace("]", "")
     if owner == safe:
         return safe
     owner = re.sub(r"\(\s*\)", "", owner)          # "(KeyboardInterrupt)" leaves "()"
+    owner = re.sub(r"\(\s*:\s*", "(", owner)       # "(OSError: x" leaves "(: x"
+    owner = re.sub(r":\s+:", ":", owner)           # "failed: EOFError: x" leaves "failed: : x"
     owner = re.sub(r"\(\s+", "(", owner)
     owner = re.sub(r"\s+([);,])", r"\1", owner)
     owner = re.sub(r"\s{2,}", " ", owner)
     return owner.strip(" :;,")
+
+
+# The phone's text guard (`WorldTowerText`, Mac tips de1b045 and 3bb4431) replaces any Tower text longer than
+# this with a generic sentence. The listing row's `finalization.detail` and `.notice` are bounded to it (review
+# V11, MED-B); every closed-set notice is far shorter (`test_world_builder_notice_closed_set`).
+FINALIZATION_TEXT_MAX_CHARS = 700
+
+
+def client_safe_finalization(finalization):
+    """A session's `finalization` record as a client is sent it (review V11, MED-B: the `GET /worlds` row
+    sent it raw): a COPY whose `detail` and `notice` are `client_safe_detail` of the record's, at most
+    `FINALIZATION_TEXT_MAX_CHARS` long. The record on disk is not touched. A record whose texts have
+    nothing to scrub (every clean detail, every closed-set notice) is returned as it is, the same object,
+    so it is sent byte for byte as before; so is anything that is not a dict, and a text that is not a
+    string."""
+    if not isinstance(finalization, dict):
+        return finalization
+    safe = {}
+    for key in ("detail", "notice"):
+        value = finalization.get(key)
+        if isinstance(value, str):
+            scrubbed = client_safe_detail(value, max_chars=FINALIZATION_TEXT_MAX_CHARS)
+            if scrubbed != value:
+                safe[key] = scrubbed
+    return dict(finalization, **safe) if safe else finalization
 
 
 def _count(value) -> int | None:
@@ -1844,9 +2059,25 @@ def _gate_cause(gate: dict) -> str | None:
         if gate.get("cause") == CAUSE_CONSENSUS_DEFERRED:
             return "consensus-deferred"
         return _depth_cause(_dict(gate.get("depth")).get("detail"))
+    no_rerun = _depth_cause_not_retryable(gate)
+    if no_rerun:
+        return no_rerun
     if _scale_short_with_depth(gate):
         return "scale-short"
     return None
+
+
+def _depth_cause_not_retryable(gate: dict) -> str | None:
+    """The cause of a scale fail-safe whose depth stage could not start for the walk's or the solve's own
+    reason (`DEPTH_CAUSES_NOT_RETRYABLE`), which the gate records NOT retryable (review V11, LOW-15), or None.
+    Its notice is the one the same record said while it was retryable: exactly the records that were."""
+    if gate.get("state") != GATE_STATE_APPLIED or gate.get("retryable") or not gate.get("masks_applied"):
+        return None
+    depth = _dict(gate.get("depth"))
+    if depth.get("state") != DEPTH_UNAVAILABLE:
+        return None
+    cause = _depth_cause(depth.get("detail"))
+    return cause if cause in DEPTH_CAUSES_NOT_RETRYABLE else None
 
 
 def _scale_short_with_depth(gate: dict) -> bool:
@@ -1890,10 +2121,12 @@ def publish_notice(summary: dict | None) -> str | None:
 
 
 def publish_detail(summary: dict | None) -> str | None:
-    """The same sentences as `publish_notice`, with the raw text each cause was recorded with in
-    place of its fixed phrase: the DIAGNOSTIC twin, for the finalization's `detail` (which the
-    phone does not show). What `publish_notice` said before review V9, M-4. None exactly when
-    `publish_notice` is None."""
+    """The same sentences as `publish_notice`, with the text each cause was recorded with, made
+    client-safe (`client_safe_detail`), in place of its fixed phrase: the DIAGNOSTIC twin, for the
+    finalization's `detail`. That field DOES reach clients -- the `GET /worlds` row and `/ws`
+    `lifecycle.finalization` send it, and `lifecycle.reason`, which the phone shows on an interrupted
+    session, quotes it owner-facing (`owner_facing_detail`; review V10, MED-5; V11, MED-B). What
+    `publish_notice` said before review V9, M-4. None exactly when `publish_notice` is None."""
     causes = notice_causes(summary)
     if not causes:
         return None

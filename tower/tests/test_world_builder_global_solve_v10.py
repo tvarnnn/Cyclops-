@@ -145,33 +145,44 @@ def test_without_a_kill_the_full_consensus_is_published_over_draw_0(walk, seeds,
     assert published["gate"]["consensus"]["state"] == CP.CONSENSUS_APPLIED
     assert CP.regate_owed(walk.store, walk.world_id, walk.session_id) is None
     assert summary["gate"]["consensus"]["state"] == CP.CONSENSUS_APPLIED
-    # Draw 0 is gated twice (the early publish, then the consensus), each draw after it once;
-    # no gate is handed a stop the caller did not give.
-    assert len(depth_calls) == 4 and not any(c["stop"] for c in depth_calls)
-    assert depth_calls[0]["identity"] == depth_calls[1]["identity"]
-    # what the early publish cost is on the record: draw 0's second gate, every prediction cached
+    # DRAW 0 IS GATED ONCE (review V11, LOW-1): the early publish's gate of it is handed to the
+    # consensus, which gates each further draw once. At a559fc0 draw 0 was gated twice (4 depth
+    # stages). No gate is handed a stop the caller did not give.
+    assert len(depth_calls) == 3 and not any(c["stop"] for c in depth_calls)
+    ids = [c["identity"] for c in depth_calls]
+    assert ids.count(ids[0]) == 1, "draw 0's depth stage ran once (this fake maps draws 1 and 2 alike)"
+    # what draw 0 cost is on the record, and it is the gate that ran: the first, cold one -- at
+    # a559fc0 the record said {cached: all, predicted: 0}, the second gate's
     draw0 = published["gate"]["consensus"]["draws"][0]
     assert draw0["draw"] == 0 and isinstance(draw0["gate_s"], float)
-    assert draw0["predictions"]["predicted"] == 0 and draw0["predictions"]["cached"] > 0
+    assert draw0["predictions"]["predicted"] > 0 and draw0["predictions"]["cached"] == 0
+    if published["gate"]["consensus"]["chosen"]["draw"] == 0:
+        assert published["gate"]["depth"]["predictions"] == draw0["predictions"]
+        assert published["gate"]["seconds"] == draw0["gate_s"]
 
 
-@pytest.mark.parametrize("stop_at", ["after-draw-0", "during-draw-0-regate", "after-draw-1"])
+@pytest.mark.parametrize("stop_at", ["after-draw-0", "during-draw-1-gate", "after-draw-1"])
 def test_a_callers_stop_never_publishes_a_stopped_draw_0(walk, seeds, depth_calls, colmap, stop_at):
     """With a depth stage that HONOURS the stop (review V10, MED-1: the V9 tests' fake ignored
     it, so they passed for the wrong reason). Wherever the stop is asked -- before the further
-    draws, while draw 0 is gated again for the consensus, or between draws -- the published
-    solve is draw 0 ATTACHED, `deferred`, owed: never the anchor-only fail-safe a stopped depth
-    stage gives. At e5f7151 a stop asked before the further draws reached draw 0's own gate."""
+    draws, while a further draw is gated, or between draws -- the published solve is draw 0
+    ATTACHED, `deferred`, owed: never the anchor-only fail-safe a stopped depth stage gives. At
+    e5f7151 a stop asked before the further draws reached draw 0's own gate.
+
+    (V10's "during-draw-0-regate" case -- a stop reaching draw 0's SECOND gate -- cannot happen
+    since review V11, LOW-1: draw 0 is gated once. That is asserted below; the stop that reaches
+    a further draw's gate takes its place.)"""
     def stop() -> bool:
         if stop_at == "after-draw-0":
             return len(seeds) >= 1
         if stop_at == "after-draw-1":
             return len(seeds) >= 2
-        # asked once draw 0's depth stage has run a second time (the consensus's own gate)
-        ident = [c["identity"] for c in depth_calls]
-        return len(ident) >= 2 and ident[0] == ident[1]
+        # asked once draw 1's depth stage has begun: it reaches that draw's own gate
+        return len(depth_calls) >= 2
 
     summary = _finish(walk, should_stop=stop)
+    ids = [c["identity"] for c in depth_calls]
+    assert ids.count(ids[0]) == 1, "draw 0 is gated once"
     published = _published(walk)
     gate = published["gate"]
     assert gate["consensus"]["state"] == CP.CONSENSUS_DEFERRED
@@ -181,10 +192,13 @@ def test_a_callers_stop_never_publishes_a_stopped_draw_0(walk, seeds, depth_call
     assert published["solve"]["seed"] == 5
     assert CP.regate_owed(walk.store, walk.world_id, walk.session_id) == CP.CAUSE_CONSENSUS_DEFERRED
     assert summary["gate"]["consensus"]["state"] == CP.CONSENSUS_DEFERRED
-    assert seeds == {"after-draw-0": [5], "during-draw-0-regate": [5], "after-draw-1": [5, 6]}[stop_at],         "no draw is mapped after the stop is seen"
-    if stop_at == "during-draw-0-regate":
-        # the stop reached draw 0's second gate: nothing was written over the early publish
-        assert gate["consensus"]["why"] == CP.WHY_PUBLISHED_FIRST
+    assert seeds == {"after-draw-0": [5], "during-draw-1-gate": [5, 6], "after-draw-1": [5, 6]}[stop_at], \
+        "no draw is mapped after the stop is seen"
+    if stop_at == "during-draw-1-gate":
+        # the stop cost draw 1 its vote: draw 0 -- the early publish's own gate of it -- is
+        # published over the early publish, deferred by the stop
+        assert gate["consensus"]["why"] == CP.WHY_STOPPED
+        assert gate["consensus"]["draws"][0]["predictions"]["predicted"] > 0
 
 
 def test_a_draw_0_fail_safe_is_published_once_and_no_draw_is_mapped(walk, seeds, engines, colmap,

@@ -1796,34 +1796,38 @@ def _publish_draw_0_first(store, world_id: str, session_id: str, workspace: Solv
     2. It is also the LAST publish when draw 0's gate attached nothing (a fail-safe: the
        consensus has nothing to vote on, and is `not-needed` or `deferred` exactly as without
        the early publish), or when the caller's stop is already asked.
-    3. FULL CONSENSUS: `gate_and_publish(...)` as before. Draw 0 is gated a second time; its
-       depth predictions are all in the prediction cache by then, so the second gate is the
-       fit, the scale and the gate alone -- measured on draws >= 1 of real consensus runs,
-       25-37 s at 398 keyframes (b2a75ab4) and 60-64 s at 690 (6839fb8f), against 88-94 s for
-       a cold draw-0 gate; the early publish's writes are 0.3 s at 690 (RUN P3-SOL2). The
-       published record says what it cost: `gate.consensus.draws[0].gate_s` is that second
-       gate (and its `predictions`, all cached). Nothing else is recorded, so a consensus whose
-       draws agree still publishes byte for byte what one draw does, but for `gate.consensus`.
-       With a caller's stop it is asked with `keep_on_stop`: a stop that reaches draw 0's
-       re-gate publishes NOTHING (the early publish stands, owed), never an anchor-only
-       fail-safe over it; a stop between or in the further draws publishes draw 0 `deferred`,
-       as before."""
+    3. FULL CONSENSUS: `gate_and_publish(...)` as before, but DRAW 0 IS NOT GATED AGAIN
+       (review V11, LOW-1): the early publish's own gate result for it (`GateResult.draw_0`) is
+       handed to the consensus (`draw_0=`), which maps and gates draws 1..N-1 only. So what an
+       uninterrupted run publishes is exactly what one pass over the N draws publishes, and
+       what the record says draw 0 cost -- `gate.consensus.draws[0].gate_s`, its
+       `predictions`, its share of `gate.consensus.seconds` -- is the gate that ran. Gated a
+       second time, draw 0 could meet a transient failure the first gate did not (the surface
+       lock held, GPU memory) and publish an anchor-only fail-safe over the room the early
+       publish had attached; and it cost 25-64 s more (RUN P3-SOL2, V11 RV11-A/B).
+       With a caller's stop it is asked with `keep_on_stop`, as before: nothing it gates is
+       draw 0, so that guard only matters if the early publish's gate result is not to hand
+       (then draw 0 is gated again, as before V11); a stop between or in the further draws
+       publishes draw 0 `deferred`, as before."""
     from tower.world_builder import coherence_publish  # noqa: PLC0415
 
+    gated: list = []
     first, first_record = coherence_publish.gate_and_publish(
         store, world_id, session_id, workspace, dataclasses.replace(solution), final=final,
         gate=gate, database_path=database_path, keyframes=keyframes, write=write_solution,
-        consensus=plan, stopped=True, why_deferred=coherence_publish.WHY_PUBLISHED_FIRST)
+        consensus=plan, stopped=True, why_deferred=coherence_publish.WHY_PUBLISHED_FIRST,
+        gate_results=gated)
     record = first_record or {}
     attached = (record.get("state") == coherence_publish.GATE_STATE_APPLIED
                 and record.get("attach") is True)
     if not attached or (should_stop is not None and should_stop()):
         return first
+    draw_0 = getattr(gated[0], "draw_0", None) if gated else None
     stop_kw = {} if should_stop is None else {"should_stop": should_stop, "keep_on_stop": True}
     published, _record = coherence_publish.gate_and_publish(
         store, world_id, session_id, workspace, solution, final=final, gate=gate,
         database_path=database_path, keyframes=keyframes, write=write_solution, consensus=plan,
-        **stop_kw)
+        draw_0=draw_0, **stop_kw)
     return first if published is None else published
 
 

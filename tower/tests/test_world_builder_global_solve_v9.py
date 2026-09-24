@@ -358,7 +358,8 @@ def test_without_a_stop_the_consensus_runs_every_draw(walk, counted, colmap):
 def test_without_a_callers_stop_no_stop_is_handed_on(walk, engines, colmap, monkeypatch):
     """No caller's stop, no `should_stop` to either publish. Review V10 MED-1(a): a consensus
     that maps further draws publishes draw 0 first (`stopped`, draw 0 as N = 1 publishes it),
-    then the full consensus, with today's arguments."""
+    then the full consensus, with today's arguments -- and, since review V11 LOW-1, the first
+    publish's gate result handed on (`gate_results`, then `draw_0`), so draw 0 is gated once."""
     seen = []
     real = CP.gate_and_publish
 
@@ -369,4 +370,4 @@ def test_without_a_callers_stop_no_stop_is_handed_on(walk, engines, colmap, monk
     monkeypatch.setattr(CP, "gate_and_publish", recording)
     _finish(walk)
     today = ["final", "gate", "database_path", "keyframes", "write", "consensus"]
-    assert seen == [sorted(today + ["stopped", "why_deferred"]), sorted(today)]
+    assert seen == [sorted(today + ["stopped", "why_deferred", "gate_results"]), sorted(today + ["draw_0"])]

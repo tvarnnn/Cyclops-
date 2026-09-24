@@ -36,8 +36,8 @@ Set them in `tower\.env` (see `tower/.env.example`) or in the Tower's environmen
 | --- | --- | --- | --- | --- |
 | `TOWER_WORLD_SOLVE_MASKS` | `false` | Masks the wearer's hands, arms and held phone in every image of the session's **final** solve. With a walk database, the solve maps from a filtered copy of it (`walk-database-filtered`). Without one, it re-extracts features under the masks (`re-extracted`). The masks are cached per image (§6). An image that cannot be masked is left out of the solve (§4, "fail-safes"). The background solves during a walk are unchanged | `TOWER_WORLD_SOLVE` (on by default) and pycolmap. The GPU detectors (Grounding DINO + SAM 2.1, and OneFormer). If they cannot run, the solve runs **unmasked**, `transients.state` in `solution.json` says so, and a gated solve writes a notice (contract §3.1) | 132–451 s a world for 218–795 keyframes, or 0.54–0.60 s a keyframe, with an empty cache (`RUN\experiments\P3-VAL\TABLE.md`, code `e2e7582`). GPU peak 2,678 MB on 383 images (`RUN\experiments\P3-PM\out-masks2.log`). A later solve of the same images computes none: 690 of 690 came from the cache (`RUN\experiments\P3-H2\real\B.solution.json`) |
 | `TOWER_WORLD_SOLVE_SEED` | unset | An integer ≥ 0 seeds every random generator of the final solve's mapper, and the mapper then runs on **one** thread. A seeded final solve also **freezes its matching** (§6). Unset, blank, `off`, or anything that is not a non-negative integer, means today's multi-threaded, unseeded solve. Recorded as `solve.seed` and `solve.threads` | `TOWER_WORLD_SOLVE`. The consensus needs it | Mapping is 3.3× slower: 111 s against 33 s at 383 keyframes (`RUN\research\D1-sfm-slam-posegraph.md` §0, §2.4). The seeded mapping took 23–181 s a world (`P3-VAL\TABLE.md`) |
-| `TOWER_WORLD_SOLVE_GATE` | `false` | Runs on the final solve only. It computes depth before publishing (MoGe-2 ViT-L) and a metric scale per camera, then applies the evidence gate. It relabels the room and the unplaced pieces, and writes `solve\<session>\components.json`. The depth predictions are cached (§6). Off publishes the solve as the solver returned it | **Masks:** if `transients.state` is not `applied`, the gate attaches nothing outside the room's anchor block (reason `masks-unavailable`). **Metric scale:** if fewer than half the supported cameras have a ratio, it attaches nothing (reason `scale-unavailable`). If depth failed, the finisher owes a re-gate in place. An exception in the gate publishes the solve **ungated**, with `components: null` (`coherence_publish.py`). Every fail-safe writes `finalization.notice`, from a closed set of sentences (contract §3.1, v8) | 40–164 s a world, of which depth is 39–160 s over 203–712 frames (`P3-VAL\TABLE.md`). With the predictions cached, the gate took 60 s against 190 s on 678 frames (`P3-H2\real\B.solution.json`, `C.solution.json`). The room's final surface reuses the depth (`coherence_publish.py`, step 6). Disk: one set of predictions per walk, 311 MB for 678 frames (`dense_pipeline.py`) |
-| `TOWER_WORLD_SOLVE_CONSENSUS` | `1` | With N = 3, 5 or 7, a gated, seeded final solve maps N draws, with mapper seeds s … s+N−1, on its one frozen database, with the same masks and depth predictions. It gates each draw. **Only a draw whose gate attached votes.** Each keyframe votes attached to the room or not. It publishes the draw that agrees most with the strict majority; ties go to the lowest seed. A group of that draw's room that fewer than a strict majority attached is withheld as its own piece, reason `seed-unstable`. A group is never withheld if it holds a keyframe every voting draw attached (`kept`), and the room's anchor group never is. The withhold is re-gated and checked keyframe by keyframe, and if the check fails the chosen draw is published unchanged (`not-applied`). **Accepted values** are 1, 3, 5 and 7. Unset or blank means 1; anything else (even, above 7, garbage) means 1 and is logged (`config.world_solve_consensus_setting`) | `TOWER_WORLD_SOLVE_GATE` and `TOWER_WORLD_SOLVE_SEED`. Without the seed, the consensus records `not-run`. If the first draw took a fail-safe, there is nothing to vote on: `not-needed`, or `deferred` to the re-gate that the fail-safe owes (`coherence_publish.py`). The states are listed in §4 | About 250–260 s per extra draw on 678 posed keyframes. That is ~190 s of single-thread mapping plus ~60 s of gate, of which ~55 s is the depth stage re-fitting cached predictions; no GPU. N = 3 adds about 8.5 min (`RUN\experiments\P3-H2\PROGRESS.md`). The cap exists to bound the cost: at N = 30, a typo, it would have been about 2 h under the writer lock (`config.py`; V9 M-3) |
+| `TOWER_WORLD_SOLVE_GATE` | `false` | Runs on the final solve only. It computes depth before publishing (MoGe-2 ViT-L) and a metric scale per camera, then applies the evidence gate. It relabels the room and the unplaced pieces, and writes `solve\<session>\components.json`. The depth predictions are cached (§6). Off publishes the solve as the solver returned it | **Masks:** if `transients.state` is not `applied`, the gate attaches nothing outside the room's anchor block (reason `masks-unavailable`). **Metric scale:** if fewer than half the supported cameras have a ratio, it attaches nothing (reason `scale-unavailable`). If depth failed, the finisher owes a re-gate in place, except when the walk has no camera intrinsics or the solve has no camera: a re-gate would fail the same way, so those are not `retryable` and their notice names the owner who can fix them (V11 LOW-15). An exception in the gate publishes the solve **ungated**, with `components: null` (`coherence_publish.py`). Every fail-safe writes `finalization.notice`, from a closed set of sentences (contract §3.1, v8) | 40–164 s a world, of which depth is 39–160 s over 203–712 frames (`P3-VAL\TABLE.md`). With the predictions cached, the gate took 60 s against 190 s on 678 frames (`P3-H2\real\B.solution.json`, `C.solution.json`). The room's final surface reuses the depth (`coherence_publish.py`, step 6). Disk: one set of predictions per walk, 311 MB for 678 frames (`dense_pipeline.py`) |
+| `TOWER_WORLD_SOLVE_CONSENSUS` | `1` | With N = 3, 5 or 7, a gated, seeded final solve maps N draws, with mapper seeds s … s+N−1, on its one frozen database, with the same masks and depth predictions. It gates each draw. **Only a draw whose gate attached votes.** Each keyframe votes attached to the room or not. It publishes the draw that agrees most with the strict majority; ties go to the lowest seed. A group of that draw's room that fewer than a strict majority attached is withheld as its own piece, reason `seed-unstable`, whatever its keyframes (V10 MED-4 removed the `kept` exception; how many of its keyframes every voting draw attached is recorded as `unanimous_keyframes`, for audit only). The room's anchor group is never withheld. The withhold is re-gated and checked keyframe by keyframe, and if the check fails the chosen draw is published unchanged (`not-applied`). **Accepted values** are 1, 3, 5 and 7. Unset or blank means 1; anything else (even, above 7, garbage) means 1 and is logged (`config.world_solve_consensus_setting`) | `TOWER_WORLD_SOLVE_GATE` and `TOWER_WORLD_SOLVE_SEED`. Without the seed, the consensus records `not-run`. If the first draw took a fail-safe, there is nothing to vote on: `not-needed`, or `deferred` to the re-gate that the fail-safe owes (`coherence_publish.py`). The states are listed in §4 | About 250–260 s per extra draw on 678 posed keyframes. That is ~190 s of single-thread mapping plus ~60 s of gate, of which ~55 s is the depth stage re-fitting cached predictions; no GPU. N = 3 adds about 8.5 min (`RUN\experiments\P3-H2\PROGRESS.md`). The cap exists to bound the cost: at N = 30, a typo, it would have been about 2 h under the writer lock (`config.py`; V9 M-3) |
 | `TOWER_WORLD_AREA_BUILDS` | `false` | The idle finisher builds a surface and an appearance for each `shown_as: "area"` component, in `<world>\areas\<area_id>\`. Off: those areas are recorded as declined, which the phone shows as *could not be built*. `world_refinish.py` builds them either way | A components record, so the gate must be on. The finisher: `TOWER_WORLD_FINISH_PENDING`, `TOWER_WORLD_SURFACE` and `TOWER_WORLD_SOLVE` all on (`components.py`, `areas_nobody_will_build_reason`) | Per area: 8–17 s to prepare, plus 43–201 s of stages. That is 9 areas on 4 worlds; a walk had 0–5 areas (`P3-VAL\TABLE.md`) |
 | `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`: after a tracking loss, the builder matches incoming frames at 2 Hz against the 10 keyframes before the loss. When it relocalizes, it journals a verified revisit link. When it does not, it asks the wearer to look back: at most 2 prompts in any 60 s, with a 30 s cooldown (`relocalizer.py`). `silent`: it runs and records, but never prompts (the test's prompt-off arm). `on`, `true`, `yes` and `1` mean `prompt`. Any other word means `off`, and is logged | The **builder** reads it at each session start, from the environment it inherits from the Tower. It needs the session's calibration (`engine.py`). A final solve imports the revisit links only when the masks are `applied` and the solve is gated. It imports them only into the database it maps, never the walk database. Of those, it drops only the pairs the import itself created that have fewer than 50 verified inliers there; a pair that loop detection or an earlier solve verified stays (contract §2.5, `solve.revisit_pairs`; V9 M-9, M-10, `99420c4`). The relocalizer writes a link only when every live leg had 50 inliers or more (`relocalizer.REVISIT_MIN_INLIERS`). The phone speaks prompts only in a DEBUG build (contract §6.5) | 0.09–0.28 of one core at 2 Hz, only while an episode is open. It asked 0.81–1.29 times a minute when replayed on 7 walks (`RUN\experiments\P3-PR\out\PRODUCT.md`, measured before `2dcf680`) |
 
@@ -629,8 +629,18 @@ Read §2.2 for what each one means.
   sentences, joined by `"; "`. Its only variable text is integer image counts and a gate
   clause from the same table. It never carries exception text, a path or a measured
   figure (V9 M-4, `30c28c0`).
-- **The diagnostics are in `finalization.detail`,** which the phone does not show: the
-  raw reason, error text included (`e5f7151`).
+- **The diagnostics are in `finalization.detail`,** and they reach clients, so they are
+  client-safe: one line, no path, no traceback frame and no user name; the exception class
+  and its message stay (`coherence_publish.client_safe_detail`; V10 MED-5, V11 MED-B).
+  - The `GET /worlds` row and `/ws` `lifecycle.finalization` both carry it. The row's copy
+    is made client-safe as it is served (`world_builder_library._client_safe_finalization`),
+    `notice` included, and each text is at most 700 characters, the phone guard's own bound.
+  - On an interrupted session, `lifecycle.reason` quotes it owner-facing, with no class name
+    and no square brackets ("a path", "a user name"), and the phone shows that reason
+    (`coherence_publish.owner_facing_detail`).
+  - The full text stays in the Tower's log and in `solution.json`'s own records
+    (`gate.detail`, `gate.depth.detail`, `transients.detail`). The session record keeps the
+    writer's text; only what is sent is scrubbed.
 - **Images that cannot be masked are excluded, with a bound** (V9 M-8, `0f9cc83`;
   `solve_masks.py`):
   - A failed hash or read is tried once more.
@@ -643,6 +653,20 @@ Read §2.2 for what each one means.
   - If **no** image could be masked, the state is `unavailable`, with cause
     `images-unmaskable` and `none_masked`. The notice names the images, not the
     detector.
+  - **Excluded means left out of a masked solve** (V10 L-11b, `315b6bf`). An image is kept
+    out only by its all-0 mask and the filter, and both act only when the masks reach the
+    solve (`extraction_masked: true`). So `images_excluded`, `excluded_examples`,
+    `excluded_reasons` and `exclusion_notice_due` count only then. A record that is
+    `unavailable` (`images-unmaskable` included) belongs to a solve that ran unmasked with
+    every image in it: it reads 0, `[]`, `{}` and `false`, owes no exclusion notice, and
+    `images_unmasked` and `detail` say what could not be masked. Such a record no longer
+    carries per-reason counts (RV11-D LOW-3, backlog).
+  - **`cache_write_failed`** (V10 L-12b): a mask the detector computed but could not write
+    to the mask cache (a full disk, a held file, MAX_PATH) is used for this solve, kept in
+    memory, and counted here. The key is present only when the count is above 0, in the
+    solve's `transients` record and in the surface stage's transient record. The next solve
+    finds no cache entry and computes the mask again. It is not a detector failure, and it
+    does not make the masks `unavailable`.
 
 **Where the consensus votes are** (contract §2.5, v7 and v8):
 
@@ -662,9 +686,12 @@ Read §2.2 for what each one means.
     and agreement;
   - the `chosen` draw;
   - **`groups`:** the chosen draw's groups, with their `keyframe_ids`, `votes`,
-    `ambiguous` (not unanimous), and `decision`: `anchor`, `attached`, `kept`,
-    `seed-unstable` or `unplaced`. `kept` is a group fewer than a majority attached but
-    that holds a keyframe every voting draw attached, so it is not withheld;
+    `ambiguous` (not unanimous), and `decision`: `anchor`, `attached`, `seed-unstable`,
+    `unplaced`, or `not-withheld`. A `seed-unstable` group of the room is withheld whole,
+    and carries `unanimous_keyframes`, the count of its keyframes every voting draw attached,
+    for audit only (V10 MED-4 removed `kept`). `not-withheld` is a group the vote would have
+    withheld when the withhold re-gate failed its check (`not-applied`): it stays in the
+    published room (V10 L-4);
   - **`pieces`:** what the chosen draw's groups cannot show (`30c28c0`, `e5f7151`). It
     lists every other draw's unplaced piece on which the draws disagree, with:
     - its `keyframe_ids`, `from_draw`, `votes` and `majority_attached`;
@@ -682,7 +709,27 @@ Read §2.2 for what each one means.
     (`RUN\mailbox\to-lead\025-v9-and-option-a.md`, decision 2).
   - It is absent when N = 1.
 - **`solve\<session>\consensus.json`:** each draw's per-round gate decisions. Written
-  only when N ≥ 2.
+  only when N ≥ 2 and further draws were mapped. A publish that writes no such record moves
+  an older one aside to `consensus.superseded.json` (never deletes it), so it cannot sit
+  beside a solve it does not describe (V11 LOW-4). That covers N = 1, the gate off, a
+  consensus that is `not-needed` or `not-run` or was `deferred` before any further draw was
+  mapped, and the solve's early publish of draw 0.
+
+**While a consensus finish is finalizing, the row serves draw 0's `components`** (V11 LOW-3;
+documented, not changed).
+
+- A consensus solve publishes draw 0 first (`global_solve._publish_draw_0_first`), with its
+  `components.json`, and then maps and gates the further draws. On acc2's timings that took
+  168–281 s (RV11-B). During that window the session is `finalizing`, and the
+  `GET /worlds` row's `components` are draw 0's.
+- When the consensus publishes, `components` becomes the consensus's. A group that only draw
+  0 attached can then leave the room and appear as its own piece, reason `seed-unstable`.
+- Draw 0 is gated once. The consensus is handed the early publish's own gate result for it,
+  so what it publishes is what one pass over the N draws publishes (V11 LOW-1).
+- Once the room is built from the consensus, the phone sees a new room revision of the same
+  walk and handles it under `WORLD-BUILDER-IOS.md` §10's existing rules: the page is swapped
+  in when the Tower reports nothing building (`live: false`); otherwise the phone offers
+  *"A newer reconstruction is ready. Show it"*. Nothing new is needed on the phone.
 
 **`components.superseded.json`** is a record set aside when a solution was published
 without the gate (`coherence_publish.py`).
@@ -818,6 +865,14 @@ Each source of variation, and what `e5f7151` does with it:
   no longer loses the depth (V9 M-11, `0f9cc83`).
 - The cache is pruned to one set per walk (§2.7), and it is left out of the re-finish's
   set-aside copy (§2.4).
+- **`prediction_cache.pruned.index_rewritten`** (V10 L-14, in `dense\<session>\align.json`):
+  a set's index that was read but is torn (not JSON, not UTF-8, or no `keyframes` map) is
+  rewritten from the stage that just completed, and nothing is pruned on the strength of it
+  that run (`kept_because` says why). The prune runs again from the next completed stage. An
+  index that cannot be opened at all is left alone, as before.
+- **A prediction with no finite value is a miss** (V10 L-15): a cached one is predicted
+  again (and logged), a fresh one is not kept, and a fit is never recorded `ok` with a
+  non-finite scale or offset.
 - **One lock for every writer of `dense\<session>\`.** A hand-run densify now also takes
   the session's surface lock, which the gate's and the surface's depth stages hold. If
   it cannot, it returns `unavailable` and writes nothing (V9 Q8, `dense_pipeline.py`).
