@@ -16,6 +16,7 @@
 > v7 (2026-09-24) adds the reason `seed-unstable` (§2.2; consensus, §2.5), frozen
 > matching, the depth-prediction cache and the re-finish's raw frames by capture identity (§7 rule 4).
 > v8 (2026-09-24): `finalization.notice` is a closed set of sentences (§3.1); P3.6 manifest keys (§2.5).
+> v9 (2026-09-24): four closed-set sentences revised; `detail` client-safe (§3.1).
 > Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
@@ -230,6 +231,10 @@ figure is ever in a notice; the diagnostics are in `finalization.detail`, which 
 show. The phone renders each verbatim and never matches on it (Mac `de1b045` also replaces anything
 that looks like machine output). The set is exported by the Tower as
 `coherence_publish.NOTICE_SENTENCES` plus the finisher's three sentences.
+(v9: four sentences revised so none promises a re-run that cannot fix its cause; every sentence also passes
+the phone's text guard (Mac `3bb4431`): no lower-case `key=value`, no exception class name, one line.)
+`finalization.detail` is client-safe too (v9, V10 MED-5): one line, no path or user name, a traceback cut
+to its exception line, at most about 200 characters of reason; `lifecycle.reason` is owner-facing.
 
 | Cause | Sentence |
 |---|---|
@@ -253,12 +258,12 @@ that looks like machine output). The set is exported by the Tower as
 | `depth-unavailable` | *the evidence gate could not measure metric scale (the depth stage did not finish); the Tower re-runs the gate when it is idle* |
 | `depth-stopped` | *the evidence gate could not measure metric scale (the depth stage was stopped); the Tower re-runs the gate when it is idle* |
 | `depth-gpu-oom` | *the evidence gate could not measure metric scale (GPU out of memory); the Tower re-runs the gate when it is idle* |
-| `depth-model-missing` | *the evidence gate could not measure metric scale (the depth model is not installed on this Tower); the Tower re-runs the gate when it is idle* |
+| `depth-model-missing` | *the evidence gate could not measure metric scale (the depth model is not installed on this Tower); an operator can install the depth model on this Tower, then the Tower re-runs the gate when it is idle* |
 | `depth-surface-busy` | *the evidence gate could not measure metric scale (another surface build of this walk was running); the Tower re-runs the gate when it is idle* |
-| `depth-no-intrinsics` | *the evidence gate could not measure metric scale (the walk has no camera intrinsics); the Tower re-runs the gate when it is idle* |
-| `depth-no-camera` | *the evidence gate could not measure metric scale (the solve has no camera); the Tower re-runs the gate when it is idle* |
+| `depth-no-intrinsics` | *the evidence gate could not measure metric scale (the walk has no camera intrinsics); re-running the gate would not change this; an owner can re-capture this walk* |
+| `depth-no-camera` | *the evidence gate could not measure metric scale (the solve has no camera); re-running the gate would not change this; an owner can re-finish this walk* |
 | `scale-short` | *the evidence gate had too little metric scale to place pieces by it; the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk* |
-| `consensus-deferred` | *the evidence gate's consensus of mapper seeds was stopped before its draws voted; the Tower re-runs it when it is idle* |
+| `consensus-deferred` | *the evidence gate's consensus of mapper seeds did not finish; the Tower re-runs it when it is idle* |
 | `regate-given-up` | *{what}; the idle Tower re-ran the gate {attempts} times without finishing it and has stopped trying; an owner can re-finish this walk* |
 | `regate-refused-notice` | *{what}; the idle Tower cannot re-run the gate on this solve; an owner can re-finish this walk* |
 | `refinish-parked-notice` | *a re-finish of this walk stopped part-way and the Tower could not put the previous result back; an owner can re-run the re-finish* |
