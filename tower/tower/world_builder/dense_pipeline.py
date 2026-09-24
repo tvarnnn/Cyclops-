@@ -641,17 +641,82 @@ def redaction_fill_mask(image, raw=None, fill_value: int = 0,
     return mask
 
 
+# ---------------------------------------------------------------------------
+# THE PREDICTION CACHE (review V8 H2, part R3: a re-finish must reproduce its depth).
+#
+# The evidence gate's metric scale reads this stage's raw per-keyframe predictions
+# (`<ki>_pred.npy`), and they did not survive a finish: the room's final surface prunes
+# `work/` (`prune_intermediates`) once its appearance is built, and the gate's hand-off
+# cuts `align.json` to the room, so a re-finish -- and every draw of a consensus --
+# predicted every frame again on the GPU. A borderline scale decision (6839fb8f's g6 at
+# x1.2526 against the x1.25 bound) could then flip on the recomputation.
+#
+# With `prediction_cache=True` (the gate's depth stage only: `coherence_publish.run_gate_depth`)
+# the network's output is kept in `<dense>/predictions/<token>/<sha1>.npy`, OUTSIDE
+# `work/`, keyed by the SHA-1 of the exact pixels the network is shown (after
+# undistortion, the redaction fill and its inpainting) and by `token`, the network and
+# its parameters (`prediction_token`). Everything else -- the image read, the fill, the
+# fit to the solve -- is computed as before, so the alignment is always this solve's;
+# only the network call is replaced. A fresh prediction is rounded through float16, the
+# precision it is stored in, BEFORE it is fitted, so a frame fitted from a fresh
+# prediction and one fitted from the cache are fitted identically. Off (every other
+# caller): the stage is byte for byte what it was.
+PREDICTIONS_DIRNAME = "predictions"
+PREDICTION_CACHE_SCHEMA = 1
+
+
+def prediction_token(backend, fov_x) -> tuple[str, dict]:
+    """(token, what it stands for): the network and every parameter of the call that
+    changes its output, beyond the pixels. 16 hex."""
+    doc = {"schema": PREDICTION_CACHE_SCHEMA, "backend": getattr(backend, "name", None),
+           "model_id": getattr(backend, "model_id", None), "kind": getattr(backend, "kind", None),
+           "resolution_level": getattr(backend, "resolution_level", None),
+           "fov_x": None if fov_x is None else round(float(fov_x), 6)}
+    return hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16], doc
+
+
+def prediction_cache_dir(root: Path, backend, fov_x) -> Path:
+    token, _doc = prediction_token(backend, fov_x)
+    return Path(root) / PREDICTIONS_DIRNAME / token
+
+
+def network_input_sha1(rgb: np.ndarray) -> str:
+    """The SHA-1 of the pixels a depth network is shown (shape and dtype included)."""
+    rgb = np.ascontiguousarray(rgb)
+    h = hashlib.sha1(f"{rgb.shape}|{rgb.dtype.str}|".encode())
+    h.update(rgb.tobytes())
+    return h.hexdigest()
+
+
+def _cached_prediction(path: Path) -> np.ndarray | None:
+    try:
+        return np.load(path).astype(np.float32) if path.is_file() else None
+    except (OSError, ValueError):
+        return None       # a torn or foreign file is a miss; the network runs
+
+
+def _cache_prediction(path: Path, disp16: np.ndarray) -> None:
+    from tower.storage import write_bytes_atomic  # noqa: PLC0415
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes_atomic(path, lambda handle: np.save(handle, disp16))
+
+
 def run_depth_stage(
     store, world_id: str, session_id: str, solution, intrinsics, params: DenseParams,
     root: Path, *, should_stop=None, progress: Callable[[str, int, int], None] | None = None,
     prior: dict | None = None,
     reuse_predictions: dict | None = None,
+    prediction_cache: bool = False,
 ) -> dict:
     """Undistort, predict depth, and align every posed keyframe in the component.
 
     The undistortion is the SOLVE's own -- `global_solve._undistort_maps` -- so
     the depth map and the poses are expressed in exactly the same camera. Doing
     this any other way silently shifts every back-projected point.
+
+    `prediction_cache`: keep and reuse the network's raw predictions (see
+    `PREDICTIONS_DIRNAME`); off is the stage as it always was.
     """
     import cv2
 
@@ -730,6 +795,11 @@ def run_depth_stage(
     if getattr(params, "known_fov", False) and getattr(backend, "accepts_fov", False):
         fov_x = float(np.degrees(2.0 * np.arctan(W / (2.0 * float(cam["fx"])))))
     fov_record = {"known_fov": round(fov_x, 6)} if fov_x is not None else {}
+    cache_dir = cache_record = None
+    if prediction_cache:
+        token, token_doc = prediction_token(backend, fov_x)
+        cache_dir = Path(root) / PREDICTIONS_DIRNAME / token
+        cache_record = {"token": token, "network": token_doc, "hits": 0, "predicted": 0}
     kids = solution.keyframe_ids
     targets = []
     for i, kid in enumerate(kids):
@@ -879,8 +949,22 @@ def run_depth_stage(
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        disp = (backend.predict(rgb, fov_x=fov_x) if fov_x is not None
-                else backend.predict(rgb))
+        disp = cached_path = None
+        if cache_dir is not None:
+            cached_path = cache_dir / f"{network_input_sha1(rgb)}.npy"
+            disp = _cached_prediction(cached_path)
+            if disp is not None:
+                cache_record["hits"] += 1
+        if disp is None:
+            disp = (backend.predict(rgb, fov_x=fov_x) if fov_x is not None
+                    else backend.predict(rgb))
+            if cached_path is not None:
+                # Fitted at the precision it is kept in, so a later build that reads
+                # it from the cache fits it exactly as this one does.
+                disp16 = np.asarray(disp).astype(np.float16)
+                disp = disp16.astype(np.float32)
+                _cache_prediction(cached_path, disp16)
+                cache_record["predicted"] += 1
         # Saved BEFORE the fit, under its own name, so a frame whose fit fails
         # against this solve -- too few sparse points yet -- still has its
         # prediction for the next solve to fit against.
@@ -912,6 +996,8 @@ def run_depth_stage(
                    getattr(redactor, "label", None)
                    if redactor is not None and redactor.available else None),
                **fov_record}
+    if cache_record is not None:
+        payload["prediction_cache"] = cache_record
     _write_json(root / "align.json", payload)
     return payload
 

@@ -6,8 +6,9 @@ Between the mapper and `write_solution` (`global_solve.solve`):
 
   1. DEPTH BEFORE PUBLISH. The product depth stage (`dense_pipeline.run_depth_stage`, MoGe-2 ViT-L, told
      the solve camera's FoV: `DenseParams.known_fov`) runs on the CANDIDATE solve, over every posed keyframe
-     of every solver component. Its predictions are what the surface stage would have made anyway; the
-     live walk's predictions are reused where they were made the same way.
+     of every solver component. Its predictions are what the surface stage would have made anyway, and
+     they are KEPT (`dense_pipeline.PREDICTIONS_DIRNAME`, keyed by the exact pixels and the network): a
+     re-finish, a re-gate or a consensus draw re-fits the kept prediction instead of predicting again.
   2. METRIC SCALE. `coherence_scale.metric_scale`: per camera log(z_sfm / z_metric) from the solve
      database's verified inlier matches, the candidate's poses and those predictions.
   3. THE GATE. `coherence_gate.apply_gate` with the solve database's verified links and their two-view
@@ -173,10 +174,16 @@ def run_gate_depth(store, world_id: str, session_id: str, solution, intrinsics, 
     Under the session's surface lock (`surface_pipeline._SurfaceLock`), the one every writer of
     `dense/<session>/` holds, so it never interleaves with a surface build of the session. The record it
     writes is UNSTAMPED (no `input_digest`, no `cache_key`): until `hand_depth_to_surface` stamps it after
-    publish, no stage reads it as a cache. Raises `DepthUnavailable` with the reason."""
+    publish, no stage reads it as a cache. Raises `DepthUnavailable` with the reason.
+
+    THE PREDICTIONS COME FROM THE PREDICTION CACHE (`dense_pipeline.PREDICTIONS_DIRNAME`; review V8 H2,
+    R3), keyed by the exact pixels the network is shown: a re-finish, a re-gate and every draw of a
+    consensus read the prediction the first gated build made, and only the fit to THIS solve is redone.
+    The older reuse path (`reusable_predictions`, offered from a previous `align.json`) is not taken
+    here: a prediction it offers may predate the cache, and then two builds of one walk could disagree
+    on it."""
     from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
         dense_dir,
-        reusable_predictions,
         run_depth_stage,
     )
     from tower.world_builder.surface_pipeline import _SurfaceLock, surface_dir  # noqa: PLC0415
@@ -192,11 +199,9 @@ def run_gate_depth(store, world_id: str, session_id: str, solution, intrinsics, 
     if not lock.acquire():
         raise DepthUnavailable("another surface build of this session holds its lock")
     try:
-        reuse = reusable_predictions(root / "align.json", dparams.backend, dparams.imagery_source,
-                                     known_fov=True)
         align = run_depth_stage(store, world_id, session_id, _all_posed_in_component_zero(solution),
                                 intrinsics, dparams, root, should_stop=should_stop, prior=None,
-                                reuse_predictions=reuse)
+                                prediction_cache=True)
     except DepthUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001 -- model missing, CUDA OOM, a camera mismatch: all "no depth"
@@ -512,6 +517,11 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
         depth = {"align": align, "work": work, "dparams": dparams}
         depth_record.update({"backend": align.get("backend"), "known_fov": align.get("known_fov"),
                              "frames": align.get("targets"), "image_origins": align.get("image_origins")})
+        cache = align.get("prediction_cache")
+        if isinstance(cache, dict):
+            # Where the predictions came from (R3): the cache, or the network this time.
+            depth_record["predictions"] = {"token": cache.get("token"), "cached": cache.get("hits"),
+                                           "predicted": cache.get("predicted")}
     except DepthUnavailable as exc:
         detail = str(exc)
         depth_record = {"state": DEPTH_STOPPED if detail.startswith(DEPTH_STOPPED) else DEPTH_UNAVAILABLE,
@@ -678,22 +688,49 @@ class RegateRefused(RuntimeError):
     """The re-gate cannot start (no solution, no database): nothing was attempted."""
 
 
+REFUSAL_NO_GATED_SOLUTION = "no gated solution is published for this session"
+REFUSAL_DATABASE_GONE = "the solve's database {name} is gone; an owner can re-finish this walk"
+
+
+def _regate_inputs(store, world_id: str, session_id: str):
+    """(the published solution, its workspace, the feature database it was solved from), or
+    `RegateRefused` saying why a re-gate cannot start. Reads only. The ONE statement of the
+    refusals: `regate_published` and `regate_refusal` both ask it."""
+    from tower.world_builder.global_solve import load_solution, workspace_for  # noqa: PLC0415
+
+    solution = load_solution(store, world_id, session_id)
+    if solution is None or not isinstance(solution.gate, dict):
+        raise RegateRefused(REFUSAL_NO_GATED_SOLUTION)
+    workspace = workspace_for(store, world_id, session_id)
+    name = (solution.solve or {}).get("database") or workspace.database_path.name
+    database = workspace.root / name
+    if not database.is_file():
+        raise RegateRefused(REFUSAL_DATABASE_GONE.format(name=name))
+    return solution, workspace, database
+
+
+def regate_refusal(store, world_id: str, session_id: str) -> str | None:
+    """Would a re-gate of this session be refused, and why: the reason `regate_published`
+    would raise `RegateRefused` with, word for word, or None when it would start. READ-ONLY
+    (review V8, FIN's OPEN 3): no lock, no write, no GPU -- for a finisher that must decide
+    before it takes the world's lock. `regate_published` still re-asks under the lock."""
+    try:
+        _regate_inputs(store, world_id, session_id)
+    except RegateRefused as exc:
+        return str(exc)
+    return None
+
+
 def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
                      gate_runner: Callable | None = None) -> dict:
     """Depth stage + metric scale + gate again, IN PLACE, on the published solve: nothing is
     moved aside, the solve itself is not redone. The caller holds the world's writer lock.
     Publishes the relabelled solution and its components record (or retires the record if
-    the gate fails again). Raises `RegateRefused` before doing anything it cannot finish."""
-    from tower.world_builder.global_solve import load_solution, workspace_for, write_solution  # noqa: PLC0415
+    the gate fails again). Raises `RegateRefused` before doing anything it cannot finish
+    (`regate_refusal` is the same test, read-only)."""
+    from tower.world_builder.global_solve import write_solution  # noqa: PLC0415
 
-    solution = load_solution(store, world_id, session_id)
-    if solution is None or not isinstance(solution.gate, dict):
-        raise RegateRefused("no gated solution is published for this session")
-    workspace = workspace_for(store, world_id, session_id)
-    name = (solution.solve or {}).get("database") or workspace.database_path.name
-    database = workspace.root / name
-    if not database.is_file():
-        raise RegateRefused(f"the solve's database {name} is gone; an owner can re-finish this walk")
+    solution, workspace, database = _regate_inputs(store, world_id, session_id)
     previous = {k: solution.gate.get(k) for k in ("state", "cause", "metric_available", "params_digest")}
     keyframes = store.read_keyframes(world_id, session_id)
     candidate = solver_candidate(solution)

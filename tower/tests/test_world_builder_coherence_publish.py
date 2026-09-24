@@ -552,7 +552,12 @@ def test_the_gates_depth_stage_covers_every_component_is_told_the_fov_and_is_not
     candidate = dc.replace(sol, poses=poses)
     align, work, dparams = CP.run_gate_depth(store, WORLD, SESSION, candidate,
                                              store.read_session(WORLD, SESSION).intrinsics)
-    assert len(backend.fov) == 8, "both solver components' frames were predicted"
+    # Every frame of both components has its prediction. This fixture's eight frames are
+    # three distinct images, and the gate's predictions are kept by the pixels the
+    # network is shown (R3), so the network ran once per distinct image.
+    cache = align["prediction_cache"]
+    assert cache["predicted"] + cache["hits"] == 8, "both solver components' frames were predicted"
+    assert len(backend.fov) == cache["predicted"] == 3
     cam = sol.camera
     fov = math.degrees(2 * math.atan(cam["width"] / (2 * cam["fx"])))
     assert all(f == pytest.approx(fov) for f in backend.fov)
