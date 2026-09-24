@@ -63,9 +63,14 @@ REASON_SINGLE_UNCONFIRMED_LINK = "single-unconfirmed-link"
 REASON_SCALE_MISMATCH = "scale-mismatch"
 REASON_LINK_CONTRADICTED = "link-contradicted"
 REASON_SCALE_UNAVAILABLE = "scale-unavailable"
+# The consensus's reason (review V8 H2; manager 019; contract v7, the lead re-admits it): the published draw
+# attached the piece, but fewer than a strict majority of the consensus draws did (mapper seeds on one frozen
+# database), so the evidence placing it is marginal. For such a piece it is the only reason. It is LAST, so the
+# precedence of every reason before it is today's.
+REASON_SEED_UNSTABLE = "seed-unstable"
 # Precedence (review V7, M2; contract v5 §2.2): the link reasons together, then the level.
 REASONS = (REASON_MASKS_UNAVAILABLE, REASON_SCALE_UNAVAILABLE, REASON_SOLVED_SEPARATELY, REASON_NO_VERIFIED_LINK,
-           REASON_SINGLE_UNCONFIRMED_LINK, REASON_LINK_CONTRADICTED, REASON_SCALE_MISMATCH)
+           REASON_SINGLE_UNCONFIRMED_LINK, REASON_LINK_CONTRADICTED, REASON_SCALE_MISMATCH, REASON_SEED_UNSTABLE)
 
 # COLMAP TwoViewGeometry configurations that are not verified evidence.
 NOT_VERIFIED_CONFIGS = (0, 1)  # UNDEFINED, DEGENERATE
@@ -358,17 +363,25 @@ def _rot_deg(R) -> float:
 
 
 def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotations: dict,
-               masks_applied: bool, params: GateParams | None = None) -> dict:
+               masks_applied: bool, params: GateParams | None = None, withhold=None) -> dict:
     """The rule (module docstring) on one solve.
 
     links: {(name_a, name_b): inliers} (`read_verified_links`); link_rotations: {(name_a, name_b): R_b_from_a}
     (`read_link_rotations`); metric_log: {name: log(z_sfm / z_metric)} (cameras without a finite ratio are
     simply absent); masks_applied: False when the solve's transient masks were not (all) applied.
 
-    Returns {"labels": {name: label}, "components": [...], "rounds": [...], "evidence": {...}, "params": ...,
-    "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is unplaced, with
-    `reason` / `reasons` from the contract's vocabulary."""
+    withhold: the CONSENSUS's hook (`coherence_publish.gate_by_consensus`), no rule of its own: candidate groups,
+    named by their first camera (`groups[*].first_camera` of an earlier call on the same solve), that may not be
+    attached in the first round of their solver component -- the room's round. A withheld group is still a round's
+    reference when its turn comes, and its label's only reason is `seed-unstable`. None or empty: today's gate.
+
+    Returns {"labels": {name: label}, "components": [...], "rounds": [...], "groups": [...], "evidence": {...},
+    "params": ..., "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is
+    unplaced, with `reason` / `reasons` from the contract's vocabulary. `groups` are the candidate groups the rounds
+    decided, with their member cameras (`members`), `first_camera`, final `label`, and whether each was a round's
+    `reference`."""
     params = params or GateParams()
+    withheld_names = frozenset(withhold or ())
     names = model.names
     idx = model.index()
     C = _shared_counts(model)
@@ -414,6 +427,7 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
     labels = np.full(model.n, -1, dtype=np.int64)
     rounds = []
     group_decisions: dict = {}  # group min camera -> decision, for the reasons
+    group_members: list = []    # every decided group: its cameras and round label (the consensus's identity)
     next_label = 0
     comps = [int(v) for v, _ in sorted(zip(*np.unique(model.component, return_counts=True)),
                                        key=lambda vc: (-vc[1], vc[0]))]
@@ -473,7 +487,10 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                         "coupled": bool(coupled), "scale_ok": differ is not True,
                         "scale_factor": (math.exp(lg - lk) if lg is not None and lk is not None else None),
                     }
-                    if attach and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
+                    held = first_round and names[int(g.min())] in withheld_names
+                    if held:
+                        d["withheld"] = True
+                    if attach and not held and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
                         best, best_n = j, len(cross)
                 if best is not None:
                     g = pending.pop(best)
@@ -488,6 +505,10 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                     group_decisions[int(g.min())] = d
             ids = np.concatenate(kept)
             labels[ids] = next_label
+            for i, g in enumerate(kept):
+                group_members.append({"first_camera": names[int(g.min())], "label": next_label,
+                                      "reference": i == 0, "source_component": comp,
+                                      "members": [names[int(v)] for v in g]})
             rounds.append({"source_component": comp, "label": next_label,
                            "reference_group": {"cameras": int(len(reference)),
                                                "first_camera": names[int(reference.min())]},
@@ -507,7 +528,7 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
             row = C[i, labelled].toarray().ravel()
             labels[i] = labels[labelled[int(np.argmax(row))]] if row.max() > 0 else first
     return _finish(model, labels, supported, rounds, group_decisions, masks_applied, metric_available, params,
-                   evidence)
+                   evidence, group_members)
 
 
 def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_applied: bool,
@@ -523,6 +544,9 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
     d = next((v for v in group_decisions.values() if v.get("first_camera") == first), None)
     if d is None:
         return [REASON_NO_VERIFIED_LINK]
+    if d.get("withheld"):
+        # Withheld by the consensus (`withhold`): its only reason.
+        return [REASON_SEED_UNSTABLE]
     out = []
     if not d.get("redundant", False):
         if d.get("cross_links_all", d.get("cross_links", 0)) == 0:
@@ -539,13 +563,14 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
 
 
 def _finish(model, labels, supported, rounds, group_decisions, masks_applied, metric_available, params,
-            evidence) -> dict:
+            evidence, group_members=()) -> dict:
     counts = {int(lab): int(((labels == lab) & supported).sum()) for lab in np.unique(labels)}
     order = sorted(counts, key=lambda lab: (-counts[lab], -int((labels == lab).sum()), lab))
     remap = {old: new for new, old in enumerate(order)}
     final = np.array([remap[int(v)] for v in labels], dtype=np.int64)
     for rd in rounds:
         rd["final_label"] = remap.get(rd["label"])
+    groups = [dict(g, label=remap.get(g["label"])) for g in group_members]
     room_round = next(rd for rd in rounds if rd["final_label"] == 0)
     room_component = room_round["source_component"]
     comps = []
@@ -559,7 +584,7 @@ def _finish(model, labels, supported, rounds, group_decisions, masks_applied, me
                       "cameras": int(sel.sum()), "supported": int((sel & supported).sum()),
                       "source_components": sorted({int(c) for c in model.component[sel]})})
     return {"labels": {model.names[i]: int(final[i]) for i in range(model.n)}, "components": comps,
-            "rounds": _json_clean(rounds), "evidence": evidence, "gate": GATE_ID,
+            "rounds": _json_clean(rounds), "groups": _json_clean(groups), "evidence": evidence, "gate": GATE_ID,
             "params": params.to_json(), "params_digest": params.digest(), "masks_applied": bool(masks_applied),
             "metric_available": bool(metric_available)}
 

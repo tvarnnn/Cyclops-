@@ -382,7 +382,8 @@ def read_sources(workspace: SolveWorkspace) -> dict:
         return {}
 
 
-def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=None) -> Path:
+def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=None,
+                  ambiguous: list | None = None) -> Path:
     """The raw capture frame when it is on disk, else the session's copy.
 
     The session's keyframe images are face-redacted, and on real walks the
@@ -391,23 +392,42 @@ def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=N
     the main model from using the raw frames. The raw frame never leaves
     this machine and nothing derived from it but points and poses is
     published, exactly as before.
+
+    A NAME FOUND IN MORE THAN ONE CAPTURE DIRECTORY IS NOT A FRAME. The
+    capture-directory fallback finds a frame by its file name, and the captures
+    of a reconnect chain restart their numbering (the live walk adc75972: three
+    captures, names restarting), so a name held by two of them may be another
+    capture's frame. Then the session's own stored (redacted) keyframe is used,
+    and the keyframe is appended to `ambiguous` when given. A name in exactly
+    one of the directories -- and every lookup with one directory -- is found
+    exactly as before. `sources.json` (the builder's, or a re-finish's by
+    capture identity) is asked first and is never ambiguous.
     """
     recorded = resolve_source_path((sources or {}).get(keyframe.keyframe_id))
     if recorded is not None and recorded.is_file():
         return recorded
     name = keyframe_image_name(keyframe)
+    found = []
     for capture_dir in capture_dirs:
         for candidate in (Path(capture_dir) / "frames" / name, Path(capture_dir) / name):
             if candidate.is_file():
-                return candidate
+                found.append(candidate)
+                break
+    if len(found) == 1:
+        return found[0]
+    if found and ambiguous is not None:
+        ambiguous.append(keyframe.keyframe_id)
     return session_dir / keyframe.image_relpath
 
 
 def prepare_images(
-    store, world_id: str, session_id: str, keyframes: list[Keyframe], *, capture_dirs=()
+    store, world_id: str, session_id: str, keyframes: list[Keyframe], *, capture_dirs=(),
+    ambiguous: list | None = None,
 ) -> tuple[PinholeCamera, int]:
     """Undistort every keyframe not yet in the workspace. Returns the pinhole
-    camera and how many images were written this call."""
+    camera and how many images were written this call. `ambiguous` collects the
+    keyframes whose name more than one capture directory holds (`_source_frame`):
+    they were undistorted from the session's stored copy."""
     import cv2
 
     workspace = workspace_for(store, world_id, session_id)
@@ -474,7 +494,7 @@ def prepare_images(
         target = workspace.images_dir / keyframe_image_name(keyframe)
         if target.exists() and not recalibrated:
             continue
-        source = _source_frame(keyframe, session_dir, capture_dirs, sources)
+        source = _source_frame(keyframe, session_dir, capture_dirs, sources, ambiguous)
         image = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if image is None:
             logger.warning("global solve: unreadable frame %s", source)
@@ -850,6 +870,7 @@ def solve(
     transient_backend_factory=None,
     mask_device_probe=None,
     gate: bool | None = None,
+    consensus: int | None = None,
 ) -> dict:
     """Run the recipe over the session's current keyframes and persist the
     solution. Returns a summary dict (what the CLI prints).
@@ -858,6 +879,11 @@ def solve(
     reads `TOWER_WORLD_SOLVE_GATE` for a FINAL solve (off by default) and is
     off for every background solve; off, the solution is published exactly as
     the solver returned it.
+
+    `consensus`: the number of mapper-seed draws the gate decides attachment by
+    (`coherence_publish.gate_by_consensus`). None reads
+    `TOWER_WORLD_SOLVE_CONSENSUS` for a gated final solve (1, today's single
+    draw, by default); it needs a seeded solve.
 
     Idempotent and incremental: images already undistorted, features already
     extracted and pairs already matched are skipped by the workspace and by
@@ -910,8 +936,10 @@ def solve(
         return {"solved": False, "reason": "fewer than two keyframes"}
     workspace = workspace_for(store, world_id, session_id)
     try:
+        ambiguous_frames: list = []
         camera, written = prepare_images(
-            store, world_id, session_id, keyframes, capture_dirs=capture_dirs
+            store, world_id, session_id, keyframes, capture_dirs=capture_dirs,
+            ambiguous=ambiguous_frames,
         )
     except UndistortionUnavailable as exc:
         return {"solved": False, "reason": f"cannot undistort: {exc}"}
@@ -1109,6 +1137,12 @@ def solve(
         # The live relocalizer's verified revisit links, matched explicitly.
         "revisit_pairs": revisits,
     }
+    if ambiguous_frames:
+        # Keyframes whose image name more than one capture directory holds: undistorted
+        # from the session's stored copy rather than another capture's frame
+        # (`_source_frame`). Only when it happened, so every other solution is as it was.
+        solution.solve["frames_ambiguous_by_name"] = {
+            "count": len(ambiguous_frames), "examples": ambiguous_frames[:10]}
     if final and seeded:
         # Reproducibility (review V8 H2): was the matching this solve mapped frozen or
         # made now, why, and exactly which database content the mapper read. Only on
@@ -1128,9 +1162,25 @@ def solve(
     # published RELABELLED -- pieces the gate did not attach are their own
     # components -- followed by `components.json` and the depth hand-off to the
     # surface. Off, this is `write_solution(workspace, solution)`.
+    #
+    # CONSENSUS (`TOWER_WORLD_SOLVE_CONSENSUS` >= 2 on a gated final solve): attachment is
+    # decided by a majority of mapper seeds on this same database, masks and depth
+    # (`coherence_publish.gate_by_consensus`). 1, the default, is today's single draw.
+    plan = None
+    requested = consensus_requested(final=final, gated=gated, consensus=consensus)
+    if requested >= 2:
+        plan = coherence_publish.ConsensusPlan(
+            draws=requested, seed=seed,
+            map_draw=(frozen_draw_mapper(store, world_id, session_id, database_path, solution,
+                                         keyframes=keyframes,
+                                         min_image_observations=min_image_observations)
+                      if seeded else None),
+            refusal=None if seeded else (
+                "the solve is not seeded (TOWER_WORLD_SOLVE_SEED): a consensus of mapper seeds "
+                "needs one"))
     solution, _gate_record = coherence_publish.gate_and_publish(
         store, world_id, session_id, workspace, solution, final=final, gate=gate,
-        database_path=database_path, keyframes=keyframes, write=write_solution)
+        database_path=database_path, keyframes=keyframes, write=write_solution, consensus=plan)
     return {
         "solved": True,
         "solver": solver,
@@ -1233,6 +1283,52 @@ def _map_candidate(pycolmap, database_path, workspace: SolveWorkspace, sparse_di
         reconstructions, keyframes, solver=solver, input_digest=input_digest,
         min_image_observations=min_image_observations, camera=camera,
     )
+
+
+# The consensus's further draws (`TOWER_WORLD_SOLVE_CONSENSUS`): each maps into its own
+# `sparse-draws/seed-<k>` beside `sparse/`, which holds draw 0's model as always.
+CONSENSUS_SPARSE_DIRNAME = "sparse-draws"
+
+
+def consensus_requested(*, final: bool, gated: bool, consensus: int | None = None) -> int:
+    """How many consensus draws this solve asks for: an explicit `consensus` wins; otherwise
+    `TOWER_WORLD_SOLVE_CONSENSUS` for a gated final solve, and 1 (today's single draw) for
+    every other solve."""
+    if consensus is not None:
+        return max(1, int(consensus))
+    if not (final and gated):
+        return 1
+    from tower.config import world_solve_consensus_setting  # noqa: PLC0415
+
+    return world_solve_consensus_setting()
+
+
+def frozen_draw_mapper(store, world_id: str, session_id: str, database_path, base: Solution, *,
+                       keyframes=None, min_image_observations: int = MIN_IMAGE_OBSERVATIONS):
+    """`seed -> candidate`: one further consensus draw on `database_path` -- the database the
+    published solve mapped, frozen -- with every seed set and one mapper thread, exactly as
+    the seeded final solve maps. The candidate carries `base`'s records (transients, solve,
+    timing: the same masks, matching and database). The final solve and a re-gate in place
+    both map their draws through this."""
+    import pycolmap  # noqa: PLC0415
+
+    _quiet_pycolmap()
+    workspace = workspace_for(store, world_id, session_id)
+    keyframes = keyframes if keyframes is not None else store.read_keyframes(world_id, session_id)
+    camera = PinholeCamera.from_json_dict(base.camera or read_json_closed(workspace.camera_path))
+    draw_root = workspace.root / CONSENSUS_SPARSE_DIRNAME
+
+    def map_draw(seed: int) -> Solution:
+        candidate = _map_candidate(
+            pycolmap, database_path, workspace, draw_root / f"seed-{int(seed)}", keyframes,
+            seed=int(seed), threads=1, input_digest=base.input_digest,
+            min_image_observations=min_image_observations, camera=camera)
+        candidate.transients = base.transients
+        candidate.solve = base.solve
+        candidate.timing = dict(base.timing or {})
+        return candidate
+
+    return map_draw
 
 
 def _seed_global_options(options, seed: int) -> None:

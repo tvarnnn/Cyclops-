@@ -110,6 +110,13 @@ class GateResult:
     record: dict                     # `solution.gate`: what ran (contract §2.5)
     components: dict | None          # the components.json document; None = not computed
     depth: dict | None = None        # {"align", "work", "dparams"} for the surface hand-off, when depth ran
+    # In memory only, for the consensus: the metric scale the gate used (`measure_metric_scale`'s output,
+    # None without depth), the gate's own output (`coherence_gate.apply_gate`: rounds, groups), the
+    # candidate it gated, and the per-draw detail `after_publish` persists (`CONSENSUS_FILENAME`).
+    scale: dict | None = None
+    gated: dict | None = None
+    candidate: object = None
+    consensus_detail: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -478,15 +485,17 @@ def retire_components(workspace_root) -> bool:
 
 def gate_final_solution(store, world_id: str, session_id: str, solution, *, database_path, keyframes,
                         should_stop=None, params: "CG.GateParams | None" = None,
-                        depth_runner: Callable | None = None, metric_fn: Callable | None = None) -> GateResult:
+                        depth_runner: Callable | None = None, metric_fn: Callable | None = None,
+                        withhold=None) -> GateResult:
     """Steps 1-4 of the module docstring on the candidate; never raises. `depth_runner` and `metric_fn`
-    replace `run_gate_depth` / `measure_metric_scale` (tests)."""
+    replace `run_gate_depth` / `measure_metric_scale` (tests, and the consensus, which gates a draw again
+    with the depth and scale it already has). `withhold`: `coherence_gate.apply_gate`'s consensus hook."""
     params = params or CG.GateParams()
     started = time.perf_counter()
     try:
         return _gate(store, world_id, session_id, solution, database_path=database_path, keyframes=keyframes,
                      should_stop=should_stop, params=params, depth_runner=depth_runner or run_gate_depth,
-                     metric_fn=metric_fn or measure_metric_scale, started=started)
+                     metric_fn=metric_fn or measure_metric_scale, started=started, withhold=withhold)
     except Exception as exc:  # noqa: BLE001 -- a broken gate publishes today's solve and says so
         logger.exception("[Tower][WorldBuilder] the evidence gate failed on %s/%s; the final solve is "
                          "published as the solver returned it, with no components record",
@@ -500,7 +509,7 @@ def gate_final_solution(store, world_id: str, session_id: str, solution, *, data
 
 
 def _gate(store, world_id, session_id, solution, *, database_path, keyframes, should_stop, params,
-          depth_runner, metric_fn, started) -> GateResult:
+          depth_runner, metric_fn, started, withhold=None) -> GateResult:
     transients = solution.transients or {}
     masks_state = transients.get("state")
     masks_applied = masks_state == "applied"
@@ -533,6 +542,7 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
     # 2. metric scale
     t = time.perf_counter()
     metric_log: dict = {}
+    scale = None
     scale_record: dict = {"scale": CS.SCALE_ID, "params": CS.ScaleParams().to_json(),
                           "params_digest": CS.ScaleParams().digest()}
     if depth is not None:
@@ -550,7 +560,7 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
     rotations = CG.read_link_rotations(database_path, solution.camera, min_inliers=params.min_link_inliers)
     model = solve_model(solution, name_of)
     result = CG.apply_gate(model, links, metric_log, link_rotations=rotations, masks_applied=masks_applied,
-                           params=params)
+                           params=params, **({"withhold": withhold} if withhold else {}))
     gate_seconds = round(time.perf_counter() - t, 3)
 
     # 4. relabel
@@ -596,7 +606,270 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
         "gate_seconds": gate_seconds,
         "seconds": round(time.perf_counter() - started, 3),
     }
-    return GateResult(solution=relabelled, record=record, components=doc, depth=depth)
+    return GateResult(solution=relabelled, record=record, components=doc, depth=depth, scale=scale,
+                      gated=result, candidate=solution)
+
+
+# ---------------------------------------------------------------------------
+# the consensus: attachment decided by a majority of mapper seeds (review V8 H2; manager 019)
+#
+# WHY. On 6839fb8f the closet (138 keyframes) detached in ONE of five mapper seeds on one frozen database and
+# the same depth (RUN P3-PF, var step 1: room 526 / 526 / 361 / 525 / 526), so which room a finish published
+# depended on the seed. A decision that flips with the seed rests on marginal evidence. Majority of 3 mapper
+# seeds, over all 10 triples, gave a room of 525-526 and no group of >= 30 keyframes flipped (P3-PF step 3).
+#
+# THE RULE (no threshold of its own). With `TOWER_WORLD_SOLVE_CONSENSUS` = N >= 2 on a gated, seeded final solve:
+#   1. DRAWS: N candidates on the SAME frozen database, masks and depth predictions, mapper seeds s, s+1, ...
+#      (DRAW_UNIT: PF's decomposition put the flips on the mapper seed alone). Draw 0 is the solve's own.
+#   2. Each draw is gated as usual (`gate_final_solution`; its depth stage re-fits the kept predictions).
+#   3. VOTES: per published keyframe, "attached to the room" in each draw; consensus = a strict majority.
+#   4. PUBLISH the draw whose attach vector agrees with the consensus on the most keyframes (ties: the lowest
+#      seed). Its GROUPS -- the gate's own candidate groups in its room, and each of its unplaced components --
+#      are voted on by keyframe overlap (a group is attached in a draw when most of its keyframes are). A group
+#      of its room that fewer than a strict majority of draws attached is WITHHELD: the draw is gated again
+#      (the same depth and scale, CPU only) with that group barred from the room, and it is published as its
+#      own piece, reason `seed-unstable`. The room's anchor group is never withheld. A group the majority
+#      attached but the published draw did not stays unplaced: no geometry is invented.
+#   5. RECORD `gate.consensus` (additive, Tower-internal §2.5), and each draw's per-round gate decisions in
+#      `solve/<session>/consensus.json` (review V8 LOW: "gate per-round decisions not persisted").
+# A consensus whose first draw took a fail-safe (nothing attached) has nothing to vote on: `not-needed`, or
+# `deferred` when that fail-safe is owed a re-gate -- the re-gate in place then runs the consensus.
+
+CONSENSUS_FILENAME = "consensus.json"
+CONSENSUS_RECORD = "wb-gate-consensus/1"
+DRAW_UNIT_MAPPER_SEED = "mapper-seed"
+CONSENSUS_APPLIED = "applied"          # the draws ran and voted; `detached` may be empty
+CONSENSUS_NOT_NEEDED = "not-needed"    # the first draw's gate attached nothing (a fail-safe)
+CONSENSUS_DEFERRED = "deferred"        # that fail-safe is owed a re-gate, which runs the consensus
+CONSENSUS_NOT_RUN = "not-run"          # it could not run (`why`)
+DECISION_ANCHOR = "anchor"
+DECISION_ATTACHED = "attached"
+DECISION_SEED_UNSTABLE = CG.REASON_SEED_UNSTABLE
+DECISION_UNPLACED = "unplaced"
+
+
+@dataclasses.dataclass
+class ConsensusPlan:
+    """What `gate_by_consensus` is asked for. `map_draw(seed)` maps one further draw -- the same database,
+    masks and depth -- and returns its candidate; `refusal` says why a consensus cannot run at all."""
+
+    draws: int
+    seed: int | None
+    map_draw: Callable | None = None
+    refusal: str | None = None
+    unit: str = DRAW_UNIT_MAPPER_SEED
+
+    def seeds(self) -> list:
+        return [None if self.seed is None else int(self.seed) + k for k in range(int(self.draws))]
+
+
+def _published_kids(solution, min_obs: int) -> set:
+    return {kid for kid, p in (getattr(solution, "poses", None) or {}).items()
+            if int(p.get("observations", 0)) >= min_obs}
+
+
+def _room_kids(solution, min_obs: int) -> set:
+    return {kid for kid, p in (getattr(solution, "poses", None) or {}).items()
+            if int(p.get("component", 0)) == 0 and int(p.get("observations", 0)) >= min_obs}
+
+
+def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> dict:
+    """The votes, the published draw and its groups' decisions, from the gated draws (`GateResult`s in draw
+    order). Pure: no IO. Draws whose gate failed do not vote. Returns {"voting", "chosen", "agreement",
+    "keyframes", "consensus_attached", "unanimous", "groups", "withhold"}; `withhold` names the groups (by
+    their first camera) `coherence_gate.apply_gate` must bar from the room."""
+    voting = [k for k, r in enumerate(results) if (r.record or {}).get("state") == GATE_STATE_APPLIED
+              and r.gated is not None]
+    n = len(voting)
+    attached = {k: _room_kids(results[k].solution, min_obs) for k in voting}
+    universe = set().union(*(_published_kids(results[k].solution, min_obs) for k in voting)) if voting else set()
+    votes = {kid: sum(kid in attached[k] for k in voting) for kid in universe}
+    consensus = {kid for kid, v in votes.items() if 2 * v > n}
+    agreement = {k: sum((kid in attached[k]) == (kid in consensus) for kid in universe) for k in voting}
+    chosen = max(voting, key=lambda k: (agreement[k], -k)) if voting else 0
+    groups: list[dict] = []
+    withhold: list[str] = []
+    if voting:
+        best = results[chosen]
+        order = {kid: i for i, kid in enumerate(best.solution.keyframe_ids)}
+        units = []
+        for g in best.gated.get("groups") or []:
+            if g.get("label") != 0:
+                continue
+            kids = sorted((kid_of_name[nm] for nm in g["members"] if nm in kid_of_name),
+                          key=lambda kid: order.get(kid, 0))
+            units.append({"kids": kids, "in_room": True, "anchor": bool(g.get("reference")),
+                          "first_camera": g["first_camera"]})
+        by_label: dict = {}
+        for kid, p in best.solution.poses.items():
+            lab = int(p.get("component", 0))
+            if lab != 0 and int(p.get("observations", 0)) >= min_obs:
+                by_label.setdefault(lab, []).append(kid)
+        for lab in sorted(by_label):
+            units.append({"kids": sorted(by_label[lab], key=lambda kid: order.get(kid, 0)), "in_room": False,
+                          "anchor": False, "first_camera": None, "label": lab})
+        for u in units:
+            kids = u["kids"]
+            if not kids:
+                continue
+            per_draw = [2 * len(set(kids) & attached[k]) > len(kids) for k in voting]
+            yes = sum(per_draw)
+            majority = 2 * yes > n
+            if u["anchor"]:
+                decision = DECISION_ANCHOR
+            elif u["in_room"]:
+                decision = DECISION_ATTACHED if majority else DECISION_SEED_UNSTABLE
+            else:
+                decision = DECISION_UNPLACED
+            if decision == DECISION_SEED_UNSTABLE:
+                withhold.append(u["first_camera"])
+            groups.append({"first_keyframe": kids[0], "keyframes": len(kids), "in_room": u["in_room"],
+                           "votes": per_draw, "attached_votes": yes, "draws": n,
+                           "ambiguous": 0 < yes < n, "decision": decision,
+                           **({"label": u["label"]} if "label" in u else {})})
+    # THE FLIPS THE PUBLISHED DRAW'S GROUPS CANNOT SHOW (reporting only). A piece another draw left out of
+    # its room may sit inside the published draw's anchor block (6839fb8f's closet: its own piece in mapper
+    # seed 2, part of the room's block in seeds 0 and 1), where no group of the published draw names it.
+    # Every other draw's unplaced piece the draws disagree on is listed with its votes, and whether the
+    # published room holds it against the majority (`against_majority`: the anchor is never withheld).
+    pieces: list[dict] = []
+    if voting:
+        best = results[chosen]
+        order = {kid: i for i, kid in enumerate(best.solution.keyframe_ids)}
+        seen = {frozenset(g_kids) for g_kids in ([u["kids"] for u in units] if voting else [])}
+        for k in voting:
+            if k == chosen:
+                continue
+            by_label: dict = {}
+            for kid, p in results[k].solution.poses.items():
+                lab = int(p.get("component", 0))
+                if lab != 0 and int(p.get("observations", 0)) >= min_obs:
+                    by_label.setdefault(lab, set()).add(kid)
+            for lab in sorted(by_label):
+                kids = by_label[lab]
+                if frozenset(kids) in seen:
+                    continue
+                seen.add(frozenset(kids))
+                per_draw = [2 * len(kids & attached[j]) > len(kids) for j in voting]
+                yes = sum(per_draw)
+                if not 0 < yes < n:
+                    continue
+                in_room = 2 * len(kids & attached[chosen]) > len(kids)
+                pieces.append({"first_keyframe": min(kids, key=lambda kid: order.get(kid, 0)),
+                               "keyframes": len(kids), "from_draw": k, "votes": per_draw,
+                               "attached_votes": yes, "draws": n, "majority_attached": 2 * yes > n,
+                               "in_published_room": in_room, "against_majority": in_room != (2 * yes > n)})
+    return {"voting": voting, "chosen": chosen, "agreement": agreement, "keyframes": len(universe),
+            "consensus_attached": len(consensus),
+            "unanimous": sum(1 for v in votes.values() if v in (0, n)),
+            "groups": groups, "withhold": withhold, "pieces": pieces}
+
+
+def _room_anchor(result) -> str | None:
+    return next((g["first_camera"] for g in ((result.gated or {}).get("groups") or [])
+                 if g.get("label") == 0 and g.get("reference")), None)
+
+
+def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: ConsensusPlan, database_path,
+                      keyframes, should_stop=None, params: "CG.GateParams | None" = None,
+                      gate_runner: Callable | None = None) -> GateResult:
+    """The consensus (see above) on `solution`, draw 0. Never raises: a draw that cannot be mapped or gated
+    does not vote, and with nothing to vote on the first draw is published exactly as `gate_final_solution`
+    gave it. The published result's record carries `consensus`; `consensus_detail` holds what
+    `after_publish` persists. `gate_runner` replaces `gate_final_solution` (tests)."""
+    from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+    params = params or CG.GateParams()
+    run = gate_runner or gate_final_solution
+    started = time.perf_counter()
+    seeds = plan.seeds()
+    base = {"record": CONSENSUS_RECORD, "requested": int(plan.draws), "unit": plan.unit, "seeds": seeds}
+
+    def gate(candidate, **kw):
+        return run(store, world_id, session_id, candidate, database_path=database_path, keyframes=keyframes,
+                   should_stop=should_stop, params=params, **kw)
+
+    first = gate(solution)
+
+    def done(result, record, detail=None):
+        result.record = dict(result.record, consensus=dict(
+            base, **record, seconds=round(time.perf_counter() - started, 3)))
+        result.consensus_detail = detail
+        return result
+
+    if plan.refusal:
+        return done(first, {"state": CONSENSUS_NOT_RUN, "why": plan.refusal})
+    if first.record.get("state") != GATE_STATE_APPLIED or not first.record.get("attach"):
+        owed = bool(first.record.get("retryable"))
+        return done(first, {
+            "state": CONSENSUS_DEFERRED if owed else CONSENSUS_NOT_NEEDED,
+            "why": ("the gate could not finish on the first draw; the re-gate in place runs the consensus"
+                    if owed else "the gate attached nothing to the room (a fail-safe): there is nothing to "
+                                 "vote on")})
+    name_of = _image_names(keyframes)
+    kid_of_name = {v: k for k, v in name_of.items()}
+    results = [first]
+    draws = [{"draw": 0, "seed": seeds[0], "map_s": None, "gate_s": first.record.get("seconds")}]
+    for k in range(1, int(plan.draws)):
+        if should_stop is not None and should_stop():
+            draws.append({"draw": k, "seed": seeds[k], "skipped": "a stop was asked for"})
+            break
+        t = time.perf_counter()
+        try:
+            candidate = plan.map_draw(seeds[k])
+        except Exception as exc:  # noqa: BLE001 -- a draw that cannot be mapped does not vote
+            logger.exception("[Tower][WorldBuilder] consensus draw %d of %s/%s could not be mapped",
+                             k, world_id, session_id)
+            draws.append({"draw": k, "seed": seeds[k], "failed": f"{type(exc).__name__}: {exc}"})
+            continue
+        map_s = round(time.perf_counter() - t, 3)
+        result = gate(candidate)
+        results.append(result)
+        draws.append({"draw": k, "seed": seeds[k], "map_s": map_s, "gate_s": result.record.get("seconds")})
+    mapped = [d for d in draws if "map_s" in d]          # one per entry of `results`, in draw order
+    decision = decide_consensus(results, kid_of_name=kid_of_name, min_obs=params.min_obs)
+    for i, (info, result) in enumerate(zip(mapped, results)):
+        info.update({"solver": getattr(result.candidate, "solver", None),
+                     "gate_state": result.record.get("state"), "attach": result.record.get("attach"),
+                     "solve_identity": solve_identity(result.solution),
+                     "room_keyframes": len(_room_kids(result.solution, params.min_obs)),
+                     "published_keyframes": len(_published_kids(result.solution, params.min_obs)),
+                     "components": result.record.get("components"),
+                     "predictions": (result.record.get("depth") or {}).get("predictions"),
+                     "votes": i in decision["voting"], "agreement": decision["agreement"].get(i)})
+    chosen = results[decision["chosen"]]
+    record = {"state": CONSENSUS_APPLIED, "draws": draws,
+              "votes": {"draws": len(decision["voting"]), "keyframes": decision["keyframes"],
+                        "consensus_attached": decision["consensus_attached"],
+                        "unanimous": decision["unanimous"]},
+              "chosen": {"draw": mapped[decision["chosen"]]["draw"], "seed": mapped[decision["chosen"]]["seed"]},
+              "groups": decision["groups"],
+              "pieces": [dict(p, from_draw=mapped[p["from_draw"]]["draw"]) for p in decision["pieces"]],
+              "detached": [g["first_keyframe"] for g in decision["groups"]
+                           if g["decision"] == DECISION_SEED_UNSTABLE],
+              "ambiguous": [g["first_keyframe"] for g in decision["groups"] if g["ambiguous"]]}
+    published = chosen
+    if decision["withhold"]:
+        depth = chosen.depth or {}
+        regated = gate(chosen.candidate,
+                       depth_runner=lambda *a, **kw: (depth.get("align"), depth.get("work"), depth.get("dparams")),
+                       metric_fn=lambda *a, **kw: chosen.scale, withhold=decision["withhold"])
+        if (regated.record.get("state") == GATE_STATE_APPLIED and regated.components is not None
+                and _room_anchor(regated) == _room_anchor(chosen)):
+            published = regated
+            published.record = dict(published.record, depth=chosen.record.get("depth"),
+                                    metric_scale=chosen.record.get("metric_scale"))
+        else:
+            record["state"] = "not-applied"
+            record["why"] = ("barring the seed-unstable groups from the room changed which piece is the room; "
+                             "the chosen draw is published as it was gated")
+            record["detached"] = []
+    detail = {"record": CONSENSUS_RECORD, "session_id": session_id,
+              "solve_identity": solve_identity(published.solution),
+              "draws": [dict(info, rounds=(r.gated or {}).get("rounds")) for info, r in zip(mapped, results)]}
+    if published is not chosen:
+        detail["published_rounds"] = (published.gated or {}).get("rounds")
+    return done(published, record, detail)
 
 
 def after_publish(store, world_id: str, session_id: str, workspace_root, solution,
@@ -613,6 +886,11 @@ def after_publish(store, world_id: str, session_id: str, workspace_root, solutio
         else:
             write_components(workspace_root, result.components)
             out["components_written"] = True
+        if result.consensus_detail is not None:
+            from tower.storage import write_json_atomic  # noqa: PLC0415
+
+            write_json_atomic(Path(workspace_root) / CONSENSUS_FILENAME, result.consensus_detail)
+            out["consensus_written"] = True
         if result.depth is not None:
             out["depth_handoff"] = hand_depth_to_surface(store, world_id, session_id, solution, result.depth)
     except Exception as exc:  # noqa: BLE001 -- the solve is published; this is its paperwork
@@ -623,17 +901,25 @@ def after_publish(store, world_id: str, session_id: str, workspace_root, solutio
 
 def gate_and_publish(store, world_id: str, session_id: str, workspace, solution, *, final: bool,
                      gate: bool | None = None, database_path, keyframes, write: Callable,
-                     should_stop=None) -> tuple[object, dict | None]:
+                     should_stop=None, consensus: ConsensusPlan | None = None) -> tuple[object, dict | None]:
     """The final solve's publish step, in one call (`global_solve.solve` makes it in place of
     `write_solution`): the gate when `gate_setting_for(final, gate)`, then `write(workspace, solution)`,
     then the record and the depth hand-off. Returns (the published solution, its gate record or None).
 
     With the gate off this is `write(workspace, solution)` and nothing else, except that a components record
-    left by an earlier gated solve is moved aside: it does not describe this solve."""
+    left by an earlier gated solve is moved aside: it does not describe this solve.
+
+    `consensus`: a plan of two or more draws (`TOWER_WORLD_SOLVE_CONSENSUS`) gates by `gate_by_consensus`;
+    None, the default, is the single gate of today."""
     result = None
     if gate_setting_for(final, gate):
-        result = gate_final_solution(store, world_id, session_id, solution, database_path=database_path,
-                                     keyframes=keyframes, should_stop=should_stop)
+        if consensus is not None and int(consensus.draws) >= 2:
+            result = gate_by_consensus(store, world_id, session_id, solution, plan=consensus,
+                                       database_path=database_path, keyframes=keyframes,
+                                       should_stop=should_stop)
+        else:
+            result = gate_final_solution(store, world_id, session_id, solution, database_path=database_path,
+                                         keyframes=keyframes, should_stop=should_stop)
         solution = result.solution
         if hasattr(solution, "gate"):
             solution.gate = result.record
@@ -734,9 +1020,23 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
     previous = {k: solution.gate.get(k) for k in ("state", "cause", "metric_available", "params_digest")}
     keyframes = store.read_keyframes(world_id, session_id)
     candidate = solver_candidate(solution)
-    result = (gate_runner or gate_final_solution)(store, world_id, session_id, candidate,
-                                                  database_path=database, keyframes=keyframes,
-                                                  should_stop=should_stop)
+    owed = (solution.gate or {}).get("consensus") or {}
+    if owed.get("state") == CONSENSUS_DEFERRED and int(owed.get("requested") or 1) >= 2:
+        # The consensus the solve asked for and could not run (its first draw was owed this
+        # re-gate): its draws are mapped now, on the database the published solve mapped.
+        from tower.world_builder.global_solve import frozen_draw_mapper  # noqa: PLC0415
+
+        seeds = owed.get("seeds") or [None]
+        plan = ConsensusPlan(draws=int(owed["requested"]), seed=seeds[0],
+                             map_draw=None if seeds[0] is None else frozen_draw_mapper(
+                                 store, world_id, session_id, database, candidate, keyframes=keyframes),
+                             refusal=None if seeds[0] is not None else "the solve was not seeded")
+        result = gate_by_consensus(store, world_id, session_id, candidate, plan=plan, database_path=database,
+                                   keyframes=keyframes, should_stop=should_stop, gate_runner=gate_runner)
+    else:
+        result = (gate_runner or gate_final_solution)(store, world_id, session_id, candidate,
+                                                      database_path=database, keyframes=keyframes,
+                                                      should_stop=should_stop)
     published = result.solution
     record = dict(result.record, regate={"at": time.time(), "previous": previous})
     published.gate = record

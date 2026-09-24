@@ -859,15 +859,21 @@ def test_an_adc75972_shaped_walk_gives_no_keyframe_another_captures_frame(
     ids = [k.keyframe_id for k in kf_records]
     ambiguous = {k for k in ids if ids.count(k) > 1}
     assert ambiguous                                   # ids collide, as on adc75972
-    # The hazard is real: by name, some keyframe gets another capture's frame.
+    # The hazard was real: by name, some keyframe got another capture's frame. The by-name
+    # fallback now refuses a name more than one capture holds (the stored keyframe instead,
+    # `global_solve._source_frame`), so it hands no keyframe a raw frame not its own.
     dirs = [root / "captures" / c for c in (CAPTURE_ID, CAP_B, CAP_C)]
     own = {(k.keyframe_id, k.received_at): _frame_bytes(c, s, t)
            for k, (c, s, t) in zip(kf_records, keyframes)}
-    by_name_wrong = sum(
-        1 for k in kf_records
-        if _source_frame(k, store.session_dir(W1, S1), dirs, {}).read_bytes()
-        != own[(k.keyframe_id, k.received_at)])
-    assert by_name_wrong > 0
+    ambiguous_by_name = []
+    picked = [_source_frame(k, store.session_dir(W1, S1), dirs, {}, ambiguous_by_name)
+              for k in kf_records]
+    assert ambiguous_by_name, "the restarted numbering makes names ambiguous"
+    for k, path in zip(kf_records, picked):
+        if Path(path).is_relative_to(root):
+            assert path.read_bytes() == own[(k.keyframe_id, k.received_at)]
+        else:
+            assert path == store.session_dir(W1, S1) / k.image_relpath
     report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
                          stamp="c")
     frames = report["solver_frames"]
