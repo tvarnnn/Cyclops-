@@ -2,11 +2,18 @@
 
 **Living document.** Added 2026-09-23.
 
-> **Status: PROPOSED 2026-09-23 — awaiting Mac review; nothing implemented.**
-> No Tower code and no iOS code implements anything in this document. It is
-> the contract half of manager decision 010, P3.1 ("contract first"): the Mac
-> Validation Lead reviews it for Apple feasibility **before** any iOS or Tower
-> product code is written. Every "OPEN" reference in the text is a question
+> **Status: IMPLEMENTED 2026-09-24, behind Tower settings that are off by
+> default; not yet validated.** The Mac Validation Lead reviewed it (C1,
+> 2026-09-23; §10). Both halves exist and are merged on the integration branch
+> `world-builder/live-world-visualization-v1` at `1111bb9`: the Tower half from
+> `world-builder/coherence-product-v1` (`d87aa5c`), the iOS half from
+> `ios/wb-coherence-areas-v1` (`50afec3`). Nothing is on `main`. Every Tower
+> behaviour here is off until its setting is on, except the owner's re-finish
+> command (§7 rule 4; `tower/docs/world-builder/COHERENCE-PRODUCT.md`). Not yet
+> accepted: review V8 says READY WITH CHANGES and its fix round is open (the
+> Mac gate G1 passed at `1111bb9`, manager 020), and the physical A/B test has
+> not run. v6 (2026-09-24) adds `finalization.notice` (§3.1, §8).
+> Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
 
@@ -163,7 +170,7 @@ reader, the physical test or the harness can tell what produced `components`:
 
 | Key | Meaning |
 |---|---|
-| `transients.state` | `applied` (every solver image masked with the union rule), `partial` (some images unmasked, or a fallback rule such as OneFormer alone -- `rule_fallback`; counts given), or `unavailable` (with `detail` and `cause`: detector unavailable, model load failure, GPU out of memory, CPU fallback). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable`. A GPU out of memory is retried once; if it persists `retryable` and `cause` are set and the row says an owner can re-finish the walk (attended; nothing re-solves unattended, review V7 H2) |
+| `transients.state` | `applied`: no unmasked evidence reaches the solve. Every solver image was masked with the union rule, or, if it could not be masked (unreadable, mis-sized, or held by another process while it was hashed), it was **excluded**: it gets an all-0 COLMAP mask, and the walk-database filter drops every match that touches it, so it is left unposed. The counts are `images_excluded` and `excluded_examples` (at most 10 names), and the filter's `keypoints_excluded` (review V8 M2b). `partial`: the union rule could not run and a fallback rule did, such as OneFormer alone (`rule_fallback`; counts given). `unavailable`: with `detail` and `cause` (detector unavailable, model load failure, `gpu-oom`, CPU fallback, off). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable`. A GPU out of memory is retried once per mask component, over that component's own missing images. If it persists, `retryable` and `cause: gpu-oom` are set. Every fail-safe cause writes a notice (section 3.1, `finalization.notice`) saying who can fix it. Nothing re-solves unattended (review V7 H2) |
 | `transients.rule`, `transients.requested_rule`, `transients.rule_fallback` | the mask rule that ran (the same union rule the surface stage uses) and any fallback |
 | `transients.masking` / `solve.masking`, `solve.walk_database` | `walk-database-filtered` (the walk's own database, matches touching masked keypoints removed and re-verified: the approved arm A1h) or `re-extracted` (no usable walk database: `absent`, `unusable` or `filter-failed`) |
 | `gate.state`, `gate.retryable`, `gate.cause`, `gate.solve_identity` | `applied`, or `failed` (with `detail`; a failed gate publishes no components record and owes a re-gate, `cause: gate-failed`). `retryable` with `cause: depth-unavailable` when the gate ran without metric scale because depth failed: the finisher owes a re-gate in place (§2.2 `scale-unavailable`). `solve_identity` names the solve the gate ran on; it is stamped in the depth stage and in `components.json`, and a record whose identity is not the published solve's is read as absent |
@@ -189,6 +196,32 @@ The listing already carries unbounded arrays (`worlds`, `sessions`); each entry
 here is a few hundred bytes, and the regression set's worst case is 21
 components in one session (52ed8e0a, history arm A1h, GT's offline evaluation;
 V4a). No cap is proposed (OPEN M9).
+
+**`finalization.notice` — what the gate could not do, and who can fix it (v6; manager 020 G1-F2).**
+This is one more additive key, inside the row's existing `finalization` object (WORLDS §2). It is a
+string, or absent. The Tower writes it only for a session whose final solve went through the evidence gate,
+and only when that solve took a fail-safe or owes work. It holds one sentence per cause, joined by `"; "`,
+in the order masks, scale, gate, and each sentence says who can fix it: an owner, an operator, the idle
+Tower, or a new walk. It is absent on every older session and whenever nothing is owed, so those rows
+are byte for byte as before (§7 rule 1). It **replaces nothing**: `finalization.detail` keeps its own
+meaning. `detail` can carry an error string; `notice` never does.
+
+The sentences, informative only. The phone shows the string verbatim and **never matches on it**:
+
+| Cause | Sentence |
+|---|---|
+| masks: GPU out of memory | *masks were not applied (GPU out of memory); an owner can re-finish this walk* |
+| masks: off on this Tower | *masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk* |
+| masks: detector did not run | *masks were not applied (&lt;why&gt;); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| masks: fallback rule | *masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk* |
+| scale: depth did not finish | *the evidence gate could not measure metric scale (&lt;why&gt;); the Tower re-runs the gate when it is idle* |
+| scale: too few cameras with a level, depth in hand | *the evidence gate had too little metric scale to place pieces by it (&lt;why&gt;); the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk* |
+| gate raised | *the evidence gate failed (&lt;why&gt;); the Tower re-runs it when it is idle* |
+| re-gate given up at its bound (replaces the scale-depth or gate-raised sentence) | *the evidence gate could not measure metric scale (&lt;why&gt;)* or *the evidence gate failed (&lt;why&gt;)*, then *; the idle Tower re-ran the gate N times without finishing it and has stopped trying; an owner can re-finish this walk* |
+
+`<why>` is a short Tower-written phrase with no metric figure (§2.4 rule 6). When the owed work is done,
+for example after a re-gate in place succeeds, the key is removed. The listing's `contract` identifier
+does not move, for the reason above.
 
 ### 3.2 On `GET /worlds/{w}/render/revision` — additive
 
@@ -691,6 +724,11 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
 - **The room caption** gains *· N more areas shown separately*.
 - With N = 0 and K = 0 nothing new appears: a walk the gate kept whole looks
   exactly as today.
+
+**The notice** (v6, G1-F2): when a session's `finalization.notice` is a non-empty string, show it
+verbatim below the room caption, as a plain note rather than an error. Show nothing when it is absent.
+It says what the Tower could not do for this walk and who can fix it (§3.1). It is independent of
+`components`. A gated session whose gate failed has `components: null` and can still carry a notice.
 
 **The area viewer:** the header and captions of §5.4, and *Back to the room*.
 No arrow toward the room, no distance, no size, no name, no position — none of

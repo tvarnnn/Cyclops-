@@ -798,8 +798,9 @@ source as an untuned placeholder and is not emitted as an event at all.
 Emitting `limited` from it would present an unmeasured placeholder as a
 calibrated judgment.
 
-**`tracking.recovery`** — **PROPOSED 2026-09-23, awaiting Mac review; nothing
-implemented.** An additive, fixed-arity object, or **`null`** when the
+**`tracking.recovery`** — **Implemented 2026-09-24 behind
+`TOWER_WORLD_RELOCALIZER` (default `off`); reviewed by the Mac (C1); not yet
+validated.** An additive, fixed-arity object, or **`null`** when the
 session's journal records no relocalizer (every session today; `null` means
 *not recorded*, never *no losses*). It reports the live relocalizer's current
 or last episode (`state`: `none` / `searching` / `prompting` / `recovered` /
