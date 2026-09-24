@@ -841,3 +841,189 @@ final class WorldNoticeGuardTests: XCTestCase {
                        WorldNoticeGuard.genericSentence)
     }
 }
+
+// MARK: - The closed notice set (contract v8, lead-008): every sentence verbatim
+
+/// Contract v8 §3.1 makes `finalization.notice` a CLOSED set: the Tower writes
+/// only these sentences, joined by "; " (masks first, then scale or the gate),
+/// and the only variable text is integers and `{what}` (a gate clause). The
+/// set below is `notice-set-e5f7151.json`, extracted by the Windows lane from
+/// the candidate's own code (product `e5f7151`, contract `7f33e0c`), embedded
+/// verbatim. Every sentence, every expansion and every composition the rule
+/// allows must render exactly as sent through `WorldNoticeGuard` -- the guard
+/// is defence in depth against machine output, never a rewrite of these.
+@MainActor
+final class WorldNoticeClosedSetTests: XCTestCase {
+
+    private static let setJSON = #"""
+{
+ "NOTICE_CLAUSES": {
+  "consensus-deferred": "the evidence gate's consensus of mapper seeds was stopped before its draws voted",
+  "depth-gpu-oom": "the evidence gate could not measure metric scale (GPU out of memory)",
+  "depth-model-missing": "the evidence gate could not measure metric scale (the depth model is not installed on this Tower)",
+  "depth-no-camera": "the evidence gate could not measure metric scale (the solve has no camera)",
+  "depth-no-intrinsics": "the evidence gate could not measure metric scale (the walk has no camera intrinsics)",
+  "depth-stopped": "the evidence gate could not measure metric scale (the depth stage was stopped)",
+  "depth-surface-busy": "the evidence gate could not measure metric scale (another surface build of this walk was running)",
+  "depth-unavailable": "the evidence gate could not measure metric scale (the depth stage did not finish)",
+  "gate-failed": "the evidence gate failed (an internal error)",
+  "gate-failed-database": "the evidence gate failed (the solve's feature database could not be read)",
+  "gate-failed-memory": "the evidence gate failed (out of memory)",
+  "masks-detector-failed": "masks were not applied (the transient detector failed)",
+  "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve",
+  "masks-excluded-uncounted": "some images could not be masked and were left out of the solve",
+  "masks-fallback": "masks were applied by OneFormer alone, not by the union rule the evidence gate needs",
+  "masks-gpu-oom": "masks were not applied (GPU out of memory)",
+  "masks-no-gpu": "masks were not applied (no GPU could run the transient detector)",
+  "masks-no-image": "masks were not applied (no solver image could be masked)",
+  "masks-none": "masks were not applied (no solver image could be masked)",
+  "masks-not-installed": "masks were not applied (the transient detector is not installed on this Tower)",
+  "masks-off": "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS)",
+  "masks-partial": "masks were not applied to {unmasked} of {images} images",
+  "masks-partial-uncounted": "masks were not applied to some of its images",
+  "masks-step-failed": "masks were not applied (the mask step failed)",
+  "masks-unavailable": "masks were not applied (the transient detector could not run)",
+  "scale-short": "the evidence gate had too little metric scale to place pieces by it"
+ },
+ "NOTICE_SENTENCES": {
+  "consensus-deferred": "the evidence gate's consensus of mapper seeds was stopped before its draws voted; the Tower re-runs it when it is idle",
+  "depth-gpu-oom": "the evidence gate could not measure metric scale (GPU out of memory); the Tower re-runs the gate when it is idle",
+  "depth-model-missing": "the evidence gate could not measure metric scale (the depth model is not installed on this Tower); the Tower re-runs the gate when it is idle",
+  "depth-no-camera": "the evidence gate could not measure metric scale (the solve has no camera); the Tower re-runs the gate when it is idle",
+  "depth-no-intrinsics": "the evidence gate could not measure metric scale (the walk has no camera intrinsics); the Tower re-runs the gate when it is idle",
+  "depth-stopped": "the evidence gate could not measure metric scale (the depth stage was stopped); the Tower re-runs the gate when it is idle",
+  "depth-surface-busy": "the evidence gate could not measure metric scale (another surface build of this walk was running); the Tower re-runs the gate when it is idle",
+  "depth-unavailable": "the evidence gate could not measure metric scale (the depth stage did not finish); the Tower re-runs the gate when it is idle",
+  "gate-failed": "the evidence gate failed (an internal error); the Tower re-runs it when it is idle",
+  "gate-failed-database": "the evidence gate failed (the solve's feature database could not be read); the Tower re-runs it when it is idle",
+  "gate-failed-memory": "the evidence gate failed (out of memory); the Tower re-runs it when it is idle",
+  "masks-detector-failed": "masks were not applied (the transient detector failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve; an owner can re-finish this walk",
+  "masks-excluded-uncounted": "some images could not be masked and were left out of the solve; an owner can re-finish this walk",
+  "masks-fallback": "masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk",
+  "masks-gpu-oom": "masks were not applied (GPU out of memory); an owner can re-finish this walk",
+  "masks-no-gpu": "masks were not applied (no GPU could run the transient detector); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-no-image": "masks were not applied (no solver image could be masked); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-none": "masks were not applied (no solver image could be masked); an owner can re-finish this walk",
+  "masks-not-installed": "masks were not applied (the transient detector is not installed on this Tower); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-off": "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk",
+  "masks-partial": "masks were not applied to {unmasked} of {images} images; an owner can re-finish this walk",
+  "masks-partial-uncounted": "masks were not applied to some of its images; an owner can re-finish this walk",
+  "masks-step-failed": "masks were not applied (the mask step failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "masks-unavailable": "masks were not applied (the transient detector could not run); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk",
+  "scale-short": "the evidence gate had too little metric scale to place pieces by it; the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk"
+ },
+ "WFP.REFINISH_PARKED_NOTICE": "a re-finish of this walk stopped part-way and the Tower could not put the previous result back; an owner can re-run the re-finish",
+ "WFP.REGATE_GIVEN_UP": "{what}; the idle Tower re-ran the gate {attempts} times without finishing it and has stopped trying; an owner can re-finish this walk",
+ "WFP.REGATE_REFUSED_NOTICE": "{what}; the idle Tower cannot re-run the gate on this solve; an owner can re-finish this walk"
+}
+"""#
+
+    private struct NoticeSet {
+        let sentences: [String: String]
+        let clauses: [String: String]
+        let givenUp: String
+        let refused: String
+        let parked: String
+    }
+
+    private func load() throws -> NoticeSet {
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(Self.setJSON.utf8)) as? [String: Any])
+        return NoticeSet(
+            sentences: try XCTUnwrap(json["NOTICE_SENTENCES"] as? [String: String]),
+            clauses: try XCTUnwrap(json["NOTICE_CLAUSES"] as? [String: String]),
+            givenUp: try XCTUnwrap(json["WFP.REGATE_GIVEN_UP"] as? String),
+            refused: try XCTUnwrap(json["WFP.REGATE_REFUSED_NOTICE"] as? String),
+            parked: try XCTUnwrap(json["WFP.REFINISH_PARKED_NOTICE"] as? String))
+    }
+
+    /// The integers fill `{unmasked}`, `{images}`, `{excluded}`, `{attempts}`.
+    private func fill(_ template: String, _ n: Int) -> String {
+        template.replacingOccurrences(of: "{unmasked}", with: String(n))
+            .replacingOccurrences(of: "{images}", with: String(n * 10))
+            .replacingOccurrences(of: "{excluded}", with: String(n))
+            .replacingOccurrences(of: "{attempts}", with: String(n))
+    }
+
+    private func assertVerbatim(_ text: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(text.contains("{"), "an unfilled placeholder: \(text)", file: file, line: line)
+        XCTAssertEqual(WorldNoticeGuard.displayText(text), text, file: file, line: line)
+    }
+
+    func testTheSetIsTheOneWindowsSent() throws {
+        let set = try load()
+        XCTAssertEqual(set.sentences.count, 26, "26 cause sentences")
+        XCTAssertEqual(set.clauses.count, 26)
+        XCTAssertEqual(set.sentences["masks-off"],
+                       "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk")
+    }
+
+    /// Each of the 26 cause sentences, and the finisher's three, alone.
+    func testEverySentenceAloneIsShownVerbatim() throws {
+        let set = try load()
+        for (cause, sentence) in set.sentences {
+            for n in [1, 12, 999_999] {
+                assertVerbatim(fill(sentence, n))
+            }
+            _ = cause
+        }
+        assertVerbatim(set.parked)
+        // Every clause (a sentence up to its first ";"), filled where it has
+        // integers -- the masks clauses carry `{unmasked}` / `{excluded}`.
+        for (_, clause) in set.clauses {
+            assertVerbatim(fill(clause, 12))
+        }
+        // `{what}` is only ever a gate clause (lead-008): gate-failed*, depth-*,
+        // scale-short, consensus-deferred.
+        for (key, clause) in set.clauses where !key.hasPrefix("masks") {
+            for n in [1, 3, 99] {
+                assertVerbatim(fill(set.givenUp, n).replacingOccurrences(of: "{what}", with: clause))
+            }
+            assertVerbatim(set.refused.replacingOccurrences(of: "{what}", with: clause))
+        }
+    }
+
+    /// Every composition the rule allows: a masks sentence, then a scale or
+    /// gate sentence (or a given-up / refused re-gate, or the parked re-finish).
+    func testEveryCompositionIsShownVerbatimAndStaysUnderTheLengthBound() throws {
+        let set = try load()
+        let masks = set.sentences.filter { $0.key.hasPrefix("masks") }.values.flatMap { s in
+            [1, 12, 999_999].map { fill(s, $0) }
+        }
+        let gateKeys = set.sentences.keys.filter { !$0.hasPrefix("masks") }
+        var second = gateKeys.compactMap { set.sentences[$0] }
+        for key in gateKeys {
+            let what = try XCTUnwrap(set.clauses[key], key)
+            second += [1, 3, 99].map { fill(set.givenUp, $0).replacingOccurrences(of: "{what}", with: what) }
+            second.append(set.refused.replacingOccurrences(of: "{what}", with: what))
+        }
+        second.append(set.parked)
+        var longest = 0
+        var count = 0
+        for text in masks + second {
+            assertVerbatim(text)
+            longest = max(longest, text.count)
+            count += 1
+        }
+        for first in masks {
+            for then in second {
+                let joined = first + "; " + then
+                assertVerbatim(joined)
+                longest = max(longest, joined.count)
+                count += 1
+            }
+        }
+        XCTAssertGreaterThan(count, 2_000)
+        XCTAssertLessThan(longest, WorldNoticeGuard.maximumLength, "the longest honest notice")
+    }
+
+    /// lead-008's two worked composite examples, exactly as written.
+    func testTheTwoWorkedExamplesAreShownVerbatim() {
+        assertVerbatim("masks were not applied to 12 of 400 images; an owner can re-finish this walk; "
+            + "the evidence gate could not measure metric scale (the depth stage did not finish); "
+            + "the Tower re-runs the gate when it is idle")
+        assertVerbatim("the evidence gate could not measure metric scale (GPU out of memory); "
+            + "the idle Tower re-ran the gate 3 times without finishing it and has stopped trying; "
+            + "an owner can re-finish this walk")
+    }
+}
