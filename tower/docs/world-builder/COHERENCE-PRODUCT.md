@@ -632,9 +632,11 @@ Read §2.2 for what each one means.
 - **The diagnostics are in `finalization.detail`,** and they reach clients, so they are
   client-safe: one line, no path, no traceback frame and no user name; the exception class
   and its message stay (`coherence_publish.client_safe_detail`; V10 MED-5, V11 MED-B).
-  - The `GET /worlds` row and `/ws` `lifecycle.finalization` both carry it. The row's copy
-    is made client-safe as it is served (`world_builder_library._client_safe_finalization`),
-    `notice` included, and each text is at most 700 characters, the phone guard's own bound.
+  - The `GET /worlds` row and `/ws` `lifecycle.finalization` both carry it, and both make it
+    client-safe as it is served, by the same transform
+    (`coherence_publish.client_safe_finalization`; the row since `6ae08c1`, `/ws` since
+    `a5001ab`). `notice` is included, and each text is at most 700 characters, the phone
+    guard's own bound.
   - On an interrupted session, `lifecycle.reason` quotes it owner-facing, with no class name
     and no square brackets ("a path", "a user name"), and the phone shows that reason
     (`coherence_publish.owner_facing_detail`).
@@ -710,8 +712,9 @@ Read §2.2 for what each one means.
   - It is absent when N = 1.
 - **`solve\<session>\consensus.json`:** each draw's per-round gate decisions. Written
   only when N ≥ 2 and further draws were mapped. A publish that writes no such record moves
-  an older one aside to `consensus.superseded.json` (never deletes it), so it cannot sit
-  beside a solve it does not describe (V11 LOW-4). That covers N = 1, the gate off, a
+  an older one aside to `consensus.superseded.json`, so it cannot sit beside a solve it does
+  not describe (V11 LOW-4). A later retirement **replaces** that file (`os.replace`): only
+  the latest superseded copy is kept (V12). That covers N = 1, the gate off, a
   consensus that is `not-needed` or `not-run` or was `deferred` before any further draw was
   mapped, and the solve's early publish of draw 0.
 

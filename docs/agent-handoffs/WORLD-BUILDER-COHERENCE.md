@@ -19,9 +19,15 @@ it was before (`tower/tower/config.py`).
 **Where each figure comes from.**
 
 - **[acc]** means acceptance at the tested code. That is `RUN\acc2\TABLE.md`, run on
-  `e5f7151`, and carried forward to `<SHA>` under manager 029's conditions. One of those
-  conditions is the same-seed byte-identity check (d), which passed at `315b6bf`
-  (`RUN\dchk\logs\*.compare-final.txt`: IDENTICAL).
+  `e5f7151`, and carried forward to `<SHA>` under manager 029's conditions.
+  - One of those conditions is the same-seed check (d). At `315b6bf` it re-finished the
+    control and the target **warm, on identical inputs** (acc2's w0).
+    - `components.json` and `solution.npz` were identical apart from `solved_at` and
+      `solve_identity`.
+    - `solution.json` differed only in fields listed as by design
+      (`RUN\dchk\logs\*.compare-final.txt`).
+  - P3.9 then changed the draw-0 gate path, so (d) is being re-run at `a5001ab`
+    (`RUN\dchk2`): <D-AT-SHA>.
 - **[earlier]** means an earlier phase of the run. The source is named each time.
 
 ---
@@ -30,9 +36,11 @@ it was before (`tower/tower/config.py`).
 
 **The problem.** The target walk (world `6e6d3fc3`, Tristan's 06:01 walk of 2026-09-23)
 had its bathroom and a bed block glued into the bedroom at a wrong tilt, scale and
-position. The glue was feature matches on the phone in his hand. 117 of the 136 inliers
-holding the two islands together sat on the held phone [earlier:
-`RUN\baseline\FORENSICS.md` H-A; `RUN\mailbox\to-manager\20260923-1813-candidate-architecture.md` §0].
+position. The glue was feature matches on the phone in his hand.
+- The two islands were held together by 7 verified pairs with 136 inliers. 85 % of those
+  inliers, about 116, lay on the held phone [earlier: `RUN\baseline\FORENSICS.md` H-A].
+- Masking hands, arms and held phones removed 117 of the 136 and left 0 cross-island pairs
+  [earlier: `RUN\mailbox\to-manager\20260923-1813-candidate-architecture.md` §1].
 
 **The answer.** Stop gluing on false evidence, and stop inventing placement. A piece of
 the walk joins the room only on independent, consistent evidence. Anything else is shown
@@ -42,7 +50,7 @@ the walk joins the room only on independent, consistent evidence. Anything else 
 |---|---|---|
 | **Masks before SfM** | Hands, arms and the held phone are masked in every image of the final solve before its features are used. The walk's own feature database is filtered, not rebuilt | `solve_masks.py`, `transients.py`, `global_solve.py` |
 | **Evidence gate, with honoured links** | After mapping and before publishing, a group of cameras joins the room only with ≥ 2 independent verified links (or a closed triangle) that the solve itself agrees with (within τ = 16.8°), **and** a matching metric level (MoGe depth, within ×1.25). Depth now runs before publishing | `coherence_gate.py`, `coherence_scale.py`, `coherence_publish.py`, `dense_pipeline.py` |
-| **Components and areas** | Every piece of the walk is listed with the reason it was not placed. A piece of ≥ 30 keyframes or ≥ 5 s is built as its own levelled **area**, shown on its own routes and never positioned into the room. Smaller pieces are only counted | `components.py`, `area_build.py`, `tower/tower/routes/geometry.py`, `tower/tower/results/world_builder_library.py`, `world_builder_render.py` |
+| **Components and areas** | Every piece of the walk is listed with the reason it was not placed. A piece of ≥ 30 keyframes or ≥ 5 s is built as its own levelled **area**, shown on its own routes and never positioned into the room. Smaller pieces are only counted | `components.py`, `area_build.py`, `tower/tower/routes/geometry.py`, `tower/tower/results/world_builder_library.py`, `tower/tower/results/world_builder_render.py` |
 | **Consensus, N = 3** | The final solve is mapped with 3 mapper seeds on one database. A group of the room joins only if a strict majority of the draws attach it; otherwise it is withheld (`seed-unstable`). The chosen draw's room is never enlarged by the vote | `coherence_publish.py` (`gate_by_consensus`), `global_solve.py` |
 | **Frozen matching and caches** | A seeded final solve freezes its matched feature database (`database.matching.json`). Masks are cached per image, and depth predictions per input pixels. A second finish of the same walk with the same seed maps the same database | `global_solve.py`, `solve_masks.py`, `dense_pipeline.py` |
 | **Relocalizer and look-back prompt** | While live, after a tracking loss, the builder looks for the view it lost. If it cannot find it within 5 s, the phone says *"Look back the way you came."* (at most 2 prompts a minute). A found view becomes a verified revisit link that the final solve may import | `relocalizer.py`, `engine.py`, `tower/tower/results/world_builder.py` (`tracking.recovery`); iOS speaks it |
@@ -52,12 +60,20 @@ the walk joins the room only on independent, consistent evidence. Anything else 
 
 **How it was checked:**
 
-- **Reviews V5 to V11**, all fresh and adversarial, ended APPROVE or READY WITH CHANGES.
-  Every must-fix was fixed; V11's MED-B is fixed in P3.9, before `<SHA>`
-  (`RUN\baseline\review\V8\V8-REVIEW.md` … `V11\V11-REVIEW.md`).
-- **The full suite** at `315b6bf`: 5303 passed, 0 failed (`RUN\status.md`).
-- **The acceptance run:** `RUN\acc2\TABLE.md`, with the control and the target complete;
-  the other worlds and phases R, B and H were still running at hand-over.
+- **Reviews V5 to V12**, all fresh and adversarial, ended APPROVE or READY WITH CHANGES.
+  - Every must-fix was fixed. V11's MED-B is fixed at `6ae08c1` and `a5001ab`.
+  - V12 found the P3.9 code sound, and asked for doc changes only
+    (`RUN\baseline\review\V8\V8-REVIEW.md` … `V12\V12-REVIEW.md`).
+- **The full suite** at `a5001ab`, the final product-lane code: 5454 passed, 87 skipped,
+  1 xfailed, 0 failed (`RUN\lead\suite-a5001ab.log`).
+  - The run at `2febf3a` had one known Windows timing flake, the finisher-chore kill test
+    (`RUN\status.md`).
+- **The acceptance run:** `RUN\acc2\TABLE.md`, with the control and the target complete.
+  - At 11:44 on 2026-09-24 the chain's early-stop gate stopped it on 2f447162, another walk of
+    the same bedroom. The room differs by 1 to 5 keyframes between seeds (at most 2.51 %), with
+    GT 0 misplaced in all five runs (`RUN\acc2\STOP`;
+    `RUN\mailbox\to-manager\20260924-1207-acc2-gate-stop-2f447162.md`).
+  - It waits for a manager ruling. 6839fb8f and phases R, B and H have not run.
 
 ## 2. The switches
 
@@ -73,7 +89,8 @@ never touched.
 | `TOWER_WORLD_AREA_BUILDS` | `false` | `true` | the idle finisher builds each area; off shows *could not be built* |
 | `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`, then `silent` | the A/B arm; the builder reads it at each session start |
 | `TOWER_WORLD_FINISH_PENDING` | `true` | `true` | finishes areas, owed re-gates and deferred consensus |
-| `TOWER_WORLD_SOLVE`, `_SURFACE`, `_APPEARANCE` | `true` | `true` | the finisher runs only with all three on |
+| `TOWER_WORLD_SOLVE`, `_SURFACE` | `true` | `true` | the finisher runs only with these two and `TOWER_WORLD_FINISH_PENDING` on (`tower/tower/main.py`, `_world_finish_spec`) |
+| `TOWER_WORLD_APPEARANCE` | `true` | `true` | builds the room's and the areas' appearance; for the finisher it only switches `--appearance` |
 | `TOWER_WORLD_DENSIFY` | `false` | `false` | the gate runs its own depth |
 | `TOWER_WORLD_AUTOBUILD`, `_REGISTER`; `_REBUILD_EVERY` | `true`; `4` | same | unchanged |
 | `TOWER_CAPTURE_ROOT`, `TOWER_WORLD_ROOT` | unset | `data`, `data/world_builder` | Tristan's values; they reach the live store through the worktree's junction |
@@ -100,10 +117,11 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
 
 1. **Pause the acceptance run, for GPU exclusivity.** Create `RUN\acc2\STOP`, then wait until
    `RUN\acc2\logs\chain.log` shows that the chain stopped after its current run. It
-   resumes where it left off (§4.1).
+   resumes where it left off, after the checks in §4.1.
 2. **Re-finish the 06:01 walk in place,** with no Tower running:
    `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\refinish-target.ps1" -Sha <SHA>`.
-   - It takes about 20 min of GPU.
+   - It holds the GPU for about 15 min: the acceptance's cold re-finishes of this walk took
+     a median of 14.5 min [acc].
    - It checks its own dry run first: every solver frame must come from the raw capture.
    - It writes the set-aside to
      `C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649\refinish\<STAMP>\`.
@@ -133,8 +151,19 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
 
 - **The dry runs** (`DEPLOY-PLAN.md` §8), and **CUDA under the detached (WMI) launch**: it
   passed on the RTX 5070, with masks `applied` on cuda (`RUN\physical-test\preflight\cuda-wmi.json`).
-- **A launch from an SSH session is not proven.** If the Tower is started over SSH, run
-  `preflight-cuda-wmi.ps1` over the same SSH session first.
+  Both were checked at earlier SHAs, and both are **re-run at `<SHA>`** before the hand-over.
+- **A launch from an SSH session is not proven.** If the Tower will be started over SSH,
+  run the pre-flight over that same SSH session first:
+  1. Move the old result aside, with a move, never a delete. Otherwise an old PASS
+     survives a probe that died:
+     `$P = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\preflight'; Move-Item "$P\cuda-wmi.json" "$P\cuda-wmi.$(Get-Date -Format yyyyMMdd-HHmmss).json"`.
+  2. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\preflight-cuda-wmi.ps1" -WaitMinutes 30 -EnvFile C:\Users\tvllo\Projects\Glasses-worktrees\wb-live-visualization-v1\tower\.env`.
+     The default `-WaitMinutes 0` returns right after the launch, without the result.
+  3. Check that a new `cuda-wmi.json` exists, says PASS, and that its `env.at` is today's
+     run.
+- **The validation Tower on :8020 can stay up.** It is serve-only, on the CPU
+  (`TOWER_CV_DEVICE=cpu`), with no finisher (`TOWER_WORLD_FINISH_PENDING=false`;
+  `RUN\v8020\start_tower.ps1`).
 - **His 167 saved worlds:** the finisher's dry run finds 0 owed, so nothing is rebuilt on
   start or when idle. Old worlds look exactly as today (`DEPLOY-PLAN.md` §3).
 
@@ -202,16 +231,21 @@ be *Improving*.
 - Two walks finalizing at once would share the GPU. That has not been measured, so do not
   overlap them.
 
-**Restart for the second arm.** Once Group 1 has finished finalizing, run:
+**Restart for the second arm.** Wait until Group 1's last walk has fully settled: the room
+saved, and **no area saying *Improving***. Then run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$D\stop-test-tower.ps1" -WaitMinutes 30
 powershell -NoProfile -ExecutionPolicy Bypass -File "$D\start-test-tower.ps1" -Sha <SHA> -Relocalizer silent
 ```
 
-The stop script refuses while a walk is recording or finalizing, or while the finisher
-runs, so it is safe to try. `-WaitMinutes 30` polls until the Tower is idle. **Never use
-`-Force` while a walk is finalizing.**
+- **The stop script** refuses while a walk is recording or finalizing, or while the
+  finisher runs. `-WaitMinutes 30` polls until the Tower is idle.
+  - DEPLOY is changing it to count owed area work as busy too (V12, RV12-A LOW-1). Until
+    that lands, check the phone for *Improving* yourself.
+- **If `start-test-tower.ps1` refuses** because the finisher's dry run finds a test walk's
+  owed areas, re-run it with `-AllowOwed`. The new Tower then builds those areas.
+- **Never use `-Force` while a walk is finalizing.**
 
 **Group 2, prompt OFF** (the relocalizer only logs): **W-B ×3**, route A with the whip pans.
 
@@ -268,6 +302,10 @@ deleted without Tristan's approval.
 
 ## 4. Rollback
 
+```powershell
+$D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\deploy'
+```
+
 ### 4.1 Stop the test Tower, and return to today's Tower
 
 1. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "$D\stop-test-tower.ps1" -WaitMinutes 30`.
@@ -281,8 +319,12 @@ deleted without Tristan's approval.
    - Today's code serves re-finished worlds as rooms without areas. This was checked on
      v8020's three, this walk among them [earlier:
      `RUN\lead\deploy\probe-canonical-83534e2-on-v8020.json`].
-4. **The lead resumes the acceptance run:**
-   `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\launch-acc2-detached.ps1 -ForceContinue`.
+4. **The lead resumes the acceptance run.** First read `RUN\acc2\STOP`, and the last `STOP`
+   or `GATE-STOP` line of `RUN\acc2\logs\chain.log`.
+   - If the chain's own gate stopped a world during the pause, do **not** force-continue:
+     that needs a manager ruling.
+   - Otherwise:
+     `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\launch-acc2-detached.ps1 -ForceContinue`.
 
 ### 4.2 Restore the original `6e6d3fc3`: only with Tristan's explicit go
 
@@ -296,10 +338,19 @@ $A = "$W\refinish\<STAMP>"
 **Route 1: from the set-aside.** Follow the `restore` field in `$A\refinish.json`; read it
 at `<SHA>`.
 
-1. Make `$A\rebuild\`.
-2. Move the rebuild's `solve\<s>`, `areas\`, `surface\<s>`, `appearance\<s>`, `dense\<s>`
-   and `derived\` into `$A\rebuild\`. Move `sessions\<s>\session.json` into
-   `$A\rebuild\session.json`.
+1. Make the destination folders:
+   `New-Item -ItemType Directory "$A\rebuild\solve", "$A\rebuild\surface", "$A\rebuild\appearance", "$A\rebuild\dense", "$A\rebuild\sessions\<s>"`.
+2. Move each of the rebuild's trees to its own destination:
+
+   | from | to |
+   |---|---|
+   | `$W\solve\<s>` | `$A\rebuild\solve\<s>` |
+   | `$W\surface\<s>` | `$A\rebuild\surface\<s>` |
+   | `$W\appearance\<s>` | `$A\rebuild\appearance\<s>` |
+   | `$W\dense\<s>` | `$A\rebuild\dense\<s>` |
+   | `$W\areas` | `$A\rebuild\areas` |
+   | `$W\derived` | `$A\rebuild\derived` |
+   | `$W\sessions\<s>\session.json` | `$A\rebuild\sessions\<s>\session.json` |
 3. Move `$A\solve\<s>` back to `$W\solve\<s>`, and every other `moved` entry of the ledger
    from its `to` to its `from`.
 4. Move the snapshots back: `surface`, `appearance`, `dense` (which has no `predictions\`)
@@ -311,8 +362,12 @@ at `<SHA>`.
 before the test: 861 files (`RUN\lead\deploy\target-live-vs-frozen.json`).
 
 ```powershell
+$ErrorActionPreference = 'Stop'
+$D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\deploy'
+$W = 'C:\Users\tvllo\Projects\Glasses\tower\data\world_builder\worlds\6e6d3fc30e7b45f3a7521e618386b649'
 $F = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\baseline\frozen\worlds\6e6d3fc30e7b45f3a7521e618386b649'
 Move-Item $W 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\physical-test\aside-6e6d3fc3-<STAMP>'
+if (Test-Path $W) { throw "$W still exists: the move did not complete; stop here" }
 Copy-Item -Recurse $F $W
 attrib -R "$W\*" /S /D      # the copy only; never the frozen evidence
 C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.py" $W $F   # expect: all identical
@@ -335,8 +390,12 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
    - It flips only between a correct attachment and an honest area: GT shows 0 misplaced in
      all 5 runs.
    - Manager 035 accepted it as **"EXCEPTION (safe direction)"**. The follow-ups are in §6.
-   - Once a walk is finished, the same seed maps the same frozen database. The (d) check
-     reproduced this target byte for byte [acc: `RUN\dchk\logs`].
+   - Once a walk is finished, re-opening shows the saved result, and the same seed maps
+     the same frozen database.
+     - The (d) check re-finished this target warm, on identical inputs.
+       `components.json` and `solution.npz` were identical apart from `solved_at` and
+       `solve_identity` [acc: `RUN\dchk\logs`].
+     - Its re-run at `a5001ab`: <D-AT-SHA>.
 3. **Marginal pieces inside the anchor block** (V9 M-2). The vote never withholds the
    room's anchor group, so a marginal piece absorbed into it is not re-verified. This is a
    named residual risk (manager 025, decision 2). `gate.consensus.held_against_majority`
@@ -351,8 +410,8 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
      the frozen, wrongly glued world. 90.6 % is shown somewhere [acc for the product;
      earlier for the frozen figure, `P3-VAL\TABLE.md`].
    - **Control:** 96.2–97.7 % [acc].
-   - **Other worlds** [earlier, e2e7582]: 2f447162 94 → 52 %, and 52ed8e0a 85 → 37 %
-     (`P3-VAL\TABLE.md`; V8 M6).
+   - **Other worlds** [earlier, e2e7582]: 2f447162 94 → 52 %, and 52ed8e0a 85.5 → 37 %
+     (`P3-VAL\TABLE.md`; V8 M6). The 85.5 is agent R's recipe run, not the frozen world.
 6. **Face-redactor false positives.** The redactor blacks out wallpaper, screens and
    furniture. On af47007c, 66 of 218 frames were ≥ 2 % filled (median 22 %), and filled
    frames were lost at 42 % against 14 % [earlier:
@@ -362,7 +421,8 @@ C:\Users\tvllo\Projects\Glasses\tower\.venv\Scripts\python.exe "$D\compare_tree.
    prompt (contract §6.5; C1 M14), and the Release build hardcodes its Tower address
    (`DEPLOY-PLAN.md` §6).
 8. **The cost per walk.** A re-finish holds the GPU for a median of 20 min cold and 15.6 min
-   warm on the control (383 kf), and 14.5 min cold on the target [acc]. Consensus 3 adds
+   warm on the control (a 398-keyframe walk; its room is 383), and 14.5 min cold on the
+   target [acc]. Consensus 3 adds
    about 8.5 min at 678 keyframes [earlier: `RUN\experiments\P3-H2\PROGRESS.md`]. A live
    walk needs about 20–25 min after Stop to settle fully (`DEPLOY-PLAN.md` §4).
 9. **Two cold computations are one draw.** Whether two fresh mask computations, or two fresh
