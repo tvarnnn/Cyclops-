@@ -3193,9 +3193,13 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
         endedAt: Double? = nil,
         buildInProgress: Bool? = nil,
         reason: String? = nil,
-        updatedAt: Double = 1788895032.0
+        updatedAt: Double = 1788895032.0,
+        photographic: String? = nil
     ) -> String {
         let sessionID = "s-\(worldID)"
+        // Only when a test names one, so every older fixture stays
+        // byte-identical to the payload it was written from.
+        let photographicKey = photographic.map { #","photographic":"# + $0 } ?? ""
         let capture = captureID.map { "\"\($0)\"" } ?? "null"
         let ended = endedAt.map { String($0) } ?? "null"
         let geometry = geometryRevision.map { "\"\($0)\"" } ?? "null"
@@ -3225,7 +3229,7 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
                           "retains_raw_imagery":true},
                "lifecycle":{"state":"\(modelState)","evidence":"fixture","reason":\(why),
                             "build_in_progress":\(building),
-                            "build_in_progress_unavailable_reason":null,"finalization":null},
+                            "build_in_progress_unavailable_reason":null,"finalization":null\(photographicKey)},
                "geometry":{"available":\(geometryRevision != nil),"current":true,
                            "revision":\(geometry)},
                "model_state":"\(modelState)","model_state_reason":\(why),
@@ -3269,6 +3273,58 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
     /// A settled pause, for the assertions that something did **not** happen.
     private func settle() async {
         try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+
+    // MARK: The photographic word (Mac gate B0, 2026-09-23)
+
+    /// `lifecycle.photographic` reaches the client over a real socket and is
+    /// published even when nothing else in the payload moved: `owed` becomes
+    /// `failed` under an unchanged snapshot, which is the shape the finisher
+    /// produces, and `state` -- deduped at the source -- announces nothing.
+    func testThePhotographicWordIsPublishedEvenWhenTheStateStandsStill() async throws {
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        serve(server)
+        defer { server.stop() }
+
+        let tower = TowerClient(metrics: SenderMetrics())
+        let client = TowerWorldBuilderClient(tower: tower)
+        var published: [WorldPhotographicReport?] = []
+        let cancellable = client.photographicUpdates.sink { published.append($0) }
+        defer { cancellable.cancel() }
+        tower.connect(to: url(port: port))
+        await expect { client.state == .awaitingFirstUpdate }
+
+        server.send(text: message(
+            seq: 1, modelState: "finalizing", worldID: "w-owed", revision: "r1",
+            geometryRevision: "g1", selection: "pinned", endedAt: 1788895000.0,
+            buildInProgress: false,
+            photographic: #"{"state":"owed","stage":"appearance","detail":"nothing is working on it"}"#
+        ))
+        await expect { client.photographic?.state == .owed }
+        XCTAssertEqual(client.photographic?.stage, "appearance")
+        guard case .finalizing(_, let building) = client.state else {
+            return XCTFail("\(client.state)")
+        }
+        XCTAssertEqual(building, false)
+
+        // The same snapshot, a new photographic word.
+        server.send(text: message(
+            seq: 2, modelState: "finalized", worldID: "w-owed", revision: "r1",
+            geometryRevision: "g1", selection: "pinned", endedAt: 1788895000.0,
+            buildInProgress: false,
+            photographic: #"{"state":"failed","stage":"appearance","detail":"the encode raised"}"#
+        ))
+        await expect { client.photographic?.state == .failed }
+        XCTAssertEqual(client.photographic?.detail, "the encode raised")
+
+        // A Tower that sends no block: absence, never a made-up word.
+        server.send(text: message(
+            seq: 3, modelState: "finalized", worldID: "w-owed", revision: "r2",
+            geometryRevision: "g1", selection: "pinned", endedAt: 1788895000.0
+        ))
+        await expect { client.photographic == nil }
+        XCTAssertEqual(published.compactMap { $0?.state }, [.owed, .failed])
     }
 
     // MARK: The ownership rule
@@ -3942,6 +3998,8 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     private(set) var recentWorld: WorldRecentReference?
     /// The builder's finalization record. `nil` until a test sends one.
     private(set) var finalization: WorldFinalizationReport?
+    /// The Tower's photographic word. `nil` until a test sends one.
+    private(set) var photographic: WorldPhotographicReport?
 
     private let stateSubject = PassthroughSubject<WorldModelState, Never>()
     private let bindingSubject = PassthroughSubject<WorldSessionBinding, Never>()
@@ -3949,6 +4007,7 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     private let recentSubject = PassthroughSubject<WorldRecentReference?, Never>()
     private let geometrySubject = PassthroughSubject<WorldGeometryCoordinates, Never>()
     private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
+    private let photographicSubject = PassthroughSubject<WorldPhotographicReport?, Never>()
 
     var stateUpdates: AnyPublisher<WorldModelState, Never> { stateSubject.eraseToAnyPublisher() }
     var bindingUpdates: AnyPublisher<WorldSessionBinding, Never> { bindingSubject.eraseToAnyPublisher() }
@@ -3956,6 +4015,7 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { recentSubject.eraseToAnyPublisher() }
     var geometryUpdates: AnyPublisher<WorldGeometryCoordinates, Never> { geometrySubject.eraseToAnyPublisher() }
     var finalizationUpdates: AnyPublisher<WorldFinalizationReport?, Never> { finalizationSubject.eraseToAnyPublisher() }
+    var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> { photographicSubject.eraseToAnyPublisher() }
 
     /// Recorded so a test can assert the view model asked for the pin it was
     /// told to.
@@ -3981,6 +4041,13 @@ final class ScriptedWorldBuilderClient: WorldBuilderClient {
     func send(finalization report: WorldFinalizationReport?) {
         finalization = report
         finalizationSubject.send(report)
+    }
+
+    /// A photographic word **without** a state change beside it: `owed` →
+    /// `complete` while the snapshot stands still.
+    func send(photographic report: WorldPhotographicReport?) {
+        photographic = report
+        photographicSubject.send(report)
     }
 
     func send(_ coordinates: WorldGeometryCoordinates) {
