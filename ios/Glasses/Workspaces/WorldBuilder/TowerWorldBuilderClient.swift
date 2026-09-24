@@ -276,6 +276,25 @@ enum WorldBuilderResultDecoder {
         return WorldFinalizationReport(json: lifecycle["finalization"])
     }
 
+    /// `lifecycle.photographic` → `WorldPhotographicReport`, or `nil` for
+    /// `null` (a lifecycle computed from the record alone), for an absent key
+    /// (every Tower before 2026-09-22), and for a payload with no `lifecycle`.
+    /// `WORLD-BUILDER-IOS.md` §3a: read, because plain "Saved" over a failed
+    /// photographic build is the T3 defect.
+    static func photographic(from payload: [String: Any]) -> WorldPhotographicReport? {
+        let lifecycle = payload["lifecycle"] as? [String: Any] ?? [:]
+        return WorldPhotographicReport(json: lifecycle["photographic"])
+    }
+
+    /// `tracking.recovery` → `WorldRecoveryReport`, or `nil` for `null` ("not
+    /// recorded", never "no losses") and for a Tower without it
+    /// (`WORLD-BUILDER-COMPONENTS.md` §6.2). The third block this decoder
+    /// reads beside the projection (C1 M5): a prompt is not part of the world.
+    static func recovery(from payload: [String: Any]) -> WorldRecoveryReport? {
+        let tracking = payload["tracking"] as? [String: Any] ?? [:]
+        return WorldRecoveryReport(json: tracking["recovery"])
+    }
+
     /// `world.updated_at`, when the payload carries the Tower-native `world`
     /// block. Read for the "last saved world" line only — it is a clock
     /// reading, not a figure, and it is never drawn as a duration.
@@ -620,6 +639,39 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         finalizationSubject.eraseToAnyPublisher()
     }
 
+    /// The Tower's photographic word from the last report, or `nil`. Stored and
+    /// published for exactly the reason `finalization` is: `state` drops
+    /// repeats at the source, and `owed` → `complete` (or → `failed`) can
+    /// arrive with the snapshot standing still.
+    private(set) var photographic: WorldPhotographicReport? {
+        didSet {
+            guard photographic != oldValue else { return }
+            photographicSubject.send(photographic)
+        }
+    }
+
+    var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> {
+        photographicSubject.eraseToAnyPublisher()
+    }
+
+    /// The live relocalizer's episode (`tracking.recovery`), **only while this
+    /// phone follows the live session it is streaming to** -- unpinned and
+    /// `.bound` -- and `nil` otherwise: the world screen shows it for the walk
+    /// in progress and never on a saved world (§8).
+    private(set) var recovery: WorldRecoveryReport? {
+        didSet {
+            guard recovery != oldValue else { return }
+            recoverySubject.send(recovery)
+        }
+    }
+
+    var recoveryUpdates: AnyPublisher<WorldRecoveryReport?, Never> {
+        recoverySubject.eraseToAnyPublisher()
+    }
+
+    /// Says each look-back prompt once (§6.5). Handed every report in `apply`.
+    private let lookBack: WorldLookBackPrompter
+
     /// The pin the next `result_subscribe` carries, or `nil` to follow the
     /// live world. Kept across reconnects on purpose: a reader looking at a
     /// stored world who loses WiFi is still looking at that world when it
@@ -631,6 +683,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let inspectionSubject = PassthroughSubject<WorldInspectionMode, Never>()
     private let recentWorldSubject = PassthroughSubject<WorldRecentReference?, Never>()
     private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
+    private let photographicSubject = PassthroughSubject<WorldPhotographicReport?, Never>()
+    private let recoverySubject = PassthroughSubject<WorldRecoveryReport?, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -667,6 +721,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         var session: WorldSessionReport?
         var selection: WorldSelection
         var finalization: WorldFinalizationReport?
+        /// `lifecycle.photographic`, or `nil` when the Tower sent none.
+        var photographic: WorldPhotographicReport? = nil
         /// `world_snapshot.world_id` / `session.session_id`, as decoded — the
         /// same two strings `WorldGeometryCoordinates` is addressed by.
         var worldID: String?
@@ -674,6 +730,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         /// The stored world this report offered instead of a live one, when
         /// its selection was `latest`; `nil` otherwise.
         var recentWorld: WorldRecentReference?
+        /// `tracking.recovery`, or `nil`.
+        var recovery: WorldRecoveryReport? = nil
 
         /// Whether a `latest` offer is the walk `followedWalk` remembers.
         /// Both ids, not just the world: a world walked twice has one id and
@@ -703,6 +761,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // `didSet` drops repeats, so a two-second heartbeat carrying an
             // unchanged finalization publishes nothing.
             finalization = lastReport?.finalization
+            photographic = lastReport?.photographic
+            if lastReport == nil { recovery = nil }
         }
     }
 
@@ -804,9 +864,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private var resubscribesUsed = 0
     private static let resubscribeBudget = 3
 
-    init(tower: TowerClient, subscribeAckTimeout: Duration? = nil) {
+    /// `lookBackVoice` is injectable so a test hears what would be said
+    /// without audio; the default speaks over A2DP (`WorldSpeechLookBackVoice`).
+    init(tower: TowerClient, subscribeAckTimeout: Duration? = nil, lookBackVoice: WorldLookBackVoice? = nil) {
         self.tower = tower
         self.subscribeAckTimeout = subscribeAckTimeout ?? Self.defaultSubscribeAckTimeout
+        self.lookBack = WorldLookBackPrompter(voice: lookBackVoice ?? WorldSpeechLookBackVoice())
 
         // `.receive(on:)` on both, and it is load-bearing rather than
         // stylistic. A `@Published` publisher fires from `willSet`, so a sink
@@ -1307,13 +1370,27 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             session: session,
             selection: selection,
             finalization: WorldBuilderResultDecoder.finalization(from: payload),
+            photographic: WorldBuilderResultDecoder.photographic(from: payload),
             worldID: (payload["world_snapshot"] as? [String: Any])?["world_id"] as? String,
             sessionID: session?.sessionID,
             recentWorld: selection.isHistoryOfferedAsLive
                 ? WorldBuilderResultDecoder.recentReference(from: payload)
-                : nil
+                : nil,
+            recovery: WorldBuilderResultDecoder.recovery(from: payload)
         )
         publishLastReport()
+
+        // The look-back prompt: only here, on a report the Tower just sent --
+        // never on a bracket change, which re-judges an old report -- and only
+        // under §6.5's four conditions and C1 E1's (following live, bound).
+        lookBack.consider(
+            recovery: lastReport?.recovery,
+            binding: sessionBinding,
+            followingLive: pinned == nil,
+            towerSentAt: envelope.towerSentAt,
+            worldID: lastReport?.worldID,
+            sessionID: lastReport?.sessionID
+        )
 
         // Sent whether or not the state changed, and whether or not the
         // geometry did. See `geometryUpdates` for why this one is not filtered
@@ -1411,6 +1488,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             recentWorld = report.recentWorld
             let binding = bindingWithNoReport
             sessionBinding = binding
+            recovery = nil
             state = WorldSessionGate.presented(.idle, binding: binding)
             return
         }
@@ -1436,6 +1514,13 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         // Before the state, so a subscriber woken by `stateUpdates` that reads
         // `sessionBinding` sees the binding that produced it.
         sessionBinding = binding
+        // The relocalizer's line is the live walk's: shown while following it
+        // and bound to it, never for a pinned or foreign world (§8).
+        if pinned == nil, case .bound = binding {
+            recovery = report.recovery
+        } else {
+            recovery = nil
+        }
         // Assigned unconditionally; the `didSet` publishes only on a real
         // change. That is what keeps the ~2 s heartbeat — which re-sends an
         // unchanged snapshot to refresh the fields excluded from the revision

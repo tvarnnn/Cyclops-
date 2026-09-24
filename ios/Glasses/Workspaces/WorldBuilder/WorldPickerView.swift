@@ -51,6 +51,9 @@ struct WorldPickerView: View {
     /// showing the same world when Close is used, and the picker stays up
     /// underneath so a person comparing two walks does not have to reopen it.
     @State private var opened: WorldRenderTarget?
+    /// For an opened AREA: its number, the walk's area count and its spans,
+    /// from the row it was opened from. `nil` for a room.
+    @State private var openedArea: WorldAreaOpening?
 
     private var grouped: WorldListingPresentation.Grouped {
         WorldListingPresentation.grouped(world.worlds)
@@ -66,6 +69,13 @@ struct WorldPickerView: View {
                         worldRow(entry)
                         ForEach(entry.sessions, id: \.sessionID) { session in
                             sessionRow(entry: entry, session: session)
+                            // A walk's areas, straight from the listing, so an
+                            // area opens without loading the room first (C1 E5).
+                            // Nothing for `components: null` (every older world)
+                            // and nothing for a walk the gate kept whole.
+                            if let components = session.components, !components.isWhole {
+                                areaRows(entry: entry, session: session, components: components)
+                            }
                         }
                     }
                 }
@@ -93,7 +103,27 @@ struct WorldPickerView: View {
             // layers and two Close buttons, and the back gesture is what a
             // person reaches for after looking at one of several walks.
             .navigationDestination(item: $opened) { target in
-                WorldRenderScene(target: target, title: openedTitle, note: openedNote)
+                WorldRenderScene(
+                    target: target,
+                    title: target.isArea ? nil : openedTitle,
+                    note: target.isArea ? nil : openedNote,
+                    components: target.isArea ? nil : openedSession?.components,
+                    area: target.isArea ? openedArea : nil,
+                    // REPLACE, never stack (C1 E5): one destination slot, so
+                    // setting it to the area swaps the room's scene -- its
+                    // model, web view and WebGL context -- for the area's.
+                    openArea: { area, opening in
+                        openedArea = opening
+                        opened = area
+                    },
+                    backToRoom: target.isArea ? {
+                        openedArea = nil
+                        opened = target.room
+                    } : nil
+                )
+                // A new identity per target, so the room's `@StateObject`
+                // model is never handed the area's target.
+                .id(target.id)
             }
             .task { await world.loadWorlds() }
             // A pull, so a "Finishing" row can become "Complete" without
@@ -124,7 +154,8 @@ struct WorldPickerView: View {
         return Self.note(
             forOpened: session, target: opened,
             pinnedStage: pinned ? world.presentation.stage : nil,
-            pinnedReconstruction: pinned ? world.presentation.reconstruction : nil
+            pinnedReconstruction: pinned ? world.presentation.reconstruction : nil,
+            pinnedPhotographic: pinned ? world.presentation.photographic : nil
         )
     }
 
@@ -146,26 +177,55 @@ struct WorldPickerView: View {
     ///
     /// So such a row gets the ladder's note: the pin's own live one once its
     /// report has arrived — so the sentence leaves when the build lands, rather
-    /// than when this list is next refreshed — and until then the note for the
-    /// stage the row's word stands for. `finalizing` in the listing is always a
-    /// live process's evidence (a held lock, or a photographic stage running),
-    /// which is exactly what `.improving` claims.
+    /// than when this list is next refreshed — and until then the note for
+    /// what the row says.
+    ///
+    /// ## `finalizing` is NOT always a live process (corrected 2026-09-23)
+    ///
+    /// This said it was: "a held lock, or a photographic stage running". Since
+    /// the Tower's `photographic` block (WORLDS §2a) a row is also `finalizing`
+    /// when its photographic room is `owed` -- nothing is building it, and it
+    /// waits for an idle Tower with its photographic stages on -- or
+    /// `unobservable`. The Improving note's "it is worth waiting for Saved" is
+    /// a promise neither can keep (Mac gate B0, F3). So the row's own
+    /// `photographic` word picks the note, through the same ladder the canvas
+    /// uses; a row with no word (an older Tower, whose `finalizing` really was
+    /// a live lock) keeps the Improving note.
+    ///
+    /// **A settled row whose photographic build failed** says so: the one
+    /// case `WORLD-BUILDER-IOS.md` §3a says is worth new copy.
     static func note(
         forOpened session: WorldListingSession,
         target: WorldRenderTarget,
         pinnedStage: WorldStage?,
-        pinnedReconstruction: WorldReconstruction?
+        pinnedReconstruction: WorldReconstruction?,
+        pinnedPhotographic: WorldPhotographicReport? = nil
     ) -> String? {
         let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
-        let settled = solve.deniesAFinishedWorld ? solve.sentence : nil
+        // The pin's report is newer than the row once it has arrived; until
+        // then the row is all there is.
+        let photographic = pinnedStage != nil ? pinnedPhotographic : session.photographic
+        let failed = photographic?.standing.isFailed == true && !solve.deniesAFinishedWorld
+        let settled = solve.deniesAFinishedWorld
+            ? solve.sentence
+            : (failed ? WorldPhotographicCopy.failedHeadline + "." : nil)
         guard session.state == .finalizing || session.state == .receiving else { return settled }
+        // The room is finished; only an area of the walk is still being made
+        // (`scope: "area"`, COMPONENTS §3.4). The Improving note's "the
+        // finished world is very different from this one" is false of a room
+        // that will not change.
+        if photographic?.standing.isAreaStillFinishing == true {
+            let count = session.components.map(\.areasStillFinishing).flatMap { $0 > 0 ? $0 : nil }
+            return WorldPhotographicCopy.areaStillFinishing(count: count)
+        }
         if pinnedStage != nil, let pinnedReconstruction {
             if case .partial(_, let note) = pinnedReconstruction { return note }
             return settled
         }
         let listed: WorldStage = session.state == .receiving ? .mapping : .improving
         if case .partial(_, let note) = WorldReconstruction.ladder(
-            target: target, stage: listed, finalSolve: .notReported, evidence: nil
+            target: target, stage: listed, finalSolve: .notReported, evidence: nil,
+            photographic: session.photographic
         ) {
             return note
         }
@@ -405,6 +465,15 @@ struct WorldPickerView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                // A complete walk whose photographic build failed: the badge
+                // is short, so the whole sentence is here, where the reader
+                // chooses which walk to open.
+                if let photographic = WorldListingPresentation.photographicCaption(for: session) {
+                    Text(photographic)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 // The session id, restored as a caption rather than as the
                 // row's primary label.
                 //
@@ -447,6 +516,60 @@ struct WorldPickerView: View {
     /// gallery, with the 3D world still two taps away.
     private func open(worldID: String, sessionID: String?) {
         world.open(worldID: worldID, sessionID: sessionID)
+        openedArea = nil
         opened = WorldRenderTarget(worldID: worldID, sessionID: sessionID)
+    }
+
+    /// Pin the walk and push one of its areas (C1 E5: "areas open directly
+    /// from Saved Worlds rows"). The pin is the session's: the workspace behind
+    /// describes the walk, whose room is the placed component.
+    private func open(worldID: String, sessionID: String, area: WorldComponent, opening: WorldAreaOpening) {
+        world.open(worldID: worldID, sessionID: sessionID)
+        openedArea = opening
+        opened = WorldRenderTarget(worldID: worldID, sessionID: sessionID, areaID: area.id)
+    }
+
+    /// The walk's areas under its row, and its short stretches as one line
+    /// (`WORLD-BUILDER-COMPONENTS.md` §8). An area opens only when the Tower
+    /// says it has something to draw; otherwise its line says why not.
+    @ViewBuilder
+    private func areaRows(
+        entry: WorldListingEntry, session: WorldListingSession, components: WorldComponents
+    ) -> some View {
+        let areas = components.areas
+        ForEach(Array(areas.enumerated()), id: \.element.id) { index, area in
+            let line = WorldComponentsPresentation.areaLine(number: index + 1, area: area)
+            let availability = WorldComponentsPresentation.availability(of: area)
+            if availability == .opens {
+                Button {
+                    open(worldID: entry.worldID, sessionID: session.sessionID, area: area,
+                         opening: WorldAreaOpening(number: index + 1, total: areas.count,
+                                                   spans: area.captureSpans))
+                } label: {
+                    HStack {
+                        Text(line).font(.caption)
+                        Spacer()
+                        Text("not placed").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .padding(.leading, 16)
+                }
+                .buttonStyle(.plain)
+            } else {
+                HStack {
+                    Text(line).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if let word = WorldComponentsPresentation.availabilityWord(availability) {
+                        Text(word).font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.leading, 16)
+            }
+        }
+        if let footer = WorldComponentsPresentation.footer(components) {
+            Text(footer)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.leading, 16)
+        }
     }
 }

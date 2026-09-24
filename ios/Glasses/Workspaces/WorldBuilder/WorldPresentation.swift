@@ -499,18 +499,43 @@ enum WorldStage: Equatable {
     static func stage(
         for state: WorldModelState,
         evidence: WorldEvidence?,
-        finalization: WorldFinalizationReport?
+        finalization: WorldFinalizationReport?,
+        photographic: WorldPhotographicReport? = nil
     ) -> WorldStage? {
         switch state {
         case .unsupported, .idle, .awaitingFirstUpdate:
             return nil
         case .receiving:
             return evidence?.hasGeometry == true ? .building : .mapping
-        case .finalizing(_, let buildInProgress):
-            // "Improving" is claimed only where there is something to improve
-            // and a live process holding the lock. Everywhere else the honest
-            // word is the weaker one.
-            if buildInProgress == true, evidence?.hasGeometry == true { return .improving }
+        case .finalizing(let snapshot, let buildInProgress):
+            // "Improving" is claimed only where there is something to improve,
+            // and either a live process working on it right now
+            // (`build_in_progress: true`) or the Tower's settled word that the
+            // photographic room is not finished yet (`running`, `owed`,
+            // `unobservable` -- `WORLD-BUILDER-IOS.md` §3a).
+            //
+            // The second half is the 2026-09-23 correction (Mac gate B0, F2).
+            // An `owed` world arrives as `finalizing` with `build_in_progress:
+            // false`, honestly: nothing is building it this millisecond. Read
+            // off the boolean alone it was "Finalizing" under "The Tower does
+            // not report whether a build is running" -- which the Tower had
+            // just reported -- and "The final pass has not landed", over a
+            // world whose final solve had landed. The world is not finished
+            // being made, which is what "Improving" says; the canvas and the
+            // ladder say WHY in words that are true of each case, and draw a
+            // spinner only for a live build.
+            guard evidence?.hasGeometry == true else { return .finalizing }
+            // The ROOM is finished and only one of the walk's areas is still
+            // being made (`scope: "area"`, COMPONENTS §3.4). The Tower keeps
+            // the whole walk `finalizing` until every area settles, and says
+            // `build_in_progress: true` while an area builds (C1 E13) -- but
+            // the room on screen will not change, so it is judged exactly as
+            // the finished world it is. The canvas adds the area's sentence.
+            if photographic?.standing.isAreaStillFinishing == true {
+                return stage(for: .finalized(snapshot), evidence: evidence, finalization: finalization)
+            }
+            if buildInProgress == true { return .improving }
+            if photographic?.standing.isUnfinished == true { return .improving }
             return .finalizing
         case .finalized:
             let solve = WorldFinalSolve(word: finalization?.finalSolve)
@@ -709,6 +734,12 @@ struct WorldPresentation: Equatable {
     /// What survived, and what can be done about it. `nil` where there is no
     /// world.
     var recoverability: WorldRecoverability?
+    /// The Tower's `lifecycle.photographic`, or `nil` when it sent none.
+    var photographic: WorldPhotographicReport?
+    /// The live relocalizer's episode, for the walk this phone is streaming
+    /// (`nil` otherwise: the client only publishes it while following live and
+    /// bound).
+    var recovery: WorldRecoveryReport?
 
     init(
         stage: WorldStage? = nil,
@@ -718,7 +749,9 @@ struct WorldPresentation: Equatable {
             reason: "The Tower has named no world to look at."
         ),
         account: WorldGeometryAccount = .undescribed,
-        recoverability: WorldRecoverability? = nil
+        recoverability: WorldRecoverability? = nil,
+        photographic: WorldPhotographicReport? = nil,
+        recovery: WorldRecoveryReport? = nil
     ) {
         self.stage = stage
         self.evidence = evidence
@@ -726,11 +759,94 @@ struct WorldPresentation: Equatable {
         self.reconstruction = reconstruction
         self.account = account
         self.recoverability = recoverability
+        self.photographic = photographic
+        self.recovery = recovery
+    }
+
+    /// Whether this is a saved world whose photographic build failed: the one
+    /// case `WORLD-BUILDER-IOS.md` §3a says is worth new copy. Only over
+    /// `.saved` -- a failed photographic build needs a solved final pass, so
+    /// every other stage already says something truer than "Saved".
+    var isSavedWithoutItsPhotographicVersion: Bool {
+        stage == .saved && photographic?.standing.isFailed == true
+    }
+
+    /// The headline word: the stage's, except over a saved world whose
+    /// photographic build failed, where plain "Saved" is the T3 defect.
+    var headline: String? {
+        if isSavedWithoutItsPhotographicVersion { return WorldPhotographicCopy.failedHeadline }
+        return stage?.label
+    }
+
+    /// A finished room with one of the walk's areas still being made
+    /// (`scope: "area"`): the room is saved; say so, and that an area is not.
+    var isSavedWithAnAreaStillFinishing: Bool {
+        photographic?.standing.isAreaStillFinishing == true
+            && (stage == .saved || stage == .partial)
+    }
+
+    /// Whether the canvas may draw the live-build spinner: a live process
+    /// (`build_in_progress: true`) working on THIS picture. Not while only an
+    /// area is building -- the room on screen will not change.
+    func showsLiveBuild(buildInProgress: Bool?) -> Bool {
+        buildInProgress == true && photographic?.standing.isAreaStillFinishing != true
+    }
+
+    /// What the 3D viewer says above its caption when it is opened from this
+    /// screen: the ladder's note for an unfinished world, the failed
+    /// photographic build's explanation for a saved one, or that an area of
+    /// the walk is still being finished. `nil` otherwise.
+    var viewerNote: String? {
+        if case .partial(_, let note) = reconstruction { return note }
+        if isSavedWithoutItsPhotographicVersion { return WorldPhotographicCopy.failedHeadline + "." }
+        if isSavedWithAnAreaStillFinishing { return WorldPhotographicCopy.areaStillFinishing() }
+        return nil
     }
 
     /// The value for a screen with no world on it. What previews and the
     /// states that carry no snapshot are drawn from.
     static let empty = WorldPresentation()
+
+    /// The canvas's sentence under a `finalizing` world, from what the Tower
+    /// actually reported. A pure function so every arm is tested.
+    ///
+    /// - `build_in_progress: true`: a live process is finishing it, and the
+    ///   figures are not final. (The spinner is drawn for this case alone.)
+    /// - otherwise the photographic word, when it names unfinished work:
+    ///   `owed`, `unobservable`, or `running` reported without a live
+    ///   boolean beside it.
+    /// - `false` with no such word: the Tower reported that nothing is
+    ///   building it.
+    /// - `nil` with no such word -- a record older than the photographic
+    ///   stages, which is the only case where "the Tower does not report
+    ///   whether a build is running" is true.
+    static func finalizingDetail(
+        buildInProgress: Bool?, photographic: WorldPhotographicReport?
+    ) -> String {
+        // First: with an area building, `build_in_progress` is `true` (C1
+        // E13), and "the final solve, the final build … these figures are not
+        // final" would be false of a room that is finished.
+        if photographic?.standing.isAreaStillFinishing == true {
+            return WorldPhotographicCopy.areaStillFinishing()
+        }
+        if buildInProgress == true {
+            return "The Tower is still finishing this world: the final solve, the final build "
+                + "and the photographic reconstruction all run after the session stops, and "
+                + "these figures are not final."
+        }
+        switch photographic?.standing {
+        case .owed: return WorldPhotographicCopy.owedSentence
+        case .unobservable: return WorldPhotographicCopy.unobservableSentence
+        case .building: return WorldPhotographicCopy.buildingSentence
+        case .failed, .settled, .areaStillFinishing, nil: break
+        }
+        if buildInProgress == false {
+            return "Capture has ended and these figures are not final. The Tower reports that "
+                + "nothing is building this world right now."
+        }
+        return "Capture has ended and these figures are not final. The Tower does not report "
+            + "whether a build is running, so this app cannot say whether one is."
+    }
 }
 
 // MARK: - The 3D ladder
@@ -777,11 +893,32 @@ enum WorldReconstruction: Equatable {
     /// is the honest "there is nothing to open", and it is a **different** state
     /// from the render route answering 404 — which happens after this, inside
     /// the viewer, and carries the Tower's own detail.
+    /// The note for a world whose photographic room is outstanding and
+    /// NOTHING is known to be building it: `owed` or `unobservable`. `nil`
+    /// for every other word, and for no word at all, so the long-standing
+    /// notes stand wherever the Tower did not say something more specific.
+    ///
+    /// `running` is deliberately not here: something IS building the world,
+    /// and the Improving note's promise is true of it.
+    static func unfinishedPhotographicNote(_ photographic: WorldPhotographicReport?) -> String? {
+        switch photographic?.standing {
+        case .owed:
+            return WorldPhotographicCopy.owedSentence + " "
+                + WorldPhotographicCopy.finishedLooksDifferent
+        case .unobservable:
+            return WorldPhotographicCopy.unobservableSentence + " "
+                + WorldPhotographicCopy.finishedLooksDifferent
+        case .building, .failed, .settled, .areaStillFinishing, nil:
+            return nil
+        }
+    }
+
     static func ladder(
         target: WorldRenderTarget?,
         stage: WorldStage?,
         finalSolve: WorldFinalSolve,
-        evidence: WorldEvidence?
+        evidence: WorldEvidence?,
+        photographic: WorldPhotographicReport? = nil
     ) -> WorldReconstruction {
         guard let target else {
             // Said in terms of what the Tower reported, never in terms of a
@@ -840,6 +977,17 @@ enum WorldReconstruction: Equatable {
             // 756 s for 690 keyframes, after the final solve -- and a wearer
             // told "a few minutes" is the wearer who shut the Tower down in
             // the middle of one. The sentence gives the long walk's figure.
+            //
+            // Since 2026-09-23 `.improving` is also reached with nothing
+            // running -- the Tower's `owed` and `unobservable` words (see
+            // `WorldStage.stage`) -- and "it is worth waiting for Saved" is
+            // not a promise the phone can make over either: owed work waits
+            // for an idle Tower with its photographic stages on, and an
+            // unobservable one may be waiting for nothing. They get the
+            // sentence that is true of them.
+            if let unfinished = Self.unfinishedPhotographicNote(photographic) {
+                return .partial(target, note: unfinished)
+            }
             return .partial(
                 target,
                 note: "This world is still being finished. After a long walk, "
@@ -881,6 +1029,22 @@ enum WorldReconstruction: Equatable {
             // that has no drawable geometry yet, where "nothing here can see
             // a build running" would sit directly under a spinner saying
             // "The Tower is finishing this world."
+            //
+            // And never over a world whose final pass DID land and whose
+            // photographic room is what is outstanding (the Tower's
+            // `running`/`owed`/`unobservable`, reached here only without
+            // drawable geometry). "The final pass has not landed" was false
+            // there (Mac gate B0, F2); the photographic sentence is not.
+            if let unfinished = Self.unfinishedPhotographicNote(photographic) {
+                return .partial(target, note: unfinished)
+            }
+            if photographic?.standing == .building {
+                return .partial(
+                    target,
+                    note: WorldPhotographicCopy.buildingSentence + " "
+                        + WorldPhotographicCopy.finishedLooksDifferent
+                )
+            }
             return .partial(
                 target,
                 note: "The final pass has not landed for this world, and the "

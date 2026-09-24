@@ -93,7 +93,13 @@ nonisolated enum WorldListingPresentation {
         if let state = session.state {
             switch state {
             case .receiving: return "Building"
-            case .finalizing: return "Finishing"
+            case .finalizing:
+                // The room is finished and only one of the walk's areas is
+                // still being made (`scope: "area"`, COMPONENTS §3.4): the
+                // walk is complete as far as its room goes, and the caption
+                // says an area is not.
+                if session.photographic?.standing.isAreaStillFinishing == true { return "Complete" }
+                return "Finishing"
             case .complete:
                 // The same rule `WorldStage.stage` applies to `.finalized`:
                 // a record whose final solve was skipped, failed or
@@ -104,8 +110,18 @@ nonisolated enum WorldListingPresentation {
                 // `finalization`, so the row can say what the canvas will.
                 // Before this, a Tower shut down mid-walk listed "Complete ·
                 // no final pass" over a canvas reading "Partial".
-                return WorldFinalSolve(word: session.finalization?.finalSolve).deniesAFinishedWorld
-                    ? "Partial" : "Complete"
+                if WorldFinalSolve(word: session.finalization?.finalSolve).deniesAFinishedWorld {
+                    return "Partial"
+                }
+                // Complete, and its photographic build failed: saved, but not
+                // what the walk was for. Plain "Complete" over it is the T3
+                // defect the Tower's `photographic` block exists to end
+                // (`WORLD-BUILDER-IOS.md` §3a); the caption under the title
+                // carries the full sentence.
+                if session.photographic?.standing.isFailed == true {
+                    return WorldPhotographicCopy.failedBadge
+                }
+                return "Complete"
             case .interrupted:
                 // "Interrupted" with geometry opens onto a canvas headlined
                 // "Interrupted"; without geometry the canvas says "Needs
@@ -179,6 +195,23 @@ nonisolated enum WorldListingPresentation {
         let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
         guard solve.deniesAFinishedWorld else { return nil }
         return "no final pass"
+    }
+
+    /// The row's photographic sentence, or `nil`: only for a session the
+    /// Tower lists `complete` whose photographic build failed, and only where
+    /// the final pass ran (a row that already says "Partial" has said the
+    /// truer thing). Every other word adds nothing to a row, and silence keeps
+    /// an older world's row exactly as it was.
+    static func photographicCaption(for session: WorldListingSession) -> String? {
+        if session.state == .finalizing, session.photographic?.standing.isAreaStillFinishing == true {
+            let count = session.components.map(\.areasStillFinishing).flatMap { $0 > 0 ? $0 : nil }
+            return WorldPhotographicCopy.areasStillFinishingCaption(count: count)
+        }
+        guard session.state == .complete,
+              session.photographic?.standing.isFailed == true,
+              !WorldFinalSolve(word: session.finalization?.finalSolve).deniesAFinishedWorld
+        else { return nil }
+        return WorldPhotographicCopy.failedHeadline
     }
 
     /// `"467 keyframes"`, or `nil` when neither count was sent. The journal's

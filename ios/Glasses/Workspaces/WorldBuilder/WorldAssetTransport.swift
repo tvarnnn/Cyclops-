@@ -47,6 +47,27 @@ nonisolated enum WorldAssetScheme {
         return components.url
     }
 
+    /// The page's address for a viewer's scope: the room's, or an area's
+    /// `/worlds/<w>/areas/<s>/<a>/render` (`WORLD-BUILDER-COMPONENTS.md` §5.5),
+    /// query-free like the room's. `nil` when an id will not go into a URL.
+    static func pageURL(worldID: String, scope: WorldAssetScope) -> URL? {
+        switch scope {
+        case .room:
+            return pageURL(worldID: worldID)
+        case .area(let sessionID, let areaID):
+            guard
+                !worldID.isEmpty, let world = encoded(worldID),
+                !sessionID.isEmpty, let session = encoded(sessionID),
+                WorldComponent.isAreaID(areaID)
+            else { return nil }
+            var components = URLComponents()
+            components.scheme = name
+            components.host = host
+            components.percentEncodedPath = "/worlds/\(world)/areas/\(session)/\(areaID)/render"
+            return components.url
+        }
+    }
+
     /// What this app declares it can draw, sent as `viewer=` on the page and
     /// revision requests (`WORLD-BUILDER-WORLDS.md` §4). The Tower's `auto`
     /// ladder offers the appearance page only to a client that declares it,
@@ -71,6 +92,30 @@ nonisolated enum WorldAssetScheme {
     private static let unreserved = CharacterSet(
         charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
     )
+}
+
+// MARK: - Which family of routes one viewer may reach
+
+/// What one viewer was opened for, fixed when its handler is created
+/// (`WORLD-BUILDER-COMPONENTS.md` §5.5, C1 M1): the room of a world, or one
+/// area of one session. **Each viewer's whitelist is exactly its own family**:
+/// a room handler answers no `/areas/` path, and an area handler answers no
+/// room route and no other area or session.
+nonisolated enum WorldAssetScope: Equatable, Sendable {
+    /// `/worlds/<w>/render` and the session routes the page names (§10).
+    case room
+    /// `/worlds/<w>/areas/<s>/<a>/…`. The session is in the path and fixed at
+    /// open -- never learned from the page's `wb-revision`.
+    case area(sessionID: String, areaID: String)
+
+    /// The scope a target opens: an area target (with its session) is an
+    /// area, anything else is the room.
+    static func of(_ target: WorldRenderTarget) -> WorldAssetScope {
+        if let areaID = target.areaID, let sessionID = target.sessionID {
+            return .area(sessionID: sessionID, areaID: areaID)
+        }
+        return .room
+    }
 }
 
 // MARK: - What the page may ask for
@@ -99,9 +144,12 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
 
     /// `worldID` is the world the viewer was opened for. `sessionID` is the
     /// session the page on screen draws (see `WorldAssetSchemeHandler.session`);
-    /// with none known, only the page itself is served.
+    /// with none known, only the page itself is served. `scope` is the family
+    /// of routes this viewer may reach; the room's whitelist below is exactly
+    /// what it was before areas existed.
     static func parse(
-        _ url: URL?, method: String?, worldID: String, sessionID: String?
+        _ url: URL?, method: String?, worldID: String, sessionID: String?,
+        scope: WorldAssetScope = .room
     ) -> WorldAssetRequest? {
         guard
             let url,
@@ -121,6 +169,10 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
         }
         let query = components.percentEncodedQuery
         guard segments.count >= 3, segments[0] == "worlds", segments[1] == world else { return nil }
+
+        if case .area(let areaSession, let areaID) = scope {
+            return parseArea(segments: segments, query: query, sessionID: areaSession, areaID: areaID)
+        }
 
         if segments.count == 3, segments[2] == "render", query == nil {
             return .page
@@ -146,6 +198,44 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
         return nil
     }
 
+    /// The area family, `WORLD-BUILDER-COMPONENTS.md` §5.5, after the world
+    /// segment has matched. Exactly five shapes, none with a query:
+    ///
+    ///     /worlds/<w>/areas/<s>/<a>/render
+    ///     /worlds/<w>/areas/<s>/<a>/render/revision
+    ///     /worlds/<w>/areas/<s>/<a>/appearance/manifest
+    ///     /worlds/<w>/areas/<s>/<a>/appearance/chunk/<32 lower-hex>
+    ///     /worlds/<w>/areas/<s>/<a>/appearance/proxy/<32 lower-hex>
+    ///
+    /// with `<s>` and `<a>` the ones this viewer was opened for.
+    private static func parseArea(
+        segments: [String], query: String?, sessionID: String, areaID: String
+    ) -> WorldAssetRequest? {
+        guard
+            query == nil,
+            !sessionID.isEmpty, let session = WorldAssetScheme.encoded(sessionID),
+            WorldComponent.isAreaID(areaID),
+            segments.count >= 6,
+            segments[2] == "areas", segments[3] == session, segments[4] == areaID
+        else { return nil }
+        switch (segments.count, segments[5]) {
+        case (6, "render"):
+            return .page
+        case (7, "render") where segments[6] == "revision":
+            return .renderRevision
+        case (7, "appearance") where segments[6] == "manifest":
+            return .appearanceManifest
+        case (8, "appearance") where isDigest(segments[7]):
+            switch segments[6] {
+            case "chunk": return .appearanceChunk(digest: segments[7])
+            case "proxy": return .appearanceProxy(digest: segments[7])
+            default: return nil
+            }
+        default:
+            return nil
+        }
+    }
+
     /// 32 lower-hex characters: `WORLD-BUILDER-APPEARANCE.md` §4.
     static func isDigest(_ value: String) -> Bool {
         value.utf8.count == 32 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
@@ -153,7 +243,9 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
 
     /// The Tower address this request is proxied to, or `nil` for the page,
     /// which is never fetched here.
-    func towerURL(baseURL: URL, worldID: String, sessionID: String?) -> URL? {
+    func towerURL(
+        baseURL: URL, worldID: String, sessionID: String?, scope: WorldAssetScope = .room
+    ) -> URL? {
         guard
             var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
             let world = WorldAssetScheme.encoded(worldID)
@@ -161,6 +253,24 @@ nonisolated enum WorldAssetRequest: Equatable, Sendable {
         let base = components.percentEncodedPath.hasSuffix("/")
             ? String(components.percentEncodedPath.dropLast())
             : components.percentEncodedPath
+        if case .area(let areaSession, let areaID) = scope {
+            // The same path on the Tower, with no query at all -- the area
+            // revision route takes none and ignores `viewer` (§5.1, C1 M12).
+            guard
+                let session = WorldAssetScheme.encoded(areaSession), !areaSession.isEmpty,
+                WorldComponent.isAreaID(areaID)
+            else { return nil }
+            let area = "\(base)/worlds/\(world)/areas/\(session)/\(areaID)"
+            switch self {
+            case .page: return nil
+            case .renderRevision: components.percentEncodedPath = "\(area)/render/revision"
+            case .appearanceManifest: components.percentEncodedPath = "\(area)/appearance/manifest"
+            case .appearanceChunk(let digest): components.percentEncodedPath = "\(area)/appearance/chunk/\(digest)"
+            case .appearanceProxy(let digest): components.percentEncodedPath = "\(area)/appearance/proxy/\(digest)"
+            }
+            components.percentEncodedQuery = nil
+            return components.url
+        }
         let session = sessionID.flatMap(WorldAssetScheme.encoded)
         switch self {
         case .page:
@@ -270,8 +380,10 @@ nonisolated struct WorldAssetClient {
 
     /// The request for `asset`, or `nil` for the page (never fetched here) or an
     /// address that will not form.
-    func request(for asset: WorldAssetRequest, worldID: String, sessionID: String?) -> URLRequest? {
-        guard let url = asset.towerURL(baseURL: baseURL, worldID: worldID, sessionID: sessionID)
+    func request(
+        for asset: WorldAssetRequest, worldID: String, sessionID: String?, scope: WorldAssetScope = .room
+    ) -> URLRequest? {
+        guard let url = asset.towerURL(baseURL: baseURL, worldID: worldID, sessionID: sessionID, scope: scope)
         else { return nil }
         var request = URLRequest(
             url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout
@@ -281,10 +393,10 @@ nonisolated struct WorldAssetClient {
         return request
     }
 
-    func fetch(_ asset: WorldAssetRequest, worldID: String, sessionID: String?) async throws
-        -> WorldAssetResponse
-    {
-        guard let request = request(for: asset, worldID: worldID, sessionID: sessionID) else {
+    func fetch(
+        _ asset: WorldAssetRequest, worldID: String, sessionID: String?, scope: WorldAssetScope = .room
+    ) async throws -> WorldAssetResponse {
+        guard let request = request(for: asset, worldID: worldID, sessionID: sessionID, scope: scope) else {
             throw WorldRenderFetchError.badAddress
         }
         let (data, response) = try await session.data(for: request)
@@ -432,6 +544,10 @@ nonisolated struct WorldAssetMemory: Sendable {
 @MainActor
 final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     let worldID: String
+    /// The family of routes this viewer may reach, fixed at creation
+    /// (`WORLD-BUILDER-COMPONENTS.md` §5.5): the room, or one area. The memory
+    /// below is this handler's, so it is per (`<s>`, `<a>`) by construction.
+    let scope: WorldAssetScope
     private let client: WorldAssetClient
 
     /// The page string `WorldRenderClient` fetched, served for `.page`.
@@ -461,9 +577,14 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     private var liveTasks: Set<ObjectIdentifier> = []
     private var inflight: [ObjectIdentifier: Task<Void, Never>] = [:]
 
-    init(worldID: String, client: WorldAssetClient = WorldAssetClient()) {
+    init(worldID: String, scope: WorldAssetScope = .room, client: WorldAssetClient = WorldAssetClient()) {
         self.worldID = worldID
+        self.scope = scope
         self.client = client
+        if case .area(let sessionID, _) = scope {
+            // Fixed at open, never taught by the page (§5.5).
+            self.sessionID = sessionID
+        }
     }
 
     /// The session a page may reach: the one the viewer was opened for, or --
@@ -531,7 +652,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         case .fetch:
             break
         }
-        let response = try await client.fetch(asset, worldID: worldID, sessionID: sessionID)
+        let response = try await client.fetch(asset, worldID: worldID, sessionID: sessionID, scope: scope)
         memory.record(asset, response, now: clock())
         return response
     }
@@ -558,7 +679,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
             guard let self else { return }
             defer { self.revalidating = nil }
             guard let manifest = try? await self.client.fetch(
-                .appearanceManifest, worldID: self.worldID, sessionID: sessionID)
+                .appearanceManifest, worldID: self.worldID, sessionID: sessionID, scope: self.scope)
             else { return }
             self.memory.record(.appearanceManifest, manifest, now: self.clock())
         }
@@ -586,7 +707,7 @@ final class WorldAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         guard isAttached else { return }
         let request = urlSchemeTask.request
         guard let asset = WorldAssetRequest.parse(
-            request.url, method: request.httpMethod, worldID: worldID, sessionID: sessionID
+            request.url, method: request.httpMethod, worldID: worldID, sessionID: sessionID, scope: scope
         ) else {
             respond(urlSchemeTask, status: 404, mimeType: "text/plain", data: Data("not served".utf8))
             return

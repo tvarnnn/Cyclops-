@@ -192,6 +192,15 @@ struct WorldCanvasView: View {
         case .receiving(let snapshot):
             stageHeadline(fallback: "Building", systemImage: "cube")
             worldName(snapshot)
+            // The live relocalizer, when tracking was lost (§8): "Finding where
+            // you are…", then linked back or not. Only ever for the walk this
+            // phone is streaming; the client publishes nothing otherwise.
+            if let line = presentation.recovery?.displayLine {
+                Label(line, systemImage: "location.viewfinder")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("world-recovery")
+            }
             reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: true)
             diagnostics
@@ -228,7 +237,7 @@ struct WorldCanvasView: View {
             // thing the Tower had carefully declined to say.
             stageHeadline(fallback: "Finalizing", systemImage: "cube")
             worldName(snapshot)
-            if buildInProgress == true {
+            if presentation.showsLiveBuild(buildInProgress: buildInProgress) {
                 HStack(spacing: 10) {
                     ProgressView()
                     Text("The Tower is finishing this world.")
@@ -238,16 +247,21 @@ struct WorldCanvasView: View {
             }
             reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: false)
-            if buildInProgress == true {
-                detailText("The Tower is still finishing this world: the final solve, the final build and the photographic reconstruction all run after the session stops, and these figures are not final.")
-            } else {
-                detailText("Capture has ended and these figures are not final. The Tower does not report whether a build is running, so this app cannot say whether one is.")
-            }
+            // Chosen by `WorldPresentation.finalizingDetail`, which says what
+            // the Tower actually reported: a live build, owed work, a probe
+            // that could not tell -- or, only for a Tower that sent neither,
+            // that it did not say. That last sentence used to be drawn for
+            // every non-`true` value, including `build_in_progress: false`
+            // from a Tower that had just reported nothing was running
+            // (Mac gate B0, F2).
+            detailText(WorldPresentation.finalizingDetail(
+                buildInProgress: buildInProgress, photographic: presentation.photographic))
             diagnostics
 
         case .finalized(let snapshot):
             stageHeadline(fallback: "Saved", systemImage: "cube.fill")
             worldName(snapshot)
+            photographicFailureNote
             reconstructionCard
             finalSolveNote
             WorldSummaryView(snapshot: snapshot, isLive: false)
@@ -451,6 +465,30 @@ struct WorldCanvasView: View {
     /// since 2026-09-06 and read by no view until now. It is `null` on the
     /// field world, meaning the final solve never ran, and the phone presented
     /// that world as a finished one.
+    /// Under the headline of a saved world whose photographic build failed:
+    /// that waiting will not help, and the Tower's own reason. Nothing for any
+    /// other world -- a finished world does not need a line saying so.
+    @ViewBuilder
+    private var photographicFailureNote: some View {
+        if presentation.isSavedWithAnAreaStillFinishing {
+            // Normally reached through the `.finalizing` arm, whose sentence
+            // says it; kept here for a Tower that settles the walk's word
+            // before its areas.
+            detailText(WorldPhotographicCopy.areaStillFinishing())
+        }
+        if presentation.isSavedWithoutItsPhotographicVersion {
+            detailText(WorldPhotographicCopy.failedExplanation)
+            if case .failed(let detail) = presentation.photographic?.standing,
+               let reason = WorldPhotographicCopy.failedReason(detail) {
+                Text(reason)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     @ViewBuilder
     private var finalSolveNote: some View {
         if let sentence = presentation.finalSolve.sentence {
@@ -570,7 +608,9 @@ struct WorldCanvasView: View {
     /// caller that passes only a state — is unchanged.
     private func stageHeadline(fallback: String, systemImage: String) -> some View {
         headline(
-            presentation.stage?.label ?? fallback,
+            // `headline`, not `stage.label`: over a saved world whose
+            // photographic build failed the word alone is the T3 defect.
+            presentation.headline ?? fallback,
             systemImage: presentation.stage?.systemImage ?? systemImage
         )
     }

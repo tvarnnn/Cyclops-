@@ -61,16 +61,53 @@ nonisolated struct WorldRenderTarget: Equatable, Hashable, Sendable, Identifiabl
     /// would make `WorldRenderTarget(worldID:sessionID:view:)` unavailable to
     /// the one call site that needs it.
     var view: WorldRenderView = .product
+    /// One of the session's areas (`WORLD-BUILDER-COMPONENTS.md` §5), or `nil`
+    /// for the room. An area target always names its session: the area routes
+    /// carry it in the path.
+    var areaID: String? = nil
 
-    /// Includes the view, so `.sheet(item:)` re-presents when the reader asks
-    /// for the other rendering of the same world rather than treating it as
-    /// the same item.
-    var id: String { "\(worldID)/\(sessionID ?? "")/\(view.rawValue)" }
+    /// Includes the view and the area, so a navigation destination keyed on
+    /// the target treats the room and each area as different screens -- which
+    /// is what makes opening an area REPLACE the room viewer rather than stack
+    /// on it (C1 E5).
+    var id: String {
+        "\(worldID)/\(sessionID ?? "")/\(view.rawValue)" + (areaID.map { "/area:\($0)" } ?? "")
+    }
+
+    var isArea: Bool { areaID != nil }
 
     /// The same world and session, in the other rendering.
     func showing(_ view: WorldRenderView) -> WorldRenderTarget {
-        WorldRenderTarget(worldID: worldID, sessionID: sessionID, view: view)
+        WorldRenderTarget(worldID: worldID, sessionID: sessionID, view: view, areaID: areaID)
     }
+
+    /// One of this session's areas, by the id the listing or revision gave.
+    func area(_ areaID: String) -> WorldRenderTarget {
+        WorldRenderTarget(worldID: worldID, sessionID: sessionID, areaID: areaID)
+    }
+
+    /// The room of the same world and session: *Back to the room*.
+    var room: WorldRenderTarget {
+        WorldRenderTarget(worldID: worldID, sessionID: sessionID)
+    }
+}
+
+/// What an area viewer needs to say about the area it shows, taken from the
+/// list it was opened from and kept for the life of the screen (C1 M7): its
+/// number, how many areas the walk has, and when it was captured.
+nonisolated struct WorldAreaOpening: Equatable, Hashable, Sendable {
+    let number: Int
+    let total: Int
+    let spans: [WorldCaptureSpan]
+
+    /// The area viewer's header (§5.4), whole: the navigation title, which is
+    /// also what accessibility reads.
+    var header: String { WorldComponentsPresentation.areaHeader(number: number, of: total) }
+    /// The header's two halves, drawn on two lines: on a phone the one-line
+    /// title truncated to "Area 1 of 1 — not placed i…", losing the half that
+    /// matters (the Mac's UI check of 46928fa).
+    var numberLine: String { "Area \(number) of \(total)" }
+    static let notPlacedLine = "not placed in the room"
 }
 
 // MARK: - The fetch
@@ -114,6 +151,11 @@ nonisolated struct WorldRenderRevision: Equatable, Sendable {
     /// the page keeps what it drew), `withdrawn` or `absent`. `nil` from a
     /// Tower that does not say.
     var appearanceState: String? = nil
+    /// The resolved session's `components` (`WORLD-BUILDER-COMPONENTS.md`
+    /// §3.2), or `nil` when not computed. Deliberately NOT part of
+    /// `revision`: an area finishing never swaps the room page. The room
+    /// screen uses it to keep its areas row current.
+    var components: WorldComponents? = nil
 }
 
 /// Fetches the viewer page over HTTP, as a string.
@@ -235,7 +277,8 @@ nonisolated struct WorldRenderClient {
             representation: representation,
             live: json["live"] as? Bool,
             appearance: (appearance?.isEmpty ?? true) ? nil : appearance,
-            appearanceState: (appearanceState?.isEmpty ?? true) ? nil : appearanceState
+            appearanceState: (appearanceState?.isEmpty ?? true) ? nil : appearanceState,
+            components: WorldComponents(json: json["components"])
         )
     }
 
@@ -245,6 +288,17 @@ nonisolated struct WorldRenderClient {
     /// page's: a revision answered without it names the surface rung while an
     /// appearance page is on screen.
     static func revisionURL(for target: WorldRenderTarget, baseURL: URL) -> URL? {
+        if target.isArea {
+            // `/worlds/<w>/areas/<s>/<a>/render/revision`, with no query at all
+            // (§5.2): the same address the page's own poll is proxied to, so
+            // the two cannot disagree.
+            guard let page = url(for: target, baseURL: baseURL),
+                  var components = URLComponents(url: page, resolvingAgainstBaseURL: false)
+            else { return nil }
+            components.percentEncodedPath += "/revision"
+            components.queryItems = nil
+            return components.url
+        }
         guard
             let page = url(for: target, baseURL: baseURL),
             var components = URLComponents(url: page, resolvingAgainstBaseURL: false)
@@ -266,6 +320,26 @@ nonisolated struct WorldRenderClient {
     /// unreserved set is encoded, `/` included.
     static func url(for target: WorldRenderTarget, baseURL: URL) -> URL? {
         guard !target.worldID.isEmpty, target.sessionID != "" else { return nil }
+        if let areaID = target.areaID {
+            // `/worlds/<w>/areas/<s>/<a>/render` (`WORLD-BUILDER-COMPONENTS.md`
+            // §5.1). The session is in the path, never a query. No `viewer`:
+            // the area route ignores it and offers the appearance rung to
+            // every client that can name it (C1 M12). No `view`: an area has
+            // no diagnostics rendering.
+            guard
+                let sessionID = target.sessionID,
+                let session = sessionID.addingPercentEncoding(withAllowedCharacters: Self.unreserved),
+                WorldComponent.isAreaID(areaID),
+                var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
+                let world = target.worldID.addingPercentEncoding(withAllowedCharacters: Self.unreserved)
+            else { return nil }
+            let base = components.percentEncodedPath.hasSuffix("/")
+                ? String(components.percentEncodedPath.dropLast())
+                : components.percentEncodedPath
+            components.percentEncodedPath = "\(base)/worlds/\(world)/areas/\(session)/\(areaID)/render"
+            components.queryItems = nil
+            return components.url
+        }
         guard
             var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
             let world = target.worldID.addingPercentEncoding(withAllowedCharacters: Self.unreserved)
@@ -609,6 +683,9 @@ nonisolated extension WorldRenderFetchError {
             // one of the contract's five sentences. That is a Tower older
             // than the route, not a world with nothing built.
             return "This Tower is too old to serve a picture of a saved world. Its worlds are still listed and their diagnostics still open."
+        case .absent(let detail?) where WorldAreaRouteAnswer.isAreaAnswer(detail):
+            // One of the area routes' four stable sentences (§5.1).
+            return "The Tower has no picture of this area: \(detail)."
         case .absent(let detail?):
             // No "yet": the detail says which — a world still being built
             // answers "no geometry yet", and a world that does not exist
@@ -634,6 +711,9 @@ nonisolated extension WorldRenderFetchError {
         switch self {
         case .badAddress, .undecodable: return false
         case .absent(let detail?) where detail == Self.unmatchedRouteDetail: return false
+        // An area that is gone, could not be built, or never existed will not
+        // appear on a retry; one not built YET might (§5.1).
+        case .absent(let detail?) where WorldAreaRouteAnswer.isTerminal(detail): return false
         case .absent, .towerError, .transport: return true
         }
     }
@@ -816,6 +896,16 @@ final class WorldRenderViewerModel: ObservableObject {
     /// itself has fetched a served manifest (`WorldAppearanceFollow`).
     let assets: WorldAssetSchemeHandler
 
+    /// The room's `components` (`WORLD-BUILDER-COMPONENTS.md` §3.2): seeded
+    /// from the listing row the viewer was opened from, then kept current from
+    /// every revision the follower reads. `nil` is not computed -- every older
+    /// world -- and draws exactly today's screen. Never set on an area viewer.
+    @Published private(set) var components: WorldComponents?
+
+    /// The Tower said this area will not be served (§5.2): kept picture,
+    /// follower stopped, and the scene offers the way back to the room.
+    @Published private(set) var areaNoLongerServed = false
+
     /// `assets` is injectable for the same reason `client` is: the follower's
     /// one piece of evidence about the page's own recovery comes through the
     /// handler, and a test needs to be able to put it there from a stubbed
@@ -823,11 +913,14 @@ final class WorldRenderViewerModel: ObservableObject {
     init(
         target: WorldRenderTarget,
         client: WorldRenderClient = WorldRenderClient(),
-        assets: WorldAssetSchemeHandler? = nil
+        assets: WorldAssetSchemeHandler? = nil,
+        components: WorldComponents? = nil
     ) {
         self.target = target
+        self.components = target.isArea ? nil : components
         self.client = client
-        self.assets = assets ?? WorldAssetSchemeHandler(worldID: target.worldID)
+        self.assets = assets
+            ?? WorldAssetSchemeHandler(worldID: target.worldID, scope: WorldAssetScope.of(target))
     }
 
     /// The viewer closed. Drops the in-memory imagery and its authorisation,
@@ -837,6 +930,30 @@ final class WorldRenderViewerModel: ObservableObject {
     /// `WKWebView` teardown is exactly the place to linger in (review 2, M-4).
     func viewerClosed() {
         assets.tearDown()
+    }
+
+    /// Keep the areas row current from a revision the Tower sent (§3.2),
+    /// republishing only when something a reader can see moved.
+    ///
+    /// A `nil` from the Tower replaces the list the viewer had: `null` is the
+    /// Tower's current answer ("not computed"), and a re-solve that dropped
+    /// its components must not keep offering areas whose routes now 404.
+    func adoptComponents(_ latest: WorldComponents?) {
+        guard !target.isArea else { return }
+        if latest?.displayKey != components?.displayKey {
+            components = latest
+        }
+    }
+
+    /// One revision read, for the areas row alone, as the screen opens: the
+    /// follower's first poll is an interval away, and a room opened from the
+    /// live screen has no listing row to seed it. Errors are ignored -- the
+    /// follower asks again -- and the page is never swapped from here.
+    func refreshComponents() async {
+        guard !target.isArea, target.view == .product else { return }
+        guard let latest = try? await client.revision(for: target) else { return }
+        guard !Task.isCancelled else { return }
+        adoptComponents(latest.components)
     }
 
     /// Keep the picture current for as long as the screen is open.
@@ -869,6 +986,16 @@ final class WorldRenderViewerModel: ObservableObject {
             do {
                 latest = try await client.revision(for: target)
             } catch {
+                // An area the Tower says will not be served -- re-finished
+                // away, failed, or never computed (§5.2, C1 E4) -- is terminal
+                // for this id: keep the picture, stop following, and say so,
+                // so the reader can go back to the room, whose areas row is
+                // current. Everything else is transient.
+                if target.isArea, case .absent(let detail) = error as? WorldRenderFetchError,
+                   WorldAreaRouteAnswer.isTerminal(detail) {
+                    areaNoLongerServed = true
+                    return
+                }
                 // A dropped request, or one of §4's own 404 sentences, is not a
                 // reason to change anything on screen; the next interval asks
                 // again.
@@ -876,6 +1003,7 @@ final class WorldRenderViewerModel: ObservableObject {
             }
             guard !Task.isCancelled else { return }
             guard let latest else { return }
+            adoptComponents(latest.components)
             // A revision refused while its build was LIVE gets one more try
             // when the Tower reports that same revision FINISHED -- the
             // per-revision form of `finishedBuildRetried`, and for the same
@@ -1056,6 +1184,20 @@ final class WorldRenderViewerModel: ObservableObject {
     /// declares the appearance rung, but nothing names the session it draws, so
     /// `WorldAssetRequest.parse` refuses every route but the page itself. Pure
     /// (review 2, m-16).
+    /// Why an area viewer will not draw `html`, or `nil` when it may: the
+    /// page's `wb-area` must be this area, and its `wb-revision` must name this
+    /// session's area (`<s>/area:<a>/…`, `WORLD-BUILDER-COMPONENTS.md` §5.1).
+    /// Always `nil` for the room.
+    nonisolated static func areaPageMismatch(html: String, target: WorldRenderTarget) -> String? {
+        guard let areaID = target.areaID, let sessionID = target.sessionID else { return nil }
+        let declaredArea = WorldRenderRepresentation.meta(named: "wb-area", in: html)
+        let revision = WorldRenderRepresentation.meta(named: "wb-revision", in: html)
+        guard declaredArea == areaID, revision?.hasPrefix("\(sessionID)/area:\(areaID)/") == true else {
+            return "The Tower's page is not a page of this area, so it was not drawn."
+        }
+        return nil
+    }
+
     nonisolated static func pageCannotReachItsImagery(
         html: String, target: WorldRenderTarget
     ) -> Bool {
@@ -1254,6 +1396,15 @@ final class WorldRenderViewerModel: ObservableObject {
                     )
                     return
                 }
+            }
+            // An area viewer draws only the area it was opened for (C1 M10):
+            // the page must say so in its own head. A page naming another
+            // area, another session, or no area at all is a Tower answering a
+            // different question, and drawing it would put the wrong walk's
+            // imagery under this area's caption.
+            if let refusal = Self.areaPageMismatch(html: html, target: target) {
+                state = .failed(message: refusal, retryable: true)
+                return
             }
             // Not `.ready`. The page has arrived; nothing has drawn it yet.
             state = .rendering(html: html)
@@ -1483,7 +1634,9 @@ struct WorldRenderWebView: UIViewRepresentable {
         init(target: WorldRenderTarget, assets: WorldAssetSchemeHandler) {
             self.target = target
             self.assets = assets
-            self.pageURL = WorldAssetScheme.pageURL(worldID: target.worldID)
+            // The room's page, or an area's (`WORLD-BUILDER-COMPONENTS.md`
+            // §5.5): the navigation policy admits exactly this one URL.
+            self.pageURL = WorldAssetScheme.pageURL(worldID: target.worldID, scope: assets.scope)
             super.init()
         }
 
@@ -1765,14 +1918,40 @@ struct WorldRenderViewerView: View {
         self.client = client
     }
 
+    /// What the sheet shows now: the room it was opened for, or one of its
+    /// areas. Opening an area REPLACES the room's scene -- its own model, web
+    /// view and WebGL context go with it -- and *Back to the room* replaces it
+    /// again (`WORLD-BUILDER-COMPONENTS.md` §5.5, C1 E5). Never both at once.
+    @State private var shown: WorldRenderTarget?
+    @State private var shownArea: WorldAreaOpening?
+
     var body: some View {
+        let current = shown ?? target
         NavigationStack {
-            WorldRenderScene(target: target, title: title, note: note, client: client)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Close") { dismiss() }
-                    }
+            WorldRenderScene(
+                target: current,
+                title: current.isArea ? nil : title,
+                note: current.isArea ? nil : note,
+                client: client,
+                area: current.isArea ? shownArea : nil,
+                openArea: { area, opening in
+                    shownArea = opening
+                    shown = area
+                },
+                backToRoom: current.isArea ? {
+                    shownArea = nil
+                    shown = target.room
+                } : nil
+            )
+            // A new identity per target: SwiftUI builds a new scene (and a new
+            // `@StateObject` model) rather than handing the room's model the
+            // area's target.
+            .id(current.id)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
                 }
+            }
         }
     }
 }
@@ -1818,31 +1997,68 @@ struct WorldRenderScene: View {
     /// debugger.
     @State private var isShowingDetails = false
 
+    /// For an area viewer: its number, the walk's area count and its capture
+    /// spans, from the list it was opened from (C1 M7). `nil` for the room.
+    private let area: WorldAreaOpening?
+    /// Opens one of this room's areas in place of the room (C1 E5). `nil`
+    /// where the host cannot, and then the areas row offers no control.
+    private let openArea: ((WorldRenderTarget, WorldAreaOpening) -> Void)?
+    /// *Back to the room*, for an area viewer.
+    private let backToRoom: (() -> Void)?
+
     init(
         target: WorldRenderTarget,
         title: String? = nil,
         note: String? = nil,
-        client: WorldRenderClient = WorldRenderClient()
+        client: WorldRenderClient = WorldRenderClient(),
+        components: WorldComponents? = nil,
+        area: WorldAreaOpening? = nil,
+        openArea: ((WorldRenderTarget, WorldAreaOpening) -> Void)? = nil,
+        backToRoom: (() -> Void)? = nil
     ) {
-        _model = StateObject(wrappedValue: WorldRenderViewerModel(target: target, client: client))
+        _model = StateObject(wrappedValue: WorldRenderViewerModel(
+            target: target, client: client, components: components))
         self.title = title
         self.note = note
+        self.area = area
+        self.openArea = openArea
+        self.backToRoom = backToRoom
+    }
+
+    /// The area's header, or the host's title, or "Saved world".
+    private var screenTitle: String {
+        if model.target.isArea { return area?.header ?? "Area — not placed in the room" }
+        return title ?? "Saved world"
     }
 
     var body: some View {
         VStack(spacing: 0) {
             caption
             content
+            if !model.target.isArea { areasRow }
             details
         }
-        .navigationTitle(title ?? "Saved world")
+        .navigationTitle(screenTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if model.target.isArea, let area {
+                ToolbarItem(placement: .principal) {
+                    VStack(spacing: 0) {
+                        Text(area.numberLine).font(.headline)
+                        Text(WorldAreaOpening.notPlacedLine).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(area.header)
+                }
+            }
+        }
         // One fetch, for the life of the screen. `model.target` is a `let`, so
         // there is nothing for a `.task(id:)` to key on; a second rendering of
         // the same world is a second screen, and the page's own button switches
         // in place without fetching at all.
         .task {
             await model.load()
+            await model.refreshComponents()
             await model.followRevisions()
         }
         // `PRIVACY.md` §3.6: in-memory reuse within one open viewer is fine;
@@ -1884,10 +2100,13 @@ struct WorldRenderScene: View {
             // page was points; the Tower can now serve a surface, and a caption
             // that denies what is on screen is as wrong as one that overclaims.
             // Before the page arrives it claims neither.
-            Text(WorldRenderRepresentation.caption(for: model.state.representation))
+            Text(nativeCaption)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if model.target.isArea {
+                areaControls
+            }
             // A rebuild of the rung on screen is offered, never forced: the
             // swap reloads the page and resets the camera the reader is using.
             // A better rung replaces the picture without asking.
@@ -1912,6 +2131,95 @@ struct WorldRenderScene: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
+    }
+
+    /// The caption line under the title. For an area: that it is an area, when
+    /// it was captured, that it is not placed, and not to scale
+    /// (`WORLD-BUILDER-COMPONENTS.md` §5.4). For the room: the rung's caption,
+    /// plus ` · N more areas shown separately` when the walk has areas (§4).
+    private var nativeCaption: String {
+        if model.target.isArea {
+            return WorldComponentsPresentation.areaCaption(
+                representation: model.state.representation, spans: area?.spans ?? [])
+        }
+        return WorldRenderRepresentation.caption(for: model.state.representation)
+            + (WorldComponentsPresentation.roomCaptionSuffix(model.components) ?? "")
+    }
+
+    /// *Back to the room*, and -- when the Tower has said this area will not be
+    /// served (§5.2) -- why the picture stopped following.
+    @ViewBuilder
+    private var areaControls: some View {
+        if model.areaNoLongerServed {
+            Text("The Tower no longer serves this area -- the walk may have been finished again. "
+                 + "The room's list of areas is current.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if let backToRoom {
+            Button("Back to the room") { backToRoom() }
+                .font(.caption)
+                .accessibilityIdentifier("world-render-back-to-room")
+        }
+    }
+
+    /// Below the room: the walk's areas, and the stretches it can only count
+    /// (§8). Nothing at all for `components: null` -- every older world -- and
+    /// nothing for a walk the gate kept whole, so both look exactly as today.
+    @ViewBuilder
+    private var areasRow: some View {
+        if let components = model.components, !components.isWhole {
+            VStack(alignment: .leading, spacing: 6) {
+                if let heading = WorldComponentsPresentation.areasHeading(components) {
+                    Text(heading)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                let areas = components.areas
+                ForEach(Array(areas.enumerated()), id: \.element.id) { index, area in
+                    areaEntry(number: index + 1, of: areas.count, area: area)
+                }
+                if let footer = WorldComponentsPresentation.footer(components) {
+                    Text(footer)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .accessibilityIdentifier("world-render-areas")
+        }
+    }
+
+    @ViewBuilder
+    private func areaEntry(number: Int, of total: Int, area: WorldComponent) -> some View {
+        let line = WorldComponentsPresentation.areaLine(number: number, area: area)
+        let availability = WorldComponentsPresentation.availability(of: area)
+        if availability == .opens, let openArea {
+            Button {
+                openArea(model.target.area(area.id),
+                         WorldAreaOpening(number: number, total: total, spans: area.captureSpans))
+            } label: {
+                HStack {
+                    Text(line).font(.footnote)
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+        } else {
+            HStack {
+                Text(line).font(.footnote).foregroundStyle(.secondary)
+                Spacer()
+                if let word = WorldComponentsPresentation.availabilityWord(availability) {
+                    Text(word).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     /// The page, the two waits, and the failure.
@@ -1999,8 +2307,9 @@ struct WorldRenderScene: View {
     private var details: some View {
         DisclosureGroup("Details", isExpanded: $isShowingDetails) {
             VStack(alignment: .leading, spacing: 8) {
-                Text(model.target.sessionID.map { "World \(model.target.worldID)\nSession \($0)" }
-                     ?? "World \(model.target.worldID)\nNewest session with geometry")
+                Text((model.target.sessionID.map { "World \(model.target.worldID)\nSession \($0)" }
+                      ?? "World \(model.target.worldID)\nNewest session with geometry")
+                     + (model.target.areaID.map { "\nArea \($0)" } ?? ""))
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)

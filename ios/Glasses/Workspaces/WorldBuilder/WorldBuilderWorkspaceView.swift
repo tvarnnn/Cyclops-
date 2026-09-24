@@ -256,10 +256,10 @@ struct WorldBuilderWorkspaceView: View {
     }
 
     /// The ladder's note for the world the viewer is about to show, so the
-    /// sheet says the same thing the card behind it says.
+    /// sheet says the same thing the card behind it says -- including, for a
+    /// saved world whose photographic build failed, that it did.
     private var viewerNote: String? {
-        if case .partial(_, let note) = world.presentation.reconstruction { return note }
-        return nil
+        world.presentation.viewerNote
     }
 }
 
