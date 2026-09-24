@@ -875,18 +875,23 @@ Each source of variation, and what `e5f7151` does with it:
 
 **Found in P3.6, not fixed:**
 
-- **A stop during the builder's consensus loses the final solve.**
+- **A stop during the builder's consensus: what survives (fixed in P3.7 and P3.8).**
   - The builder runs its final solve in a `world_solve.py` child. Neither that child nor
-    `world_finalize.py` hands `should_stop` to the solve
-    (`RUN\experiments\P3-SOL\PROGRESS.md`, OPEN).
-  - On a hard stop, the builder terminates the child (`world_build_session.run_final`).
-    Nothing of that final solve is published, and the last background solution stands.
-  - The finisher does not redo a final solve. It builds only after a finalization whose
-    final solve is `solved` (`world_finish_pending.py`, `no-final-solve`). An owner's
-    re-finish does redo it.
-  - A stop reaches the consensus, and publishes draw 0 as `deferred`, only for callers
-    that hand it on: in-process solves, and the finisher's re-gate in place (`99420c4`,
-    `30c28c0`).
+    `world_finalize.py` hands `should_stop` to the solve, and on a hard stop the builder
+    terminates the child (`world_build_session.run_final`).
+  - Since `b7450f3`, a consensus solve publishes draw 0 FIRST, as `deferred`, before it
+    maps further draws. Since `2febf3a` (V11 MED-A), the builder records
+    `final_solve: solved` when the child already published such a solve: gated, consensus
+    requested, loadable, and `solved_at` no earlier than the launch. The row carries the
+    CONSENSUS-DEFERRED notice, and the idle finisher re-runs the owed consensus and builds
+    the surface. Rows written before `2febf3a` are healed by the finisher.
+  - A stop before draw 0 was published still loses the final solve. The last background
+    solution then stands, and an owner's re-finish redoes it, as for N = 1 today.
+  - A stop reaches the consensus directly, publishing draw 0 as `deferred`, only for
+    callers that hand it on: in-process solves, and the finisher's re-gate in place
+    (`99420c4`, `30c28c0`).
+  - A legacy row healed only on the finisher's first run can read "nothing will retry it"
+    until then (`photographic._appearance_is_expected`).
 - **The area levelling floor is below chance.** Isotropic normals gave `levelled: true`
   in 20 of 20 cases, and the *may look tilted* caption was suppressed with the up
   direction 34° off (`rv9-report.txt`, LOW "Areas and masks"; `area_build.py`).
