@@ -932,6 +932,23 @@ def _assess_masks_retry(store: WorldStore, world_id: str, session_id: str, *,
                    code="owed-masks-retry", stage=MASKS_RETRY_STAGE, attempts=attempts)
 
 
+def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: str) -> None:
+    """Undo one `record_attempt` for work that was REFUSED before it began. Not
+    `forgive_attempt`, whose bound is about runs that were stopped: a refusal did no
+    work at all, so it is not counted, and not bounded either."""
+    with _LEDGER_LOCK:
+        sessions, unreadable = _read_ledger(store, world_id)
+        if unreadable:
+            return
+        sessions = dict(sessions)
+        entry = dict(sessions.get(key) or {})
+        entry["attempts"] = max(0, _counter(entry, "attempts") - 1)
+        entry["forgiven"] = _counter(entry, "forgiven")
+        entry["detail"] = detail
+        sessions[key] = entry
+        _write_ledger(store, world_id, sessions)
+
+
 def finish_masks_retry(store: WorldStore, verdict: Verdict, *, appearance: bool,
                        prune_depth_work: bool, stop_request,
                        max_forgiven: int = DEFAULT_MAX_FORGIVEN, refinish=None) -> dict:
@@ -959,6 +976,8 @@ def finish_masks_retry(store: WorldStore, verdict: Verdict, *, appearance: bool,
         stop_request,
         lambda source: forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({source})",
                                        max_forgiven=max_forgiven))
+    from scripts.world_refinish import Refused  # noqa: PLC0415
+
     try:
         if refinish is None:
             from scripts.world_refinish import PRODUCT_SOLVE_ENV  # noqa: PLC0415
@@ -977,6 +996,15 @@ def finish_masks_retry(store: WorldStore, verdict: Verdict, *, appearance: bool,
             prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
             stop_source=lambda: stop_request.source)
         report["finished"] = bool((report["refinish"] or {}).get("done"))
+    except Refused as exc:
+        # REFUSED IS WAITING, NOT FAILING: a session being built right now, a live writer,
+        # a set-aside that could not be made (`world_refinish.Refused` and its
+        # `SetAsideFailed`). Nothing was attempted, so no attempt is spent: it is given
+        # back, and the next idle run asks again.
+        _give_back_attempt(store, verdict.world_id, key,
+                           detail=f"not started, waiting: {type(exc).__name__}: {exc}")
+        report.update({"finished": False, "waiting": True,
+                       "reason": f"{type(exc).__name__}: {exc}"})
     except Exception as exc:  # noqa: BLE001 -- reported; what was set aside stays aside
         report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
     finally:
@@ -1522,7 +1550,11 @@ def main(argv=None, *, stop_request=None) -> int:
         )
         report["finished"].append(outcome)
         done += 1
-        if not outcome.get("finished"):
+        if outcome.get("waiting"):
+            # Refused before it began (a masks re-solve): not a failure; the Tower asks
+            # again after its backoff.
+            retire_waiting += 1
+        elif not outcome.get("finished"):
             failures += 1
 
     _emit(report, args.format)

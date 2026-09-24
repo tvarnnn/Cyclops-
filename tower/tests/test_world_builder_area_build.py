@@ -638,3 +638,126 @@ def test_no_path_an_area_build_writes_nears_max_path(tmp_path, monkeypatch, fake
     assert WORST_ROOT_CHARS + deepest_placed < 240, deepest_placed
     assert all("areas" in str(p) or "worlds" in str(p) for p in placed if ".ab" not in str(p))
     assert not (Path(store.root) / AB.AREA_BUILD_DIRNAME).exists(), "the build directory is gone"
+
+
+# ---------------------------------------------------------------------------
+# the build directory holds imagery outside the world: owned, purged, never reused
+# (lead, round 3 -- a privacy rule)
+# ---------------------------------------------------------------------------
+
+
+def _dead_pid():
+    import subprocess
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    return dead.pid
+
+
+def _killed_build(store, area_id=AREA1, world_id=None, pid=None):
+    """What a build killed mid-way leaves: its marked build directory with keyframe imagery."""
+    bdir = AB._fresh_build_dir(store, world_id or W1, S1, area_id)
+    img = bdir / "dense" / S1 / "work" / "undist" / "00004.jpg"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(b"\xff\xd8 keyframe pixels")
+    chunk = bdir / "appearance" / S1 / ("c." + "f" * 32 + ".bin")
+    chunk.parent.mkdir(parents=True, exist_ok=True)
+    chunk.write_bytes(b"imagery")
+    if pid is not None:
+        owner = json.loads((bdir / AB.OWNER_FILENAME).read_text())
+        owner["pid"] = pid
+        (bdir / AB.OWNER_FILENAME).write_text(json.dumps(owner))
+    return bdir
+
+
+def test_purge_after_a_killed_area_build_leaves_no_imagery(tmp_path):
+    store, kids = _store(tmp_path)
+    _components(store, kids)
+    bdir = _killed_build(store)
+    owner = json.loads((bdir / AB.OWNER_FILENAME).read_text())
+    assert owner["world_id"] == W1 and owner["area_id"] == AREA1
+    # and one left WITHOUT a marker (killed before it was written) for an area of this world
+    (C.area_root(store, W1, S1, AREA2)).mkdir(parents=True, exist_ok=True)
+    unmarked = AB.area_build_dir(store, AREA2)
+    (unmarked / "appearance").mkdir(parents=True)
+    (unmarked / "appearance" / "c.bin").write_bytes(b"imagery")
+    report = store.purge_world(W1)
+    assert not report.retained
+    assert not (Path(store.root) / AB.AREA_BUILD_DIRNAME).exists()
+    assert not store.world_dir(W1).exists()
+    assert any(str(bdir) in r for r in report.removed)
+
+
+def test_purge_leaves_another_worlds_area_build_alone(tmp_path):
+    store, kids = _store(tmp_path)
+    other = _killed_build(store, area_id="b" * 16, world_id="w-other")
+    store.purge_world(W1)
+    assert other.exists() and (other / AB.OWNER_FILENAME).exists()
+
+
+def test_a_rebuild_after_a_kill_starts_clean(tmp_path, fake_depth):
+    store, kids = _store(tmp_path)
+    record = _components(store, kids)
+    stale = _killed_build(store, pid=_dead_pid())
+    (stale / "surface" / S1).mkdir(parents=True)
+    (stale / "surface" / S1 / "stale-from-the-killed-build.bin").write_bytes(b"x")
+    report = AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    assert report["built"] is True
+    final = C.area_root(store, W1, S1, AREA1)
+    assert not list(final.rglob("stale-from-the-killed-build.bin"))
+    assert not list(final.rglob("00004.jpg")), "nothing of the killed build is reused"
+    assert not AB.area_build_dir(store, AREA1).exists()
+
+
+def test_an_orphan_of_a_world_that_no_longer_exists_is_swept_never_reused(tmp_path, fake_depth):
+    store, kids = _store(tmp_path)
+    record = _components(store, kids)
+    orphan = _killed_build(store, area_id="c" * 16, world_id="w-gone", pid=_dead_pid())
+    AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    assert not orphan.exists()
+
+
+def test_a_build_killed_while_moving_into_place_is_never_recorded_complete(tmp_path, monkeypatch,
+                                                                          fake_depth):
+    store, kids = _store(tmp_path)
+    record = _components(store, kids)
+    real = AB.publish_area_build
+
+    def killed_half_way(store_, world_id, session_id, area_id):
+        bdir = AB.area_build_dir(store_, area_id)
+        final = C.area_root(store_, world_id, session_id, area_id)
+        (bdir / "solve").replace(final / "solve")          # one stage in, then the process dies
+        raise KeyboardInterrupt("killed")
+
+    monkeypatch.setattr(AB, "publish_area_build", killed_half_way)
+    with pytest.raises(KeyboardInterrupt):
+        AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    rec = C.read_area_record(store, W1, S1, AREA1)
+    assert rec["stages"]["surface"]["state"] == "running", "not recorded ok before it is in place"
+    assert rec["stages"].get("appearance", {}).get("state") != "ok"
+    monkeypatch.setattr(AB, "publish_area_build", real)
+    # the next build replaces it whole, and only then says ok
+    AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    rec = C.read_area_record(store, W1, S1, AREA1)
+    assert rec["stages"]["surface"]["state"] == "ok"
+
+
+def test_publishing_never_holds_two_builds_stages(tmp_path, fake_depth):
+    store, kids = _store(tmp_path)
+    record = _components(store, kids)
+    AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    final = C.area_root(store, W1, S1, AREA1)
+    (final / "appearance" / S1 / "from-the-first-build.bin").write_bytes(b"x")
+    AB.build_area(store, W1, S1, AREA1, record, final_surface_stages=_fake_stages([]))
+    assert not (final / "appearance" / S1 / "from-the-first-build.bin").exists()
+
+
+def test_a_keyframe_set_switch_discards_a_dead_builds_imagery(tmp_path):
+    from tower.world_builder import reredaction as RR
+
+    store, kids = _store(tmp_path)
+    _components(store, kids)
+    dead = _killed_build(store, pid=_dead_pid())
+    live = _killed_build(store, area_id=AREA2)                 # this process: alive
+    RR._discard_area_builds(store, W1)
+    assert not dead.exists() and live.exists()

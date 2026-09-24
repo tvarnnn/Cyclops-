@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import sys
 import time
@@ -113,41 +114,163 @@ class _BuildView(C.AreaStore):
         self._area_dir = Path(build_dir)
 
 
-def _fresh_build_dir(store, area_id: str) -> Path:
-    """An empty build directory. What a killed build left there is its own
-    unpublished output, replaced by this build exactly as a stage replaces its own."""
+# THE OWNER MARKER. A build directory holds keyframe imagery (undistorted frames,
+# appearance chunks) OUTSIDE its world's directory, so `store.purge_world` would not see
+# it -- a privacy rule, not tidiness. Every build directory therefore names its world
+# before anything else is written into it, and `purge_area_builds` removes a world's
+# build directories by that name, whether or not the area's record still exists.
+OWNER_FILENAME = "owner.json"
+
+
+def _read_owner(bdir: Path) -> dict | None:
+    try:
+        owner = json.loads((Path(bdir) / OWNER_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return owner if isinstance(owner, dict) else None
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        import psutil  # noqa: PLC0415
+
+        return bool(pid) and psutil.pid_exists(int(pid))
+    except Exception:  # noqa: BLE001 -- unknown is alive: never remove a live build's files
+        return True
+
+
+def _remove_tree(path: Path, removed: list, retained: list) -> None:
+    """Delete `path` bottom-up like `purge_world`, reporting what could not go."""
+    path = Path(path)
+    if not path.exists():
+        return
+    entries = sorted(path.rglob("*"), key=lambda q: len(q.parts), reverse=True) + [path]
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                entry.rmdir()
+            else:
+                entry.unlink()
+            removed.append(str(entry))
+        except OSError as exc:
+            logger.warning("[Tower][WorldBuilder] could not remove %s: %s", entry, exc)
+            retained.append(str(entry))
+
+
+def _belongs_to(store, bdir: Path, world_id: str) -> bool:
+    """Whether a build directory is this world's: its marker says so, or -- a directory
+    left without one -- its area id is one of this world's areas on disk."""
+    owner = _read_owner(bdir)
+    if owner is not None:
+        return owner.get("world_id") == world_id
+    return (Path(store.world_dir(world_id)) / C.AREAS_DIRNAME / bdir.name).exists()
+
+
+def purge_area_builds(store, world_id: str, *, only_stale: bool = False) -> tuple[list, list]:
+    """Remove every area build directory of `world_id` (and `.old.*` leftovers inside
+    them). `only_stale`: keep one whose building process is still alive. Returns
+    (removed, retained) paths. Called by `store.purge_world` and by the re-redaction
+    switch, which invalidate the imagery these directories hold."""
+    removed: list = []
+    retained: list = []
+    root = Path(store.root) / AREA_BUILD_DIRNAME
+    if not root.is_dir():
+        return removed, retained
+    for bdir in sorted(root.iterdir()):
+        if not bdir.is_dir() or not _belongs_to(store, bdir, world_id):
+            continue
+        if only_stale and _pid_alive((_read_owner(bdir) or {}).get("pid")):
+            continue
+        _remove_tree(bdir, removed, retained)
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+    return removed, retained
+
+
+def _sweep_orphans(store) -> list:
+    """Build directories whose world no longer exists and whose builder is gone: never
+    reused, never served, removed."""
+    removed: list = []
+    root = Path(store.root) / AREA_BUILD_DIRNAME
+    if not root.is_dir():
+        return removed
+    for bdir in sorted(root.iterdir()):
+        if not bdir.is_dir():
+            continue
+        owner = _read_owner(bdir)
+        world = (owner or {}).get("world_id")
+        if owner is not None and world and Path(store.world_dir(world)).exists():
+            continue
+        if owner is None and any(Path(store.world_dir(w)).joinpath(C.AREAS_DIRNAME, bdir.name).exists()
+                                 for w in _world_ids(store)):
+            continue
+        if _pid_alive((owner or {}).get("pid")) and owner is not None:
+            continue
+        _remove_tree(bdir, removed, [])
+    return removed
+
+
+def _world_ids(store) -> list:
+    try:
+        return list(store.list_world_ids())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _fresh_build_dir(store, world_id: str, session_id: str, area_id: str) -> Path:
+    """An empty build directory, marked with its owner BEFORE anything is written into
+    it. What a killed build left there is its own unpublished output: never reused,
+    removed. Orphans of worlds that no longer exist are swept on the way."""
     bdir = area_build_dir(store, area_id)
+    _sweep_orphans(store)
     if bdir.exists():
+        _remove_tree(bdir, [], [])
         shutil.rmtree(bdir, ignore_errors=True)
     bdir.mkdir(parents=True, exist_ok=True)
+    from tower.storage import write_json_atomic  # noqa: PLC0415
+
+    write_json_atomic(bdir / OWNER_FILENAME, {"world_id": world_id, "session_id": session_id,
+                                              "area_id": area_id, "pid": os.getpid(),
+                                              "created_at": time.time()})
     return bdir
 
 
+# The order stage directories are moved into place: the surface's inputs first, then
+# the surface, then the appearance built on it -- the room's own publishing order.
+_PUBLISH_ORDER = ("solve", "dense", "surface", "appearance")
+
+
 def publish_area_build(store, world_id: str, session_id: str, area_id: str) -> list:
-    """Move every stage directory the build produced into the area's own directory,
-    replacing that stage's previous output (a rebuild replaces its own artifacts,
-    as the stages do in place). Returns the stage names moved. Never raises for a
-    build that produced nothing."""
+    """Move every stage directory the build produced into the area's own directory.
+    Returns the stage names moved. Never raises for a build that produced nothing.
+
+    NEVER HALF OF TWO BUILDS. Every stage directory this build replaces is moved OUT of
+    the area first (into the build directory, removed with it), so the area never holds
+    one build's surface beside another's appearance; then the new ones go in. The
+    area's record says the build finished only after this returns (`build_area`), so a
+    process killed half-way through leaves `running` under a dead pid -- owed, rebuilt
+    -- never an area recorded complete with half its artifacts."""
     bdir = area_build_dir(store, area_id)
     if not bdir.is_dir():
         return []
     final = C.area_root(store, world_id, session_id, area_id)
     final.mkdir(parents=True, exist_ok=True)
-    moved = []
-    for child in sorted(bdir.iterdir()):
-        if not child.is_dir():
-            continue
-        target = final / child.name
-        old = None
+    new = [c.name for c in bdir.iterdir() if c.is_dir() and not c.name.startswith(".old.")]
+    new.sort(key=lambda n: (_PUBLISH_ORDER.index(n) if n in _PUBLISH_ORDER else -1, n))
+    for name in new:
+        target = final / name
         if target.exists():
-            old = bdir.parent / f"{area_id}.old.{child.name}"
+            old = bdir / f".old.{name}"
             if old.exists():
                 shutil.rmtree(old, ignore_errors=True)
             target.replace(old)
-        child.replace(target)
-        moved.append(child.name)
-        if old is not None:
-            shutil.rmtree(old, ignore_errors=True)
+    moved = []
+    for name in new:
+        (bdir / name).replace(final / name)
+        moved.append(name)
+    _remove_tree(bdir, [], [])
     shutil.rmtree(bdir, ignore_errors=True)
     try:
         bdir.parent.rmdir()   # `.ab` itself, when no other build is running
@@ -634,15 +757,31 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
     script). The surface is marked `running` BEFORE the preparation, so a process
     killed anywhere from here leaves the signature the finisher recovers.
     """
-    record_stage = area_recorder(store, world_id, session_id, area_id, record.sha1)
+    record_now = area_recorder(store, world_id, session_id, area_id, record.sha1)
     report = {"area_id": area_id}
-    record_stage(STAGE_SURFACE, state=STAGE_STATE_RUNNING)
+    record_now(STAGE_SURFACE, state=STAGE_STATE_RUNNING)
+    # TERMINAL RECORDS WAIT FOR THE MOVE. The stages record `ok` / `failed` as they end,
+    # which is before their output is in the area's directory; recorded then, a process
+    # killed during the move left an area recorded complete with half its artifacts.
+    # `running` is written at once (liveness); everything else after the publish.
+    deferred: list = []
+
+    def record_stage(stage, *, state, detail=None, attempted=True):
+        if state == STAGE_STATE_RUNNING:
+            record_now(stage, state=state, detail=detail, attempted=attempted)
+        else:
+            deferred.append((stage, state, detail, attempted))
+
+    def flush_records():
+        while deferred:
+            stage, state, detail, attempted = deferred.pop(0)
+            record_now(stage, state=state, detail=detail, attempted=attempted)
     t0 = time.time()
     # THE SHORT BUILD DIRECTORY (`AREA_BUILD_DIRNAME`). The liveness probe reads the
     # area's OWN directory, so the `running` status goes there too: a process killed
     # anywhere from here leaves `running` under a dead pid there -- owed -- whatever
     # the build directory holds.
-    bdir = _fresh_build_dir(store, area_id)
+    bdir = _fresh_build_dir(store, world_id, session_id, area_id)
     _mark_running(store, world_id, session_id, area_id)
     try:
         view, levelling = prepare_area(store, world_id, session_id, area_id, record,
@@ -656,6 +795,7 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
         record_stage(STAGE_SURFACE, state=state, attempted=not stopped, detail=exc.reason)
         record_stage(STAGE_APPEARANCE, state=state, attempted=False,
                      detail=f"the surface was not built: {exc.reason}")
+        flush_records()
         report.update({"built": False, "reason": exc.reason})
         return report
     except BaseException:
@@ -670,6 +810,7 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
                        f"{type(exc).__name__}: {exc}")
         record_stage(STAGE_APPEARANCE, state=STAGE_STATE_UNAVAILABLE, attempted=False,
                      detail="the area could not be prepared; there was nothing to shade")
+        flush_records()
         raise
     report["levelling"] = {k: levelling.get(k) for k in
                            ("levelled", "support", "ambiguity", "normals", "source")}
@@ -687,7 +828,9 @@ def build_area(store, world_id: str, session_id: str, area_id: str, record, *,
             logger.exception("[Tower][WorldBuilder] could not stamp the area manifests")
     finally:
         # Whatever the stages produced -- finished, stopped or failed, with its status
-        # saying which -- goes into the area's directory, where it is read.
+        # saying which -- goes into the area's directory, where it is read; and only
+        # then does the record say how the stages ended.
         report["published"] = publish_area_build(store, world_id, session_id, area_id)
+        flush_records()
     report["built"] = True
     return report

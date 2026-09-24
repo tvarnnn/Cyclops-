@@ -1219,11 +1219,26 @@ class WorldStore:
         """
         with self._lock:
             world_dir = self.world_dir(world_id)
-            if not world_dir.exists():
-                return PurgeReport(removed=(), retained=())
-
             removed: list[str] = []
             retained: list[str] = []
+            # THE WORLD'S AREA BUILD DIRECTORIES FIRST (`area_build.AREA_BUILD_DIRNAME`,
+            # `<root>/.ab/<area>`): an area is built outside the world directory for
+            # MAX_PATH's sake, and a killed build leaves keyframe imagery there. Found
+            # by the owner marker each one carries, so even an area whose record is
+            # gone is purged with its world. Before the world itself, while its areas
+            # can still be recognised.
+            from tower.world_builder.area_build import purge_area_builds  # noqa: PLC0415
+
+            try:
+                staged_removed, staged_retained = purge_area_builds(self, world_id)
+                removed.extend(staged_removed)
+                retained.extend(staged_retained)
+            except Exception as exc:  # noqa: BLE001 -- reported, never claimed as purged
+                logger.warning("world builder: could not purge the area builds of %s: %s",
+                               world_id, exc)
+                retained.append(str(self.root / ".ab"))
+            if not world_dir.exists():
+                return PurgeReport(removed=tuple(removed), retained=tuple(retained))
 
             for path in sorted(
                 world_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True

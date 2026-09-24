@@ -816,3 +816,26 @@ def test_the_re_solve_is_the_refinish_under_its_own_attempt_bound(tmp_path):
     assert calls == [("w1", "s1", 0)] * 3
     v = wfp.assess(store, "w1", "s1")
     assert not v.owed and v.code == "attempt-bound" and not v.exhausted
+
+
+@pytest.mark.parametrize("refusal", ["Refused", "SetAsideFailed"])
+def test_a_refused_re_solve_is_waiting_and_spends_no_attempt(tmp_path, refusal):
+    """PA's refusals (a session being built; a set-aside that could not be made) are not failures: the
+    attempt is given back, the run reports waiting, and the session is still owed next time."""
+    from scripts import world_finish_pending as wfp
+    from scripts import world_refinish as WR
+    from scripts.world_build_session import StopRequest
+
+    store = _gated_session(tmp_path, transients=OOM)
+    exc_type = getattr(WR, refusal)
+
+    def refusing(*a, **kw):
+        raise exc_type("this session is being built right now")
+
+    v = wfp.assess(store, "w1", "s1")
+    for _ in range(4):
+        out = wfp.finish_masks_retry(store, v, appearance=False, prune_depth_work=False,
+                                     stop_request=StopRequest(), refinish=refusing)
+        assert out["finished"] is False and out["waiting"] is True
+    v = wfp.assess(store, "w1", "s1")
+    assert v.owed and v.code == "owed-masks-retry" and v.attempts == 0
