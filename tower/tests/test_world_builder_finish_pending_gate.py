@@ -183,19 +183,31 @@ def test_m1a_a_re_gate_that_cannot_start_is_decided_read_only(tmp_path, refusal)
 def test_m1a_a_refused_re_gate_does_not_starve_another_owed_world(tmp_path, stage_runner,
                                                                    refusal):
     """The reviewer's probe: before the fix every run exited `EXIT_MORE_OWED` (a respawn
-    with no backoff) and b1 was never reached."""
+    with no backoff) and b1 was never reached.
+
+    And review V9 (LOW, RV9-E F2): it then exited `EXIT_WAITING` on every run for ever, which
+    drives the Tower's chore backoff to an hour for every owed world, while the row kept
+    promising a re-run that can never happen. A refusal is permanent until an owner
+    re-finishes, so the first run says so on the row -- once -- and every run exits 0."""
     a0 = _gated(tmp_path, world_id="a0", stages=ROOM_OK, **REFUSALS[refusal])
-    a0_before = a0.session_path("a0", "s1").read_bytes()
+    promise = a0.read_session("a0", "s1").finalization["notice"]
+    assert "the Tower re-runs the gate when it is idle" in promise
     _world(tmp_path, world_id="b1", stages=ROOM_INTERRUPTED)
-    codes = [_run(tmp_path) for _ in range(5)]
+    codes = [_run(tmp_path)]
+    after_first = a0.session_path("a0", "s1").read_bytes()
+    codes += [_run(tmp_path) for _ in range(4)]
     assert [c["world"] for c in stage_runner] == ["b1"], "b1 is finished, once, on the first run"
-    assert wfp.EXIT_MORE_OWED not in codes, codes
-    # Only waiting work is left: the Tower asks again after its backoff.
-    assert codes == [wfp.EXIT_WAITING] * 5, codes
-    # And the refused world was never worked on: no attempt, no lock, no record written.
+    assert codes == [0] * 5, codes
+    # The refused world was never worked on -- no attempt counted, no lock left -- and its
+    # row was corrected once, by the first run.
     assert wfp.regate_ledger_key("s1") not in _ledger(a0, "a0")
-    assert a0.session_path("a0", "s1").read_bytes() == a0_before
+    fin = a0.read_session("a0", "s1").finalization
+    assert fin["notice"] == wfp.regate_refused_notice(wfp._published_meta(a0, "a0", "s1"))
+    assert "re-runs" not in fin["notice"] and "cannot re-run the gate" in fin["notice"]
+    assert a0.session_path("a0", "s1").read_bytes() == after_first
     assert a0.lock_holder("a0") is None
+    v = wfp.assess(a0, "a0", "s1")
+    assert not v.owed and not v.exhausted and v.code not in wfp.WAITING_CODES, v
 
 
 def test_m1a_a_re_gate_refused_under_the_lock_spends_no_budget(tmp_path, stage_runner,
@@ -326,7 +338,9 @@ def test_m1b_at_the_bound_the_interrupted_room_is_finished_in_the_same_run(tmp_p
     assert [c["world"] for c in stage_runner] == ["w1"], "the room behind the bound is built"
     detail = store.read_session("w1", "s1").finalization["detail"]
     assert "re-runs" not in detail and "stopped trying" in detail
-    assert "moge is not installed" in detail and "re-finish" in detail
+    # The cause by its fixed phrase, never the gate's raw text (review V9, M-4).
+    assert "moge" not in detail and "DepthModelUnavailable" not in detail
+    assert CP.notice_cause_phrase(DEPTH_LOST) in detail and "re-finish" in detail
     v = wfp.assess(store, "w1", "s1")
     assert not v.owed and v.code == "nothing-interrupted", v
     # Settled: a second run finds nothing and writes nothing.
@@ -371,7 +385,10 @@ def test_m1b_the_given_up_notice_keeps_the_masks_sentence(tmp_path):
             "gate": GATE_FAILED}
     notice = wfp.regate_given_up_notice(meta, 3)
     assert notice.startswith(CP.NOTICE_MASKS_OOM)
-    assert "the evidence gate failed (ZeroDivisionError: a bug)" in notice
+    # The gate's cause by its fixed phrase (review V9, M-4): the raw exception text stays in
+    # the solve's gate record.
+    assert "ZeroDivisionError" not in notice
+    assert f"the evidence gate failed ({CP.notice_cause_phrase(GATE_FAILED)})" in notice
     assert "re-runs" not in notice and "stopped trying" in notice and "3 times" in notice
 
 

@@ -453,18 +453,61 @@ def test_a_live_refinish_holds_the_world_whatever_its_room_says(tmp_path, state)
     assert f"pid {os.getpid()}" in v.reason
 
 
-@pytest.mark.parametrize("state", ["setting-aside", "set-aside", "published"])
 def test_a_refinish_whose_process_is_gone_no_longer_parks_the_world(tmp_path, dead_process,
-                                                                    stage_runner, state):
+                                                                    stage_runner):
     """Before: the room still carried the re-finish's marker, so the world was left alone
-    for ever. Now the ledger says the process is gone, and the stopped room is owed --
-    the rebuild the re-finish promised the finisher would do."""
+    for ever. Now the ledger says the process is gone, and -- once its new solve was
+    published -- the stopped room is owed: the rebuild the re-finish promised the finisher
+    would do."""
     store = _world(tmp_path, stages=_marked("t1"))
-    _ledger_with_process(store, "t1", state, dead_process)
+    _ledger_with_process(store, "t1", "published", dead_process)
     v = wfp.assess(store, "w1", "s1")
     assert v.owed and v.stage == STAGE_SURFACE, v
     assert _run(tmp_path) == 0
     assert stage_runner == ["w1"]
+
+
+@pytest.mark.parametrize("state", ["setting-aside", "set-aside"])
+def test_a_refinish_whose_process_died_before_it_published_is_put_back(tmp_path, dead_process,
+                                                                       stage_runner, state):
+    """Review V9, M-5 (changed by REF, P3.6). This test used to cover these two states with
+    the one above and pass for the wrong reason: its ledger was written by hand and no solve
+    was ever set aside, so "the stopped room is owed and built" looked right. With the solve
+    REALLY set aside -- the re-finish's own step 1, then a hard kill -- that build ran on a
+    session with no solution and wrote `surface: unavailable` (RV9-D probe C, RV9-E F4).
+    Now the finisher puts back what the re-finish set aside, and builds nothing from what
+    it left."""
+    from scripts import world_refinish as wr
+    from tower.world_builder.global_solve import load_solution
+
+    store = _gated(tmp_path, stages=ROOM_OK, gate=CLEAN_GATE)
+    engine = WorldBuilderEngine(store)
+    store.acquire_writer_lock("w1")
+    try:
+        wr.set_aside(store, "w1", "s1", "t1")
+        if state == "set-aside":      # what `refinish` does next, under the same lock
+            for stage in ("surface", "appearance"):
+                engine.mark_stage("w1", "s1", stage, state="stopped",
+                                  detail=wr.REFINISH_IN_PROGRESS.format(stamp="t1"))
+    finally:
+        engine.release_world("w1")
+    # ... and the process dies: at `set-aside`, or at `setting-aside` -- killed after its
+    # last move, before the ledger said the step was done.
+    path = store.world_dir("w1") / wr.REFINISH_DIRNAME / "t1" / wr.LEDGER_FILENAME
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    ledger["state"] = state
+    ledger["process"] = dead_process
+    path.write_text(json.dumps(ledger), encoding="utf-8")
+    assert load_solution(store, "w1", "s1") is None       # the solve is set aside
+    v = wfp.assess(store, "w1", "s1")
+    assert v.owed and v.stage == "refinish", v          # wfp.REFINISH_STAGE
+    assert _run(tmp_path) == 0
+    assert stage_runner == [], "no room is built from a session whose solve is set aside"
+    assert load_solution(store, "w1", "s1") is not None   # put back
+    assert store.read_session("w1", "s1").stages == ROOM_OK
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == \
+        wr.LEDGER_RESTORED_AFTER_DEATH
+    assert wfp.assess(store, "w1", "s1").code == "nothing-interrupted"
 
 
 def test_a_recycled_pid_is_not_the_refinish(tmp_path):

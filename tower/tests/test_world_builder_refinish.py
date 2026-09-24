@@ -334,12 +334,17 @@ def test_a_refinish_filters_the_walks_own_database_and_keeps_the_original(tmp_pa
     assert (aside / "database.db").read_bytes() == walk_db
     assert (solve_dir / "database.db").read_bytes() != walk_db
     assert (aside / "images" / "00000001.jpg").read_bytes() == b"the walk's solver image"
-    assert (solve_dir / "images" / "00000001.jpg").read_bytes() == b"the walk's solver image"
+    # Review V9, M-7: a solver image goes back only when its provenance is proven. This
+    # one belongs to no keyframe of the session, so it is withheld -- the set-aside
+    # original is untouched.
+    assert not (solve_dir / "images" / "00000001.jpg").exists()
     assert json.loads((solve_dir / "camera.json").read_text()) == {"fx": 1.0}
     ledger = json.loads((store.world_dir(W1) / "refinish" / "m" / wr.LEDGER_FILENAME)
                         .read_text())
     assert {c["name"] for c in ledger["copied_back"]} >= {"database.db", "images",
                                                           "camera.json", "sources.json"}
+    assert ledger["solver_frames"]["walk_images"]["withheld_images"] == {
+        "00000001.jpg": "no-keyframe"}
     assert {m["kind"] for m in ledger["moved"]} == {"solve"}
 
 
@@ -980,8 +985,14 @@ def test_the_builders_record_wins_except_for_an_ambiguous_keyframe_id(tmp_path, 
     assert frames["dropped_builder_entries"] == [f"{S1}:00000001"]
 
 
-def test_already_undistorted_walk_images_are_counted_as_reused(tmp_path, stages,
-                                                               monkeypatch):
+def test_walk_images_whose_provenance_is_unproven_are_withheld_not_reused(
+        tmp_path, stages, monkeypatch):
+    """Review V9, M-7. This test used to pin the defect: three walk images of unknown
+    provenance were counted `already_undistorted`, the plan called its source
+    `walk-solver-images`, and the solve kept them over the raw frames found by identity.
+    Now an image goes back only when it is proven to be the planned frame (by the
+    provenance record, or by reproducing it); these cannot be, so none goes back, and the
+    solve writes each keyframe's image from its own raw frame."""
     store, kids, capture_root = _live_capture_world(tmp_path)
     monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
     images = store.world_dir(W1) / "solve" / S1 / "images"
@@ -990,8 +1001,15 @@ def test_already_undistorted_walk_images_are_counted_as_reused(tmp_path, stages,
         (images / f"{i:08d}.jpg").write_bytes(b"the walk's solver image")
     report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
                          stamp="c")
-    assert report["solver_frames"]["already_undistorted"] == 3
-    assert report["solver_frames"]["source"] == wr.SOURCE_WALK_IMAGES
+    frames = report["solver_frames"]
+    assert frames["already_undistorted"] == 0
+    assert frames["raw_from_capture_dir"] == 3 and frames["source"] == wr.SOURCE_RAW
+    assert frames["walk_images"]["carried_back"] == 0
+    assert sum(frames["walk_images"]["withheld"].values()) == 3
+    assert not any((store.world_dir(W1) / "solve" / S1 / "images").iterdir())
+    # The set-aside originals are untouched.
+    aside = store.world_dir(W1) / "refinish" / "c" / "solve" / S1 / "images"
+    assert sorted(p.read_bytes() for p in aside.iterdir()) == [b"the walk's solver image"] * 3
 
 
 def test_capture_resolution_rules(tmp_path, monkeypatch):
@@ -1089,11 +1107,16 @@ def test_a_stopped_rebuild_ends_stopped(tmp_path, stages):
 def test_a_ledger_whose_process_is_gone_reads_dead(tmp_path):
     import subprocess
 
-    gone = subprocess.Popen([sys.executable, "-c", "pass"])
-    gone.wait()
     from tower.world_builder.store import _lock_record
 
-    assert wr.refinish_process_alive({"process": {"pid": gone.pid}}) is False
+    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        record = _lock_record(gone.pid)
+    finally:
+        gone.kill()
+        gone.wait(timeout=30)
+    assert "created_at" in record
+    assert wr.refinish_process_alive({"process": record}) is False
     # a pid now naming ANOTHER process (recycled) reads dead by its start time
     me = _lock_record(os.getpid())
     assert wr.refinish_process_alive(

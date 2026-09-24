@@ -35,9 +35,15 @@ the lock):
       solve filter THE WALK'S OWN DATABASE (`solve.masking:
       "walk-database-filtered"`, the approved arm A1h). Without it the solve finds
       no walk database, re-extracts under the masks (`"re-extracted"`, arm A1),
-      and on the target walk that splits the room (reviewer RV1, finding M1-1);
-    - `surface/`, `appearance/` and `dense/<session>`, `derived/` and the session
-      record are COPIED there, because the rebuild replaces them in place;
+      and on the target walk that splits the room (reviewer RV1, finding M1-1).
+      A solver image goes back ONLY when it is proven to be exactly what step 2
+      plans for its keyframe (review V9, M-7; `carry_back_decisions`); every other
+      one is withheld -- the solve writes it afresh from its planned frame -- and
+      its features are cleared from the copied database. Each image's provenance
+      is recorded in `images.provenance.json`, which `prepare_images` honours;
+    - `surface/`, `appearance/` and `dense/<session>` (without its depth-prediction
+      cache, review V9 M-12), `derived/` and the session record are COPIED there,
+      because the rebuild replaces them in place;
     - every `areas/<area>` of this session is MOVED there: a new solve names new areas;
     - `<world>/refinish/<stamp>/refinish.json` records what was set aside, from where,
       and the session's previous finalization and stage records. Restoring is moving
@@ -71,7 +77,11 @@ areas, the derived tree and the session record (what the failed solve left is ke
 published solve -- a session record that cannot be written, a child that cannot be
 started -- and the ledger then says `restored-after-an-error` and names the step and
 the error (`restore-incomplete`, with what could not be done, if it could not all go
-back).
+back). And so does the idle Tower's finisher, or the next run of this command, when a
+re-finish was KILLED before it published -- a console closed, a reboot (review V9,
+M-5; `recover_dead_refinish`): the ledger then says
+`restored-after-the-refinish-ended`. The finisher's attempt counters are restarted only
+once the new solve is published, so a put-back leaves them as they were.
 
 Exit status: 0 done; 1 a step failed (the report says which); 2 refused (no such world
 or session, imagery purged, a live writer holds the world, a build is running, or the
@@ -82,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -93,6 +104,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.world_builder.store import WorldStore, WorldStoreError  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 REFINISH_DIRNAME = "refinish"
 LEDGER_FILENAME = "refinish.json"
@@ -111,8 +124,62 @@ FINALIZE_SCRIPT = Path(__file__).resolve().parent / "world_finalize.py"
 # which is not reproducible -- review V8 H2). NOT `masks/` (the COLMAP masks are
 # rewritten from that cache on every masked solve), nor `database.masked.*` /
 # `reverify_pairs.txt` (made by a solve, for that solve). See `set_aside`.
+#
+# `images/` GOES BACK ONLY IMAGE BY IMAGE, AND ONLY WHERE ITS PROVENANCE IS PROVEN
+# (review V9, M-7). A carried-back solver image used to outrank capture identity:
+# `prepare_images` never rewrites an image that exists, so a walk first solved from
+# its redacted keyframes stayed redacted after a re-finish that found every raw frame
+# (RV9-D D1), a frame another capture's by-name lookup had given it survived every
+# re-finish (D2), and duplicate-id keyframes were solved from a raw image instead of
+# their stored copy (D3). Now each image is carried back only when it is exactly what
+# this re-finish plans for it (`carry_back_decisions`), its provenance is recorded
+# (`SOLVER_IMAGES_PROVENANCE`), and every other image is WITHHELD -- rewritten by the
+# solve from the planned frame -- and its features are cleared from the copied
+# database (`_clear_image_features`), so the rewritten image is extracted and matched
+# afresh instead of mapped with the old image's keypoints.
 SOLVE_COPY_BACK = ("database.db", "database.db-wal", "database.db-shm", "images",
                    "sources.json", "camera.json", "transients", "database.matching.json")
+
+# THE SOLVER-IMAGE PROVENANCE RECORD (review V9, M-7; the format is agreed with
+# `global_solve.prepare_images`, which honours it when the file exists):
+#
+#     {"record": "wb-solver-image-provenance/1",
+#      "images": {"<image name>": {"keyframe_id": ..., "source": "raw" | "redacted",
+#                                  "frame": ..., "sha1": ...}}}
+#
+# `source` is where the image's pixels were undistorted from: a raw capture frame, or
+# the session's stored (face-redacted) keyframe. `frame` is the raw frame's path AS
+# `sources.json` RECORDS IT (compared after `global_solve.resolve_source_path`), or the
+# keyframe's `image_relpath` for a redacted copy. `sha1` is the image file's
+# (`solve_masks.file_sha1`). One entry per image NAME -- for a name two keyframes share,
+# the first keyframe in keyframe order, which is the one `prepare_images` writes. A
+# re-finish writes it into every fresh solve directory, with an entry for each image it
+# carried back; an absent file is a solve directory no re-finish has prepared, and means
+# today's behaviour.
+SOLVER_IMAGES_PROVENANCE = "images.provenance.json"
+PROVENANCE_RECORD = "wb-solver-image-provenance/1"
+IMAGE_SOURCE_RAW = "raw"
+IMAGE_SOURCE_REDACTED = "redacted"
+# `prepare_images` writes a solver image as `cv2.imwrite(..., [IMWRITE_JPEG_QUALITY, 95])`
+# of the undistorted, cropped frame; an image is VERIFIED BY REPRODUCTION when the same
+# steps on the planned frame give the same bytes (`_solver_image_sha1`). Measured on the
+# frozen walk 6839fb8f: 689 of its 690 solver images reproduce byte for byte from the raw
+# frame `sources.json` names; the 690th (keyframe 00000936) reproduces from its REDACTED
+# copy -- the walk solved it before its raw frame was recorded -- and is withheld.
+SOLVER_JPEG_QUALITY = 95
+# COLMAP's pair id: min_image_id * kMaxNumImages + max_image_id.
+COLMAP_PAIR_BASE = 2147483647
+
+# The depth-prediction cache (`dense_pipeline.PREDICTIONS_DIRNAME`, the gate's depth
+# stage) is left out of the set-aside COPY of `dense/<session>` (review V9, M-12): it is
+# re-derivable from the redacted keyframes and the network, it is about twenty times
+# the size of the keyframe images (311 MB for 678 frames), and every re-finish would
+# keep another full copy of it, which policy forbids deleting. The live cache is not
+# touched -- the rebuild reuses it -- and the ledger's copy entry says it was skipped.
+DENSE_PREDICTIONS_DIRNAME = "predictions"
+DENSE_PREDICTIONS_SKIPPED = ("re-derivable depth predictions (the gate's depth cache, about "
+                             "twenty times the keyframe images); left in place for the "
+                             "rebuild to reuse, not copied")
 
 # The product settings a re-finish runs the final solve with (§7 rule 4).
 PRODUCT_SOLVE_ENV = {
@@ -140,8 +207,11 @@ def plan(store: WorldStore, world_id: str, session_id: str, stamp: str) -> dict:
                       ("dense", "copy")):
         src = world_dir / kind / session_id
         if src.exists():
-            (moves if how == "move" else copies).append(
-                {"kind": kind, "from": str(src), "to": str(aside / kind / session_id)})
+            entry = {"kind": kind, "from": str(src), "to": str(aside / kind / session_id)}
+            if kind == "dense" and (src / DENSE_PREDICTIONS_DIRNAME).is_dir():
+                entry["skipped"] = [DENSE_PREDICTIONS_DIRNAME]
+                entry["skipped_why"] = DENSE_PREDICTIONS_SKIPPED
+            (moves if how == "move" else copies).append(entry)
     from tower.world_builder.components import session_area_dirs  # noqa: PLC0415
 
     for area in session_area_dirs(store, world_id, session_id):
@@ -161,7 +231,9 @@ def plan(store: WorldStore, world_id: str, session_id: str, stamp: str) -> dict:
 def _restart_attempts(store: WorldStore, world_id: str, session_id: str,
                       stamp: str) -> dict:
     """Restart `world_finish_pending`'s counters for this session (room and areas);
-    return what they were."""
+    return what they were. Called once the new solve is published (review V9, M-6 and
+    LOW): the counters describe the build being REPLACED, and until the publish nothing
+    has replaced it -- a put-back leaves them as they were."""
     from scripts import world_finish_pending as wfp  # noqa: PLC0415
 
     # The room's, the areas' AND the re-gate's counters (FIN, review V8): a re-finished
@@ -176,7 +248,7 @@ def _restart_attempts(store: WorldStore, world_id: str, session_id: str,
             sessions = dict(sessions)
             for key in prior:
                 sessions[key] = {"attempts": 0, "forgiven": 0,
-                                 "detail": f"restarted by scripts/world_refinish.py ({stamp})"}
+                                 "detail": _restart_detail(stamp)}
             wfp._write_ledger(store, world_id, sessions)
     return prior
 
@@ -211,23 +283,41 @@ LEDGER_RESTORE_INCOMPLETE = "restore-incomplete"
 LEDGER_PUBLISHED = "published"
 LEDGER_DONE = "done"
 LEDGER_STOPPED = "stopped"
+# A re-finish whose process ended in step 1 or 2 -- before its new solve was published --
+# put back by the idle Tower's finisher (review V9, M-5; `recover_dead_refinish`).
+LEDGER_RESTORED_AFTER_DEATH = "restored-after-the-refinish-ended"
 LEDGER_TERMINAL_STATES = (LEDGER_ROLLED_BACK, LEDGER_ROLLBACK_INCOMPLETE, LEDGER_RESTORED,
                           LEDGER_RESTORED_AFTER_ERROR, LEDGER_RESTORE_INCOMPLETE, LEDGER_DONE,
-                          LEDGER_STOPPED)
+                          LEDGER_STOPPED, LEDGER_RESTORED_AFTER_DEATH)
+# The two states a re-finish is in before its new solve is published: the only ones in
+# which a re-finish that died leaves the world with its solve set aside (M-5).
+LEDGER_BEFORE_PUBLISH = (LEDGER_SETTING_ASIDE, LEDGER_SET_ASIDE)
 
 
 def refinish_process_alive(ledger: dict) -> bool | None:
     """Whether the process that wrote this ledger is still running: True, False, or None
-    for a ledger written before the pid was recorded. Pid AND start time, the writer
-    lock's own test (`store._holder_is_running`), so a recycled pid is not taken for the
-    re-finish that died."""
+    when it cannot be told. Pid AND start time, the writer lock's own test
+    (`store._holder_is_running`), so a recycled pid is not taken for the re-finish that
+    died.
+
+    None for a ledger written before the pid was recorded, AND for one with a pid but no
+    start time (review V9, LOW): a bare pid cannot tell the re-finish from whatever
+    process reuses its number, so it is UNKNOWN -- the finisher then decides by what the
+    files show, which keeps it out of a marked room (`world_finish_pending`) -- never
+    "alive" or "dead" on the pid alone. Logged, because a ledger should not lack it."""
     from tower.world_builder.store import _holder_is_running  # noqa: PLC0415
 
     process = (ledger or {}).get("process") or {}
     pid = process.get("pid")
-    if not isinstance(pid, int):
+    if not isinstance(pid, int) or isinstance(pid, bool):
         return None
-    return bool(_holder_is_running(pid, process.get("created_at")))
+    created_at = process.get("created_at")
+    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+        logger.warning("[Tower][WorldBuilder] re-finish ledger %s names pid %s without its "
+                       "start time; whether it is running cannot be told, so it is treated "
+                       "as unknown", (ledger or {}).get("stamp"), pid)
+        return None
+    return bool(_holder_is_running(pid, created_at))
 
 
 class SetAsideFailed(Refused):
@@ -253,6 +343,16 @@ def _write_ledger(aside: Path, ledger: dict) -> None:
     write_json_atomic(aside / LEDGER_FILENAME, ledger)
 
 
+def _write_ledger_quietly(aside: Path, ledger: dict) -> str | None:
+    """`_write_ledger`, for a path that is already failing: None when written, else why
+    not. A ledger that cannot be written must not stop what puts the world back."""
+    try:
+        _write_ledger(aside, ledger)
+    except Exception as exc:  # noqa: BLE001 -- reported by the caller
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def _move_back(done: list, ledger: dict, aside: Path) -> bool:
     """Undo completed moves, newest first. True when every one went back."""
     ok = True
@@ -264,33 +364,66 @@ def _move_back(done: list, ledger: dict, aside: Path) -> bool:
             ok = False
             m["moved_back"] = False
             m["move_back_error"] = f"{type(exc).__name__}: {exc}"
-    _write_ledger(aside, ledger)
+    _write_ledger_quietly(aside, ledger)
     return ok
 
 
-def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> dict:
+def _skipping(root: Path, skipped):
+    """A `copytree` ignore that leaves out `skipped` names directly under `root` only."""
+    if not skipped:
+        return None
+    top = os.path.normcase(os.path.abspath(root))
+
+    def ignore(directory, names):
+        if os.path.normcase(os.path.abspath(directory)) != top:
+            return []
+        return [n for n in names if n in skipped]
+
+    return ignore
+
+
+def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str, *,
+              solver_images: dict | None = None) -> dict:
     """Step 1, under the caller's lock. Never deletes; returns the ledger it wrote.
 
-    IN AN ORDER THAT CANNOT STRAND THE WORLD (review V6, M1):
+    IN AN ORDER THAT CANNOT STRAND THE WORLD (review V6, M1; review V9, M-6):
 
     1. the LEDGER first, naming everything that is about to move, so nothing can move
        without a record of where it went;
-    2. the snapshot COPIES (surface, appearance, dense, derived, the session record),
-       and the COPY-BACK of the walk's solve inputs into a staging directory beside
-       the ledger -- both copies, both before anything moves, so the copy-back does
-       not depend on any move having happened;
+    2. the snapshot COPIES (surface, appearance, dense without its prediction cache,
+       derived, the session record), and the COPY-BACK of the walk's solve inputs into
+       a staging directory beside the ledger -- only the solver images whose provenance
+       is proven, with the withheld images' features cleared from the COPIED database
+       (M-7) -- both copies, both before anything moves, so the copy-back does not
+       depend on any move having happened;
     3. the MOVES, the session's areas before its solve, each retried against a file
-       another process holds open, and every completed move undone if a later one
-       fails;
-    4. the staged copy put in place as the fresh `solve/<session>`.
+       another process holds open;
+    4. the staged copy put in place as the fresh `solve/<session>`, and the ledger's
+       `set-aside`.
 
-    A failure at any point leaves the world as it was and raises `SetAsideFailed`;
-    what was copied stays under `refinish/<stamp>/`, named by the ledger.
+    ONE ROLLBACK COVERS EVERYTHING FROM THE FIRST MOVE TO THE LAST LEDGER WRITE (M-6).
+    Any exception there -- not only a move's `OSError` -- puts the staged copy back
+    beside the ledger if it was placed, undoes every completed move, and raises
+    `SetAsideFailed`, which `main` reports as a refusal (an interrupt is re-raised as
+    itself, after the same rollback). It used to cover the moves alone: the finisher's
+    counters were restarted after them, a read-only `finish_attempts.json` raised
+    `PermissionError`, and the solve and areas stayed moved with the ledger at
+    `setting-aside` and nothing reporting it (RV9-D probe A). The counters are now
+    restarted after the publish, and never fatally (`refinish`). A failure before the
+    first move moved nothing, and says so.
+
+    `solver_images` is `plan_solver_frames`' answer, whose `carry_back` decides which
+    solver images go back; None plans from the walk's own `sources.json`, searching no
+    capture.
     """
     p = plan(store, world_id, session_id, stamp)
     aside = Path(p["aside"])
-    aside.mkdir(parents=True, exist_ok=False)
-    session = store.read_session(world_id, session_id)
+    try:
+        aside.mkdir(parents=True, exist_ok=False)
+        session = store.read_session(world_id, session_id)
+    except Exception as exc:  # noqa: BLE001 -- nothing has moved: a refusal
+        raise SetAsideFailed(f"the previous result could not be set aside "
+                             f"({type(exc).__name__}: {exc}); nothing was moved") from exc
     moves = [dict(m) for m in p["moves"]]
     # Areas before the solve: an open area file is the likeliest refusal, and failing
     # there leaves nothing of the solve to put back.
@@ -315,17 +448,23 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
                    "walk database and images (the originals were never modified)",
         "deletion": "requires a human's approval (Glasses filesystem policy rule 14)",
     }
-    _write_ledger(aside, ledger)
+    try:
+        _write_ledger(aside, ledger)
+    except Exception as exc:  # noqa: BLE001 -- nothing has moved: a refusal
+        raise SetAsideFailed(f"the previous result could not be set aside (writing its "
+                             f"ledger: {type(exc).__name__}: {exc}); nothing was moved: "
+                             f"{aside}") from exc
 
     def fail(state: str, what: str, exc: BaseException) -> "SetAsideFailed":
         ledger["state"] = state
         ledger["error"] = f"{what}: {type(exc).__name__}: {exc}"
-        _write_ledger(aside, ledger)
+        unwritten = _write_ledger_quietly(aside, ledger)
         return SetAsideFailed(
             f"the previous result could not be set aside ({ledger['error']}); "
             + ("nothing was moved" if state == LEDGER_ROLLED_BACK else
                "SOME MOVES COULD NOT BE UNDONE -- see the ledger")
-            + f": {aside / LEDGER_FILENAME}")
+            + f": {aside / LEDGER_FILENAME}"
+            + (f" (the ledger itself could not be written: {unwritten})" if unwritten else ""))
 
     # 2. copies: snapshots, then the copy-back staged beside the ledger.
     solve_live = store.world_dir(world_id) / "solve" / session_id
@@ -334,7 +473,7 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
             src, dst = Path(c["from"]), Path(c["to"])
             dst.parent.mkdir(parents=True, exist_ok=True)
             if src.is_dir():
-                shutil.copytree(src, dst)
+                shutil.copytree(src, dst, ignore=_skipping(src, c.get("skipped")))
             else:
                 shutil.copy2(src, dst)
         # THE WALK'S OWN DATABASE GOES BACK, AS A COPY (RV1 M1-1). The masked final
@@ -343,58 +482,92 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
         # the masks when it is not (`re-extracted`, arm A1) -- which splits the
         # target room. So the fresh solve directory gets a COPY of the database and
         # of the solver images its keypoints were extracted from (so the masks are
-        # computed on the same pixels), where the raw frames were (`sources.json`),
-        # the camera the images were undistorted with (`camera.json`, without which
+        # computed on the same pixels) -- the ones whose provenance is this
+        # re-finish's plan (M-7) --, where the raw frames were (`sources.json`), the
+        # camera the images were undistorted with (`camera.json`, without which
         # `prepare_images` would re-undistort them) and the content-keyed mask cache.
         # The set-aside originals are never touched again.
         if solve_live.exists():
+            if solver_images is None:
+                solver_images = plan_solver_frames(store, world_id, session_id, ())
+            carry = solver_images.get("carry_back") or {}
+            carried = carry.get("carried") or {}
             staging.mkdir()
+            database_entry = None
             for name in SOLVE_COPY_BACK:
                 old = solve_live / name
-                if old.is_dir():
+                entry = {"kind": "solve", "name": name,
+                         "from": str(aside / "solve" / session_id / name),
+                         "to": str(solve_live / name)}
+                if name == "images":
+                    if not old.is_dir():
+                        continue
+                    entry.update(_carry_back_images(old, staging / name, carried))
+                elif old.is_dir():
                     shutil.copytree(old, staging / name)
                 elif old.is_file():
                     shutil.copy2(old, staging / name)
                 else:
                     continue
-                ledger["copied_back"].append({
-                    "kind": "solve", "name": name,
-                    "from": str(aside / "solve" / session_id / name),
-                    "to": str(solve_live / name)})
-    except OSError as exc:
+                ledger["copied_back"].append(entry)
+                if name == "database.db":
+                    database_entry = entry
+            # What `_carry_back_images` did not copy is withheld too, and has no entry.
+            _write_provenance_record(staging, carried)
+            ledger["copied_back"].append({
+                "kind": "solve", "name": SOLVER_IMAGES_PROVENANCE, "written": True,
+                "to": str(solve_live / SOLVER_IMAGES_PROVENANCE), "images": len(carried)})
+            if database_entry is not None:
+                clear = set(carry.get("clear_features") or ()) | set(
+                    database_entry.get("images_changed_while_copying") or ())
+                database_entry["features_cleared"] = _clear_image_features(
+                    staging / "database.db", sorted(clear))
+    except Exception as exc:  # noqa: BLE001 -- nothing has moved yet
         raise fail(LEDGER_ROLLED_BACK, "copying", exc) from exc
 
-    # 3. moves, undone on failure.
-    done = []
-    for m in moves:
-        src, dst = Path(m["from"]), Path(m["to"])
-        try:
+    # 3 and 4, under ONE rollback (M-6).
+    done: list = []
+    placed = False
+    doing = "moving"
+    try:
+        for m in moves:
+            src, dst = Path(m["from"]), Path(m["to"])
+            doing = f"moving {m['kind']} {src.name}"
             dst.parent.mkdir(parents=True, exist_ok=True)
             _replace_with_retry(src, dst)
-        except OSError as exc:
-            all_back = _move_back(done, ledger, aside)
-            raise fail(LEDGER_ROLLED_BACK if all_back else LEDGER_ROLLBACK_INCOMPLETE,
-                       f"moving {m['kind']} {src.name}", exc) from exc
-        m["moved"] = True
-        done.append(m)
-        _write_ledger(aside, ledger)
-
-    # 4. the staged copy becomes the fresh solve directory.
-    if staging.exists():
-        try:
+            m["moved"] = True
+            done.append(m)
+            _write_ledger(aside, ledger)
+        if staging.exists():
+            doing = "placing the fresh solve directory"
             _replace_with_retry(staging, solve_live)
-        except OSError as exc:
-            all_back = _move_back(done, ledger, aside)
-            raise fail(LEDGER_ROLLED_BACK if all_back else LEDGER_ROLLBACK_INCOMPLETE,
-                       "placing the fresh solve directory", exc) from exc
-
-    # The finisher's attempt counters for this session describe the build being set
-    # aside. They are kept in the ledger and restarted, so a rebuild interrupted
-    # later is not retired on the old build's account.
-    ledger["previous"]["finish_attempts"] = _restart_attempts(store, world_id, session_id,
-                                                             stamp)
-    ledger["state"] = LEDGER_SET_ASIDE
-    _write_ledger(aside, ledger)
+            placed = True
+        doing = "recording the set-aside"
+        ledger["state"] = LEDGER_SET_ASIDE
+        _write_ledger(aside, ledger)
+    except BaseException as exc:
+        all_back = True
+        if placed:
+            # The staged copy goes back beside the ledger first: the solve cannot be
+            # moved back over it.
+            try:
+                _replace_with_retry(solve_live, staging)
+                placed = False
+            except OSError as undo:
+                all_back = False
+                ledger["unplace_error"] = f"{type(undo).__name__}: {undo}"
+        back = [m for m in done if not (placed and m["kind"] == "solve")]
+        for m in done:
+            if m not in back:
+                m["moved_back"] = False
+                m["move_back_error"] = ("skipped: the fresh solve directory still occupies "
+                                        f"{m['from']}")
+        all_back = _move_back(back, ledger, aside) and all_back
+        failure = fail(LEDGER_ROLLED_BACK if all_back else LEDGER_ROLLBACK_INCOMPLETE,
+                       doing, exc)
+        if not isinstance(exc, Exception):
+            raise          # an interrupt or an exit, after the world was put back
+        raise failure from exc
     return ledger
 
 
@@ -429,7 +602,16 @@ def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str
 
     failed = world_dir / "solve" / session_id
     solve_cleared = True
-    if failed.exists():
+    # The directory at solve/<session> is the REBUILD'S only when the previous solve was
+    # moved out of it (or there was none). A re-finish that died in step 1 before its
+    # solve moved (review V9, M-5) left the PREVIOUS solve there, and moving that aside
+    # as a "failed solve" would strand the very result being put back.
+    solve_move = next((m for m in ledger.get("moved") or () if m.get("kind") == "solve"), None)
+    rebuilds = solve_move is None or bool(solve_move.get("moved")
+                                          and not solve_move.get("moved_back"))
+    if failed.exists() and not rebuilds:
+        out["solve_never_moved"] = str(failed)
+    elif failed.exists():
         dst = aside / "failed-solve" / session_id
 
         def keep_failed_solve():
@@ -438,7 +620,7 @@ def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str
             out["kept"].append(str(dst))
 
         solve_cleared = attempt("keeping the new solve directory aside", keep_failed_solve)
-    for m in ledger["moved"]:
+    for m in ledger.get("moved") or ():
         if not m.get("moved") or m.get("moved_back"):
             continue
         if m["kind"] == "solve" and not solve_cleared:
@@ -452,8 +634,11 @@ def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str
             out["restored"].append(m["from"])
 
         attempt(f"moving {m['kind']} {Path(m['from']).name} back", move_back)
+    # A set-aside that never completed (a re-finish that died in step 1) rebuilt nothing
+    # in place, and its snapshots may be partial: only its moves are undone.
+    snapshots = ledger.get("state") != LEDGER_SETTING_ASIDE
     snapshot = aside / "derived"
-    if snapshot.is_dir():
+    if snapshots and snapshot.is_dir():
         live = world_dir / "derived"
 
         def restore_derived():
@@ -466,7 +651,7 @@ def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str
 
         attempt("restoring the derived tree", restore_derived)
     session_copy = aside / "session.json"
-    if session_copy.is_file():
+    if snapshots and session_copy.is_file():
         live_session = store.session_path(world_id, session_id)
 
         def restore_session():
@@ -478,10 +663,182 @@ def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str
             out["restored"].append(str(live_session))
 
         attempt("restoring the session record", restore_session)
+    # THE FINISHER'S COUNTERS (review V9, LOW). A re-finish now restarts them only after
+    # its solve is published (`refinish`), so a put-back never meets restarted counters.
+    # A ledger from before that restarted them in step 1 and kept the old ones here: they
+    # go back, each only while it still carries THIS stamp's restart -- a counter the
+    # finisher has moved on since is its own.
+    prior = (ledger.get("previous") or {}).get("finish_attempts")
+    if isinstance(prior, dict) and prior and not prior.get("unreadable"):
+        attempt("restoring the finisher's attempt counters",
+                lambda: _restore_attempts(store, world_id, ledger["stamp"], prior, out))
     ledger["state"] = LEDGER_RESTORE_INCOMPLETE if out["errors"] else state
     ledger["restore_report"] = out
     _write_ledger(aside, ledger)
     return out
+
+
+def _restart_detail(stamp: str) -> str:
+    return f"restarted by scripts/world_refinish.py ({stamp})"
+
+
+def _restore_attempts(store: WorldStore, world_id: str, stamp: str, prior: dict,
+                      out: dict) -> None:
+    """Write the finisher's counters `prior` back, where a re-finish of `stamp` restarted
+    them and nothing has touched them since."""
+    from scripts import world_finish_pending as wfp  # noqa: PLC0415
+
+    with wfp._LEDGER_LOCK:
+        sessions, unreadable = wfp._read_ledger(store, world_id)
+        if unreadable:
+            raise RuntimeError("the finisher's attempt ledger is unreadable")
+        restored = [key for key, entry in prior.items() if isinstance(entry, dict)
+                    and (sessions.get(key) or {}).get("detail") == _restart_detail(stamp)]
+        if restored:
+            sessions = dict(sessions)
+            for key in restored:
+                sessions[key] = prior[key]
+            wfp._write_ledger(store, world_id, sessions)
+    out["finish_attempts_restored"] = restored
+
+
+# A RE-FINISH THAT DIED BEFORE IT PUBLISHED (review V9, M-5). A hard kill in step 1 or 2 --
+# a console closed, a reboot -- has no `finally`: the solve stays set aside, the room stays
+# marked `stopped`, and the ledger stays at `setting-aside` or `set-aside`. The finisher
+# used to read the dead process as "not holding the world", owe the stopped room, and run
+# the room's stages on a session with NO solution: `surface: unavailable` written into the
+# live status, the ledger never moving on, no notice (RV9-D probe C, RV9-E F4).
+#
+# WHY PUT IT BACK, AND NOT PARK THE WORLD. Everything the re-finish moved is intact under
+# `refinish/<stamp>/` and named by its ledger (renames, recorded move by move), so putting
+# it back is exactly what the re-finish itself does after any failure before a publish
+# (`restore_after_failed_solve`), under the same lock, deleting nothing: the world is
+# again the published, consistent world it was before, and an owner who still wants the
+# re-finish runs it again. Parking would leave the phone a world with its solve moved
+# away -- no components, no room to rebuild from -- until an owner noticed; and the
+# process being gone is established by pid AND start time, so a live re-finish is never
+# put back under its own feet. The finisher parks a world only if the put-back itself
+# fails (`world_finish_pending`).
+
+
+def session_ledgers(store: WorldStore, world_id: str, session_id: str) -> list:
+    """`(stamp, ledger)` for every readable re-finish ledger of this session, oldest first
+    (stamps sort by time). Reads only; [] when there is no `refinish/` or it cannot be
+    listed."""
+    from tower.storage import read_json_closed  # noqa: PLC0415
+
+    root = store.world_dir(world_id) / REFINISH_DIRNAME
+    try:
+        stamps = sorted(entry for entry in root.iterdir() if entry.is_dir())
+    except OSError:
+        return []
+    out = []
+    for aside in stamps:
+        try:
+            ledger = read_json_closed(aside / LEDGER_FILENAME)
+        except (OSError, ValueError):
+            continue
+        if isinstance(ledger, dict) and ledger.get("session_id") == session_id:
+            out.append((aside.name, ledger))
+    return out
+
+
+def dead_before_publish(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """The re-finish of this session that died before its new solve was published and has
+    not been put back: `{"stamp", "state"}`, or None. Only the session's NEWEST ledger
+    counts -- a later re-finish has since acted on what the earlier one left, and putting
+    the earlier one back would move things under it. Dead is established by pid and start
+    time (`refinish_process_alive` False); unknown is not dead. Reads only."""
+    ledgers = session_ledgers(store, world_id, session_id)
+    if not ledgers:
+        return None
+    stamp, ledger = ledgers[-1]
+    if ledger.get("state") in LEDGER_BEFORE_PUBLISH and refinish_process_alive(ledger) is False:
+        return {"stamp": stamp, "state": ledger.get("state")}
+    return None
+
+
+def recover_dead_refinish(store: WorldStore, world_id: str, stamp: str) -> dict:
+    """Put back what the re-finish `stamp` set aside, when its process ended before its new
+    solve was published. Under the caller's writer lock (the finisher's). Returns
+    `{"state": <the ledger's state now>, "recovered": bool, ...}`; raises only when the
+    ledger cannot be read or written.
+
+    Per what the process left (the ledger is written after every move, so a kill between
+    a rename and its record is the only gap, and the disk closes it):
+    - `setting-aside`: step 1 did not complete. A move the ledger does not record but the
+      disk shows (its source gone, its destination there) counts as moved; the moves are
+      undone, and nothing else -- the rebuild replaced nothing in place yet, and its
+      snapshots may be partial. A solve that never moved is left where it is.
+    - `set-aside`: the moves are undone and the session record and derived tree go back
+      from their snapshots -- unless the solve child had PUBLISHED before the re-finish
+      ended (a solution in the fresh solve directory, and a completed, solved
+      finalization written after the set-aside). Then the new solve stands: the ledger
+      says `published`, and the room the re-finish marked is owed to the finisher, as for
+      any re-finish that died after its publish."""
+    from tower.storage import read_json_closed  # noqa: PLC0415
+
+    aside = store.world_dir(world_id) / REFINISH_DIRNAME / stamp
+    ledger = read_json_closed(aside / LEDGER_FILENAME)
+    if not isinstance(ledger, dict):
+        raise ValueError(f"{aside / LEDGER_FILENAME} is not a re-finish ledger")
+    state = ledger.get("state")
+    if state not in LEDGER_BEFORE_PUBLISH:
+        return {"state": state, "recovered": False,
+                "why": "the ledger is not at a step before the publish"}
+    if refinish_process_alive(ledger) is not False:
+        return {"state": state, "recovered": False,
+                "why": "its process is not known to have ended"}
+    session_id = ledger.get("session_id")
+    found = []
+    for m in ledger.get("moved") or ():
+        if m.get("moved") or m.get("moved_back"):
+            continue
+        if Path(m["to"]).exists() and not Path(m["from"]).exists():
+            m["moved"] = True
+            m["found_moved_on_disk"] = True
+            found.append(m["from"])
+    ledger["ended_before_publish"] = {"state": state, "noticed_at": time.time(),
+                                      "by": "scripts/world_finish_pending.py",
+                                      "moves_found_on_disk": found}
+    if state == LEDGER_SET_ASIDE and _published_since_set_aside(store, world_id, session_id,
+                                                                ledger):
+        ledger["state"] = LEDGER_PUBLISHED
+        ledger["published_at"] = time.time()
+        ledger["detail"] = ("the final solve had published before the re-finish's process "
+                            "ended; the room it marked is owed to the finisher")
+        _write_ledger(aside, ledger)
+        return {"state": LEDGER_PUBLISHED, "recovered": True, "published": True}
+    out = restore_after_failed_solve(store, world_id, session_id, ledger,
+                                     state=LEDGER_RESTORED_AFTER_DEATH)
+    return {"state": ledger["state"], "recovered": True, "restore_report": out}
+
+
+def _published_since_set_aside(store: WorldStore, world_id: str, session_id: str,
+                               ledger: dict) -> bool:
+    """Whether the re-finish's solve child published before the re-finish ended: the
+    previous solve moved out, a solution in its place (the fresh directory is copied
+    WITHOUT one), and a complete, solved finalization written after the set-aside."""
+    from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
+    from tower.world_builder.records import (  # noqa: PLC0415
+        FINAL_SOLVE_SOLVED,
+        FINALIZATION_COMPLETE,
+    )
+
+    solve_move = next((m for m in ledger.get("moved") or () if m.get("kind") == "solve"), None)
+    if solve_move is None or not solve_move.get("moved") or solve_move.get("moved_back"):
+        return False
+    try:
+        if load_solution(store, world_id, session_id) is None:
+            return False
+        fin = store.read_session(world_id, session_id).finalization or {}
+    except Exception:  # noqa: BLE001 -- unreadable is not published
+        return False
+    at, since = fin.get("updated_at"), ledger.get("set_aside_at")
+    return (fin.get("state") == FINALIZATION_COMPLETE
+            and fin.get("final_solve") == FINAL_SOLVE_SOLVED
+            and isinstance(at, (int, float)) and isinstance(since, (int, float))
+            and at > since)
 
 
 def build_in_progress(store: WorldStore, world_id: str, session_id: str) -> str | None:
@@ -572,7 +929,13 @@ def resolve_capture_dirs(store: WorldStore, world_id: str, session_id: str,
     if not use_capture:
         return {"capture_dirs": [], "from": None, "why": "--no-capture"}
     if explicit:
-        return {"capture_dirs": [str(Path(d)) for d in explicit],
+        # ABSOLUTE, from the owner's working directory, which is where they named it
+        # (review V9, LOW). The frames found in it are written into `sources.json`, whose
+        # relative paths every reader resolves against the Tower's `tower/`
+        # (`resolve_source_path`), never the cwd: a relative `--capture-dir` was counted
+        # raw here and then not found by the solve, which fell back to the redacted
+        # copies without a word (RV9-D probe G).
+        return {"capture_dirs": [str(Path(d).resolve()) for d in explicit],
                 "from": CAPTURE_FROM_ARGUMENT}
     capture_id = getattr(store.read_session(world_id, session_id), "capture_id", None)
     if not capture_id:
@@ -647,6 +1010,31 @@ def _frame_key(source_seq, received_at) -> tuple | None:
         return None
 
 
+def _wire_seq(value):
+    """A `wire_seq` as an int; None when absent; `False` when present but not an integer
+    (review V9, LOW: one malformed journal field used to raise out of the whole plan).
+    A record whose `wire_seq` cannot be read cannot be matched by it, so it is no match."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else False
+    try:
+        return int(str(value).strip(), 10)
+    except (TypeError, ValueError):
+        return False
+
+
+def _wire_seq_agrees(recorded, keyframe) -> bool:
+    a, b = _wire_seq(recorded), _wire_seq(keyframe)
+    if a is False or b is False:
+        return False
+    return a is None or b is None or a == b
+
+
 def _journal_index(capture_dirs) -> tuple[dict, list[str]]:
     """(source_seq, received_at) -> every journal record with that identity, across
     `capture_dirs`, as `{"path", "wire_seq", "time_basis", "capture"}`; and notes on
@@ -696,8 +1084,7 @@ def map_raw_frames(keyframes, capture_dirs) -> tuple[dict, dict]:
             continue
         key = _frame_key(kf.source_seq, kf.received_at)
         hits = [h for h in index.get(key, []) if h["path"].is_file()
-                and (h["wire_seq"] is None or kf.wire_seq is None
-                     or int(h["wire_seq"]) == int(kf.wire_seq))
+                and _wire_seq_agrees(h["wire_seq"], kf.wire_seq)
                 and (h["time_basis"] is None or h["time_basis"] == kf.time_basis)]
         if len(hits) == 1:
             mapping[kf.keyframe_id] = str(hits[0]["path"])
@@ -709,23 +1096,33 @@ def map_raw_frames(keyframes, capture_dirs) -> tuple[dict, dict]:
     return mapping, why
 
 
+# What `source` sums a plan up as. `walk-solver-images` was the answer when every
+# keyframe reused the walk's solver image, whatever it had been made from; since review
+# V9 (M-7) an image is reused only when its provenance is known, so a plan now always
+# says where the pixels come from, and this label appears only in older ledgers.
 SOURCE_WALK_IMAGES = "walk-solver-images"
 SOURCE_RAW = "raw-capture"
 SOURCE_REDACTED = "redacted-session-keyframes"
 SOURCE_MIXED = "mixed"
+# Keys of `plan_solver_frames`' answer that are for the re-finish itself, not the ledger.
+PLAN_INTERNAL_KEYS = ("sources", "image_plan", "carry_back")
 
 
 def plan_solver_frames(store: WorldStore, world_id: str, session_id: str,
                        capture_dirs) -> dict:
-    """Where each keyframe's solver image will come from, and the `sources.json` that
-    makes it so. Reads only: `sources` in the result is what `apply_solver_frames`
-    writes, `sources_changed` whether it differs from the record on disk.
+    """Where each keyframe's solver image will come from, the `sources.json` that makes it
+    so, and which of the walk's solver images may be carried back. Reads only: `sources`
+    in the result is what `apply_solver_frames` writes, `sources_changed` whether it
+    differs from the record on disk, `carry_back` what `set_aside` copies back.
 
-    Per keyframe record, in `global_solve.prepare_images`' own order: already
-    undistorted in the solve directory (the walk's solver images, reused); the raw
-    frame the builder recorded (`raw_from_sources_json`); the raw frame found by
-    identity in the captures (`raw_from_capture_dir`); else the stored redacted
-    keyframe (`redacted_session_copies`, split by why)."""
+    Per keyframe record, in `global_solve.prepare_images`' own order: the raw frame the
+    builder recorded (`raw_from_sources_json`); the raw frame found by identity in the
+    captures (`raw_from_capture_dir`); else the stored redacted keyframe
+    (`redacted_session_copies`, split by why). That is where its solver image's PIXELS
+    come from, whether the image is written afresh or reused: `already_undistorted`
+    counts the keyframes whose walk image is reused because it is proven to be exactly
+    that (`carry_back_decisions`; review V9, M-7), and `walk_images` says what became of
+    each of the walk's solver images."""
     from tower.world_builder.global_solve import (  # noqa: PLC0415
         keyframe_image_name,
         read_sources,
@@ -751,9 +1148,7 @@ def plan_solver_frames(store: WorldStore, world_id: str, session_id: str,
         builder_ok = builder is not None and builder.is_file()
         if not builder_ok and kid in mapping:
             sources[kid] = mapping[kid]
-        if (workspace.images_dir / keyframe_image_name(kf)).exists():
-            counts["already_undistorted"] += 1
-        elif builder_ok:
+        if builder_ok:
             counts["raw_from_sources_json"] += 1
         elif kid in mapping:
             counts["raw_from_capture_dir"] += 1
@@ -762,10 +1157,26 @@ def plan_solver_frames(store: WorldStore, world_id: str, session_id: str,
             counts["redacted_ambiguous_in_session" if kid in ambiguous else
                    "redacted_several_capture_frames" if kid in several else
                    "redacted_no_capture_frame"] += 1
+    image_plan = plan_solver_images(store, world_id, session_id, keyframes, sources)
+    carry = carry_back_decisions(store, world_id, session_id, keyframes, image_plan)
+    carried = carry["carried"]
+    counts["already_undistorted"] = sum(1 for kf in keyframes
+                                        if keyframe_image_name(kf) in carried)
+    withheld: dict = {}
+    for reason in carry["withheld"].values():
+        withheld[reason] = withheld.get(reason, 0) + 1
+    counts["walk_images"] = {
+        "carried_back": len(carried),
+        "by_record": sum(1 for e in carried.values() if e.get("verified") == "record"),
+        "by_reproduction": sum(1 for e in carried.values()
+                               if e.get("verified") == "reproduced"),
+        "withheld": withheld,
+        "withheld_images": dict(sorted(carry["withheld"].items())),
+        "features_to_clear": len(carry["clear_features"]),
+    }
     raw = counts["raw_from_sources_json"] + counts["raw_from_capture_dir"]
     redacted = counts["redacted_session_copies"]
     counts["source"] = (None if counts["keyframes"] == 0 else
-                        SOURCE_WALK_IMAGES if raw + redacted == 0 else
                         SOURCE_RAW if redacted == 0 else
                         SOURCE_REDACTED if raw == 0 else SOURCE_MIXED)
     counts["matched_by"] = "source_seq + received_at (+ wire_seq) in the captures' journals"
@@ -776,7 +1187,248 @@ def plan_solver_frames(store: WorldStore, world_id: str, session_id: str,
     counts["sources"] = sources
     counts["sources_changed"] = ({k: str(v) for k, v in sources.items()}
                                  != {k: str(v) for k, v in recorded.items()})
+    counts["image_plan"] = image_plan
+    counts["carry_back"] = carry
     return counts
+
+
+def plan_solver_images(store: WorldStore, world_id: str, session_id: str, keyframes,
+                       sources: dict) -> dict:
+    """image name -> where the solve child will undistort it from, given the planned
+    `sources.json`: `{"keyframe_id", "source", "frame", "path"}`. The child's own rule
+    (`global_solve._source_frame` with no capture directory, which a re-finish never
+    passes): the entry's raw frame when that file exists, else the session's stored copy.
+    For a name two keyframes share, the first in keyframe order -- the one
+    `prepare_images` writes. Reads only."""
+    from tower.world_builder.global_solve import (  # noqa: PLC0415
+        keyframe_image_name,
+        resolve_source_path,
+    )
+
+    session_dir = store.session_dir(world_id, session_id)
+    out: dict = {}
+    for kf in keyframes:
+        name = keyframe_image_name(kf)
+        if name in out:
+            continue
+        recorded = sources.get(kf.keyframe_id)
+        path = resolve_source_path(recorded)
+        if path is not None and path.is_file():
+            out[name] = {"keyframe_id": kf.keyframe_id, "source": IMAGE_SOURCE_RAW,
+                         "frame": str(recorded), "path": path}
+        else:
+            out[name] = {"keyframe_id": kf.keyframe_id, "source": IMAGE_SOURCE_REDACTED,
+                         "frame": kf.image_relpath, "path": session_dir / kf.image_relpath}
+    return out
+
+
+def read_image_provenance(solve_dir: Path) -> dict:
+    """image name -> its provenance entry, from `SOLVER_IMAGES_PROVENANCE` in `solve_dir`;
+    {} when there is none or it cannot be read. Reads only."""
+    from tower.storage import read_json_closed  # noqa: PLC0415
+
+    try:
+        data = read_json_closed(Path(solve_dir) / SOLVER_IMAGES_PROVENANCE)
+    except (OSError, ValueError):
+        return {}
+    if (not isinstance(data, dict) or data.get("record") != PROVENANCE_RECORD
+            or not isinstance(data.get("images"), dict)):
+        return {}
+    return {k: v for k, v in data["images"].items() if isinstance(v, dict)}
+
+
+def _same_path(a, b) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _same_provenance(entry: dict, planned: dict) -> bool:
+    """Whether a provenance entry names the frame the plan names."""
+    from tower.world_builder.global_solve import resolve_source_path  # noqa: PLC0415
+
+    if entry.get("source") != planned["source"]:
+        return False
+    if planned["source"] == IMAGE_SOURCE_RAW:
+        frame = resolve_source_path(entry.get("frame"))
+        return frame is not None and _same_path(frame, planned["path"])
+    return (str(entry.get("frame") or "").replace("\\", "/")
+            == str(planned["frame"]).replace("\\", "/"))
+
+
+def _undistortion(store: WorldStore, world_id: str, session_id: str, keyframes):
+    """`prepare_images`' undistortion for this session, or None when there is none."""
+    from tower.world_builder.global_solve import _undistort_maps  # noqa: PLC0415
+
+    if not keyframes:
+        return None
+    width, height = keyframes[0].width, keyframes[0].height
+    try:
+        m1, m2, roi, _camera = _undistort_maps(
+            store.read_session(world_id, session_id).intrinsics, width, height)
+    except Exception:  # noqa: BLE001 -- nothing can be verified by reproduction
+        return None
+    return m1, m2, roi, width, height
+
+
+def _solver_image_sha1(source: Path, undistortion) -> str | None:
+    """The SHA-1 of the solver image `prepare_images` would write from `source`: the same
+    read, size check, remap, crop and JPEG quality. None when it would write none."""
+    import hashlib  # noqa: PLC0415
+
+    import cv2  # noqa: PLC0415
+
+    m1, m2, (x, y, rw, rh), width, height = undistortion
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None or image.shape[1] != width or image.shape[0] != height:
+        return None
+    undistorted = cv2.remap(image, m1, m2, cv2.INTER_LINEAR)[y:y + rh, x:x + rw]
+    ok, encoded = cv2.imencode(".jpg", undistorted,
+                               [cv2.IMWRITE_JPEG_QUALITY, SOLVER_JPEG_QUALITY])
+    return hashlib.sha1(encoded.tobytes()).hexdigest() if ok else None
+
+
+def carry_back_decisions(store: WorldStore, world_id: str, session_id: str, keyframes,
+                         image_plan: dict) -> dict:
+    """Which of the walk's solver images may go back into the fresh solve directory
+    (review V9, M-7). Reads only. Returns
+    `{"carried": {name: provenance entry + "verified"}, "withheld": {name: why},
+    "clear_features": [names]}`.
+
+    An image goes back ONLY when it is proven to be exactly what this re-finish plans for
+    its keyframe -- the raw frame found by identity, or the stored redacted copy for a
+    keyframe that falls back:
+    - `record`: the set-aside solve's provenance record names the planned frame, and its
+      SHA-1 is the file's; or
+    - `reproduced`: undistorting the planned frame as `prepare_images` does gives the
+      very same bytes.
+    Every other image is WITHHELD, and says why: `no-keyframe` (no keyframe of the session
+    has that name), `planned-frame-unreadable`, `not-reproducible` (the session has no
+    undistortion to reproduce it with), `differs-from-plan`. The solve then writes it
+    afresh from the planned frame. `clear_features` is every keyframe image NOT carried
+    back -- withheld, or absent -- whose features the copied walk database must lose."""
+    from tower.world_builder.global_solve import workspace_for  # noqa: PLC0415
+    from tower.world_builder.solve_masks import file_sha1  # noqa: PLC0415
+
+    workspace = workspace_for(store, world_id, session_id)
+    recorded = read_image_provenance(workspace.root)
+    carried: dict = {}
+    withheld: dict = {}
+    undistortion = None
+    undistortion_known = False
+    if workspace.images_dir.is_dir():
+        for entry in sorted(workspace.images_dir.iterdir()):
+            if not entry.is_file():
+                continue
+            name = entry.name
+            planned = image_plan.get(name)
+            if planned is None:
+                withheld[name] = "no-keyframe"
+                continue
+            sha1 = file_sha1(entry)
+            provenance = {k: planned[k] for k in ("keyframe_id", "source", "frame")}
+            old = recorded.get(name)
+            if old is not None and old.get("sha1") == sha1 and _same_provenance(old, planned):
+                carried[name] = dict(provenance, sha1=sha1, verified="record")
+                continue
+            if not undistortion_known:
+                undistortion = _undistortion(store, world_id, session_id, keyframes)
+                undistortion_known = True
+            if undistortion is None:
+                withheld[name] = "not-reproducible"
+                continue
+            reproduced = _solver_image_sha1(planned["path"], undistortion)
+            if reproduced is None:
+                withheld[name] = "planned-frame-unreadable"
+            elif reproduced != sha1:
+                withheld[name] = "differs-from-plan"
+            else:
+                carried[name] = dict(provenance, sha1=sha1, verified="reproduced")
+    return {"carried": carried, "withheld": withheld,
+            "clear_features": sorted(n for n in image_plan if n not in carried)}
+
+
+def _carry_back_images(src: Path, dst: Path, carried: dict) -> dict:
+    """Copy the carried-back images from `src` to `dst`, each verified by its SHA-1 as it
+    is copied; an image that changed since it was judged is not copied, and leaves
+    `carried`. Returns the ledger's account."""
+    import hashlib  # noqa: PLC0415
+
+    dst.mkdir(parents=True, exist_ok=True)
+    changed = []
+    for name in sorted(carried):
+        try:
+            data = (src / name).read_bytes()
+        except OSError:
+            data = None          # gone since it was judged: withheld like a changed one
+        if data is None or hashlib.sha1(data).hexdigest() != carried[name]["sha1"]:
+            changed.append(name)
+            continue
+        (dst / name).write_bytes(data)
+        shutil.copystat(src / name, dst / name)
+    for name in changed:
+        carried.pop(name)
+    present = sum(1 for p in src.iterdir() if p.is_file())
+    return {"carried_back": len(carried), "withheld": present - len(carried),
+            "images_changed_while_copying": changed}
+
+
+def _write_provenance_record(solve_dir: Path, carried: dict) -> None:
+    from tower.storage import write_json_atomic  # noqa: PLC0415
+
+    write_json_atomic(solve_dir / SOLVER_IMAGES_PROVENANCE, {
+        "record": PROVENANCE_RECORD,
+        "images": {name: {k: entry[k] for k in ("keyframe_id", "source", "frame", "sha1",
+                                                "verified") if k in entry}
+                   for name, entry in sorted(carried.items())}})
+
+
+def _clear_image_features(database: Path, names) -> dict:
+    """Remove, from the re-finish's OWN COPY of the walk database, the keypoints and
+    descriptors of every image in `names` and every match and two-view geometry touching
+    one. The image rows stay, so COLMAP's extractor -- which skips a name that still has
+    keypoints -- extracts the rewritten image afresh, and its matcher -- which skips a pair
+    that still has matches -- matches its pairs afresh. Without this a withheld image
+    would be rewritten on disk and mapped with the old image's features (M-7). A database
+    the solve would not use as the walk's (`solve_masks.walk_database_usable`) is left as
+    it is. Raises on an SQLite error: the set-aside then rolls back."""
+    import sqlite3  # noqa: PLC0415
+
+    from tower.world_builder.solve_masks import walk_database_usable  # noqa: PLC0415
+
+    wanted = set(names)
+    out = {"images": 0, "pairs": 0}
+    if not wanted or not database.is_file():
+        return out
+    if not walk_database_usable(database):
+        out["skipped"] = "not a COLMAP database holding an image"
+        return out
+    con = sqlite3.connect(str(database))
+    try:
+        con.execute("PRAGMA busy_timeout = 10000")
+        tables = {n for (n,) in con.execute("select name from sqlite_master where type = 'table'")}
+        ids = sorted(i for i, n in con.execute("select image_id, name from images") if n in wanted)
+        if ids:
+            with con:
+                con.execute("create temp table refinish_withheld (image_id integer primary key)")
+                con.executemany("insert into refinish_withheld values (?)", [(i,) for i in ids])
+                for table in ("keypoints", "descriptors"):
+                    if table in tables:
+                        con.execute(f"delete from {table} where image_id in "
+                                    "(select image_id from refinish_withheld)")
+                pairs = set()
+                withheld = "(select image_id from refinish_withheld)"
+                for table in ("matches", "two_view_geometries"):
+                    if table not in tables:
+                        continue
+                    touching = [pid for (pid,) in con.execute(
+                        f"select pair_id from {table} where pair_id / {COLMAP_PAIR_BASE} in "
+                        f"{withheld} or pair_id % {COLMAP_PAIR_BASE} in {withheld}")]
+                    pairs.update(touching)
+                    con.executemany(f"delete from {table} where pair_id = ?",
+                                    [(pid,) for pid in touching])
+            out = {"images": len(ids), "pairs": len(pairs)}
+    finally:
+        con.close()
+    return out
 
 
 def apply_solver_frames(store: WorldStore, world_id: str, session_id: str,
@@ -857,11 +1509,13 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
              capture_dirs=(), use_capture: bool = True) -> dict:
     """Steps 1-4. Raises `Refused` before anything is written when it must refuse:
     no such world or session, purged imagery, a session that never stopped, a live
-    writer, or a build of this session running without the lock (V6 H1). Raises
-    `SetAsideFailed` (a `Refused`) when step 1 could not complete; the world is then as
-    it was. A final solve that publishes nothing puts the previous result back (L3), and
-    so does ANY exception between the set-aside and a published solve (the ledger then
-    says `restored-after-an-error` and names the error).
+    writer, a build of this session running without the lock (V6 H1), or solver frames
+    that cannot be planned. Raises `SetAsideFailed` (a `Refused`) when step 1 could not
+    complete; the world is then as it was (V9 M-6). A final solve that publishes nothing
+    puts the previous result back (L3), and so does ANY exception between the set-aside
+    and a published solve (the ledger then says `restored-after-an-error` and names the
+    error). After the publish the ledger always ends in a terminal state: `done`, or
+    `stopped` with why -- a stop, or a room or area stage that raised (V9 LOW).
 
     `capture_dirs` / `use_capture`: where the solver's raw frames are
     (`resolve_capture_dirs`); the ledger's `solver_frames` records what was used."""
@@ -904,7 +1558,37 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
         busy = build_in_progress(store, world_id, session_id)
         if busy is not None:
             raise Refused(busy)
-        report["set_aside"] = ledger = set_aside(store, world_id, session_id, stamp)
+        # An earlier re-finish of this session that died before it published (review V9,
+        # M-5) is put back first, exactly as the idle Tower's finisher would: what it set
+        # aside IS the previous result, and setting aside its half-built replacement
+        # instead would bury it one level deeper.
+        dead = dead_before_publish(store, world_id, session_id)
+        if dead is not None:
+            try:
+                report["earlier_refinish"] = recover_dead_refinish(store, world_id,
+                                                                   dead["stamp"])
+            except Exception as exc:  # noqa: BLE001
+                raise Refused(f"an earlier re-finish ({dead['stamp']}) of this session "
+                              f"ended before it published and could not be put back "
+                              f"({type(exc).__name__}: {exc})") from exc
+            if report["earlier_refinish"].get("state") == LEDGER_RESTORE_INCOMPLETE:
+                raise Refused(f"an earlier re-finish ({dead['stamp']}) of this session ended "
+                              "before it published, and what it set aside could not all be "
+                              f"put back; see {REFINISH_DIRNAME}/{dead['stamp']}/"
+                              f"{LEDGER_FILENAME}")
+        # THE SOLVER'S FRAMES ARE PLANNED BEFORE ANYTHING IS SET ASIDE (review V9, M-7):
+        # which of the walk's solver images may be carried back depends on the plan.
+        # Reads only, so a failure here is a refusal with nothing written.
+        try:
+            capture = resolve_capture_dirs(store, world_id, session_id, capture_dirs,
+                                           use_capture=use_capture)
+            planned = plan_solver_frames(store, world_id, session_id,
+                                         capture["capture_dirs"])
+        except Exception as exc:  # noqa: BLE001
+            raise Refused(f"the solver's frames could not be planned "
+                          f"({type(exc).__name__}: {exc}); nothing was set aside") from exc
+        report["set_aside"] = ledger = set_aside(store, world_id, session_id, stamp,
+                                                 solver_images=planned)
     except BaseException:
         engine.release_world(world_id)
         raise
@@ -927,16 +1611,12 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
             # The solver's raw frames, each found by its own capture identity and
             # written as `sources.json` into the fresh solve directory -- under the
             # same lock. Never handed to the solve as a capture directory.
-            step = "resolving the solver's frames"
-            capture = resolve_capture_dirs(store, world_id, session_id, capture_dirs,
-                                           use_capture=use_capture)
-            planned = plan_solver_frames(store, world_id, session_id,
-                                         capture["capture_dirs"])
+            step = "writing the solver's frames"
             capture["sources_json_written"] = apply_solver_frames(
                 store, world_id, session_id, planned)
         finally:
             engine.release_world(world_id)
-        capture.update({k: v for k, v in planned.items() if k != "sources"})
+        capture.update({k: v for k, v in planned.items() if k not in PLAN_INTERNAL_KEYS})
         report["solver_frames"] = ledger["solver_frames"] = capture
         _write_ledger(store.world_dir(world_id) / REFINISH_DIRNAME / stamp, ledger)
 
@@ -983,6 +1663,23 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
             report["ledger_error"] = f"{type(exc).__name__}: {exc}"
 
     ledger_state(LEDGER_PUBLISHED)
+    # The finisher's counters for this session describe the build that was just
+    # replaced: they are kept in the ledger and restarted, so a rebuild interrupted later
+    # is not retired on the old build's account. NOW, after the publish, and never
+    # fatal (review V9, M-6): the build is not replaced until then -- a put-back leaves
+    # them as they were -- and a counter file that cannot be written (read-only, RV9-D
+    # probe A) costs the restart, not the re-finish.
+    try:
+        ledger["previous"]["finish_attempts"] = _restart_attempts(store, world_id,
+                                                                 session_id, stamp)
+        ledger["finish_attempts_restarted_at"] = time.time()
+    except Exception as exc:  # noqa: BLE001 -- recorded; the rebuild goes on
+        report["finish_attempts_error"] = ledger["finish_attempts_error"] = (
+            f"the finisher's attempt counters could not be restarted: "
+            f"{type(exc).__name__}: {exc}")
+    unwritten = _write_ledger_quietly(aside_dir, ledger)
+    if unwritten:
+        report["ledger_error"] = unwritten
     record = read_components_record(store, world_id, session_id)
     report["components"] = (None if record is None else
                             [{"id": e["id"], "shown_as": e["shown_as"],
@@ -1003,19 +1700,34 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
         report.update({"done": False, "reason": f"{type(exc).__name__}: {exc}"})
         ledger_state(LEDGER_STOPPED, f"the room was not rebuilt: {report['reason']}")
         return report
+    # ANY EXCEPTION IN STEPS 3 AND 4 ENDS THE LEDGER TRUTHFULLY (review V9, LOW): it used
+    # to stay at `published` -- a state that says the rebuild is still going on -- over a
+    # room whose stage had raised. Now `stopped`, naming the error; the new solve stays
+    # published, and the room's own record says what became of it.
     try:
-        report["room"] = final_surface_stages(
-            store, world_id, session_id, solved=True, appearance=appearance,
-            prune_depth_work=prune_depth_work, should_stop=should_stop,
-            stop_source=stop_source, record=_recorder(engine, world_id, session_id))
-        if record is not None and not should_stop():
-            report["areas"] = build_session_areas(
-                store, world_id, session_id, appearance=appearance,
+        try:
+            step = "rebuilding the room"
+            report["room"] = final_surface_stages(
+                store, world_id, session_id, solved=True, appearance=appearance,
                 prune_depth_work=prune_depth_work, should_stop=should_stop,
-                stop_source=stop_source, build=True,
-                area_ids=[e["id"] for e in record.areas()])
-    finally:
-        engine.release_world(world_id)
+                stop_source=stop_source, record=_recorder(engine, world_id, session_id))
+            if record is not None and not should_stop():
+                step = "building the areas"
+                report["areas"] = build_session_areas(
+                    store, world_id, session_id, appearance=appearance,
+                    prune_depth_work=prune_depth_work, should_stop=should_stop,
+                    stop_source=stop_source, build=True,
+                    area_ids=[e["id"] for e in record.areas()])
+        finally:
+            engine.release_world(world_id)
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        report.update({"done": False, "error": f"{step}: {error}"})
+        ledger_state(LEDGER_STOPPED, f"{step} failed after the new solve was published "
+                                     f"({error}); the new solve stands")
+        if not isinstance(exc, Exception):
+            raise
+        return report
     report["done"] = not should_stop()
     ledger_state(LEDGER_DONE if report["done"] else LEDGER_STOPPED,
                  None if report["done"] else "a stop was asked for")
@@ -1069,7 +1781,7 @@ def main(argv=None) -> int:
         frames = resolve_capture_dirs(store, args.world, session_id, args.capture_dir,
                                       use_capture=not args.no_capture)
         planned = plan_solver_frames(store, args.world, session_id, frames["capture_dirs"])
-        frames.update({k: v for k, v in planned.items() if k != "sources"})
+        frames.update({k: v for k, v in planned.items() if k not in PLAN_INTERNAL_KEYS})
         _emit({"dry_run": True, "world_id": args.world, "session_id": session_id,
                "plan": plan(store, args.world, session_id, stamp),
                "final_solve_env": {**PRODUCT_SOLVE_ENV,
