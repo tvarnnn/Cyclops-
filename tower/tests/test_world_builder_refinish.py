@@ -224,3 +224,108 @@ def test_dry_run_writes_nothing(tmp_path, capsys):
 def test_the_root_goes_through_the_artifact_guard():
     src = (Path(wr.__file__)).read_text(encoding="utf-8")
     assert '"--root", type=artifact_root_arg' in src
+
+
+# ---------------------------------------------------------------------------
+# RV1 M1-1: the masked final solve must filter THE WALK'S OWN database (arm A1h)
+# ---------------------------------------------------------------------------
+
+
+def _walk_database(path: Path) -> None:
+    """A COLMAP-shaped feature database holding one image: what a walk leaves."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()   # the fixture's placeholder bytes, in tmp_path
+    con = sqlite3.connect(str(path))
+    try:
+        con.executescript(
+            "create table images (image_id integer primary key, name text, camera_id int);"
+            "create table keypoints (image_id int, rows int, cols int, data blob);"
+            "create table matches (pair_id int, rows int, cols int, data blob);"
+            "create table two_view_geometries (pair_id int, rows int, cols int, data blob,"
+            " config int);"
+            "insert into images values (1, '00000001.jpg', 1);"
+            "insert into keypoints values (1, 1, 2, x'00');")
+        con.commit()
+    finally:
+        con.close()
+
+
+class _MaskedSolve(_Solve):
+    """The solve child with the masks on, deciding its database the way
+    `global_solve.solve` does (`_walk_database_usable` on the workspace's
+    `database.db`): a walk database is filtered (A1h), none is re-extracted (A1).
+    Like the real one it extracts and matches INTO the database it finds."""
+
+    def __call__(self, argv, env=None, capture_output=True, text=True):
+        import sqlite3
+
+        from tower.world_builder import global_solve as gs
+
+        self.calls.append({"argv": argv, "env": env})
+        assert env["TOWER_WORLD_SOLVE_MASKS"] == "1"
+        ws = gs.workspace_for(self.store, W1, S1)
+        self.masking = ("walk-database-filtered" if gs._walk_database_usable(ws.database_path)
+                        else "re-extracted")
+        if self.masking == "walk-database-filtered":
+            con = sqlite3.connect(str(ws.database_path))
+            con.execute("insert into images values (2, '00000002.jpg', 1)")
+            con.commit()
+            con.close()
+        aside = self.store.world_dir(W1) / wr.REFINISH_DIRNAME
+        stamp = next(aside.iterdir()).name
+        sol = gs.load_solution(_ShadowStore(None, aside / stamp), W1, S1)
+        sol.solve = {"masking": self.masking, "database": ws.database_path.name}
+        gs.write_solution(ws, sol)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+
+def test_a_refinish_filters_the_walks_own_database_and_keeps_the_original(tmp_path, stages):
+    from tower.world_builder.global_solve import load_solution
+
+    store, kids = _old_world(tmp_path)
+    solve_dir = store.world_dir(W1) / "solve" / S1
+    _walk_database(solve_dir / "database.db")
+    (solve_dir / "images").mkdir()
+    (solve_dir / "images" / "00000001.jpg").write_bytes(b"the walk's solver image")
+    (solve_dir / "camera.json").write_text(json.dumps({"fx": 1.0}))
+    walk_db = (solve_dir / "database.db").read_bytes()
+
+    solve = _MaskedSolve(store, kids)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="m")
+    assert report["done"] is True
+    # The masked solve found the walk's database and filtered it: arm A1h.
+    assert solve.masking == "walk-database-filtered"
+    assert load_solution(store, W1, S1).solve["masking"] == "walk-database-filtered"
+    # The set-aside original is byte for byte what the walk left; the rebuild wrote
+    # into its own copy.
+    aside = store.world_dir(W1) / "refinish" / "m" / "solve" / S1
+    assert (aside / "database.db").read_bytes() == walk_db
+    assert (solve_dir / "database.db").read_bytes() != walk_db
+    assert (aside / "images" / "00000001.jpg").read_bytes() == b"the walk's solver image"
+    assert (solve_dir / "images" / "00000001.jpg").read_bytes() == b"the walk's solver image"
+    assert json.loads((solve_dir / "camera.json").read_text()) == {"fx": 1.0}
+    ledger = json.loads((store.world_dir(W1) / "refinish" / "m" / wr.LEDGER_FILENAME)
+                        .read_text())
+    assert {c["name"] for c in ledger["copied_back"]} >= {"database.db", "images",
+                                                          "camera.json", "sources.json"}
+    assert {m["kind"] for m in ledger["moved"]} == {"solve"}
+
+
+def test_without_a_walk_database_the_same_solve_would_re_extract(tmp_path, stages):
+    """The contrast that makes the test above mean something: the fixture's
+    placeholder `database.db` is not a COLMAP database, so the solve takes arm A1."""
+    store, kids = _old_world(tmp_path)
+    solve = _MaskedSolve(store, kids)
+    wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="n")
+    assert solve.masking == "re-extracted"
+
+
+def test_the_dry_run_names_what_goes_back(tmp_path, capsys):
+    store, _kids = _old_world(tmp_path)
+    _walk_database(store.world_dir(W1) / "solve" / S1 / "database.db")
+    assert wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "database.db" in out["plan"]["copy_back_into_fresh_solve"]

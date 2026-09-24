@@ -16,9 +16,16 @@ stored, redacted keyframes; refused for a world whose imagery was purged):
 
 1.  SETS THE PREVIOUS RESULT ASIDE, AND DELETES NOTHING (contract T11). Under the
     world's writer lock:
-    - `solve/<session>` is MOVED to `<world>/refinish/<stamp>/solve/<session>` (the
-      masked solve extracts its features afresh, so the old database is not reused;
-      `sources.json` and `camera.json` are copied back);
+    - `solve/<session>` is MOVED to `<world>/refinish/<stamp>/solve/<session>`, and
+      then the walk's own feature database (`database.db`, with any SQLite
+      `-wal`/`-shm` beside it), the solver images it was extracted from (`images/`),
+      `sources.json` and `camera.json` are COPIED BACK into a fresh
+      `solve/<session>` -- never moved back, so the set-aside copy stays byte for
+      byte what the walk left, for rollback. The copy is what makes the masked
+      solve filter THE WALK'S OWN DATABASE (`solve.masking:
+      "walk-database-filtered"`, the approved arm A1h). Without it the solve finds
+      no walk database, re-extracts under the masks (`"re-extracted"`, arm A1),
+      and on the target walk that splits the room (reviewer RV1, finding M1-1);
     - `surface/`, `appearance/` and `dense/<session>`, `derived/` and the session
       record are COPIED there, because the rebuild replaces them in place;
     - every `areas/<area>` of this session is MOVED there: a new solve names new areas;
@@ -68,6 +75,13 @@ LEDGER_FILENAME = "refinish.json"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 FINALIZE_SCRIPT = Path(__file__).resolve().parent / "world_finalize.py"
 
+# What the fresh solve directory gets back, AS COPIES, from the set-aside one: the
+# walk's feature database (and SQLite's companions, if a writer left them), the
+# solver images its keypoints came from, where the raw frames were, and the camera
+# the images were undistorted with. See `set_aside`.
+SOLVE_COPY_BACK = ("database.db", "database.db-wal", "database.db-shm", "images",
+                   "sources.json", "camera.json")
+
 # The product settings a re-finish runs the final solve with (§7 rule 4).
 PRODUCT_SOLVE_ENV = {
     "TOWER_WORLD_SOLVE_MASKS": "1",
@@ -106,7 +120,10 @@ def plan(store: WorldStore, world_id: str, session_id: str, stamp: str) -> dict:
                        "to": str(aside / "derived")})
     copies.append({"kind": "session", "from": str(store.session_path(world_id, session_id)),
                    "to": str(aside / "session.json")})
-    return {"aside": str(aside), "moves": moves, "copies": copies}
+    solve_src = world_dir / "solve" / session_id
+    copy_back = [name for name in SOLVE_COPY_BACK if (solve_src / name).exists()]
+    return {"aside": str(aside), "moves": moves, "copies": copies,
+            "copy_back_into_fresh_solve": copy_back}
 
 
 def _restart_attempts(store: WorldStore, world_id: str, session_id: str,
@@ -150,16 +167,32 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
         dst.parent.mkdir(parents=True, exist_ok=True)
         # Same volume (the world's own directory): a rename, instant and atomic.
         os.replace(src, dst)
-    # The solve keeps what it cannot re-derive from the session: where the raw frames
-    # were (`sources.json`) and the calibrated camera (`camera.json`).
+    # THE WALK'S OWN DATABASE GOES BACK, AS A COPY (RV1 M1-1). The masked final
+    # solve maps a filtered copy of the walk database when one is there
+    # (`global_solve`, `walk-database-filtered`, arm A1h) and re-extracts under the
+    # masks when it is not (`re-extracted`, arm A1) -- which splits the target room.
+    # So the fresh solve directory gets a COPY of the database and of the solver
+    # images its keypoints were extracted from (so the masks are computed on the
+    # same pixels), plus where the raw frames were (`sources.json`) and the camera
+    # the images were undistorted with (`camera.json`, without which
+    # `prepare_images` would re-undistort them). The set-aside originals are never
+    # touched again: the rebuild extracts and matches into the copy.
     solve_moved = next((m for m in p["moves"] if m["kind"] == "solve"), None)
+    copied_back = []
     if solve_moved is not None:
+        old_root = Path(solve_moved["to"])
         fresh = store.world_dir(world_id) / "solve" / session_id
         fresh.mkdir(parents=True, exist_ok=True)
-        for name in ("sources.json", "camera.json"):
-            old = Path(solve_moved["to"]) / name
-            if old.exists():
+        for name in SOLVE_COPY_BACK:
+            old = old_root / name
+            if old.is_dir():
+                shutil.copytree(old, fresh / name)
+            elif old.is_file():
                 shutil.copy2(old, fresh / name)
+            else:
+                continue
+            copied_back.append({"kind": "solve", "name": name, "from": str(old),
+                                "to": str(fresh / name)})
     # The finisher's attempt counters for this session describe the build being set
     # aside. They are kept in the ledger below and restarted, so a rebuild interrupted
     # later is not retired on the old build's account.
@@ -167,11 +200,14 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
     ledger = {
         "command": "scripts/world_refinish.py",
         "world_id": world_id, "session_id": session_id, "set_aside_at": time.time(),
-        "moved": p["moves"], "copied": p["copies"],
+        "moved": p["moves"], "copied": p["copies"], "copied_back": copied_back,
         "previous": {"finalization": session.finalization, "stages": session.stages,
                      "finish_attempts": prior_attempts},
-        "restore": "move each `moved` entry back from `to` to `from`; the `copied` "
-                   "entries are snapshots of what the rebuild replaced in place",
+        "restore": "move the rebuild's own solve/<session> (and areas) aside, then move "
+                   "each `moved` entry back from `to` to `from`; the `copied` entries "
+                   "are snapshots of what the rebuild replaced in place, and the "
+                   "`copied_back` entries are the rebuild's COPIES of the set-aside "
+                   "walk database and images (the originals were never modified)",
         "deletion": "requires a human's approval (Glasses filesystem policy rule 14)",
     }
     write_json_atomic(aside / LEDGER_FILENAME, ledger)
