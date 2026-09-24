@@ -1050,9 +1050,15 @@ class WorldBuilderEngine:
         # own arbitrary unit -- measured 4x apart between two segments of
         # one session. Calling that "relative" would assert a coherence
         # the reconstruction does not have.
+        #
+        # COUNTED OVER THE ROWS AS WELL AS THE TRACKER (review V7, M1). A gated solve
+        # can split a tracker segment into two derived segments whose poses share no
+        # frame either (`global_solve.merge`, `split_from`); the tracker would still say
+        # one. Never fewer than the tracker's count, so an ungated build is unchanged.
+        frame_segments = max(len(segments), len({int(r["segment_index"]) for r in pose_rows}))
         if not poses_solved:
             scale_state = SCALE_UNKNOWN
-        elif len(segments) > 1:
+        elif frame_segments > 1:
             scale_state = SCALE_UNKNOWN
         else:
             scale_state = SCALE_RELATIVE
@@ -1118,7 +1124,10 @@ class WorldBuilderEngine:
                     ),
                 },
                 "points_triangulated": total_triangulated,
-                "segments": len(segments),
+                # The segments the derived tree's poses fall in (`frame_segments`): the
+                # tracker's, plus any a gated solve split off. The status channel's
+                # path length reads it (review V7, M1).
+                "segments": frame_segments,
                 "scale_state": scale_state,
                 "global_solve": solve_summary,
             },

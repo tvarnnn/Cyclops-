@@ -411,29 +411,35 @@ def test_the_final_surface_reuses_the_gates_depth(tmp_path, monkeypatch):
                                       trust=got["redaction_trust"])
 
 
-@pytest.mark.parametrize("gate_on", [False, True])
-def test_the_final_surface_asks_for_the_gates_depth_only_with_the_gate_on(monkeypatch, gate_on):
-    """The builder's final surface call is today's call with the gate off (no new keyword at all), and asks
-    for the FoV-known depth -- the gate's -- with it on."""
+@pytest.mark.parametrize("gated", [False, True])
+def test_the_final_surface_asks_for_the_gates_depth_only_for_a_gated_solve(tmp_path, monkeypatch, gated):
+    """Keyed on the published solve's gate record, not the environment (review V7, L-a): an ungated
+    world gets today's call (no new keyword) even with the setting on, and a gated one the FoV-known
+    depth -- the gate's -- even with it off."""
     import scripts.world_build_session as B
     from tower.world_builder import surface_pipeline
+    from tower.world_builder.store import WorldStore
 
-    if gate_on:
-        monkeypatch.setenv("TOWER_WORLD_SOLVE_GATE", "1")
-    else:
-        monkeypatch.delenv("TOWER_WORLD_SOLVE_GATE", raising=False)
+    monkeypatch.setenv("TOWER_WORLD_SOLVE_GATE", "0" if gated else "1")
+    store = WorldStore(tmp_path)
+    solve = store.world_dir("w1") / "solve" / SID
+    solve.mkdir(parents=True)
+    meta = {"poses": {}}
+    if gated:
+        meta["gate"] = {"state": CP.GATE_STATE_APPLIED}
+    (solve / "solution.json").write_text(json.dumps(meta))
     seen = {}
 
-    def surfacify(store, world_id, session_id, **kw):
+    def surfacify(store_, world_id, session_id, **kw):
         seen.update(kw)
         return SimpleNamespace(state="unavailable", detail="stub", as_dict=lambda: {})
 
     monkeypatch.setattr(surface_pipeline, "surfacify", surfacify)
-    B.final_surface_stages(None, "w1", SID, solved=True, appearance=False, prune_depth_work=False,
+    B.final_surface_stages(store, "w1", SID, solved=True, appearance=False, prune_depth_work=False,
                            should_stop=lambda: False)
     assert seen["params"].depth_known_fov is False
-    assert ("depth_known_fov" in seen) is gate_on
-    if gate_on:
+    assert ("depth_known_fov" in seen) is gated
+    if gated:
         assert seen["depth_known_fov"] is True
 
 
@@ -748,8 +754,8 @@ def test_an_ungated_solution_merges_exactly_as_before(gate):
 
 
 # ---------------------------------------------------------------------------
-# review V5 M1-2: a gated solve whose masks were lost to a GPU out-of-memory is owed a re-solve by the
-# finisher -- and a session without a components record is never owed one
+# review V7: H2 -- no unattended re-solve (masks lost to GPU memory are an owner's re-finish, said on the
+# row); H1b / L-c -- a gate that could not finish is owed a re-gate IN PLACE
 
 
 def _gated_session(tmp_path, *, transients, gate=None, record=True):
@@ -768,74 +774,286 @@ def _gated_session(tmp_path, *, transients, gate=None, record=True):
 
 
 OOM = {"state": "unavailable", "cause": "gpu-oom", "retryable": True}
+DEPTH_LOST = {"state": CP.GATE_STATE_APPLIED, "masks_applied": True, "metric_available": False,
+              "retryable": True, "cause": CP.CAUSE_DEPTH_UNAVAILABLE,
+              "depth": {"state": "unavailable", "detail": "DepthModelUnavailable: moge is not installed"}}
 
 
-def test_a_gated_solve_that_lost_its_masks_to_a_gpu_oom_is_owed_a_re_solve(tmp_path):
+def test_masks_lost_to_gpu_memory_owe_nothing_unattended_and_say_so_on_the_row(tmp_path):
+    """V7 H2: no finisher re-solve. The record keeps `retryable`, and the row's finalization detail
+    tells the owner to re-finish."""
     from scripts import world_finish_pending as wfp
 
     store = _gated_session(tmp_path, transients=OOM)
     v = wfp.assess(store, "w1", "s1")
-    assert v.owed and v.code == "owed-masks-retry" and v.stage == wfp.MASKS_RETRY_STAGE
+    assert not v.owed and "masks" not in v.code
+    assert not hasattr(wfp, "finish_masks_retry")
+    notice = CP.publish_notice({"transients": OOM, "gate": {"state": CP.GATE_STATE_APPLIED}})
+    assert notice == CP.NOTICE_MASKS_OOM
+    assert "GPU out of memory" in notice and "re-finish" in notice
+    assert CP.publish_notice({"transients": {"state": "applied"}, "gate": None}) is None
+    assert CP.publish_notice(None) is None
 
 
-@pytest.mark.parametrize("case", ["no-record", "not-retryable", "masks-applied", "gate-failed"])
-def test_nothing_else_is_owed_a_re_solve(tmp_path, case):
+@pytest.mark.parametrize("gate", [DEPTH_LOST, {"state": CP.GATE_STATE_FAILED, "retryable": True,
+                                               "cause": CP.CAUSE_GATE_FAILED, "detail": "ZeroDivisionError"}])
+def test_a_gate_that_could_not_finish_is_owed_a_re_gate_and_says_so(tmp_path, gate):
     from scripts import world_finish_pending as wfp
 
-    kw = {"transients": OOM}
-    if case == "no-record":
-        kw["record"] = False                       # never computes components for a world without them
+    store = _gated_session(tmp_path, transients={"state": "applied"}, gate=gate)
+    v = wfp.assess(store, "w1", "s1")
+    assert v.owed and v.code == "owed-regate" and v.stage == wfp.REGATE_STAGE
+    notice = CP.publish_notice({"gate": gate, "transients": {"state": "applied"}})
+    assert "re-runs" in notice
+
+
+@pytest.mark.parametrize("case", ["ungated", "not-retryable", "masks-fail-safe"])
+def test_nothing_else_is_owed_a_re_gate(tmp_path, case):
+    from scripts import world_finish_pending as wfp
+
+    if case == "ungated":
+        store = _gated_session(tmp_path, transients={"state": "applied"}, record=False)
+        path = store.world_dir("w1") / "solve" / "s1" / "solution.json"
+        path.write_text(json.dumps({"transients": {"state": "applied"}}))
     elif case == "not-retryable":
-        kw["transients"] = {"state": "unavailable", "cause": "detector-failed", "retryable": False}
-    elif case == "masks-applied":
-        kw["transients"] = {"state": "applied"}
-        kw["gate"] = {"state": CP.GATE_STATE_APPLIED, "masks_applied": True}
-    elif case == "gate-failed":
-        kw["gate"] = {"state": CP.GATE_STATE_FAILED}
-    store = _gated_session(tmp_path, **kw)
+        store = _gated_session(tmp_path, transients={"state": "applied"},
+                               gate=dict(DEPTH_LOST, retryable=False))
+    else:
+        store = _gated_session(tmp_path, transients=OOM)
     v = wfp.assess(store, "w1", "s1")
-    assert v.code != "owed-masks-retry" and not v.owed
+    assert v.code != "owed-regate" and not v.owed
 
 
-def test_the_re_solve_is_the_refinish_under_its_own_attempt_bound(tmp_path):
+def test_the_gate_records_a_depth_failure_as_retryable_and_a_scale_shortfall_not(monkeypatch):
+    def no_depth(*a, **kw):
+        raise CP.DepthUnavailable("CUDA out of memory")
+
+    _, result = _run(monkeypatch, cross=TRIANGLE, depth_runner=no_depth)
+    assert result.record["retryable"] is True and result.record["cause"] == CP.CAUSE_DEPTH_UNAVAILABLE
+
+    def few_levels(solution, name_of, database_path, work):
+        return {"metric_log": {_name(i): 0.0 for i in range(10)}}   # 10 of 50 cameras: under half
+
+    _, result = _run(monkeypatch, cross=TRIANGLE, metric_fn=few_levels)
+    assert result.record["metric_available"] is False and result.record["retryable"] is False
+    assert [e["reasons"] for e in _entries(result)][1] == [CG.REASON_SCALE_UNAVAILABLE]
+
+    def broken(*a, **kw):
+        raise ZeroDivisionError("a bug")
+
+    _, result = _run(monkeypatch, metric_fn=broken)
+    assert result.record["state"] == CP.GATE_STATE_FAILED and result.record["retryable"] is True
+
+
+def test_the_re_gate_runs_in_place_from_the_solvers_partition(tmp_path, monkeypatch):
+    """The published fail-safe solve is gated again IN PLACE: the solver's components come back as the
+    candidate (kept per pose as `solver_component`), nothing is moved aside, the solution and its record
+    are republished with the new partition and a matching solve identity."""
+    from tower.world_builder import global_solve as GS
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    solution = _solution()
+    # what the first publish did: the scale fail-safe split B off and recorded depth as lost
+    labels = {kid: (1 if i >= 30 else 0) for i, kid in enumerate(solution.keyframe_ids)}
+    published = CP.relabel_solution(solution, labels, [{"label": 0, "state": "placed", "reasons": []},
+                                                       {"label": 1, "state": "unplaced",
+                                                        "reasons": ["scale-unavailable"]}])
+    published.gate = dict(DEPTH_LOST)
+    ws = GS.workspace_for(store, "w1", SID)
+    GS.write_solution(ws, published)
+    (ws.root / "database.db").write_bytes(b"not read: the gate runner is a stub")
+    before = sorted(p.name for p in ws.root.iterdir())
+    seen = {}
+
+    def gate_runner(store_, world_id, session_id, candidate, *, database_path, keyframes, should_stop=None):
+        seen["components"] = {p["component"] for p in candidate.poses.values()}
+        seen["database"] = Path(database_path).name
+        relabelled = CP.relabel_solution(candidate, {k: 0 for k in candidate.keyframe_ids},
+                                         [{"label": 0, "state": "placed", "reasons": []}])
+        doc = CP.components_document(session_id, relabelled, {k: 0 for k in candidate.keyframe_ids},
+                                     {"components": [{"label": 0, "state": "placed", "reasons": []}],
+                                      "gate": CG.GATE_ID, "params": {}, "params_digest": "x",
+                                      "masks_applied": True, "metric_available": True},
+                                     _keyframes(50), 1000.0)
+        return CP.GateResult(solution=relabelled, record={"state": CP.GATE_STATE_APPLIED,
+                                                          "retryable": False, "metric_available": True},
+                             components=doc)
+
+    monkeypatch.setattr(store, "read_keyframes", lambda w, s: _keyframes(50), raising=False)
+    out = CP.regate_published(store, "w1", SID, gate_runner=gate_runner)
+    assert seen == {"components": {0}, "database": "database.db"}, "the solver's partition, the solve's DB"
+    again = GS.load_solution(store, "w1", SID)
+    assert {p["component"] for p in again.poses.values()} == {0}
+    assert again.gate["regate"]["previous"]["cause"] == CP.CAUSE_DEPTH_UNAVAILABLE
+    assert out["notice"] is None, "nothing owed any more"
+    doc = json.loads((ws.root / CP.COMPONENTS_FILENAME).read_text())
+    meta = json.loads(ws.solution_path.read_text())
+    assert doc["solve_identity"] == meta["solve_identity"] == GS.solve_identity(again)
+    assert sorted(p.name for p in ws.root.iterdir()) == sorted(set(before) | {CP.COMPONENTS_FILENAME})
+
+
+def test_a_re_gate_that_cannot_start_is_waiting_and_spends_no_attempt(tmp_path):
     from scripts import world_finish_pending as wfp
     from scripts.world_build_session import StopRequest
 
-    store = _gated_session(tmp_path, transients=OOM)
-    calls = []
-
-    def fake_refinish(store_, root, world_id, session_id, **kw):
-        calls.append((world_id, session_id, kw["seed"]))
-        return {"done": True}
-
-    v = wfp.assess(store, "w1", "s1")
-    for _ in range(3):
-        out = wfp.finish_masks_retry(store, v, appearance=False, prune_depth_work=False,
-                                     stop_request=StopRequest(), refinish=fake_refinish)
-        assert out["finished"] is True
-    assert calls == [("w1", "s1", 0)] * 3
-    v = wfp.assess(store, "w1", "s1")
-    assert not v.owed and v.code == "attempt-bound" and not v.exhausted
-
-
-@pytest.mark.parametrize("refusal", ["Refused", "SetAsideFailed"])
-def test_a_refused_re_solve_is_waiting_and_spends_no_attempt(tmp_path, refusal):
-    """PA's refusals (a session being built; a set-aside that could not be made) are not failures: the
-    attempt is given back, the run reports waiting, and the session is still owed next time."""
-    from scripts import world_finish_pending as wfp
-    from scripts import world_refinish as WR
-    from scripts.world_build_session import StopRequest
-
-    store = _gated_session(tmp_path, transients=OOM)
-    exc_type = getattr(WR, refusal)
+    store = _gated_session(tmp_path, transients={"state": "applied"}, gate=DEPTH_LOST)
 
     def refusing(*a, **kw):
-        raise exc_type("this session is being built right now")
+        raise CP.RegateRefused("the solve's database database.db is gone")
 
     v = wfp.assess(store, "w1", "s1")
     for _ in range(4):
-        out = wfp.finish_masks_retry(store, v, appearance=False, prune_depth_work=False,
-                                     stop_request=StopRequest(), refinish=refusing)
+        out = wfp.finish_regate(store, v, appearance=False, prune_depth_work=False,
+                                stop_request=StopRequest(), regate=refusing)
         assert out["finished"] is False and out["waiting"] is True
     v = wfp.assess(store, "w1", "s1")
-    assert v.owed and v.code == "owed-masks-retry" and v.attempts == 0
+    assert v.owed and v.attempts == 0
+
+
+def test_the_re_gate_is_bounded_and_rebuilds_the_room(tmp_path, monkeypatch):
+    from scripts import world_finish_pending as wfp
+    from scripts.world_build_session import StopRequest
+
+    store = _gated_session(tmp_path, transients={"state": "applied"}, gate=DEPTH_LOST)
+    calls = []
+    monkeypatch.setattr(wfp.WorldBuilderEngine, "build",
+                        lambda self, w, s: SimpleNamespace(poses_solved=1))
+
+    def regate(store_, world_id, session_id, should_stop=None):
+        calls.append("regate")
+        return {"notice": None}
+
+    def stages(*a, **kw):
+        calls.append("room")
+        return {"surface": {"state": "ok"}}
+
+    v = wfp.assess(store, "w1", "s1")
+    for _ in range(3):
+        out = wfp.finish_regate(store, v, appearance=False, prune_depth_work=False,
+                                stop_request=StopRequest(), regate=regate, surface_stages=stages)
+        assert out["finished"] is True
+    assert calls == ["regate", "room"] * 3
+    v = wfp.assess(store, "w1", "s1")       # the stub never cleared the record: bounded
+    assert not v.owed and v.code == "attempt-bound"
+
+
+def test_a_split_segment_is_a_frame_of_its_own_for_scale_and_path_length(tmp_path):
+    """V7 M1: the build counts the derived tree's segments, so a gated solve that split ONE tracker segment
+    in two is two frames -- scale not `relative`, no path length summed across the split -- and the debug
+    trajectory names the segment each pose is in."""
+    from tower.results.world_builder import WorldBuilderStatusProducer
+    from tower.world_builder import global_solve as GS
+    from tower.world_builder.engine import WorldBuilderEngine
+    from tower.world_builder.inspect import WorldView
+    from tower.world_builder.records import CameraIntrinsics
+    from tower.world_builder.store import WorldStore
+
+    store = WorldStore(tmp_path)
+    engine = WorldBuilderEngine(store)
+    wid = engine.create_world()
+    sid = engine.start_session(wid, frame_source="synthetic", intrinsics=CameraIntrinsics(
+        source="self_calibrated", model="pinhole", fx=300.0, fy=300.0, cx=160.0, cy=120.0,
+        calibrated_width=320, calibrated_height=240))
+    from tower.world_builder.records import Keyframe
+    import cv2
+
+    kfs = []
+    for i in range(6):
+        ok, buf = cv2.imencode(".jpg", np.full((240, 320, 3), 40 * i, np.uint8))
+        store.write_keyframe_image(wid, sid, f"{i:08d}.jpg", buf.tobytes())
+        k = Keyframe(keyframe_id=f"{sid}:{i:08d}", session_id=sid, source_seq=i, received_at=float(i),
+                     image_relpath=f"images/{i:08d}.jpg", width=320, height=240, byte_count=1,
+                     segment_index=0)
+        store.append_keyframe(wid, k)
+        kfs.append(k)
+    engine.stop_session("stopped")
+    comp = [0, 0, 0, 1, 1, 1]
+    poses = {k.keyframe_id: {"component": comp[i], "rotation": np.eye(3).ravel().tolist(),
+                             "translation": [-float(i) if i < 3 else -100.0 - i, 0.0, 0.0],
+                             "observations": 100} for i, k in enumerate(kfs)}
+    first = np.arange(6, dtype=np.int32)
+    sol = GS.Solution(solver="glomap", solved_at=1.0, input_digest="d",
+                      keyframe_ids=[k.keyframe_id for k in kfs], poses=poses, components=[],
+                      xyz=np.zeros((6, 3), np.float32), rgb=np.zeros((6, 3), np.uint8),
+                      component=np.asarray(comp, np.int32), first_keyframe=first,
+                      track_length=np.full(6, 2, np.int32), error=np.zeros(6, np.float32),
+                      observations=np.zeros((0, 3), np.int32), gate={"state": CP.GATE_STATE_APPLIED})
+    GS.write_solution(GS.workspace_for(store, wid, sid), sol)
+    result = engine.build(wid, sid)
+    manifest = store.read_derived_manifest(wid)
+    assert manifest["segments"] == 2 and result.scale_state == "unknown"
+    world = store.read_world(wid)
+    from dataclasses import replace
+    from tower.world_builder.records import ScaleState
+    pl = WorldBuilderStatusProducer._compute_path_length(None, store, replace(world, scale=ScaleState(
+        state="relative")), sid, manifest)
+    assert pl["available"] is False
+    traj = {t["keyframe_id"]: t for t in WorldView(store, wid).trajectory(sid)}
+    assert traj[kfs[4].keyframe_id]["segment_index"] == 1 and traj[kfs[4].keyframe_id]["tracker_segment_index"] == 0
+
+
+def test_metric_scale_needs_a_majority_of_the_supported_cameras(monkeypatch):
+    """V7 H1a: a level on fewer than half the supported cameras is not a scale test: the gate takes its
+    fail-safe; at half or more it tests as before. The fraction is a named, recorded parameter."""
+    assert CG.GateParams().min_metric_fraction == 0.5 and "min_metric_fraction" in CG.GateParams().to_json()
+
+    def levels(n):
+        def metric(solution, name_of, database_path, work):
+            return {"metric_log": {_name(i): 0.0 for i in range(n)}}
+        return metric
+
+    _, result = _run(monkeypatch, cross=TRIANGLE, metric_fn=levels(24))          # 24 of 50
+    assert result.record["metric_available"] is False
+    assert result.record["evidence"]["metric_fraction"] == pytest.approx(0.48)
+    _, result = _run(monkeypatch, cross=TRIANGLE, metric_fn=levels(25))          # 25 of 50
+    assert result.record["metric_available"] is True
+
+
+def test_zero_links_is_no_verified_link_even_with_shared_points(monkeypatch):
+    """V7 M2: points shared across the pieces are not a link."""
+    _, result = _run(monkeypatch, cross=())
+    assert _entries(result)[1]["reasons"] == [CG.REASON_NO_VERIFIED_LINK]
+    assert CG.REASONS.index(CG.REASON_LINK_CONTRADICTED) < CG.REASONS.index(CG.REASON_SCALE_MISMATCH)
+
+
+def test_a_depth_stamp_of_another_solve_of_the_same_keyframes_is_not_this_ones(tmp_path):
+    """V7 M3: the gated solve's depth stamp names the solve; a re-solve of the same keyframes does not
+    take it. An ungated solve is checked exactly as before."""
+    import dataclasses as dc
+
+    from tests.test_world_builder_surface_pipeline import SESSION, WORLD, _synthetic_world
+    from tower.world_builder import surface_pipeline as SP
+    from tower.world_builder.dense import DenseParams
+    from tower.world_builder.global_solve import load_solution, solve_identity
+
+    store = _synthetic_world(tmp_path, digest="final-solve")
+    dense = store.world_dir(WORLD) / "dense" / SESSION
+    align = json.loads((dense / "align.json").read_text())
+    sol = load_solution(store, WORLD, SESSION)
+    assert SP._depth_cache_usable(align, dense, sol, DenseParams()), "ungated: as before"
+    gated_a = dc.replace(sol, gate={"state": "applied"})
+    gated_b = dc.replace(gated_a, solved_at=gated_a.solved_at + 1.0)          # a re-solve, same keyframes
+    stamped = dict(align, solve_identity=solve_identity(gated_a))
+    assert SP._depth_cache_usable(stamped, dense, gated_a, DenseParams())
+    assert not SP._depth_cache_usable(stamped, dense, gated_b, DenseParams())
+    assert not SP._depth_cache_usable(align, dense, gated_a, DenseParams()), "unstamped is not a gated solve's"
+
+
+def test_the_components_reader_refuses_a_record_of_another_solve(tmp_path, monkeypatch):
+    """V7 L-d: a crash between publishing a solve and writing its record must not pair them."""
+    from tower.world_builder import global_solve as GS
+    from tower.world_builder.components import read_components_record
+    from tower.world_builder.store import WorldStore
+
+    _, result = _run(monkeypatch)
+    store = WorldStore(tmp_path)
+    ws = GS.workspace_for(store, "w1", SID)
+    published = result.solution
+    published.gate = result.record
+    GS.write_solution(ws, published)
+    CP.write_components(ws.root, result.components)
+    assert read_components_record(store, "w1", SID) is not None
+    import dataclasses as dc
+    GS.write_solution(ws, dc.replace(published, solved_at=published.solved_at + 5.0))   # a newer solve
+    assert read_components_record(store, "w1", SID) is None

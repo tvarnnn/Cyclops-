@@ -153,6 +153,11 @@ def main(argv=None) -> int:
             report["global_solve"] = summary
             if summary.get("solved"):
                 final_solve_state = FINAL_SOLVE_SOLVED
+                # What the published solve still owes, on the row (review V7, H2 and L-c):
+                # masks lost to GPU memory (an owner re-finishes), a gate to re-run.
+                from tower.world_builder.coherence_publish import publish_notice  # noqa: PLC0415
+
+                detail = publish_notice(summary) or detail
             elif summary.get("error"):
                 final_solve_state = FINAL_SOLVE_FAILED
                 detail = f"final solve failed: {summary['error']}"

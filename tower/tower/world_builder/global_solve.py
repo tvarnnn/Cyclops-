@@ -622,6 +622,21 @@ def sweep_workspace(workspace: SolveWorkspace) -> int:
     return swept
 
 
+def solve_identity(solution) -> str:
+    """Which solve this is, beyond which keyframes (`input_digest` is the keyframe ids
+    only): its `solved_at`, and every pose's component, rotation and translation. Two
+    solves of the same keyframes, or a re-gate that moved a piece out of the room, differ
+    (review V7, M3 and L-d). 16 hex."""
+    import hashlib  # noqa: PLC0415
+
+    poses = {kid: [int(p.get("component", 0)), [float(v) for v in p.get("rotation") or []],
+                   [float(v) for v in p.get("translation") or []]]
+             for kid, p in (solution.poses or {}).items()}
+    doc = {"solved_at": repr(float(solution.solved_at)), "input_digest": solution.input_digest,
+           "poses": poses}
+    return hashlib.sha1(json.dumps(doc, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
 def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
     """Publish a solution: the arrays first, the metadata last.
 
@@ -669,6 +684,9 @@ def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
         meta["solve"] = solution.solve
     if solution.gate is not None:
         meta["gate"] = solution.gate
+        # Only on a gated solve, whose components record and depth stamp name it: an
+        # ungated solution.json is byte-for-byte what it was.
+        meta["solve_identity"] = solve_identity(solution)
     write_json_atomic(workspace.solution_path, meta)
 
 

@@ -66,6 +66,9 @@ RECORD = "wb-components-record/1"
 
 GATE_STATE_APPLIED = "applied"
 GATE_STATE_FAILED = "failed"
+# `gate.cause` of a gate record that owes a re-gate (`gate.retryable`).
+CAUSE_DEPTH_UNAVAILABLE = "depth-unavailable"
+CAUSE_GATE_FAILED = "gate-failed"
 
 DEPTH_OK = "ok"
 DEPTH_UNAVAILABLE = "unavailable"
@@ -242,6 +245,11 @@ def hand_depth_to_surface(store, world_id: str, session_id: str, solution, depth
     stamped["digest"] = solution.input_digest
     stamped["cache_key"] = _depth_cache_key(solution.input_digest, dparams, align.get("keyframe_image_set"),
                                             align.get("redaction_trust"))
+    # WHICH SOLVE (review V7, M3): `input_digest` names the keyframes only, and two solves
+    # of the same keyframes are two solves.
+    from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+    stamped["solve_identity"] = solve_identity(solution)
     stamped["gate_handoff"] = {"room_keyframes": len(room), "records_kept": len(records),
                                "records_outside_room": len(align.get("records") or []) - len(records)}
     lock = _SurfaceLock(surface_dir(store, world_id, session_id))
@@ -292,6 +300,9 @@ def relabel_solution(solution, labels_by_kid: dict[str, int], gate_components: l
     poses = {kid: dict(p) for kid, p in (solution.poses or {}).items()}
     for kid, lab in labels_by_kid.items():
         if kid in poses:
+            # The solver's own component, kept beside the gate's label: a re-gate starts
+            # again from the solver's partition (`solver_candidate`).
+            poses[kid].setdefault("solver_component", int(poses[kid].get("component", 0)))
             poses[kid]["component"] = int(lab)
     kf_label = np.full(len(solution.keyframe_ids), -1, np.int64)
     for i, kid in enumerate(solution.keyframe_ids):
@@ -409,13 +420,21 @@ def components_document(session_id: str, solution, labels_by_kid: dict[str, int]
         "record": RECORD,
         "contract": CONTRACT,
         "session_id": session_id,
-        # Which published solve this record describes: a reader can refuse a record whose solve is gone.
+        # Which published solve this record describes: the reader refuses a record whose solve is not
+        # the published one (review V7, L-d).
         "input_digest": solution.input_digest,
         "solved_at": solution.solved_at,
+        "solve_identity": _identity(solution),
         "gate": {"id": gate["gate"], "params": gate["params"], "params_digest": gate["params_digest"],
                  "masks_applied": gate["masks_applied"], "metric_available": gate["metric_available"]},
         "components": entries,
     }
+
+
+def _identity(solution) -> str:
+    from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+    return solve_identity(solution)
 
 
 def components_path(workspace_root) -> Path:
@@ -467,6 +486,8 @@ def gate_final_solution(store, world_id: str, session_id: str, solution, *, data
         return GateResult(solution=solution, components=None, record={
             "state": GATE_STATE_FAILED, "detail": f"{type(exc).__name__}: {exc}", "gate": CG.GATE_ID,
             "params": params.to_json(), "params_digest": params.digest(),
+            # Owes a re-gate (review V7, L-c): the finisher runs it in place when idle.
+            "retryable": True, "cause": CAUSE_GATE_FAILED,
             "seconds": round(time.perf_counter() - started, 3)})
 
 
@@ -528,8 +549,16 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
     counts = {"placed": 0, "area": 0, "none": 0}
     for e in (doc or {}).get("components", []):
         counts["placed" if e["state"] == CG_PLACED else e["shown_as"]] += 1
+    # RETRYABLE (review V7, H1b): the scale fail-safe caused by the DEPTH STAGE -- the network
+    # missing, CUDA out of memory, the surface lock held, a stop -- is not the world's
+    # fault, and the finisher owes it a re-gate in place. A fail-safe with depth in hand
+    # (too few cameras with a level) would come out the same, and the masks fail-safe is
+    # the solve's, so neither is retried here.
+    retryable = bool(masks_applied and depth is None)
     record = {
         "state": GATE_STATE_APPLIED,
+        "retryable": retryable,
+        "cause": CAUSE_DEPTH_UNAVAILABLE if retryable else None,
         "gate": CG.GATE_ID,
         "params": result["params"],
         "params_digest": result["params_digest"],
@@ -593,3 +622,108 @@ def gate_and_publish(store, world_id: str, session_id: str, workspace, solution,
     if result is None:
         return solution, None
     return solution, dict(result.record, publish=published)
+
+
+# ---------------------------------------------------------------------------
+# the re-gate, in place (review V7, H1b and L-c)
+
+
+def regate_owed(store, world_id: str, session_id: str) -> str | None:
+    """The cause a PUBLISHED gated solve owes a re-gate for, or None. Only a solve the gate
+    ran on (a `gate` record in `solution.json`) can owe one: an ungated world never does."""
+    from tower.storage import read_json_closed  # noqa: PLC0415
+
+    path = store.world_dir(world_id) / "solve" / session_id / "solution.json"
+    try:
+        meta = read_json_closed(path) if path.exists() else None
+    except (OSError, ValueError):
+        return None
+    gate = (meta or {}).get("gate")
+    if not isinstance(gate, dict) or not gate.get("retryable"):
+        return None
+    return gate.get("cause") or ("gate-failed" if gate.get("state") == GATE_STATE_FAILED
+                                 else CAUSE_DEPTH_UNAVAILABLE)
+
+
+def solver_candidate(solution):
+    """The published solution with the SOLVER's partition back (`solver_component`, kept by
+    `relabel_solution`): what the gate saw. A solution the gate never relabelled (it
+    failed) is its own candidate."""
+    poses = {}
+    labels = {}
+    for kid, p in (solution.poses or {}).items():
+        q = dict(p)
+        if "solver_component" in q:
+            q["component"] = int(q.pop("solver_component"))
+        poses[kid] = q
+        labels[kid] = int(q.get("component", 0))
+    kf_label = np.asarray([labels.get(k, -1) for k in solution.keyframe_ids], np.int64)
+    point_label = _point_labels(solution, kf_label)
+    return dataclasses.replace(solution, poses=poses, component=point_label.astype(np.int32),
+                               gate=None)
+
+
+class RegateRefused(RuntimeError):
+    """The re-gate cannot start (no solution, no database): nothing was attempted."""
+
+
+def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
+                     gate_runner: Callable | None = None) -> dict:
+    """Depth stage + metric scale + gate again, IN PLACE, on the published solve: nothing is
+    moved aside, the solve itself is not redone. The caller holds the world's writer lock.
+    Publishes the relabelled solution and its components record (or retires the record if
+    the gate fails again). Raises `RegateRefused` before doing anything it cannot finish."""
+    from tower.world_builder.global_solve import load_solution, workspace_for, write_solution  # noqa: PLC0415
+
+    solution = load_solution(store, world_id, session_id)
+    if solution is None or not isinstance(solution.gate, dict):
+        raise RegateRefused("no gated solution is published for this session")
+    workspace = workspace_for(store, world_id, session_id)
+    name = (solution.solve or {}).get("database") or workspace.database_path.name
+    database = workspace.root / name
+    if not database.is_file():
+        raise RegateRefused(f"the solve's database {name} is gone; an owner can re-finish this walk")
+    previous = {k: solution.gate.get(k) for k in ("state", "cause", "metric_available", "params_digest")}
+    keyframes = store.read_keyframes(world_id, session_id)
+    candidate = solver_candidate(solution)
+    result = (gate_runner or gate_final_solution)(store, world_id, session_id, candidate,
+                                                  database_path=database, keyframes=keyframes,
+                                                  should_stop=should_stop)
+    published = result.solution
+    record = dict(result.record, regate={"at": time.time(), "previous": previous})
+    published.gate = record
+    published.timing = dict(published.timing or {}, regate_s=result.record.get("seconds"))
+    write_solution(workspace, published)
+    out = after_publish(store, world_id, session_id, workspace.root, published, result)
+    return {"gate": {k: record.get(k) for k in ("state", "retryable", "cause", "metric_available",
+                                                  "attach", "components")},
+            "publish": out,
+            # The row's sentence after the re-gate (None when nothing is owed any more).
+            "notice": publish_notice({"gate": record, "transients": published.transients})}
+
+
+# ---------------------------------------------------------------------------
+# what the row says (review V7, H2 and L-c)
+
+NOTICE_MASKS_OOM = ("masks were not applied (GPU out of memory); an owner can re-finish this walk")
+NOTICE_REGATE = ("the evidence gate could not measure metric scale ({why}); "
+                 "the Tower re-runs the gate when it is idle")
+NOTICE_GATE_FAILED = "the evidence gate failed ({why}); the Tower re-runs it when it is idle"
+
+
+def publish_notice(summary: dict | None) -> str | None:
+    """One sentence for the session's finalization `detail` (the row carries it), when the
+    published solve owes something an owner or the idle Tower will do, else None."""
+    if not isinstance(summary, dict):
+        return None
+    transients = summary.get("transients") or {}
+    gate = summary.get("gate") or {}
+    parts = []
+    if transients.get("retryable") and transients.get("cause") == "gpu-oom":
+        parts.append(NOTICE_MASKS_OOM)
+    if gate.get("state") == GATE_STATE_FAILED:
+        parts.append(NOTICE_GATE_FAILED.format(why=gate.get("detail") or "an error"))
+    elif gate.get("retryable"):
+        why = (gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"
+        parts.append(NOTICE_REGATE.format(why=why))
+    return "; ".join(parts) or None

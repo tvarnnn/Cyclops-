@@ -500,7 +500,10 @@ def area_solution(solution, keyframe_ids, *, rotation=None, centre=None, tag: st
         camera=solution.camera,
         timing={"area": {"source_input_digest": solution.input_digest, "tag": tag}},
         transients=getattr(solution, "transients", None),
-        solve=getattr(solution, "solve", None))
+        solve=getattr(solution, "solve", None),
+        # The room's gate record travels with the area's solution: its stages key their
+        # depth (the camera's FoV told or not) on it, as the room's do (review V7, L-a).
+        gate=getattr(solution, "gate", None))
     return sub, members
 
 

@@ -581,7 +581,11 @@ def is_gpu_oom(exc: BaseException) -> bool:
     """A CUDA out-of-memory error, from torch or from a library under it."""
     if type(exc).__name__ in ("OutOfMemoryError", "OutOfMemory"):
         return True
-    text = str(exc).lower()
+    return _text_is_gpu_oom(str(exc))
+
+
+def _text_is_gpu_oom(text: str) -> bool:
+    text = str(text).lower()
     return "out of memory" in text and ("cuda" in text or "gpu" in text or "cublas" in text)
 
 
@@ -600,6 +604,10 @@ def _fall_back(out: SolverMasks, params: T.TransientParams, missing: dict) -> T.
     """`union` without Grounding DINO / SAM continues as `oneformer`, and says
     so -- the surface stage's own rule (`transients._fall_back`)."""
     why = "; ".join(f"{c}: {r}" for c, r in sorted(missing.items()))
+    if any(_text_is_gpu_oom(str(r)) for r in missing.values()):
+        # A fallback forced by the GPU running out of memory is transient: recorded so,
+        # like an OOM that left the solve unmasked (review V7, L-b).
+        out.cause = CAUSE_GPU_OOM
     effective = replace(params, mode=T.MODE_ONEFORMER)
     out.params = effective
     out.partial = (f"{params.mode} was requested but only {T.MODE_ONEFORMER} could run ({why}); "

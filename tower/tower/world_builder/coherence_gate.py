@@ -63,8 +63,9 @@ REASON_SINGLE_UNCONFIRMED_LINK = "single-unconfirmed-link"
 REASON_SCALE_MISMATCH = "scale-mismatch"
 REASON_LINK_CONTRADICTED = "link-contradicted"
 REASON_SCALE_UNAVAILABLE = "scale-unavailable"
+# Precedence (review V7, M2; contract v5 §2.2): the link reasons together, then the level.
 REASONS = (REASON_MASKS_UNAVAILABLE, REASON_SCALE_UNAVAILABLE, REASON_SOLVED_SEPARATELY, REASON_NO_VERIFIED_LINK,
-           REASON_SINGLE_UNCONFIRMED_LINK, REASON_SCALE_MISMATCH, REASON_LINK_CONTRADICTED)
+           REASON_SINGLE_UNCONFIRMED_LINK, REASON_LINK_CONTRADICTED, REASON_SCALE_MISMATCH)
 
 # COLMAP TwoViewGeometry configurations that are not verified evidence.
 NOT_VERIFIED_CONFIGS = (0, 1)  # UNDEFINED, DEGENERATE
@@ -83,6 +84,11 @@ class GateParams:
     scale_step_factor: float = 1.25
     # Cameras with a metric ratio needed on EACH side of a scale comparison.
     scale_min_cameras: int = 10
+    # METRIC SCALE COUNTS AS AVAILABLE only when at least this fraction of the supported
+    # cameras has a finite ratio (review V7, H1a). Below it the gate takes its fail-safe
+    # (`scale-unavailable`) rather than splitting and attaching on the few levels it has.
+    # OPEN: 0.5 is a majority rule, not a measured threshold.
+    min_metric_fraction: float = 0.5
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -387,12 +393,21 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
         edges_all.append((ia, ib))
         if tuple(sorted((a, b))) in honoured:
             edges.append((ia, ib))
-    metric_available = bool(np.isfinite(r).any())
+    n_supported = int(supported.sum())
+    n_with_ratio = int((np.isfinite(r) & supported).sum())
+    metric_fraction = float(n_with_ratio / n_supported) if n_supported else 0.0
+    metric_available = bool(np.isfinite(r).any()) and metric_fraction >= params.min_metric_fraction
+    if not metric_available:
+        # Levels on fewer than `min_metric_fraction` of the cameras are not used at all:
+        # half a scale test is not a scale test.
+        r = np.full(model.n, np.nan)
     attach = masks_applied and metric_available
     evidence = {
         "links": f"{len(edges_all)} verified pairs >= {params.min_link_inliers} inliers",
         "links_honoured": f"{len(edges)} of them within {params.max_link_disagreement_deg} deg of the solve",
-        "metric_scale": f"{int(np.isfinite(r).sum())} cameras with a ratio",
+        "metric_scale": (f"{n_with_ratio} of {n_supported} supported cameras with a ratio ({metric_fraction:.0%}; "
+                         f"available at >= {params.min_metric_fraction:.0%})"),
+        "metric_fraction": round(metric_fraction, 4),
         "masks": "applied" if masks_applied else "NOT applied: no piece attached (fail-safe)",
         "attach": attach,
     }
@@ -510,10 +525,12 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
         return [REASON_NO_VERIFIED_LINK]
     out = []
     if not d.get("redundant", False):
-        if d.get("redundant_without_honouring", False):
-            out.append(REASON_LINK_CONTRADICTED)
-        elif d.get("cross_links", 0) == 0 and not d.get("coupled", False):
+        if d.get("cross_links_all", d.get("cross_links", 0)) == 0:
+            # No verified link at all, honoured or not -- whatever points the two share
+            # (review V7, M2: shared points alone are not a link).
             out.append(REASON_NO_VERIFIED_LINK)
+        elif d.get("redundant_without_honouring", False):
+            out.append(REASON_LINK_CONTRADICTED)
         else:
             out.append(REASON_SINGLE_UNCONFIRMED_LINK)
     if not d.get("scale_ok", True):

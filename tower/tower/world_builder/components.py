@@ -293,6 +293,19 @@ def read_components_record(store: WorldStore, world_id: str,
                        f"names solve {named[:12]} but the published solve is "
                        f"{str(published)[:12]}; the session reports components: null")
             return None
+    # AND THE SAME SOLVE, NOT ONLY THE SAME KEYFRAMES (review V7, L-d). `input_digest`
+    # names the keyframe ids; a new solve of them -- or a re-gate that moved a piece --
+    # with a crash between publishing it and writing its record would pair the old
+    # record with the new solve. A record naming a `solve_identity` is read only beside
+    # the solution that carries the same one.
+    identity = payload.get("solve_identity") if isinstance(payload, dict) else None
+    if isinstance(identity, str) and identity:
+        published = _published_meta_field(store, world_id, session_id, "solve_identity")
+        if published != identity:
+            _warn_once(f"[Tower][WorldBuilder] components record {world_id}/{session_id} "
+                       f"names solve identity {identity} but the published solve is "
+                       f"{published}; the session reports components: null")
+            return None
     return record
 
 
@@ -305,12 +318,18 @@ _DIGEST_CACHE_MAX = 256
 def _published_input_digest(store: WorldStore, world_id: str, session_id: str):
     """The `input_digest` of the solution published in `solve/<session>`, or None when
     there is none or it cannot be read. Cached by the file's stat."""
+    return _published_meta_field(store, world_id, session_id, "input_digest")
+
+
+def _published_meta_field(store: WorldStore, world_id: str, session_id: str, field: str):
+    """One top-level field of the published `solution.json`, or None. Cached by the file's
+    stat, per field."""
     path = store.world_dir(world_id) / "solve" / session_id / "solution.json"
     try:
         st = path.stat()
     except OSError:
         return None
-    key = (str(path), st.st_mtime_ns, st.st_size)
+    key = (str(path), st.st_mtime_ns, st.st_size, field)
     if key in _DIGEST_CACHE:
         return _DIGEST_CACHE[key]
     try:
@@ -319,7 +338,7 @@ def _published_input_digest(store: WorldStore, world_id: str, session_id: str):
         meta = _read_json_past_a_replace(path)
     except Exception:  # noqa: BLE001 -- unreadable is "not known", never a match
         return None
-    digest = meta.get("input_digest") if isinstance(meta, dict) else None
+    digest = meta.get(field) if isinstance(meta, dict) else None
     if len(_DIGEST_CACHE) >= _DIGEST_CACHE_MAX:
         _DIGEST_CACHE.clear()
     _DIGEST_CACHE[key] = digest

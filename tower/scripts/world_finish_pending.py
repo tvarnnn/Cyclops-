@@ -636,13 +636,16 @@ def assess(
             "needs a global solve and there is none"
         )
 
-    # A GATED SOLVE THAT LOST ITS MASKS TO A TRANSIENT CAUSE (review V5, M1-2). Asked
-    # before the photographic stages because the answer is a whole re-solve, which
-    # rebuilds them too. Never of a session without a components record: this tool
-    # never computes components for a world that has none.
-    retry = _assess_masks_retry(store, world_id, session_id, max_attempts=max_attempts)
-    if retry is not None:
-        return retry
+    # A GATED SOLVE THAT OWES ITS GATE AGAIN (review V7, H1b and L-c): the depth stage could
+    # not give it a metric scale (the network missing, CUDA out of memory, the surface lock
+    # held), or the gate itself raised. Asked before the photographic stages because the
+    # re-gate can move pieces out of the room, which the room's stages then rebuild. Only a
+    # solve the gate RAN on can owe one: this tool never computes components for a world
+    # the gate never saw. A solve that lost its MASKS owes nothing here -- that needs a new
+    # solve, which an owner runs attended (`world_refinish.py`; V7, H2).
+    regate = _assess_regate(store, world_id, session_id, max_attempts=max_attempts)
+    if regate is not None:
+        return regate
 
     # TWO SIGNALS, IN PRECEDENCE ORDER, AND NEITHER CAN DISCOVER A BACKLOG.
     #
@@ -861,75 +864,62 @@ def _assess_areas(store: WorldStore, world_id: str, session_id: str, session, *,
                    attempts=attempts)
 
 
-# -- a re-solve owed to lost masks (review V5, M1-2) ------------------------
+# -- a re-gate owed to a gate that could not finish (review V7, H1b and L-c) ------------
 #
-# The evidence gate treats a solve without its hand/arm/held-phone masks as unsafe and
-# attaches nothing (`masks-unavailable`). When the masks were lost to something that
-# clears by itself -- the GPU was out of memory (`solve_masks.RETRYABLE_CAUSES`) --
-# that fail-safe must not be permanent: the session is owed ONE thing, the product
-# re-solve `scripts/world_refinish.py` runs (masks, the seeded solve, the gate, the
-# room and its areas), under this tool's attempt bound. Only for a session that HAS a
-# components record, i.e. whose final solve ran the gate: this tool still never
-# computes components for a world that has none.
+# The evidence gate's scale fail-safe publishes the room as its unsplit anchor block, which
+# on GT's masked arms leaves [129, 89, 120, 44] misplaced where the gate leaves [24, 0, 0,
+# 38] (V7) -- tolerable for an interim publish, not as a world's final answer. When it was
+# caused by the depth stage (`gate.retryable`, `gate.cause` depth-unavailable) or the gate
+# raised (gate-failed), the session is owed ONE thing: the depth stage and the gate run
+# again IN PLACE on the published solve (`coherence_publish.regate_published`) -- the solve
+# is not redone and nothing is moved aside -- then the derived tree and the room's stages
+# are rebuilt from it; its areas are owed by the new record. Under the writer lock, on its
+# own attempt ledger key, bounded like every other stage.
+#
+# There is deliberately no unattended RE-SOLVE (V7, H2): a solve that lost its masks keeps
+# `transients.retryable` and says so on the row; an owner re-finishes it attended.
 
-MASKS_RETRY_STAGE = "masks-retry"
+REGATE_STAGE = "regate"
 
 
-def masks_retry_ledger_key(session_id: str) -> str:
-    return f"{session_id}#{MASKS_RETRY_STAGE}"
+def regate_ledger_key(session_id: str) -> str:
+    return f"{session_id}#{REGATE_STAGE}"
 
 
-def _masks_retry_cause(store: WorldStore, world_id: str, session_id: str) -> str | None:
-    """The transient cause the published gated solve lost its masks to, or None."""
-    from tower.world_builder.components import components_path  # noqa: PLC0415
-    from tower.world_builder.solve_masks import RETRYABLE_CAUSES  # noqa: PLC0415
+def _assess_regate(store: WorldStore, world_id: str, session_id: str, *,
+                   max_attempts: int) -> "Verdict | None":
+    from tower.world_builder.coherence_publish import regate_owed  # noqa: PLC0415
 
-    if not components_path(store, world_id, session_id).exists():
-        return None                                    # no record: never a re-solve
     try:
-        meta = read_json_closed(store.world_dir(world_id) / "solve" / session_id / "solution.json")
-    except (OSError, ValueError):
-        return None
-    transients = (meta or {}).get("transients") or {}
-    gate = (meta or {}).get("gate") or {}
-    if gate.get("state") != "applied" or gate.get("masks_applied") is not False:
-        return None
-    if transients.get("state") == "applied" or not transients.get("retryable"):
-        return None
-    cause = transients.get("cause")
-    return cause if cause in RETRYABLE_CAUSES else None
-
-
-def _assess_masks_retry(store: WorldStore, world_id: str, session_id: str, *,
-                        max_attempts: int) -> "Verdict | None":
-    try:
-        cause = _masks_retry_cause(store, world_id, session_id)
+        cause = regate_owed(store, world_id, session_id)
     except Exception as exc:  # noqa: BLE001 -- one session, not the survey
-        logger.warning("[Tower][WorldBuilder] could not read the masks record of %s/%s: %s",
+        logger.warning("[Tower][WorldBuilder] could not read the gate record of %s/%s: %s",
                        world_id, session_id, exc)
         return None
     if cause is None:
         return None
+    if session_build_running(store, world_id, session_id):
+        return Verdict(world_id, session_id, False, "this session is being built right now",
+                       code="building-now", stage=REGATE_STAGE)
     holder = store.lock_holder(world_id)
     if holder is not None and holder["pid"] == os.getpid():
         holder = None
     if holder is not None and (holder["alive"] or holder["unreadable"]):
         return Verdict(world_id, session_id, False,
                        "this world's writer lock is held by another process",
-                       code="locked", stage=MASKS_RETRY_STAGE)
-    attempts = read_attempts(store, world_id, masks_retry_ledger_key(session_id)) or 0
+                       code="locked", stage=REGATE_STAGE)
+    attempts = read_attempts(store, world_id, regate_ledger_key(session_id)) or 0
     if attempts >= max_attempts:
-        # Not `exhausted`: there is nothing to retire -- the published solve and its
-        # fail-safe components stand, and say why.
+        # Not `exhausted`: nothing to retire. The published fail-safe stands, and its row
+        # says why (`coherence_publish.publish_notice`).
         return Verdict(world_id, session_id, False,
-                       f"this tool has already re-solved this session {attempts} times "
-                       f"(the bound is {max_attempts}); its masks were lost to {cause} "
-                       "every time", code="attempt-bound", stage=MASKS_RETRY_STAGE,
-                       attempts=attempts)
+                       f"this tool has already re-run the gate of this session {attempts} "
+                       f"times (the bound is {max_attempts}); {cause} every time",
+                       code="attempt-bound", stage=REGATE_STAGE, attempts=attempts)
     return Verdict(world_id, session_id, True,
-                   f"the final solve ran without its masks ({cause}, transient), so the "
-                   "evidence gate attached nothing; it is owed a re-solve",
-                   code="owed-masks-retry", stage=MASKS_RETRY_STAGE, attempts=attempts)
+                   f"the published solve's evidence gate could not finish ({cause}); it is "
+                   "owed a re-gate in place", code="owed-regate", stage=REGATE_STAGE,
+                   attempts=attempts)
 
 
 def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: str) -> None:
@@ -949,69 +939,72 @@ def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: st
         _write_ledger(store, world_id, sessions)
 
 
-def finish_masks_retry(store: WorldStore, verdict: Verdict, *, appearance: bool,
-                       prune_depth_work: bool, stop_request,
-                       max_forgiven: int = DEFAULT_MAX_FORGIVEN, refinish=None) -> dict:
-    """The owed re-solve: `world_refinish.refinish` (which takes the lock itself, sets
-    the previous result aside and deletes nothing), counted on its own ledger key."""
-    key = masks_retry_ledger_key(verdict.session_id)
+def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prune_depth_work: bool,
+                  stop_request, max_forgiven: int = DEFAULT_MAX_FORGIVEN, regate=None,
+                  surface_stages=None) -> dict:
+    """The owed re-gate, under the world's writer lock: `regate_published`, then the derived
+    tree (`engine.build`) and the room's stages (`final_surface_stages`) from the relabelled
+    solve. A refusal before any work (`RegateRefused`) gives the attempt back: waiting."""
+    from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
+
+    key = regate_ledger_key(verdict.session_id)
     report: dict = {"world_id": verdict.world_id, "session_id": verdict.session_id,
-                    "stage": MASKS_RETRY_STAGE}
+                    "stage": REGATE_STAGE}
+    engine = WorldBuilderEngine(store)
     try:
         store.acquire_writer_lock(verdict.world_id)
     except Exception as exc:  # noqa: BLE001
-        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+        report.update({"finished": False, "waiting": True, "reason": f"{type(exc).__name__}: {exc}"})
         return report
+    disarm = None
     try:
-        report["attempts"] = record_attempt(store, verdict.world_id, key,
-                                            detail="re-solving: the masks were lost")
-    except Exception as exc:  # noqa: BLE001
-        report.update({"finished": False,
-                       "reason": f"the attempt could not be counted, so it was not started: "
-                                 f"{type(exc).__name__}: {exc}"})
-        return report
-    finally:
-        store.release_writer_lock(verdict.world_id)
-    disarm = _forgive_on_stop(
-        stop_request,
-        lambda source: forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({source})",
-                                       max_forgiven=max_forgiven))
-    from scripts.world_refinish import Refused  # noqa: PLC0415
-
-    try:
-        if refinish is None:
-            from scripts.world_refinish import PRODUCT_SOLVE_ENV  # noqa: PLC0415
-            from scripts.world_refinish import refinish  # noqa: PLC0415
-
-            # The room's and areas' stages run in THIS process, with the product
-            # settings, like the re-finish command's own.
-            os.environ.update(PRODUCT_SOLVE_ENV)
-        from tower.config import world_solve_seed_setting  # noqa: PLC0415
-
-        seed = world_solve_seed_setting()
+        try:
+            report["attempts"] = record_attempt(store, verdict.world_id, key,
+                                                detail="re-running the evidence gate in place")
+        except Exception as exc:  # noqa: BLE001
+            report.update({"finished": False,
+                           "reason": f"the attempt could not be counted, so it was not started: "
+                                     f"{type(exc).__name__}: {exc}"})
+            return report
+        disarm = _forgive_on_stop(
+            stop_request,
+            lambda source: forgive_attempt(store, verdict.world_id, key,
+                                           detail=f"stopped ({source})", max_forgiven=max_forgiven))
         prewarm_world_builder()
-        report["refinish"] = refinish(
-            store, Path(store.root), verdict.world_id, verdict.session_id,
-            seed=0 if seed is None else seed, appearance=appearance,
+        try:
+            report["regate"] = (regate or CP.regate_published)(
+                store, verdict.world_id, verdict.session_id, should_stop=stop_request.asked_for)
+        except CP.RegateRefused as exc:
+            _give_back_attempt(store, verdict.world_id, key,
+                               detail=f"not started, waiting: {exc}")
+            report.update({"finished": False, "waiting": True, "reason": str(exc)})
+            return report
+        # The row's sentence follows the re-gate: cleared, or the new reason.
+        fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
+        if fin.get("state"):
+            engine.mark_finalization(verdict.world_id, verdict.session_id, state=fin["state"],
+                                     final_solve=fin.get("final_solve"),
+                                     detail=(report["regate"] or {}).get("notice"))
+        if stop_request.asked:
+            report.update({"finished": False, "reason": f"stopped ({stop_request.source})"})
+            return report
+        report["build"] = {"poses_solved": getattr(engine.build(verdict.world_id, verdict.session_id),
+                                                   "poses_solved", None)}
+        report["stages"] = (surface_stages or final_surface_stages)(
+            store, verdict.world_id, verdict.session_id, solved=True, appearance=appearance,
             prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
-            stop_source=lambda: stop_request.source)
-        report["finished"] = bool((report["refinish"] or {}).get("done"))
-    except Refused as exc:
-        # REFUSED IS WAITING, NOT FAILING: a session being built right now, a live writer,
-        # a set-aside that could not be made (`world_refinish.Refused` and its
-        # `SetAsideFailed`). Nothing was attempted, so no attempt is spent: it is given
-        # back, and the next idle run asks again.
-        _give_back_attempt(store, verdict.world_id, key,
-                           detail=f"not started, waiting: {type(exc).__name__}: {exc}")
-        report.update({"finished": False, "waiting": True,
-                       "reason": f"{type(exc).__name__}: {exc}"})
-    except Exception as exc:  # noqa: BLE001 -- reported; what was set aside stays aside
+            stop_source=lambda: stop_request.source,
+            record=_recorder(engine, verdict.world_id, verdict.session_id))
+        report["finished"] = True
+    except Exception as exc:  # noqa: BLE001 -- recorded, then reported
         report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
     finally:
-        forgiven = disarm()
-        if not forgiven and stop_request.asked:
-            forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({stop_request.source})",
-                            max_forgiven=max_forgiven)
+        if disarm is not None:
+            forgiven = disarm()
+            if not forgiven and stop_request.asked:
+                forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({stop_request.source})",
+                                max_forgiven=max_forgiven)
+        engine.release_world(verdict.world_id)
     return report
 
 
@@ -1038,12 +1031,10 @@ def build_session_areas(store: WorldStore, world_id: str, session_id: str, *,
     # The depth the area's levelling runs must be the depth its surface stage will
     # ask for, or the predictions are made twice: `final_surface_stages` asks for the
     # FoV-told depth exactly when the evidence gate is on.
-    try:
-        from tower.config import world_solve_gate_setting  # noqa: PLC0415
+    # Keyed on the published solve's gate record, as the room's surface is (review V7, L-a).
+    from scripts.world_build_session import _solution_gated  # noqa: PLC0415
 
-        known_fov = bool(world_solve_gate_setting())
-    except Exception:  # noqa: BLE001
-        known_fov = False
+    known_fov = _solution_gated(store, world_id, session_id)
     reports = []
     for area_id in targets:
         if should_stop():
@@ -1286,10 +1277,10 @@ def finish(
         return finish_areas(store, verdict, appearance=appearance,
                             prune_depth_work=prune_depth_work,
                             stop_request=stop_request, max_forgiven=max_forgiven)
-    if verdict.stage == MASKS_RETRY_STAGE:
-        return finish_masks_retry(store, verdict, appearance=appearance,
-                                  prune_depth_work=prune_depth_work,
-                                  stop_request=stop_request, max_forgiven=max_forgiven)
+    if verdict.stage == REGATE_STAGE:
+        return finish_regate(store, verdict, appearance=appearance,
+                             prune_depth_work=prune_depth_work,
+                             stop_request=stop_request, max_forgiven=max_forgiven)
     report: dict = {
         "world_id": verdict.world_id,
         "session_id": verdict.session_id,
@@ -1551,8 +1542,8 @@ def main(argv=None, *, stop_request=None) -> int:
         report["finished"].append(outcome)
         done += 1
         if outcome.get("waiting"):
-            # Refused before it began (a masks re-solve): not a failure; the Tower asks
-            # again after its backoff.
+            # Refused before it began (a re-gate): not a failure; the Tower asks again
+            # after its backoff.
             retire_waiting += 1
         elif not outcome.get("finished"):
             failures += 1

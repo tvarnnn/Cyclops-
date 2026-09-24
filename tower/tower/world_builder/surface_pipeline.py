@@ -302,6 +302,12 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
         align["cache_key"] = _depth_cache_key(solution.input_digest, dparams,
                                               align.get("keyframe_image_set"),
                                               align.get("redaction_trust"))
+        # A GATED solve is named by identity too (review V7, M3); an ungated one is
+        # stamped exactly as before.
+        if getattr(solution, "gate", None) is not None:
+            from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+            align["solve_identity"] = solve_identity(solution)
     write_json_atomic(align_path, align)
     return align, root / "work"
 
@@ -331,6 +337,14 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
     named = cached.get("input_digest") or cached.get("digest")
     if named != solution.input_digest:
         return False
+    # THE SAME KEYFRAMES ARE NOT THE SAME SOLVE (review V7, M3). A gated solve's depth
+    # stamp names the solve itself; a stamp for another solve of these keyframes -- the
+    # one before a re-solve whose own depth stage then failed -- is not this one's.
+    if getattr(solution, "gate", None) is not None or cached.get("solve_identity") is not None:
+        from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+        if cached.get("solve_identity") != solve_identity(solution):
+            return False
     # AN INTERRUPTED STAGE IS NOT A COMPLETE ONE. A stop mid-depth leaves an
     # `align.json` holding only the frames reached; trusting it built a
     # surface from 3 of 8 frames under the full solve's digest, and every

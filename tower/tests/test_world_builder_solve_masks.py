@@ -1068,3 +1068,19 @@ def test_a_dead_solves_masked_database_is_swept_the_published_one_kept(walked, c
     removed = SM.sweep_masked_databases(walked.workspace)
     assert removed == [stale.name]
     assert not stale.exists() and published.exists() and walked.workspace.database_path.exists()
+
+
+def test_a_fallback_forced_by_gpu_memory_is_recorded_retryable(session, colmap):
+    """V7 L-b: Grounding DINO / SAM out of memory, OneFormer carries on: `partial`, with the cause."""
+    class OOMGdsam(StubDetector):
+        def __call__(self, component):
+            backend = super().__call__(component)
+            if component == T.COMPONENT_GDSAM:
+                def run(items, params, emit, should_stop=None):
+                    raise T.TransientDetectorUnavailable("CUDA out of memory. Tried to allocate 1 GiB")
+                backend.run = run
+            return backend
+
+    record = _masked(session, OOMGdsam())["transients"]
+    assert record["state"] == SM.RECORD_PARTIAL
+    assert record["cause"] == SM.CAUSE_GPU_OOM and record["retryable"] is True

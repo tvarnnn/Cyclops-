@@ -1384,6 +1384,23 @@ def _record_raise(record, stage: str) -> None:
     record(stage, state=STAGE_STATE_FAILED, detail=f"{type(exc).__name__}: {exc}")
 
 
+def _solution_gated(store, world_id: str, session_id: str) -> bool:
+    """Whether the PUBLISHED solve ran the evidence gate (its `solution.json` carries a
+    `gate` record): then its depth stage was told the camera's FoV, and the surface asks
+    for the same to reuse it. Keyed on the solve, not the environment (review V7, L-a): a
+    world solved before the gate keeps today's surface whatever the setting is now.
+    Never raises; unreadable is "not gated", today's surface."""
+    try:
+        from tower.storage import read_json_closed  # noqa: PLC0415
+
+        path = store.world_dir(world_id) / "solve" / session_id / "solution.json"
+        meta = read_json_closed(path) if path.exists() else None
+        gate = (meta or {}).get("gate")
+        return isinstance(gate, dict) and gate.get("state") == "applied"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _gate_setting() -> bool:
     """`TOWER_WORLD_SOLVE_GATE` (off). Never raises: a malformed environment is
     the gate off, which is today's surface."""
@@ -1487,7 +1504,7 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
             # solve already ran the depth stage told the camera's FoV
             # (`coherence_publish.py`); asking for the same here is what makes
             # this stage REUSE it. Off: not passed at all -- today's call.
-            **({"depth_known_fov": True} if _gate_setting() else {}),
+            **({"depth_known_fov": True} if _solution_gated(store, world_id, session_id) else {}),
         )
     except BaseException:
         # RECORDED, THEN RE-RAISED UNCHANGED. The exception is how the
@@ -2248,6 +2265,14 @@ def main(argv=None) -> int:
                 )
                 if solve_report.get("solved"):
                     final_solve_state = FINAL_SOLVE_SOLVED
+                    # What the published solve still owes, on the row (review V7, H2 and
+                    # L-c): masks lost to GPU memory (an owner re-finishes this walk), a
+                    # gate the idle Tower re-runs. None for every ungated solve.
+                    from tower.world_builder.coherence_publish import (  # noqa: PLC0415
+                        publish_notice,
+                    )
+
+                    finalization_detail = publish_notice(solve_report) or finalization_detail
                 elif solve_report.get("interrupted"):
                     final_solve_state = FINAL_SOLVE_SKIPPED
                     finalization_detail = (
