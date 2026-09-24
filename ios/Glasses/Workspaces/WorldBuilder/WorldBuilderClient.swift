@@ -138,6 +138,12 @@ protocol WorldBuilderClient: CartridgeClient {
     /// view model was built.
     var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> { get }
 
+    /// The live relocalizer's episode (`tracking.recovery`) for the walk this
+    /// phone is streaming, or `nil` -- never for a saved or foreign world.
+    var recovery: WorldRecoveryReport? { get }
+
+    var recoveryUpdates: AnyPublisher<WorldRecoveryReport?, Never> { get }
+
     /// Every value after the one `recentWorld` held when the view model was
     /// built.
     var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { get }
@@ -198,6 +204,13 @@ extension WorldBuilderClient {
     var photographic: WorldPhotographicReport? { nil }
 
     var photographicUpdates: AnyPublisher<WorldPhotographicReport?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// No live walk, no relocalizer.
+    var recovery: WorldRecoveryReport? { nil }
+
+    var recoveryUpdates: AnyPublisher<WorldRecoveryReport?, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 
@@ -333,6 +346,9 @@ final class WorldBuilderViewModel: ObservableObject {
     /// reason `finalization` is: an `owed` → `complete` flip can leave the
     /// snapshot, and so `state`, unchanged.
     @Published private(set) var photographic: WorldPhotographicReport?
+
+    /// The live relocalizer's line, republished from the client.
+    @Published private(set) var recovery: WorldRecoveryReport?
 
     /// The world whose interactive picture can be opened, or `nil` when none
     /// has been named yet.
@@ -490,6 +506,7 @@ final class WorldBuilderViewModel: ObservableObject {
         self.recentWorld = client.recentWorld
         self.finalization = client.finalization
         self.photographic = client.photographic
+        self.recovery = client.recovery
         self.geometry = geometry
         self.library = library
 
@@ -546,6 +563,13 @@ final class WorldBuilderViewModel: ObservableObject {
                 // Deduped here as well as at the source, as `finalization` is.
                 guard let self, self.photographic != report else { return }
                 self.photographic = report
+            }
+            .store(in: &cancellables)
+        client.recoveryUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] report in
+                guard let self, self.recovery != report else { return }
+                self.recovery = report
             }
             .store(in: &cancellables)
         client.geometryUpdates
@@ -1239,7 +1263,8 @@ final class WorldBuilderViewModel: ObservableObject {
             reconstruction: reconstruction,
             account: geometryAccount,
             recoverability: recoverability,
-            photographic: photographic
+            photographic: photographic,
+            recovery: recovery
         )
     }
 

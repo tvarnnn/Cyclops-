@@ -262,6 +262,11 @@ struct CartridgeResultEnvelope {
     let coalesced: Int
     /// Always `true` today.
     let isSnapshot: Bool
+    /// `tower_sent_at`: when the Tower sent this result, on the Tower's clock
+    /// (`CARTRIDGE-RESULTS.md` §4). Compared only with other Tower times --
+    /// the look-back prompt's `speak_until` (`WORLD-BUILDER-COMPONENTS.md`
+    /// §6.5 rule 4) -- never with the phone's clock. `nil` when absent.
+    var towerSentAt: Double? = nil
     let payload: [String: Any]
 
     init?(json: [String: Any]) {
@@ -279,6 +284,7 @@ struct CartridgeResultEnvelope {
         self.revisionChanged = json["revision_changed"] as? Bool ?? true
         self.coalesced = json["coalesced"] as? Int ?? 0
         self.isSnapshot = json["snapshot"] as? Bool ?? true
+        self.towerSentAt = (json["tower_sent_at"] as? NSNumber)?.doubleValue
         self.payload = payload
     }
 }

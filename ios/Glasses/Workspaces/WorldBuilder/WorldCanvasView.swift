@@ -192,6 +192,15 @@ struct WorldCanvasView: View {
         case .receiving(let snapshot):
             stageHeadline(fallback: "Building", systemImage: "cube")
             worldName(snapshot)
+            // The live relocalizer, when tracking was lost (§8): "Finding where
+            // you are…", then linked back or not. Only ever for the walk this
+            // phone is streaming; the client publishes nothing otherwise.
+            if let line = presentation.recovery?.displayLine {
+                Label(line, systemImage: "location.viewfinder")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("world-recovery")
+            }
             reconstructionCard
             WorldSummaryView(snapshot: snapshot, isLive: true)
             diagnostics

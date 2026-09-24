@@ -736,6 +736,10 @@ struct WorldPresentation: Equatable {
     var recoverability: WorldRecoverability?
     /// The Tower's `lifecycle.photographic`, or `nil` when it sent none.
     var photographic: WorldPhotographicReport?
+    /// The live relocalizer's episode, for the walk this phone is streaming
+    /// (`nil` otherwise: the client only publishes it while following live and
+    /// bound).
+    var recovery: WorldRecoveryReport?
 
     init(
         stage: WorldStage? = nil,
@@ -746,7 +750,8 @@ struct WorldPresentation: Equatable {
         ),
         account: WorldGeometryAccount = .undescribed,
         recoverability: WorldRecoverability? = nil,
-        photographic: WorldPhotographicReport? = nil
+        photographic: WorldPhotographicReport? = nil,
+        recovery: WorldRecoveryReport? = nil
     ) {
         self.stage = stage
         self.evidence = evidence
@@ -755,6 +760,7 @@ struct WorldPresentation: Equatable {
         self.account = account
         self.recoverability = recoverability
         self.photographic = photographic
+        self.recovery = recovery
     }
 
     /// Whether this is a saved world whose photographic build failed: the one
