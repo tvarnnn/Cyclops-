@@ -1770,16 +1770,13 @@ def _owner_facing_detail(detail) -> str | None:
 
 
 def _client_safe_finalization(finalization):
-    """The session's `finalization` record as `lifecycle.finalization` carries it on `/ws`: a COPY whose
-    `detail` is `coherence_publish.client_safe_detail` of the record's (review V10, MED-5 -- one line,
-    no path; the exception class stays, this is the diagnostic field). The record on disk is not
-    touched, and a record whose detail has nothing to scrub is returned as it is, the same object."""
-    if not isinstance(finalization, dict) or not isinstance(finalization.get("detail"), str):
-        return finalization
-    from tower.world_builder.coherence_publish import client_safe_detail  # noqa: PLC0415
+    """The session's `finalization` record as `lifecycle.finalization` carries it on `/ws`: exactly what
+    the `GET /worlds` row sends (`coherence_publish.client_safe_finalization`; review V10 MED-5, V11
+    MED-B) -- a COPY whose `detail` AND `notice` are client-safe and bounded. The record on disk is not
+    touched, and a record whose texts have nothing to scrub is returned as it is, the same object."""
+    from tower.world_builder.coherence_publish import client_safe_finalization  # noqa: PLC0415
 
-    safe = client_safe_detail(finalization["detail"])
-    return finalization if safe == finalization["detail"] else dict(finalization, detail=safe)
+    return client_safe_finalization(finalization)
 
 
 def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
