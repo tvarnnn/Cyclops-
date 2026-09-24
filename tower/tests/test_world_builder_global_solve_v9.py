@@ -300,7 +300,10 @@ def test_a_consensus_draw_carries_its_own_seed_and_mapping_time_and_leaves_no_mo
 
 @pytest.fixture
 def counted(engines, monkeypatch):
-    """How many draws the mapper was asked for (the engines' fake mapper, counted)."""
+    """How many draws the mapper was asked for (the engines' fake mapper, counted). The
+    engines' depth network HONOURS the stop here, as the product's depth stage does (it asks
+    `should_stop` before its first frame): review V10 found this test passing for the wrong
+    reason with a fake that ignored it -- a stop handed to draw 0's own gate went unseen."""
     calls = []
     real = GS._map_candidate
 
@@ -309,6 +312,15 @@ def counted(engines, monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(GS, "_map_candidate", counting)
+    depth = CP.run_gate_depth
+
+    def honouring(store, world_id, session_id, solution, intrinsics, should_stop=None):
+        if should_stop is not None and should_stop():
+            raise CP.DepthUnavailable(f"{CP.DEPTH_STOPPED}: the depth stage was stopped after 0 "
+                                      "frames")
+        return depth(store, world_id, session_id, solution, intrinsics, should_stop=should_stop)
+
+    monkeypatch.setattr(CP, "run_gate_depth", honouring)
     return calls
 
 
@@ -330,6 +342,10 @@ def test_a_stop_during_the_consensus_publishes_draw_0_deferred(walk, counted, co
     published = json.loads(walk.workspace.solution_path.read_text(encoding="utf-8"))
     assert published["solve"]["seed"] == 5
     assert published["gate"]["consensus"]["state"] == CP.CONSENSUS_DEFERRED
+    # draw 0 AS ITS GATE ATTACHED IT, not the anchor-only fail-safe of a stopped depth stage
+    assert published["gate"]["attach"] is True
+    assert published["gate"]["depth"]["state"] == CP.DEPTH_OK
+    assert published["gate"]["cause"] == CP.CAUSE_CONSENSUS_DEFERRED
     assert CP.regate_owed(walk.store, walk.world_id, walk.session_id) is not None
 
 
@@ -339,7 +355,10 @@ def test_without_a_stop_the_consensus_runs_every_draw(walk, counted, colmap):
     assert summary["gate"]["consensus"]["state"] != CP.CONSENSUS_DEFERRED
 
 
-def test_without_a_callers_stop_the_publish_call_is_todays(walk, engines, colmap, monkeypatch):
+def test_without_a_callers_stop_no_stop_is_handed_on(walk, engines, colmap, monkeypatch):
+    """No caller's stop, no `should_stop` to either publish. Review V10 MED-1(a): a consensus
+    that maps further draws publishes draw 0 first (`stopped`, draw 0 as N = 1 publishes it),
+    then the full consensus, with today's arguments."""
     seen = []
     real = CP.gate_and_publish
 
@@ -349,4 +368,5 @@ def test_without_a_callers_stop_the_publish_call_is_todays(walk, engines, colmap
 
     monkeypatch.setattr(CP, "gate_and_publish", recording)
     _finish(walk)
-    assert seen == [sorted(["final", "gate", "database_path", "keyframes", "write", "consensus"])]
+    today = ["final", "gate", "database_path", "keyframes", "write", "consensus"]
+    assert seen == [sorted(today + ["stopped", "why_deferred"]), sorted(today)]
