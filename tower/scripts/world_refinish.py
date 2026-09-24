@@ -3,6 +3,7 @@
 
     .venv\\Scripts\\python.exe scripts/world_refinish.py --root <world root> --world <id>
         [--session <id>] [--seed 0] [--threads -1] [--no-appearance]
+        [--capture-dir <dir> ... | --no-capture]
         [--keep-depth-work] [--dry-run] [--format json|text]
 
 WHAT IT IS FOR (WORLD-BUILDER-COMPONENTS.md §7 rule 4). Every world saved before the
@@ -45,7 +46,11 @@ the lock):
     `TOWER_WORLD_SOLVE_SEED=<--seed>` (the seeded single-thread solve) and
     `TOWER_WORLD_SOLVE_GATE=1` (depth before publish, the evidence gate, and
     `solve/<session>/components.json`). It takes the lock itself, re-derives the tree
-    and records the finalization.
+    and records the finalization. It is given the session's raw capture as
+    `--capture-dir` when one is resolvable (`--capture-dir`, else the capture the
+    session records under `TOWER_CAPTURE_ROOT`; `--no-capture` for neither), as the
+    builder gives its own final solve; the ledger's `solver_frames` says where the
+    solver's frames came from (`resolve_capture_dirs`, `tally_solver_frames`).
 3.  THE ROOM: the builder's own final surface and appearance
     (`world_build_session.final_surface_stages`) under the lock.
 4.  THE AREAS: every `shown_as: "area"` component, built on its own and levelled
@@ -59,7 +64,11 @@ still runs, the room is rebuilt, and the report says `components: null`.
 
 A final solve that publishes nothing puts the previous result back: the solve, the
 areas, the derived tree and the session record (what the failed solve left is kept under
-`refinish/<stamp>/failed-*`).
+`refinish/<stamp>/failed-*`). So does ANY exception between the set-aside and a
+published solve -- a session record that cannot be written, a child that cannot be
+started -- and the ledger then says `restored-after-an-error` and names the step and
+the error (`restore-incomplete`, with what could not be done, if it could not all go
+back).
 
 Exit status: 0 done; 1 a step failed (the report says which); 2 refused (no such world
 or session, imagery purged, a live writer holds the world, a build is running, or the
@@ -149,7 +158,9 @@ def _restart_attempts(store: WorldStore, world_id: str, session_id: str,
     return what they were."""
     from scripts import world_finish_pending as wfp  # noqa: PLC0415
 
-    keys = (session_id, wfp.area_ledger_key(session_id))
+    # The room's, the areas' AND the re-gate's counters (FIN, review V8): a re-finished
+    # world must not inherit an exhausted re-gate count from the build it replaces.
+    keys = (session_id, wfp.area_ledger_key(session_id), wfp.regate_ledger_key(session_id))
     with wfp._LEDGER_LOCK:
         sessions, unreadable = wfp._read_ledger(store, world_id)
         if unreadable:
@@ -177,6 +188,40 @@ LEDGER_SET_ASIDE = "set-aside"
 LEDGER_ROLLED_BACK = "rolled-back"
 LEDGER_ROLLBACK_INCOMPLETE = "rollback-incomplete"
 LEDGER_RESTORED = "restored-after-a-failed-solve"
+# An exception between the set-aside and a published solve (review P3, PV attempt 1:
+# a read-only `session.json` made `mark_stage` raise WinError 5 after the solve was
+# set aside, and the world was left with its solve moved and a session saying
+# `complete`). The previous result is put back exactly as for a failed solve.
+LEDGER_RESTORED_AFTER_ERROR = "restored-after-an-error"
+# The previous result could not be put back, or only part of it; `restore_report`
+# and `restore_errors` in the ledger say what is where.
+LEDGER_RESTORE_INCOMPLETE = "restore-incomplete"
+# After a published solve (FIN, review V8): the room and the areas are being rebuilt
+# (`published`), then the run's TERMINAL state -- `done`, or `stopped` when a stop was
+# asked for or the room could not be rebuilt (`detail` says which). A ledger left at a
+# non-terminal state by a process that is gone is a re-finish that died there; the
+# ledger's `process` (pid and start time) is what tells a reader so
+# (`refinish_process_alive`).
+LEDGER_PUBLISHED = "published"
+LEDGER_DONE = "done"
+LEDGER_STOPPED = "stopped"
+LEDGER_TERMINAL_STATES = (LEDGER_ROLLED_BACK, LEDGER_ROLLBACK_INCOMPLETE, LEDGER_RESTORED,
+                          LEDGER_RESTORED_AFTER_ERROR, LEDGER_RESTORE_INCOMPLETE, LEDGER_DONE,
+                          LEDGER_STOPPED)
+
+
+def refinish_process_alive(ledger: dict) -> bool | None:
+    """Whether the process that wrote this ledger is still running: True, False, or None
+    for a ledger written before the pid was recorded. Pid AND start time, the writer
+    lock's own test (`store._holder_is_running`), so a recycled pid is not taken for the
+    re-finish that died."""
+    from tower.world_builder.store import _holder_is_running  # noqa: PLC0415
+
+    process = (ledger or {}).get("process") or {}
+    pid = process.get("pid")
+    if not isinstance(pid, int):
+        return None
+    return bool(_holder_is_running(pid, process.get("created_at")))
 
 
 class SetAsideFailed(Refused):
@@ -245,11 +290,16 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
     # there leaves nothing of the solve to put back.
     moves.sort(key=lambda m: 0 if m["kind"] == "areas" else 1)
     staging = aside / FRESH_SOLVE_STAGING
+    from tower.world_builder.store import _lock_record  # noqa: PLC0415
+
     ledger = {
         "command": "scripts/world_refinish.py",
         "state": LEDGER_SETTING_ASIDE,
         "world_id": world_id, "session_id": session_id, "stamp": stamp,
         "set_aside_at": time.time(),
+        # Which process is doing this (FIN, review V8): pid and start time, as in the
+        # writer lock. See `refinish_process_alive`.
+        "process": _lock_record(os.getpid()),
         "moved": moves, "copied": p["copies"], "copied_back": [],
         "previous": {"finalization": session.finalization, "stages": session.stages},
         "restore": "move the rebuild's own solve/<session> (and areas) aside, then move "
@@ -343,43 +393,86 @@ def set_aside(store: WorldStore, world_id: str, session_id: str, stamp: str) -> 
 
 
 def restore_after_failed_solve(store: WorldStore, world_id: str, session_id: str,
-                               ledger: dict) -> dict:
+                               ledger: dict, *, state: str = LEDGER_RESTORED) -> dict:
     """Put the set-aside result back after a final solve that did not publish (review
-    V6, L3), under the caller's lock. Nothing is deleted: what the failed solve left
-    is moved under `refinish/<stamp>/failed-solve/`, the derived tree it rebuilt under
+    V6, L3) or after any exception between the set-aside and a published solve, under
+    the caller's lock. Nothing is deleted: what the failed solve left is moved under
+    `refinish/<stamp>/failed-solve/`, the derived tree it rebuilt under
     `failed-derived/`. The session record is written back from its snapshot, so the
-    session says what is on disk again."""
+    session says what is on disk again.
+
+    EVERY STEP IS ATTEMPTED, whatever an earlier one did: the moves that put the old
+    solve and areas back must not be skipped because, say, the session record cannot
+    be written (the very file whose write failed in PV's attempt 1). What could not be
+    done is listed in `errors`, and the ledger then says `restore-incomplete` rather
+    than `state`. A session record that already equals its snapshot byte for byte is
+    left alone -- nothing moved it, so there is nothing to write back."""
     from tower.storage import write_json_atomic  # noqa: PLC0415
 
     world_dir = store.world_dir(world_id)
     aside = world_dir / REFINISH_DIRNAME / ledger["stamp"]
-    out = {"restored": [], "kept": []}
+    out = {"restored": [], "kept": [], "errors": []}
+
+    def attempt(what: str, step) -> bool:
+        try:
+            step()
+            return True
+        except Exception as exc:  # noqa: BLE001 -- recorded; the next step still runs
+            out["errors"].append(f"{what}: {type(exc).__name__}: {exc}")
+            return False
+
     failed = world_dir / "solve" / session_id
+    solve_cleared = True
     if failed.exists():
         dst = aside / "failed-solve" / session_id
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        _replace_with_retry(failed, dst)
-        out["kept"].append(str(dst))
+
+        def keep_failed_solve():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _replace_with_retry(failed, dst)
+            out["kept"].append(str(dst))
+
+        solve_cleared = attempt("keeping the new solve directory aside", keep_failed_solve)
     for m in ledger["moved"]:
-        if m.get("moved") and not m.get("moved_back"):
+        if not m.get("moved") or m.get("moved_back"):
+            continue
+        if m["kind"] == "solve" and not solve_cleared:
+            out["errors"].append(f"moving {m['kind']} back: skipped, {m['from']} is "
+                                 "still occupied by the new solve directory")
+            continue
+
+        def move_back(m=m):
             _replace_with_retry(Path(m["to"]), Path(m["from"]))
             m["moved_back"] = True
             out["restored"].append(m["from"])
+
+        attempt(f"moving {m['kind']} {Path(m['from']).name} back", move_back)
     snapshot = aside / "derived"
     if snapshot.is_dir():
         live = world_dir / "derived"
-        if live.exists():
-            dst = aside / "failed-derived"
-            _replace_with_retry(live, dst)
-            out["kept"].append(str(dst))
-        shutil.copytree(snapshot, live)
-        out["restored"].append(str(live))
+
+        def restore_derived():
+            if live.exists():
+                dst = aside / "failed-derived"
+                _replace_with_retry(live, dst)
+                out["kept"].append(str(dst))
+            shutil.copytree(snapshot, live)
+            out["restored"].append(str(live))
+
+        attempt("restoring the derived tree", restore_derived)
     session_copy = aside / "session.json"
     if session_copy.is_file():
-        write_json_atomic(store.session_path(world_id, session_id),
-                          json.loads(session_copy.read_text(encoding="utf-8")))
-        out["restored"].append(str(store.session_path(world_id, session_id)))
-    ledger["state"] = LEDGER_RESTORED
+        live_session = store.session_path(world_id, session_id)
+
+        def restore_session():
+            if live_session.is_file() and live_session.read_bytes() == session_copy.read_bytes():
+                out["unchanged"] = str(live_session)
+                return
+            write_json_atomic(live_session,
+                              json.loads(session_copy.read_text(encoding="utf-8")))
+            out["restored"].append(str(live_session))
+
+        attempt("restoring the session record", restore_session)
+    ledger["state"] = LEDGER_RESTORE_INCOMPLETE if out["errors"] else state
     ledger["restore_report"] = out
     _write_ledger(aside, ledger)
     return out
@@ -418,14 +511,185 @@ REFINISH_IN_PROGRESS = (
     "is set aside under refinish/{stamp}/, and the room is rebuilt after the new solve")
 
 
+# WHERE THE SOLVER'S FRAMES COME FROM (P3 finding 6: 991e5a15 and af47007c were
+# re-finished from the face-redacted session keyframes although their raw captures
+# were on disk). The builder hands its final solve the capture it followed
+# (`--capture-dir`, and `sources.json` per keyframe); a re-finish of a world with no
+# `sources.json` passed nothing, so `global_solve._source_frame` fell back to the
+# session copies. It now passes the capture on the same terms as the builder:
+#
+# * `--capture-dir DIR` (repeatable): the owner names it;
+# * otherwise the capture this session RECORDS (`session.capture_id`, set only for a
+#   live-capture session, whose frame names are the capture's own) under the
+#   owner's configured capture root, `TOWER_CAPTURE_ROOT` -- the setting that arms
+#   the raw recorder at all, so there is raw imagery on disk only where the owner
+#   configured it. A relative root is anchored where `sources.json` paths are
+#   (`global_solve.resolve_source_path`: the Tower directory, or
+#   `TOWER_SOURCES_ROOT`), never the cwd. The captures that CONTINUE it after a
+#   reconnect (`continues_capture`) follow it, as the builder followed them
+#   (`_capture_chain`);
+# * `--no-capture`, or neither resolvable: today's behaviour, the session copies.
+#
+# The raw frames are solver input only, exactly as the builder's: they never leave
+# this machine, point colours are withheld (`global_solve.WITHHELD_POINT_RGB`), and
+# the room's surface and appearance still read the redacted keyframes. A per-frame
+# `sources.json` still wins over a capture directory, frame by frame.
+CAPTURE_ROOT_ENV = "TOWER_CAPTURE_ROOT"
+CAPTURE_FROM_ARGUMENT = "--capture-dir"
+CAPTURE_FROM_SESSION = "TOWER_CAPTURE_ROOT + the session's capture_id"
+
+
+def resolve_capture_dirs(store: WorldStore, world_id: str, session_id: str,
+                         explicit=(), *, use_capture: bool = True) -> dict:
+    """The raw capture directories to hand the final solve, and why. Reads only."""
+    if not use_capture:
+        return {"capture_dirs": [], "from": None, "why": "--no-capture"}
+    if explicit:
+        return {"capture_dirs": [str(Path(d)) for d in explicit],
+                "from": CAPTURE_FROM_ARGUMENT}
+    capture_id = getattr(store.read_session(world_id, session_id), "capture_id", None)
+    if not capture_id:
+        return {"capture_dirs": [], "from": None,
+                "why": "the session records no capture (it was not a live capture)"}
+    if Path(capture_id).name != capture_id or capture_id in (".", ".."):
+        return {"capture_dirs": [], "from": None, "capture_id": capture_id,
+                "why": "the session's capture_id is not a plain directory name"}
+    root = (os.environ.get(CAPTURE_ROOT_ENV) or "").strip()
+    if not root:
+        return {"capture_dirs": [], "from": None, "capture_id": capture_id,
+                "why": f"{CAPTURE_ROOT_ENV} is not set"}
+    from tower.world_builder.global_solve import resolve_source_path  # noqa: PLC0415
+
+    captures_root = resolve_source_path(root) / "captures"
+    candidate = captures_root / capture_id
+    if not (candidate / "frames").is_dir():
+        return {"capture_dirs": [], "from": None, "capture_id": capture_id,
+                "why": f"no capture frames at {candidate}"}
+    chain, note = _capture_chain(captures_root, capture_id)
+    out = {"capture_dirs": [str(captures_root / c["capture_id"]) for c in chain],
+           "from": CAPTURE_FROM_SESSION, "capture_id": capture_id, "captures": chain}
+    if note:
+        out["chain_note"] = note
+    return out
+
+
+def _capture_chain(captures_root: Path, first: str) -> tuple[list[dict], str | None]:
+    """The session's capture and every capture that CONTINUES it, in order.
+
+    A walk whose link drops mid-way goes on in a successor capture whose manifest names
+    its predecessor in `continues_capture`, and the builder follows it
+    (`tower.capture.CaptureFollower`, "follows a capture ACROSS a reconnect") -- but
+    the session records only the capture it started on. Measured on the run's frozen
+    captures: 991e5a15's session spans 69a4e59d -> 28f544af -> 01e4c64f (132 of its
+    229 keyframes are in the first), af47007c's 023b5d84 -> 95831c34 -> e3e8fd2e (164
+    of 218). Frames are found BY NAME (the source sequence number), so a chain in
+    which one name occurs twice is ambiguous: then only the session's own capture is
+    used, and the note says why. A fork (two captures continuing one) stops the chain
+    there. Reads only."""
+    manifests: dict[str, dict] = {}
+    try:
+        with os.scandir(captures_root) as entries:
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                try:
+                    manifest = json.loads((Path(entry.path) / "capture.json")
+                                          .read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(manifest, dict):
+                    manifests[entry.name] = manifest
+    except OSError:
+        pass
+
+    def describe(capture_id: str) -> dict:
+        m = manifests.get(capture_id, {})
+        return {"capture_id": capture_id,
+                "continues_capture": m.get("continues_capture"),
+                "retains_raw_imagery": m.get("retains_raw_imagery"),
+                "redaction": m.get("redaction")}
+
+    chain, note = [first], None
+    while len(chain) <= len(manifests):
+        successors = [c for c, m in manifests.items()
+                      if m.get("continues_capture") == chain[-1] and c not in chain
+                      and (captures_root / c / "frames").is_dir()]
+        if len(successors) > 1:
+            note = f"{len(successors)} captures continue {chain[-1]}; the chain stops there"
+            break
+        if not successors:
+            break
+        chain.append(successors[0])
+    if len(chain) > 1:
+        seen: set = set()
+        for capture_id in chain:
+            names = {p.name for p in (captures_root / capture_id / "frames").iterdir()}
+            if seen & names:
+                return ([describe(first)],
+                        f"frame names repeat across the continued captures {chain}; "
+                        "only the session's own capture is used")
+            seen |= names
+    return [describe(c) for c in chain], note
+
+
+SOURCE_WALK_IMAGES = "walk-solver-images"
+SOURCE_RAW = "raw-capture"
+SOURCE_REDACTED = "redacted-session-keyframes"
+SOURCE_MIXED = "mixed"
+
+
+def tally_solver_frames(store: WorldStore, world_id: str, session_id: str,
+                        capture_dirs) -> dict:
+    """Where each keyframe's solver image would come from, the way
+    `global_solve.prepare_images` decides it (`_source_frame`): already undistorted in
+    the solve directory (the walk's own solver images, reused), the raw frame
+    `sources.json` names, the raw frame in a capture directory, or the face-redacted
+    session copy. Reads only."""
+    from tower.world_builder.global_solve import (  # noqa: PLC0415
+        _source_frame,
+        keyframe_image_name,
+        read_sources,
+        resolve_source_path,
+        workspace_for,
+    )
+
+    workspace = workspace_for(store, world_id, session_id)
+    sources = read_sources(workspace)
+    session_dir = store.session_dir(world_id, session_id)
+    counts = {"keyframes": 0, "already_undistorted": 0, "raw_from_sources_json": 0,
+              "raw_from_capture_dir": 0, "redacted_session_copies": 0}
+    for keyframe in store.read_keyframes(world_id, session_id):
+        counts["keyframes"] += 1
+        if (workspace.images_dir / keyframe_image_name(keyframe)).exists():
+            counts["already_undistorted"] += 1
+            continue
+        source = _source_frame(keyframe, session_dir, capture_dirs, sources)
+        recorded = resolve_source_path(sources.get(keyframe.keyframe_id))
+        if recorded is not None and source == recorded:
+            counts["raw_from_sources_json"] += 1
+        elif source == session_dir / keyframe.image_relpath:
+            counts["redacted_session_copies"] += 1
+        else:
+            counts["raw_from_capture_dir"] += 1
+    raw = counts["raw_from_sources_json"] + counts["raw_from_capture_dir"]
+    redacted = counts["redacted_session_copies"]
+    counts["source"] = (None if counts["keyframes"] == 0 else
+                        SOURCE_WALK_IMAGES if raw + redacted == 0 else
+                        SOURCE_RAW if redacted == 0 else
+                        SOURCE_REDACTED if raw == 0 else SOURCE_MIXED)
+    return counts
+
+
 def run_final_solve(root: Path, world_id: str, session_id: str, *, seed: int,
-                    threads: int, runner=subprocess.run) -> dict:
+                    threads: int, capture_dirs=(), runner=subprocess.run) -> dict:
     """Step 2: `world_finalize.py` with the product solve settings, in a child."""
     env = dict(os.environ)
     env.update(PRODUCT_SOLVE_ENV)
     env["TOWER_WORLD_SOLVE_SEED"] = str(int(seed))
     argv = [sys.executable, str(FINALIZE_SCRIPT), "--root", str(root), "--world", world_id,
             "--session", session_id, "--threads", str(int(threads)), "--format", "json"]
+    for capture_dir in capture_dirs:
+        argv += ["--capture-dir", str(capture_dir)]
     done = runner(argv, env=env, capture_output=True, text=True)
     try:
         report = json.loads(done.stdout) if done.stdout.strip() else {}
@@ -437,15 +701,56 @@ def run_final_solve(root: Path, world_id: str, session_id: str, *, seed: int,
     return report
 
 
+def _put_back(store: WorldStore, engine, world_id: str, session_id: str, ledger: dict,
+              report: dict, *, stamp: str, what: str, state: str) -> None:
+    """Restore the set-aside result under the world's lock and say so in `report`
+    (and, through `restore_after_failed_solve`, in the ledger)."""
+    try:
+        store.acquire_writer_lock(world_id)
+    except Exception as exc:  # noqa: BLE001
+        report["reason"] = (f"{what}, and the previous result could not be put back "
+                            f"({type(exc).__name__}: {exc}); it is under "
+                            f"refinish/{stamp}/")
+        ledger["state"] = LEDGER_RESTORE_INCOMPLETE
+        ledger["restore_errors"] = [f"the world's lock: {type(exc).__name__}: {exc}"]
+        try:
+            _write_ledger(store.world_dir(world_id) / REFINISH_DIRNAME / stamp, ledger)
+        except OSError:
+            pass
+        return
+    try:
+        restored = restore_after_failed_solve(store, world_id, session_id, ledger,
+                                              state=state)
+        report["restored"] = restored
+        if restored["errors"]:
+            report["reason"] = (f"{what}, and putting the previous result back stopped "
+                                f"part-way ({'; '.join(restored['errors'])}); see "
+                                f"refinish/{stamp}/{LEDGER_FILENAME}")
+        else:
+            report["reason"] = f"{what}; the previous result was put back (see restored)"
+    except Exception as exc:  # noqa: BLE001 -- the ledger could not even be written
+        report["reason"] = (f"{what}, and putting the previous result back stopped "
+                            f"part-way ({type(exc).__name__}: {exc}); see "
+                            f"refinish/{stamp}/{LEDGER_FILENAME}")
+    finally:
+        engine.release_world(world_id)
+
+
 def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
              seed: int = 0, threads: int = -1, appearance: bool = True,
              prune_depth_work: bool = True, should_stop=lambda: False,
-             stop_source=lambda: None, solve_runner=None, stamp: str | None = None) -> dict:
+             stop_source=lambda: None, solve_runner=None, stamp: str | None = None,
+             capture_dirs=(), use_capture: bool = True) -> dict:
     """Steps 1-4. Raises `Refused` before anything is written when it must refuse:
     no such world or session, purged imagery, a session that never stopped, a live
     writer, or a build of this session running without the lock (V6 H1). Raises
     `SetAsideFailed` (a `Refused`) when step 1 could not complete; the world is then as
-    it was. A final solve that publishes nothing puts the previous result back (L3)."""
+    it was. A final solve that publishes nothing puts the previous result back (L3), and
+    so does ANY exception between the set-aside and a published solve (the ledger then
+    says `restored-after-an-error` and names the error).
+
+    `capture_dirs` / `use_capture`: where the solver's raw frames are
+    (`resolve_capture_dirs`); the ledger's `solver_frames` records what was used."""
     from scripts.world_build_session import final_surface_stages  # noqa: PLC0415
     from scripts.world_finish_pending import (  # noqa: PLC0415
         _recorder,
@@ -486,47 +791,80 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
         if busy is not None:
             raise Refused(busy)
         report["set_aside"] = ledger = set_aside(store, world_id, session_id, stamp)
-        # M3: the room's stages are now built from a solve that is set aside. Say so,
-        # under the same lock, so a re-finish that stops before step 3 leaves a room
-        # the finisher rebuilds (`stopped` is owed) rather than one that claims `ok`.
-        detail = REFINISH_IN_PROGRESS.format(stamp=stamp)
-        for stage in ("surface", "appearance"):
-            engine.mark_stage(world_id, session_id, stage, state="stopped", detail=detail)
-    finally:
+    except BaseException:
         engine.release_world(world_id)
+        raise
 
-    # Step 2 takes the lock itself, in its own process.
-    report["final_solve"] = run_final_solve(
-        root, world_id, session_id, seed=seed, threads=threads,
-        **({"runner": solve_runner} if solve_runner is not None else {}))
-    from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
+    # FROM HERE UNTIL A SOLVE IS PUBLISHED, ANY EXCEPTION PUTS THE PREVIOUS RESULT BACK
+    # (P3, PV attempt 1: `mark_stage` raised WinError 5 on a read-only session.json
+    # right after the set-aside, and the world was left with its solve moved aside and
+    # a session saying `complete`). `step` names where it happened, for the ledger.
+    step = "marking the room's stages"
+    try:
+        try:
+            # M3: the room's stages are now built from a solve that is set aside. Say
+            # so, under the same lock, so a re-finish that stops before step 3 leaves
+            # a room the finisher rebuilds (`stopped` is owed) rather than one that
+            # claims `ok`.
+            detail = REFINISH_IN_PROGRESS.format(stamp=stamp)
+            for stage in ("surface", "appearance"):
+                engine.mark_stage(world_id, session_id, stage, state="stopped",
+                                  detail=detail)
+        finally:
+            engine.release_world(world_id)
 
-    if (report["final_solve"].get("exit_code") != 0
-            or load_solution(store, world_id, session_id) is None):
+        step = "resolving the solver's frames"
+        capture = resolve_capture_dirs(store, world_id, session_id, capture_dirs,
+                                       use_capture=use_capture)
+        capture.update(tally_solver_frames(store, world_id, session_id,
+                                           capture["capture_dirs"]))
+        report["solver_frames"] = ledger["solver_frames"] = capture
+        _write_ledger(store.world_dir(world_id) / REFINISH_DIRNAME / stamp, ledger)
+
+        # Step 2 takes the lock itself, in its own process.
+        step = "running the final solve"
+        report["final_solve"] = run_final_solve(
+            root, world_id, session_id, seed=seed, threads=threads,
+            capture_dirs=capture["capture_dirs"],
+            **({"runner": solve_runner} if solve_runner is not None else {}))
+        step = "reading the published solution"
+        from tower.world_builder.global_solve import load_solution  # noqa: PLC0415
+
+        published = (report["final_solve"].get("exit_code") == 0
+                     and load_solution(store, world_id, session_id) is not None)
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        report["done"] = False
+        report["error"] = f"{step}: {error}"
+        ledger["error_after_set_aside"] = {"step": step, "error": error,
+                                           "at": time.time()}
+        _put_back(store, engine, world_id, session_id, ledger, report, stamp=stamp,
+                  what=f"{step} failed after the set-aside ({error})",
+                  state=LEDGER_RESTORED_AFTER_ERROR)
+        if not isinstance(exc, Exception):
+            raise      # an interrupt or an exit, after the world was put back
+        return report
+    if not published:
         # L3: no new solve was published. Put the old one back, so the session is
         # again what is on disk; nothing is deleted.
         report["done"] = False
-        report["reason"] = ("the final solve did not publish a solution; the previous "
-                            "result was put back (see restored)")
-        try:
-            store.acquire_writer_lock(world_id)
-        except Exception as exc:  # noqa: BLE001
-            report["reason"] = (f"the final solve did not publish a solution, and the "
-                                f"previous result could not be put back "
-                                f"({type(exc).__name__}: {exc}); it is under "
-                                f"refinish/{stamp}/")
-            return report
-        try:
-            report["restored"] = restore_after_failed_solve(store, world_id, session_id,
-                                                            ledger)
-        except OSError as exc:
-            report["reason"] = (f"the final solve did not publish a solution, and putting "
-                                f"the previous result back stopped part-way "
-                                f"({type(exc).__name__}: {exc}); see refinish/{stamp}/"
-                                f"{LEDGER_FILENAME}")
-        finally:
-            engine.release_world(world_id)
+        _put_back(store, engine, world_id, session_id, ledger, report, stamp=stamp,
+                  what="the final solve did not publish a solution",
+                  state=LEDGER_RESTORED)
         return report
+    aside_dir = store.world_dir(world_id) / REFINISH_DIRNAME / stamp
+
+    def ledger_state(state: str, detail: str | None = None) -> None:
+        ledger["state"] = state
+        ledger[f"{state}_at"] = time.time()
+        if detail:
+            ledger["detail"] = detail
+        try:
+            _write_ledger(aside_dir, ledger)
+        except OSError as exc:      # the ledger is a record; the rebuild goes on
+            report["ledger_error"] = f"{type(exc).__name__}: {exc}"
+
+    ledger_state(LEDGER_PUBLISHED)
     record = read_components_record(store, world_id, session_id)
     report["components"] = (None if record is None else
                             [{"id": e["id"], "shown_as": e["shown_as"],
@@ -545,6 +883,7 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
         store.acquire_writer_lock(world_id)
     except Exception as exc:  # noqa: BLE001
         report.update({"done": False, "reason": f"{type(exc).__name__}: {exc}"})
+        ledger_state(LEDGER_STOPPED, f"the room was not rebuilt: {report['reason']}")
         return report
     try:
         report["room"] = final_surface_stages(
@@ -560,6 +899,8 @@ def refinish(store: WorldStore, root: Path, world_id: str, session_id: str, *,
     finally:
         engine.release_world(world_id)
     report["done"] = not should_stop()
+    ledger_state(LEDGER_DONE if report["done"] else LEDGER_STOPPED,
+                 None if report["done"] else "a stop was asked for")
     return report
 
 
@@ -584,6 +925,15 @@ def main(argv=None) -> int:
                         default=True, help="build the appearance of the room and areas")
     parser.add_argument("--keep-depth-work", action="store_true",
                         help="do not prune the per-frame depth work afterwards")
+    capture = parser.add_mutually_exclusive_group()
+    capture.add_argument("--capture-dir", action="append", default=[],
+                         help="where the session's raw capture frames live (repeatable); "
+                              "passed to world_finalize.py. Default: the capture the "
+                              "session records, under TOWER_CAPTURE_ROOT, when it is on "
+                              "disk; else the redacted session keyframes")
+    capture.add_argument("--no-capture", action="store_true",
+                         help="never hand the solve a capture directory: the session's "
+                              "own sources.json, else its redacted keyframes")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be set aside and run; write nothing")
     parser.add_argument("--format", choices=("json", "text"), default="json")
@@ -597,10 +947,15 @@ def main(argv=None) -> int:
         return EXIT_REFUSED
     if args.dry_run:
         stamp = time.strftime("%Y%m%d-%H%M%S")
+        frames = resolve_capture_dirs(store, args.world, session_id, args.capture_dir,
+                                      use_capture=not args.no_capture)
+        frames.update(tally_solver_frames(store, args.world, session_id,
+                                          frames["capture_dirs"]))
         _emit({"dry_run": True, "world_id": args.world, "session_id": session_id,
                "plan": plan(store, args.world, session_id, stamp),
                "final_solve_env": {**PRODUCT_SOLVE_ENV,
-                                   "TOWER_WORLD_SOLVE_SEED": str(args.seed)}},
+                                   "TOWER_WORLD_SOLVE_SEED": str(args.seed)},
+               "solver_frames": frames},
               args.format)
         return EXIT_OK
 
@@ -617,7 +972,8 @@ def main(argv=None) -> int:
         report = refinish(store, root, args.world, session_id, seed=args.seed,
                           threads=args.threads, appearance=args.appearance,
                           prune_depth_work=not args.keep_depth_work,
-                          should_stop=stop.asked_for, stop_source=lambda: stop.source)
+                          should_stop=stop.asked_for, stop_source=lambda: stop.source,
+                          capture_dirs=args.capture_dir, use_capture=not args.no_capture)
     except Refused as exc:
         _emit({"done": False, "refused": str(exc)}, args.format)
         return EXIT_REFUSED

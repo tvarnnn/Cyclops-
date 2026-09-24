@@ -513,3 +513,454 @@ def test_while_the_new_solve_runs_the_room_says_a_refinish_is_in_progress(tmp_pa
     # And while it said `stopped`, the finisher would have owed the room.
     assert "stopped" in {v["state"] for v in seen.values()}
     del wfp2
+
+
+# ---------------------------------------------------------------------------
+# P3 (PF): any exception between the set-aside and a published solve puts the previous
+# result back (PV attempt 1: a read-only session.json made `mark_stage` raise WinError 5
+# right after the set-aside, and the world was left with its solve moved aside)
+# ---------------------------------------------------------------------------
+
+
+def _world_with_areas(tmp_path):
+    """A world after one re-finish: a solve, the room, two built areas."""
+    store, kids = _old_world(tmp_path)
+    wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids), stamp="a")
+    assert (C.areas_dir(store, W1) / AREA1).exists()
+    return store, kids
+
+
+def _snapshot(store, *, derived=True):
+    from tower.world_builder.global_solve import load_solution
+
+    wd = store.world_dir(W1)
+    snap = {"solve": sorted(p.name for p in (wd / "solve" / S1).iterdir()),
+            "digest": load_solution(store, W1, S1).input_digest,
+            "session": store.session_path(W1, S1).read_bytes(),
+            "areas": sorted(p.name for p in C.areas_dir(store, W1).iterdir())}
+    if derived:
+        snap["derived"] = _files(wd / "derived")
+    return snap
+
+
+def _assert_put_back(store, before, stamp, step):
+    wd = store.world_dir(W1)
+    assert _snapshot(store) == before
+    aside = wd / "refinish" / stamp
+    ledger = json.loads((aside / wr.LEDGER_FILENAME).read_text())
+    assert ledger["state"] == wr.LEDGER_RESTORED_AFTER_ERROR, ledger
+    assert ledger["error_after_set_aside"]["step"] == step
+    assert all(m.get("moved_back") for m in ledger["moved"] if m.get("moved"))
+    assert ledger["restore_report"]["errors"] == []
+    # What the rebuild had put in place is kept, never deleted.
+    assert (aside / "failed-solve" / S1).exists()
+    assert store.lock_holder(W1) is None
+    return ledger
+
+
+def test_an_error_right_after_the_set_aside_puts_the_previous_result_back(
+        tmp_path, stages, fake_depth, monkeypatch):  # noqa: F811
+    from tower.world_builder.engine import WorldBuilderEngine
+
+    store, kids = _world_with_areas(tmp_path)
+    before = _snapshot(store)
+
+    def denied(self, *a, **k):
+        raise PermissionError(13, "Access is denied", "session.json")
+
+    monkeypatch.setattr(WorldBuilderEngine, "mark_stage", denied)
+    solve = _Solve2(store, kids)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="b")
+    assert report["done"] is False
+    assert report["error"].startswith("marking the room's stages: PermissionError")
+    assert "put back" in report["reason"]
+    assert solve.calls == []                        # the solve never ran
+    ledger = _assert_put_back(store, before, "b", "marking the room's stages")
+    assert "PermissionError" in ledger["error_after_set_aside"]["error"]
+    assert (C.areas_dir(store, W1) / AREA1).exists()   # the areas went back
+    assert store.read_session(W1, S1).stages["surface"]["state"] == "ok"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows refuses to replace a read-only file")
+def test_a_read_only_session_record_is_pv_attempt_1_and_is_put_back(tmp_path, stages,
+                                                                    fake_depth):  # noqa: F811
+    """The failure as it happened: the copied tree kept the read-only attribute, so the
+    real `mark_stage` could not replace session.json after the solve was set aside."""
+    import stat
+
+    store, kids = _world_with_areas(tmp_path)
+    before = _snapshot(store)
+    path = store.session_path(W1, S1)
+    os.chmod(path, stat.S_IREAD)
+    try:
+        report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve2(store, kids),
+                             stamp="b")
+    finally:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    assert report["done"] is False and "PermissionError" in report["error"]
+    ledger = _assert_put_back(store, before, "b", "marking the room's stages")
+    # The record was never written, so it is left alone rather than rewritten.
+    assert ledger["restore_report"]["unchanged"] == str(path)
+
+
+def test_a_solve_child_that_cannot_start_puts_the_previous_result_back(tmp_path, stages,
+                                                                      fake_depth):  # noqa: F811
+    store, kids = _world_with_areas(tmp_path)
+    before = _snapshot(store)
+
+    def cannot_start(argv, env=None, capture_output=True, text=True):
+        # The room was marked `stopped` before the child was asked for.
+        assert store.read_session(W1, S1).stages["surface"]["state"] == "stopped"
+        raise OSError(8, "Not enough memory resources are available")
+
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=cannot_start, stamp="b")
+    assert report["done"] is False and "OSError" in report["error"]
+    _assert_put_back(store, before, "b", "running the final solve")
+    # The session record this run marked `stopped` is written back from its snapshot.
+    assert store.read_session(W1, S1).stages["surface"]["state"] == "ok"
+
+
+def test_an_interrupt_after_the_set_aside_puts_it_back_and_is_re_raised(tmp_path, stages,
+                                                                       fake_depth):  # noqa: F811
+    store, kids = _world_with_areas(tmp_path)
+    before = _snapshot(store)
+
+    def interrupted(argv, env=None, capture_output=True, text=True):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        wr.refinish(store, tmp_path, W1, S1, solve_runner=interrupted, stamp="b")
+    _assert_put_back(store, before, "b", "running the final solve")
+
+
+def test_a_restore_that_cannot_finish_still_moves_everything_it_can_and_says_so(
+        tmp_path, stages, fake_depth, monkeypatch):  # noqa: F811
+    store, kids = _world_with_areas(tmp_path)
+    before = _snapshot(store, derived=False)
+
+    def cannot_start(argv, env=None, capture_output=True, text=True):
+        raise OSError("no child")
+
+    real_copytree = wr.shutil.copytree
+    calls = {"n": 0}
+
+    def copytree_fails_on_restore(src, dst, *a, **k):
+        # the set-aside's own copies succeed; the restore's derived copy does not
+        if Path(dst) == store.world_dir(W1) / "derived":
+            calls["n"] += 1
+            raise OSError(28, "No space left on device")
+        return real_copytree(src, dst, *a, **k)
+
+    monkeypatch.setattr(wr.shutil, "copytree", copytree_fails_on_restore)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=cannot_start, stamp="b")
+    assert calls["n"] == 1
+    assert report["done"] is False and "stopped part-way" in report["reason"]
+    ledger = json.loads((store.world_dir(W1) / "refinish" / "b" / wr.LEDGER_FILENAME)
+                        .read_text())
+    assert ledger["state"] == wr.LEDGER_RESTORE_INCOMPLETE
+    assert any("derived" in e for e in ledger["restore_report"]["errors"])
+    # every other step still ran: the solve, the areas and the session are back
+    assert _snapshot(store, derived=False) == before
+    assert store.lock_holder(W1) is None
+
+
+def test_when_the_lock_is_taken_meanwhile_the_ledger_says_nothing_was_put_back(
+        tmp_path, stages, monkeypatch):
+    store, kids = _old_world(tmp_path)
+    real = store.acquire_writer_lock
+    calls = {"n": 0}
+
+    def second_time_taken(world_id):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("a live writer holds the world")
+        return real(world_id)
+
+    monkeypatch.setattr(store, "acquire_writer_lock", second_time_taken)
+
+    def cannot_start(argv, env=None, capture_output=True, text=True):
+        raise OSError("no child")
+
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=cannot_start, stamp="b")
+    assert report["done"] is False and "could not be put back" in report["reason"]
+    ledger = _ledger(store, "b")
+    assert ledger["state"] == wr.LEDGER_RESTORE_INCOMPLETE
+    assert "live writer" in ledger["restore_errors"][0]
+    assert ledger["error_after_set_aside"]["step"] == "running the final solve"
+
+
+# ---------------------------------------------------------------------------
+# P3 (PF): the session's raw capture reaches the final solve (finding 6: 991e5a15 and
+# af47007c were re-finished from the redacted keyframes with their captures on disk)
+# ---------------------------------------------------------------------------
+
+CAPTURE_ID = "c0ffee00c0ffee00c0ffee00c0ffee00"
+
+
+def _live_capture_world(tmp_path, *, capture_id=CAPTURE_ID, n=3):
+    """An old world whose session was a live capture: keyframes named by source_seq,
+    no usable sources.json, and the capture's frames on disk under <root>/captures/."""
+    import dataclasses
+
+    from tower.world_builder.records import Keyframe
+
+    store, kids = _old_world(tmp_path)
+    store.write_session(dataclasses.replace(store.read_session(W1, S1),
+                                            capture_id=capture_id))
+    for i in range(1, n + 1):
+        store.append_keyframe(W1, Keyframe(
+            keyframe_id=f"{S1}:{i:08d}", session_id=S1, source_seq=i, received_at=float(i),
+            image_relpath=f"images/{i:08d}.jpg", width=240, height=180, byte_count=1))
+    capture_root = tmp_path / "caproot"
+    frames = capture_root / "captures" / capture_id / "frames"
+    frames.mkdir(parents=True)
+    for i in range(1, n + 1):
+        (frames / f"{i:08d}.jpg").write_bytes(b"raw frame")
+    return store, kids, capture_root
+
+
+def _capture_args(argv):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--capture-dir"]
+
+
+def _ledger(store, stamp):
+    return json.loads((store.world_dir(W1) / "refinish" / stamp / wr.LEDGER_FILENAME)
+                      .read_text())
+
+
+def test_the_sessions_capture_under_the_capture_root_goes_to_the_solve(tmp_path, stages,
+                                                                        monkeypatch):
+    store, kids, capture_root = _live_capture_world(tmp_path)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    solve = _Solve(store, kids)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
+    assert report["done"] is True
+    expected = str(capture_root / "captures" / CAPTURE_ID)
+    assert _capture_args(solve.calls[0]["argv"]) == [expected]
+    frames = _ledger(store, "c")["solver_frames"]
+    assert frames["from"] == wr.CAPTURE_FROM_SESSION
+    assert frames["capture_id"] == CAPTURE_ID and frames["capture_dirs"] == [expected]
+    assert frames["raw_from_capture_dir"] == 3 and frames["redacted_session_copies"] == 0
+    assert frames["source"] == wr.SOURCE_RAW
+    assert report["solver_frames"] == frames
+
+
+def test_without_a_capture_root_the_solve_gets_the_session_copies_as_today(tmp_path, stages,
+                                                                           monkeypatch):
+    store, kids, _capture_root = _live_capture_world(tmp_path)
+    monkeypatch.delenv(wr.CAPTURE_ROOT_ENV, raising=False)
+    solve = _Solve(store, kids)
+    wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
+    assert _capture_args(solve.calls[0]["argv"]) == []
+    frames = _ledger(store, "c")["solver_frames"]
+    assert frames["from"] is None and wr.CAPTURE_ROOT_ENV in frames["why"]
+    assert frames["redacted_session_copies"] == 3
+    assert frames["source"] == wr.SOURCE_REDACTED
+
+
+def test_an_explicit_capture_dir_wins_and_no_capture_turns_it_off(tmp_path, stages,
+                                                                  monkeypatch):
+    store, kids, capture_root = _live_capture_world(tmp_path / "one")
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    other = tmp_path / "elsewhere"
+    (other / "frames").mkdir(parents=True)
+    (other / "frames" / "00000002.jpg").write_bytes(b"raw frame")
+    solve = _Solve(store, kids)
+    wr.refinish(store, tmp_path / "one", W1, S1, solve_runner=solve, stamp="c",
+                capture_dirs=[other])
+    assert _capture_args(solve.calls[0]["argv"]) == [str(other)]
+    frames = _ledger(store, "c")["solver_frames"]
+    assert frames["from"] == wr.CAPTURE_FROM_ARGUMENT
+    assert frames["raw_from_capture_dir"] == 1 and frames["redacted_session_copies"] == 2
+    assert frames["source"] == wr.SOURCE_MIXED
+
+    store2, kids2, capture_root2 = _live_capture_world(tmp_path / "two")
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root2))
+    solve2 = _Solve(store2, kids2)
+    wr.refinish(store2, tmp_path / "two", W1, S1, solve_runner=solve2, stamp="d",
+                use_capture=False)
+    assert _capture_args(solve2.calls[0]["argv"]) == []
+    assert _ledger(store2, "d")["solver_frames"]["why"] == "--no-capture"
+
+
+def test_a_frame_sources_json_names_still_wins_over_the_capture(tmp_path, stages,
+                                                                monkeypatch):
+    store, kids, capture_root = _live_capture_world(tmp_path)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    raw = tmp_path / "walk-raw" / "00000001.jpg"
+    raw.parent.mkdir()
+    raw.write_bytes(b"raw frame the builder recorded")
+    (store.world_dir(W1) / "solve" / S1 / "sources.json").write_text(
+        json.dumps({"sources": {f"{S1}:00000001": str(raw)}}))
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="c")
+    frames = report["solver_frames"]
+    assert frames["raw_from_sources_json"] == 1 and frames["raw_from_capture_dir"] == 2
+    assert frames["source"] == wr.SOURCE_RAW
+
+
+def test_already_undistorted_walk_images_are_counted_as_reused(tmp_path, stages,
+                                                               monkeypatch):
+    store, kids, capture_root = _live_capture_world(tmp_path)
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    images = store.world_dir(W1) / "solve" / S1 / "images"
+    images.mkdir()
+    for i in (1, 2, 3):
+        (images / f"{i:08d}.jpg").write_bytes(b"the walk's solver image")
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="c")
+    assert report["solver_frames"]["already_undistorted"] == 3
+    assert report["solver_frames"]["source"] == wr.SOURCE_WALK_IMAGES
+
+
+def test_capture_resolution_rules(tmp_path, monkeypatch):
+    import dataclasses
+
+    store, _kids, capture_root = _live_capture_world(tmp_path)
+    # A relative capture root is anchored where sources.json paths are, never the cwd.
+    monkeypatch.setenv("TOWER_SOURCES_ROOT", str(tmp_path))
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, "caproot")
+    monkeypatch.chdir(capture_root)
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert got["capture_dirs"] == [str(tmp_path / "caproot" / "captures" / CAPTURE_ID)]
+    # Blank is unset.
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, "   ")
+    assert wr.resolve_capture_dirs(store, W1, S1)["capture_dirs"] == []
+    # A capture root without this capture's frames.
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(tmp_path / "nowhere"))
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert got["capture_dirs"] == [] and "no capture frames" in got["why"]
+    # A session that was not a live capture records none.
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    store.write_session(dataclasses.replace(store.read_session(W1, S1), capture_id=None))
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert got["capture_dirs"] == [] and "no capture" in got["why"]
+    # A capture id that is not a plain name never walks out of the capture root.
+    store.write_session(dataclasses.replace(store.read_session(W1, S1),
+                                            capture_id="../" + CAPTURE_ID))
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert got["capture_dirs"] == [] and "plain" in got["why"]
+
+
+# ---------------------------------------------------------------------------
+# FIN (review V8): the ledger names its process and ends in a terminal state; a
+# re-finish restarts the re-gate counter too
+# ---------------------------------------------------------------------------
+
+
+def test_the_ledger_names_its_process_and_ends_done(tmp_path, stages):
+    store, kids = _old_world(tmp_path)
+    seen = {}
+
+    def solve(argv, env=None, capture_output=True, text=True):
+        seen["during"] = _ledger(store, "p")
+        return _Solve(store, kids)(argv, env=env, capture_output=capture_output, text=text)
+
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="p")
+    assert report["done"] is True
+    during, after = seen["during"], _ledger(store, "p")
+    assert during["process"]["pid"] == os.getpid()
+    assert during["state"] == wr.LEDGER_SET_ASIDE
+    assert wr.refinish_process_alive(during) is True          # this process, running
+    assert after["state"] == wr.LEDGER_DONE and after["state"] in wr.LEDGER_TERMINAL_STATES
+    assert "published_at" in after and "done_at" in after
+
+
+def test_a_stopped_rebuild_ends_stopped(tmp_path, stages):
+    store, kids = _old_world(tmp_path)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids),
+                         stamp="p", should_stop=lambda: True)
+    assert report["done"] is False
+    assert _ledger(store, "p")["state"] == wr.LEDGER_STOPPED
+
+
+def test_a_ledger_whose_process_is_gone_reads_dead(tmp_path):
+    import subprocess
+
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    from tower.world_builder.store import _lock_record
+
+    assert wr.refinish_process_alive({"process": {"pid": gone.pid}}) is False
+    # a pid now naming ANOTHER process (recycled) reads dead by its start time
+    me = _lock_record(os.getpid())
+    assert wr.refinish_process_alive(
+        {"process": {"pid": me["pid"], "created_at": me["created_at"] - 3600.0}}) is False
+    assert wr.refinish_process_alive({"state": "set-aside"}) is None     # an old ledger
+
+
+def test_a_refinish_restarts_the_regate_counter_too(tmp_path, stages):
+    store, kids = _old_world(tmp_path)
+    exhausted = {"attempts": 3, "forgiven": 0, "detail": "re-gate failed"}
+    keys = (S1, wfp.area_ledger_key(S1), wfp.regate_ledger_key(S1))
+    wfp._write_ledger(store, W1, {k: dict(exhausted) for k in keys})
+    wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids), stamp="p")
+    sessions, _unreadable = wfp._read_ledger(store, W1)
+    for key in keys:
+        assert sessions[key]["attempts"] == 0, key
+    assert _ledger(store, "p")["previous"]["finish_attempts"][wfp.regate_ledger_key(S1)] \
+        == exhausted
+
+
+def _capture(root, capture_id, seqs, *, continues=None):
+    d = root / "captures" / capture_id
+    (d / "frames").mkdir(parents=True, exist_ok=True)
+    (d / "capture.json").write_text(json.dumps({
+        "capture_id": capture_id, "continues_capture": continues,
+        "retains_raw_imagery": True, "redaction": "none"}))
+    for i in seqs:
+        (d / "frames" / f"{i:08d}.jpg").write_bytes(b"raw frame")
+    return d
+
+
+def test_the_captures_that_continue_the_sessions_capture_are_followed(tmp_path, stages,
+                                                                      monkeypatch):
+    """991e5a15 and af47007c: the walk went on in two successor captures after a
+    reconnect, and the session records only the first -- 132 of 229 and 164 of 218
+    keyframes were in it."""
+    import shutil
+
+    store, kids, capture_root = _live_capture_world(tmp_path, n=5)
+    shutil.rmtree(capture_root / "captures" / CAPTURE_ID)          # tmp_path fixture
+    first = _capture(capture_root, CAPTURE_ID, (1, 2))
+    second = _capture(capture_root, "b" * 32, (3, 4), continues=CAPTURE_ID)
+    third = _capture(capture_root, "c" * 32, (5,), continues="b" * 32)
+    _capture(capture_root, "d" * 32, (9,))                           # unrelated
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    solve = _Solve(store, kids)
+    report = wr.refinish(store, tmp_path, W1, S1, solve_runner=solve, stamp="c")
+    assert _capture_args(solve.calls[0]["argv"]) == [str(first), str(second), str(third)]
+    frames = report["solver_frames"]
+    assert [c["capture_id"] for c in frames["captures"]] == [CAPTURE_ID, "b" * 32, "c" * 32]
+    assert all(c["retains_raw_imagery"] is True for c in frames["captures"])
+    assert frames["raw_from_capture_dir"] == 5 and frames["redacted_session_copies"] == 0
+
+
+def test_a_continued_capture_whose_frame_names_repeat_is_not_followed(tmp_path, monkeypatch):
+    import shutil
+
+    store, _kids, capture_root = _live_capture_world(tmp_path)
+    shutil.rmtree(capture_root / "captures" / CAPTURE_ID)
+    first = _capture(capture_root, CAPTURE_ID, (1, 2))
+    _capture(capture_root, "b" * 32, (2, 3), continues=CAPTURE_ID)  # 00000002 twice
+    monkeypatch.setenv(wr.CAPTURE_ROOT_ENV, str(capture_root))
+    got = wr.resolve_capture_dirs(store, W1, S1)
+    assert got["capture_dirs"] == [str(first)]
+    assert "repeat" in got["chain_note"]
+
+
+def test_the_cli_passes_capture_dirs_and_the_dry_run_names_the_frames(tmp_path, capsys,
+                                                                      monkeypatch):
+    store, _kids, capture_root = _live_capture_world(tmp_path)
+    monkeypatch.delenv(wr.CAPTURE_ROOT_ENV, raising=False)
+    cap = capture_root / "captures" / CAPTURE_ID
+    before = _files(tmp_path)
+    assert wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
+                    "--capture-dir", str(cap)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["solver_frames"]["from"] == wr.CAPTURE_FROM_ARGUMENT
+    assert out["solver_frames"]["raw_from_capture_dir"] == 3
+    assert _files(tmp_path) == before
+    with pytest.raises(SystemExit):
+        wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run",
+                 "--capture-dir", str(cap), "--no-capture"])
