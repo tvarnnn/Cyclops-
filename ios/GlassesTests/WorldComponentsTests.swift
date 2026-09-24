@@ -231,6 +231,10 @@ final class WorldComponentsWordsTests: XCTestCase {
     /// or a position.
     func testTheAreaViewerSaysItIsNotPlaced() {
         XCTAssertEqual(WorldComponentsPresentation.areaHeader(number: 2, of: 2), "Area 2 of 2 — not placed in the room")
+        let opening = WorldAreaOpening(number: 2, total: 2, spans: [])
+        XCTAssertEqual(opening.header, "Area 2 of 2 — not placed in the room")
+        XCTAssertEqual(opening.numberLine, "Area 2 of 2")
+        XCTAssertEqual(WorldAreaOpening.notPlacedLine, "not placed in the room")
         let spans = [WorldCaptureSpan(start: 86.0, end: 109.0)]
         let appearance = WorldComponentsPresentation.areaCaption(representation: .appearance, spans: spans)
         // §5.4's sentence, with the spans in §8's `m:ss` en-dash form (C1 E14).

@@ -100,8 +100,14 @@ nonisolated struct WorldAreaOpening: Equatable, Hashable, Sendable {
     let total: Int
     let spans: [WorldCaptureSpan]
 
-    /// The area viewer's header.
+    /// The area viewer's header (§5.4), whole: the navigation title, which is
+    /// also what accessibility reads.
     var header: String { WorldComponentsPresentation.areaHeader(number: number, of: total) }
+    /// The header's two halves, drawn on two lines: on a phone the one-line
+    /// title truncated to "Area 1 of 1 — not placed i…", losing the half that
+    /// matters (the Mac's UI check of 46928fa).
+    var numberLine: String { "Area \(number) of \(total)" }
+    static let notPlacedLine = "not placed in the room"
 }
 
 // MARK: - The fetch
@@ -2034,6 +2040,18 @@ struct WorldRenderScene: View {
         }
         .navigationTitle(screenTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if model.target.isArea, let area {
+                ToolbarItem(placement: .principal) {
+                    VStack(spacing: 0) {
+                        Text(area.numberLine).font(.headline)
+                        Text(WorldAreaOpening.notPlacedLine).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(area.header)
+                }
+            }
+        }
         // One fetch, for the life of the screen. `model.target` is a `let`, so
         // there is nothing for a `.task(id:)` to key on; a second rendering of
         // the same world is a second screen, and the page's own button switches
