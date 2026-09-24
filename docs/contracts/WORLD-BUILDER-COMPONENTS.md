@@ -163,9 +163,13 @@ reader, the physical test or the harness can tell what produced `components`:
 
 | Key | Meaning |
 |---|---|
-| `transients.state` | `applied` (every solver image masked), `partial` (some images unmasked; counts given), or `unavailable` (with `detail`: detector unavailable, model load failure, GPU out of memory, CPU fallback). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable` |
-| `transients.rule` | the mask rule's id (the same union rule the surface stage uses) |
-| `gate.params` | the gate's parameters, including `max_link_disagreement_deg` (16.8) and `attach_groups`, and their digest |
+| `transients.state` | `applied` (every solver image masked with the union rule), `partial` (some images unmasked, or a fallback rule such as OneFormer alone -- `rule_fallback`; counts given), or `unavailable` (with `detail` and `cause`: detector unavailable, model load failure, GPU out of memory, CPU fallback). Anything but `applied` switches the gate to its fail-safe: no piece is attached, reason `masks-unavailable`. A GPU out of memory is retried once; if it persists `retryable` is set and the finisher owes that gated session a bounded re-solve |
+| `transients.rule`, `transients.requested_rule`, `transients.rule_fallback` | the mask rule that ran (the same union rule the surface stage uses) and any fallback |
+| `transients.masking` / `solve.masking`, `solve.walk_database` | `walk-database-filtered` (the walk's own database, matches touching masked keypoints removed and re-verified: the approved arm A1h) or `re-extracted` (no usable walk database: `absent`, `unusable` or `filter-failed`) |
+| `gate.state` | `applied`, or `failed` (with `detail`; a failed gate publishes no components record) |
+| `gate.gate`, `gate.params`, `gate.params_digest` | the rule id and its parameters -- `min_obs`, `min_link_inliers`, `max_link_disagreement_deg` (16.8), `scale_step_factor`, `scale_min_cameras` -- and their digest. There is no `attach_groups` parameter in the product: the fail-safe is decided by the two keys below |
+| `gate.masks_applied`, `gate.metric_available`, `gate.attach` | whether the masks were applied (`transients.state == "applied"`), whether any camera had a metric ratio, and so whether any piece could be attached at all |
+| `gate.evidence`, `gate.depth`, `gate.metric_scale`, `gate.components_file` | what the gate saw (links, honoured links, cameras with a ratio), the depth stage it used (told the solve camera's field of view), and the record it wrote |
 | `solve.seed`, `solve.threads` | the seeded single-thread solve that produced the model |
 
 ## 3. Where `components` appears
