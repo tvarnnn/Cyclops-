@@ -369,6 +369,7 @@ class WorldBuilderEngine:
             # One undecodable frame is frame-scoped: drop it, keep going.
             self._note_rejected("malformed_frame")
             self._events.append("frame_rejected", {"reason": "malformed_frame"})
+            self._recovery_tick()
             return self._result("reject", "malformed_frame")
 
         # A FRAME OF A DIFFERENT SIZE IS REJECTED, NOT TRACKED.
@@ -404,6 +405,7 @@ class WorldBuilderEngine:
                 "expected": list(self._frame_shape),
                 "received": list(gray.shape[:2]),
             })
+            self._recovery_tick()
             return self._result("reject", "frame_size_changed")
 
         quality = analyse_frame(gray)
@@ -1212,7 +1214,12 @@ class WorldBuilderEngine:
         try:
             from tower.world_builder import relocalizer
 
-            reloc = relocalizer.from_session(session.intrinsics, mode=mode)
+            # `wall_clock` is the clock the journal stamps `at` with: the
+            # limiter checks the prompt cap on the wire's own numbers too
+            # (review V8 LOW-3; see `_recovery`).
+            reloc = relocalizer.from_session(
+                session.intrinsics, mode=mode, wall_clock=self._clock
+            )
         except Exception:
             logger.exception(
                 "[Tower][WorldBuilder] look-back relocalizer unavailable for "
@@ -1260,7 +1267,20 @@ class WorldBuilderEngine:
                 self._events.append(kind, payload)
             return
         for kind, payload in events or ():
-            self._events.append(kind, payload)
+            event = self._events.append(kind, payload)
+            if kind == "recovery_prompted":
+                # The line's own `at` IS the wire's `prompt.issued_at`; the
+                # limiter keeps these, not a reading of its own, so the cap
+                # holds exactly on the wire (review V8 LOW-3).
+                reloc.prompt_journaled(event.at)
+
+    def _recovery_tick(self) -> None:
+        """A frame rejected before tracking still moves the recovery
+        episode's clock (review V8 LOW-1): an episode must not stay
+        `searching` for ever behind undecodable or resized frames. Time
+        only -- the relocalizer matches nothing here, and off it is not
+        called at all."""
+        self._recovery(lambda r: r.tick(self._mono()))
 
     def _open_live_solve(self, session) -> None:
         """Start the solve that observe() will extend.
