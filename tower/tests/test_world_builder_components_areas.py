@@ -272,16 +272,31 @@ class TestAnOldWorld:
         assert r.status_code == 404
         assert r.json()["detail"] == "this session has no areas"
 
-    def test_the_room_page_is_the_same_page_with_or_without_a_record(self, old_world):
+    def test_the_room_page_changes_only_by_its_caption(self, old_world):
         """§4: the room page draws the placed component exactly as today; areas are
-        never a rung of the room's ladder and never drawn on its pages."""
+        never a rung of the room's ladder and never drawn on its pages. The one
+        change is the caption's " · N more areas shown separately" -- and a record
+        with no area entry changes nothing at all."""
+        from tower.world_builder.appearance_render import ANCHOR_HEAD
+
         client = _client(old_world)
         before = client.get(f"/worlds/{WORLD}/render?viewer=appearance-1")
+        entries = [e for e in _entries(old_world.kids) if e["shown_as"] != "area"]
+        write_components(old_world.store, entries)
+        no_areas = client.get(f"/worlds/{WORLD}/render?viewer=appearance-1")
+        assert before.status_code == no_areas.status_code == 200
+        assert before.text == no_areas.text
         write_components(old_world.store, _entries(old_world.kids))
         after = client.get(f"/worlds/{WORLD}/render?viewer=appearance-1")
-        assert before.status_code == after.status_code == 200
-        assert before.text == after.text
+        assert after.status_code == 200
         assert "/areas/" not in after.text
+        assert ANCHOR_HEAD in before.text and ANCHOR_HEAD not in after.text
+        assert "2 more areas shown separately" in after.text
+        # Everything but the caption's head line is the same page.
+        head_at = before.text.index(ANCHOR_HEAD)
+        assert after.text[:head_at] == before.text[:head_at]
+        tail = before.text[head_at + len(ANCHOR_HEAD):]
+        assert after.text.endswith(tail)
 
 
 # ---------------------------------------------------------------------------

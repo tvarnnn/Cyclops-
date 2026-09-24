@@ -408,6 +408,20 @@ def build_render_revision(store: WorldStore, world_id: str,
             "components": _components_or_none(store, world_id, chosen)}
 
 
+def _room_captions(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """`{"more_areas": N}` when this session's components record shows at least one
+    area, else None. Never raises: a caption must not cost the room its page."""
+    try:
+        from tower.world_builder.components import read_components_record  # noqa: PLC0415
+
+        record = read_components_record(store, world_id, session_id)
+        count = len(record.areas()) if record is not None else 0
+    except Exception:  # noqa: BLE001
+        logger.debug("[Tower][WorldBuilder] components caption probe failed", exc_info=True)
+        return None
+    return {"more_areas": count} if count >= 1 else None
+
+
 def _components_or_none(store: WorldStore, world_id: str, session_id: str):
     """`components.components_for_session`, never an exception: the revision must
     answer whatever the area half does. None -- one `stat` -- for every session
@@ -424,7 +438,8 @@ def _components_or_none(store: WorldStore, world_id: str, session_id: str):
 
 
 def _appearance_page(store: WorldStore, world_id: str, session_id: str, revisions: dict,
-                     transport: str, *, pinned: bool) -> str | None:
+                     transport: str, *, pinned: bool,
+                     captions: dict | None = None) -> str | None:
     """The appearance page, or None to walk on down the ladder.
 
     Served exactly when the appearance routes would serve -- the same probe
@@ -450,7 +465,8 @@ def _appearance_page(store: WorldStore, world_id: str, session_id: str, revision
         return None
     try:
         page = build_appearance_page(store, world_id, session_id, transport=transport,
-                                     appearance_revision=appearance["revision"])
+                                     appearance_revision=appearance["revision"],
+                                     **({"captions": captions} if captions else {}))
         return _stamp_revision(store, world_id, session_id, page, revisions)
     except AppearanceViewerUnavailable as exc:
         if pinned:
@@ -667,9 +683,14 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         wanted = REPRESENTATION_SPARSE
     start = REPRESENTATION_LADDER.index(wanted)
 
+    # WORLD-BUILDER-COMPONENTS.md §4: " · N more areas shown separately" on the room
+    # page of a session with at least one area; None -- the page exactly as before --
+    # for every other session, including every one with `components: null`.
+    room_captions = _room_captions(store, world_id, chosen)
     if start <= REPRESENTATION_LADDER.index(REPRESENTATION_APPEARANCE):
         page = _appearance_page(store, world_id, chosen, revisions, transport,
-                                pinned=representation == REPRESENTATION_APPEARANCE)
+                                pinned=representation == REPRESENTATION_APPEARANCE,
+                                captions=room_captions)
         if page is not None:
             return page
 
@@ -704,7 +725,8 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         try:
             if build_surface_page is None:
                 raise RuntimeError("surface viewer unavailable")
-            page = build_surface_page(store, world_id, chosen, max_points=max_points)
+            page = build_surface_page(store, world_id, chosen, max_points=max_points,
+                                      **({"captions": room_captions} if room_captions else {}))
             return _stamp_revision(store, world_id, chosen, page, revisions)
         except SurfaceViewerUnavailable as exc:
             if representation == REPRESENTATION_SURFACE:
@@ -1017,28 +1039,36 @@ def area_routes(world_id: str, session_id: str, area_id: str) -> dict:
     }
 
 
+def _area_caption_info(area: _Area) -> dict:
+    """What the area page's captions need (§5.4): its number among the session's
+    areas (§2.4 rule 2, the record's order), how many there are, when in the walk it
+    was captured (first span start to last span end, the Tower's receipt clock), and
+    whether it was levelled."""
+    areas = area.record.areas()
+    ids = [e["id"] for e in areas]
+    spans = area.entry.get("capture_spans_s") or []
+    return {"number": ids.index(area.area_id) + 1, "of": len(ids),
+            "from_s": spans[0][0] if spans else None,
+            "to_s": spans[-1][1] if spans else None,
+            "levelled": _area_levelled(area)}
+
+
 def _area_appearance_page(area: _Area, appearance: dict, transport: str) -> str | None:
-    """The room's appearance page program, fed the area's artifacts and addresses.
-    None to fall to the surface rung."""
+    """The room's appearance page program, fed the area's artifacts, addresses and
+    captions. None to fall to the surface rung."""
     try:
         from tower.world_builder import appearance_render as AR  # noqa: PLC0415
-        from tower.world_builder.surface_render import js_object_literal  # noqa: PLC0415
     except Exception:  # noqa: BLE001
         logger.exception("[Tower][WorldBuilder] the appearance viewer module did not import")
         return None
     try:
-        template = AR.viewer_template_path().read_text(encoding="utf-8")
-        if AR.TOKEN_CONFIG not in template or AR.TOKEN_CSP not in template:
-            return None
-        config = AR.build_appearance_config(area.view, area.world_id, area.session_id,
-                                            transport=transport,
-                                            appearance_revision=appearance["revision"])
-        config["routes"] = area_routes(area.world_id, area.session_id, area.area_id)
-        # Additive, for the page and for a later caption (§5.4): which area, and
-        # whether its vertical could be estimated.
-        config["area"] = {"id": area.area_id, "levelled": _area_levelled(area)}
-        page = (template.replace(AR.TOKEN_CSP, AR.content_security_policy(config["transport"]))
-                .replace(AR.TOKEN_CONFIG, js_object_literal(config)))
+        page = AR.build_appearance_page(
+            area.view, area.world_id, area.session_id, transport=transport,
+            appearance_revision=appearance["revision"],
+            routes=area_routes(area.world_id, area.session_id, area.area_id),
+            # Additive (§5.4): which area, and whether its vertical could be estimated.
+            extra_config={"area": {"id": area.area_id, "levelled": _area_levelled(area)}},
+            captions={"area": _area_caption_info(area)})
     except Exception as exc:  # noqa: BLE001 -- never lose the area to an appearance bug
         logger.warning("[Tower][WorldBuilder] area appearance page for %s/%s/%s could not "
                        "be composed (%s); falling back", area.world_id, area.session_id,
@@ -1102,7 +1132,8 @@ def build_area_render(store: WorldStore, world_id: str, session_id: str, area_id
                 raise RuntimeError("surface viewer unavailable")
             revision = _area_surface_revision(area)
             page = build_surface_page(area.view, area.world_id, area.session_id,
-                                      max_points=max_points)
+                                      max_points=max_points,
+                                      captions={"area": _area_caption_info(area)})
             return _stamp_area(page, revision, area.area_id)
         except SurfaceViewerUnavailable as exc:
             logger.error("[Tower][WorldBuilder] area surface for %s/%s/%s passes its header "

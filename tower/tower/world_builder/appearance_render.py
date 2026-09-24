@@ -38,7 +38,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 from tower.world_builder.raw_imagery import IMAGERY_REDACTED
-from tower.world_builder.surface_render import js_object_literal
+from tower.world_builder.surface_render import (
+    area_caption,
+    area_header,
+    js_object_literal,
+    js_string_literal,
+    more_areas_text,
+    replace_anchors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,10 +310,75 @@ def build_appearance_config(store, world_id: str, session_id: str, *,
     }
 
 
+# The appearance page's caption anchors (appearance_viewer.html); see
+# `surface_render`'s "Components captions" note for why the template is not edited.
+ANCHOR_HEAD = (
+    '    head.textContent = RAW_IMAGERY\n'
+    '      ? "RESEARCH BUILD — unredacted captured images on reconstructed geometry"\n'
+    '      : "Captured images on reconstructed geometry";')
+ANCHOR_WHAT_REDACTED = (
+    '         : "These are the camera\'s own frames, with faces redacted, placed on the '
+    'reconstructed room.")')
+ANCHOR_WHAT_RAW = (
+    '         ? "These are the camera\'s own frames, UNREDACTED, placed on the '
+    'reconstructed room."')
+ANCHOR_FACE_TEXT = '" “Face the room” turns you'
+ANCHOR_FACE_BUTTON = (
+    'aria-label="Turn to the nearest photographed direction">Face the room</button>')
+AREA_FIRST_CLAUSE = "The camera's own images, faces redacted"
+AREA_FIRST_CLAUSE_RAW = "The camera's own frames, UNREDACTED"
+
+
+def caption_replacements(captions: dict | None) -> list:
+    """The anchor replacements `captions` asks of an appearance page (§4, §5.4)."""
+    if not captions:
+        return []
+    area = captions.get("area")
+    if area:
+        header = area_header(area)
+        return [
+            (ANCHOR_HEAD,
+             "    head.textContent = RAW_IMAGERY\n"
+             "      ? " + js_string_literal(
+                 "RESEARCH BUILD — unredacted captured images · " + header) + "\n"
+             "      : " + js_string_literal(header) + ";"),
+            (ANCHOR_WHAT_REDACTED,
+             "         : " + js_string_literal(area_caption(area, AREA_FIRST_CLAUSE)) + ")"),
+            (ANCHOR_WHAT_RAW,
+             "         ? " + js_string_literal(area_caption(area, AREA_FIRST_CLAUSE_RAW))),
+            (ANCHOR_FACE_TEXT, '" “Face the area” turns you'),
+            (ANCHOR_FACE_BUTTON,
+             'aria-label="Turn to the nearest photographed direction">Face the area</button>'),
+        ]
+    more = int(captions.get("more_areas") or 0)
+    if more >= 1:
+        return [(ANCHOR_HEAD,
+                 "    head.textContent = (RAW_IMAGERY\n"
+                 '      ? "RESEARCH BUILD — unredacted captured images on reconstructed geometry"\n'
+                 '      : "Captured images on reconstructed geometry") + '
+                 + js_string_literal(" · " + more_areas_text(more)) + ";")]
+    return []
+
+
+def apply_captions(template: str, captions: dict | None) -> str:
+    """The template with the components captions applied (unchanged for None)."""
+    replacements = caption_replacements(captions)
+    return replace_anchors(template, replacements, "appearance") if replacements else template
+
+
 def build_appearance_page(store, world_id: str, session_id: str, *,
                           transport: str = TRANSPORT_APP,
-                          appearance_revision: str | None = None) -> str:
-    """The page shell. Raises `AppearanceViewerUnavailable`."""
+                          appearance_revision: str | None = None,
+                          routes: dict | None = None,
+                          extra_config: dict | None = None,
+                          captions: dict | None = None) -> str:
+    """The page shell. Raises `AppearanceViewerUnavailable`.
+
+    `routes`, `extra_config` and `captions` exist for the AREA page and the room
+    page of a session with areas (WORLD-BUILDER-COMPONENTS.md §4, §5.4): the four
+    addresses an area page fetches, its additive `area` configuration, and the
+    captions. All three None -- every page of a session without components -- is
+    the page exactly as before."""
     template_path = viewer_template_path()
     if not template_path.exists():
         raise AppearanceViewerUnavailable("the appearance viewer template is not installed")
@@ -314,8 +386,14 @@ def build_appearance_page(store, world_id: str, session_id: str, *,
     for token in (TOKEN_CONFIG, TOKEN_CSP):
         if token not in template:
             raise AppearanceViewerUnavailable(f"the appearance viewer template has no {token}")
+    if captions:
+        template = apply_captions(template, captions)
     config = build_appearance_config(store, world_id, session_id, transport=transport,
                                      appearance_revision=appearance_revision)
+    if routes is not None:
+        config["routes"] = dict(routes)
+    if extra_config:
+        config.update(extra_config)
     page = (template.replace(TOKEN_CSP, content_security_policy(config["transport"]))
             .replace(TOKEN_CONFIG, js_object_literal(config)))
     logger.info(
