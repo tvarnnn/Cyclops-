@@ -400,7 +400,27 @@ def build_render_revision(store: WorldStore, world_id: str,
             # them into the page revision would swap the page -- and reset the
             # wearer's camera -- on every one. `null` exactly when the
             # appearance route would 404, including a changed redaction label.
-            "appearance": appearance}
+            "appearance": appearance,
+            # WORLD-BUILDER-COMPONENTS.md §3.2: the same array as this session's
+            # listing row, or null. NOT part of `revision`: an area finishing, or
+            # its build state moving, does not change the room page and must not
+            # swap it. The phone compares it by value to keep its areas row current.
+            "components": _components_or_none(store, world_id, chosen)}
+
+
+def _components_or_none(store: WorldStore, world_id: str, session_id: str):
+    """`components.components_for_session`, never an exception: the revision must
+    answer whatever the area half does. None -- one `stat` -- for every session
+    without a components record."""
+    try:
+        from tower.world_builder.components import components_for_session  # noqa: PLC0415
+
+        return components_for_session(store, world_id, session_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("[Tower][WorldBuilder] components for %s/%s could not be "
+                       "computed; the revision says components: null",
+                       world_id, session_id, exc_info=True)
+        return None
 
 
 def _appearance_page(store: WorldStore, world_id: str, session_id: str, revisions: dict,
@@ -785,3 +805,393 @@ def build_world_render(store: WorldStore, world_id: str, session_id: str | None,
         # (contract §3 rule 3: no paths on the wire).
         raise WorldRenderUnavailable(
             f"session {chosen!r} of world {world_id!r} has no geometry yet") from None
+
+
+# ---------------------------------------------------------------------------
+# AREAS: `GET /worlds/{w}/areas/{s}/{a}/...` (WORLD-BUILDER-COMPONENTS.md §5)
+# ---------------------------------------------------------------------------
+#
+# A part of a walk the evidence gate could not place, drawn ON ITS OWN, in its own
+# levelled frame, by the same page programs as the room fed the area's artifacts.
+# Nothing here composites an area with the room or names the room's geometry: the
+# area's artifacts live under `<world>/areas/<area>/` and are reached through
+# `components.AreaStore`, a view that answers everything about the SESSION (its
+# keyframes, its redaction label, `world.json`) from the real world, so every check the
+# room's pages and appearance routes make is made again, unchanged, for the area.
+#
+# Kept in this adapter rather than a new file so the architecture boundary's adapter
+# list does not move: it is the render route's own family.
+
+
+class AreaUnavailable(Exception):
+    """An area route's 404. `reason` is the `detail` the phone shows; four of them are
+    stable identifiers (`components.NO_SUCH_AREA` and its siblings, C1 E4)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Area:
+    __slots__ = ("world_id", "session_id", "area_id", "world", "session", "record",
+                 "entry", "view")
+
+    def __init__(self, **fields) -> None:
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+def resolve_area(store: WorldStore, world_id: str, session_id: str, area_id: str) -> _Area:
+    """The area a request names, checked in the order a path is joined from it.
+
+    The world is contained first (`contained_world_id`), the session is checked
+    against the world's own sessions before the record path is joined from it, and
+    the area id is checked against the CURRENT components record -- 16 lower-hex AND
+    a `shown_as: "area"` entry -- before the area directory is joined from it. The
+    room's id and a `none` entry's id are `no such area in this session` (§5).
+    """
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    contained = contained_world_id(store, world_id)
+    if contained is None:
+        raise AreaUnavailable(f"no world {_clip(world_id)!r}")
+    try:
+        world = store.read_world(contained)
+    except (WorldStoreError, OSError, ValueError, KeyError):
+        raise AreaUnavailable(f"no world {_clip(world_id)!r}") from None
+    listed = {sid for sid in world.session_ids if isinstance(sid, str)}
+    if session_id not in set(store.list_session_ids(contained)) | listed:
+        raise AreaUnavailable(
+            f"world {_clip(world_id)!r} has no session {_clip(session_id)!r}")
+    # NULL FIRST: every older world answers this and only this (§7 rule 1), whatever
+    # the id looks like.
+    record = C.read_components_record(store, contained, session_id)
+    if record is None:
+        raise AreaUnavailable(C.NO_AREAS)
+    entry = record.entry(area_id) if C.is_area_id(area_id) else None
+    if entry is None or entry["shown_as"] != C.SHOWN_AREA:
+        raise AreaUnavailable(C.NO_SUCH_AREA)
+    try:
+        session = store.read_session(contained, session_id)
+    except (WorldStoreError, OSError, ValueError, KeyError):
+        raise AreaUnavailable(
+            f"world {_clip(world_id)!r} has no session {_clip(session_id)!r}") from None
+    return _Area(world_id=contained, session_id=session_id, area_id=area_id, world=world,
+                 session=session, record=record, entry=entry,
+                 view=C.AreaStore(store, contained, session_id, area_id))
+
+
+def _area_word(store: WorldStore, area: _Area) -> dict:
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    return C.area_photographic_state(store, area.world_id, area.session_id, area.session,
+                                     area.area_id, area.record.sha1)
+
+
+def _area_not_drawable(store: WorldStore, area: _Area) -> AreaUnavailable:
+    """Nothing is drawable: transient while its build is owed, running or
+    unobservable; terminal once it is settled (failed, or declined)."""
+    from tower.world_builder import components as C  # noqa: PLC0415
+    from tower.world_builder.photographic import is_unsettled  # noqa: PLC0415
+
+    try:
+        word = _area_word(store, area)
+    except Exception:  # noqa: BLE001 -- not known is not terminal
+        return AreaUnavailable(C.AREA_NOT_BUILT_YET)
+    if is_unsettled(word.get("state")):
+        return AreaUnavailable(C.AREA_NOT_BUILT_YET)
+    return AreaUnavailable(C.AREA_COULD_NOT_BE_BUILT)
+
+
+def _area_levelled(area: _Area):
+    """`area.levelled` as the build recorded it, or None when unknown."""
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    record = C.read_area_record(area.view.base, area.world_id, area.session_id,
+                                area.area_id) or {}
+    value = record.get("levelled")
+    return value if isinstance(value, bool) else None
+
+
+def _area_appearance_revision(store: WorldStore, area: _Area) -> dict:
+    """WORLDS §4a's `appearance` object, for the area's artifact (§5.2). Never raises."""
+    from tower.world_builder import appearance_pipeline as AP  # noqa: PLC0415
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    not_served = {"revision": None, "current": False, "state": AP.ABSENT, "epoch": None}
+    try:
+        manifest, reason = C.area_appearance_servable(store, area.world_id, area.session_id,
+                                                      area.area_id, world=area.world)
+    except Exception:  # noqa: BLE001 -- the safe answer is to drop
+        logger.debug("[Tower][WorldBuilder] area appearance probe failed", exc_info=True)
+        return {**not_served, "state": AP.WITHDRAWN}
+    if manifest is None:
+        if reason == AP.STALE_LABEL_DETAIL:
+            try:
+                state = AP.withdrawal_state(
+                    area.view, area.world_id, area.session_id,
+                    AP.read_appearance_manifest(area.view, area.world_id, area.session_id))
+            except Exception:  # noqa: BLE001
+                state = AP.WITHDRAWN
+        elif reason == "appearance imagery was purged":
+            state = AP.WITHDRAWN
+        else:
+            state = AP.ABSENT
+        return {**not_served, "state": state}
+    build = manifest.get("build_id")
+    if not isinstance(build, str):
+        return {**not_served, "state": AP.WITHDRAWN}
+    try:
+        current = bool(AP.appearance_currency(area.view, area.world_id, area.session_id,
+                                              manifest)["current"])
+    except Exception:  # noqa: BLE001
+        current = False
+    epoch = manifest.get("epoch")
+    return {"revision": f"{area.session_id}/area:{area.area_id}/appearance:{build}",
+            "current": current, "state": AP.SERVED,
+            "epoch": epoch if isinstance(epoch, str) else None}
+
+
+def _area_page_revision(area: _Area, appearance: dict) -> str | None:
+    """`<session>/area:<area>/appearance:1@<epoch>` (§5.1), or None."""
+    try:
+        from tower.world_builder.appearance_render import PAGE_REVISION  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    epoch = appearance.get("epoch")
+    own = f"{PAGE_REVISION}@{epoch}" if epoch else PAGE_REVISION
+    return f"{area.session_id}/area:{area.area_id}/{own}"
+
+
+def _area_surface_revision(area: _Area) -> str | None:
+    """`<session>/area:<area>/surface:<built_at>` (§5.2), or None."""
+    own = render_revision(area.view, area.world_id, area.session_id, REPRESENTATION_SURFACE)
+    return None if own is None else f"{area.session_id}/area:{area.area_id}/{own}"
+
+
+def _area_live(area: _Area) -> bool:
+    """§5.2 `live`: this area's surface or appearance stage is running under a live
+    process and has not yet published (§4a's rule, per area). Never raises."""
+    try:
+        from tower.world_builder.surface_pipeline import (  # noqa: PLC0415
+            status_is_stale,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    root = area.view.world_dir(area.world_id)
+    for stage in ("surface", "appearance"):
+        try:
+            if _stage_running(root / stage / area.session_id / "status.json",
+                              status_is_stale):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _stamp_area(html: str, revision: str | None, area_id: str) -> str:
+    """`wb-revision` and `wb-area` right after the page's `wb-representation`, inside
+    its first 4096 characters (§5.1). No revision stamp rather than a false one."""
+    match = _REPRESENTATION_META.search(html, 0, 4096)
+    if match is None:
+        return html
+    tags = ""
+    if revision is not None:
+        tags += f'<meta name="wb-revision" content="{html_escape(revision, quote=True)}">'
+    tags += f'<meta name="wb-area" content="{html_escape(area_id, quote=True)}">'
+    return html[:match.end()] + tags + html[match.end():]
+
+
+def area_routes(world_id: str, session_id: str, area_id: str) -> dict:
+    """The four addresses the area's appearance page fetches, relative to its base
+    (§5.4) -- the §5.5 whitelist, and nothing else. The revision carries no query."""
+    from urllib.parse import quote  # noqa: PLC0415
+
+    w, s, a = (quote(v, safe="") for v in (world_id, session_id, area_id))
+    prefix = f"/worlds/{w}/areas/{s}/{a}"
+    return {
+        "manifest": f"{prefix}/appearance/manifest",
+        "chunk": f"{prefix}/appearance/chunk/",
+        "proxy": f"{prefix}/appearance/proxy/",
+        "revision": f"{prefix}/render/revision",
+    }
+
+
+def _area_appearance_page(area: _Area, appearance: dict, transport: str) -> str | None:
+    """The room's appearance page program, fed the area's artifacts and addresses.
+    None to fall to the surface rung."""
+    try:
+        from tower.world_builder import appearance_render as AR  # noqa: PLC0415
+        from tower.world_builder.surface_render import js_object_literal  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        logger.exception("[Tower][WorldBuilder] the appearance viewer module did not import")
+        return None
+    try:
+        template = AR.viewer_template_path().read_text(encoding="utf-8")
+        if AR.TOKEN_CONFIG not in template or AR.TOKEN_CSP not in template:
+            return None
+        config = AR.build_appearance_config(area.view, area.world_id, area.session_id,
+                                            transport=transport,
+                                            appearance_revision=appearance["revision"])
+        config["routes"] = area_routes(area.world_id, area.session_id, area.area_id)
+        # Additive, for the page and for a later caption (§5.4): which area, and
+        # whether its vertical could be estimated.
+        config["area"] = {"id": area.area_id, "levelled": _area_levelled(area)}
+        page = (template.replace(AR.TOKEN_CSP, AR.content_security_policy(config["transport"]))
+                .replace(AR.TOKEN_CONFIG, js_object_literal(config)))
+    except Exception as exc:  # noqa: BLE001 -- never lose the area to an appearance bug
+        logger.warning("[Tower][WorldBuilder] area appearance page for %s/%s/%s could not "
+                       "be composed (%s); falling back", area.world_id, area.session_id,
+                       area.area_id, getattr(exc, "reason", type(exc).__name__))
+        return None
+    return _stamp_area(page, _area_page_revision(area, appearance), area.area_id)
+
+
+def _pinned_rung_missing(store: WorldStore, area: _Area, rung: str) -> AreaUnavailable:
+    """A named rung the area does not have (§5.1, "as in §4")."""
+    from tower.world_builder import components as C  # noqa: PLC0415
+    from tower.world_builder.photographic import is_unsettled  # noqa: PLC0415
+
+    try:
+        if is_unsettled(_area_word(store, area).get("state")):
+            return AreaUnavailable(C.AREA_NOT_BUILT_YET)
+    except Exception:  # noqa: BLE001
+        return AreaUnavailable(C.AREA_NOT_BUILT_YET)
+    return AreaUnavailable(f"this area has no {rung} that can be served")
+
+
+def build_area_render(store: WorldStore, world_id: str, session_id: str, area_id: str, *,
+                      max_points: int | None = None,
+                      representation: str = REPRESENTATION_AUTO,
+                      transport: str = TRANSPORT_APP,
+                      viewer: str | None = None) -> str:
+    """`GET /worlds/{w}/areas/{s}/{a}/render` (§5.1): the area's page, or
+    `AreaUnavailable`.
+
+    The ladder is the room's, shortened to the two rungs an area is built as:
+    appearance, then surface. `viewer` is accepted and ignored -- `auto` offers the
+    appearance rung unconditionally, because every client that can name this route
+    postdates the scheme handler (§5.1, OPEN M12).
+    """
+    del viewer  # accepted, ignored (§5.1)
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    area = resolve_area(store, world_id, session_id, area_id)
+    if representation in (REPRESENTATION_SPARSE, REPRESENTATION_DENSE):
+        raise AreaUnavailable(C.AREA_NO_SPARSE_OR_DENSE)
+    if representation in (REPRESENTATION_AUTO, REPRESENTATION_APPEARANCE):
+        appearance = _area_appearance_revision(store, area)
+        if appearance.get("revision") is not None:
+            page = _area_appearance_page(area, appearance, transport)
+            if page is not None:
+                return page
+        if representation == REPRESENTATION_APPEARANCE:
+            raise _pinned_rung_missing(store, area, REPRESENTATION_APPEARANCE)
+    if C.area_surface_drawable(store, area.world_id, area.session_id, area.area_id):
+        try:
+            from tower.world_builder.surface_render import (  # noqa: PLC0415
+                SurfaceViewerUnavailable,
+                build_surface_page,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[Tower][WorldBuilder] the surface viewer module did not import")
+            SurfaceViewerUnavailable = _ViewerModuleMissing  # noqa: N806
+            build_surface_page = None
+        try:
+            if build_surface_page is None:
+                raise RuntimeError("surface viewer unavailable")
+            revision = _area_surface_revision(area)
+            page = build_surface_page(area.view, area.world_id, area.session_id,
+                                      max_points=max_points)
+            return _stamp_area(page, revision, area.area_id)
+        except SurfaceViewerUnavailable as exc:
+            logger.error("[Tower][WorldBuilder] area surface for %s/%s/%s passes its header "
+                         "check but the page could not be built (%s)", area.world_id,
+                         area.session_id, area.area_id, exc.reason)
+        except Exception:  # noqa: BLE001
+            logger.exception("[Tower][WorldBuilder] area surface viewer failed")
+    elif representation == REPRESENTATION_SURFACE:
+        raise _pinned_rung_missing(store, area, REPRESENTATION_SURFACE)
+    raise _area_not_drawable(store, area)
+
+
+def build_area_revision(store: WorldStore, world_id: str, session_id: str,
+                        area_id: str) -> dict:
+    """`GET /worlds/{w}/areas/{s}/{a}/render/revision` (§5.2). 404 exactly when the
+    render route would: the same resolution, the same ladder, by artifact checks."""
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    area = resolve_area(store, world_id, session_id, area_id)
+    appearance = _area_appearance_revision(store, area)
+    representation = revision = None
+    if appearance.get("revision") is not None:
+        revision = _area_page_revision(area, appearance)
+        if revision is not None:
+            representation = REPRESENTATION_APPEARANCE
+    if representation is None and C.area_surface_drawable(
+            store, area.world_id, area.session_id, area.area_id):
+        revision = _area_surface_revision(area)
+        if revision is not None:
+            representation = REPRESENTATION_SURFACE
+    if representation is None:
+        raise _area_not_drawable(store, area)
+    return {"session_id": area.session_id, "area_id": area.area_id,
+            "representation": representation, "revision": revision,
+            "live": _area_live(area), "appearance": appearance}
+
+
+def area_appearance_manifest(store: WorldStore, world_id: str, session_id: str,
+                             area_id: str):
+    """(payload, effective label, imagery) of the area's appearance manifest, with
+    `currency`, under APPEARANCE §9 in every respect (§5.3). Raises the appearance
+    adapter's `AppearanceNotServed`."""
+    from tower.results.world_builder_appearance import (  # noqa: PLC0415
+        AppearanceNotServed,
+        _imagery,
+        _label,
+    )
+    from tower.world_builder import appearance_pipeline as AP  # noqa: PLC0415
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    try:
+        area = resolve_area(store, world_id, session_id, area_id)
+    except AreaUnavailable as exc:
+        raise AppearanceNotServed(exc.reason) from None
+    manifest, reason = C.area_appearance_servable(store, area.world_id, area.session_id,
+                                                  area.area_id, world=area.world)
+    if manifest is None:
+        raise AppearanceNotServed(reason)
+    payload = dict(manifest)
+    payload["currency"] = AP.appearance_currency(area.view, area.world_id, area.session_id,
+                                                 manifest)
+    payload.setdefault("area", {"id": area.area_id, "levelled": _area_levelled(area)})
+    return payload, _label(manifest), _imagery(manifest)
+
+
+def area_appearance_file(store: WorldStore, world_id: str, session_id: str, area_id: str,
+                         kind: str, digest: str):
+    """(bytes, effective label, imagery) of a chunk or the proxy the area's current
+    manifest names (or one superseded less than 120 s ago), §5.3."""
+    from tower.results.world_builder_appearance import (  # noqa: PLC0415
+        AppearanceNotServed,
+        _imagery,
+        _label,
+    )
+    from tower.world_builder import appearance_pipeline as AP  # noqa: PLC0415
+    from tower.world_builder import components as C  # noqa: PLC0415
+
+    if kind not in ("chunk", "proxy") or not AP.is_digest(digest):
+        raise AppearanceNotServed("no such appearance file")
+    try:
+        area = resolve_area(store, world_id, session_id, area_id)
+    except AreaUnavailable as exc:
+        raise AppearanceNotServed(exc.reason) from None
+    manifest, reason = C.area_appearance_servable(store, area.world_id, area.session_id,
+                                                  area.area_id, world=area.world)
+    if manifest is None:
+        raise AppearanceNotServed(reason)
+    data = AP.read_appearance_file(area.view, area.world_id, area.session_id, kind, digest,
+                                   manifest)
+    if data is None:
+        raise AppearanceNotServed("no such appearance file")
+    return data, _label(manifest), _imagery(manifest)

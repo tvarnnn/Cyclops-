@@ -664,6 +664,15 @@ def assess(
                 stage = candidate
                 break
         if stage is None:
+            # THE ROOM OWES NOTHING; ITS AREAS MAY (WORLD-BUILDER-COMPONENTS.md
+            # §3.4, §7 rule 5). Asked only here, after the room, because the row
+            # carries an area's word only when the room's is settled -- and never
+            # of a session without a components record: `null` owes nothing, so
+            # no world is rebuilt into components by this tool.
+            areas = _assess_areas(store, world_id, session_id, session,
+                                  max_attempts=max_attempts)
+            if areas is not None:
+                return areas
             return no("nothing-interrupted",
                       "no photographic stage is in an interrupted state")
     else:
@@ -679,6 +688,10 @@ def assess(
                 return no("building-now",
                           "a photographic stage for this session is running "
                           "right now")
+            areas = _assess_areas(store, world_id, session_id, session,
+                                  max_attempts=max_attempts)
+            if areas is not None:
+                return areas
             return no(
                 "no-stage-record",
                 "this session has no stage record and no interrupted "
@@ -763,6 +776,214 @@ def assess(
     )
 
 
+# -- areas (WORLD-BUILDER-COMPONENTS.md §5.4, §7 rule 5) ---------------
+#
+# An AREA is a part of a walk the evidence gate did not place; it is built on its
+# own (`tower/world_builder/area_build.py`) after the room. Its work is owed exactly
+# when the session's components record -- written by the gate with the published
+# solve, and by nothing here -- names an area whose build is unsettled, which is the
+# same judgement the row's `photographic` block makes (`components.area_words`), so
+# the tool that builds the work and the row that reports it cannot disagree about it.
+#
+# THIS TOOL NEVER COMPUTES COMPONENTS. A session with no record (`components: null`,
+# every world built before the gate) owes no area work, whatever it looks like.
+
+# The verdict's `stage` for owed area work, and the attempt ledger's key for it: a
+# counter of its own, so a room that needed two attempts does not leave its areas one.
+AREAS_STAGE = "areas"
+
+
+def area_ledger_key(session_id: str) -> str:
+    return f"{session_id}#{AREAS_STAGE}"
+
+
+def _owed_areas(store: WorldStore, world_id: str, session_id: str, session):
+    """`(record, {area_id: word})` of the unsettled areas, or `(None, {})`.
+
+    Light on purpose: the survey runs at every Tower start over every session, and a
+    session without a record costs one `stat` here and imports nothing heavy."""
+    from tower.world_builder.components import (  # noqa: PLC0415
+        area_words,
+        read_components_record,
+    )
+    from tower.world_builder.photographic import is_unsettled  # noqa: PLC0415
+
+    record = read_components_record(store, world_id, session_id)
+    if record is None:
+        return None, {}
+    words = area_words(store, world_id, session_id, session, record)
+    return record, {aid: w for aid, w in words.items() if is_unsettled(w.get("state"))}
+
+
+def _assess_areas(store: WorldStore, world_id: str, session_id: str, session, *,
+                  max_attempts: int) -> "Verdict | None":
+    """A verdict about this session's AREAS, or None when they owe nothing (which
+    includes every session with no components record)."""
+    try:
+        _record, owed = _owed_areas(store, world_id, session_id, session)
+    except Exception as exc:  # noqa: BLE001 -- one session's areas, not the survey
+        logger.warning("[Tower][WorldBuilder] could not assess the areas of %s/%s: %s: %s",
+                       world_id, session_id, type(exc).__name__, exc)
+        return None
+    if not owed:
+        return None
+    if any(word.get("state") == "running" for word in owed.values()):
+        return Verdict(world_id, session_id, False,
+                       "an area of this session is being built right now",
+                       code="building-now", stage=AREAS_STAGE)
+    holder = store.lock_holder(world_id)
+    if holder is not None and holder["pid"] == os.getpid():
+        holder = None
+    if holder is not None and (holder["alive"] or holder["unreadable"]):
+        return Verdict(world_id, session_id, False,
+                       "this world's writer lock is held by another process",
+                       code="locked", stage=AREAS_STAGE)
+    attempts = read_attempts(store, world_id, area_ledger_key(session_id))
+    if attempts is None:
+        attempts = 0
+    if attempts >= max_attempts:
+        return Verdict(world_id, session_id, False,
+                       f"this tool has already started this session's areas {attempts} "
+                       f"times (the bound is {max_attempts}) and something ended it "
+                       "every time", code="attempt-bound", stage=AREAS_STAGE,
+                       attempts=attempts, exhausted=True)
+    return Verdict(world_id, session_id, True,
+                   f"{len(owed)} area(s) of this session are unsettled and nothing is "
+                   "building them", code="owed-area", stage=AREAS_STAGE,
+                   attempts=attempts)
+
+
+def build_session_areas(store: WorldStore, world_id: str, session_id: str, *,
+                        appearance: bool, prune_depth_work: bool, should_stop,
+                        stop_source=lambda: None, build: bool | None = None,
+                        area_ids=None) -> list:
+    """Build (or, with area builds off, decline) this session's unsettled areas, one
+    at a time, the stop checked between each. The caller holds the world's lock.
+
+    `build` None reads `TOWER_WORLD_AREA_BUILDS` (off: every owed area is recorded as
+    declined, a settled word, rather than left owed for ever). `area_ids` restricts
+    the set (the re-finish command passes every area). Returns one report per area.
+    """
+    from tower.config import world_area_builds_setting  # noqa: PLC0415
+    from tower.world_builder import area_build as AB  # noqa: PLC0415
+
+    session = store.read_session(world_id, session_id)
+    record, owed = _owed_areas(store, world_id, session_id, session)
+    if record is None:
+        return []
+    targets = list(area_ids) if area_ids is not None else list(owed)
+    build = world_area_builds_setting() if build is None else build
+    # The depth the area's levelling runs must be the depth its surface stage will
+    # ask for, or the predictions are made twice: `final_surface_stages` asks for the
+    # FoV-told depth exactly when the evidence gate is on.
+    try:
+        from tower.config import world_solve_gate_setting  # noqa: PLC0415
+
+        known_fov = bool(world_solve_gate_setting())
+    except Exception:  # noqa: BLE001
+        known_fov = False
+    reports = []
+    for area_id in targets:
+        if should_stop():
+            reports.append({"area_id": area_id, "built": False,
+                            "reason": f"stop requested ({stop_source()})"})
+            break
+        if not build:
+            AB.decline_area(store, world_id, session_id, area_id, record.sha1,
+                            AB.AREA_BUILDS_OFF_DETAIL)
+            reports.append({"area_id": area_id, "built": False, "declined": True,
+                            "reason": AB.AREA_BUILDS_OFF_DETAIL})
+            continue
+        reports.append(AB.build_area(
+            store, world_id, session_id, area_id, record,
+            final_surface_stages=final_surface_stages, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=should_stop,
+            stop_source=stop_source, depth_known_fov=known_fov))
+    return reports
+
+
+def finish_areas(store: WorldStore, verdict: Verdict, *, appearance: bool,
+                 prune_depth_work: bool, stop_request,
+                 max_forgiven: int = DEFAULT_MAX_FORGIVEN) -> dict:
+    """`finish`, for owed area work: the same lock, attempt and forgiveness
+    discipline, on the areas' own ledger key."""
+    key = area_ledger_key(verdict.session_id)
+    report: dict = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+                    "stage": AREAS_STAGE}
+    engine = WorldBuilderEngine(store)
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+        return report
+    disarm = None
+    try:
+        try:
+            report["attempts"] = record_attempt(store, verdict.world_id, key,
+                                                detail="finishing this session's areas")
+        except Exception as exc:  # noqa: BLE001
+            report.update({"finished": False,
+                           "reason": f"the attempt could not be counted, so it was not "
+                                     f"started: {type(exc).__name__}: {exc}"})
+            return report
+        disarm = _forgive_on_stop(
+            stop_request,
+            lambda source: forgive_attempt(store, verdict.world_id, key,
+                                           detail=f"stopped ({source})",
+                                           max_forgiven=max_forgiven))
+        prewarm_world_builder()
+        report["areas"] = build_session_areas(
+            store, verdict.world_id, verdict.session_id, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
+            stop_source=lambda: stop_request.source)
+        report["finished"] = True
+    except Exception as exc:  # noqa: BLE001 -- recorded on the area, then reported
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if disarm is not None:
+            forgiven = disarm()
+            if not forgiven and stop_request.asked:
+                forgive_attempt(store, verdict.world_id, key,
+                                detail=f"stopped ({stop_request.source})",
+                                max_forgiven=max_forgiven)
+        engine.release_world(verdict.world_id)
+    return report
+
+
+def _retire_areas(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
+    """`_retire` for area work: every still-unsettled area is recorded `failed`,
+    once, under the lock, after re-assessing underneath it."""
+    from tower.world_builder import area_build as AB  # noqa: PLC0415
+
+    out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+           "retired": AREAS_STAGE, "attempts": verdict.attempts}
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update({"retired": None, "reason": f"{type(exc).__name__}: {exc}"})
+        return out
+    try:
+        again = assess(store, verdict.world_id, verdict.session_id,
+                       max_attempts=max_attempts)
+        if not (again.exhausted and again.stage == AREAS_STAGE):
+            out.update({"retired": None, "reason": f"no longer {verdict.code}: {again.code}"})
+            return out
+        session = store.read_session(verdict.world_id, verdict.session_id)
+        record, owed = _owed_areas(store, verdict.world_id, verdict.session_id, session)
+        detail = (f"scripts/world_finish_pending.py started this session's areas "
+                  f"{verdict.attempts} times (bound {max_attempts}) and something ended "
+                  "it on its own every time; not retrying. scripts/world_refinish.py "
+                  "rebuilds them by hand.")
+        for area_id in owed:
+            AB.area_recorder(store, verdict.world_id, verdict.session_id, area_id,
+                             record.sha1)(STAGE_SURFACE, state=STAGE_STATE_FAILED,
+                                          detail=detail)
+        out["areas"] = list(owed)
+    finally:
+        store.release_writer_lock(verdict.world_id)
+    return out
+
+
 def survey(store: WorldStore, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> list:
     """Every session under the root, assessed. Reads only."""
     verdicts = []
@@ -807,6 +1028,8 @@ def _retire(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
     lock closes the window, and the second `assess` is what makes taking it
     worth anything.
     """
+    if verdict.stage == AREAS_STAGE:
+        return _retire_areas(store, verdict, max_attempts)
     out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
            "retired": verdict.stage, "attempts": verdict.attempts}
     try:
@@ -897,6 +1120,10 @@ def finish(
     after a successful pair, so an appearance-only rebuild has, in the common
     case, nothing left to read.
     """
+    if verdict.stage == AREAS_STAGE:
+        return finish_areas(store, verdict, appearance=appearance,
+                            prune_depth_work=prune_depth_work,
+                            stop_request=stop_request, max_forgiven=max_forgiven)
     report: dict = {
         "world_id": verdict.world_id,
         "session_id": verdict.session_id,

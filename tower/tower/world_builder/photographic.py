@@ -336,7 +336,37 @@ def _liveness(store, world_id, session_id, stage_hint):
 
 
 def photographic_state(store, world_id: str, session_id: str, session) -> dict:
-    """Where this session's photographic representation has got to.
+    """Does this world still owe photographic work -- the ROOM AND ITS AREAS.
+
+    The block the listing row and the status channel's `lifecycle.photographic`
+    both carry (WORLD-BUILDER-COMPONENTS.md §3.4, C1 E3). For a session with no
+    components record -- every session built before the evidence gate, and every
+    session of a Tower with it switched off -- this IS `room_photographic_state`,
+    byte for byte: no `scope`, no area probe beyond one `stat` of the record.
+
+    For a session with one: the room's word when the room is unsettled, else the
+    first unsettled area's word (`scope: "area"`, a `detail` naming *an area of
+    this walk*), else the room's word; `scope` says which
+    (`components.combine_photographic`). An area's `failed` never reaches here.
+
+    Never raises. A failure in the area half keeps the room's word and is logged:
+    the room is the thing the row has always been about, and a broken area probe
+    must not take it down.
+    """
+    room = room_photographic_state(store, world_id, session_id, session)
+    try:
+        from tower.world_builder.components import with_areas  # noqa: PLC0415
+
+        return with_areas(store, world_id, session_id, session, room)
+    except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+        _warn_unobservable(
+            f"{world_id}/{session_id}: the areas' photographic state could not be "
+            f"computed: {type(exc).__name__}", exc)
+        return room
+
+
+def room_photographic_state(store, world_id: str, session_id: str, session) -> dict:
+    """Where this session's photographic ROOM has got to (its own build only).
 
     Returns `{"state": <one of PHOTOGRAPHIC_STATES>, "stage": str | None,
     "detail": str}`. Never raises: a probe that fails becomes
