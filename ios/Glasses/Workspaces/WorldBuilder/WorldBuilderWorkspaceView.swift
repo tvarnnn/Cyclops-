@@ -166,7 +166,11 @@ struct WorldBuilderWorkspaceView: View {
             WorldRenderViewerView(
                 target: target,
                 title: world.state.snapshot?.name,
-                note: viewerNote
+                note: viewerNote,
+                // The status channel's `lifecycle.finalization` is the same
+                // record as the row's; when the Tower carries the v6 notice
+                // there too, the live screen's room shows it. `nil` otherwise.
+                notice: world.finalization?.notice
             )
         }
         // The World Builder cartridge session: `start` on appearance and

@@ -647,3 +647,119 @@ final class WorldRoomComponentsTests: XCTestCase {
         XCTAssertNil(area.components, "an area viewer never shows an areas row")
     }
 }
+
+// MARK: - `finalization.notice` (contract v6, G1-F2)
+
+@MainActor
+final class WorldFinalizationNoticeTests: XCTestCase {
+
+    /// §3.1's sentence for masks that are off, as a row would carry it.
+    private let masksOff = "masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); "
+        + "an operator can turn them on, then an owner can re-finish this walk"
+
+    private func row(finalization: Any?, components: Any? = nil) throws -> WorldListingSession {
+        var json = V2.row(components: components)
+        json["finalization"] = finalization
+        return try XCTUnwrap(WorldListingSession(json: json))
+    }
+
+    func testTheNoticeIsReadVerbatim() throws {
+        let joined = masksOff + "; the evidence gate could not measure metric scale (depth did not finish); "
+            + "the Tower re-runs the gate when it is idle"
+        let session = try row(finalization: ["state": "complete", "final_solve": "solved", "detail": NSNull(),
+                                             "notice": joined])
+        XCTAssertEqual(session.finalization?.notice, joined, "verbatim: joined causes, punctuation and all")
+        XCTAssertEqual(session.finalization?.finalSolve, "solved")
+    }
+
+    /// Absent is today's row, byte for byte (§7 rule 1).
+    func testAbsentOrUnusableIsNoNotice() throws {
+        XCTAssertNil(try row(finalization: ["state": "complete", "final_solve": "solved"]).finalization?.notice)
+        for value in [NSNull(), "", "   \n", 7, ["text": "x"], true] as [Any] {
+            let session = try row(finalization: ["state": "complete", "final_solve": "solved", "notice": value])
+            XCTAssertNil(session.finalization?.notice, "\(value)")
+            XCTAssertNotNil(session.finalization, "a bad notice does not cost the finalization record")
+        }
+        XCTAssertNil(try row(finalization: NSNull()).finalization)
+    }
+
+    /// `detail` keeps its meaning and is never shown in the notice's place.
+    func testDetailIsNotTheNotice() throws {
+        let session = try row(finalization: ["state": "complete", "final_solve": "solved",
+                                             "detail": "Traceback (most recent call last): …"])
+        XCTAssertNil(session.finalization?.notice)
+        XCTAssertNil(WorldPickerView.notice(forOpened: session, target: WorldRenderTarget(worldID: "w1", sessionID: "s1")))
+    }
+
+    /// Shown for the ROOM, whatever `components` says -- a walk whose gate
+    /// raised has `components: null` and can still carry one -- and never on
+    /// an area's screen.
+    func testTheNoticeBelongsToTheRoomRegardlessOfComponents() throws {
+        let room = WorldRenderTarget(worldID: "w1", sessionID: "s1")
+        let gateRaised = try row(finalization: ["state": "complete", "final_solve": "solved",
+                                                "notice": "the evidence gate failed (a Tower error); the Tower re-runs it when it is idle"],
+                                 components: nil)
+        XCTAssertNil(gateRaised.components)
+        XCTAssertEqual(WorldPickerView.notice(forOpened: gateRaised, target: room),
+                       "the evidence gate failed (a Tower error); the Tower re-runs it when it is idle")
+        let withAreas = try row(finalization: ["state": "complete", "final_solve": "solved", "notice": masksOff],
+                                components: V2.components)
+        XCTAssertEqual(WorldPickerView.notice(forOpened: withAreas, target: room), masksOff)
+        XCTAssertNil(WorldPickerView.notice(forOpened: withAreas, target: room.area(V2.bathroomID)),
+                     "an area's screen does not repeat the walk's notice")
+        XCTAssertNil(WorldPickerView.notice(forOpened: nil, target: room), "a world row that named no session")
+    }
+
+    /// The same record on the status channel (`lifecycle.finalization`) decodes
+    /// the notice too, for the live screen's room.
+    func testTheStatusChannelsFinalizationCarriesItToo() {
+        let payload: [String: Any] = ["lifecycle": ["finalization": [
+            "state": "complete", "final_solve": "solved", "notice": masksOff]]]
+        XCTAssertEqual(WorldBuilderResultDecoder.finalization(from: payload)?.notice, masksOff)
+    }
+
+    /// A notice arriving or leaving is a change the view model republishes
+    /// (the report is `Equatable` over it), so it cannot stick on screen after
+    /// the owed work is done.
+    func testANoticeArrivingOrLeavingIsAChange() {
+        let owed = WorldFinalizationReport(state: .complete, finalSolve: "solved", notice: masksOff)
+        let done = WorldFinalizationReport(state: .complete, finalSolve: "solved")
+        XCTAssertNotEqual(owed, done)
+    }
+}
+
+// MARK: - Contract v7's reason `seed-unstable` (rule 8: unknown reasons are generic)
+
+@MainActor
+final class WorldComponentsUnknownReasonTests: XCTestCase {
+
+    /// v7 (H2 consensus) adds `seed-unstable`. This build has no copy for any
+    /// reason -- §8 shows none -- so a new one changes nothing a wearer sees:
+    /// the entry decodes, the area opens, the line is the same.
+    func testSeedUnstableIsCarriedAndChangesNothingOnScreen() throws {
+        var list = V2.components
+        list[1]["reason"] = "seed-unstable"
+        list[1]["reasons"] = ["seed-unstable", "single-unconfirmed-link"]
+        list[3]["reason"] = "seed-unstable"
+        list[3]["reasons"] = ["seed-unstable"]
+        let components = try XCTUnwrap(WorldComponents(json: list))
+        XCTAssertEqual(components.areas.map(\.id), [V2.bedID, V2.bathroomID])
+        XCTAssertEqual(components.areas[0].reason, "seed-unstable")
+        XCTAssertEqual(components.areas[0].reasons, ["seed-unstable", "single-unconfirmed-link"])
+        XCTAssertEqual(WorldComponentsPresentation.availability(of: components.areas[0]), .opens)
+        let baseline = try XCTUnwrap(WorldComponents(json: V2.components))
+        XCTAssertEqual(WorldComponentsPresentation.areaLine(number: 1, area: components.areas[0]),
+                       WorldComponentsPresentation.areaLine(number: 1, area: baseline.areas[0]))
+        XCTAssertEqual(WorldComponentsPresentation.footer(components), WorldComponentsPresentation.footer(baseline))
+        XCTAssertEqual(WorldComponentsPresentation.areasHeading(components),
+                       WorldComponentsPresentation.areasHeading(baseline))
+    }
+
+    /// A `placed` entry is only ever the room: a reason on it (which the Tower
+    /// never sends) does not stop the list being trusted.
+    func testAReasonWordNeverDecidesWhetherTheListIsTrusted() throws {
+        var list = V2.components
+        list[0]["reason"] = "seed-unstable"
+        XCTAssertNotNil(WorldComponents(json: list))
+    }
+}

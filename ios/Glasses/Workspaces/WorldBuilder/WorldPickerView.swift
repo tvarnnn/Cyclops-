@@ -108,6 +108,7 @@ struct WorldPickerView: View {
                     title: target.isArea ? nil : openedTitle,
                     note: target.isArea ? nil : openedNote,
                     components: target.isArea ? nil : openedSession?.components,
+                    notice: Self.notice(forOpened: openedSession, target: target),
                     area: target.isArea ? openedArea : nil,
                     // REPLACE, never stack (C1 E5): one destination slot, so
                     // setting it to the area swaps the room's scene -- its
@@ -230,6 +231,15 @@ struct WorldPickerView: View {
             return note
         }
         return settled
+    }
+
+    /// The walk's `finalization.notice` for the pushed ROOM, from its listing
+    /// row (v6, §8), or `nil`: for an area, for a world row that named no
+    /// session, and for a row without one. Independent of `components` -- a
+    /// walk whose gate raised has `components: null` and can still carry one.
+    static func notice(forOpened session: WorldListingSession?, target: WorldRenderTarget) -> String? {
+        guard !target.isArea else { return nil }
+        return session?.finalization?.notice
     }
 
     private var openedEntry: WorldListingEntry? {

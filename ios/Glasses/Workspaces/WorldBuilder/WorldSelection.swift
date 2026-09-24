@@ -121,20 +121,32 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
     var startedAt: Double?
     var updatedAt: Double?
     /// The builder's prose — an error text when the state is `interrupted`.
+    /// **Not for display** (`WORLD-BUILDER-COMPONENTS.md` §3.1, v6): it can
+    /// carry an error string. `notice` is the sentence meant for the owner.
     var detail: String?
+    /// `finalization.notice` (v6, `WORLD-BUILDER-COMPONENTS.md` §3.1, §8):
+    /// what the evidence gate could not do for this walk, and who can fix it
+    /// -- an owner, an operator, the idle Tower, or a new walk. Shown
+    /// **verbatim** below the room caption, as a plain note, never matched
+    /// on: the wording is the Tower's and may change between Towers. `nil`
+    /// when absent -- every older session, and every gated session with
+    /// nothing owed -- and for anything that is not a non-empty string.
+    var notice: String?
 
     init(
         state: WorldFinalizationState,
         finalSolve: String? = nil,
         startedAt: Double? = nil,
         updatedAt: Double? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        notice: String? = nil
     ) {
         self.state = state
         self.finalSolve = finalSolve
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.detail = detail
+        self.notice = notice
     }
 
     /// `nil` for `null`, for an absent key, and for a block with no `state`
@@ -149,6 +161,16 @@ nonisolated struct WorldFinalizationReport: Equatable, Sendable {
         self.startedAt = json["started_at"] as? Double
         self.updatedAt = json["updated_at"] as? Double
         self.detail = json["detail"] as? String
+        self.notice = Self.notice(json["notice"])
+    }
+
+    /// The notice as sent, or `nil`: absent, `null`, not a string, or nothing
+    /// but whitespace. The text itself is kept exactly as the Tower wrote it.
+    nonisolated static func notice(_ value: Any?) -> String? {
+        guard let text = value as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return text
     }
 }
 
