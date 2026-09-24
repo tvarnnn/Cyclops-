@@ -15,6 +15,7 @@
 > not run. v6 (2026-09-24) adds `finalization.notice` (§3.1, §8).
 > v7 (2026-09-24) adds the reason `seed-unstable` (§2.2; consensus, §2.5), frozen
 > matching, the depth-prediction cache and the re-finish's raw frames by capture identity (§7 rule 4).
+> v8 (2026-09-24): `finalization.notice` is a closed set of sentences (§3.1); P3.6 manifest keys (§2.5).
 > Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
@@ -188,6 +189,10 @@ reader, the physical test or the harness can tell what produced `components`:
 | `gate.consensus` | **Consensus** (v7): `requested` (N), `unit: mapper-seed`, `seeds`, `state` (`applied`, `not-needed`, `deferred`, `not-run` or `not-applied`, with why), per-draw summaries (seed, seconds, `solve_identity`, room keyframes, votes, agreement), the chosen draw, and per group its votes, `ambiguous` (not unanimous) and its decision (`anchor`, `attached`, `seed-unstable` or `unplaced`). Each draw's per-round gate decisions are in `solve/<s>/consensus.json`. A minority piece inside the published anchor block cannot be withheld (the anchor is never withheld) and is reported in `gate.consensus.pieces`. Absent when N = 1 |
 | `solve.frames_ambiguous_by_name` | Present only when > 0: keyframes whose raw frame name was found in more than one capture directory, so the stored keyframe was used instead of a guess (v7). The re-finish never reaches this lookup: it assigns raw frames by capture identity (`source_seq` + `received_at`, section 7 rule 4) |
 | `gate.depth.predictions` | `{token, cached, predicted}`. The gate's MoGe predictions are cached per exact input pixels under `dense/<s>/predictions/<token>/` (v7, V8 H2), so a re-finish does not recompute them on the GPU. The fit to this solve is always recomputed |
+| `transients.images_excluded`, `excluded_reasons`, `retried`, `exclusion_notice_due`, `none_masked` | (v8, V9 M-8) an image that cannot be masked is excluded after one retry of its hash and its read; `excluded_reasons` counts why (`hash-failed`, `read-failed`, `undecodable`, `wrong-size`, `no-mask`); `exclusion_notice_due` when at least max(3, 2 %) of images were excluded (a notice follows); when NO image could be masked the state is `unavailable` with cause `images-unmaskable` and `none_masked` |
+| `gate.consensus` (v8 additions) | `state` also `partial` (fewer voting draws than requested; only draws whose gate attached vote), `not-applied` (the withhold failed its per-keyframe check: the chosen draw is published unchanged) and `deferred` by a stop (draw 0 published, `cause: consensus-deferred`, owed); `held_against_majority` (keyframes the published room holds that a strict majority of voting draws did not attach, anchor included: the M-2 visibility count); a group decision `kept` (it holds a keyframe every voting draw attached, so it is never withheld); `groups[].keyframe_ids` and `pieces[].keyframe_ids` |
+| `solve.revisit_pairs` (v8 additions) | `created_by_import`, `removed_below_floor`, `kept_existing`: the floor removes only pairs the import created; imported pairs live only in the mapped copy, never the walk database |
+| `images.provenance.json` (solve workspace) | (v8, V9 M-7) where each solver image came from (raw frame by capture identity, or the stored redacted keyframe). The re-finish carries an image back only when its provenance matches the plan; a solve rewrites an image whose provenance differs or is unknown |
 
 ## 3. Where `components` appears
 
@@ -216,22 +221,50 @@ Tower, or a new walk. It is absent on every older session and whenever nothing i
 are byte for byte as before (§7 rule 1). It **replaces nothing**: `finalization.detail` keeps its own
 meaning. `detail` can carry an error string; `notice` never does.
 
-The sentences, informative only. The phone shows the string verbatim and **never matches on it**:
+**The closed set (v8, review V9 M-4, manager 025).** The Tower writes `notice` ONLY from these sentences,
+joined by `"; "` when several causes apply (masks first, then scale or the gate). The fields are
+the only variable text: `{unmasked}`, `{images}` and `{excluded}` are integer image counts, `{attempts}` is an integer, and
+`{what}` is one of the gate clauses of this table (the `gate-failed*`, `depth-*`, `scale-short` and
+`consensus-deferred` sentences up to their first `;`). No exception text, path, username or measured
+figure is ever in a notice; the diagnostics are in `finalization.detail`, which the phone does not
+show. The phone renders each verbatim and never matches on it (Mac `de1b045` also replaces anything
+that looks like machine output). The set is exported by the Tower as
+`coherence_publish.NOTICE_SENTENCES` plus the finisher's three sentences.
 
 | Cause | Sentence |
 |---|---|
-| masks: GPU out of memory | *masks were not applied (GPU out of memory); an owner can re-finish this walk* |
-| masks: off on this Tower | *masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk* |
-| masks: detector did not run | *masks were not applied (&lt;why&gt;); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
-| masks: fallback rule | *masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk* |
-| scale: depth did not finish | *the evidence gate could not measure metric scale (&lt;why&gt;); the Tower re-runs the gate when it is idle* |
-| scale: too few cameras with a level, depth in hand | *the evidence gate had too little metric scale to place pieces by it (&lt;why&gt;); the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk* |
-| gate raised | *the evidence gate failed (&lt;why&gt;); the Tower re-runs it when it is idle* |
-| re-gate given up at its bound (replaces the scale-depth or gate-raised sentence) | *the evidence gate could not measure metric scale (&lt;why&gt;)* or *the evidence gate failed (&lt;why&gt;)*, then *; the idle Tower re-ran the gate N times without finishing it and has stopped trying; an owner can re-finish this walk* |
+| `masks-gpu-oom` | *masks were not applied (GPU out of memory); an owner can re-finish this walk* |
+| `masks-off` | *masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); an operator can turn them on, then an owner can re-finish this walk* |
+| `masks-no-gpu` | *masks were not applied (no GPU could run the transient detector); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-not-installed` | *masks were not applied (the transient detector is not installed on this Tower); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-detector-failed` | *masks were not applied (the transient detector failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-step-failed` | *masks were not applied (the mask step failed); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-no-image` | *masks were not applied (no solver image could be masked); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-none` | *masks were not applied (no solver image could be masked); an owner can re-finish this walk* |
+| `masks-unavailable` | *masks were not applied (the transient detector could not run); an operator can make the transient detector run on this Tower, then an owner can re-finish this walk* |
+| `masks-fallback` | *masks were applied by OneFormer alone, not by the union rule the evidence gate needs; an operator can make Grounding DINO and SAM available on this Tower, then an owner can re-finish this walk* |
+| `masks-partial` | *masks were not applied to {unmasked} of {images} images; an owner can re-finish this walk* |
+| `masks-partial-uncounted` | *masks were not applied to some of its images; an owner can re-finish this walk* |
+| `masks-excluded` | *{excluded} of {images} images could not be masked and were left out of the solve; an owner can re-finish this walk* |
+| `masks-excluded-uncounted` | *some images could not be masked and were left out of the solve; an owner can re-finish this walk* |
+| `gate-failed` | *the evidence gate failed (an internal error); the Tower re-runs it when it is idle* |
+| `gate-failed-database` | *the evidence gate failed (the solve's feature database could not be read); the Tower re-runs it when it is idle* |
+| `gate-failed-memory` | *the evidence gate failed (out of memory); the Tower re-runs it when it is idle* |
+| `depth-unavailable` | *the evidence gate could not measure metric scale (the depth stage did not finish); the Tower re-runs the gate when it is idle* |
+| `depth-stopped` | *the evidence gate could not measure metric scale (the depth stage was stopped); the Tower re-runs the gate when it is idle* |
+| `depth-gpu-oom` | *the evidence gate could not measure metric scale (GPU out of memory); the Tower re-runs the gate when it is idle* |
+| `depth-model-missing` | *the evidence gate could not measure metric scale (the depth model is not installed on this Tower); the Tower re-runs the gate when it is idle* |
+| `depth-surface-busy` | *the evidence gate could not measure metric scale (another surface build of this walk was running); the Tower re-runs the gate when it is idle* |
+| `depth-no-intrinsics` | *the evidence gate could not measure metric scale (the walk has no camera intrinsics); the Tower re-runs the gate when it is idle* |
+| `depth-no-camera` | *the evidence gate could not measure metric scale (the solve has no camera); the Tower re-runs the gate when it is idle* |
+| `scale-short` | *the evidence gate had too little metric scale to place pieces by it; the depth stage ran to the end, so re-running the gate would not change this; an owner can re-capture this walk* |
+| `consensus-deferred` | *the evidence gate's consensus of mapper seeds was stopped before its draws voted; the Tower re-runs it when it is idle* |
+| `regate-given-up` | *{what}; the idle Tower re-ran the gate {attempts} times without finishing it and has stopped trying; an owner can re-finish this walk* |
+| `regate-refused-notice` | *{what}; the idle Tower cannot re-run the gate on this solve; an owner can re-finish this walk* |
+| `refinish-parked-notice` | *a re-finish of this walk stopped part-way and the Tower could not put the previous result back; an owner can re-run the re-finish* |
 
-`<why>` is a short Tower-written phrase with no metric figure (§2.4 rule 6). When the owed work is done,
-for example after a re-gate in place succeeds, the key is removed. The listing's `contract` identifier
-does not move, for the reason above.
+The key is removed when the owed work is done (for example after a re-gate in place succeeds). The
+listing's `contract` identifier does not move, for the reason above.
 
 ### 3.2 On `GET /worlds/{w}/render/revision` — additive
 
