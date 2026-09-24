@@ -93,7 +93,13 @@ nonisolated enum WorldListingPresentation {
         if let state = session.state {
             switch state {
             case .receiving: return "Building"
-            case .finalizing: return "Finishing"
+            case .finalizing:
+                // The room is finished and only one of the walk's areas is
+                // still being made (`scope: "area"`, COMPONENTS §3.4): the
+                // walk is complete as far as its room goes, and the caption
+                // says an area is not.
+                if session.photographic?.standing.isAreaStillFinishing == true { return "Complete" }
+                return "Finishing"
             case .complete:
                 // The same rule `WorldStage.stage` applies to `.finalized`:
                 // a record whose final solve was skipped, failed or
@@ -197,6 +203,10 @@ nonisolated enum WorldListingPresentation {
     /// truer thing). Every other word adds nothing to a row, and silence keeps
     /// an older world's row exactly as it was.
     static func photographicCaption(for session: WorldListingSession) -> String? {
+        if session.state == .finalizing, session.photographic?.standing.isAreaStillFinishing == true {
+            let count = session.components.map(\.areasStillFinishing).flatMap { $0 > 0 ? $0 : nil }
+            return WorldPhotographicCopy.areasStillFinishingCaption(count: count)
+        }
         guard session.state == .complete,
               session.photographic?.standing.isFailed == true,
               !WorldFinalSolve(word: session.finalization?.finalSolve).deniesAFinishedWorld

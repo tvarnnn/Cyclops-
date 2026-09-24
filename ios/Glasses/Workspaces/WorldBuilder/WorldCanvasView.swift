@@ -228,7 +228,7 @@ struct WorldCanvasView: View {
             // thing the Tower had carefully declined to say.
             stageHeadline(fallback: "Finalizing", systemImage: "cube")
             worldName(snapshot)
-            if buildInProgress == true {
+            if presentation.showsLiveBuild(buildInProgress: buildInProgress) {
                 HStack(spacing: 10) {
                     ProgressView()
                     Text("The Tower is finishing this world.")
@@ -461,6 +461,12 @@ struct WorldCanvasView: View {
     /// other world -- a finished world does not need a line saying so.
     @ViewBuilder
     private var photographicFailureNote: some View {
+        if presentation.isSavedWithAnAreaStillFinishing {
+            // Normally reached through the `.finalizing` arm, whose sentence
+            // says it; kept here for a Tower that settles the walk's word
+            // before its areas.
+            detailText(WorldPhotographicCopy.areaStillFinishing())
+        }
         if presentation.isSavedWithoutItsPhotographicVersion {
             detailText(WorldPhotographicCopy.failedExplanation)
             if case .failed(let detail) = presentation.photographic?.standing,

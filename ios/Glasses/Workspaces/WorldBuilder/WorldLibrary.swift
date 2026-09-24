@@ -55,9 +55,13 @@ nonisolated struct WorldListingSession: Equatable, Sendable {
     /// Where this session's photographic room has got to (WORLDS §2a):
     /// always present on a Tower since 2026-09-22, `nil` on an older one.
     /// The same block, and the same decoder, as the status channel's
-    /// `lifecycle.photographic`. (Contract v2's `components[]` will sit beside
-    /// it, each entry carrying its own block through the same decoder.)
+    /// `lifecycle.photographic`.
     let photographic: WorldPhotographicReport?
+    /// The walk's pieces after the evidence gate: the room and the areas it
+    /// could not place (`WORLD-BUILDER-COMPONENTS.md` §2, §3.1). `nil` means
+    /// **not computed** -- every world built before the gate, and every list
+    /// the phone could not trust (rule 8) -- never "no areas".
+    let components: WorldComponents?
 
     /// The record is open and the Tower did **not** call it abandoned. On a
     /// Tower that does not send `abandoned`, the record being open is all
@@ -108,6 +112,7 @@ nonisolated extension WorldListingSession {
         self.state = (json["state"] as? String).map(WorldListingSessionState.init(rawValue:))
         self.finalization = WorldFinalizationReport(json: json["finalization"])
         self.photographic = WorldPhotographicReport(json: json["photographic"])
+        self.components = WorldComponents(json: json["components"])
     }
 }
 

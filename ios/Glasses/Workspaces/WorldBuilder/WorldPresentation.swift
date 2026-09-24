@@ -507,7 +507,7 @@ enum WorldStage: Equatable {
             return nil
         case .receiving:
             return evidence?.hasGeometry == true ? .building : .mapping
-        case .finalizing(_, let buildInProgress):
+        case .finalizing(let snapshot, let buildInProgress):
             // "Improving" is claimed only where there is something to improve,
             // and either a live process working on it right now
             // (`build_in_progress: true`) or the Tower's settled word that the
@@ -525,6 +525,15 @@ enum WorldStage: Equatable {
             // ladder say WHY in words that are true of each case, and draw a
             // spinner only for a live build.
             guard evidence?.hasGeometry == true else { return .finalizing }
+            // The ROOM is finished and only one of the walk's areas is still
+            // being made (`scope: "area"`, COMPONENTS §3.4). The Tower keeps
+            // the whole walk `finalizing` until every area settles, and says
+            // `build_in_progress: true` while an area builds (C1 E13) -- but
+            // the room on screen will not change, so it is judged exactly as
+            // the finished world it is. The canvas adds the area's sentence.
+            if photographic?.standing.isAreaStillFinishing == true {
+                return stage(for: .finalized(snapshot), evidence: evidence, finalization: finalization)
+            }
             if buildInProgress == true { return .improving }
             if photographic?.standing.isUnfinished == true { return .improving }
             return .finalizing
@@ -763,12 +772,28 @@ struct WorldPresentation: Equatable {
         return stage?.label
     }
 
+    /// A finished room with one of the walk's areas still being made
+    /// (`scope: "area"`): the room is saved; say so, and that an area is not.
+    var isSavedWithAnAreaStillFinishing: Bool {
+        photographic?.standing.isAreaStillFinishing == true
+            && (stage == .saved || stage == .partial)
+    }
+
+    /// Whether the canvas may draw the live-build spinner: a live process
+    /// (`build_in_progress: true`) working on THIS picture. Not while only an
+    /// area is building -- the room on screen will not change.
+    func showsLiveBuild(buildInProgress: Bool?) -> Bool {
+        buildInProgress == true && photographic?.standing.isAreaStillFinishing != true
+    }
+
     /// What the 3D viewer says above its caption when it is opened from this
-    /// screen: the ladder's note for an unfinished world, or the failed
-    /// photographic build's explanation for a saved one. `nil` otherwise.
+    /// screen: the ladder's note for an unfinished world, the failed
+    /// photographic build's explanation for a saved one, or that an area of
+    /// the walk is still being finished. `nil` otherwise.
     var viewerNote: String? {
         if case .partial(_, let note) = reconstruction { return note }
         if isSavedWithoutItsPhotographicVersion { return WorldPhotographicCopy.failedHeadline + "." }
+        if isSavedWithAnAreaStillFinishing { return WorldPhotographicCopy.areaStillFinishing() }
         return nil
     }
 
@@ -792,6 +817,12 @@ struct WorldPresentation: Equatable {
     static func finalizingDetail(
         buildInProgress: Bool?, photographic: WorldPhotographicReport?
     ) -> String {
+        // First: with an area building, `build_in_progress` is `true` (C1
+        // E13), and "the final solve, the final build … these figures are not
+        // final" would be false of a room that is finished.
+        if photographic?.standing.isAreaStillFinishing == true {
+            return WorldPhotographicCopy.areaStillFinishing()
+        }
         if buildInProgress == true {
             return "The Tower is still finishing this world: the final solve, the final build "
                 + "and the photographic reconstruction all run after the session stops, and "
@@ -801,7 +832,7 @@ struct WorldPresentation: Equatable {
         case .owed: return WorldPhotographicCopy.owedSentence
         case .unobservable: return WorldPhotographicCopy.unobservableSentence
         case .building: return WorldPhotographicCopy.buildingSentence
-        case .failed, .settled, nil: break
+        case .failed, .settled, .areaStillFinishing, nil: break
         }
         if buildInProgress == false {
             return "Capture has ended and these figures are not final. The Tower reports that "
@@ -871,7 +902,7 @@ enum WorldReconstruction: Equatable {
         case .unobservable:
             return WorldPhotographicCopy.unobservableSentence + " "
                 + WorldPhotographicCopy.finishedLooksDifferent
-        case .building, .failed, .settled, nil:
+        case .building, .failed, .settled, .areaStillFinishing, nil:
             return nil
         }
     }
