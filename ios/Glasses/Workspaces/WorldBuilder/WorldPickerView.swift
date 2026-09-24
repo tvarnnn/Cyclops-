@@ -124,7 +124,8 @@ struct WorldPickerView: View {
         return Self.note(
             forOpened: session, target: opened,
             pinnedStage: pinned ? world.presentation.stage : nil,
-            pinnedReconstruction: pinned ? world.presentation.reconstruction : nil
+            pinnedReconstruction: pinned ? world.presentation.reconstruction : nil,
+            pinnedPhotographic: pinned ? world.presentation.photographic : nil
         )
     }
 
@@ -146,18 +147,38 @@ struct WorldPickerView: View {
     ///
     /// So such a row gets the ladder's note: the pin's own live one once its
     /// report has arrived — so the sentence leaves when the build lands, rather
-    /// than when this list is next refreshed — and until then the note for the
-    /// stage the row's word stands for. `finalizing` in the listing is always a
-    /// live process's evidence (a held lock, or a photographic stage running),
-    /// which is exactly what `.improving` claims.
+    /// than when this list is next refreshed — and until then the note for
+    /// what the row says.
+    ///
+    /// ## `finalizing` is NOT always a live process (corrected 2026-09-23)
+    ///
+    /// This said it was: "a held lock, or a photographic stage running". Since
+    /// the Tower's `photographic` block (WORLDS §2a) a row is also `finalizing`
+    /// when its photographic room is `owed` -- nothing is building it, and it
+    /// waits for an idle Tower with its photographic stages on -- or
+    /// `unobservable`. The Improving note's "it is worth waiting for Saved" is
+    /// a promise neither can keep (Mac gate B0, F3). So the row's own
+    /// `photographic` word picks the note, through the same ladder the canvas
+    /// uses; a row with no word (an older Tower, whose `finalizing` really was
+    /// a live lock) keeps the Improving note.
+    ///
+    /// **A settled row whose photographic build failed** says so: the one
+    /// case `WORLD-BUILDER-IOS.md` §3a says is worth new copy.
     static func note(
         forOpened session: WorldListingSession,
         target: WorldRenderTarget,
         pinnedStage: WorldStage?,
-        pinnedReconstruction: WorldReconstruction?
+        pinnedReconstruction: WorldReconstruction?,
+        pinnedPhotographic: WorldPhotographicReport? = nil
     ) -> String? {
         let solve = WorldFinalSolve(word: session.finalization?.finalSolve)
-        let settled = solve.deniesAFinishedWorld ? solve.sentence : nil
+        // The pin's report is newer than the row once it has arrived; until
+        // then the row is all there is.
+        let photographic = pinnedStage != nil ? pinnedPhotographic : session.photographic
+        let failed = photographic?.standing.isFailed == true && !solve.deniesAFinishedWorld
+        let settled = solve.deniesAFinishedWorld
+            ? solve.sentence
+            : (failed ? WorldPhotographicCopy.failedHeadline + "." : nil)
         guard session.state == .finalizing || session.state == .receiving else { return settled }
         if pinnedStage != nil, let pinnedReconstruction {
             if case .partial(_, let note) = pinnedReconstruction { return note }
@@ -165,7 +186,8 @@ struct WorldPickerView: View {
         }
         let listed: WorldStage = session.state == .receiving ? .mapping : .improving
         if case .partial(_, let note) = WorldReconstruction.ladder(
-            target: target, stage: listed, finalSolve: .notReported, evidence: nil
+            target: target, stage: listed, finalSolve: .notReported, evidence: nil,
+            photographic: session.photographic
         ) {
             return note
         }
@@ -404,6 +426,15 @@ struct WorldPickerView: View {
                     Text(solve)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                }
+                // A complete walk whose photographic build failed: the badge
+                // is short, so the whole sentence is here, where the reader
+                // chooses which walk to open.
+                if let photographic = WorldListingPresentation.photographicCaption(for: session) {
+                    Text(photographic)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 // The session id, restored as a caption rather than as the
                 // row's primary label.

@@ -52,6 +52,12 @@ nonisolated struct WorldListingSession: Equatable, Sendable {
     let state: WorldListingSessionState?
     /// The builder's account of finalization, or `nil` on an older record.
     let finalization: WorldFinalizationReport?
+    /// Where this session's photographic room has got to (WORLDS §2a):
+    /// always present on a Tower since 2026-09-22, `nil` on an older one.
+    /// The same block, and the same decoder, as the status channel's
+    /// `lifecycle.photographic`. (Contract v2's `components[]` will sit beside
+    /// it, each entry carrying its own block through the same decoder.)
+    let photographic: WorldPhotographicReport?
 
     /// The record is open and the Tower did **not** call it abandoned. On a
     /// Tower that does not send `abandoned`, the record being open is all
@@ -101,6 +107,7 @@ nonisolated extension WorldListingSession {
         self.abandoned = json["abandoned"] as? Bool
         self.state = (json["state"] as? String).map(WorldListingSessionState.init(rawValue:))
         self.finalization = WorldFinalizationReport(json: json["finalization"])
+        self.photographic = WorldPhotographicReport(json: json["photographic"])
     }
 }
 
