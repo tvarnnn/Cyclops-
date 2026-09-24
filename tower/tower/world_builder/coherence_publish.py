@@ -494,8 +494,10 @@ def write_components(workspace_root, document: dict) -> Path:
 
 
 def retire_components(workspace_root) -> bool:
-    """A solution published without a components record moves the previous one aside (never deletes
-    it): an old record must not describe a new solve. True when one was moved."""
+    """A solution published without a components record moves the previous one aside, to
+    `SUPERSEDED_FILENAME` (a move, never a delete; a later retirement replaces the earlier superseded
+    copy, so only the latest is kept): an old record must not describe a new solve. True when one was
+    moved."""
     path = components_path(workspace_root)
     if not path.exists():
         return False
@@ -510,7 +512,8 @@ def retire_components(workspace_root) -> bool:
 
 def retire_consensus(workspace_root) -> bool:
     """A solution published without a consensus detail moves the previous `consensus.json` aside, to
-    `CONSENSUS_SUPERSEDED_FILENAME` (never deletes it), exactly as `retire_components` does for the
+    `CONSENSUS_SUPERSEDED_FILENAME` (a move, never a delete; only the latest superseded copy is kept),
+    exactly as `retire_components` does for the
     components record: an old record of per-draw decisions must not sit beside a new solve (review V11,
     LOW-4). True when one was moved."""
     path = Path(workspace_root) / CONSENSUS_FILENAME
@@ -1706,7 +1709,9 @@ _TRACEBACK = "Traceback (most recent call last)"
 _EXCEPTION_NAME = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Interrupt|Exit|Warning)\b")
 # A CamelCase name directly followed by ": " -- how `f"{type(exc).__name__}: {exc}"` begins, whatever the
 # suffix (`DepthModelUnavailable: ...`).
-_CLASS_PREFIX = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+:\s")
+# `[A-Z][A-Za-z0-9]*` after the first word, not `(?:[A-Z][A-Za-z0-9]*)+`: the same strings, but the nested
+# form backtracked exponentially on a run of capitals (review V12, RV12-B LOW-B: 33 characters took a second).
+_CLASS_PREFIX = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*:\s")
 _WIN_ERROR = re.compile(r"\[WinError -?\d+\]\s*")
 _ERRNO = re.compile(r"\[Errno -?\d+\]\s*")
 # Line breaks other than CR and LF (review V11, LOW-16): VT, FF, the file, group and record separators, NEL, and
@@ -1727,8 +1732,10 @@ _UNQUOTED_PATHS = (
     # (`IDEA-Research/grounding-dino-base`), or a part of a URL or of an absolute path (what precedes it)
     re.compile(r"""(?<![\w.@+:/~\\-])(?:[\w.@+-]+/){2,}[\w.@+-]*"""),
     re.compile(r"""(?<![\w.@+:/~\\-])[\w.@+-]+/[\w@+-][\w.@+-]*\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w/])"""),
-    # anything else with a backslash in it: a UNC path, a relative Windows path
-    re.compile(r"""[^\s'"]*\\[^\s'"]*"""),
+    # anything else with a backslash in it: a UNC path, a relative Windows path. Tried at the start of a token
+    # only: the same matches, but unanchored it rescanned a long token from every character in it (review V12,
+    # RV12-B LOW-A: 100k characters held the Tower for 20 s)
+    re.compile(r"""(?<![^\s'"])[^\s'"]*\\[^\s'"]*"""),
 )
 # The words after a space that are still the same path: each holds a separator (`C:\Program Files\x`), or is a
 # file name with an extension (`C:\Users\x\my file.txt`, review V11, LOW-16).
@@ -1742,6 +1749,11 @@ _NAME_WORDS = re.compile(r"""(?:\s+[A-Z][^\s'"\\/]*)+""")
 # path itself opened (`C:\Program Files (x86)`).
 _CLOSING = {")": "(", "]": "[", "}": "{"}
 _TRAILING = ")]},;.:"
+# The longest one-line text the path and name patterns run on. Several of them are quadratic in the length of an
+# unbroken run of text (review V12, RV12-B LOW-A: 100,000 characters held the whole Tower for about a minute,
+# `re` keeping the GIL). Every text the Tower writes itself is far shorter, and a client's copy is at most
+# `FINALIZATION_TEXT_MAX_CHARS` anyway. The rest is dropped before scrubbing, at a word boundary.
+SCRUB_MAX_CHARS = 4000
 
 
 USER_PLACEHOLDER = "[user]"
@@ -1801,8 +1813,10 @@ def _one_line(text: str) -> str:
             kept = _exception_lines(rest)
             last = kept[-1] if kept else ""
         else:
-            hits = list(_EXCEPTION_NAME.finditer(rest))
-            last = rest[hits[-1].start():].strip() if hits else ""
+            # the exception is at the end: looked for in the last `SCRUB_MAX_CHARS` only (RV12-B LOW-A)
+            tail = rest[-SCRUB_MAX_CHARS:]
+            hits = list(_EXCEPTION_NAME.finditer(tail))
+            last = tail[hits[-1].start():].strip() if hits else ""
         return ": ".join(part for part in (head, last) if part) or "a traceback"
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[0] if lines else ""
@@ -1818,12 +1832,18 @@ def _without_frames(text: str) -> str:
 
 def _given_back(path: str) -> tuple[str, str]:
     """`path` without the sentence punctuation its match took with it, and that punctuation: a closing
-    bracket the path did not open, and `;`, `,`, `.` and `:` at its end (review V11, LOW-16)."""
+    bracket the path did not open, and `;`, `,`, `.` and `:` at its end (review V11, LOW-16). The brackets are
+    counted once, not once per character given back (review V12, RV12-B LOW-A)."""
     end = len(path)
+    opened = {opener: path.count(opener) for opener in _CLOSING.values()}
+    closed = {closer: path.count(closer) for closer in _CLOSING}
     while end > 1 and path[end - 1] in _TRAILING:
-        opener = _CLOSING.get(path[end - 1])
-        if opener is not None and path[:end].count(opener) >= path[:end].count(path[end - 1]):
-            break
+        closer = path[end - 1]
+        opener = _CLOSING.get(closer)
+        if opener is not None:
+            if opened[opener] >= closed[closer]:
+                break
+            closed[closer] -= 1
         end -= 1
     return path[:end], path[end:]
 
@@ -1872,12 +1892,14 @@ def client_safe_detail(text, *, max_chars: int | None = None) -> str:
     them the user names they carry), NO USER NAME left anywhere else (this machine's,
     `USER_PLACEHOLDER`), and, with `max_chars`, at most that long. The exception class and its message
     stay: this is the diagnostic text. "" for no text. Single-line text with none of those, at most
-    `max_chars` long, is returned unchanged."""
+    `max_chars` long, is returned unchanged. The one line is first cut to `SCRUB_MAX_CHARS` (review V12,
+    RV12-B LOW-A), far longer than any text the Tower writes."""
     if text is None:
         return ""
     text = str(text).translate(_OTHER_LINE_BREAKS)
     if "\n" in text or "\r" in text or _TRACEBACK in text:
         text = _one_line(text)
+    text = _shorten(text, SCRUB_MAX_CHARS)
     text = _without_frames(text)
     text = _scrub_paths(text)
     for name in _user_names():
