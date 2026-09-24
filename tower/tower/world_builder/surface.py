@@ -433,6 +433,13 @@ class SurfaceParams:
     params digest, so neither mode's artifact is ever mistaken for the
     other's; and it is not privacy-safe."""
 
+    depth_known_fov: bool = False
+    """The depth stage's `DenseParams.known_fov`: MoGe told the solve camera's
+    FoV. Off is today's surface. On is what the evidence gate's depth-before-
+    publish runs (`coherence_publish.py`), so a final surface built with it on
+    REUSES that depth stage instead of predicting every frame again. Part of the
+    params digest only when on."""
+
     # -- resolution ---------------------------------------------------------
     voxel_frac: float = 0.0051
     """Voxel edge as a fraction of the scene scale (`surface_pipeline.
@@ -1046,6 +1053,8 @@ class SurfaceParams:
         if self.fill_gap_frac > 0:
             base = base + ("fill", self.fill_gap_frac, self.fill_enclose_dirs,
                            self.fill_sealed_only)
+        if self.depth_known_fov:
+            base = base + (("depth-fov", "known"),)
         return base
 
     def _consistency_digest(self):

@@ -147,6 +147,11 @@ def _depth_cache_key(digest, params: DenseParams, image_set: str | None = None,
     # the re-redaction had changed (review 1, M3).
     if trust:
         fields.append(f"trust:{trust}")
+    # `DenseParams.known_fov`: a prediction conditioned on the solve camera's
+    # FoV is another prediction. Appended only when on, so every key written
+    # without it is unchanged.
+    if getattr(params, "known_fov", False):
+        fields.append("fov:known")
     return "|".join(str(x) for x in fields)
 
 
@@ -719,6 +724,12 @@ def run_depth_stage(
     origins: dict[str, int] = {}
 
     backend = make_backend(params.backend)
+    # `DenseParams.known_fov`: the solve camera's horizontal FoV, for a backend
+    # that can be told it. None -- the call today's stage makes -- otherwise.
+    fov_x = None
+    if getattr(params, "known_fov", False) and getattr(backend, "accepts_fov", False):
+        fov_x = float(np.degrees(2.0 * np.arctan(W / (2.0 * float(cam["fx"])))))
+    fov_record = {"known_fov": round(fov_x, 6)} if fov_x is not None else {}
     kids = solution.keyframe_ids
     targets = []
     for i, kid in enumerate(kids):
@@ -779,7 +790,7 @@ def run_depth_stage(
                     "kind": backend.kind, "fill_rule": FILL_RULE,
                     "keyframe_image_set": image_set.cache_token,
                     "imagery_source": params.imagery_source,
-                    "redaction_trust": trust}
+                    "redaction_trust": trust, **fov_record}
         if progress and n % 25 == 0:
             progress(STAGE_DEPTH, n, len(targets))
 
@@ -867,7 +878,9 @@ def run_depth_stage(
             cv2.imwrite(str(work / "undist" / f"{ki:05d}.jpg"), img,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-        disp = backend.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        disp = (backend.predict(rgb, fov_x=fov_x) if fov_x is not None
+                else backend.predict(rgb))
         # Saved BEFORE the fit, under its own name, so a frame whose fit fails
         # against this solve -- too few sparse points yet -- still has its
         # prediction for the next solve to fit against.
@@ -897,7 +910,8 @@ def run_depth_stage(
                "keyframes_were_redacted_at_capture": keyframes_are_redacted and not raw_imagery,
                "redactor_applied_here": (
                    getattr(redactor, "label", None)
-                   if redactor is not None and redactor.available else None)}
+                   if redactor is not None and redactor.available else None),
+               **fov_record}
     _write_json(root / "align.json", payload)
     return payload
 
@@ -977,7 +991,8 @@ def _fit_record(ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
 
 
 def reusable_predictions(align_path: Path, backend: str,
-                         imagery_source: str = IMAGERY_REDACTED) -> dict:
+                         imagery_source: str = IMAGERY_REDACTED,
+                         known_fov: bool = False) -> dict:
     """`{ki: kid}` for every frame an earlier depth stage predicted with this
     backend, read off its `align.json`. Empty when there is none or it cannot
     be read; the depth stage then predicts every frame, which is slower and
@@ -999,6 +1014,11 @@ def reusable_predictions(align_path: Path, backend: str,
     if cached.get("backend") != backend:
         return {}
     if cached.get("imagery_source", IMAGERY_REDACTED) != imagery_source:
+        return {}
+    # Nor across `DenseParams.known_fov`: a prediction told the camera's FoV and
+    # one left to estimate it are different predictions of the same image.
+    # Absent is off, which every stage before the parameter was.
+    if (cached.get("known_fov") is not None) != bool(known_fov):
         return {}
     # (kid, image hash): a record written before hashes were recorded offers
     # nothing, and costs one fresh prediction rather than a wrong reuse. Nor
@@ -1569,7 +1589,8 @@ def densify(
                                     progress=progress, prior=prior,
                                     reuse_predictions=reusable_predictions(
                                         align_path, params.backend,
-                                        params.imagery_source))
+                                        params.imagery_source,
+                                        known_fov=params.known_fov))
             if align.get("stopped_after") is None:
                 # Only a COMPLETE stage names its solve. A stopped one written
                 # under the digest was trusted as a finished cache.

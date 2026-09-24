@@ -1384,6 +1384,17 @@ def _record_raise(record, stage: str) -> None:
     record(stage, state=STAGE_STATE_FAILED, detail=f"{type(exc).__name__}: {exc}")
 
 
+def _gate_setting() -> bool:
+    """`TOWER_WORLD_SOLVE_GATE` (off). Never raises: a malformed environment is
+    the gate off, which is today's surface."""
+    try:
+        from tower.config import world_solve_gate_setting  # noqa: PLC0415
+
+        return bool(world_solve_gate_setting())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
                          solved: bool, appearance: bool, prune_depth_work: bool,
                          should_stop, stop_source=lambda: None,
@@ -1472,6 +1483,11 @@ def final_surface_stages(store: WorldStore, world_id: str, session_id: str, *,
             # get wrong.
             force=True,
             should_stop=should_stop,
+            # With the evidence gate on (`TOWER_WORLD_SOLVE_GATE`) the final
+            # solve already ran the depth stage told the camera's FoV
+            # (`coherence_publish.py`); asking for the same here is what makes
+            # this stage REUSE it. Off: not passed at all -- today's call.
+            **({"depth_known_fov": True} if _gate_setting() else {}),
         )
     except BaseException:
         # RECORDED, THEN RE-RAISED UNCHANGED. The exception is how the

@@ -579,6 +579,13 @@ class Solution:
     #               two-view RANSAC seed, and which feature database was used.
     transients: dict | None = None
     solve: dict | None = None
+    #   gate:       the evidence gate on the final solve (`coherence_publish.py`,
+    #               `TOWER_WORLD_SOLVE_GATE`): `state` applied / failed, the
+    #               gate's `params` and `params_digest`, `masks_applied`,
+    #               `metric_available`, the depth stage and metric scale that
+    #               fed it. None: the gate did not run -- every solve before it
+    #               existed, and every solve with it off.
+    gate: dict | None = None
 
     @property
     def horizon(self) -> set[str]:
@@ -660,6 +667,8 @@ def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
         meta["transients"] = solution.transients
     if solution.solve is not None:
         meta["solve"] = solution.solve
+    if solution.gate is not None:
+        meta["gate"] = solution.gate
     write_json_atomic(workspace.solution_path, meta)
 
 
@@ -699,6 +708,7 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
                 timing=dict(meta.get("timing") or {}),
                 transients=meta.get("transients"),
                 solve=meta.get("solve"),
+                gate=meta.get("gate"),
             )
     except Exception as exc:  # noqa: BLE001 -- see below; the narrow tuple IS the bug
         # DELIBERATELY BROAD, and the breadth is the fix rather than a
@@ -821,9 +831,15 @@ def solve(
     seed=FROM_SETTINGS,
     transient_backend_factory=None,
     mask_device_probe=None,
+    gate: bool | None = None,
 ) -> dict:
     """Run the recipe over the session's current keyframes and persist the
     solution. Returns a summary dict (what the CLI prints).
+
+    `gate`: the evidence gate before publish (`coherence_publish.py`). None
+    reads `TOWER_WORLD_SOLVE_GATE` for a FINAL solve (off by default) and is
+    off for every background solve; off, the solution is published exactly as
+    the solver returned it.
 
     Idempotent and incremental: images already undistorted, features already
     extracted and pairs already matched are skipped by the workspace and by
@@ -1078,7 +1094,16 @@ def solve(
         # The live relocalizer's verified revisit links, matched explicitly.
         "revisit_pairs": revisits,
     }
-    write_solution(workspace, solution)
+    # PUBLISH. With the evidence gate on (a final solve, `TOWER_WORLD_SOLVE_GATE`)
+    # the candidate first gets its depth stage, metric scale and gate, and is
+    # published RELABELLED -- pieces the gate did not attach are their own
+    # components -- followed by `components.json` and the depth hand-off to the
+    # surface. Off, this is `write_solution(workspace, solution)`.
+    from tower.world_builder import coherence_publish  # noqa: PLC0415
+
+    solution, _gate_record = coherence_publish.gate_and_publish(
+        store, world_id, session_id, workspace, solution, final=final, gate=gate,
+        database_path=database_path, keyframes=keyframes, write=write_solution)
     return {
         "solved": True,
         "solver": solver,
@@ -1090,6 +1115,7 @@ def solve(
         "workspace": str(workspace.root),
         "transients": solution.transients,
         "solve": solution.solve,
+        "gate": solution.gate,
     }
 
 
@@ -1679,6 +1705,10 @@ def merge(
         summary["transients"] = solution.transients
     if solution.solve is not None:
         summary["solve"] = solution.solve
+    # The evidence gate's record (§2.5 `gate.params` and digest, what fed it),
+    # when the gate ran on this solution.
+    if solution.gate is not None:
+        summary["gate"] = solution.gate
     return MergeResult(
         pose_rows=new_pose_rows, point_rows=new_point_rows, support_rows=new_support_rows,
         placements=placements, segments=per_segment, summary=summary,
