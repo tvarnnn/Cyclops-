@@ -225,7 +225,9 @@ def test_when_no_image_could_be_masked_the_cause_names_the_images(tmp_path, monk
     assert rec["state"] == SM.RECORD_UNAVAILABLE, "never `applied` with nothing masked"
     assert rec["none_masked"] is True
     assert rec["cause"] == SM.CAUSE_IMAGES_UNMASKABLE and rec["retryable"] is False
-    assert rec["excluded_reasons"] == {SM.REASON_HASH_FAILED: 4}
+    # The solve ran unmasked with all four in it: none was excluded (review V10, L-11b). The
+    # reasons are in `detail`.
+    assert rec["excluded_reasons"] == {} and rec["images_excluded"] == 0
     assert rec["detail"] == ("no solver image could be masked: 4 of 4 solver images were unusable "
                              "(4 hash-failed)")
     assert "detector" not in rec["detail"]
@@ -239,7 +241,7 @@ def test_none_masked_mixed_image_reasons(tmp_path):
     (ws.images_dir / names[2]).write_bytes(b"")
     rec = _masks(ws, names).record()
     assert rec["none_masked"] is True and rec["state"] == SM.RECORD_UNAVAILABLE
-    assert rec["excluded_reasons"] == {SM.REASON_UNDECODABLE: 2, SM.REASON_WRONG_SIZE: 1}
+    assert rec["excluded_reasons"] == {}, "unmasked, not excluded (review V10, L-11b)"
     assert "(2 undecodable, 1 wrong-size)" in rec["detail"]
 
 

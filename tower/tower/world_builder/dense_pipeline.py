@@ -851,7 +851,18 @@ def _cached_prediction(path: Path, shape=None) -> np.ndarray | None:
         _log_bad_prediction(path, f"a {arr.dtype} array of shape {arr.shape}, not float16 of "
                                   f"{None if shape is None else tuple(shape)}")
         return None
+    if not _has_depth(arr):
+        # All NaN, all infinite (review V10, L-15): it was a hit, and the frame was then fitted
+        # `ok` with a = b = NaN. SOME NaN is the network's own "no depth here" (MoGe's mask,
+        # `MoGeBackend.predict`), and stays a hit.
+        _log_bad_prediction(path, "it holds no finite value")
+        return None
     return arr.astype(np.float32)
+
+
+def _has_depth(pred: np.ndarray) -> bool:
+    """Whether a depth prediction holds at least one finite value."""
+    return bool(np.isfinite(pred).any())
 
 
 def _log_bad_prediction(path: Path, why: str) -> None:
@@ -869,17 +880,29 @@ def _cache_prediction(path: Path, disp16: np.ndarray) -> None:
 def _read_prediction_index(token_dir: Path) -> dict | None:
     """{keyframe id: input digest} of a token's set, {} when it has none, None when it
     exists and cannot be read (nothing is pruned on the strength of an unreadable index)."""
+    return _prediction_index(token_dir)[0]
+
+
+def _prediction_index(token_dir: Path) -> tuple[dict | None, bool]:
+    """(`_read_prediction_index`, torn). `torn`: the index was read, and is not one -- not
+    JSON, not UTF-8, not {"keyframes": {...}} -- so no later read will do better and
+    `prune_prediction_cache` rewrites it (review V10, L-14). A file that cannot be OPENED
+    (held by another process, gone) is not torn: it is read again next time."""
     path = Path(token_dir) / PREDICTION_INDEX
     try:
         if not path.is_file():
-            return {}
-        doc = json.loads(path.read_text(encoding="utf-8"))
+            return {}, False
+        data = path.read_bytes()
+    except OSError:
+        return None, False
+    try:
+        doc = json.loads(data.decode("utf-8"))
         keyframes = doc.get("keyframes") if isinstance(doc, dict) else None
         if not isinstance(keyframes, dict):
-            return None
-        return {str(k): str(v) for k, v in keyframes.items()}
-    except (OSError, ValueError, TypeError):
-        return None
+            return None, True
+        return {str(k): str(v) for k, v in keyframes.items()}, False
+    except (ValueError, TypeError):
+        return None, True
 
 
 def prune_prediction_cache(root: Path, token: str, current: dict) -> dict:
@@ -891,7 +914,9 @@ def prune_prediction_cache(root: Path, token: str, current: dict) -> dict:
     staging files; a live writer's file is left, and so is its directory); in `token`'s,
     every prediction that no keyframe's latest input names, and every dead writer's
     staging file. The index is updated first and written atomically; when it cannot be
-    written, or an existing one cannot be read, nothing in `token`'s set is removed."""
+    written, or an existing one cannot be read, nothing in `token`'s set is removed -- and
+    one that was read but is torn is rewritten from `current` (`index_rewritten`), so the
+    next stage prunes again (review V10, L-14)."""
     from tower.storage import sweep_abandoned_staging, write_json_atomic  # noqa: PLC0415
 
     base = Path(root) / PREDICTIONS_DIRNAME
@@ -931,9 +956,23 @@ def prune_prediction_cache(root: Path, token: str, current: dict) -> dict:
         out["staging"] += sweep_abandoned_staging(here)
     except OSError:
         pass
-    index = _read_prediction_index(here)
+    index, torn = _prediction_index(here)
     if index is None:
         out["kept_because"] = "the set's index is unreadable"
+        if torn:
+            # A TORN INDEX IS REWRITTEN (review V10, L-14). It used to stay torn, and this
+            # branch then kept every prediction for good: the in-token prune never ran again.
+            # Rewritten from this stage's own frames; nothing is removed on the strength of
+            # it this time. From the next completed stage on the prune runs again, and a
+            # prediction only the lost index named is removed then -- a keyframe that needs
+            # it again is predicted again: a cost, never a wrong depth.
+            try:
+                write_json_atomic(here / PREDICTION_INDEX, {
+                    "schema": PREDICTION_CACHE_SCHEMA, "token": token,
+                    "keyframes": dict(sorted((str(k), str(v)) for k, v in current.items()))})
+                out["index_rewritten"] = True
+            except OSError:
+                out["kept_because"] = "the set's index could not be written"
         return out
     index.update({str(k): str(v) for k, v in current.items()})
     try:
@@ -1222,7 +1261,10 @@ def run_depth_stage(
                 disp = disp16.astype(np.float32)
                 cache_record["predicted"] += 1
                 try:
-                    _cache_prediction(cached_path, disp16)
+                    # One with no finite value would only be a miss when read (review V10,
+                    # L-15): it is not kept.
+                    if _has_depth(disp16):
+                        _cache_prediction(cached_path, disp16)
                 except OSError as exc:
                     # Never a reason to lose the depth (review V9, M-11): the stage goes
                     # on with the float16 prediction it has, and says it kept none.
@@ -1331,6 +1373,16 @@ def _fit_record(ki, kid, pose, disp, fill_u, fill_fraction, origin, solution,
     ui, vi = ui[clean], vi[clean]
     zc_fit = zc[g][clean]
     a, b, ho = align_frame(disp[vi, ui].astype(np.float64), zc_fit, backend.kind)
+    if not (np.isfinite(a) and np.isfinite(b)):
+        # NEVER `ok` WITH A NON-FINITE FIT (review V10, L-15). A prediction with no finite
+        # value at the anchors -- all NaN, all infinite -- fits a = b = NaN, and the frame was
+        # recorded `ok`: a "fitted" frame whose every depth is NaN. No real frame is affected:
+        # the 1,892 `align.json` files of the coherence run (41,363 `ok` records, 1,882 files
+        # from MoGe) hold no NaN or infinity at all (P3-DEP2, 2026-09-24).
+        return {"ki": int(ki), "kid": kid, "ok": False,
+                "why": "the depth prediction gives no finite fit at the sparse anchors",
+                "anchors_used": int(len(zc_fit)),
+                "redaction_fill_fraction": fill_fraction}
     # float16: the depth values run 0.2-40 in world units and the pipeline's
     # own error is a few percent, so three significant digits is far more
     # than the evidence supports -- and it halves the largest thing this

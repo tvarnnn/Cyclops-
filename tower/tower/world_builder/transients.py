@@ -321,7 +321,12 @@ def _log_bad_cache_file(path, why: str) -> None:
 
 def write_component(path: Path, key: dict, hand: np.ndarray, phone: np.ndarray, *,
                     image_sha1: str | None, seconds: float | None = None) -> None:
-    """Atomically: a reader sees the old file or the whole new one."""
+    """Atomically: a reader sees the old file or the whole new one.
+
+    Raises `OSError` when the file cannot be written (a full disk, a cached file another
+    process holds, MAX_PATH), after taking back its own staging file: the CALLER decides
+    what a lost cache entry costs (review V10, L-12b), and every caller here keeps the
+    mask it computed for the build in hand."""
     buf = io.BytesIO()
     record = dict(key, image_sha1=image_sha1, computed_at=time.time(),
                   seconds=None if seconds is None else round(float(seconds), 4))
@@ -331,8 +336,29 @@ def write_component(path: Path, key: dict, hand: np.ndarray, phone: np.ndarray, 
              key=np.frombuffer(json.dumps(record, sort_keys=True).encode(), np.uint8))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.p{os.getpid()}.tmp")
-    tmp.write_bytes(buf.getvalue())
-    os.replace(tmp, path)
+    try:
+        tmp.write_bytes(buf.getvalue())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)     # this call's own staging file, never the cache's
+        except OSError:
+            pass
+        raise
+
+
+def pack_masks(hand: np.ndarray, phone: np.ndarray) -> tuple:
+    """A component's (hand, phone) held in memory when its cache write failed (review V10,
+    L-12b), as bits: a full disk fails EVERY write, and a long walk's masks at one byte a
+    pixel would be gigabytes. `unpack_masks` gives them back."""
+    hand, phone = np.asarray(hand, bool), np.asarray(phone, bool)
+    return np.packbits(hand, axis=-1), np.packbits(phone, axis=-1), int(hand.shape[-1])
+
+
+def unpack_masks(packed: tuple) -> tuple:
+    hand, phone, width = packed
+    return (np.unpackbits(hand, axis=-1)[..., :width].astype(bool),
+            np.unpackbits(phone, axis=-1)[..., :width].astype(bool))
 
 
 def read_component(path: Path, key: dict | None = None, shape=None):
@@ -680,6 +706,12 @@ class TransientReport:
     # Keyframes whose masks were taken from the final solve's own cache
     # (`solve_masks.solve_mask_donor`) instead of being computed here.
     reused_from_solve: int = 0
+    # Masks computed by THIS build whose cache write failed (a full disk, a held file,
+    # MAX_PATH; review V10, L-12b): (ki, component) -> `pack_masks(hand, phone)`, used by
+    # `mask` for this build, and counted. The failed write used to fail the whole stage. The
+    # next build finds no cache entry and computes them again.
+    cache_write_failed: int = 0
+    kept: dict = field(default_factory=dict, repr=False)
 
     @property
     def available(self) -> bool:
@@ -692,7 +724,11 @@ class TransientReport:
             return None
         parts = []
         for component, key in self.keys[ki]:
-            got = read_component(cache_path(self.depth_dir, ki, component), key, self.shape)
+            packed = self.kept.get((ki, component))
+            if packed is not None:
+                got = unpack_masks(packed)
+            else:
+                got = read_component(cache_path(self.depth_dir, ki, component), key, self.shape)
             if got is None:
                 return None
             parts.append(got[:2])
@@ -731,6 +767,8 @@ class TransientReport:
         # writes exactly the record it wrote before.
         if self.reused_from_solve:
             out["reused_from_solve"] = self.reused_from_solve
+        if self.cache_write_failed:
+            out["cache_write_failed"] = self.cache_write_failed
         return out
 
 
@@ -746,8 +784,15 @@ def _take_from_donor(donor, kid, component, params, shape, path, key) -> bool:
     if got is None:
         return False
     hand, phone, provenance = got
-    write_component(path, dict(key, **provenance), hand, phone,
-                    image_sha1=provenance.get("solve_image_sha1"))
+    try:
+        write_component(path, dict(key, **provenance), hand, phone,
+                        image_sha1=provenance.get("solve_image_sha1"))
+    except OSError as exc:
+        # Not taken (review V10, L-12b): the detector computes this mask instead, and a
+        # write that fails again there is kept in memory for the build.
+        logger.warning("[Tower][WorldBuilder][transients] could not copy the solve's mask of %s "
+                       "(%s: %s); it is computed here instead", kid, type(exc).__name__, exc)
+        return False
     return True
 
 
@@ -880,8 +925,17 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
             keymap = {ki: dict(wanted[ki])[c] for ki in todo}
 
             def emit(ki, hand, phone, seconds, c=c, keymap=keymap):
-                write_component(cache_path(depth_dir, ki, c), keymap[ki], hand, phone,
-                                image_sha1=pixels[ki][2], seconds=seconds)
+                try:
+                    write_component(cache_path(depth_dir, ki, c), keymap[ki], hand, phone,
+                                    image_sha1=pixels[ki][2], seconds=seconds)
+                except OSError as exc:
+                    # Not the detector's failure (review V10, L-12b): kept for this build.
+                    report.cache_write_failed += 1
+                    report.kept[(ki, c)] = pack_masks(hand, phone)
+                    if report.cache_write_failed == 1:
+                        logger.warning("[Tower][WorldBuilder][transients] %s/%s: could not keep a "
+                                       "mask in the cache (%s: %s); this build uses the mask it "
+                                       "computed", world_id, session_id, type(exc).__name__, exc)
                 computed.add(ki)
 
             items = [(ki, pixels[ki][0], pixels[ki][1]) for ki in todo]
@@ -917,9 +971,11 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
         report.computed = len(computed)
         report.gpu_peak_mb = _peak_mb(peak)
 
-    # Only keyframes whose every component is on disk under its key.
+    # Only keyframes whose every component is on disk under its key -- or was computed by this
+    # build and could not be written (`kept`, review V10 L-12b).
     report.keys = {ki: keys for ki, keys in wanted.items()
-                   if all(read_component(cache_path(depth_dir, ki, c), key, (H, W)) is not None
+                   if all((ki, c) in report.kept
+                          or read_component(cache_path(depth_dir, ki, c), key, (H, W)) is not None
                           for c, key in keys)}
     report.seconds["total"] = round(time.time() - t0, 3)
     if need:
