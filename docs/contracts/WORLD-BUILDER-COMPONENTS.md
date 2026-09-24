@@ -2,11 +2,18 @@
 
 **Living document.** Added 2026-09-23.
 
-> **Status: PROPOSED 2026-09-23 — awaiting Mac review; nothing implemented.**
-> No Tower code and no iOS code implements anything in this document. It is
-> the contract half of manager decision 010, P3.1 ("contract first"): the Mac
-> Validation Lead reviews it for Apple feasibility **before** any iOS or Tower
-> product code is written. Every "OPEN" reference in the text is a question
+> **Status: IMPLEMENTED 2026-09-24, behind Tower settings that are off by
+> default; not yet validated.** The Mac Validation Lead reviewed it (C1,
+> 2026-09-23; §10). Both halves exist and are merged on the integration branch
+> `world-builder/live-world-visualization-v1` at `1111bb9`: the Tower half from
+> `world-builder/coherence-product-v1` (`d87aa5c`), the iOS half from
+> `ios/wb-coherence-areas-v1` (`50afec3`). Nothing is on `main`. Every Tower
+> behaviour here is off until its setting is on, except the owner's re-finish
+> command (§7 rule 4; `tower/docs/world-builder/COHERENCE-PRODUCT.md`). Not yet
+> accepted: review V8 says READY WITH CHANGES and its fix round is open (the
+> Mac gate G1 passed at `1111bb9`, manager 020), and the physical A/B test has
+> not run. v6 (2026-09-24) adds `finalization.notice` (§3.1, §8).
+> Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
 
