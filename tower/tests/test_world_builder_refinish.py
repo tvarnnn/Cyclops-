@@ -329,3 +329,27 @@ def test_the_dry_run_names_what_goes_back(tmp_path, capsys):
     assert wr.main(["--root", str(tmp_path), "--world", W1, "--dry-run"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert "database.db" in out["plan"]["copy_back_into_fresh_solve"]
+
+
+def test_the_solvers_mask_cache_is_copied_back_and_the_rest_is_not(tmp_path, stages):
+    """`transients/` is keyed by image name AND content, so the rebuild can only use an
+    entry for the exact image it was made on; it saves the masked solve its GPU
+    minutes. What a solve made for itself (`masks/`, `database.masked.*`) stays set
+    aside only."""
+    store, kids = _old_world(tmp_path)
+    solve_dir = store.world_dir(W1) / "solve" / S1
+    (solve_dir / "transients").mkdir()
+    entry = solve_dir / "transients" / "00000001.0123456789ab.hands.npz"
+    entry.write_bytes(b"cached union mask")
+    (solve_dir / "masks").mkdir()
+    (solve_dir / "masks" / "00000001.jpg.png").write_bytes(b"colmap mask")
+    (solve_dir / "database.masked.db").write_bytes(b"a masked solve's own db")
+    wr.refinish(store, tmp_path, W1, S1, solve_runner=_Solve(store, kids, gate_writes=False),
+                stamp="t")
+    aside = store.world_dir(W1) / "refinish" / "t" / "solve" / S1
+    assert (solve_dir / "transients" / entry.name).read_bytes() == b"cached union mask"
+    assert (aside / "transients" / entry.name).read_bytes() == b"cached union mask"
+    assert not (solve_dir / "masks").exists()
+    assert not (solve_dir / "database.masked.db").exists()
+    assert (aside / "masks" / "00000001.jpg.png").exists()
+    assert (aside / "database.masked.db").exists()

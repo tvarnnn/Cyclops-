@@ -163,8 +163,10 @@ def _valid_spans(spans) -> list | None:
         return None
     out = []
     for span in spans:
+        # `0 <= start <= end` (mac-002 item 1): seconds since the session started;
+        # the phone treats a list holding anything else as null, so it is never sent.
         if (not isinstance(span, (list, tuple)) or len(span) != 2
-                or not all(_finite(v) for v in span) or span[0] > span[1]):
+                or not all(_finite(v) for v in span) or not 0 <= span[0] <= span[1]):
             return None
         out.append([float(span[0]), float(span[1])])
     return out
