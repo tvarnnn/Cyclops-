@@ -836,10 +836,14 @@ def solve(
     `world_solve_seed` in `tower/config.py`). Off, every call into pycolmap is
     exactly today's.
 
-      * `masks`: the wearer's hands, arms and held phone are masked out of
-        feature extraction on every solver image (`solve_masks.py`), into a
-        feature database of its own. When the detector cannot run the solve
-        runs unmasked on today's database and `transients.state` says why.
+      * `masks`: no match touching the wearer's hands, arms or held phone
+        reaches the model (`solve_masks.py`). With a walk database, it is
+        extracted and matched exactly as today and the solve maps a filtered
+        copy of it (`walk-database-filtered`, the run's arm A1h); without one,
+        the masks go to extraction, into a database of their own
+        (`re-extracted`, arm A1). `solve.masking` says which. When the
+        detector cannot run the solve runs unmasked on today's database and
+        `transients.state` says why.
       * `seed`: every mapper seed, pycolmap's global seed and the two-view
         RANSAC seed are set and mapping runs on one thread -- the determinism
         hygiene of the run's experiment driver (lane `coherence_exp/driver.py`),
@@ -891,14 +895,28 @@ def solve(
 
     # THE FEATURE DATABASE, and the masks that decide which one. Without masks
     # it is `database.db`, shared with the walk's background solves -- today.
+    # With masks there are two paths (`solve_masks.MASKING_*`): the walk's
+    # database is extracted and matched exactly as today and a FILTERED COPY
+    # is mapped, or, with no walk database to filter, the masks go to
+    # extraction itself, into a fresh database of their own.
     database_path = workspace.database_path
     database_existed = database_path.exists()
     masks_record = _masks_off_record()
+    masks = None
+    masking = None
     if want_masks:
-        database_path, masks_record = _apply_solver_masks(
-            workspace, reader, present, keyframes, camera,
+        masks, masks_record = _ensure_solver_masks(
+            workspace, present, keyframes, camera,
             backend_factory=transient_backend_factory, device_probe=mask_device_probe)
-        database_existed = masks_record.get("database_reused", database_path.exists())
+        if masks is not None:
+            if _walk_database_usable(database_path):
+                masking = _MASKING_FILTERED
+            else:
+                database_path, masks_record = _reextract_masked(workspace, reader, masks,
+                                                                present, masks_record)
+                database_existed = masks_record.get("database_reused", False)
+                masking = _MASKING_REEXTRACTED
+        masks_record["database"] = database_path.name
     masked = time.perf_counter()
 
     extraction = pycolmap.FeatureExtractionOptions()
@@ -948,25 +966,43 @@ def solve(
         wanted = False
     pairing.loop_detection = wanted
     seeded = seed is not None
+    verification = None
     if seeded:
         # The two-view RANSAC is seeded too (the experiment driver's
         # `verification_seed`): otherwise the verified inlier sets, and so
         # the view graph GLOMAP averages, differ run to run.
         verification = pycolmap.TwoViewGeometryOptions()
         verification.ransac.random_seed = seed
-        pycolmap.match_sequential(
-            database_path, matching_options=matching, pairing_options=pairing,
-            verification_options=verification,
-        )
-    else:
-        pycolmap.match_sequential(
-            database_path, matching_options=matching, pairing_options=pairing
-        )
+    _match_sequential(pycolmap, database_path, matching, pairing, verification)
     revisits = {"listed": 0, "verified": 0, "detail": None}
     if final:
         revisits = _match_revisit_pairs(
             pycolmap, store, world_id, session_id, workspace, database_path, present,
-            matching, verification if seeded else None)
+            matching, verification)
+    if masking == _MASKING_FILTERED:
+        try:
+            database_path, masks_record = _filter_walk_database(
+                pycolmap, workspace, masks, masks_record, verification)
+        except Exception as exc:  # noqa: BLE001 -- fall back to re-extraction, recorded
+            logger.exception("global solve: filtering the walk database failed; the masks "
+                             "go to extraction instead")
+            masks_record = dict(masks_record, filter_failed=f"{type(exc).__name__}: {exc}")
+            database_path, masks_record = _reextract_masked(workspace, reader, masks,
+                                                            present, masks_record)
+            masking = _MASKING_REEXTRACTED
+            pycolmap.extract_features(
+                database_path, workspace.images_dir, image_names=present,
+                camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
+                extraction_options=extraction,
+            )
+            _match_sequential(pycolmap, database_path, matching, pairing, verification)
+            if final:
+                revisits = _match_revisit_pairs(
+                    pycolmap, store, world_id, session_id, workspace, database_path, present,
+                    matching, verification)
+        masks_record["database"] = database_path.name
+    if masking is not None:
+        masks_record["masking"] = masking
     matched = time.perf_counter()
 
     shutil.rmtree(workspace.sparse_dir, ignore_errors=True)
@@ -1034,6 +1070,9 @@ def solve(
         "verification_seed": seed if seeded else None,
         "database": database_path.name,
         "database_existed": bool(database_existed),
+        # How the masks reached the model: `walk-database-filtered`,
+        # `re-extracted`, or None for an unmasked solve.
+        "masking": masking,
         "final": bool(final),
         "pycolmap": getattr(pycolmap, "__version__", None),
         # The live relocalizer's verified revisit links, matched explicitly.
@@ -1160,13 +1199,31 @@ def _masks_off_record() -> dict:
     return off_record()
 
 
-def _apply_solver_masks(workspace, reader, present, keyframes, camera, *,
-                        backend_factory=None, device_probe=None):
-    """Masks for every solver image; on success the masked database and the
-    reader's `mask_path`, else today's database and a record saying why.
+# `solve_masks.MASKING_FILTERED` / `MASKING_REEXTRACTED`, spelled here so this
+# module does not import the mask module (and its detector) to solve unmasked.
+_MASKING_FILTERED = "walk-database-filtered"
+_MASKING_REEXTRACTED = "re-extracted"
 
-    Never raises: whatever the mask step does, the solve runs, and the record
-    says whether it ran masked (`applied`)."""
+
+def _match_sequential(pycolmap, database_path, matching, pairing, verification) -> None:
+    """Today's call when unseeded -- no `verification_options` at all -- and the
+    seeded two-view RANSAC otherwise."""
+    if verification is not None:
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing,
+            verification_options=verification,
+        )
+    else:
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing
+        )
+
+
+def _ensure_solver_masks(workspace, present, keyframes, camera, *,
+                         backend_factory=None, device_probe=None):
+    """(the masks, their record) when they can be applied, else (None, a record
+    saying why). Never raises: whatever the mask step does, the solve runs, and
+    the record says whether it ran masked."""
     from tower.world_builder import solve_masks  # noqa: PLC0415
 
     ids = {keyframe_image_name(k): k.keyframe_id for k in keyframes}
@@ -1174,21 +1231,48 @@ def _apply_solver_masks(workspace, reader, present, keyframes, camera, *,
         result = solve_masks.ensure_solver_masks(
             workspace, present, keyframe_ids=ids, shape=(camera.height, camera.width),
             backend_factory=backend_factory, device_probe=device_probe)
-        record = result.record()
-        if not result.available:
-            logger.warning(
-                "global solve: transient masks were requested for the final solve and "
-                "are NOT applied (%s: %s); this solve is unmasked and says so",
-                result.state, result.detail)
-            return workspace.database_path, dict(record, database=workspace.database_path.name)
-        database, info = solve_masks.masked_database(workspace, result, all_names=present)
     except Exception as exc:  # noqa: BLE001 -- a mask failure is an unmasked solve, recorded
         logger.exception("global solve: the transient mask step failed; this solve is unmasked")
-        record = solve_masks.failed_record(f"{type(exc).__name__}: {exc}")
-        return workspace.database_path, dict(record, database=workspace.database_path.name)
+        return None, solve_masks.failed_record(f"{type(exc).__name__}: {exc}")
+    record = result.record()
+    if not result.available:
+        logger.warning(
+            "global solve: transient masks were requested for the final solve and "
+            "are NOT applied (%s: %s); this solve is unmasked and says so",
+            result.state, result.detail)
+        return None, record
+    return result, record
+
+
+def _walk_database_usable(path) -> bool:
+    from tower.world_builder.solve_masks import walk_database_usable  # noqa: PLC0415
+
+    return walk_database_usable(path)
+
+
+def _reextract_masked(workspace, reader, masks, present, record):
+    """The fallback: the masks go to extraction, into `database.masked.db`."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    database, info = solve_masks.masked_database(workspace, masks, all_names=present)
     reader.mask_path = str(solve_masks.masks_dir(workspace))
     return database, dict(record, database=info["database"], database_reused=info["reused"],
                           database_rebuilt_because=info["rebuilt_because"])
+
+
+def _filter_walk_database(pycolmap, workspace, masks, record, verification):
+    """The walk database, copied and stripped of every match touching a mask
+    (`solve_masks.filter_walk_database`), with the pairs that changed
+    re-verified under the solve's own two-view options."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    database, pairs_path, info = solve_masks.filter_walk_database(workspace, masks)
+    info["pairs_reverified"] = 0
+    if pairs_path is not None:
+        options = verification if verification is not None else pycolmap.TwoViewGeometryOptions()
+        pycolmap.verify_matches(database, pairs_path, options=options)
+        info["pairs_reverified"] = info["pairs_listed"]
+    return database, dict(record, filter=info)
 
 
 def _solution_from_reconstructions(

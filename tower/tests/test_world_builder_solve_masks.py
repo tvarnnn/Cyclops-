@@ -108,6 +108,10 @@ class FakeColmap(types.ModuleType):
         self.log.append(("call", "match_image_pairs", Path(database_path).name,
                          tuple(sorted(kwargs)), listed.read_text(encoding="utf-8")))
 
+    def verify_matches(self, database_path, pairs_path, options=None):
+        self.log.append(("call", "verify_matches", Path(database_path).name,
+                         Path(pairs_path).read_text(encoding="utf-8"), options))
+
     def set_random_seed(self, seed):
         self.log.append(("call", "set_random_seed", seed))
 
@@ -499,6 +503,168 @@ def test_a_verified_revisit_is_counted_by_colmaps_pair_id(tmp_path):
     assert global_solve._verified_pair_count(tmp_path / "absent.db", pairs) in (None, 0)
 
 
+# ---------------------------------------------------------------------------
+# 4b. the walk database, filtered (arm A1h) -- the path when one exists
+# ---------------------------------------------------------------------------
+
+_B = 2147483647
+# Four keypoints per image: 0 and 1 inside HAND_RECT (masked), 2 and 3 outside.
+_KEYPOINTS = np.array([[10.5, 10.5, 1, 0, 0, 1], [20.5, 15.5, 1, 0, 0, 1],
+                       [50.5, 40.5, 1, 0, 0, 1], [60.5, 5.5, 1, 0, 0, 1]], np.float32)
+
+
+def _blob(rows):
+    a = np.asarray(rows, np.uint32).reshape(-1, 2)
+    return len(a), 2, a.tobytes()
+
+
+def _colmap_walk_database(path: Path):
+    """A walk `database.db` in COLMAP's schema (the columns the filter reads)."""
+    import sqlite3
+
+    path.unlink(missing_ok=True)
+    con = sqlite3.connect(str(path))
+    con.executescript(
+        "create table images (image_id integer primary key, name text, camera_id integer);"
+        "create table keypoints (image_id integer primary key, rows integer, cols integer, data blob);"
+        "create table matches (pair_id integer primary key, rows integer, cols integer, data blob);"
+        "create table two_view_geometries (pair_id integer primary key, rows integer, cols integer,"
+        " data blob, config integer);")
+    for i in range(N):
+        con.execute("insert into images values (?, ?, 1)", (i + 1, f"{i:08d}.jpg"))
+        con.execute("insert into keypoints values (?, 4, 6, ?)", (i + 1, _KEYPOINTS.tobytes()))
+    # (1,2): two raw matches on masked keypoints, one of them a verified inlier.
+    con.execute("insert into matches values (?, ?, ?, ?)", (1 * _B + 2, *_blob([[0, 0], [2, 2], [3, 3], [1, 2]])))
+    con.execute("insert into two_view_geometries values (?, ?, ?, ?, 2)", (1 * _B + 2, *_blob([[0, 0], [2, 2], [3, 3]])))
+    # (3,4): clean.
+    con.execute("insert into matches values (?, ?, ?, ?)", (3 * _B + 4, *_blob([[2, 3], [3, 2]])))
+    con.execute("insert into two_view_geometries values (?, ?, ?, ?, 2)", (3 * _B + 4, *_blob([[2, 3], [3, 2]])))
+    # (2,3): clean raw matches, but an inlier on a masked keypoint.
+    con.execute("insert into matches values (?, ?, ?, ?)", (2 * _B + 3, *_blob([[2, 2], [3, 3]])))
+    con.execute("insert into two_view_geometries values (?, ?, ?, ?, 2)", (2 * _B + 3, *_blob([[0, 2], [3, 3]])))
+    con.commit()
+    con.close()
+
+
+def _rows(db: Path, table: str) -> dict:
+    import sqlite3
+
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        return {pid: np.frombuffer(data, np.uint32).reshape(-1, 2).tolist()
+                for pid, data in con.execute(f"select pair_id, data from {table}")}
+    finally:
+        con.close()
+
+
+@pytest.fixture
+def walked(session, colmap):
+    """The session after its walk: undistorted images and a walk database."""
+    _solve(session, final=True)
+    _colmap_walk_database(session.workspace.database_path)
+    colmap.log.clear()
+    return session
+
+
+@pytest.mark.parametrize("seed", [None, 5])
+def test_with_a_walk_database_the_solve_maps_a_filtered_copy_of_it(walked, colmap, seed):
+    ws = walked.workspace
+    before = ws.database_path.read_bytes()
+    summary = _masked(walked, StubDetector(), seed=seed)
+    assert summary["solved"] is True
+
+    # The walk database is extracted and matched exactly as today: unmasked.
+    assert "mask_path" not in colmap.sets("ImageReaderOptions")
+    assert [c[2] for c in colmap.calls("extract_features")] == ["database.db"]
+    assert colmap.calls("match_sequential")[0][2] == "database.db"
+    # ... and never modified by the filter.
+    assert ws.database_path.read_bytes() == before
+
+    # The copy loses every match and inlier on a masked keypoint.
+    masked = SM.masked_database_path(ws)
+    matches = _rows(masked, "matches")
+    geometries = _rows(masked, "two_view_geometries")
+    assert matches[1 * _B + 2] == [[2, 2], [3, 3]]
+    assert matches[3 * _B + 4] == [[2, 3], [3, 2]] and matches[2 * _B + 3] == [[2, 2], [3, 3]]
+    assert set(geometries) == {3 * _B + 4}, "the touched geometries are gone, the clean one kept"
+
+    # The changed pairs are re-verified, under the solve's own two-view options,
+    # and the solve maps the copy.
+    (_c, _n, database, listed, options), = colmap.calls("verify_matches")
+    assert database == SM.MASKED_DATABASE_NAME
+    assert sorted(listed.splitlines()) == ["00000000.jpg 00000001.jpg", "00000001.jpg 00000002.jpg"]
+    if seed is None:
+        assert options._values == {} and options._children == {}
+    else:
+        assert options.ransac._values == {"random_seed": seed}
+    order = [e[1] for e in colmap.log if e[0] == "call"]
+    assert order.index("match_sequential") < order.index("verify_matches") < order.index("global_mapping")
+    assert colmap.calls("global_mapping")[0][2] == SM.MASKED_DATABASE_NAME
+
+    record = summary["transients"]
+    assert record["state"] == SM.RECORD_APPLIED
+    assert record["masking"] == SM.MASKING_FILTERED == summary["solve"]["masking"]
+    assert record["database"] == SM.MASKED_DATABASE_NAME
+    f = record["filter"]
+    assert (f["keypoints_total"], f["keypoints_in_mask"]) == (4 * N, 2 * N)
+    assert f["matches_dropped"] == 2 and f["pairs_changed"] == 2 and f["pairs_reverified"] == 2
+    assert f["geometries_dropped"] == 1 and f["images_filtered"] == N
+    assert _solution_json(walked)["solve"]["masking"] == SM.MASKING_FILTERED
+
+
+def test_without_a_walk_database_the_masks_go_to_extraction(session, colmap):
+    summary = _masked(session, StubDetector())
+    assert summary["solve"]["masking"] == SM.MASKING_REEXTRACTED
+    assert summary["transients"]["masking"] == SM.MASKING_REEXTRACTED
+    assert colmap.calls("verify_matches") == []
+
+
+def test_an_unreadable_walk_database_is_not_filtered(walked, colmap):
+    walked.workspace.database_path.write_bytes(b"not a database at all, not even close")
+    summary = _masked(walked, StubDetector())
+    assert summary["solve"]["masking"] == SM.MASKING_REEXTRACTED
+    assert [c[2] for c in colmap.calls("extract_features")] == [SM.MASKED_DATABASE_NAME]
+
+
+def test_a_filter_that_fails_falls_back_to_re_extraction_and_says_so(walked, colmap, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(SM, "filter_walk_database", broken)
+    summary = _masked(walked, StubDetector())
+    assert summary["solved"] is True
+    assert [c[2] for c in colmap.calls("extract_features")] == ["database.db", SM.MASKED_DATABASE_NAME]
+    assert colmap.sets("ImageReaderOptions")["mask_path"] == str(walked.workspace.root / SM.MASKS_DIRNAME)
+    assert colmap.calls("global_mapping")[0][2] == SM.MASKED_DATABASE_NAME
+    record = summary["transients"]
+    assert record["masking"] == SM.MASKING_REEXTRACTED == summary["solve"]["masking"]
+    assert "disk full" in record["filter_failed"]
+    assert record["state"] == SM.RECORD_APPLIED
+
+
+def test_with_the_settings_off_a_walk_database_is_used_exactly_as_today(walked, colmap):
+    before = walked.workspace.database_path.read_bytes()
+    summary = _solve(walked, final=True)
+    assert colmap.log == _todays_trace(walked)
+    assert walked.workspace.database_path.read_bytes() == before
+    assert not SM.masked_database_path(walked.workspace).exists()
+    assert summary["solve"]["masking"] is None
+
+
+def test_a_filtered_database_is_never_reused_as_a_re_extracted_one(walked, colmap):
+    _masked(walked, StubDetector())                      # filtered: record says so
+    walked.workspace.database_path.unlink()              # the walk database is gone
+    summary = _masked(walked, StubDetector())
+    assert summary["solve"]["masking"] == SM.MASKING_REEXTRACTED
+    assert summary["transients"]["database_reused"] is False
+    assert "walk-database-filtered" in summary["transients"]["database_rebuilt_because"]
+
+
+def test_the_two_spellings_of_the_masking_paths_agree():
+    assert global_solve._MASKING_FILTERED == SM.MASKING_FILTERED
+    assert global_solve._MASKING_REEXTRACTED == SM.MASKING_REEXTRACTED
+
+
 def test_a_second_solve_reuses_the_cache_and_the_masked_database(session, colmap):
     stub = StubDetector()
     _masked(session, stub)
@@ -603,9 +769,11 @@ def test_the_failure_detail_names_the_cause(session, colmap):
     assert "CPU fallback" in summary["transients"]["detail"]
 
 
-def test_a_union_without_grounding_dino_is_masked_by_oneformer_and_says_so(session, colmap):
+def test_a_union_without_grounding_dino_is_masked_by_oneformer_and_is_not_applied(session, colmap):
     """The surface stage's own fallback: the masks are real, under the
-    OneFormer rule, and the record names both rules."""
+    OneFormer rule, and the record names both rules. But the evidence was
+    measured with the union rule, so the state is `partial`, never `applied`,
+    and the gate falls back to its fail-safe."""
 
     class Half(StubDetector):
         def __call__(self, component):
@@ -615,7 +783,9 @@ def test_a_union_without_grounding_dino_is_masked_by_oneformer_and_says_so(sessi
 
     summary = _masked(session, Half())
     record = summary["transients"]
-    assert record["state"] == SM.RECORD_APPLIED
+    assert record["state"] == SM.RECORD_PARTIAL
+    assert record["extraction_masked"] is True
+    assert record["images_masked"] == N and record["images_unmasked"] == 0
     assert record["rule"] == T.TransientParams(mode=T.MODE_ONEFORMER).rule_id()
     assert record["requested_rule"] == T.TransientParams().rule_id()
     assert "Grounding DINO weights missing" in record["rule_fallback"]

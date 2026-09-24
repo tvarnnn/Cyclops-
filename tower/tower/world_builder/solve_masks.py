@@ -34,18 +34,23 @@ LAYOUT, under the solve workspace `<world>/solve/<session>/`:
                                         component (`transients.write_component`)
     transients/index.json               keyframe id -> solver image + SHA-1: what
                                         the surface stage looks its masks up by
-    masks/<image name>.png              COLMAP extraction masks: 0 = transient,
-                                        no keypoint is extracted there; 255 = use
-    database.masked.db                  the masked feature database
-    database.masked.json                per image, the image and mask digests its
-                                        features were extracted under
+    masks/<image name>.png              COLMAP masks: 0 = transient, 255 = use
+    database.masked.db                  the masked feature database the solve maps
+    database.masked.json                how it was made (`path`), and for the
+                                        re-extracted path, per image, the image
+                                        and mask digests it was extracted under
+    reverify_pairs.txt                  the filtered path's re-verified pairs
 
-WHY A SECOND DATABASE. `database.db` is shared with the background solves of
-the walk, which extract UNMASKED features, and `extract_features` skips every
-image already in a database. A masked final solve on that database would
-silently reuse unmasked keypoints for every keyframe the walk had solved. The
-masked database is its own file, and it is rebuilt whenever an image it
-already holds was extracted under a different image or mask.
+TWO WAYS TO A MASKED DATABASE (`MASKING_*` below). `database.db` is the walk's
+own: its background solves extracted UNMASKED features into it and verified
+pairs at every horizon, loop detection included. The final solve extracts and
+matches into it exactly as today, then maps from a FILTERED COPY with every
+match touching a masked keypoint removed -- the run's arm A1h, which keeps the
+target's room whole. Only when there is no walk database do the masks go to
+extraction, into a fresh database matched once (arm A1), which on the target
+splits the room: a single round of loop detection finds fewer revisits than
+the walk's accumulated rounds. The walk's `database.db` is never modified by
+either path, and never mapped by a masked solve.
 
 ONE COMPUTATION, TWO CONSUMERS -- FOR A RAW-IMAGERY BUILD ONLY. The surface
 and appearance stages compute the same union masks per keyframe today (about
@@ -116,6 +121,26 @@ RECORD_UNAVAILABLE = "unavailable"  # none: `detail` says why (off, no GPU, load
 
 OFF_DETAIL = ("transient masks on the final solve are off (TOWER_WORLD_SOLVE_MASKS "
               "unset or false): this solve is unmasked")
+
+# HOW the masks reached the solve (`solve.masking`, `transients.masking`).
+#
+# walk-database-filtered: the walk's own `database.db`, extracted and matched
+#     exactly as today, is COPIED; every match and every verified inlier that
+#     touches a keypoint on a masked pixel is removed from the copy; the pairs
+#     that lost any are re-verified; the solve maps from the copy. The
+#     experiment driver's `database_from` + masks path -- arm A1h, the arm the
+#     approved candidate numbers were measured on (the target's room whole at
+#     232 keyframes in 5 of 5 seeds).
+# re-extracted: no walk database to filter (a re-finish whose database is
+#     gone). Masked keypoints are never extracted (`ImageReaderOptions.
+#     mask_path`) into a fresh database matched once -- arm A1, which on the
+#     target splits the room (154 + 81, 5 of 5 seeds).
+#
+# Either way, no match touching a masked pixel survives into the solve.
+MASKING_FILTERED = "walk-database-filtered"
+MASKING_REEXTRACTED = "re-extracted"
+REVERIFY_PAIRS_FILENAME = "reverify_pairs.txt"
+_PAIR_ID_BASE = 2147483647   # COLMAP: pair_id = image_id1 * kMaxNumImages + image_id2, id1 < id2
 
 
 def solver_params() -> T.TransientParams:
@@ -223,10 +248,15 @@ class SolverMasks:
 
     @property
     def record_state(self) -> str:
-        """`applied` / `partial` / `unavailable`, as the contract spells it."""
+        """`applied` / `partial` / `unavailable`, as the contract spells it.
+
+        `partial` also when every image is masked but under a FALLBACK rule
+        (`union` asked for, OneFormer alone could run): the evidence was
+        measured with the union rule, and the gate treats anything but
+        `applied` as masks unavailable (lead, 2026-09-23)."""
         if not self.available:
             return RECORD_UNAVAILABLE
-        if self.unmasked or len(self.masked) < self.images:
+        if self.unmasked or len(self.masked) < self.images or self.partial:
             return RECORD_PARTIAL
         return RECORD_APPLIED
 
@@ -507,6 +537,8 @@ def masked_database(workspace, masks: SolverMasks, *, all_names=()) -> tuple[Pat
             stale_reason = "no record of what the masked database was extracted under"
             if isinstance(previous, dict):
                 stale_reason = f"mask rule changed from {previous.get('rule')!r}"
+        elif previous.get("path", MASKING_REEXTRACTED) != MASKING_REEXTRACTED:
+            stale_reason = f"it was made by {previous.get('path')!r}, not by re-extraction"
         else:
             held = previous.get("images") or {}
             for name, entry in held.items():
@@ -522,8 +554,170 @@ def masked_database(workspace, masks: SolverMasks, *, all_names=()) -> tuple[Pat
     held.update(current)
     # Written BEFORE extraction: an interrupted extraction leaves images in the
     # database that the record already names, never the reverse.
-    write_json_atomic(record_path, {"schema": SOLVER_MASK_SCHEMA, "rule": rule, "images": held})
+    write_json_atomic(record_path, {"schema": SOLVER_MASK_SCHEMA, "path": MASKING_REEXTRACTED,
+                                    "rule": rule, "images": held})
     return db, {"database": db.name, "reused": bool(reused), "rebuilt_because": stale_reason}
+
+
+def walk_database_usable(path) -> bool:
+    """Whether `path` is a COLMAP database holding at least one image: the
+    walk's own database, which the filtered path copies. Never raises."""
+    import sqlite3  # noqa: PLC0415
+
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            images = con.execute("select count(*) from images").fetchone()[0]
+            con.execute("select count(*) from keypoints").fetchone()
+            con.execute("select count(*) from matches").fetchone()
+            con.execute("select count(*) from two_view_geometries").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    return images > 0
+
+
+def _keypoints_in_mask(con, names: dict, masks: SolverMasks, mdir: Path, info: dict) -> dict:
+    """image_id -> bool per keypoint (True = on a masked pixel), for every image
+    that has a mask. An image without one is absent: nothing of it is removed,
+    and the record (`partial`) already says it was not masked."""
+    import cv2  # noqa: PLC0415
+
+    in_mask = {}
+    for iid, rows, cols, data in con.execute("select image_id, rows, cols, data from keypoints"):
+        name = names.get(iid)
+        if name not in masks.masked:
+            info["images_unfiltered"] += 1
+            continue
+        png = cv2.imread(str(mdir / f"{name}.png"), cv2.IMREAD_GRAYSCALE)
+        if png is None:
+            raise OSError(f"the COLMAP mask of {name} is unreadable")
+        if not rows or data is None:
+            in_mask[iid] = np.zeros(0, bool)
+            info["images_filtered"] += 1
+            continue
+        xy = np.frombuffer(data, np.float32).reshape(int(rows), int(cols))[:, :2]
+        # COLMAP's keypoint (x, y) has the top-left pixel's centre at (0.5, 0.5),
+        # so the pixel a keypoint sits on is floor(x), floor(y): the rule the
+        # run's driver used.
+        x = np.clip(np.floor(xy[:, 0]).astype(np.int64), 0, png.shape[1] - 1)
+        y = np.clip(np.floor(xy[:, 1]).astype(np.int64), 0, png.shape[0] - 1)
+        hit = png[y, x] == 0
+        in_mask[iid] = hit
+        info["images_filtered"] += 1
+        info["keypoints_total"] += int(rows)
+        info["keypoints_in_mask"] += int(hit.sum())
+    return in_mask
+
+
+def _touching(pairs: np.ndarray, first, second) -> np.ndarray:
+    """Which rows of an (n, 2) index array touch a masked keypoint. An index
+    past the end of an image's keypoints is treated as touching: a match that
+    cannot be checked cannot be kept."""
+    bad = np.zeros(len(pairs), bool)
+    for col, hit in ((0, first), (1, second)):
+        if hit is None:
+            continue
+        idx = pairs[:, col].astype(np.int64)
+        outside = idx >= len(hit)
+        bad |= outside
+        bad[~outside] |= hit[idx[~outside]]
+    return bad
+
+
+def filter_walk_database(workspace, masks: SolverMasks) -> tuple[Path, Path | None, dict]:
+    """The walk database, copied, with every match and every verified inlier
+    that touches a masked keypoint removed. Returns (the masked database, the
+    COLMAP pair list to re-verify or None, what was removed).
+
+    The walk's `database.db` is never modified: it is read through SQLite's
+    backup API, which also carries whatever COLMAP left in its write-ahead log.
+    A pair that lost a raw match loses its verified geometry and is listed for
+    re-verification from what is left; a verified geometry whose inliers touch
+    a mask while its raw matches did not (it cannot happen through COLMAP, but
+    a database is not a promise) is dropped and re-verified the same way.
+    """
+    import sqlite3  # noqa: PLC0415
+
+    t0 = time.time()
+    walk = Path(workspace.database_path)
+    db = masked_database_path(workspace)
+    record_path = Path(workspace.root) / MASKED_DATABASE_RECORD
+    for side in ("", "-wal", "-shm"):
+        Path(str(db) + side).unlink(missing_ok=True)
+    record_path.unlink(missing_ok=True)
+    info = {"source": walk.name, "images_filtered": 0, "images_unfiltered": 0,
+            "keypoints_total": 0, "keypoints_in_mask": 0, "matches_dropped": 0,
+            "pairs_changed": 0, "pairs_emptied": 0, "geometries_dropped": 0}
+    src = sqlite3.connect(str(walk))
+    out = sqlite3.connect(str(db))
+    try:
+        src.backup(out)
+    finally:
+        src.close()
+    changed: dict = {}
+    try:
+        names = dict(out.execute("select image_id, name from images"))
+        in_mask = _keypoints_in_mask(out, names, masks, masks_dir(workspace), info)
+        with_matches = set()
+        for pair_id, rows, cols, data in out.execute(
+                "select pair_id, rows, cols, data from matches").fetchall():
+            with_matches.add(pair_id)
+            if not rows or data is None:
+                continue
+            second = int(pair_id) % _PAIR_ID_BASE
+            first = (int(pair_id) - second) // _PAIR_ID_BASE
+            a, b = in_mask.get(first), in_mask.get(second)
+            if a is None and b is None:
+                continue
+            matches = np.frombuffer(data, np.uint32).reshape(int(rows), int(cols))
+            bad = _touching(matches, a, b)
+            if not bad.any():
+                continue
+            keep = np.ascontiguousarray(matches[~bad])
+            info["matches_dropped"] += int(bad.sum())
+            info["pairs_emptied"] += int(len(keep) == 0)
+            out.execute("update matches set rows=?, data=? where pair_id=?",
+                        (int(len(keep)), keep.tobytes(), pair_id))
+            out.execute("delete from two_view_geometries where pair_id=?", (pair_id,))
+            changed[pair_id] = (names.get(first), names.get(second))
+        for pair_id, rows, cols, data in out.execute(
+                "select pair_id, rows, cols, data from two_view_geometries").fetchall():
+            if not rows or data is None:
+                continue
+            second = int(pair_id) % _PAIR_ID_BASE
+            first = (int(pair_id) - second) // _PAIR_ID_BASE
+            a, b = in_mask.get(first), in_mask.get(second)
+            if a is None and b is None:
+                continue
+            inliers = np.frombuffer(data, np.uint32).reshape(int(rows), int(cols))
+            if _touching(inliers, a, b).any():
+                out.execute("delete from two_view_geometries where pair_id=?", (pair_id,))
+                info["geometries_dropped"] += 1
+                if pair_id in with_matches:
+                    changed[pair_id] = (names.get(first), names.get(second))
+        out.commit()
+    finally:
+        out.close()
+    info["pairs_changed"] = len(changed)
+    pairs_path = None
+    listed = [(a, b) for a, b in changed.values() if a and b]
+    info["pairs_listed"] = len(listed)
+    if listed:
+        pairs_path = Path(workspace.root) / REVERIFY_PAIRS_FILENAME
+        data = "".join(f"{a} {b}\n" for a, b in listed).encode("utf-8")
+        write_bytes_atomic(pairs_path, lambda handle: handle.write(data))
+    write_json_atomic(record_path, {"schema": SOLVER_MASK_SCHEMA, "path": MASKING_FILTERED,
+                                    "rule": masks.params.rule_id(), "source": walk.name})
+    info["seconds"] = round(time.time() - t0, 3)
+    logger.info("[Tower][WorldBuilder][solve-masks] walk database filtered: %d of %d keypoints "
+                "on masks, %d matches in %d pairs removed", info["keypoints_in_mask"],
+                info["keypoints_total"], info["matches_dropped"], info["pairs_changed"])
+    return db, pairs_path, info
 
 
 def solve_mask_donor(store, world_id: str, session_id: str):
