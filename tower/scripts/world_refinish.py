@@ -27,8 +27,9 @@ the lock):
     - `solve/<session>` is MOVED to `<world>/refinish/<stamp>/solve/<session>`, and
       then the walk's own feature database (`database.db`, with any SQLite
       `-wal`/`-shm` beside it), the solver images it was extracted from (`images/`),
-      `sources.json`, `camera.json` and the solver's content-keyed transient-mask
-      cache (`transients/`) are COPIED BACK into a fresh
+      `sources.json`, `camera.json`, the solver's content-keyed transient-mask
+      cache (`transients/`) and the record of the walk database's frozen matching
+      (`database.matching.json`) are COPIED BACK into a fresh
       `solve/<session>` -- never moved back, so the set-aside copy stays byte for
       byte what the walk left, for rollback. The copy is what makes the masked
       solve filter THE WALK'S OWN DATABASE (`solve.masking:
@@ -102,11 +103,14 @@ FINALIZE_SCRIPT = Path(__file__).resolve().parent / "world_finalize.py"
 # images were undistorted with, and the solver's transient-mask cache
 # (`transients/`, keyed by image name AND the SHA-1 of its bytes, so an entry can
 # only ever be used for the exact image it was computed on -- it saves the masked
-# solve its GPU minutes). NOT `masks/` (the COLMAP masks are rewritten from that
-# cache on every masked solve), nor `database.masked.*` / `reverify_pairs.txt`
-# (made by a solve, for that solve). See `set_aside`.
+# solve its GPU minutes), and the record of the walk database's FROZEN matching
+# (`database.matching.json`, `global_solve.FROZEN_MATCHING_FILENAME`: the seeded
+# final solve that made it maps that database as it is instead of matching again,
+# which is not reproducible -- review V8 H2). NOT `masks/` (the COLMAP masks are
+# rewritten from that cache on every masked solve), nor `database.masked.*` /
+# `reverify_pairs.txt` (made by a solve, for that solve). See `set_aside`.
 SOLVE_COPY_BACK = ("database.db", "database.db-wal", "database.db-shm", "images",
-                   "sources.json", "camera.json", "transients")
+                   "sources.json", "camera.json", "transients", "database.matching.json")
 
 # The product settings a re-finish runs the final solve with (§7 rule 4).
 PRODUCT_SOLVE_ENV = {

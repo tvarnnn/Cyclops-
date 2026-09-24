@@ -436,9 +436,25 @@ def _walk_database(path: Path, pairs):
     con.close()
 
 
-@pytest.mark.parametrize("masked,seed", [(False, None), (True, 5)])
+def _stub_the_gate(monkeypatch):
+    """The evidence gate, faked: it publishes the candidate as the room."""
+    from tower.world_builder import coherence_publish as CP
+
+    def fake(store, world_id, session_id, solution, *, database_path, keyframes, **kw):
+        return CP.GateResult(solution=solution, components=None,
+                             record={"state": CP.GATE_STATE_APPLIED, "seconds": 0.0})
+
+    monkeypatch.setattr(CP, "gate_final_solution", fake)
+
+
+# Review V8 M4: the links go only into a MASKED and GATED final solve; every other
+# solve imports none and says why (tests/test_world_builder_revisit_import.py pins the
+# floor). Before M4 every final solve imported them, masked or not.
+@pytest.mark.parametrize("masked,gated,seed", [(False, False, None), (True, False, 5),
+                                               (False, True, None), (True, True, None),
+                                               (True, True, 5)])
 def test_the_final_solve_matches_the_relocalizers_revisit_links(session, colmap, monkeypatch,
-                                                                 masked, seed):
+                                                                 masked, gated, seed):
     from tower.world_builder import relocalizer
 
     seen_dirs = []
@@ -448,24 +464,36 @@ def test_the_final_solve_matches_the_relocalizers_revisit_links(session, colmap,
         return [("00000000.jpg", "00000003.jpg"), ("00000001.jpg", "not-a-solver-image.jpg")]
 
     monkeypatch.setattr(relocalizer, "revisit_pairs", links)
-    monkeypatch.setattr(global_solve, "_verified_pair_count", lambda db, pairs: len(pairs))
+    monkeypatch.setattr(global_solve, "_apply_revisit_floor",
+                        lambda db, pairs, floor, overlap: {"verified": len(pairs),
+                                                           "removed_below_floor": 0,
+                                                           "kept_as_sequential": 0})
+    _stub_the_gate(monkeypatch)
     if masked:
-        summary = _masked(session, StubDetector(), seed=seed)
+        summary = _masked(session, StubDetector(), seed=seed, gate=gated)
     else:
-        summary = _solve(session, final=True, seed=seed)
+        summary = _solve(session, final=True, seed=seed, gate=gated)
     assert seen_dirs == [session.store.session_dir(session.world_id, session.session_id)]
     calls = colmap.calls("match_image_pairs")
+    record = summary["solve"]["revisit_pairs"]
+    assert _solution_json(session)["solve"]["revisit_pairs"] == record
+    if not (masked and gated):
+        assert calls == []
+        assert record == {"listed": 1, "verified": 0, "imported": False,
+                          "detail": (global_solve.REVISIT_IMPORT_UNGATED if masked
+                                     else global_solve.REVISIT_IMPORT_UNMASKED)}
+        return
     assert len(calls) == 1
     _call, _name, database, kwargs, listed = calls[0]
     assert listed == "00000000.jpg 00000003.jpg\n", "only pairs of images this solve has"
-    assert (_is_masked_db(database) if masked else database == "database.db")
+    assert _is_masked_db(database)
     assert ("verification_options" in kwargs) is (seed is not None)
     order = [e[1] for e in colmap.log if e[0] == "call"]
     assert order.index("match_sequential") < order.index("match_image_pairs") < \
         order.index("global_mapping")
-    record = summary["solve"]["revisit_pairs"]
-    assert record == {"listed": 1, "verified": 1, "detail": None}
-    assert _solution_json(session)["solve"]["revisit_pairs"] == record
+    assert record == {"listed": 1, "verified": 1, "detail": None, "imported": True,
+                      "min_inliers": global_solve.revisit_floor(), "removed_below_floor": 0,
+                      "kept_as_sequential": 0}
 
 
 def test_revisit_links_are_for_the_final_solve_only(session, colmap, monkeypatch):

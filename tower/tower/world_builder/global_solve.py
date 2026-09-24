@@ -959,14 +959,53 @@ def solve(
         masks_record["database"] = database_path.name
     masked = time.perf_counter()
 
+    # Decided before any matching (review V8 M4, and the frozen matching's key): which
+    # revisit links this solve imports, and whether it is gated at all.
+    from tower.world_builder import coherence_publish  # noqa: PLC0415
+
+    gated = coherence_publish.gate_setting_for(final, gate)
+    masks_applied = masking is not None and masks_record.get("state") == "applied"
+    revisits = {"listed": 0, "verified": 0, "detail": None}
+    revisit_list: list = []
+    if final:
+        listed, unreadable = _read_revisit_links(store, world_id, session_id, present)
+        if unreadable is not None:
+            revisits["detail"] = unreadable
+        elif listed:
+            refusal = revisit_import_refusal(masks_applied=masks_applied, gated=gated)
+            if refusal is None:
+                revisit_list = listed
+            else:
+                revisits = {"listed": len(listed), "verified": 0, "detail": refusal,
+                            "imported": False}
+    floor = revisit_floor() if revisit_list else None
+    wanted = _loop_detection_wanted(loop_detection)
+    seeded = seed is not None
+
+    # THE FROZEN MATCHING (seeded final solves only; see `database_digest`). Only the
+    # walk's own database is frozen: a re-extracted masked database is this solve's own.
+    freeze = bool(final and seeded and masking != _MASKING_REEXTRACTED)
+    frozen_refusal = None
+    frozen = False
+    if freeze:
+        key = matching_key(camera_params=reader.camera_params, overlap=overlap,
+                           loop_detection=wanted, seed=seed, revisit_pairs=revisit_list,
+                           revisit_min_inliers=floor,
+                           pycolmap_version=getattr(pycolmap, "__version__", None))
+        images = _image_digests(workspace, present)
+        frozen_refusal = _frozen_matching_refusal(workspace, database_path, key, images)
+        frozen = frozen_refusal is None
+    froze = time.perf_counter()
+
     extraction = pycolmap.FeatureExtractionOptions()
     extraction.num_threads = threads
     extraction.sift.max_num_features = MAX_FEATURES
-    pycolmap.extract_features(
-        database_path, workspace.images_dir, image_names=present,
-        camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
-        extraction_options=extraction,
-    )
+    if not frozen:
+        pycolmap.extract_features(
+            database_path, workspace.images_dir, image_names=present,
+            camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
+            extraction_options=extraction,
+        )
     extracted = time.perf_counter()
 
     matching = pycolmap.FeatureMatchingOptions()
@@ -974,38 +1013,7 @@ def solve(
     pairing = pycolmap.SequentialPairingOptions()
     pairing.overlap = overlap
     pairing.quadratic_overlap = False
-    # Loop detection needs a vocabulary tree COLMAP downloads on first use
-    # and caches in the USER's home. It is what makes a live world converge
-    # instead of fragmenting -- 16 components to 5 on the 2026-09-09
-    # capture -- so every solve asks for it now, not just the final one.
-    #
-    # WHICH IS WHY THE ABSENCE OF THE TREE HAS TO BE CHECKED HERE. A missing
-    # tree is not a refusal: `match_sequential` is outside any try/except,
-    # and COLMAP's failure to fetch the file is a glog CHECK, so the process
-    # dies of `abort()` with exit code 3 and no Python exception to catch.
-    # Measured with an empty cache and no network:
-    #
-    #     file.cc:507] Check failed: blob.has_value() Failed to download file
-    #     *** Aborted ***                                        EXIT=3
-    #
-    # End to end that means EVERY solve dies, the manifest carries no
-    # `global_solve` at all, and the world ships with every segment refused
-    # -- the "87 disconnected fragments" outcome, from a new cause, on a
-    # machine that merely has no network. Turning loop detection off instead
-    # costs the convergence and keeps the walk.
-    wanted = bool(loop_detection) if loop_detection is not None else False
-    if wanted and not vocabulary_tree_cached():
-        logger.warning(
-            "global solve: no vocabulary tree in %s, so loop detection is off for "
-            "this solve. Fetching it needs a network and COLMAP aborts the process "
-            "rather than failing the call, so it is not attempted mid-walk. The "
-            "world will still solve, in more pieces than it would otherwise. "
-            "scripts/world_builder_env_check.py reports this before a walk.",
-            vocabulary_tree_cache_dir(),
-        )
-        wanted = False
     pairing.loop_detection = wanted
-    seeded = seed is not None
     verification = None
     if seeded:
         # The two-view RANSAC is seeded too (the experiment driver's
@@ -1013,12 +1021,18 @@ def solve(
         # the view graph GLOMAP averages, differ run to run.
         verification = pycolmap.TwoViewGeometryOptions()
         verification.ransac.random_seed = seed
-    _match_sequential(pycolmap, database_path, matching, pairing, verification)
-    revisits = {"listed": 0, "verified": 0, "detail": None}
-    if final:
-        revisits = _match_revisit_pairs(
-            pycolmap, store, world_id, session_id, workspace, database_path, present,
-            matching, verification)
+    if not frozen:
+        _match_sequential(pycolmap, database_path, matching, pairing, verification)
+        if revisit_list:
+            revisits = _match_revisit_pairs(
+                pycolmap, store, world_id, session_id, workspace, database_path, present,
+                matching, verification, pairs=revisit_list)
+        if freeze:
+            not_frozen = _freeze_matching(workspace, database_path, key, images, revisit_list)
+            frozen_refusal = (f"{frozen_refusal}; this solve's matching is frozen now"
+                              if not_frozen is None else f"{frozen_refusal}; {not_frozen}")
+    elif revisit_list:
+        revisits = {"listed": len(revisit_list), "verified": 0, "detail": None}
     if masking == _MASKING_FILTERED:
         try:
             database_path, masks_record = _filter_walk_database(
@@ -1037,62 +1051,34 @@ def solve(
                 extraction_options=extraction,
             )
             _match_sequential(pycolmap, database_path, matching, pairing, verification)
-            if final:
+            if revisit_list:
                 revisits = _match_revisit_pairs(
                     pycolmap, store, world_id, session_id, workspace, database_path, present,
-                    matching, verification)
+                    matching, verification, pairs=revisit_list)
         masks_record["database"] = database_path.name
     if masking is not None:
         masks_record["masking"] = masking
         masks_record["walk_database"] = walk_database
+    if revisit_list and database_path != workspace.database_path:
+        # M4's floor, in the database the solve maps (never the walk's own).
+        revisits = dict(revisits, imported=True, min_inliers=floor,
+                        **_apply_revisit_floor(database_path, revisit_list, floor=floor,
+                                               overlap=overlap))
+    # What the mapper reads, by content (seeded final solves: `database_digest`).
+    mapped_digest = database_digest(database_path) if (final and seeded) else None
     matched = time.perf_counter()
 
-    shutil.rmtree(workspace.sparse_dir, ignore_errors=True)
-    workspace.sparse_dir.mkdir(parents=True)
     # ONE thread when seeded: GLOMAP is reproducible only then (D1 §2.4).
     map_threads = 1 if seeded else threads
-    solver = SOLVER_GLOMAP
-    options = pycolmap.GlobalPipelineOptions()
-    options.num_threads = map_threads
-    options.mapper.bundle_adjustment.refine_focal_length = False
-    options.mapper.bundle_adjustment.refine_principal_point = False
-    options.mapper.bundle_adjustment.refine_extra_params = False
-    if seeded:
-        _seed_global_options(options, seed)
-        pycolmap.set_random_seed(seed)
-    try:
-        reconstructions = pycolmap.global_mapping(
-            database_path, workspace.images_dir, workspace.sparse_dir, options=options
-        )
-    except Exception as exc:  # a solver failure is a refusal, not a crash
-        logger.warning("global solve: global mapping raised %s", exc)
-        reconstructions = {}
-    if not reconstructions:
-        solver = SOLVER_INCREMENTAL
-        inc = pycolmap.IncrementalPipelineOptions()
-        inc.num_threads = map_threads
-        inc.ba_refine_focal_length = False
-        inc.ba_refine_principal_point = False
-        inc.ba_refine_extra_params = False
-        if seeded:
-            _seed_incremental_options(inc, seed)
-            pycolmap.set_random_seed(seed)
-        try:
-            reconstructions = pycolmap.incremental_mapping(
-                database_path, workspace.images_dir, workspace.sparse_dir, options=inc
-            )
-        except Exception as exc:
-            logger.warning("global solve: incremental mapping raised %s", exc)
-            reconstructions = {}
+    solution = _map_candidate(
+        pycolmap, database_path, workspace, workspace.sparse_dir, keyframes, seed=seed,
+        threads=map_threads, input_digest=input_digest,
+        min_image_observations=min_image_observations, camera=camera)
+    solver = solution.solver
     mapped = time.perf_counter()
-
-    solution = _solution_from_reconstructions(
-        reconstructions, keyframes, solver=solver, input_digest=input_digest,
-        min_image_observations=min_image_observations, camera=camera,
-    )
     solution.timing = {
         "prepare_s": round(prepared - started, 3),
-        "extract_s": round(extracted - masked, 3),
+        "extract_s": round(extracted - froze, 3),
         "match_s": round(matched - extracted, 3),
         "map_s": round(mapped - matched, 3),
         "images_undistorted": written,
@@ -1100,6 +1086,8 @@ def solve(
     }
     if want_masks:
         solution.timing["masks_s"] = round(masked - prepared, 3)
+    if freeze:
+        solution.timing["freeze_s"] = round(froze - masked, 3)
     solution.transients = masks_record
     solution.solve = {
         "seed": seed,
@@ -1121,13 +1109,25 @@ def solve(
         # The live relocalizer's verified revisit links, matched explicitly.
         "revisit_pairs": revisits,
     }
+    if final and seeded:
+        # Reproducibility (review V8 H2): was the matching this solve mapped frozen or
+        # made now, why, and exactly which database content the mapper read. Only on
+        # a seeded final solve, so every other solution.json is what it was.
+        mapped_frozen = frozen and masking != _MASKING_REEXTRACTED
+        solution.solve["matching"] = MATCHING_FROZEN if mapped_frozen else MATCHING_MATCHED
+        solution.solve["matching_detail"] = (
+            None if mapped_frozen else
+            "the mask filter failed; the masks went to extraction, into a database of "
+            "this solve's own, which is matched afresh and not frozen"
+            if walk_database == "filter-failed" else frozen_refusal
+            or "a re-extracted masked database is this solve's own; it is not frozen")
+        solution.solve["database_digest"] = (mapped_digest or {}).get("content")
+        solution.solve["verified_pairs"] = (mapped_digest or {}).get("verified_pairs")
     # PUBLISH. With the evidence gate on (a final solve, `TOWER_WORLD_SOLVE_GATE`)
     # the candidate first gets its depth stage, metric scale and gate, and is
     # published RELABELLED -- pieces the gate did not attach are their own
     # components -- followed by `components.json` and the depth hand-off to the
     # surface. Off, this is `write_solution(workspace, solution)`.
-    from tower.world_builder import coherence_publish  # noqa: PLC0415
-
     solution, _gate_record = coherence_publish.gate_and_publish(
         store, world_id, session_id, workspace, solution, final=final, gate=gate,
         database_path=database_path, keyframes=keyframes, write=write_solution)
@@ -1144,6 +1144,95 @@ def solve(
         "solve": solution.solve,
         "gate": solution.gate,
     }
+
+
+def _loop_detection_wanted(loop_detection) -> bool:
+    """Whether this solve's sequential matching runs loop detection.
+
+    Loop detection needs a vocabulary tree COLMAP downloads on first use
+    and caches in the USER's home. It is what makes a live world converge
+    instead of fragmenting -- 16 components to 5 on the 2026-09-09
+    capture -- so every solve asks for it now, not just the final one.
+
+    WHICH IS WHY THE ABSENCE OF THE TREE HAS TO BE CHECKED HERE. A missing
+    tree is not a refusal: `match_sequential` is outside any try/except,
+    and COLMAP's failure to fetch the file is a glog CHECK, so the process
+    dies of `abort()` with exit code 3 and no Python exception to catch.
+    Measured with an empty cache and no network:
+
+        file.cc:507] Check failed: blob.has_value() Failed to download file
+        *** Aborted ***                                        EXIT=3
+
+    End to end that means EVERY solve dies, the manifest carries no
+    `global_solve` at all, and the world ships with every segment refused
+    -- the "87 disconnected fragments" outcome, from a new cause, on a
+    machine that merely has no network. Turning loop detection off instead
+    costs the convergence and keeps the walk.
+    """
+    wanted = bool(loop_detection) if loop_detection is not None else False
+    if wanted and not vocabulary_tree_cached():
+        logger.warning(
+            "global solve: no vocabulary tree in %s, so loop detection is off for "
+            "this solve. Fetching it needs a network and COLMAP aborts the process "
+            "rather than failing the call, so it is not attempted mid-walk. The "
+            "world will still solve, in more pieces than it would otherwise. "
+            "scripts/world_builder_env_check.py reports this before a walk.",
+            vocabulary_tree_cache_dir(),
+        )
+        wanted = False
+    return wanted
+
+
+def _map_candidate(pycolmap, database_path, workspace: SolveWorkspace, sparse_dir: Path,
+                   keyframes, *, seed, threads: int, input_digest, min_image_observations,
+                   camera) -> Solution:
+    """Map `database_path` once into `sparse_dir` (emptied first): GLOMAP, the
+    incremental mapper when GLOMAP yields nothing, every seed set and `threads` mapper
+    threads. Returns the candidate solution, not yet published, its `solver` saying
+    which mapper made it. A mapper failure is an empty candidate, never a crash.
+
+    The final solve maps once through this; a consensus (`TOWER_WORLD_SOLVE_CONSENSUS`)
+    maps each further draw through it with the next seed, on the same database."""
+    shutil.rmtree(sparse_dir, ignore_errors=True)
+    Path(sparse_dir).mkdir(parents=True)
+    seeded = seed is not None
+    solver = SOLVER_GLOMAP
+    options = pycolmap.GlobalPipelineOptions()
+    options.num_threads = threads
+    options.mapper.bundle_adjustment.refine_focal_length = False
+    options.mapper.bundle_adjustment.refine_principal_point = False
+    options.mapper.bundle_adjustment.refine_extra_params = False
+    if seeded:
+        _seed_global_options(options, seed)
+        pycolmap.set_random_seed(seed)
+    try:
+        reconstructions = pycolmap.global_mapping(
+            database_path, workspace.images_dir, sparse_dir, options=options
+        )
+    except Exception as exc:  # a solver failure is a refusal, not a crash
+        logger.warning("global solve: global mapping raised %s", exc)
+        reconstructions = {}
+    if not reconstructions:
+        solver = SOLVER_INCREMENTAL
+        inc = pycolmap.IncrementalPipelineOptions()
+        inc.num_threads = threads
+        inc.ba_refine_focal_length = False
+        inc.ba_refine_principal_point = False
+        inc.ba_refine_extra_params = False
+        if seeded:
+            _seed_incremental_options(inc, seed)
+            pycolmap.set_random_seed(seed)
+        try:
+            reconstructions = pycolmap.incremental_mapping(
+                database_path, workspace.images_dir, sparse_dir, options=inc
+            )
+        except Exception as exc:
+            logger.warning("global solve: incremental mapping raised %s", exc)
+            reconstructions = {}
+    return _solution_from_reconstructions(
+        reconstructions, keyframes, solver=solver, input_digest=input_digest,
+        min_image_observations=min_image_observations, camera=camera,
+    )
 
 
 def _seed_global_options(options, seed: int) -> None:
@@ -1167,14 +1256,278 @@ def _seed_incremental_options(inc, seed: int) -> None:
 
 
 REVISIT_PAIRS_FILENAME = "revisit_pairs.txt"
-# A revisit pair counts as verified at COLMAP's own two-view floor
-# (`TwoViewGeometryOptions.min_num_inliers`, 15), the floor the solve's view
-# graph uses for every other pair.
+# COLMAP's own two-view floor (`TwoViewGeometryOptions.min_num_inliers`, 15): what
+# `_verified_pair_count` counts by default. An IMPORTED revisit pair is held to the
+# relocalizer's floor instead (`revisit_floor`, review V8 M4).
 REVISIT_VERIFIED_MIN_INLIERS = 15
 
 
+# ---------------------------------------------------------------------------
+# The relocalizer's revisit links in the final solve (review V8, M4).
+#
+# WHICH SOLVES IMPORT THEM. Only a MASKED (transients `applied`) and GATED final
+# solve. The links were imported into every final solve at COLMAP's 15 inliers,
+# never checked against the live path's own 50/100, and unmasked by default: a
+# 15-inlier pair on the wearer's hand is exactly the glue the gate exists to find,
+# and only a masked, gated solve can find it. Every other solve imports none and
+# says why in `solve.revisit_pairs.detail`. A solve with no links at all (the
+# relocalizer is off by default, `TOWER_WORLD_RELOCALIZER`) records exactly what it
+# always did: `{"listed": 0, "verified": 0, "detail": None}`.
+#
+# THE FLOOR. An imported pair counts only at `relocalizer.REVISIT_MIN_INLIERS`
+# (50) verified inliers IN THE DATABASE THE SOLVE MAPS -- after the masks -- and a
+# pair of this source below it is REMOVED from that database (its matches and its
+# geometry), so nothing under the floor from the relocalizer reaches the mapper.
+# "Of this source" means a listed pair the sequential matcher would not have
+# proposed anyway (further apart than the pairing overlap in COLMAP's name order):
+# a listed pair inside the overlap is a sequential pair first, held to COLMAP's 15
+# like every other. The walk's own `database.db` is never modified: the mapped
+# database of a masked solve is always this solve's own (the filtered copy, or the
+# re-extracted database).
+
+REVISIT_IMPORT_UNMASKED = ("not imported: the relocalizer's revisit links go only into a "
+                           "masked, gated final solve (review V8 M4), and this solve's masks "
+                           "are not applied")
+REVISIT_IMPORT_UNGATED = ("not imported: the relocalizer's revisit links go only into a "
+                          "masked, gated final solve (review V8 M4), and this solve is not "
+                          "gated (TOWER_WORLD_SOLVE_GATE)")
+
+
+def revisit_floor() -> int:
+    """The fewest verified inliers an imported revisit pair may have: the relocalizer's
+    own `REVISIT_MIN_INLIERS` (its per-leg acceptance floor, `tri2_50`), cited, not
+    copied."""
+    from tower.world_builder.relocalizer import REVISIT_MIN_INLIERS  # noqa: PLC0415
+
+    return int(REVISIT_MIN_INLIERS)
+
+
+def _read_revisit_links(store, world_id, session_id, present) -> tuple[list, str | None]:
+    """(the relocalizer's revisit links between images this solve has, None), or
+    ([], why) when they cannot be read. Never raises: no links is today's solve."""
+    try:
+        from tower.world_builder.relocalizer import revisit_pairs  # noqa: PLC0415
+
+        pairs = revisit_pairs(store.session_dir(world_id, session_id))
+    except Exception as exc:  # noqa: BLE001 -- no links is today's solve
+        return [], f"revisit links unreadable ({type(exc).__name__}: {exc})"
+    have = set(present)
+    return [(a, b) for a, b in pairs if a in have and b in have and a != b], None
+
+
+def revisit_import_refusal(*, masks_applied: bool, gated: bool) -> str | None:
+    """None when a final solve imports the revisit links, else why it does not."""
+    if not masks_applied:
+        return REVISIT_IMPORT_UNMASKED
+    if not gated:
+        return REVISIT_IMPORT_UNGATED
+    return None
+
+
+def _pair_id(a: int, b: int) -> int:
+    lo, hi = (a, b) if a < b else (b, a)
+    return lo * 2147483647 + hi   # COLMAP's kMaxNumImages
+
+
+def _apply_revisit_floor(database_path, pairs, *, floor: int, overlap: int) -> dict:
+    """In the database the solve maps: remove every listed pair of this source below
+    `floor` verified inliers (matches and geometry), and count those at or above it.
+    Returns {"verified", "removed_below_floor", "kept_as_sequential"} or {"detail": why}
+    when the database cannot be read. The caller never passes the walk's database."""
+    import sqlite3  # noqa: PLC0415
+
+    out = {"verified": 0, "removed_below_floor": 0, "kept_as_sequential": 0}
+    try:
+        con = sqlite3.connect(str(database_path))
+        try:
+            ids = {name: iid for iid, name in con.execute("select image_id, name from images")}
+            rank = {name: i for i, name in enumerate(sorted(ids))}
+            for a, b in pairs:
+                if a not in ids or b not in ids:
+                    continue
+                pid = _pair_id(ids[a], ids[b])
+                row = con.execute("select rows, config from two_view_geometries where pair_id = ?",
+                                  (pid,)).fetchone()
+                inliers = int(row[0] or 0) if row is not None and row[1] not in (0, 1) else 0
+                if inliers >= floor:
+                    out["verified"] += 1
+                elif abs(rank[a] - rank[b]) <= overlap:
+                    out["kept_as_sequential"] += 1   # the sequential matcher's pair too
+                else:
+                    con.execute("delete from two_view_geometries where pair_id = ?", (pid,))
+                    con.execute("delete from matches where pair_id = ?", (pid,))
+                    out["removed_below_floor"] += 1
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return {"detail": f"the floor could not be applied ({type(exc).__name__}: {exc})"}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# A frozen matching (review V8 H2, manager 019; reproducibility).
+#
+# Matching is not reproducible even on one thread: from the pristine walk database,
+# with loop detection on and the two-view RANSAC seeded, two one-thread runs differed
+# by 2 + 2 verified pairs and two default-thread runs by 5 + 7 (RUN P3-PF, var step 2),
+# and a final solve matches INTO the walk's database, so every re-finish started from a
+# different one. So a SEEDED final solve freezes it: after its matching (sequential,
+# loop detection, the revisit links) it writes `database.matching.json` beside the walk
+# database -- the keyframe image names and the SHA-1 of every solver image, everything
+# that decides what is matched (the key), the pycolmap version, and the database's
+# content digest. A later seeded final solve whose images, key and database all match
+# that record SKIPS extraction and matching entirely and maps what the record describes
+# (`solve.matching: "frozen"`). Anything else matches as before, into the same database,
+# and freezes the result (`"matched"`; `solve.matching_detail` says why). A world
+# finished before this change has no record: it matches once more, then it is frozen.
+# An unseeded solve (the default) neither reads nor writes the record.
+
+FROZEN_MATCHING_FILENAME = "database.matching.json"
+FROZEN_MATCHING_RECORD = "wb-frozen-matching/1"
+MATCHING_FROZEN = "frozen"
+MATCHING_MATCHED = "matched"
+# Tables that do not reach the mapper, the mask filter or the re-verification.
+_DIGEST_SKIP_TABLES = ("descriptors",)
+
+
+def database_digest(path) -> dict | None:
+    """What a COLMAP database holds, as digests: `content` (SHA-1 over every table but
+    the descriptors, row by row in key order -- what the mapper, the mask filter and the
+    re-verification read) and `verified` (SHA-1 over the verified pair set by image name
+    with each pair's inlier count and configuration), with `verified_pairs`, the count.
+    Read-only, the write-ahead log included. None when it cannot be read."""
+    import hashlib  # noqa: PLC0415
+    import sqlite3  # noqa: PLC0415
+
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = sorted(n for (n,) in con.execute(
+                "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
+                if n not in _DIGEST_SKIP_TABLES)
+            if "images" not in tables or "two_view_geometries" not in tables:
+                return None
+            content = hashlib.sha1()
+            for table in tables:
+                content.update(f"\x00table {table}\x00".encode())
+                for row in con.execute(f'select * from "{table}" order by 1'):
+                    for value in row:
+                        if isinstance(value, (bytes, bytearray, memoryview)):
+                            content.update(b"b%d:" % len(value))
+                            content.update(bytes(value))
+                        else:
+                            content.update(repr(value).encode("utf-8"))
+                        content.update(b"\x1f")
+                    content.update(b"\x1e")
+            names = dict(con.execute("select image_id, name from images"))
+            lines = []
+            for pid, rows, config in con.execute(
+                    "select pair_id, rows, config from two_view_geometries"):
+                if config in (0, 1) or not rows:
+                    continue
+                b = int(pid) % 2147483647
+                a = (int(pid) - b) // 2147483647
+                lines.append(" ".join(sorted((str(names.get(a)), str(names.get(b)))))
+                             + f" {int(rows)} {int(config)}")
+            lines.sort()
+            verified = hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return {"content": content.hexdigest(), "verified": verified, "verified_pairs": len(lines)}
+
+
+def _image_digests(workspace: SolveWorkspace, names) -> dict:
+    from tower.world_builder.solve_masks import file_sha1  # noqa: PLC0415
+
+    return {name: file_sha1(workspace.images_dir / name) for name in names}
+
+
+def matching_key(*, camera_params: str, overlap: int, loop_detection: bool, seed,
+                 revisit_pairs, revisit_min_inliers, pycolmap_version) -> dict:
+    """Everything that decides WHAT a final solve's matching puts in the database, beyond
+    the images. Thread counts are not in it: they change how, not what is asked for. The
+    pycolmap version pins every option this module leaves at its default."""
+    import hashlib  # noqa: PLC0415
+
+    listed = "".join(f"{a} {b}\n" for a, b in revisit_pairs or ())
+    return {
+        "pycolmap": pycolmap_version,
+        "camera_model": "PINHOLE",
+        "camera_params": camera_params,
+        "max_num_features": MAX_FEATURES,
+        "sequential_overlap": int(overlap),
+        "quadratic_overlap": False,
+        "loop_detection": bool(loop_detection),
+        "verification_seed": seed,
+        "revisit_pairs": {
+            "imported": bool(revisit_pairs),
+            "count": len(revisit_pairs or ()),
+            "sha1": hashlib.sha1(listed.encode("utf-8")).hexdigest() if revisit_pairs else None,
+            "min_inliers": revisit_min_inliers if revisit_pairs else None,
+        },
+    }
+
+
+def read_frozen_matching(workspace: SolveWorkspace) -> dict | None:
+    try:
+        record = read_json_closed(workspace.root / FROZEN_MATCHING_FILENAME)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("record") != FROZEN_MATCHING_RECORD:
+        return None
+    return record
+
+
+def _frozen_matching_refusal(workspace, database_path, key, images) -> str | None:
+    """None when the recorded matching is this solve's, else why not."""
+    record = read_frozen_matching(workspace)
+    if record is None:
+        return "no frozen matching record"
+    if record.get("database") != Path(database_path).name:
+        return f"the record is for {record.get('database')!r}"
+    if record.get("key") != key:
+        changed = sorted(k for k in set(key) | set(record.get("key") or {})
+                         if (record.get("key") or {}).get(k) != key.get(k))
+        return f"the matching parameters changed ({', '.join(changed)})"
+    held = record.get("images") or {}
+    if set(held) != set(images):
+        return (f"the keyframe images changed ({len(set(images) - set(held))} new, "
+                f"{len(set(held) - set(images))} gone)")
+    changed = sum(1 for name, sha1 in images.items() if held.get(name) != sha1)
+    if changed:
+        return f"{changed} solver images changed since the matching was frozen"
+    digest = database_digest(database_path)
+    if digest is None or digest.get("content") != (record.get("database_digest") or {}).get("content"):
+        return "the database changed since its matching was frozen"
+    return None
+
+
+def _freeze_matching(workspace, database_path, key, images, revisit_pairs) -> str | None:
+    """Write the record of the matching this solve just did. None when written, else why
+    not (a database that cannot be read cannot be frozen, and the solve goes on)."""
+    digest = database_digest(database_path)
+    if digest is None:
+        return "the database could not be read to freeze its matching"
+    write_json_atomic(workspace.root / FROZEN_MATCHING_FILENAME, {
+        "record": FROZEN_MATCHING_RECORD,
+        "database": Path(database_path).name,
+        "frozen_at": time.time(),
+        "key": key,
+        "images": images,
+        "revisit_pairs": [list(p) for p in revisit_pairs or ()],
+        "database_digest": digest,
+    })
+    return None
+
+
 def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, database_path,
-                         present, matching, verification) -> dict:
+                         present, matching, verification, *, pairs=None) -> dict:
     """Match the live relocalizer's revisit links (`relocalizer.revisit_pairs`)
     explicitly, in the final solve's database, with its matching and
     verification options -- and its masks, which apply to every pair because
@@ -1185,17 +1538,17 @@ def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, datab
     neither is sure to propose. No links (no relocalizer, an old session, a
     walk that never lost tracking) is today's solve, with no call made.
     Never raises: a failure costs the links, and the record says so.
+
+    `pairs`: the links already read (`_read_revisit_links`); None reads them here.
+    Which solves import them, and the floor they are held to, is `solve`'s decision
+    (review V8 M4); the verified count here is at COLMAP's 15.
     """
     record = {"listed": 0, "verified": 0, "detail": None}
-    try:
-        from tower.world_builder.relocalizer import revisit_pairs  # noqa: PLC0415
-
-        pairs = revisit_pairs(store.session_dir(world_id, session_id))
-    except Exception as exc:  # noqa: BLE001 -- no links is today's solve
-        record["detail"] = f"revisit links unreadable ({type(exc).__name__}: {exc})"
-        return record
-    have = set(present)
-    pairs = [(a, b) for a, b in pairs if a in have and b in have and a != b]
+    if pairs is None:
+        pairs, unreadable = _read_revisit_links(store, world_id, session_id, present)
+        if unreadable is not None:
+            record["detail"] = unreadable
+            return record
     record["listed"] = len(pairs)
     if not pairs:
         return record
@@ -1220,9 +1573,10 @@ def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, datab
     return record
 
 
-def _verified_pair_count(database_path, pairs) -> int | None:
-    """How many of `pairs` (image names) the database holds as verified pairs,
-    or None when the database cannot be read."""
+def _verified_pair_count(database_path, pairs, min_inliers: int = REVISIT_VERIFIED_MIN_INLIERS
+                         ) -> int | None:
+    """How many of `pairs` (image names) the database holds as verified pairs of at
+    least `min_inliers`, or None when the database cannot be read."""
     import sqlite3  # noqa: PLC0415
 
     base = 2147483647  # COLMAP's kMaxNumImages: pair_id = min_id * base + max_id
@@ -1237,7 +1591,7 @@ def _verified_pair_count(database_path, pairs) -> int | None:
                 lo, hi = sorted((ids[a], ids[b]))
                 row = con.execute("select rows from two_view_geometries where pair_id = ?",
                                   (lo * base + hi,)).fetchone()
-                if row is not None and (row[0] or 0) >= REVISIT_VERIFIED_MIN_INLIERS:
+                if row is not None and (row[0] or 0) >= min_inliers:
                     count += 1
         finally:
             con.close()
