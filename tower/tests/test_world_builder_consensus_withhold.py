@@ -415,6 +415,10 @@ def test_an_anchor_absorbed_piece_is_counted_and_listed_ambiguous(install):
     assert w.kids("X")[0] in c["ambiguous"]
     assert c["held_against_majority"] == 20
     assert c["detached"] == []
+    # The members are recorded (Tower-internal), so a flip's coverage by this report is exact.
+    assert piece["keyframe_ids"] == list(w.kids("X")) and len(piece["keyframe_ids"]) == piece["keyframes"]
+    for g in c["groups"]:
+        assert len(g["keyframe_ids"]) == g["keyframes"] and g["keyframe_ids"][0] == g["first_keyframe"]
 
 
 def test_a_unanimous_consensus_holds_nothing_against_the_majority(install):

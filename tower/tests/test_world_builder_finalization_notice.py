@@ -218,7 +218,9 @@ def test_the_builder_writes_the_gates_notice(tmp_path, monkeypatch):
     sentence = CP.publish_notice(report)
     assert sentence and "re-runs the gate" in sentence
     assert fin["notice"] == sentence
-    assert fin["detail"] == sentence, "detail keeps its meaning, and the sentence"
+    # `detail` keeps its meaning -- the diagnostics, raw why included (review V9 M-4, manager 025);
+    # the phone's `notice` is the closed set.
+    assert fin["detail"] == CP.publish_detail(report), "detail carries the diagnostic twin"
 
 
 @pytest.mark.parametrize("report", [

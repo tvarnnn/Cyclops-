@@ -162,9 +162,10 @@ def main(argv=None) -> int:
                 # What the published solve still owes, on the row (review V7, H2 and L-c):
                 # masks lost to GPU memory (an owner re-finishes), a gate to re-run.
                 from scripts.world_build_session import finalization_notice  # noqa: PLC0415
-                from tower.world_builder.coherence_publish import publish_notice  # noqa: PLC0415
+                from tower.world_builder.coherence_publish import publish_detail  # noqa: PLC0415
 
-                detail = publish_notice(summary) or detail
+                # `detail` keeps the diagnostics (review V9 M-4); the phone's `notice` is the closed set.
+                detail = publish_detail(summary) or detail
                 notice = finalization_notice(summary)
             elif summary.get("error"):
                 final_solve_state = FINAL_SOLVE_FAILED

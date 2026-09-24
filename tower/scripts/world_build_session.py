@@ -2292,10 +2292,11 @@ def main(argv=None) -> int:
                     # L-c): masks lost to GPU memory (an owner re-finishes this walk), a
                     # gate the idle Tower re-runs. None for every ungated solve.
                     from tower.world_builder.coherence_publish import (  # noqa: PLC0415
-                        publish_notice,
+                        publish_detail,
                     )
 
-                    finalization_detail = publish_notice(solve_report) or finalization_detail
+                    # `detail` keeps the diagnostics (review V9 M-4); `notice` is the closed set.
+                    finalization_detail = publish_detail(solve_report) or finalization_detail
                     # And the phone's copy of it (v6, §3.1; `detail` keeps its meaning and
                     # still carries the sentence).
                     finalization_notice_text = finalization_notice(solve_report)

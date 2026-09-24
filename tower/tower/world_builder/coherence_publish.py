@@ -780,7 +780,10 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
                 decision = DECISION_UNPLACED
             if decision == DECISION_SEED_UNSTABLE:
                 withhold.append(u["first_camera"])
-            groups.append({"first_keyframe": kids[0], "keyframes": len(kids), "in_room": u["in_room"],
+            # `keyframe_ids` (Tower-internal, for audit and the acceptance scorer): which keyframes the
+            # group is, so a flip's coverage by an ambiguous report is exact, not a size bound.
+            groups.append({"first_keyframe": kids[0], "keyframes": len(kids), "keyframe_ids": list(kids),
+                           "in_room": u["in_room"],
                            "votes": per_draw, "attached_votes": yes, "draws": n,
                            "ambiguous": 0 < yes < n, "decision": decision, **extra,
                            **({"label": u["label"]} if "label" in u else {})})
@@ -813,7 +816,9 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
                     continue
                 in_room = 2 * len(kids & attached[chosen]) > len(kids)
                 pieces.append({"first_keyframe": min(kids, key=lambda kid: order.get(kid, 0)),
-                               "keyframes": len(kids), "from_draw": k, "votes": per_draw,
+                               "keyframes": len(kids),
+                               "keyframe_ids": sorted(kids, key=lambda kid: order.get(kid, 0)),
+                               "from_draw": k, "votes": per_draw,
                                "attached_votes": yes, "draws": n, "majority_attached": 2 * yes > n,
                                "in_published_room": in_room, "against_majority": in_room != (2 * yes > n)})
     return {"voting": voting, "chosen": chosen, "agreement": agreement, "keyframes": len(universe),
