@@ -361,10 +361,14 @@ compression, and no `ETag` or `Last-Modified`. The manifest format stays
 `wb-appearance-keyframes/1`; the area's appearance and surface manifests each
 gain one additive key, `area: {id, levelled}`.
 
-The area's artifacts live beside the session's (proposed:
-`<world>/areas/<session>/<area_id>/{surface,appearance}/`, with the same files,
-atomic publish and prune rules as SURFACE §4 and APPEARANCE §4). Tower-internal;
-OPEN T9.
+The area's artifacts live in `<world>/areas/<area_id>/`, laid out as a world
+directory of the area's one session (`solve/`, `surface/`, `appearance/`,
+`dense/` `/<session>/`) plus `record.json` (the area's stage record, naming its
+session), with the same files, atomic publish and prune rules as SURFACE §4 and
+APPEARANCE §4. Not `<world>/areas/<session>/<area_id>/`: repeating the 32-hex
+session id put the first real area build's staging paths past Windows MAX_PATH,
+and the area id already hashes the session id (§2.4 rule 3), so it is unique in
+the world. Tower-internal; settled 2026-09-23 (contract v3), no wire change.
 
 ### 5.4 What the area page draws
 
@@ -642,12 +646,21 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
    command rebuilds a saved session with the product pipeline (masks, the
    seeded solve, depth before publishing, the evidence gate, components, room
    and area builds), from authoritative data (the stored, redacted keyframes;
-   refused for `images_purged`). Proposed name:
-   `.venv\Scripts\python.exe scripts/world_refinish.py --root <root> --world <id> [--session <sid>]`.
-   An owner runs it; nothing else does. Its result: `components` appears, and
-   the room may change (the gate may move pieces out of it), so the room's
-   revision changes and an open viewer offers *A newer reconstruction is ready*
-   under IOS §10's existing rules.
+   refused for `images_purged`). It is
+   `.venv\Scripts\python.exe scripts/world_refinish.py --root <root> --world <id> [--session <sid>] [--seed 0]`.
+   It first sets the session's previous result aside under
+   `<world>/refinish/<stamp>/` and **deletes nothing**: the solve directory and
+   the session's areas are moved there, the surface, appearance, dense and
+   derived trees and the session record are copied there, and `refinish.json`
+   records what came from where (kept for rollback; deletion requires human
+   approval). It then runs the final solve with the masks, the seeded
+   single-thread solve and the evidence gate on, the room's final surface and
+   appearance, and every `shown_as: "area"` component. It is refused for
+   `images_purged` and while a live writer holds the world. An owner runs it;
+   nothing else does. Its result: `components` appears, and the room may change
+   (the gate may move pieces out of it), so the room's revision changes and an
+   open viewer offers *A newer reconstruction is ready* under IOS §10's existing
+   rules. (Settled 2026-09-23, contract v3; Tower-internal, no wire change.)
 5. **The finisher never computes components.** `world_finish_pending.py` and
    the Tower's idle and start-up finishing treat `components: null` as owing
    **nothing**: no world is rebuilt into components on Tower start or when idle.
@@ -777,11 +790,11 @@ phone sends no `viewer` on area routes; M13 needs `scope` and
 - **T7** Whether to report keyframes in no component (the solve could not pose
   them) as a count.
 - **T8** Episode timeouts when frames stop arriving.
-- **T9** Where the components record and the area artifacts live
-  (proposed: `solve/<session>/components.json`, written with the published
-  solve; `<world>/areas/<session>/<area_id>/…`; per-area stage records in
-  `session.json` `stages`).
+- **T9** SETTLED (v3): the components record is `solve/<session>/components.json`,
+  written once per published solve; area artifacts are `<world>/areas/<area_id>/…`
+  (§5.3); per-area stage records live in the area's `record.json`, not in
+  `session.json` `stages` (the builder and finisher rewrite `session.json`).
 - **T10** The span timebase for recorded captures replayed at other than real
   time.
-- **T11** Whether a re-finish keeps the previous solve and builds for rollback
-  (deletion requires human approval).
+- **T11** SETTLED (v3): a re-finish keeps the previous solve and builds under
+  `<world>/refinish/<stamp>/` for rollback and deletes nothing (§7 rule 4).
