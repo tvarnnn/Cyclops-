@@ -167,6 +167,19 @@ class DenseParams:
     # masked out of the reconstruction afterwards -- this exists to protect the
     # rest of the frame, not to recover the hole.
     inpaint_redaction_fill: bool = True
+    # Tell a network that can take it (MoGe: `fov_x`) the SOLVE CAMERA'S field
+    # of view instead of letting it estimate one per frame. Off: today's
+    # prediction, byte for byte. On: what the evidence gate's metric scale
+    # needs (`coherence_scale.py`). Measured on the control world (run
+    # wb-coherence-run-2026-09-23, P3-PG `depth_diag.py`, against the run's
+    # harness depth cache: the same checkpoint told the FoV, on raw frames):
+    # with the FoV left to the network, the per-frame metric depth of frames
+    # with no redaction fill differs by p10-p90 x0.99-x1.56 (median x1.19) --
+    # a per-frame level noise the size of the gate's x1.25 bound; told the
+    # FoV, by x0.987-x1.015. The affine per-frame fit absorbs a pure scale, so
+    # for the surface this changes only the depth SHAPE the fit is applied to
+    # (unmeasured for the surface: OPEN).
+    known_fov: bool = False
 
     # -- consensus --------------------------------------------------------
     # How many nearby cameras the agreement test consults. Raising it does
@@ -242,6 +255,10 @@ class DenseParams:
     def as_dict(self) -> dict:
         d = asdict(self)
         d["lod_depth_fractions"] = list(self.lod_depth_fractions)
+        # Recorded only when on, so every manifest written with the default is
+        # byte-identical to one written before the parameter existed.
+        if not self.known_fov:
+            d.pop("known_fov", None)
         return d
 
     def voxels_for(self, median_scene_depth: float) -> list[float]:
@@ -492,6 +509,11 @@ class MoGeBackend(DepthBackend):
     """
 
     kind = "depth"
+    # `predict(rgb, fov_x=...)` conditions the point map on a known horizontal
+    # field of view (degrees), as the run's harness depth cache does
+    # (`coherence_eval/eval_depth.py`). Without it MoGe estimates the FoV per
+    # frame (`DenseParams.known_fov`).
+    accepts_fov = True
 
     def __init__(self, model_id: str, name: str, licence: str,
                  resolution_level: int = 9) -> None:
@@ -524,13 +546,15 @@ class MoGeBackend(DepthBackend):
         logger.info("[Tower][WorldBuilder][dense] depth backend %s (%s) on %s",
                     self.name, self.licence, self._device)
 
-    def predict(self, rgb: np.ndarray) -> np.ndarray:
+    def predict(self, rgb: np.ndarray, fov_x: float | None = None) -> np.ndarray:
         self._load()
         t = self._torch.tensor(rgb / 255.0, dtype=self._torch.float32,
                                device=self._device).permute(2, 0, 1)
+        # `fov_x` only when given, so the default call is exactly today's.
+        extra = {"fov_x": float(fov_x)} if fov_x is not None else {}
         with self._torch.no_grad():
             out = self._model.infer(t, resolution_level=self.resolution_level,
-                                    apply_mask=False)
+                                    apply_mask=False, **extra)
         pts = out["points"].float().cpu().numpy()
         z = np.ascontiguousarray(pts[..., 2]).astype(np.float32)
         mask = out.get("mask")

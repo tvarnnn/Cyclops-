@@ -739,9 +739,11 @@ one that survives the gaps between stages.
 > not coming -- so `failed` keeps its `ready` and tells the truth in this
 > block instead.
 
-> **`never_recorded` is load-bearing for compatibility.** 165 of the 166
-> worlds on the machine this was written for were built by a Tower with no
-> photographic stages at all. They are finished, they are owed nothing, and
+> **`never_recorded` is load-bearing for compatibility.** Worlds built by a
+> Tower with no photographic stages at all (corrected 2026-09-23, C1 E10: the
+> Tower's own code measured 67 `unattempted` and 2 `never_recorded` on the
+> development root, not "165 of 166"; PROPOSED the same day: the block gains an
+> additive `scope: "room" | "area"`, `WORLD-BUILDER-COMPONENTS.md` §3.4). They are finished, they are owed nothing, and
 > they keep reading `ready`/`finalized` exactly as before. It is reached only
 > when there is NO stage record AND no stage artifact on disk, and it is
 > decided **without** consulting the liveness probe -- so a probe that breaks
@@ -795,6 +797,20 @@ one that survives the gaps between stages.
 source as an untuned placeholder and is not emitted as an event at all.
 Emitting `limited` from it would present an unmeasured placeholder as a
 calibrated judgment.
+
+**`tracking.recovery`** — **PROPOSED 2026-09-23, awaiting Mac review; nothing
+implemented.** An additive, fixed-arity object, or **`null`** when the
+session's journal records no relocalizer (every session today; `null` means
+*not recorded*, never *no losses*). It reports the live relocalizer's current
+or last episode (`state`: `none` / `searching` / `prompting` / `recovered` /
+`timed_out`; `recovered` only on a triangle of two ≥ 50-inlier links closing
+within 8°, or one ≥ 100-inlier link), the latest look-back `prompt` with a
+per-session, strictly increasing `id` the phone speaks at most once, per-session
+`counts`, and — read-only, as the builder ran them — the prompt-rate
+`limiter` (never more than 2 prompts in any 60 s) and the `acceptance`
+parameters. Every time is the Tower's clock; nothing in it advances by itself,
+so it moves `revision` only when the state does. The contract identifier does
+not move. Specified in `docs/contracts/WORLD-BUILDER-COMPONENTS.md` §6.
 
 **`calibration`** — scope is **`"session"`**, always.
 

@@ -154,7 +154,12 @@ class WorldView:
                 {
                     "keyframe_id": keyframe.keyframe_id,
                     "source_seq": keyframe.source_seq,
-                    "segment_index": keyframe.segment_index,
+                    # THE SEGMENT THE POSE IS IN -- the derived row's, which a gated solve
+                    # may have split off the tracker's (review V7, M1); the pose is only
+                    # meaningful in that segment's frame. The tracker's when there is no row.
+                    "segment_index": (int(row["segment_index"]) if row and row.get("segment_index")
+                                      is not None else keyframe.segment_index),
+                    "tracker_segment_index": keyframe.segment_index,
                     "image_relpath": keyframe.image_relpath,
                     "status": row["status"] if row else UNKNOWN,
                     "degeneracy": (row.get("degeneracy") or "") if row else "",

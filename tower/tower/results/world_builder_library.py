@@ -328,6 +328,46 @@ def _photographic_state_for_row(store: WorldStore, world_id: str,
         }
 
 
+def _components_for_row(store: WorldStore, world_id: str, session_id: str, session,
+                        world, *, has_geometry: bool, appearance: dict | None):
+    """The row's `components` (contract §2), or None -- never an exception.
+
+    None costs one `stat` for every session without a components record, which is
+    every session built before the evidence gate: `components: null`, and the row is
+    otherwise byte for byte what it was (§7 rule 1). The room entry's
+    `has_geometry` and `keyframes_phone` ARE the row's own (§2.1), passed in rather
+    than recomputed so the two cannot disagree.
+
+    A record that cannot be turned into the wire array is null too, and logged: the
+    phone behaves as today on null, which is the safe failure of a new key.
+    """
+    try:
+        from tower.world_builder.components import (  # noqa: PLC0415
+            read_components_record,
+            wire_components,
+        )
+        from tower.world_builder.photographic import (  # noqa: PLC0415
+            room_photographic_state,
+        )
+
+        record = read_components_record(store, world_id, session_id)
+        if record is None:
+            return None
+        return wire_components(
+            store, world_id, session_id, session, record=record,
+            room_has_geometry=has_geometry,
+            room_keyframes_phone=(appearance or {}).get("keyframes_phone"),
+            room_word=room_photographic_state(store, world_id, session_id, session),
+            world=world,
+        )
+    except Exception:  # noqa: BLE001 -- a new key must never take the row down
+        logger.warning(
+            "[Tower][Worlds] the components of %s/%s could not be listed; the row "
+            "says components: null", world_id, session_id, exc_info=True,
+        )
+        return None
+
+
 def session_state(session, *, live: bool, has_geometry: bool, manifest=None,
                   still_building: bool = False,
                   photographic: dict | None = None) -> str:
@@ -675,6 +715,7 @@ def build_world_listing(store: WorldStore) -> dict:
             photographic = _photographic_state_for_row(
                 store, world_id, session_id, session
             )
+            appearance = _appearance_summary_or_none(store, world_id, session_id, world)
             sessions.append({
                 "session_id": session.session_id,
                 "started_at": session.started_at,
@@ -742,7 +783,15 @@ def build_world_listing(store: WorldStore) -> dict:
                 "dense": _dense_summary(store, world_id, session_id),
                 # Additive (review 1, m6): the appearance artifact, reported as
                 # the imagery it is. Null when the session has none.
-                "appearance": _appearance_summary_or_none(store, world_id, session_id, world),
+                "appearance": appearance,
+                # Additive (WORLD-BUILDER-COMPONENTS.md §3.1): the pieces of this
+                # session's final solve -- the room and the areas the evidence
+                # gate could not place -- or null, "not computed", on every
+                # session without a components record. The contract identifier
+                # does not move, for `_dense_summary`'s reason.
+                "components": _components_for_row(
+                    store, world_id, session_id, session, world,
+                    has_geometry=has_geometry, appearance=appearance),
             })
         # `_sortable` HERE TOO, and its absence here was the whole
         # argument for it thirty lines below.

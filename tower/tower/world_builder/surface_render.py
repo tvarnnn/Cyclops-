@@ -98,6 +98,121 @@ def js_object_literal(value: dict) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Components captions (WORLD-BUILDER-COMPONENTS.md §4 and §5.4)
+# ---------------------------------------------------------------------------
+#
+# THE TEMPLATES ARE NOT EDITED, and that is the design. A page for a session with
+# no components record -- every saved world today (§7 rule 1) -- must be the page
+# it was, byte for byte. So the two captions the contract adds are applied at
+# composition time, and only to the pages that carry them, by replacing exact
+# fragments of the template ("anchors") that each occur exactly once in it:
+#
+#   - the ROOM page of a session with at least one `shown_as: "area"` entry gains
+#     " · N more areas shown separately" (§4);
+#   - an AREA page gets its header "Area k of N — not placed in the room", the
+#     not-to-scale caption from P2-PX's wording, "Face the area", and the
+#     levelling note when its vertical could not be estimated (§5.4).
+#
+# `captions` is None for every other page, and then nothing is touched.
+# `tests/test_world_builder_component_captions.py` holds every anchor to "exactly
+# once in the template", so rewording one of these lines in a template fails a
+# test instead of silently dropping an area's caption.
+
+AREA_NOT_PLACED = (
+    "This area could not be placed relative to the room, so it is shown on its own: "
+    "its position, direction and size are not comparable with the room's. Not to scale.")
+AREA_NOT_LEVELLED = "Its vertical could not be estimated, so it may look tilted."
+
+
+def js_string_literal(text: str) -> str:
+    """A JavaScript string literal, safe inside a `<script>` (`js_object_literal`'s
+    escapes)."""
+    return js_object_literal(text)  # json.dumps of a str is a JS string literal
+
+
+def walk_time(seconds: float) -> str:
+    """`m:ss` of this walk (§8): minutes are not wrapped past 59, hours are never
+    used, seconds are truncated."""
+    total = max(0, int(seconds))
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def more_areas_text(count: int) -> str:
+    """The room caption's suffix (§4), without its leading separator."""
+    return f"{int(count)} more area{'' if int(count) == 1 else 's'} shown separately"
+
+
+def area_header(area: dict) -> str:
+    """`Area k of N — not placed in the room` (§5.4), numbered by §2.4 rule 2."""
+    return f"Area {int(area['number'])} of {int(area['of'])} — not placed in the room"
+
+
+def area_caption(area: dict, first_clause: str) -> str:
+    """The area rung's caption (§5.4, P2-PX's wording): `first_clause`, when in
+    this walk it was captured, that it is shown on its own and not to scale, and
+    the levelling note when its vertical could not be estimated."""
+    when = ""
+    if area.get("from_s") is not None and area.get("to_s") is not None:
+        when = (f", from {walk_time(area['from_s'])} to {walk_time(area['to_s'])} "
+                "of this walk")
+    text = f"{first_clause}{when}. {AREA_NOT_PLACED}"
+    if area.get("levelled") is False:
+        text += " " + AREA_NOT_LEVELLED
+    return text
+
+
+def replace_anchors(page: str, replacements: list, what: str) -> str:
+    """Each `(anchor, text)` replaced, only if EVERY anchor occurs exactly once;
+    otherwise the page is returned unchanged and the mismatch logged (a template
+    edit must cost a caption, never the page)."""
+    for anchor, _text in replacements:
+        if page.count(anchor) != 1:
+            logger.error("[Tower][WorldBuilder] the %s captions were not applied: a template "
+                         "anchor occurs %d times (expected once): %r", what,
+                         page.count(anchor), anchor[:80])
+            return page
+    for anchor, text in replacements:
+        page = page.replace(anchor, text, 1)
+    return page
+
+
+# The surface page's anchors (surface_viewer.html).
+SURFACE_ANCHOR_HEAD = '  head.textContent = "Reconstructed surface";'
+SURFACE_ANCHOR_BITS = (
+    "  if (!CONFIG.current && CONFIG.currency_reason) "
+    "bits.push(String(CONFIG.currency_reason));")
+SURFACE_ANCHOR_NOTE = "  let note = (CONFIG.evidence_filter"
+SURFACE_AREA_FIRST_CLAUSE = "Surfaces the Tower reconstructed from the walk"
+
+
+def surface_caption_replacements(captions: dict | None) -> list:
+    """The anchor replacements `captions` asks of a surface page (empty for None)."""
+    if not captions:
+        return []
+    area = captions.get("area")
+    if area:
+        return [
+            (SURFACE_ANCHOR_HEAD,
+             f"  head.textContent = {js_string_literal(area_header(area))};"),
+            (SURFACE_ANCHOR_NOTE,
+             "  let note = "
+             + js_string_literal(area_caption(area, SURFACE_AREA_FIRST_CLAUSE) + " ")
+             + " + (CONFIG.evidence_filter"),
+        ]
+    more = int(captions.get("more_areas") or 0)
+    if more >= 1:
+        return [(SURFACE_ANCHOR_BITS,
+                 SURFACE_ANCHOR_BITS + "\n  bits.push("
+                 + js_string_literal(more_areas_text(more)) + ");")]
+    return []
+
+
+def apply_surface_captions(page: str, captions: dict | None) -> str:
+    replacements = surface_caption_replacements(captions)
+    return replace_anchors(page, replacements, "surface") if replacements else page
+
+
 def choose_level(manifest: dict, budget_bytes: int, overhead: int | None = None) -> dict:
     """The largest level whose PAGE fits the budget, else the smallest there is.
 
@@ -346,8 +461,13 @@ def _compose(template: str, raw: bytes, config: dict) -> str:
 def build_surface_page(store, world_id: str, session_id: str, *,
                        budget_bytes: int = MOBILE_BYTE_BUDGET,
                        level: int | None = None,
-                       max_points: int | None = None) -> str:
-    """One self-contained HTML page with the mesh inside it."""
+                       max_points: int | None = None,
+                       captions: dict | None = None) -> str:
+    """One self-contained HTML page with the mesh inside it.
+
+    `captions` (WORLD-BUILDER-COMPONENTS.md §4/§5.4, `apply_surface_captions`) is
+    None for every page without components, which is then composed exactly as
+    before."""
     template_path = viewer_template_path()
     if not template_path.exists():
         raise SurfaceViewerUnavailable("the surface viewer template is not installed")
@@ -356,6 +476,10 @@ def build_surface_page(store, world_id: str, session_id: str, *,
         if token not in template:
             raise SurfaceViewerUnavailable(
                 f"the surface viewer template has no {token}")
+    # Applied to the TEMPLATE, before any data is pasted in, so an anchor can only
+    # ever match the program's own text.
+    if captions:
+        template = apply_surface_captions(template, captions)
 
     # `max_points` is the worlds contract's budget knob and must not be
     # ignored just because this representation is not made of points. It was

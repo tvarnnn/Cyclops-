@@ -33,7 +33,12 @@ from tower.results.world_builder_geometry import (
 from tower.results.world_builder_library import build_world_listing
 from tower.results.world_builder_render import (
     MAX_POINTS_CEILING,
+    AreaUnavailable,
     WorldRenderUnavailable,
+    area_appearance_file,
+    area_appearance_manifest,
+    build_area_render,
+    build_area_revision,
     build_render_revision,
     build_world_render,
     render_content_security_policy,
@@ -295,3 +300,94 @@ def world_render(
         "Cache-Control": "no-store",
         "Content-Security-Policy": render_content_security_policy(html, transport),
     })
+
+
+# -- areas (WORLD-BUILDER-COMPONENTS.md §5) ----------------------------------
+#
+# A part of a walk the Tower could not place relative to the room, drawn on its own.
+# New paths, which no existing app requests; every room route above is unchanged. The
+# same status codes, headers and CSP as the room's pages and appearance routes. The
+# four area 404 sentences are stable identifiers the phone compares for equality
+# (C1 E4): they come from the adapter, verbatim, and a test pins them.
+
+
+@router.get("/worlds/{world_id}/areas/{session_id}/{area_id}/render/revision")
+def area_render_revision(world_id: str, session_id: str, area_id: str,
+                         request: Request) -> JSONResponse:
+    """Which picture the area's render route would serve now (§5.2). No query: the
+    phone's scheme handler proxies this path with none, and `viewer` would be
+    ignored here anyway."""
+    try:
+        payload = build_area_revision(_store(request), world_id, session_id, area_id)
+    except AreaUnavailable as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from None
+    return JSONResponse(json_safe(payload), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/worlds/{world_id}/areas/{session_id}/{area_id}/render",
+            response_class=HTMLResponse)
+def area_render(
+    world_id: str, session_id: str, area_id: str, request: Request,
+    # An area is built as a surface and an appearance only. `sparse` and `dense`
+    # are accepted by the pattern so the adapter can answer them with a 404 that
+    # says why ("an area has no sparse or dense rung"); anything else is a 422.
+    representation: str = Query(
+        default="auto", pattern="^(auto|sparse|dense|surface|appearance)$"),
+    max_points: int | None = Query(default=None, ge=1, le=MAX_POINTS_CEILING),
+    transport: str = Query(default="app", pattern="^(app|tower)$"),
+    # Accepted and ignored, never a 422 (§5.1): every client that can name this
+    # route postdates the scheme handler, so `auto` offers the appearance rung.
+    viewer: str | None = Query(default=None),
+) -> HTMLResponse:
+    """The area's viewer page (§5.1): the room's page programs, fed the area's own
+    artifacts, in the area's own levelled frame, never composited with the room."""
+    try:
+        html = build_area_render(
+            _store(request), world_id, session_id, area_id, max_points=max_points,
+            representation=representation, transport=transport, viewer=viewer,
+        )
+    except AreaUnavailable as exc:
+        raise HTTPException(status_code=404, detail=exc.reason) from None
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": render_content_security_policy(html, transport),
+    })
+
+
+@router.get("/worlds/{world_id}/areas/{session_id}/{area_id}/appearance/manifest")
+def area_appearance_manifest_route(world_id: str, session_id: str, area_id: str,
+                                   request: Request) -> Response:
+    """The area's appearance manifest, under APPEARANCE §9 in every respect (§5.3)."""
+    try:
+        payload, label, imagery = area_appearance_manifest(
+            _appearance_store(request), world_id, session_id, area_id)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    data = JSONResponse(json_safe(payload)).body
+    return _appearance_response(request, data, "application/json", label, imagery)
+
+
+def _area_appearance_bytes(request: Request, world_id: str, session_id: str,
+                           area_id: str, kind: str, digest: str) -> Response:
+    try:
+        data, label, imagery = area_appearance_file(
+            _appearance_store(request), world_id, session_id, area_id, kind, digest)
+    except AppearanceNotServed as exc:
+        raise HTTPException(status_code=404, detail=exc.reason,
+                            headers=NO_STORE_HEADERS) from None
+    return _appearance_response(request, data, "application/octet-stream", label, imagery)
+
+
+@router.get("/worlds/{world_id}/areas/{session_id}/{area_id}/appearance/chunk/{digest}")
+def area_appearance_chunk_route(world_id: str, session_id: str, area_id: str,
+                                digest: str, request: Request) -> Response:
+    """One of the area's keyframe bundles, by the digest its manifest names."""
+    return _area_appearance_bytes(request, world_id, session_id, area_id, "chunk", digest)
+
+
+@router.get("/worlds/{world_id}/areas/{session_id}/{area_id}/appearance/proxy/{digest}")
+def area_appearance_proxy_route(world_id: str, session_id: str, area_id: str,
+                                digest: str, request: Request) -> Response:
+    """The area's proxy mesh (`WBSURF01`)."""
+    return _area_appearance_bytes(request, world_id, session_id, area_id, "proxy", digest)

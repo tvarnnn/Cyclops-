@@ -636,6 +636,17 @@ def assess(
             "needs a global solve and there is none"
         )
 
+    # A GATED SOLVE THAT OWES ITS GATE AGAIN (review V7, H1b and L-c): the depth stage could
+    # not give it a metric scale (the network missing, CUDA out of memory, the surface lock
+    # held), or the gate itself raised. Asked before the photographic stages because the
+    # re-gate can move pieces out of the room, which the room's stages then rebuild. Only a
+    # solve the gate RAN on can owe one: this tool never computes components for a world
+    # the gate never saw. A solve that lost its MASKS owes nothing here -- that needs a new
+    # solve, which an owner runs attended (`world_refinish.py`; V7, H2).
+    regate = _assess_regate(store, world_id, session_id, max_attempts=max_attempts)
+    if regate is not None:
+        return regate
+
     # TWO SIGNALS, IN PRECEDENCE ORDER, AND NEITHER CAN DISCOVER A BACKLOG.
     #
     # THE RECORD FIRST, wherever there is one. `Session.stages` is written
@@ -664,6 +675,15 @@ def assess(
                 stage = candidate
                 break
         if stage is None:
+            # THE ROOM OWES NOTHING; ITS AREAS MAY (WORLD-BUILDER-COMPONENTS.md
+            # §3.4, §7 rule 5). Asked only here, after the room, because the row
+            # carries an area's word only when the room's is settled -- and never
+            # of a session without a components record: `null` owes nothing, so
+            # no world is rebuilt into components by this tool.
+            areas = _assess_areas(store, world_id, session_id, session,
+                                  max_attempts=max_attempts)
+            if areas is not None:
+                return areas
             return no("nothing-interrupted",
                       "no photographic stage is in an interrupted state")
     else:
@@ -679,6 +699,10 @@ def assess(
                 return no("building-now",
                           "a photographic stage for this session is running "
                           "right now")
+            areas = _assess_areas(store, world_id, session_id, session,
+                                  max_attempts=max_attempts)
+            if areas is not None:
+                return areas
             return no(
                 "no-stage-record",
                 "this session has no stage record and no interrupted "
@@ -763,6 +787,356 @@ def assess(
     )
 
 
+# -- areas (WORLD-BUILDER-COMPONENTS.md §5.4, §7 rule 5) ---------------
+#
+# An AREA is a part of a walk the evidence gate did not place; it is built on its
+# own (`tower/world_builder/area_build.py`) after the room. Its work is owed exactly
+# when the session's components record -- written by the gate with the published
+# solve, and by nothing here -- names an area whose build is unsettled, which is the
+# same judgement the row's `photographic` block makes (`components.area_words`), so
+# the tool that builds the work and the row that reports it cannot disagree about it.
+#
+# THIS TOOL NEVER COMPUTES COMPONENTS. A session with no record (`components: null`,
+# every world built before the gate) owes no area work, whatever it looks like.
+
+# The verdict's `stage` for owed area work, and the attempt ledger's key for it: a
+# counter of its own, so a room that needed two attempts does not leave its areas one.
+AREAS_STAGE = "areas"
+
+
+def area_ledger_key(session_id: str) -> str:
+    return f"{session_id}#{AREAS_STAGE}"
+
+
+def _owed_areas(store: WorldStore, world_id: str, session_id: str, session):
+    """`(record, {area_id: word})` of the unsettled areas, or `(None, {})`.
+
+    Light on purpose: the survey runs at every Tower start over every session, and a
+    session without a record costs one `stat` here and imports nothing heavy."""
+    from tower.world_builder.components import (  # noqa: PLC0415
+        area_words,
+        read_components_record,
+    )
+    from tower.world_builder.photographic import is_unsettled  # noqa: PLC0415
+
+    record = read_components_record(store, world_id, session_id)
+    if record is None:
+        return None, {}
+    words = area_words(store, world_id, session_id, session, record)
+    return record, {aid: w for aid, w in words.items() if is_unsettled(w.get("state"))}
+
+
+def _assess_areas(store: WorldStore, world_id: str, session_id: str, session, *,
+                  max_attempts: int) -> "Verdict | None":
+    """A verdict about this session's AREAS, or None when they owe nothing (which
+    includes every session with no components record)."""
+    try:
+        _record, owed = _owed_areas(store, world_id, session_id, session)
+    except Exception as exc:  # noqa: BLE001 -- one session's areas, not the survey
+        logger.warning("[Tower][WorldBuilder] could not assess the areas of %s/%s: %s: %s",
+                       world_id, session_id, type(exc).__name__, exc)
+        return None
+    if not owed:
+        return None
+    if any(word.get("state") == "running" for word in owed.values()):
+        return Verdict(world_id, session_id, False,
+                       "an area of this session is being built right now",
+                       code="building-now", stage=AREAS_STAGE)
+    holder = store.lock_holder(world_id)
+    if holder is not None and holder["pid"] == os.getpid():
+        holder = None
+    if holder is not None and (holder["alive"] or holder["unreadable"]):
+        return Verdict(world_id, session_id, False,
+                       "this world's writer lock is held by another process",
+                       code="locked", stage=AREAS_STAGE)
+    attempts = read_attempts(store, world_id, area_ledger_key(session_id))
+    if attempts is None:
+        attempts = 0
+    if attempts >= max_attempts:
+        return Verdict(world_id, session_id, False,
+                       f"this tool has already started this session's areas {attempts} "
+                       f"times (the bound is {max_attempts}) and something ended it "
+                       "every time", code="attempt-bound", stage=AREAS_STAGE,
+                       attempts=attempts, exhausted=True)
+    return Verdict(world_id, session_id, True,
+                   f"{len(owed)} area(s) of this session are unsettled and nothing is "
+                   "building them", code="owed-area", stage=AREAS_STAGE,
+                   attempts=attempts)
+
+
+# -- a re-gate owed to a gate that could not finish (review V7, H1b and L-c) ------------
+#
+# The evidence gate's scale fail-safe publishes the room as its unsplit anchor block, which
+# on GT's masked arms leaves [129, 89, 120, 44] misplaced where the gate leaves [24, 0, 0,
+# 38] (V7) -- tolerable for an interim publish, not as a world's final answer. When it was
+# caused by the depth stage (`gate.retryable`, `gate.cause` depth-unavailable) or the gate
+# raised (gate-failed), the session is owed ONE thing: the depth stage and the gate run
+# again IN PLACE on the published solve (`coherence_publish.regate_published`) -- the solve
+# is not redone and nothing is moved aside -- then the derived tree and the room's stages
+# are rebuilt from it; its areas are owed by the new record. Under the writer lock, on its
+# own attempt ledger key, bounded like every other stage.
+#
+# There is deliberately no unattended RE-SOLVE (V7, H2): a solve that lost its masks keeps
+# `transients.retryable` and says so on the row; an owner re-finishes it attended.
+
+REGATE_STAGE = "regate"
+
+
+def regate_ledger_key(session_id: str) -> str:
+    return f"{session_id}#{REGATE_STAGE}"
+
+
+def _assess_regate(store: WorldStore, world_id: str, session_id: str, *,
+                   max_attempts: int) -> "Verdict | None":
+    from tower.world_builder.coherence_publish import regate_owed  # noqa: PLC0415
+
+    try:
+        cause = regate_owed(store, world_id, session_id)
+    except Exception as exc:  # noqa: BLE001 -- one session, not the survey
+        logger.warning("[Tower][WorldBuilder] could not read the gate record of %s/%s: %s",
+                       world_id, session_id, exc)
+        return None
+    if cause is None:
+        return None
+    if session_build_running(store, world_id, session_id):
+        return Verdict(world_id, session_id, False, "this session is being built right now",
+                       code="building-now", stage=REGATE_STAGE)
+    holder = store.lock_holder(world_id)
+    if holder is not None and holder["pid"] == os.getpid():
+        holder = None
+    if holder is not None and (holder["alive"] or holder["unreadable"]):
+        return Verdict(world_id, session_id, False,
+                       "this world's writer lock is held by another process",
+                       code="locked", stage=REGATE_STAGE)
+    attempts = read_attempts(store, world_id, regate_ledger_key(session_id)) or 0
+    if attempts >= max_attempts:
+        # Not `exhausted`: nothing to retire. The published fail-safe stands, and its row
+        # says why (`coherence_publish.publish_notice`).
+        return Verdict(world_id, session_id, False,
+                       f"this tool has already re-run the gate of this session {attempts} "
+                       f"times (the bound is {max_attempts}); {cause} every time",
+                       code="attempt-bound", stage=REGATE_STAGE, attempts=attempts)
+    return Verdict(world_id, session_id, True,
+                   f"the published solve's evidence gate could not finish ({cause}); it is "
+                   "owed a re-gate in place", code="owed-regate", stage=REGATE_STAGE,
+                   attempts=attempts)
+
+
+def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: str) -> None:
+    """Undo one `record_attempt` for work that was REFUSED before it began. Not
+    `forgive_attempt`, whose bound is about runs that were stopped: a refusal did no
+    work at all, so it is not counted, and not bounded either."""
+    with _LEDGER_LOCK:
+        sessions, unreadable = _read_ledger(store, world_id)
+        if unreadable:
+            return
+        sessions = dict(sessions)
+        entry = dict(sessions.get(key) or {})
+        entry["attempts"] = max(0, _counter(entry, "attempts") - 1)
+        entry["forgiven"] = _counter(entry, "forgiven")
+        entry["detail"] = detail
+        sessions[key] = entry
+        _write_ledger(store, world_id, sessions)
+
+
+def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prune_depth_work: bool,
+                  stop_request, max_forgiven: int = DEFAULT_MAX_FORGIVEN, regate=None,
+                  surface_stages=None) -> dict:
+    """The owed re-gate, under the world's writer lock: `regate_published`, then the derived
+    tree (`engine.build`) and the room's stages (`final_surface_stages`) from the relabelled
+    solve. A refusal before any work (`RegateRefused`) gives the attempt back: waiting."""
+    from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
+
+    key = regate_ledger_key(verdict.session_id)
+    report: dict = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+                    "stage": REGATE_STAGE}
+    engine = WorldBuilderEngine(store)
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        report.update({"finished": False, "waiting": True, "reason": f"{type(exc).__name__}: {exc}"})
+        return report
+    disarm = None
+    try:
+        try:
+            report["attempts"] = record_attempt(store, verdict.world_id, key,
+                                                detail="re-running the evidence gate in place")
+        except Exception as exc:  # noqa: BLE001
+            report.update({"finished": False,
+                           "reason": f"the attempt could not be counted, so it was not started: "
+                                     f"{type(exc).__name__}: {exc}"})
+            return report
+        disarm = _forgive_on_stop(
+            stop_request,
+            lambda source: forgive_attempt(store, verdict.world_id, key,
+                                           detail=f"stopped ({source})", max_forgiven=max_forgiven))
+        prewarm_world_builder()
+        try:
+            report["regate"] = (regate or CP.regate_published)(
+                store, verdict.world_id, verdict.session_id, should_stop=stop_request.asked_for)
+        except CP.RegateRefused as exc:
+            _give_back_attempt(store, verdict.world_id, key,
+                               detail=f"not started, waiting: {exc}")
+            report.update({"finished": False, "waiting": True, "reason": str(exc)})
+            return report
+        # The row's sentence follows the re-gate: cleared, or the new reason.
+        fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
+        if fin.get("state"):
+            engine.mark_finalization(verdict.world_id, verdict.session_id, state=fin["state"],
+                                     final_solve=fin.get("final_solve"),
+                                     detail=(report["regate"] or {}).get("notice"))
+        if stop_request.asked:
+            report.update({"finished": False, "reason": f"stopped ({stop_request.source})"})
+            return report
+        report["build"] = {"poses_solved": getattr(engine.build(verdict.world_id, verdict.session_id),
+                                                   "poses_solved", None)}
+        report["stages"] = (surface_stages or final_surface_stages)(
+            store, verdict.world_id, verdict.session_id, solved=True, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
+            stop_source=lambda: stop_request.source,
+            record=_recorder(engine, verdict.world_id, verdict.session_id))
+        report["finished"] = True
+    except Exception as exc:  # noqa: BLE001 -- recorded, then reported
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if disarm is not None:
+            forgiven = disarm()
+            if not forgiven and stop_request.asked:
+                forgive_attempt(store, verdict.world_id, key, detail=f"stopped ({stop_request.source})",
+                                max_forgiven=max_forgiven)
+        engine.release_world(verdict.world_id)
+    return report
+
+
+def build_session_areas(store: WorldStore, world_id: str, session_id: str, *,
+                        appearance: bool, prune_depth_work: bool, should_stop,
+                        stop_source=lambda: None, build: bool | None = None,
+                        area_ids=None) -> list:
+    """Build (or, with area builds off, decline) this session's unsettled areas, one
+    at a time, the stop checked between each. The caller holds the world's lock.
+
+    `build` None reads `TOWER_WORLD_AREA_BUILDS` (off: every owed area is recorded as
+    declined, a settled word, rather than left owed for ever). `area_ids` restricts
+    the set (the re-finish command passes every area). Returns one report per area.
+    """
+    from tower.config import world_area_builds_setting  # noqa: PLC0415
+    from tower.world_builder import area_build as AB  # noqa: PLC0415
+
+    session = store.read_session(world_id, session_id)
+    record, owed = _owed_areas(store, world_id, session_id, session)
+    if record is None:
+        return []
+    targets = list(area_ids) if area_ids is not None else list(owed)
+    build = world_area_builds_setting() if build is None else build
+    # The depth the area's levelling runs must be the depth its surface stage will
+    # ask for, or the predictions are made twice: `final_surface_stages` asks for the
+    # FoV-told depth exactly when the evidence gate is on.
+    # Keyed on the published solve's gate record, as the room's surface is (review V7, L-a).
+    from scripts.world_build_session import _solution_gated  # noqa: PLC0415
+
+    known_fov = _solution_gated(store, world_id, session_id)
+    reports = []
+    for area_id in targets:
+        if should_stop():
+            reports.append({"area_id": area_id, "built": False,
+                            "reason": f"stop requested ({stop_source()})"})
+            break
+        if not build:
+            AB.decline_area(store, world_id, session_id, area_id, record.sha1,
+                            AB.AREA_BUILDS_OFF_DETAIL)
+            reports.append({"area_id": area_id, "built": False, "declined": True,
+                            "reason": AB.AREA_BUILDS_OFF_DETAIL})
+            continue
+        reports.append(AB.build_area(
+            store, world_id, session_id, area_id, record,
+            final_surface_stages=final_surface_stages, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=should_stop,
+            stop_source=stop_source, depth_known_fov=known_fov))
+    return reports
+
+
+def finish_areas(store: WorldStore, verdict: Verdict, *, appearance: bool,
+                 prune_depth_work: bool, stop_request,
+                 max_forgiven: int = DEFAULT_MAX_FORGIVEN) -> dict:
+    """`finish`, for owed area work: the same lock, attempt and forgiveness
+    discipline, on the areas' own ledger key."""
+    key = area_ledger_key(verdict.session_id)
+    report: dict = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+                    "stage": AREAS_STAGE}
+    engine = WorldBuilderEngine(store)
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+        return report
+    disarm = None
+    try:
+        try:
+            report["attempts"] = record_attempt(store, verdict.world_id, key,
+                                                detail="finishing this session's areas")
+        except Exception as exc:  # noqa: BLE001
+            report.update({"finished": False,
+                           "reason": f"the attempt could not be counted, so it was not "
+                                     f"started: {type(exc).__name__}: {exc}"})
+            return report
+        disarm = _forgive_on_stop(
+            stop_request,
+            lambda source: forgive_attempt(store, verdict.world_id, key,
+                                           detail=f"stopped ({source})",
+                                           max_forgiven=max_forgiven))
+        prewarm_world_builder()
+        report["areas"] = build_session_areas(
+            store, verdict.world_id, verdict.session_id, appearance=appearance,
+            prune_depth_work=prune_depth_work, should_stop=stop_request.asked_for,
+            stop_source=lambda: stop_request.source)
+        report["finished"] = True
+    except Exception as exc:  # noqa: BLE001 -- recorded on the area, then reported
+        report.update({"finished": False, "reason": f"{type(exc).__name__}: {exc}"})
+    finally:
+        if disarm is not None:
+            forgiven = disarm()
+            if not forgiven and stop_request.asked:
+                forgive_attempt(store, verdict.world_id, key,
+                                detail=f"stopped ({stop_request.source})",
+                                max_forgiven=max_forgiven)
+        engine.release_world(verdict.world_id)
+    return report
+
+
+def _retire_areas(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
+    """`_retire` for area work: every still-unsettled area is recorded `failed`,
+    once, under the lock, after re-assessing underneath it."""
+    from tower.world_builder import area_build as AB  # noqa: PLC0415
+
+    out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+           "retired": AREAS_STAGE, "attempts": verdict.attempts}
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update({"retired": None, "reason": f"{type(exc).__name__}: {exc}"})
+        return out
+    try:
+        again = assess(store, verdict.world_id, verdict.session_id,
+                       max_attempts=max_attempts)
+        if not (again.exhausted and again.stage == AREAS_STAGE):
+            out.update({"retired": None, "reason": f"no longer {verdict.code}: {again.code}"})
+            return out
+        session = store.read_session(verdict.world_id, verdict.session_id)
+        record, owed = _owed_areas(store, verdict.world_id, verdict.session_id, session)
+        detail = (f"scripts/world_finish_pending.py started this session's areas "
+                  f"{verdict.attempts} times (bound {max_attempts}) and something ended "
+                  "it on its own every time; not retrying. scripts/world_refinish.py "
+                  "rebuilds them by hand.")
+        for area_id in owed:
+            AB.area_recorder(store, verdict.world_id, verdict.session_id, area_id,
+                             record.sha1)(STAGE_SURFACE, state=STAGE_STATE_FAILED,
+                                          detail=detail)
+        out["areas"] = list(owed)
+    finally:
+        store.release_writer_lock(verdict.world_id)
+    return out
+
+
 def survey(store: WorldStore, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> list:
     """Every session under the root, assessed. Reads only."""
     verdicts = []
@@ -807,6 +1181,8 @@ def _retire(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
     lock closes the window, and the second `assess` is what makes taking it
     worth anything.
     """
+    if verdict.stage == AREAS_STAGE:
+        return _retire_areas(store, verdict, max_attempts)
     out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
            "retired": verdict.stage, "attempts": verdict.attempts}
     try:
@@ -897,6 +1273,14 @@ def finish(
     after a successful pair, so an appearance-only rebuild has, in the common
     case, nothing left to read.
     """
+    if verdict.stage == AREAS_STAGE:
+        return finish_areas(store, verdict, appearance=appearance,
+                            prune_depth_work=prune_depth_work,
+                            stop_request=stop_request, max_forgiven=max_forgiven)
+    if verdict.stage == REGATE_STAGE:
+        return finish_regate(store, verdict, appearance=appearance,
+                             prune_depth_work=prune_depth_work,
+                             stop_request=stop_request, max_forgiven=max_forgiven)
     report: dict = {
         "world_id": verdict.world_id,
         "session_id": verdict.session_id,
@@ -1157,7 +1541,11 @@ def main(argv=None, *, stop_request=None) -> int:
         )
         report["finished"].append(outcome)
         done += 1
-        if not outcome.get("finished"):
+        if outcome.get("waiting"):
+            # Refused before it began (a re-gate): not a failure; the Tower asks again
+            # after its backoff.
+            retire_waiting += 1
+        elif not outcome.get("finished"):
             failures += 1
 
     _emit(report, args.format)

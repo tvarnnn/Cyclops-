@@ -155,8 +155,9 @@ cannot carry:
 | pose arrays, point clouds | Not on **this** channel, and deliberately: they are bulk, and this socket shares its send lock with the frame path. They travel over HTTP under `world_builder.geometry/2026-08-25` instead — see [`WORLD-BUILDER-GEOMETRY.md`](WORLD-BUILDER-GEOMETRY.md) |
 | keyframe images | **The Tower does not send them, on any channel.** `retains_raw_imagery` stays true Tower-side; no byte of imagery crosses to iOS, redacted or not |
 | `progress.frames_observed` | Null while live and genuinely unknowable — an ordinary rejected frame writes no journal event |
-| `lifecycle.build_in_progress` | `null` in every stopped state, and null means **unobservable**, not `false` |
-| `lifecycle.photographic` | Added `2026-09-22`. **Optional to read, and the app is correct without it** — the states that matter already move `lifecycle.state`. Read it to say *why* a world is still Improving, or to distinguish a Saved world whose photographic build FAILED from one that has the room. §3a |
+| `lifecycle.build_in_progress` | Null means **unobservable**, not `false`. (Corrected 2026-09-23, C1 E10: it is not "null in every stopped state" — an owed or failed photographic stage answers `false`; and under the PROPOSED components contract it is `true` whenever `photographic.state` is `running`, room or area, `WORLD-BUILDER-COMPONENTS.md` §3.4) |
+| `lifecycle.photographic` | Added `2026-09-22`. **To be READ** (corrected 2026-09-23, C1 E8/E10): showing plain "Saved" for a failed photographic build is the T3 defect (§3a), so this block is not optional; with the PROPOSED `scope` (`WORLD-BUILDER-COMPONENTS.md` §3.4) it also says whether an Improving world is still making its room or only an area. §3a |
+| `tracking.recovery` | PROPOSED 2026-09-23 (`WORLD-BUILDER-COMPONENTS.md` §6): the THIRD read exception (C1 M5/E8), decoded from `payload["tracking"]["recovery"]` into its own type beside `selection` and `finalization`, never projected into `world_snapshot` |
 | `artifacts.*`, `session.retains_raw_imagery` | Real and honest, but no iOS surface asks the question yet. See §6 |
 
 ---
@@ -232,8 +233,10 @@ room*.
 The rule the Tower now applies, so the phone does not have to:
 
 - `running`, `owed`, `unobservable` → `lifecycle.state` is **`finalizing`**.
-  The world is not finished being made. `model_state` is `finalizing`, and
-  the existing Improving copy is correct for all three.
+  The world is not finished being made. `model_state` is `finalizing`.
+  (Corrected 2026-09-23, C1 E10: the existing Improving copy is NOT correct
+  for all three on today's app — `owed` shows a spinner implying work is
+  running; the photographic decoder in P3.3 fixes it.)
 - `complete`, `failed`, `unattempted`, `never_recorded` → `lifecycle.state`
   is whatever it always was. These are settled; a world in one of them is
   not waiting for anything.
@@ -252,9 +255,9 @@ adds is the ability to be specific:
   "Saved — the photographic version could not be built" is the honest
   middle, and `detail` carries the reason.
 - `never_recorded` — a world from before the photographic stages existed.
-  **Must keep rendering exactly as today**: 165 of the 166 worlds on the
-  development Tower are these, they are finished, and nothing about them
-  changed.
+  **Must keep rendering exactly as today**: they are finished, and nothing
+  about them changed. (Corrected 2026-09-23, C1 E10: the development root holds
+  67 `unattempted` and 2 `never_recorded`, not "165 of 166".)
 
 `stage` names `surface` or `appearance` when the word is about one.
 
@@ -513,6 +516,13 @@ any screen. The binding is therefore permanently `.none` there, and the Tower's
 own state is the whole answer, which is correct: a build with no capture cannot
 be looking at the wrong one.
 
+**Look-back prompts are DEBUG-only (C1 M14/E9, PROPOSED 2026-09-23).** A prompt
+is spoken only under a `.bound` binding while following live
+(`WORLD-BUILDER-COMPONENTS.md` §6.5), which Release never reaches. The physical
+A/B test therefore runs a DEBUG build installed from Xcode. The `audio`
+background mode the prompt needs (§6.5 there) is declared in the shared
+Info.plist; it matters for App Review only if Release is ever submitted.
+
 ## 10. The saved-world picture (`WorldRenderViewer.swift`)
 
 Consumes `WORLD-BUILDER-WORLDS.md` §4 (the page) and §4a (its revision). Added
@@ -564,6 +574,18 @@ WORLDS §4, which fetches its imagery:
   another world or session, any other route, any method but GET, a query
   elsewhere, a user, port or fragment, an empty, `.` or `..` segment. The
   whitelist is the pure `WorldAssetRequest.parse`.
+- **PROPOSED 2026-09-23 — awaiting Mac review; NOT implemented, and the
+  handler answers none of these today. Requires Mac validation.** Area viewers
+  (`WORLD-BUILDER-COMPONENTS.md` §5.5) would add a second whitelist, for a
+  viewer opened for one (`<w>`, `<s>`, `<a>`) taken from the listing row, `<a>`
+  exactly 16 lower-hex: `/worlds/<w>/areas/<s>/<a>/render` (no query, the page
+  from memory); `/worlds/<w>/areas/<s>/<a>/render/revision` (no query, proxied
+  with none); `/worlds/<w>/areas/<s>/<a>/appearance/manifest`; and
+  `…/areas/<s>/<a>/appearance/chunk/<digest>` and `…/appearance/proxy/<digest>`
+  with a 32 lower-hex digest. An area viewer's handler answers **none** of the
+  room routes above, and a room viewer's handler answers **no** `/areas/` path;
+  `<s>` is never learned from the page's `wb-revision`; memory and its
+  authorisation are per (`<s>`, `<a>`). The room whitelist above is unchanged.
 - **Proxying.** Whitelisted requests go to the same path on
   `TowerConfiguration.httpBaseURL` through `WorldAssetClient`: an ephemeral
   session, `urlCache = nil`, no cookies, `.reloadIgnoringLocalAndRemoteCacheData`.

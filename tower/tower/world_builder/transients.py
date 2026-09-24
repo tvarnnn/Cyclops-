@@ -38,7 +38,10 @@ rule that made it.
 PIXELS COME FROM ONE PLACE. Masks are computed only on what
 `appearance.keyframe_source` returns: the session's redacted keyframe,
 undistorted with the solve's own maps, with its unobserved (fill) mask. This
-module never opens an image itself.
+module never opens an image itself. The one exception is opt-in: when the
+final solve ran with `TOWER_WORLD_SOLVE_MASKS`, it computed these masks on its
+own images first (`solve_masks.py`), and a keyframe's mask is copied from that
+cache, marked `origin: solve`, instead of being computed twice.
 
 WHAT IS CACHED, AND WHY IN THE DEPTH WORK. One file per keyframe per component,
 `dense/<sid>/work/depth/<ki:05d>_transient.<component>.npz`, holding the
@@ -653,6 +656,9 @@ class TransientReport:
     # the network rebuilds.
     requested: TransientParams | None = None
     partial: str | None = None
+    # Keyframes whose masks were taken from the final solve's own cache
+    # (`solve_masks.solve_mask_donor`) instead of being computed here.
+    reused_from_solve: int = 0
 
     @property
     def available(self) -> bool:
@@ -683,7 +689,7 @@ class TransientReport:
 
     def record(self) -> dict:
         """What a consumer's manifest says about its transient masks."""
-        return {
+        out = {
             "state": self.state,
             "detail": self.detail,
             "mode": self.params.mode,
@@ -699,17 +705,56 @@ class TransientReport:
             "seconds": dict(self.seconds),
             "gpu_peak_mb": self.gpu_peak_mb,
         }
+        # Only when it happened: a build that took nothing from the solve --
+        # every build of a world solved without `TOWER_WORLD_SOLVE_MASKS` --
+        # writes exactly the record it wrote before.
+        if self.reused_from_solve:
+            out["reused_from_solve"] = self.reused_from_solve
+        return out
+
+
+def _take_from_donor(donor, kid, component, params, shape, path, key) -> bool:
+    """Copy one component's masks from the solve's cache into this stage's own
+    cache, under this stage's key plus where they came from. False when the
+    solve has none for this keyframe under the same component rule."""
+    try:
+        got = donor(kid, component, params, shape)
+    except Exception:  # noqa: BLE001 -- a donor is an optimisation, never a failure
+        logger.exception("[Tower][WorldBuilder][transients] solve mask lookup failed for %s", kid)
+        return False
+    if got is None:
+        return False
+    hand, phone, provenance = got
+    write_component(path, dict(key, **provenance), hand, phone,
+                    image_sha1=provenance.get("solve_image_sha1"))
+    return True
 
 
 def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
                            intrinsics, camera: dict, align_records: dict, depth_dir,
                            params: TransientParams, policy=None, redactor_factory=None,
-                           backend_factory=None, should_stop=None, progress=None) -> TransientReport:
+                           backend_factory=None, should_stop=None, progress=None,
+                           donor=None) -> TransientReport:
     """Make sure every keyframe in `frames` ((ki, keyframe_id) pairs) has its
     transient mask cached under `params`, computing only what is missing.
 
-    Pixels come only from `appearance.keyframe_source`. Never raises for a
-    machine that cannot run the detector: the report says `unavailable`.
+    Pixels come only from `appearance.keyframe_source` -- with ONE exception,
+    and only for a world whose final solve was run with
+    `TOWER_WORLD_SOLVE_MASKS`: a mask the solve already computed for the same
+    keyframe under the same component rule is copied rather than recomputed
+    (`solve_masks`, "one computation, two consumers"). The solve's detector saw
+    the solver image -- the same undistorted pixel grid, from the raw capture
+    frame where one exists, without redaction fill -- and the copied file says
+    so (`origin: solve`).
+
+    ONLY FOR A RAW-IMAGERY BUILD. The solver image is the unredacted capture
+    frame, which a redacted (product) build must never draw from -- not even
+    as the shape of a mask that becomes the published alpha
+    (`test_masks_are_computed_only_from_the_redacted_session_keyframes`). A
+    research build (`TOWER_WORLD_RAW_IMAGERY`) already reads those frames, so
+    for it the copy changes nothing about provenance. `donor=None` looks the
+    solve's cache up; `False` turns the lookup off. Never raises for a machine
+    that cannot run the detector: the report says `unavailable`.
     """
     from tower.world_builder import appearance as A  # noqa: PLC0415
 
@@ -742,6 +787,12 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
             report.state, report.detail = STATE_UNAVAILABLE, exc.reason
             return report
     undistorter = A.Undistorter(intrinsics, camera)
+    if not getattr(policy, "raw", False) or donor is False:
+        donor = None   # a redacted build: never a mask made from raw pixels
+    elif donor is None:
+        from tower.world_builder.solve_masks import solve_mask_donor  # noqa: PLC0415
+
+        donor = solve_mask_donor(store, world_id, session_id)
 
     # -- the cheap pass: which (frame, component) are already cached ---------
     wanted: dict = {}                     # ki -> [(component, key)]
@@ -761,11 +812,18 @@ def ensure_transient_masks(store, world_id: str, session_id: str, frames, *,
                 for c in params.components]
         wanted[ki] = keys
         any_missing = False
+        took = False
         for c, key in keys:
-            if read_component(cache_path(depth_dir, ki, c), key, (H, W)) is None:
+            path = cache_path(depth_dir, ki, c)
+            if read_component(path, key, (H, W)) is None:
+                if donor is not None and _take_from_donor(donor, kid, c, params, (H, W), path, key):
+                    took = True
+                    continue
                 missing[c].append(ki)
                 any_missing = True
-        if not any_missing:
+        if took:
+            report.reused_from_solve += 1
+        elif not any_missing:
             report.cached += 1
     report.seconds["lookup"] = round(time.time() - t0, 3)
 

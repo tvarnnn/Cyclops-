@@ -623,12 +623,28 @@ def apply_plan(store, plan: Plan, *, redactor=None) -> dict:
         }
         # LAST, and atomic: before this line every reader still reads images/.
         store.write_redaction_set_pointer(w, s, new_pointer)
+        _discard_area_builds(store, w)
         logger.info("[Tower][WorldBuilder][reredact] %s/%s now reads %s (%s)",
                     w, s, plan.name, plan.set_label)
         return {"set": plan.name, "set_digest": set_digest, "reused": reused,
                 "pointer": str(store.redaction_set_path(w, s))}
     finally:
         store.release_writer_lock(w)
+
+
+def _discard_area_builds(store, world_id: str) -> None:
+    """A switch of the keyframe set invalidates the imagery an unfinished area build
+    holds outside the world (`area_build.purge_area_builds`, `<root>/.ab/<area>`);
+    removed here, except a build whose process is still alive -- none can be, since a
+    switch holds the world's writer lock, which every area build holds too. Never
+    fatal: the switch has happened, and the next area build starts clean anyway."""
+    try:
+        from tower.world_builder.area_build import purge_area_builds  # noqa: PLC0415
+
+        purge_area_builds(store, world_id, only_stale=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("[Tower][WorldBuilder][reredact] could not discard the area builds of %s",
+                       world_id, exc_info=True)
 
 
 def revert_session(store, world_id: str, session_id: str) -> dict:
@@ -651,6 +667,7 @@ def revert_session(store, world_id: str, session_id: str) -> dict:
         reverted = dict(pointer)
         reverted.update({"active": None, "switched_at": time.time(), "history": history})
         store.write_redaction_set_pointer(world_id, session_id, reverted)
+        _discard_area_builds(store, world_id)
         logger.info("[Tower][WorldBuilder][reredact] %s/%s reads images/ again (was %s)",
                     world_id, session_id, previous)
         return {"reverted_from": previous}

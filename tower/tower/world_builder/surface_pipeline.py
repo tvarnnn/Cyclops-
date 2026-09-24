@@ -245,7 +245,8 @@ def _params_digest(params: SurfaceParams, input_digest: str | None) -> str:
 def ensure_depth_stage(store, world_id: str, session_id: str, solution,
                        intrinsics, *, gate_rel: float, backend: str | None,
                        should_stop=None, progress=None,
-                       imagery_source: str = IMAGERY_REDACTED) -> tuple[dict, Path]:
+                       imagery_source: str = IMAGERY_REDACTED,
+                       known_fov: bool = False) -> tuple[dict, Path]:
     """Return the dense stage's `align.json` and its work directory, running
     the depth stage first if it is absent or was produced from another solve.
 
@@ -261,6 +262,7 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
     root = dense_dir(store, world_id, session_id)
     root.mkdir(parents=True, exist_ok=True)
     dparams = DenseParams(gate_rel=gate_rel, imagery_source=imagery_source,
+                          known_fov=bool(known_fov),
                           **({"backend": backend} if backend else {}))
 
     align_path = root / "align.json"
@@ -290,7 +292,8 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
                             progress=progress, prior=None,
                             reuse_predictions=reusable_predictions(
                                 align_path, dparams.backend,
-                                dparams.imagery_source))
+                                dparams.imagery_source,
+                                known_fov=dparams.known_fov))
     if align.get("stopped_after") is None:
         # Name the solve, in both spellings the two readers of this file use,
         # so neither can mistake it for a cache of another solve.
@@ -299,6 +302,12 @@ def ensure_depth_stage(store, world_id: str, session_id: str, solution,
         align["cache_key"] = _depth_cache_key(solution.input_digest, dparams,
                                               align.get("keyframe_image_set"),
                                               align.get("redaction_trust"))
+        # A GATED solve is named by identity too (review V7, M3); an ungated one is
+        # stamped exactly as before.
+        if getattr(solution, "gate", None) is not None:
+            from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+            align["solve_identity"] = solve_identity(solution)
     write_json_atomic(align_path, align)
     return align, root / "work"
 
@@ -328,6 +337,14 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
     named = cached.get("input_digest") or cached.get("digest")
     if named != solution.input_digest:
         return False
+    # THE SAME KEYFRAMES ARE NOT THE SAME SOLVE (review V7, M3). A gated solve's depth
+    # stamp names the solve itself; a stamp for another solve of these keyframes -- the
+    # one before a re-solve whose own depth stage then failed -- is not this one's.
+    if getattr(solution, "gate", None) is not None or cached.get("solve_identity") is not None:
+        from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
+
+        if cached.get("solve_identity") != solve_identity(solution):
+            return False
     # AN INTERRUPTED STAGE IS NOT A COMPLETE ONE. A stop mid-depth leaves an
     # `align.json` holding only the frames reached; trusting it built a
     # surface from 3 of 8 frames under the full solve's digest, and every
@@ -355,6 +372,10 @@ def _depth_cache_usable(cached: dict, root: Path, solution, dparams, *,
     # a redacted surface must not be built on them, nor the reverse. Absent
     # is `redacted`, which every stage before the bypass was.
     if cached.get("imagery_source", IMAGERY_REDACTED) != dparams.imagery_source:
+        return False
+    # WHETHER THE NETWORK WAS TOLD THE CAMERA'S FoV (`DenseParams.known_fov`).
+    # Absent is off, which every stage before the parameter was.
+    if (cached.get("known_fov") is not None) != bool(getattr(dparams, "known_fov", False)):
         return False
     # THE TRUST DECISION IT READ THE PIXELS UNDER (`dense_pipeline.recorded_trust`).
     # A walk's stage re-redacted under `none` and recorded those bytes' SHA-1;
@@ -657,11 +678,20 @@ def surfacify(store, world_id: str, session_id: str, *,
               progress: Callable[[str, int, int], None] | None = None,
               force: bool = False,
               backend: str | None = None,
-              transient_backend_factory=None) -> SurfaceResult:
-    """Build the surface of one solved session. Idempotent, stop-aware."""
+              transient_backend_factory=None,
+              depth_known_fov: bool | None = None) -> SurfaceResult:
+    """Build the surface of one solved session. Idempotent, stop-aware.
+
+    `depth_known_fov`, when not None, sets `params.depth_known_fov` (the depth
+    stage told the solve camera's FoV): the builder passes the evidence gate's
+    setting here, so the final surface reuses the depth stage the gate ran."""
+    import dataclasses  # noqa: PLC0415
+
     from tower.world_builder.global_solve import load_solution
 
     params = params or SurfaceParams()
+    if depth_known_fov is not None and bool(depth_known_fov) != params.depth_known_fov:
+        params = dataclasses.replace(params, depth_known_fov=bool(depth_known_fov))
     root = surface_dir(store, world_id, session_id)
     root.mkdir(parents=True, exist_ok=True)
     seconds: dict = {}
@@ -740,7 +770,8 @@ def surfacify(store, world_id: str, session_id: str, *,
             store, world_id, session_id, solution, intrinsics,
             gate_rel=params.gate_rel, backend=backend,
             should_stop=should_stop, progress=progress,
-            imagery_source=params.imagery_source)
+            imagery_source=params.imagery_source,
+            known_fov=params.depth_known_fov)
         seconds[STAGE_DEPTH] = round(time.time() - t, 2)
         if _stopped(should_stop):
             return _stop(root, STAGE_DEPTH, seconds)

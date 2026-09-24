@@ -567,6 +567,25 @@ class Solution:
     observation_xy: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), np.float32))  # (M, 2) undistorted px
     camera: dict | None = None  # the pinhole camera the observations are expressed in
     timing: dict = field(default_factory=dict)
+    # WHAT RAN, for the evidence gate and the harness (contract
+    # WORLD-BUILDER-COMPONENTS §2.5). Both None on a solution written before
+    # 2026-09-23 (and on any written by hand), which a reader must take as
+    # "today's solve: unmasked, unseeded" -- never as an error.
+    #   transients: the solver-image masks (`solve_masks`): `state` applied /
+    #               partial / unavailable, `detail`, `rule`, `cache_hits`,
+    #               `computed`, images masked and unmasked.
+    #   solve:      `seed` (None = unseeded), `threads` (the mapper's; 1 when
+    #               seeded, -1 = every core), the other steps' threads, the
+    #               two-view RANSAC seed, and which feature database was used.
+    transients: dict | None = None
+    solve: dict | None = None
+    #   gate:       the evidence gate on the final solve (`coherence_publish.py`,
+    #               `TOWER_WORLD_SOLVE_GATE`): `state` applied / failed, the
+    #               gate's `params` and `params_digest`, `masks_applied`,
+    #               `metric_available`, the depth stage and metric scale that
+    #               fed it. None: the gate did not run -- every solve before it
+    #               existed, and every solve with it off.
+    gate: dict | None = None
 
     @property
     def horizon(self) -> set[str]:
@@ -596,7 +615,26 @@ def sweep_workspace(workspace: SolveWorkspace) -> int:
     swept = sweep_abandoned_staging(workspace.root)
     if workspace.images_dir.is_dir():
         swept += sweep_abandoned_staging(workspace.images_dir)
+    # The solver's COLMAP masks (`solve_masks`), written the same atomic way.
+    masks = workspace.root / "masks"
+    if masks.is_dir():
+        swept += sweep_abandoned_staging(masks)
     return swept
+
+
+def solve_identity(solution) -> str:
+    """Which solve this is, beyond which keyframes (`input_digest` is the keyframe ids
+    only): its `solved_at`, and every pose's component, rotation and translation. Two
+    solves of the same keyframes, or a re-gate that moved a piece out of the room, differ
+    (review V7, M3 and L-d). 16 hex."""
+    import hashlib  # noqa: PLC0415
+
+    poses = {kid: [int(p.get("component", 0)), [float(v) for v in p.get("rotation") or []],
+                   [float(v) for v in p.get("translation") or []]]
+             for kid, p in (solution.poses or {}).items()}
+    doc = {"solved_at": repr(float(solution.solved_at)), "input_digest": solution.input_digest,
+           "poses": poses}
+    return hashlib.sha1(json.dumps(doc, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
 def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
@@ -627,20 +665,29 @@ def write_solution(workspace: SolveWorkspace, solution: Solution) -> None:
             observation_xy=solution.observation_xy.astype(np.float32).reshape(-1, 2),
         ),
     )
-    write_json_atomic(
-        workspace.solution_path,
-        {
-            "schema_version": SOLUTION_SCHEMA_VERSION,
-            "solver": solution.solver,
-            "solved_at": solution.solved_at,
-            "input_digest": solution.input_digest,
-            "keyframe_ids": solution.keyframe_ids,
-            "components": solution.components,
-            "poses": solution.poses,
-            "camera": solution.camera,
-            "timing": solution.timing,
-        },
-    )
+    meta = {
+        "schema_version": SOLUTION_SCHEMA_VERSION,
+        "solver": solution.solver,
+        "solved_at": solution.solved_at,
+        "input_digest": solution.input_digest,
+        "keyframe_ids": solution.keyframe_ids,
+        "components": solution.components,
+        "poses": solution.poses,
+        "camera": solution.camera,
+        "timing": solution.timing,
+    }
+    # Additive, and only when recorded: the schema version is unchanged, so
+    # every reader of a solution written before these fields still reads it.
+    if solution.transients is not None:
+        meta["transients"] = solution.transients
+    if solution.solve is not None:
+        meta["solve"] = solution.solve
+    if solution.gate is not None:
+        meta["gate"] = solution.gate
+        # Only on a gated solve, whose components record and depth stamp name it: an
+        # ungated solution.json is byte-for-byte what it was.
+        meta["solve_identity"] = solve_identity(solution)
+    write_json_atomic(workspace.solution_path, meta)
 
 
 def load_solution(store, world_id: str, session_id: str) -> Solution | None:
@@ -677,6 +724,9 @@ def load_solution(store, world_id: str, session_id: str) -> Solution | None:
                                 if "observation_xy" in arrays else np.zeros((0, 2), np.float32)),
                 camera=meta.get("camera"),
                 timing=dict(meta.get("timing") or {}),
+                transients=meta.get("transients"),
+                solve=meta.get("solve"),
+                gate=meta.get("gate"),
             )
     except Exception as exc:  # noqa: BLE001 -- see below; the narrow tuple IS the bug
         # DELIBERATELY BROAD, and the breadth is the fix rather than a
@@ -751,6 +801,38 @@ def _quiet_pycolmap():
         pass
 
 
+class _FromSettings:
+    """`solve(seed=...)` not given: the final solve reads `TOWER_WORLD_SOLVE_SEED`."""
+
+    def __repr__(self) -> str:
+        return "FROM_SETTINGS"
+
+
+FROM_SETTINGS = _FromSettings()
+
+
+def resolve_run_options(*, final: bool, masks: bool | None, seed) -> tuple[bool, int | None]:
+    """(masks, seed) for one solve.
+
+    The two settings belong to the FINAL solve only. The background solves of
+    a walk keep today's recipe whatever the settings say: masks need the GPU the
+    live surface is using, and a single-thread mapper would slow the live
+    world's convergence 3.3x (research D1). An explicit argument wins either
+    way, so a script or a test can ask for exactly what it wants.
+    """
+    from tower.config import world_solve_masks_setting, world_solve_seed_setting  # noqa: PLC0415
+
+    if masks is None:
+        masks = bool(final) and world_solve_masks_setting()
+    if seed is FROM_SETTINGS:
+        seed = world_solve_seed_setting() if final else None
+    if seed is not None:
+        seed = int(seed)
+        if seed < 0:
+            raise ValueError(f"a solve seed is a non-negative integer, not {seed}")
+    return bool(masks), seed
+
+
 def solve(
     store,
     world_id: str,
@@ -763,19 +845,61 @@ def solve(
     overlap: int = SEQUENTIAL_OVERLAP,
     loop_detection: bool | None = None,
     input_digest: str | None = None,
+    masks: bool | None = None,
+    seed=FROM_SETTINGS,
+    transient_backend_factory=None,
+    mask_device_probe=None,
+    gate: bool | None = None,
 ) -> dict:
     """Run the recipe over the session's current keyframes and persist the
     solution. Returns a summary dict (what the CLI prints).
+
+    `gate`: the evidence gate before publish (`coherence_publish.py`). None
+    reads `TOWER_WORLD_SOLVE_GATE` for a FINAL solve (off by default) and is
+    off for every background solve; off, the solution is published exactly as
+    the solver returned it.
 
     Idempotent and incremental: images already undistorted, features already
     extracted and pairs already matched are skipped by the workspace and by
     pycolmap respectively. The MODEL is rebuilt from scratch every call --
     GLOMAP is fast enough (E8: 43 s for 438 keyframes) and a from-scratch
     solve has no way to inherit a wrong decision.
+
+    TWO OPTIONS, BOTH OFF BY DEFAULT, BOTH FOR THE FINAL SOLVE
+    (`resolve_run_options`; the settings are `world_solve_masks` and
+    `world_solve_seed` in `tower/config.py`). Off, every call into pycolmap is
+    exactly today's.
+
+      * `masks`: no match touching the wearer's hands, arms or held phone
+        reaches the model (`solve_masks.py`). With a walk database, it is
+        extracted and matched exactly as today and the solve maps a filtered
+        copy of it (`walk-database-filtered`, the run's arm A1h); without one,
+        the masks go to extraction, into a database of their own
+        (`re-extracted`, arm A1). `solve.masking` says which. When the
+        detector cannot run the solve runs unmasked on today's database and
+        `transients.state` says why.
+      * `seed`: every mapper seed, pycolmap's global seed and the two-view
+        RANSAC seed are set and mapping runs on one thread -- the determinism
+        hygiene of the run's experiment driver (lane `coherence_exp/driver.py`),
+        without which GLOMAP is not reproducible (research D1 §2.4).
+        Extraction and matching keep their threads, as in the driver. What is
+        reproducible is the MAPPING, given its feature database -- measured
+        on the target walk (run P3-PM): two seeded one-thread GLOMAP runs on
+        one database were bit-identical, two unseeded ones were not. The
+        database itself is not reproducible: SIFT extraction is, but
+        multi-threaded matching is not (62 of 7,450 sequential pairs matched
+        differently twice; one thread matched all 7,450 identically, about 6x
+        slower), and loop detection re-run on an existing database proposes
+        new pairs. Without masks the database is also the one the walk's
+        background solves accumulated.
+
+    Both are recorded in the solution (`transients`, `solve`) and in the
+    returned summary, so the evidence gate and the harness can tell what ran.
     """
     available, reason = solver_available()
     if not available:
         return {"solved": False, "reason": reason}
+    want_masks, seed = resolve_run_options(final=final, masks=masks, seed=seed)
     sweep_workspace(workspace_for(store, world_id, session_id))
     import pycolmap
 
@@ -802,11 +926,44 @@ def solve(
     reader = pycolmap.ImageReaderOptions()
     reader.camera_model = "PINHOLE"
     reader.camera_params = ",".join(str(v) for v in (camera.fx, camera.fy, camera.cx, camera.cy))
+
+    # THE FEATURE DATABASE, and the masks that decide which one. Without masks
+    # it is `database.db`, shared with the walk's background solves -- today.
+    # With masks there are two paths (`solve_masks.MASKING_*`): the walk's
+    # database is extracted and matched exactly as today and a FILTERED COPY
+    # is mapped, or, with no walk database to filter, the masks go to
+    # extraction itself, into a fresh database of their own.
+    database_path = workspace.database_path
+    database_existed = database_path.exists()
+    masks_record = _masks_off_record()
+    masks = None
+    masking = None
+    # WHY a masked solve took the path it took (review V5, M1-6): the walk's
+    # database was `filtered`, or it was `absent`, `unusable` or its filter
+    # `filter-failed` -- the three reasons a solve re-extracts.
+    walk_database = None
+    if want_masks:
+        masks, masks_record = _ensure_solver_masks(
+            workspace, present, keyframes, camera,
+            backend_factory=transient_backend_factory, device_probe=mask_device_probe)
+        if masks is not None:
+            if _walk_database_usable(database_path):
+                masking = _MASKING_FILTERED
+                walk_database = "filtered"
+            else:
+                walk_database = "absent" if not database_path.exists() else "unusable"
+                database_path, masks_record = _reextract_masked(workspace, reader, masks,
+                                                                present, masks_record)
+                database_existed = masks_record.get("database_reused", False)
+                masking = _MASKING_REEXTRACTED
+        masks_record["database"] = database_path.name
+    masked = time.perf_counter()
+
     extraction = pycolmap.FeatureExtractionOptions()
     extraction.num_threads = threads
     extraction.sift.max_num_features = MAX_FEATURES
     pycolmap.extract_features(
-        workspace.database_path, workspace.images_dir, image_names=present,
+        database_path, workspace.images_dir, image_names=present,
         camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
         extraction_options=extraction,
     )
@@ -848,22 +1005,64 @@ def solve(
         )
         wanted = False
     pairing.loop_detection = wanted
-    pycolmap.match_sequential(
-        workspace.database_path, matching_options=matching, pairing_options=pairing
-    )
+    seeded = seed is not None
+    verification = None
+    if seeded:
+        # The two-view RANSAC is seeded too (the experiment driver's
+        # `verification_seed`): otherwise the verified inlier sets, and so
+        # the view graph GLOMAP averages, differ run to run.
+        verification = pycolmap.TwoViewGeometryOptions()
+        verification.ransac.random_seed = seed
+    _match_sequential(pycolmap, database_path, matching, pairing, verification)
+    revisits = {"listed": 0, "verified": 0, "detail": None}
+    if final:
+        revisits = _match_revisit_pairs(
+            pycolmap, store, world_id, session_id, workspace, database_path, present,
+            matching, verification)
+    if masking == _MASKING_FILTERED:
+        try:
+            database_path, masks_record = _filter_walk_database(
+                pycolmap, workspace, masks, masks_record, verification)
+        except Exception as exc:  # noqa: BLE001 -- fall back to re-extraction, recorded
+            logger.exception("global solve: filtering the walk database failed; the masks "
+                             "go to extraction instead")
+            masks_record = dict(masks_record, filter_failed=f"{type(exc).__name__}: {exc}")
+            database_path, masks_record = _reextract_masked(workspace, reader, masks,
+                                                            present, masks_record)
+            masking = _MASKING_REEXTRACTED
+            walk_database = "filter-failed"
+            pycolmap.extract_features(
+                database_path, workspace.images_dir, image_names=present,
+                camera_mode=pycolmap.CameraMode.SINGLE, reader_options=reader,
+                extraction_options=extraction,
+            )
+            _match_sequential(pycolmap, database_path, matching, pairing, verification)
+            if final:
+                revisits = _match_revisit_pairs(
+                    pycolmap, store, world_id, session_id, workspace, database_path, present,
+                    matching, verification)
+        masks_record["database"] = database_path.name
+    if masking is not None:
+        masks_record["masking"] = masking
+        masks_record["walk_database"] = walk_database
     matched = time.perf_counter()
 
     shutil.rmtree(workspace.sparse_dir, ignore_errors=True)
     workspace.sparse_dir.mkdir(parents=True)
+    # ONE thread when seeded: GLOMAP is reproducible only then (D1 §2.4).
+    map_threads = 1 if seeded else threads
     solver = SOLVER_GLOMAP
     options = pycolmap.GlobalPipelineOptions()
-    options.num_threads = threads
+    options.num_threads = map_threads
     options.mapper.bundle_adjustment.refine_focal_length = False
     options.mapper.bundle_adjustment.refine_principal_point = False
     options.mapper.bundle_adjustment.refine_extra_params = False
+    if seeded:
+        _seed_global_options(options, seed)
+        pycolmap.set_random_seed(seed)
     try:
         reconstructions = pycolmap.global_mapping(
-            workspace.database_path, workspace.images_dir, workspace.sparse_dir, options=options
+            database_path, workspace.images_dir, workspace.sparse_dir, options=options
         )
     except Exception as exc:  # a solver failure is a refusal, not a crash
         logger.warning("global solve: global mapping raised %s", exc)
@@ -871,13 +1070,16 @@ def solve(
     if not reconstructions:
         solver = SOLVER_INCREMENTAL
         inc = pycolmap.IncrementalPipelineOptions()
-        inc.num_threads = threads
+        inc.num_threads = map_threads
         inc.ba_refine_focal_length = False
         inc.ba_refine_principal_point = False
         inc.ba_refine_extra_params = False
+        if seeded:
+            _seed_incremental_options(inc, seed)
+            pycolmap.set_random_seed(seed)
         try:
             reconstructions = pycolmap.incremental_mapping(
-                workspace.database_path, workspace.images_dir, workspace.sparse_dir, options=inc
+                database_path, workspace.images_dir, workspace.sparse_dir, options=inc
             )
         except Exception as exc:
             logger.warning("global solve: incremental mapping raised %s", exc)
@@ -890,13 +1092,45 @@ def solve(
     )
     solution.timing = {
         "prepare_s": round(prepared - started, 3),
-        "extract_s": round(extracted - prepared, 3),
+        "extract_s": round(extracted - masked, 3),
         "match_s": round(matched - extracted, 3),
         "map_s": round(mapped - matched, 3),
         "images_undistorted": written,
         "final": bool(final),
     }
-    write_solution(workspace, solution)
+    if want_masks:
+        solution.timing["masks_s"] = round(masked - prepared, 3)
+    solution.transients = masks_record
+    solution.solve = {
+        "seed": seed,
+        # The MAPPER's threads, which is what reproducibility turns on: 1 when
+        # seeded; otherwise pycolmap's -1, "every core", or the caller's count.
+        "threads": map_threads,
+        "seeded": seeded,
+        "extraction_threads": threads,
+        "matching_threads": threads,
+        "verification_seed": seed if seeded else None,
+        "database": database_path.name,
+        "database_existed": bool(database_existed),
+        # How the masks reached the model: `walk-database-filtered`,
+        # `re-extracted`, or None for an unmasked solve.
+        "masking": masking,
+        "walk_database": walk_database,
+        "final": bool(final),
+        "pycolmap": getattr(pycolmap, "__version__", None),
+        # The live relocalizer's verified revisit links, matched explicitly.
+        "revisit_pairs": revisits,
+    }
+    # PUBLISH. With the evidence gate on (a final solve, `TOWER_WORLD_SOLVE_GATE`)
+    # the candidate first gets its depth stage, metric scale and gate, and is
+    # published RELABELLED -- pieces the gate did not attach are their own
+    # components -- followed by `components.json` and the depth hand-off to the
+    # surface. Off, this is `write_solution(workspace, solution)`.
+    from tower.world_builder import coherence_publish  # noqa: PLC0415
+
+    solution, _gate_record = coherence_publish.gate_and_publish(
+        store, world_id, session_id, workspace, solution, final=final, gate=gate,
+        database_path=database_path, keyframes=keyframes, write=write_solution)
     return {
         "solved": True,
         "solver": solver,
@@ -906,7 +1140,194 @@ def solve(
         "points": int(len(solution.xyz)),
         "timing": solution.timing,
         "workspace": str(workspace.root),
+        "transients": solution.transients,
+        "solve": solution.solve,
+        "gate": solution.gate,
     }
+
+
+def _seed_global_options(options, seed: int) -> None:
+    """Every random number generator GLOMAP's pipeline owns, and one thread.
+    The experiment driver's `_mapper_options` for `glomap`, verbatim."""
+    options.mapper.num_threads = 1
+    options.random_seed = seed
+    options.mapper.random_seed = seed
+    options.mapper.rotation_averaging.random_seed = seed
+    options.mapper.global_positioning.random_seed = seed
+    options.mapper.retriangulation.random_seed = seed
+
+
+def _seed_incremental_options(inc, seed: int) -> None:
+    """The same for the incremental fallback (driver `_mapper_options`), plus
+    the mapper's own thread count, which the driver left to `num_threads`."""
+    inc.mapper.num_threads = 1
+    inc.random_seed = seed
+    inc.mapper.random_seed = seed
+    inc.triangulation.random_seed = seed
+
+
+REVISIT_PAIRS_FILENAME = "revisit_pairs.txt"
+# A revisit pair counts as verified at COLMAP's own two-view floor
+# (`TwoViewGeometryOptions.min_num_inliers`, 15), the floor the solve's view
+# graph uses for every other pair.
+REVISIT_VERIFIED_MIN_INLIERS = 15
+
+
+def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, database_path,
+                         present, matching, verification) -> dict:
+    """Match the live relocalizer's revisit links (`relocalizer.revisit_pairs`)
+    explicitly, in the final solve's database, with its matching and
+    verification options -- and its masks, which apply to every pair because
+    they applied at extraction.
+
+    Sequential matching reaches 20 keyframes either side and loop detection
+    queries every tenth keyframe; a look-back revisit is exactly the pair
+    neither is sure to propose. No links (no relocalizer, an old session, a
+    walk that never lost tracking) is today's solve, with no call made.
+    Never raises: a failure costs the links, and the record says so.
+    """
+    record = {"listed": 0, "verified": 0, "detail": None}
+    try:
+        from tower.world_builder.relocalizer import revisit_pairs  # noqa: PLC0415
+
+        pairs = revisit_pairs(store.session_dir(world_id, session_id))
+    except Exception as exc:  # noqa: BLE001 -- no links is today's solve
+        record["detail"] = f"revisit links unreadable ({type(exc).__name__}: {exc})"
+        return record
+    have = set(present)
+    pairs = [(a, b) for a, b in pairs if a in have and b in have and a != b]
+    record["listed"] = len(pairs)
+    if not pairs:
+        return record
+    path = workspace.root / REVISIT_PAIRS_FILENAME
+    data = "".join(f"{a} {b}\n" for a, b in pairs).encode("utf-8")
+    try:
+        write_bytes_atomic(path, lambda handle: handle.write(data))
+        imported = pycolmap.ImportedPairingOptions()
+        imported.match_list_path = str(path)
+        if verification is not None:
+            pycolmap.match_image_pairs(database_path, matching_options=matching,
+                                       pairing_options=imported,
+                                       verification_options=verification)
+        else:
+            pycolmap.match_image_pairs(database_path, matching_options=matching,
+                                       pairing_options=imported)
+    except Exception as exc:  # noqa: BLE001 -- recorded, the solve goes on
+        logger.warning("global solve: matching %d revisit links failed: %s", len(pairs), exc)
+        record["detail"] = f"matching failed ({type(exc).__name__}: {exc})"
+        return record
+    record["verified"] = _verified_pair_count(database_path, pairs)
+    return record
+
+
+def _verified_pair_count(database_path, pairs) -> int | None:
+    """How many of `pairs` (image names) the database holds as verified pairs,
+    or None when the database cannot be read."""
+    import sqlite3  # noqa: PLC0415
+
+    base = 2147483647  # COLMAP's kMaxNumImages: pair_id = min_id * base + max_id
+    try:
+        con = sqlite3.connect(f"file:{Path(database_path).as_posix()}?mode=ro", uri=True)
+        try:
+            ids = {name: iid for iid, name in con.execute("select image_id, name from images")}
+            count = 0
+            for a, b in pairs:
+                if a not in ids or b not in ids:
+                    continue
+                lo, hi = sorted((ids[a], ids[b]))
+                row = con.execute("select rows from two_view_geometries where pair_id = ?",
+                                  (lo * base + hi,)).fetchone()
+                if row is not None and (row[0] or 0) >= REVISIT_VERIFIED_MIN_INLIERS:
+                    count += 1
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return count
+
+
+def _masks_off_record() -> dict:
+    from tower.world_builder.solve_masks import off_record  # noqa: PLC0415
+
+    return off_record()
+
+
+# `solve_masks.MASKING_FILTERED` / `MASKING_REEXTRACTED`, spelled here so this
+# module does not import the mask module (and its detector) to solve unmasked.
+_MASKING_FILTERED = "walk-database-filtered"
+_MASKING_REEXTRACTED = "re-extracted"
+
+
+def _match_sequential(pycolmap, database_path, matching, pairing, verification) -> None:
+    """Today's call when unseeded -- no `verification_options` at all -- and the
+    seeded two-view RANSAC otherwise."""
+    if verification is not None:
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing,
+            verification_options=verification,
+        )
+    else:
+        pycolmap.match_sequential(
+            database_path, matching_options=matching, pairing_options=pairing
+        )
+
+
+def _ensure_solver_masks(workspace, present, keyframes, camera, *,
+                         backend_factory=None, device_probe=None):
+    """(the masks, their record) when they can be applied, else (None, a record
+    saying why). Never raises: whatever the mask step does, the solve runs, and
+    the record says whether it ran masked."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    ids = {keyframe_image_name(k): k.keyframe_id for k in keyframes}
+    try:
+        result = solve_masks.ensure_solver_masks(
+            workspace, present, keyframe_ids=ids, shape=(camera.height, camera.width),
+            backend_factory=backend_factory, device_probe=device_probe)
+    except Exception as exc:  # noqa: BLE001 -- a mask failure is an unmasked solve, recorded
+        logger.exception("global solve: the transient mask step failed; this solve is unmasked")
+        return None, solve_masks.failed_record(f"{type(exc).__name__}: {exc}")
+    record = result.record()
+    if not result.available:
+        logger.warning(
+            "global solve: transient masks were requested for the final solve and "
+            "are NOT applied (%s: %s); this solve is unmasked and says so",
+            result.state, result.detail)
+        return None, record
+    return result, record
+
+
+def _walk_database_usable(path) -> bool:
+    from tower.world_builder.solve_masks import walk_database_usable  # noqa: PLC0415
+
+    return walk_database_usable(path)
+
+
+def _reextract_masked(workspace, reader, masks, present, record):
+    """The fallback: the masks go to extraction, into this solve's own masked
+    database (`solve_masks.masked_database`)."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    database, info = solve_masks.masked_database(workspace, masks, all_names=present)
+    reader.mask_path = str(solve_masks.masks_dir(workspace))
+    return database, dict(record, database=info["database"], database_reused=info["reused"],
+                          database_reused_from=info.get("reused_from"),
+                          database_rebuilt_because=info["rebuilt_because"])
+
+
+def _filter_walk_database(pycolmap, workspace, masks, record, verification):
+    """The walk database, copied and stripped of every match touching a mask
+    (`solve_masks.filter_walk_database`), with the pairs that changed
+    re-verified under the solve's own two-view options."""
+    from tower.world_builder import solve_masks  # noqa: PLC0415
+
+    database, pairs_path, info = solve_masks.filter_walk_database(workspace, masks)
+    info["pairs_reverified"] = 0
+    if pairs_path is not None:
+        options = verification if verification is not None else pycolmap.TwoViewGeometryOptions()
+        pycolmap.verify_matches(database, pairs_path, options=options)
+        info["pairs_reverified"] = info["pairs_listed"]
+    return database, dict(record, filter=info)
 
 
 def _solution_from_reconstructions(
@@ -1076,6 +1497,12 @@ def coverage_for(posed: int, keyframes: int, median_observations: float | None, 
     return COVERAGE_PARTIAL
 
 
+def _gate_applied(solution) -> bool:
+    """Whether the evidence gate relabelled this solution's components."""
+    gate = getattr(solution, "gate", None)
+    return isinstance(gate, dict) and gate.get("state") == "applied"
+
+
 def merge(
     keyframes: list[Keyframe],
     pose_rows: list[dict],
@@ -1103,9 +1530,18 @@ def merge(
         wrong keypoints), and its placement is `registered` into the lowest
         segment index of the same component with scale exactly 1.
     A segment whose posed members fall in more than one component takes the
-    component holding most of them; the others become `unregistered` rows.
+    component holding most of them; the others become `unregistered` rows --
+    EXCEPT on a solution the evidence gate relabelled (`solution.gate` state
+    `applied`): there the components are the gate's, and a gate label that
+    splits a tracker segment would lose every keyframe it placed in the
+    minority. So each minority component's posed members become a SPLIT
+    segment of their own (`split_segments`): a new segment index past every
+    tracker segment, anchored at its first posed member, registered into its
+    component's reference like any other, and recorded in `segments` with
+    `split_from`. Ungated solutions merge exactly as before.
     """
     horizon = solution.horizon
+    split_segments = _gate_applied(solution)
     members_by_segment: dict[int, list[tuple[int, Keyframe]]] = {}
     for position, keyframe in enumerate(keyframes):
         members_by_segment.setdefault(keyframe.segment_index, []).append((position, keyframe))
@@ -1147,13 +1583,51 @@ def merge(
             c = solution.poses[k.keyframe_id]["component"]
             by_component[c] = by_component.get(c, 0) + 1
         component = max(by_component, key=lambda c: (by_component[c], -c))
+        minority = {}
+        if split_segments:
+            for pos, k in posed:
+                c = solution.poses[k.keyframe_id]["component"]
+                if c != component:
+                    minority.setdefault(c, []).append((pos, k))
         posed = [(pos, k) for pos, k in posed if solution.poses[k.keyframe_id]["component"] == component]
         anchor_pos, anchor_kf = posed[0]
         r_wa, c_a = _pose_matrices(solution.poses[anchor_kf.keyframe_id])
         decided[segment] = {
             "mode": "replaced", "component": component, "posed": posed,
-            "r_wa": r_wa, "c_a": c_a,
+            "r_wa": r_wa, "c_a": c_a, "minority": minority,
         }
+
+    # SPLIT SEGMENTS (gated solutions only; see the docstring). Indices past
+    # every tracker segment, in (segment, component) order, so a rebuild of
+    # the same solution numbers them the same way.
+    if split_segments:
+        next_index = max(members_by_segment, default=-1) + 1
+        for segment in sorted(decided):
+            d = decided[segment]
+            minority = d.get("minority") or {}
+            if not minority:
+                continue
+            moved = set()
+            for c in sorted(minority):
+                posed_c = minority[c]
+                anchor_pos, anchor_kf = posed_c[0]
+                r_wa, c_a = _pose_matrices(solution.poses[anchor_kf.keyframe_id])
+                decided[next_index] = {"mode": "replaced", "component": c, "posed": posed_c,
+                                       "r_wa": r_wa, "c_a": c_a, "split_from": segment}
+                members_by_segment[next_index] = list(posed_c)
+                moved.update(k.keyframe_id for _, k in posed_c)
+                next_index += 1
+            members_by_segment[segment] = [(p, k) for p, k in members_by_segment[segment]
+                                           if k.keyframe_id not in moved]
+        # A point belongs to the segment of its first observer -- the SPLIT
+        # segment when that observer was moved into one.
+        derived_segment = {}
+        for segment, members in members_by_segment.items():
+            for position, _k in members:
+                derived_segment[position] = segment
+        owner_segment = np.array(
+            [derived_segment.get(int(i), -1) for i in solution.first_keyframe], dtype=np.int64,
+        ) if len(solution.first_keyframe) else np.zeros(0, dtype=np.int64)
 
     reference_by_component: dict[int, int] = {}
     for segment in sorted(decided):
@@ -1289,6 +1763,11 @@ def merge(
             "median_observations": median_obs, "points": n_points,
             "component": component, "reference_segment": reference,
         }
+        if d.get("split_from") is not None:
+            # A tracker segment the gate's components cut in two: this part's
+            # keyframes are the journal's segment `split_from`.
+            per_segment[segment]["split_from"] = d["split_from"]
+            placements[-1].evidence["split_from"] = d["split_from"]
 
     components_out = []
     for component, reference in sorted(reference_by_component.items()):
@@ -1306,6 +1785,17 @@ def merge(
         "components": components_out,
         **counts,
     }
+    # What ran (contract WORLD-BUILDER-COMPONENTS §2.5), into the published
+    # manifest's `global_solve` beside the rest -- only when the solution
+    # recorded it, so a world solved before these records builds as it did.
+    if solution.transients is not None:
+        summary["transients"] = solution.transients
+    if solution.solve is not None:
+        summary["solve"] = solution.solve
+    # The evidence gate's record (§2.5 `gate.params` and digest, what fed it),
+    # when the gate ran on this solution.
+    if solution.gate is not None:
+        summary["gate"] = solution.gate
     return MergeResult(
         pose_rows=new_pose_rows, point_rows=new_point_rows, support_rows=new_support_rows,
         placements=placements, segments=per_segment, summary=summary,
