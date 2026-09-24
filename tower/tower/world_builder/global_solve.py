@@ -1155,7 +1155,10 @@ def solve(
             "this solve's own, which is matched afresh and not frozen"
             if walk_database == "filter-failed" else frozen_refusal
             or "a re-extracted masked database is this solve's own; it is not frozen")
-        solution.solve["database_digest"] = (mapped_digest or {}).get("content")
+        # At the stated precision (`DATABASE_DIGEST_RULE`): the mapped database is the
+        # mask filter's, whose re-verification leaves last-bit noise in unused F matrices.
+        solution.solve["database_digest"] = (mapped_digest or {}).get("stated")
+        solution.solve["database_digest_rule"] = DATABASE_DIGEST_RULE if mapped_digest else None
         solution.solve["verified_pairs"] = (mapped_digest or {}).get("verified_pairs")
     # PUBLISH. With the evidence gate on (a final solve, `TOWER_WORLD_SOLVE_GATE`)
     # the candidate first gets its depth stage, metric scale and gate, and is
@@ -1485,6 +1488,39 @@ MATCHING_FROZEN = "frozen"
 MATCHING_MATCHED = "matched"
 # Tables that do not reach the mapper, the mask filter or the re-verification.
 _DIGEST_SKIP_TABLES = ("descriptors",)
+# THE STATED-PRECISION DIGEST (`stated`, what `solve.database_digest` reports). The
+# mask filter's seeded re-verification is deterministic but for the representation of
+# a few two-view matrices: two same-seed re-finishes of one walk (6839fb8f, P3-H2 runs B
+# and C) mapped and gated identically, yet 3 of 16,793 pairs' F differed -- two by at
+# most 2.7e-13 (last-bit noise) and one by its SIGN (F and -F are one fundamental
+# matrix), all planar/panoramic pairs where F is not used. So those matrices are
+# digested as what they mean: F, E, H and qvec are defined only up to scale and sign,
+# so each is divided by its own largest-magnitude entry (sign included) and rounded to
+# 10 decimals; tvec keeps its sign and is divided by its largest magnitude. The inlier
+# matches, the configurations and every other table stay exact. `content` is the exact
+# digest, and it is what the frozen matching compares on the walk database.
+_DIGEST_STATED_COLUMNS = {"two_view_geometries": {"F": True, "E": True, "H": True,
+                                                  "qvec": True, "tvec": False}}
+_DIGEST_STATED_DECIMALS = 10
+DATABASE_DIGEST_RULE = ("sha1 of every table but descriptors, row by row in key order; two-view "
+                        "F, E, H, qvec up to scale and sign, tvec up to scale, at 10 decimals of "
+                        "each matrix's largest-magnitude entry")
+
+
+def _stated_bytes(value, *, up_to_sign: bool) -> bytes:
+    """A float64 blob at the stated precision, or the blob itself when it is not one.
+    `up_to_sign`: the blob means the same thing negated (F, E, H, a quaternion)."""
+    raw = bytes(value)
+    if not raw or len(raw) % 8:
+        return raw
+    arr = np.frombuffer(raw, dtype=np.float64)
+    if not np.all(np.isfinite(arr)) or not np.any(arr):
+        return raw
+    pivot = float(arr[int(np.argmax(np.abs(arr)))])
+    scale = pivot if up_to_sign else abs(pivot)
+    q = np.round(arr / scale, _DIGEST_STATED_DECIMALS) + 0.0  # + 0.0: no negative zero
+    # The matrix's own magnitude, at the same number of significant digits.
+    return q.tobytes() + f"|{abs(pivot):.{_DIGEST_STATED_DECIMALS - 1}e}".encode("ascii")
 
 
 def database_digest(path) -> dict | None:
@@ -1508,17 +1544,31 @@ def database_digest(path) -> dict | None:
             if "images" not in tables or "two_view_geometries" not in tables:
                 return None
             content = hashlib.sha1()
+            stated = hashlib.sha1()
             for table in tables:
-                content.update(f"\x00table {table}\x00".encode())
-                for row in con.execute(f'select * from "{table}" order by 1'):
-                    for value in row:
+                head = f"\x00table {table}\x00".encode()
+                content.update(head)
+                stated.update(head)
+                cursor = con.execute(f'select * from "{table}" order by 1')
+                columns = [d[0] for d in cursor.description]
+                rounded = {columns.index(c): sign
+                           for c, sign in _DIGEST_STATED_COLUMNS.get(table, {}).items()
+                           if c in columns}
+                for row in cursor:
+                    for k, value in enumerate(row):
                         if isinstance(value, (bytes, bytearray, memoryview)):
-                            content.update(b"b%d:" % len(value))
-                            content.update(bytes(value))
+                            exact = b"b%d:" % len(value) + bytes(value)
+                            content.update(exact)
+                            stated.update(b"s:" + _stated_bytes(value, up_to_sign=rounded[k])
+                                          if k in rounded else exact)
                         else:
-                            content.update(repr(value).encode("utf-8"))
+                            text = repr(value).encode("utf-8")
+                            content.update(text)
+                            stated.update(text)
                         content.update(b"\x1f")
+                        stated.update(b"\x1f")
                     content.update(b"\x1e")
+                    stated.update(b"\x1e")
             names = dict(con.execute("select image_id, name from images"))
             lines = []
             for pid, rows, config in con.execute(
@@ -1535,7 +1585,8 @@ def database_digest(path) -> dict | None:
             con.close()
     except sqlite3.Error:
         return None
-    return {"content": content.hexdigest(), "verified": verified, "verified_pairs": len(lines)}
+    return {"content": content.hexdigest(), "stated": stated.hexdigest(), "verified": verified,
+            "verified_pairs": len(lines)}
 
 
 def _image_digests(workspace: SolveWorkspace, names) -> dict:
