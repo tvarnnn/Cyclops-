@@ -18,6 +18,7 @@ THE RECORD'S SHAPE (Tower-internal; the gate's writer and this reader agree on i
     {"components": [ {<the §2.1 fields the gate decides: id, state, reason, reasons,
                        shown_as, keyframes, capture_spans_s>,
                       "keyframe_ids": [<the member keyframe ids>]}, ... ],
+     "input_digest": <the published solve's; a record naming another solve is absent>,
      ...any other keys (gate params, digests) are ignored here}
 
 `keyframe_ids` never leaves the Tower; it is what an area build is built from. A bare
@@ -81,7 +82,7 @@ _STATES = (STATE_PLACED, STATE_UNPLACED)
 _SHOWN = (SHOWN_ROOM, SHOWN_AREA, SHOWN_NONE)
 
 # §2.1: 16 lower-hex, because the id is a path segment of the area routes.
-_AREA_ID = re.compile(r"^[0-9a-f]{16}$")
+_AREA_ID = re.compile(r"[0-9a-f]{16}")
 
 # §2.4 rule 5: at most 8 spans.
 MAX_SPANS = 8
@@ -92,7 +93,8 @@ SCOPE_AREA = "area"
 # THE FOUR AREA SENTENCES (§5.1, C1 E4). Stable identifiers: the phone compares them for
 # equality, exactly as it compares FastAPI's `Not Found`, to tell a terminal answer from
 # a transient one. Their text never changes without a contract change, and
-# `tests/test_world_builder_area_routes.py` pins it.
+# `tests/test_world_builder_components_areas.py` and `test_world_builder_phone_pins.py`
+# pin it.
 NO_SUCH_AREA = "no such area in this session"           # terminal
 NO_AREAS = "this session has no areas"                   # terminal
 AREA_NOT_BUILT_YET = "this area has not been built yet"  # transient
@@ -105,7 +107,9 @@ AREA_STAGES = (STAGE_SURFACE, STAGE_APPEARANCE)
 
 
 def is_area_id(value) -> bool:
-    return isinstance(value, str) and bool(_AREA_ID.match(value))
+    # `fullmatch`, not `match`: `$` also matches before a final newline, and an id is
+    # joined into a path (review V6, L1).
+    return isinstance(value, str) and bool(_AREA_ID.fullmatch(value))
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +279,51 @@ def read_components_record(store: WorldStore, world_id: str,
         _warn_once(f"[Tower][WorldBuilder] components record {world_id}/{session_id} is "
                    "not the contract's shape (WORLD-BUILDER-COMPONENTS.md §2); the "
                    "session reports components: null")
+        return None
+    # A RECORD OF ANOTHER SOLVE IS NOT THIS SOLVE'S (review V6, L2). The gate writes
+    # the published solve's `input_digest` into the record; a record whose solve is no
+    # longer the one in `solve/<session>` describes components nobody can build or
+    # draw, and is read as absent. A record without the key (a hand-written one) is
+    # taken as it is: there is nothing to compare.
+    named = payload.get("input_digest") if isinstance(payload, dict) else None
+    if isinstance(named, str) and named:
+        published = _published_input_digest(store, world_id, session_id)
+        if published != named:
+            _warn_once(f"[Tower][WorldBuilder] components record {world_id}/{session_id} "
+                       f"names solve {named[:12]} but the published solve is "
+                       f"{str(published)[:12]}; the session reports components: null")
+            return None
     return record
+
+
+# `(path, mtime_ns, size) -> input_digest`: the listing and the 2 Hz status poll ask
+# for the same few solutions over and over, and a solution.json is hundreds of KB.
+_DIGEST_CACHE: dict = {}
+_DIGEST_CACHE_MAX = 256
+
+
+def _published_input_digest(store: WorldStore, world_id: str, session_id: str):
+    """The `input_digest` of the solution published in `solve/<session>`, or None when
+    there is none or it cannot be read. Cached by the file's stat."""
+    path = store.world_dir(world_id) / "solve" / session_id / "solution.json"
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key in _DIGEST_CACHE:
+        return _DIGEST_CACHE[key]
+    try:
+        from tower.world_builder.store import _read_json_past_a_replace  # noqa: PLC0415
+
+        meta = _read_json_past_a_replace(path)
+    except Exception:  # noqa: BLE001 -- unreadable is "not known", never a match
+        return None
+    digest = meta.get("input_digest") if isinstance(meta, dict) else None
+    if len(_DIGEST_CACHE) >= _DIGEST_CACHE_MAX:
+        _DIGEST_CACHE.clear()
+    _DIGEST_CACHE[key] = digest
+    return digest
 
 
 # ---------------------------------------------------------------------------
@@ -453,14 +501,14 @@ def area_photographic_state(store: WorldStore, world_id: str, session_id: str, s
         record = read_area_record(store, world_id, session_id, area_id)
     except Exception as exc:  # noqa: BLE001
         return {"state": P.PHOTOGRAPHIC_UNOBSERVABLE, "stage": None,
-                "detail": f"the area's record could not be read: {type(exc).__name__}"}
+                "detail": f"its record could not be read: {type(exc).__name__}"}
     stages = {}
     if (record and record.get("components_sha1") == components_sha1
             and record.get("session_id") in (None, session_id)):
         stages = record.get("stages") or {}
     if not stages:
         return {"state": P.PHOTOGRAPHIC_OWED, "stage": STAGE_SURFACE,
-                "detail": "the area has not been built yet and no process is working on it"}
+                "detail": "not built yet, and no process is working on it"}
 
     def entry(stage):
         value = stages.get(stage)
@@ -468,12 +516,12 @@ def area_photographic_state(store: WorldStore, world_id: str, session_id: str, s
 
     if entry(STAGE_APPEARANCE).get("state") == STAGE_STATE_OK:
         return {"state": P.PHOTOGRAPHIC_COMPLETE, "stage": STAGE_APPEARANCE,
-                "detail": "the area's appearance stage finished"}
+                "detail": "its appearance stage finished"}
     for stage in AREA_STAGES:
         if entry(stage).get("state") == STAGE_STATE_FAILED:
             return {"state": P.PHOTOGRAPHIC_FAILED, "stage": stage,
                     "detail": entry(stage).get("detail")
-                    or f"the area's {stage} stage is recorded failed"}
+                    or f"its {stage} stage is recorded failed"}
     for stage in AREA_STAGES:
         if entry(stage).get("state") in (STAGE_STATE_RUNNING, STAGE_STATE_STOPPED):
             # The room's rule (`photographic._liveness`), asked of the AREA's own
@@ -483,17 +531,17 @@ def area_photographic_state(store: WorldStore, world_id: str, session_id: str, s
                 view = AreaStore(store, world_id, session_id, area_id)
             except Exception as exc:  # noqa: BLE001
                 return {"state": P.PHOTOGRAPHIC_UNOBSERVABLE, "stage": stage,
-                        "detail": f"the area could not be probed: {type(exc).__name__}"}
+                        "detail": f"it could not be probed: {type(exc).__name__}"}
             return P._liveness(view, world_id, session_id, stage)
     for stage in AREA_STAGES:
         e = entry(stage)
         if e.get("state") == STAGE_STATE_UNAVAILABLE and e.get("attempted"):
             return {"state": P.PHOTOGRAPHIC_FAILED, "stage": stage,
                     "detail": e.get("detail")
-                    or f"the area's {stage} stage ran and could not produce it"}
+                    or f"its {stage} stage ran and could not produce it"}
     return {"state": P.PHOTOGRAPHIC_UNATTEMPTED, "stage": None,
             "detail": entry(STAGE_APPEARANCE).get("detail") or entry(STAGE_SURFACE).get("detail")
-            or "no photographic stage was attempted for this area"}
+            or "no photographic stage was attempted for it"}
 
 
 def area_words(store: WorldStore, world_id: str, session_id: str, session,
@@ -508,7 +556,7 @@ def area_words(store: WorldStore, world_id: str, session_id: str, session,
                                                    e["id"], record.sha1)
         except Exception as exc:  # noqa: BLE001 -- one area, not the row
             out[e["id"]] = {"state": P.PHOTOGRAPHIC_UNOBSERVABLE, "stage": None,
-                            "detail": f"the area's state could not be computed: "
+                            "detail": f"its state could not be computed: "
                                       f"{type(exc).__name__}"}
     return out
 
@@ -561,6 +609,75 @@ def with_areas(store: WorldStore, world_id: str, session_id: str, session,
         return room
     return combine_photographic(room, record,
                                 area_words(store, world_id, session_id, session, record))
+
+
+# ---------------------------------------------------------------------------
+# "owed" is a promise (review V6, M2)
+# ---------------------------------------------------------------------------
+#
+# An area with no record reads `owed` -- "Improving" on the phone -- because the
+# finisher (`scripts/world_finish_pending.py`) builds it at the Tower's next idle moment.
+# That is only true when a finisher will run and is allowed to build areas. When it is
+# not, the promise is false and nothing would ever end it, so the BUILDER, when the room
+# finishes, records those areas as declined: a settled word ("could not be built"),
+# which `scripts/world_refinish.py` can still turn into a built area on request.
+
+AREA_BUILDS_OFF_DETAIL = (
+    "area builds are switched off on this Tower (TOWER_WORLD_AREA_BUILDS); "
+    "scripts/world_refinish.py builds them on request")
+NO_FINISHER_DETAIL = (
+    "no process on this Tower builds areas: the idle finisher is switched off "
+    "(TOWER_WORLD_FINISH_PENDING, TOWER_WORLD_SURFACE or TOWER_WORLD_SOLVE); "
+    "scripts/world_refinish.py builds them on request")
+
+
+def areas_nobody_will_build_reason() -> str | None:
+    """Why no process will build this Tower's owed areas, or None when the finisher
+    will. The finisher runs only with `TOWER_WORLD_FINISH_PENDING`, the surface and the
+    solve all on (`tower/main.py`, `_world_finish_spec`), and builds areas only with
+    `TOWER_WORLD_AREA_BUILDS` on. Read from the environment the builder inherits from
+    the Tower, like every setting a child reads."""
+    from tower.config import _flag, world_area_builds_setting  # noqa: PLC0415
+
+    if not world_area_builds_setting():
+        return AREA_BUILDS_OFF_DETAIL
+    if not (_flag("TOWER_WORLD_FINISH_PENDING", default=True)
+            and _flag("TOWER_WORLD_SURFACE", default=True)
+            and _flag("TOWER_WORLD_SOLVE", default=True)):
+        return NO_FINISHER_DETAIL
+    return None
+
+
+def settle_areas_nobody_will_build(store: WorldStore, world_id: str,
+                                   session_id: str) -> list:
+    """Record every OWED area of this session as declined when no process will build
+    it (`areas_nobody_will_build_reason`); return their ids. Nothing for a session
+    without a components record, and nothing when the finisher will build them.
+    Called by the builder when the room's stages end. Never raises."""
+    try:
+        reason = areas_nobody_will_build_reason()
+        if reason is None:
+            return []
+        record = read_components_record(store, world_id, session_id)
+        if record is None:
+            return []
+        session = store.read_session(world_id, session_id)
+        settled = []
+        for area_id, word in area_words(store, world_id, session_id, session,
+                                        record).items():
+            if word.get("state") != "owed":
+                continue
+            for stage in AREA_STAGES:
+                write_area_record(store, world_id, session_id, area_id,
+                                  components_sha1=record.sha1, stage=stage,
+                                  state=STAGE_STATE_UNAVAILABLE, attempted=False,
+                                  detail=reason)
+            settled.append(area_id)
+        return settled
+    except Exception:  # noqa: BLE001 -- a record must not take the build down
+        logger.exception("[Tower][WorldBuilder] could not settle the areas of %s/%s",
+                         world_id, session_id)
+        return []
 
 
 # ---------------------------------------------------------------------------

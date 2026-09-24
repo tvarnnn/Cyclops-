@@ -2498,6 +2498,20 @@ def main(argv=None) -> int:
     # `--surface` without `--appearance` is recorded by `final_surface_stages`
     # itself, so the recovery finisher records it too.
 
+    # THE AREAS' "OWED" MUST BE A PROMISE SOMETHING KEEPS (WORLD-BUILDER-COMPONENTS.md
+    # §3.4, §7 rule 5; review V6, M2). An area the evidence gate named reads `owed`
+    # until the idle finisher builds it. On a Tower where no finisher will run, or
+    # where area builds are switched off, that is never, so the room's end is where
+    # they are recorded as declined instead. Nothing for a session with no components
+    # record, and nothing when the finisher will build them. Never raises.
+    from tower.world_builder.components import (  # noqa: PLC0415
+        settle_areas_nobody_will_build,
+    )
+
+    settled = settle_areas_nobody_will_build(store, world_id, session_id)
+    if settled:
+        report["areas_declined"] = settled
+
     # Dense reconstruction last (after the surface, which shares its depth
     # stage), because it is the most expensive thing here
     # and the least load-bearing: every other artifact is already on disk and

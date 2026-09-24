@@ -322,6 +322,7 @@ ANCHOR_WHAT_REDACTED = (
 ANCHOR_WHAT_RAW = (
     '         ? "These are the camera\'s own frames, UNREDACTED, placed on the '
     'reconstructed room."')
+ANCHOR_LOADING = 'status("Loading the room\'s surface…");'
 ANCHOR_FACE_TEXT = '" “Face the room” turns you'
 ANCHOR_FACE_BUTTON = (
     'aria-label="Turn to the nearest photographed direction">Face the room</button>')
@@ -347,6 +348,7 @@ def caption_replacements(captions: dict | None) -> list:
             (ANCHOR_WHAT_RAW,
              "         ? " + js_string_literal(area_caption(area, AREA_FIRST_CLAUSE_RAW))),
             (ANCHOR_FACE_TEXT, '" “Face the area” turns you'),
+            (ANCHOR_LOADING, 'status("Loading the area\'s surface…");'),
             (ANCHOR_FACE_BUTTON,
              'aria-label="Turn to the nearest photographed direction">Face the area</button>'),
         ]

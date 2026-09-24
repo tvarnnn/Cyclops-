@@ -409,13 +409,29 @@ def build_render_revision(store: WorldStore, world_id: str,
 
 
 def _room_captions(store: WorldStore, world_id: str, session_id: str) -> dict | None:
-    """`{"more_areas": N}` when this session's components record shows at least one
-    area, else None. Never raises: a caption must not cost the room its page."""
+    """`{"more_areas": N}` when this session has at least one area that is, or will
+    be, SHOWN separately, else None. An area whose build failed or was declined is not
+    shown anywhere, so it is not counted (review V6, L6): a room whose every area was
+    declined says nothing about areas. Never raises: a caption must not cost the room
+    its page."""
     try:
-        from tower.world_builder.components import read_components_record  # noqa: PLC0415
+        from tower.world_builder.components import (  # noqa: PLC0415
+            area_words,
+            read_components_record,
+        )
+        from tower.world_builder.photographic import (  # noqa: PLC0415
+            PHOTOGRAPHIC_FAILED,
+            PHOTOGRAPHIC_UNATTEMPTED,
+        )
 
         record = read_components_record(store, world_id, session_id)
-        count = len(record.areas()) if record is not None else 0
+        count = 0
+        if record is not None and record.areas():
+            session = store.read_session(world_id, session_id)
+            words = area_words(store, world_id, session_id, session, record)
+            count = sum(1 for w in words.values()
+                        if w.get("state") not in (PHOTOGRAPHIC_FAILED,
+                                                  PHOTOGRAPHIC_UNATTEMPTED))
     except Exception:  # noqa: BLE001
         logger.debug("[Tower][WorldBuilder] components caption probe failed", exc_info=True)
         return None
@@ -911,16 +927,24 @@ def _area_word(store: WorldStore, area: _Area) -> dict:
 
 
 def _area_not_drawable(store: WorldStore, area: _Area) -> AreaUnavailable:
-    """Nothing is drawable: transient while its build is owed, running or
-    unobservable; terminal once it is settled (failed, or declined)."""
+    """Nothing is drawable: TRANSIENT while its build is owed, running or
+    unobservable, and also when its build is recorded COMPLETE (review V6, L4) -- a
+    finished build that cannot be composed right now (a read racing a publish, a
+    relabel the next build answers) is not a build that failed, and the terminal
+    sentence would make the phone stop asking. TERMINAL only once the build itself
+    settled without a picture: failed, or declined."""
     from tower.world_builder import components as C  # noqa: PLC0415
-    from tower.world_builder.photographic import is_unsettled  # noqa: PLC0415
+    from tower.world_builder.photographic import (  # noqa: PLC0415
+        PHOTOGRAPHIC_COMPLETE,
+        is_unsettled,
+    )
 
     try:
         word = _area_word(store, area)
     except Exception:  # noqa: BLE001 -- not known is not terminal
         return AreaUnavailable(C.AREA_NOT_BUILT_YET)
-    if is_unsettled(word.get("state")):
+    state = word.get("state")
+    if is_unsettled(state) or state == PHOTOGRAPHIC_COMPLETE:
         return AreaUnavailable(C.AREA_NOT_BUILT_YET)
     return AreaUnavailable(C.AREA_COULD_NOT_BE_BUILT)
 
