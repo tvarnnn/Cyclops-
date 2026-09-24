@@ -760,14 +760,21 @@ def test_an_ungated_solution_merges_exactly_as_before(gate):
 
 def _gated_session(tmp_path, *, transients, gate=None, record=True):
     from tests.test_world_builder_finish_pending import _stage, _world
+    from tower.world_builder import global_solve as GS
     from tower.world_builder.records import STAGE_STATE_OK, STAGE_SURFACE
 
     store = _world(tmp_path, stages={STAGE_SURFACE: _stage(STAGE_STATE_OK),
                                      "appearance": _stage(STAGE_STATE_OK)})
-    solve = store.world_dir("w1") / "solve" / "s1"
-    solve.mkdir(parents=True, exist_ok=True)
     gate = gate if gate is not None else {"state": CP.GATE_STATE_APPLIED, "masks_applied": False}
-    (solve / "solution.json").write_text(json.dumps({"transients": transients, "gate": gate}))
+    # A PUBLISHED solve a re-gate can start from: it loads, and the walk's database is there.
+    # (Review V8, M1a: the finisher decides a refusal read-only, so a `solution.json` alone --
+    # which `load_solution` reads as absent -- is `regate-refused`, not owed.)
+    solution = _solution(transients=None)
+    solution.transients, solution.gate = transients, gate
+    workspace = GS.workspace_for(store, "w1", "s1")
+    GS.write_solution(workspace, solution)
+    workspace.database_path.write_bytes(b"not read: the re-gate is a stub in these tests")
+    solve = workspace.root
     if record:
         (solve / CP.COMPONENTS_FILENAME).write_text(json.dumps({"components": []}))
     return store

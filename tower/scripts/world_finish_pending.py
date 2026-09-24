@@ -90,7 +90,19 @@ have done -- including a run that found nothing owed, which is the common
 case -- 1 when a session that was owed could not be finished, and 3
 (`EXIT_MORE_OWED`) when the run finished what `--max-worlds` allowed and
 another world is still owed. The Tower reads that last one as "run me again
-at the next idle moment" (`tower/main.py`, `CHORE_EXIT_MORE_OWED`).
+at the next idle moment" (`tower/main.py`, `CHORE_EXIT_MORE_OWED`), and 4
+(`EXIT_WAITING`) as "try again after a backoff": what is left is waiting on
+somebody else -- another writer, a re-gate whose solve an owner must re-finish,
+an owner's re-finish in progress.
+
+WITH THE EVIDENCE GATE ON (review V8, `test_world_builder_finish_pending_gate.py`).
+A re-gate that cannot start is decided before any work and waits without
+spending the run's one-world budget (M1a); a re-gate at its attempt bound is
+given up on the row and stops hiding the room and areas behind it (M1b); the
+room is owed from before the re-gate publishes, so no interruption leaves it
+stale (M1c); and a world an owner is re-finishing is left alone (M3b). A world
+whose solve carries no gate record, and that nobody is re-finishing, takes none
+of these paths.
 """
 
 import argparse
@@ -224,7 +236,14 @@ EXIT_MORE_OWED = 3
 # is what this wants: not nothing-to-do, and not a spawn every tick while a
 # foreign writer holds the lock.
 EXIT_WAITING = 4
-WAITING_CODES = ("locked", "building-now")
+# Two more with the evidence gate on (review V8), and both are "somebody else must act
+# first", never "run me again now": a re-gate that cannot start (its solve will not load,
+# or the solve's database is gone -- an owner's re-finish), and a world an owner is
+# re-finishing right now. `EXIT_MORE_OWED` is a respawn with no backoff; reporting either
+# of these as owed made the refused world loop and starved every other one (M1a).
+REGATE_REFUSED = "regate-refused"
+REFINISH_IN_PROGRESS_CODE = "refinish-in-progress"
+WAITING_CODES = ("locked", "building-now", REGATE_REFUSED, REFINISH_IN_PROGRESS_CODE)
 
 # Where the attempt counter lives. Beside the world rather than on the
 # session record, because it is THIS TOOL's bookkeeping and not a fact about
@@ -614,6 +633,17 @@ def assess(
             f"the session record is unreadable: {type(exc).__name__}: {exc}",
         )
 
+    # AN OWNER IS RE-FINISHING THIS WORLD (review V8, M3b). Asked first, so the whole
+    # re-finish -- its steps and the lock gaps between them -- reads as one waiting answer,
+    # whatever the session record says at the instant this looks. See
+    # `refinish_in_progress`.
+    refinish = refinish_in_progress(store, world_id)
+    if refinish is not None:
+        logger.info("[Tower][WorldBuilder] %s/%s is left alone: %s", world_id, session_id,
+                    refinish)
+        return no(REFINISH_IN_PROGRESS_CODE,
+                  f"{refinish}; the finisher stays out of a world while it is re-finished")
+
     if session.ended_at is None:
         # A walk in progress, or a builder that died mid-walk. Either way the
         # photographic stages are not what it is missing, and
@@ -643,9 +673,29 @@ def assess(
     # solve the gate RAN on can owe one: this tool never computes components for a world
     # the gate never saw. A solve that lost its MASKS owes nothing here -- that needs a new
     # solve, which an owner runs attended (`world_refinish.py`; V7, H2).
-    regate = _assess_regate(store, world_id, session_id, max_attempts=max_attempts)
-    if regate is not None:
+    #
+    # A RE-GATE THE FINISHER CANNOT RUN HIDES NOTHING (review V8, M1a and M1b). Given up at
+    # its attempt bound (and said so on the row), or refused because its solve will not
+    # load, the room and the areas behind it are asked exactly as for a world with no gate:
+    # a re-gate that will never happen must not leave owed room or area work unfinished for
+    # ever. A refused re-gate is still the answer when the room and areas owe nothing, so
+    # the run reports WAITING rather than nothing-to-do.
+    regate = _assess_regate(store, world_id, session_id, session, max_attempts=max_attempts)
+    if regate is not None and regate.code != REGATE_REFUSED:
         return regate
+    room = _assess_room(store, world_id, session_id, session, max_attempts=max_attempts)
+    if regate is not None and not (room.owed or room.exhausted or room.code in WAITING_CODES):
+        return regate
+    return room
+
+
+def _assess_room(store: WorldStore, world_id: str, session_id: str, session, *,
+                 max_attempts: int) -> Verdict:
+    """`assess`, for the room's photographic stages and then the session's areas: what a
+    session owes once the re-gate owes nothing this tool can do."""
+
+    def no(code: str, reason: str, **kwargs) -> Verdict:
+        return Verdict(world_id, session_id, False, reason, code=code, **kwargs)
 
     # TWO SIGNALS, IN PRECEDENCE ORDER, AND NEITHER CAN DISCOVER A BACKLOG.
     #
@@ -886,8 +936,13 @@ def regate_ledger_key(session_id: str) -> str:
     return f"{session_id}#{REGATE_STAGE}"
 
 
-def _assess_regate(store: WorldStore, world_id: str, session_id: str, *,
+def _assess_regate(store: WorldStore, world_id: str, session_id: str, session, *,
                    max_attempts: int) -> "Verdict | None":
+    """A verdict about the published solve's re-gate, or None when it owes none -- which
+    includes every solve the gate never ran on, and a re-gate given up on the record.
+
+    Reads only. Every answer that is not `owed-regate` is decided HERE, before any lock,
+    attempt or warm is spent on it (review V8, M1a)."""
     from tower.world_builder.coherence_publish import regate_owed  # noqa: PLC0415
 
     try:
@@ -910,16 +965,202 @@ def _assess_regate(store: WorldStore, world_id: str, session_id: str, *,
                        code="locked", stage=REGATE_STAGE)
     attempts = read_attempts(store, world_id, regate_ledger_key(session_id)) or 0
     if attempts >= max_attempts:
-        # Not `exhausted`: nothing to retire. The published fail-safe stands, and its row
-        # says why (`coherence_publish.publish_notice`).
+        # GIVEN UP, AND SAID SO ON THE ROW (review V8, M1b). The published fail-safe stands.
+        # What the row said until now was `publish_notice`'s promise that the idle Tower
+        # re-runs the gate, which is no longer true -- so the bound is `exhausted` until
+        # `_retire_regate` has put the given-up sentence in its place. THE RECORD IS THE
+        # SENTENCE: once the finalization detail says it, the re-gate owes nothing and
+        # `assess` asks the room and the areas behind it, which it used to hide for ever.
+        # Anything that puts the promise back (a hand-run `world_finalize.py`) is corrected
+        # at the next run.
+        notice = regate_given_up_notice(_published_meta(store, world_id, session_id),
+                                        attempts)
+        if (session.finalization or {}).get("detail") == notice:
+            return None
         return Verdict(world_id, session_id, False,
                        f"this tool has already re-run the gate of this session {attempts} "
                        f"times (the bound is {max_attempts}); {cause} every time",
-                       code="attempt-bound", stage=REGATE_STAGE, attempts=attempts)
+                       code="attempt-bound", stage=REGATE_STAGE, attempts=attempts,
+                       exhausted=True)
+    refusal = _regate_refusal(store, world_id, session_id)
+    if refusal is not None:
+        # Not owed, and not `exhausted`: nothing was attempted, so nothing is given up.
+        # WAITING -- an owner's re-finish is what it needs -- and read-only: the run never
+        # takes the lock, counts an attempt or warms the native stack for it (M1a).
+        logger.info("[Tower][WorldBuilder] the re-gate of %s/%s cannot start: %s",
+                    world_id, session_id, refusal)
+        return Verdict(world_id, session_id, False,
+                       f"the published solve's evidence gate could not finish ({cause}), and "
+                       f"a re-gate cannot start: {refusal}", code=REGATE_REFUSED,
+                       stage=REGATE_STAGE, attempts=attempts)
     return Verdict(world_id, session_id, True,
                    f"the published solve's evidence gate could not finish ({cause}); it is "
                    "owed a re-gate in place", code="owed-regate", stage=REGATE_STAGE,
                    attempts=attempts)
+
+
+def _published_meta(store: WorldStore, world_id: str, session_id: str) -> dict:
+    """The published `solution.json`, or {} when there is no readable one."""
+    path = store.world_dir(world_id) / "solve" / session_id / "solution.json"
+    try:
+        meta = read_json_closed(path) if path.exists() else {}
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _regate_refusal(store: WorldStore, world_id: str, session_id: str) -> str | None:
+    """Why `coherence_publish.regate_published` would refuse this session, or None. Reads
+    only.
+
+    THE SAME TWO REFUSALS, WORD FOR WORD: the published solve does not load as a gated
+    solution, or the feature database it was solved from is gone. Restated here rather than
+    shared because `coherence_publish.py` is another lane's file; a test holds the two to
+    one answer on every shape (`test_the_read_only_refusal_agrees_with_regate_published`).
+    `regate_published` still refuses under the lock, and `finish_regate` still gives that
+    attempt back -- this only moves the common case in front of the lock."""
+    from tower.world_builder.global_solve import load_solution, workspace_for  # noqa: PLC0415
+
+    solution = load_solution(store, world_id, session_id)
+    if solution is None or not isinstance(solution.gate, dict):
+        return "no gated solution is published for this session"
+    workspace = workspace_for(store, world_id, session_id)
+    name = (solution.solve or {}).get("database") or workspace.database_path.name
+    if not (workspace.root / name).is_file():
+        return f"the solve's database {name} is gone; an owner can re-finish this walk"
+    return None
+
+
+# The row's sentence once the finisher has stopped re-running a gate: the cause, as
+# `publish_notice` states it, and the owner's way out instead of the idle Tower's promise.
+REGATE_GIVEN_UP = ("{what}; the idle Tower re-ran the gate {attempts} times without "
+                   "finishing it and has stopped trying; an owner can re-finish this walk")
+
+
+def regate_given_up_notice(meta: dict, attempts: int) -> str:
+    """The finalization detail for a re-gate given up at its bound (review V8, M1b).
+
+    `publish_notice`'s sentence for the same record, with its promise -- "the Tower re-runs
+    the gate when it is idle" -- replaced by what is now true. The masks sentence, when the
+    solve has one, is kept exactly as `publish_notice` words it. Deterministic in the
+    published record and the count, because it is also the record that the give-up
+    happened (`_assess_regate`)."""
+    from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
+
+    gate = (meta or {}).get("gate") or {}
+    parts = []
+    masks = CP.publish_notice({"transients": (meta or {}).get("transients") or {}, "gate": {}})
+    if masks:
+        parts.append(masks)
+    if gate.get("state") == CP.GATE_STATE_FAILED:
+        what = f"the evidence gate failed ({gate.get('detail') or 'an error'})"
+    else:
+        why = (gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"
+        what = f"the evidence gate could not measure metric scale ({why})"
+    parts.append(REGATE_GIVEN_UP.format(what=what, attempts=attempts))
+    return "; ".join(parts)
+
+
+# -- a re-finish in progress (review V8, M3b) --------------------------
+#
+# `scripts/world_refinish.py` rebuilds one session in steps, and between them it holds no
+# lock: after step 1 (the previous solve set aside, the room's stages recorded `stopped`
+# "re-finish in progress") and after step 2 (the new solve published by its child
+# `world_finalize.py`, which took and released the lock itself). A `stopped` room is owed
+# work, so an idle Tower's finisher picked it up in exactly those gaps -- building the room
+# from a solve that was set aside or not yet rebuilt, and holding the lock the re-finish's
+# next step then could not take.
+#
+# WHAT "IN PROGRESS" MEANS, from PF's `world_refinish.py` as it is: its ledger,
+# `<world>/refinish/<stamp>/refinish.json`, and the room marker it writes.
+#
+# * `state: setting-aside` -- step 1 has not completed. Under the world's lock while it
+#   runs; left behind, it means a set-aside that never finished, and nothing should build
+#   on that world until its owner looks.
+# * otherwise, the room of a session of this world still carries THIS stamp's marker
+#   (`REFINISH_IN_PROGRESS`, `stopped`). The marker is written under the step-1 lock and is
+#   gone as soon as step 3 records the rebuilt room, or a put-back restores the session
+#   record -- so it covers precisely the gaps. The ledger's `state` alone cannot say this:
+#   a re-finish that SUCCEEDED leaves it `set-aside` for ever (nothing writes a terminal
+#   state), and reading that as live would park the world for good.
+#
+# A MALFORMED LEDGER (unreadable, not an object, an unknown state) is therefore decided by
+# the marker too, and that is the fail-safe choice in both directions: with the marker on
+# the room the finisher stays out (a live re-finish is never interfered with, which is the
+# failure that can end in a half-restored world), and without it the world takes today's
+# path (a corrupt file cannot park a world on "Improving" for ever).
+#
+# THE COST, stated: a re-finish that DIED between its steps looks exactly like a live one
+# on disk -- the ledger records no pid -- so the finisher leaves that world alone until its
+# owner runs the re-finish again (which is what a set-aside solve needs anyway). OPEN for
+# the re-finish's owner: a pid and a terminal state in the ledger would let this tell the
+# two apart.
+
+
+def refinish_in_progress(store: WorldStore, world_id: str) -> str | None:
+    """Why an owner's re-finish of this world is live, or None. Reads only; one `stat` for
+    a world that was never re-finished."""
+    try:
+        from scripts import world_refinish as WR  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 -- then no re-finish can be running either
+        logger.warning("[Tower][WorldBuilder] scripts/world_refinish.py does not import "
+                       "(%s: %s); no re-finish is looked for", type(exc).__name__, exc)
+        return None
+    root = store.world_dir(world_id) / WR.REFINISH_DIRNAME
+    try:
+        if not root.is_dir():
+            return None
+        stamps = sorted(entry for entry in root.iterdir() if entry.is_dir())
+    except OSError as exc:
+        # Not "no re-finish": it could not be looked for. Staying out costs a wait.
+        return f"this world's {WR.REFINISH_DIRNAME}/ could not be read ({exc})"
+    for aside in stamps:
+        ledger_path = aside / WR.LEDGER_FILENAME
+        if not ledger_path.is_file():
+            continue            # the ledger is written first: nothing was set aside here
+        try:
+            ledger = read_json_closed(ledger_path)
+        except (OSError, ValueError):
+            ledger = None
+        state = ledger.get("state") if isinstance(ledger, dict) else None
+        if state == WR.LEDGER_SETTING_ASIDE:
+            return (f"re-finish {aside.name} is setting the previous result aside "
+                    f"({WR.REFINISH_DIRNAME}/{aside.name}/{WR.LEDGER_FILENAME})")
+        marker = WR.REFINISH_IN_PROGRESS.format(stamp=aside.name)
+        marked = _room_marked(store, world_id, marker)
+        if marked is not None:
+            return (f"re-finish {aside.name} (ledger "
+                    f"{state if isinstance(state, str) else 'unreadable'}) has set the "
+                    f"solve of session {marked} aside and not rebuilt its room yet")
+    return None
+
+
+def _refinish_under_the_lock(store: WorldStore, verdict: Verdict, report: dict) -> bool:
+    """True (and `report` says so) when a re-finish of the verdict's world is live, asked
+    once the world's lock is ours. A verdict comes from the survey at the start of the run,
+    and an owner may have started a re-finish since; the re-finish marks the room under the
+    same lock, so the answer given under it is final. Waiting, for the whole world."""
+    busy = refinish_in_progress(store, verdict.world_id)
+    if busy is None:
+        return False
+    logger.info("[Tower][WorldBuilder] %s/%s is left alone: %s", verdict.world_id,
+                verdict.session_id, busy)
+    report.update({"finished": False, "waiting": True, "world_busy": True, "reason": busy})
+    return True
+
+
+def _room_marked(store: WorldStore, world_id: str, marker: str) -> str | None:
+    """The session of this world whose room a re-finish marked `stopped` with `marker`."""
+    for session_id in store.list_session_ids(world_id):
+        try:
+            stages = store.read_session(world_id, session_id).stages or {}
+        except (WorldStoreError, OSError, ValueError, KeyError):
+            continue
+        for stage in PHOTOGRAPHIC_STAGES:
+            entry = stages.get(stage) or {}
+            if entry.get("state") == STAGE_STATE_STOPPED and entry.get("detail") == marker:
+                return session_id
+    return None
 
 
 def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: str) -> None:
@@ -939,12 +1180,51 @@ def _give_back_attempt(store: WorldStore, world_id: str, key: str, *, detail: st
         _write_ledger(store, world_id, sessions)
 
 
+# What the room's stages say between the moment the re-gate is about to publish and the
+# moment the room is rebuilt from it (review V8, M1c).
+REGATE_IN_PROGRESS = ("re-gate in progress (scripts/world_finish_pending.py): the evidence "
+                      "gate is re-run on the published solve, and the room is rebuilt from "
+                      "it afterwards")
+
+
+def _room_record(store: WorldStore, world_id: str, session_id: str) -> dict | None:
+    """The session's stage record as it is now (None for a session that has none)."""
+    stages = store.read_session(world_id, session_id).stages
+    return None if stages is None else dict(stages)
+
+
+def _put_room_record_back(store: WorldStore, world_id: str, session_id: str,
+                          before: dict | None) -> None:
+    """Restore the room's stage entries exactly as `_room_record` read them, under the
+    caller's lock, leaving any other stage's entry as it is now. Only for a re-gate that
+    was REFUSED: it did nothing, so the room it marked owed is exactly as good as it was."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    session = store.read_session(world_id, session_id)
+    stages = dict(session.stages or {})
+    for stage in PHOTOGRAPHIC_STAGES:
+        if before is not None and stage in before:
+            stages[stage] = before[stage]
+        else:
+            stages.pop(stage, None)
+    store.write_session(replace(session, stages=None if before is None and not stages
+                                else stages))
+
+
 def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prune_depth_work: bool,
                   stop_request, max_forgiven: int = DEFAULT_MAX_FORGIVEN, regate=None,
                   surface_stages=None) -> dict:
     """The owed re-gate, under the world's writer lock: `regate_published`, then the derived
     tree (`engine.build`) and the room's stages (`final_surface_stages`) from the relabelled
-    solve. A refusal before any work (`RegateRefused`) gives the attempt back: waiting."""
+    solve. A refusal before any work (`RegateRefused`) gives the attempt back: waiting.
+
+    THE ROOM IS OWED FROM BEFORE THE PUBLISH (review V8, M1c). Its stages are recorded
+    `stopped` (`REGATE_IN_PROGRESS`) under this lock, right before `regate_published`
+    replaces the solve and its components. A stop, a crash or a kill anywhere after that --
+    between the publish and the rebuild there is no `finally` a `terminate_tree` would run
+    -- leaves a room the next run rebuilds from the new partition, where it used to leave
+    the OLD room standing over the new solve with nothing owed. The mark is the builder's
+    own discipline (`mark_stage` `running` before a stage) and `world_refinish.py`'s."""
     from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
 
     key = regate_ledger_key(verdict.session_id)
@@ -954,10 +1234,15 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
     try:
         store.acquire_writer_lock(verdict.world_id)
     except Exception as exc:  # noqa: BLE001
-        report.update({"finished": False, "waiting": True, "reason": f"{type(exc).__name__}: {exc}"})
+        # `world_busy`: another writer has this WORLD, so the run does not try the world's
+        # other sessions either (`main`).
+        report.update({"finished": False, "waiting": True, "world_busy": True,
+                       "reason": f"{type(exc).__name__}: {exc}"})
         return report
     disarm = None
     try:
+        if _refinish_under_the_lock(store, verdict, report):
+            return report
         try:
             report["attempts"] = record_attempt(store, verdict.world_id, key,
                                                 detail="re-running the evidence gate in place")
@@ -971,12 +1256,27 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
             lambda source: forgive_attempt(store, verdict.world_id, key,
                                            detail=f"stopped ({source})", max_forgiven=max_forgiven))
         prewarm_world_builder()
+        if stop_request.asked:
+            # Asked before anything is published: nothing to mark and nothing to rebuild.
+            # (The attempt is given back on the way out, below.)
+            report.update({"finished": False, "reason": f"stopped ({stop_request.source})"})
+            return report
+        before = _room_record(store, verdict.world_id, verdict.session_id)
+        for stage in PHOTOGRAPHIC_STAGES:
+            engine.mark_stage(verdict.world_id, verdict.session_id, stage,
+                              state=STAGE_STATE_STOPPED, detail=REGATE_IN_PROGRESS)
         try:
             report["regate"] = (regate or CP.regate_published)(
                 store, verdict.world_id, verdict.session_id, should_stop=stop_request.asked_for)
         except CP.RegateRefused as exc:
             _give_back_attempt(store, verdict.world_id, key,
                                detail=f"not started, waiting: {exc}")
+            try:
+                _put_room_record_back(store, verdict.world_id, verdict.session_id, before)
+            except Exception:  # noqa: BLE001 -- the room then stays owed: rebuilt, not stale
+                logger.warning("[Tower][WorldBuilder] could not put the room's stage record "
+                               "of %s/%s back after a refused re-gate", verdict.world_id,
+                               verdict.session_id, exc_info=True)
             report.update({"finished": False, "waiting": True, "reason": str(exc)})
             return report
         # The row's sentence follows the re-gate: cleared, or the new reason.
@@ -986,6 +1286,8 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
                                      final_solve=fin.get("final_solve"),
                                      detail=(report["regate"] or {}).get("notice"))
         if stop_request.asked:
+            # The room stays `stopped` -- owed -- and the next run rebuilds it from the new
+            # partition (M1c).
             report.update({"finished": False, "reason": f"stopped ({stop_request.source})"})
             return report
         report["build"] = {"poses_solved": getattr(engine.build(verdict.world_id, verdict.session_id),
@@ -1071,6 +1373,8 @@ def finish_areas(store: WorldStore, verdict: Verdict, *, appearance: bool,
         return report
     disarm = None
     try:
+        if _refinish_under_the_lock(store, verdict, report):
+            return report
         try:
             report["attempts"] = record_attempt(store, verdict.world_id, key,
                                                 detail="finishing this session's areas")
@@ -1137,6 +1441,36 @@ def _retire_areas(store: WorldStore, verdict: Verdict, max_attempts: int) -> dic
     return out
 
 
+def _retire_regate(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
+    """`_retire` for a re-gate at its bound (review V8, M1b): the row's promise that the
+    idle Tower re-runs the gate is replaced by the given-up sentence -- the existing notice
+    mechanism, the session's finalization detail -- once, under the lock, after
+    re-assessing underneath it. Nothing else changes: the published fail-safe stands, and
+    `assess` now asks the room and the areas behind it."""
+    out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
+           "retired": REGATE_STAGE, "attempts": verdict.attempts}
+    try:
+        store.acquire_writer_lock(verdict.world_id)
+    except Exception as exc:  # noqa: BLE001
+        out.update({"retired": None, "reason": f"{type(exc).__name__}: {exc}"})
+        return out
+    try:
+        again = assess(store, verdict.world_id, verdict.session_id, max_attempts=max_attempts)
+        if not (again.exhausted and again.stage == REGATE_STAGE):
+            out.update({"retired": None, "reason": f"no longer {verdict.code}: {again.code}"})
+            return out
+        notice = regate_given_up_notice(
+            _published_meta(store, verdict.world_id, verdict.session_id), again.attempts)
+        fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
+        WorldBuilderEngine(store).mark_finalization(
+            verdict.world_id, verdict.session_id, state=fin["state"],
+            final_solve=fin.get("final_solve"), detail=notice)
+        out["notice"] = notice
+    finally:
+        store.release_writer_lock(verdict.world_id)
+    return out
+
+
 def survey(store: WorldStore, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> list:
     """Every session under the root, assessed. Reads only."""
     verdicts = []
@@ -1183,6 +1517,8 @@ def _retire(store: WorldStore, verdict: Verdict, max_attempts: int) -> dict:
     """
     if verdict.stage == AREAS_STAGE:
         return _retire_areas(store, verdict, max_attempts)
+    if verdict.stage == REGATE_STAGE:
+        return _retire_regate(store, verdict, max_attempts)
     out = {"world_id": verdict.world_id, "session_id": verdict.session_id,
            "retired": verdict.stage, "attempts": verdict.attempts}
     try:
@@ -1298,6 +1634,8 @@ def finish(
 
     disarm = None
     try:
+        if _refinish_under_the_lock(store, verdict, report):
+            return report
         try:
             report["attempts"] = record_attempt(
                 store, verdict.world_id, verdict.session_id,
@@ -1497,9 +1835,17 @@ def main(argv=None, *, stop_request=None) -> int:
 
     retire_failures = 0
     retire_waiting = 0
-    for verdict in verdicts:
-        if not verdict.exhausted or should_stop():
-            continue
+    # A WORKLIST, because retiring a re-gate can uncover more (review V8, M1b): once its
+    # give-up is on the record, the same session is asked again, and the room or areas it
+    # was hiding are finished -- or retired -- in THIS run rather than at the next start.
+    # Bounded: a given-up re-gate is never `exhausted` again, so each session re-enters
+    # the list at most once.
+    position = {(v.world_id, v.session_id): i for i, v in enumerate(verdicts)}
+    pending = [v for v in verdicts if v.exhausted]
+    while pending:
+        verdict = pending.pop(0)
+        if should_stop():
+            break
         try:
             retired = _retire(store, verdict, args.max_attempts)
             report["retired"].append(retired)
@@ -1517,14 +1863,33 @@ def main(argv=None, *, stop_request=None) -> int:
                 "[Tower][WorldBuilder] could not retire %s/%s: %s",
                 verdict.world_id, verdict.session_id, exc,
             )
+            continue
+        if verdict.stage == REGATE_STAGE and retired.get("retired") == REGATE_STAGE:
+            try:
+                again = assess(store, verdict.world_id, verdict.session_id,
+                               max_attempts=args.max_attempts)
+            except Exception as exc:  # noqa: BLE001 -- one session, as in `survey`
+                logger.warning("[Tower][WorldBuilder] could not assess %s/%s: %s",
+                               verdict.world_id, verdict.session_id, exc)
+                continue
+            verdicts[position[(verdict.world_id, verdict.session_id)]] = again
+            if again.exhausted and again.stage != REGATE_STAGE:
+                pending.append(again)
+    if any(r.get("retired") == REGATE_STAGE for r in report["retired"]):
+        report["owed"] = [v.as_dict() for v in verdicts if v.owed]
+        report["skipped"] = collections.Counter(v.code for v in verdicts if not v.owed)
 
     failures = retire_failures
     done = 0
+    # Worlds this run found busy -- another writer holding the lock, or an owner's
+    # re-finish -- whose other sessions would only meet the same answer, so they are not
+    # picked again in this run (review V8, M1a).
+    held = set()
     # ONE AT A TIME, and the stop checked between each. A run asked to stop
     # between two worlds stops there rather than starting a second
     # six-minute stage nobody is waiting for.
     for verdict in verdicts:
-        if not verdict.owed:
+        if not verdict.owed or verdict.world_id in held:
             continue
         if should_stop():
             report["stopped"] = f"stop requested ({stop_request.source})"
@@ -1540,12 +1905,19 @@ def main(argv=None, *, stop_request=None) -> int:
             max_forgiven=args.max_forgiven,
         )
         report["finished"].append(outcome)
-        done += 1
         if outcome.get("waiting"):
-            # Refused before it began (a re-gate): not a failure; the Tower asks again
-            # after its backoff.
+            # Refused before it began (a re-gate whose solve went, a lock another writer
+            # took): no work was done, so it does not spend the run's budget, and the run
+            # goes on to the next owed world. It used to count, and with another world
+            # owed the run exited EXIT_MORE_OWED -- a respawn with no backoff that picked
+            # the same refused world first, every time, and starved the rest (review V8,
+            # M1a). The Tower asks again after its backoff (EXIT_WAITING).
             retire_waiting += 1
-        elif not outcome.get("finished"):
+            if outcome.get("world_busy"):
+                held.add(verdict.world_id)
+            continue
+        done += 1
+        if not outcome.get("finished"):
             failures += 1
 
     _emit(report, args.format)
