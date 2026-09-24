@@ -229,6 +229,21 @@ nonisolated enum WorldComponentsPresentation {
         }
     }
 
+    /// The same spans in prose, for the area viewer's caption, exactly as
+    /// §5.4 words it: *from 1:26 to 1:49*. Several are *from 0:29 to 0:33 and
+    /// 1:49 to 2:12*. The rows keep §8's en-dash form (`spans`).
+    static func spansInProse(_ spans: [WorldCaptureSpan]) -> String? {
+        let parts = spans.map {
+            clock($0.start, roundingUp: false) + " to " + clock($0.end, roundingUp: true)
+        }
+        switch parts.count {
+        case 0: return nil
+        case 1: return parts[0]
+        case 2: return "\(parts[0]) and \(parts[1])"
+        default: return parts.dropLast().joined(separator: ", ") + " and " + parts[parts.count - 1]
+        }
+    }
+
     static func photos(_ count: Int) -> String {
         count == 1 ? "1 photo" : "\(count) photos"
     }
@@ -303,7 +318,7 @@ nonisolated enum WorldComponentsPresentation {
     static func areaCaption(
         representation: WorldRenderRepresentation?, spans spanList: [WorldCaptureSpan], levelled: Bool? = nil
     ) -> String {
-        let when = spans(spanList).map { " from \($0) of this walk" } ?? " of this walk"
+        let when = spansInProse(spanList).map { " from \($0) of this walk" } ?? " of this walk"
         let first: String
         switch representation {
         case .appearance: first = "The camera's own images, faces redacted,\(when)."

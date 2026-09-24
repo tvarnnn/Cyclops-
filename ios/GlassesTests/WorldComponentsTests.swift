@@ -237,12 +237,17 @@ final class WorldComponentsWordsTests: XCTestCase {
         XCTAssertEqual(WorldAreaOpening.notPlacedLine, "not placed in the room")
         let spans = [WorldCaptureSpan(start: 86.0, end: 109.0)]
         let appearance = WorldComponentsPresentation.areaCaption(representation: .appearance, spans: spans)
-        // §5.4's sentence, with the spans in §8's `m:ss` en-dash form (C1 E14).
-        XCTAssertEqual(appearance, "The camera's own images, faces redacted, from 1:26–1:49 of this walk. "
+        // §5.4's sentence exactly: "from 1:26 to 1:49 of this walk".
+        XCTAssertEqual(appearance, "The camera's own images, faces redacted, from 1:26 to 1:49 of this walk. "
             + "This area could not be placed relative to the room, so it is shown on its own: its "
             + "position, direction and size are not comparable with the room's. Not to scale.")
         let surface = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans)
-        XCTAssertTrue(surface.hasPrefix("Surfaces the Tower reconstructed from the walk, from 1:26–1:49"), surface)
+        XCTAssertTrue(surface.hasPrefix("Surfaces the Tower reconstructed from the walk, from 1:26 to 1:49"), surface)
+        XCTAssertEqual(
+            WorldComponentsPresentation.spansInProse([WorldCaptureSpan(start: 29.4, end: 33.2),
+                                                      WorldCaptureSpan(start: 109.0, end: 131.6)]),
+            "0:29 to 0:34 and 1:49 to 2:12")
+        XCTAssertNil(WorldComponentsPresentation.spansInProse([]))
         let tilted = WorldComponentsPresentation.areaCaption(representation: .surface, spans: spans, levelled: false)
         XCTAssertTrue(tilted.contains("Its vertical could not be estimated, so it may look tilted."), tilted)
         for caption in [appearance, surface, tilted] {
