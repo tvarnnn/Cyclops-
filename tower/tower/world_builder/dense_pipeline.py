@@ -308,11 +308,21 @@ class _DenseLock:
     The dense stage runs after `world_build_session.py` has released the world
     writer lock -- following the `--register` precedent, and deliberately, since
     holding it for the minutes this takes would block a new capture on the same
-    world. `dense/<session>/` is touched by nothing else, so that is safe
-    against other WRITERS but not against another densify of the same session,
-    which is easy to start by accident: run `scripts/world_densify.py` while a
-    build is finalising. Two runs interleaving their writes would leave a points
-    file of the wrong length, which does not fail loudly.
+    world. That is safe against the world's other writers but not against another
+    densify of the same session, which is easy to start by accident: run
+    `scripts/world_densify.py` while a build is finalising. Two runs interleaving
+    their writes would leave a points file of the wrong length, which does not
+    fail loudly.
+
+    `dense/<session>/` IS touched by something else, and this lock alone never
+    covered it (review V9, Q8): the surface's depth stage and the evidence gate's
+    (`coherence_publish.run_gate_depth`) write the same `work/`, `align.json` and
+    `predictions/` under the SURFACE lock (`surface_pipeline._SurfaceLock`), which
+    a densify did not take -- so a hand-run densify beside a finisher's re-gate or
+    an owner's re-finish of the session could overwrite the gate's `<ki>_pred.npy`
+    with predictions made under other parameters before its metric scale read them,
+    or prune `work/` from under it. `densify` now holds that lock too, for its whole
+    run: the one lock every writer of `dense/<session>/` holds.
     """
 
     def __init__(self, root: Path) -> None:
@@ -661,8 +671,36 @@ def redaction_fill_mask(image, raw=None, fill_value: int = 0,
 # precision it is stored in, BEFORE it is fitted, so a frame fitted from a fresh
 # prediction and one fitted from the cache are fitted identically. Off (every other
 # caller): the stage is byte for byte what it was.
+#
+# THE CACHE IS AN OPTIMISATION, NEVER A REASON TO LOSE THE DEPTH (review V9, M-11 and LOW).
+# A write that fails (MAX_PATH, a full disk, a sharing violation) is counted
+# (`prediction_cache.write_failed`) and the stage goes on with the float16-rounded prediction
+# it already has; it used to raise, and the gate published a scale-unavailable fail-safe --
+# how P3-H2 run A lost its depth. A cache file that exists but is not a whole float16 array
+# of the frame's shape (empty, truncated, foreign, wrong shape) is a MISS, logged, and the
+# network's fresh prediction replaces it; an empty file used to raise `EOFError` for ever.
+#
+# GROWTH, MEASURED, AND ITS BOUND (review V9, M-12). The cache of 6839fb8f in
+# `RUN/experiments/P3-H2/real/r0` holds 678 frames in 311,154,540 bytes (about 459 kB a
+# frame: float16 at 359x639), about 20x the keyframe images. Nothing reclaimed it:
+# `prune_intermediates` keeps it on purpose, only `purge_world` removed it, and every change
+# of the pixels (a re-redaction switch, the raw-imagery bypass) or of the network's call
+# (its token) added a whole new set. Now, after every depth stage that COMPLETES with the
+# cache on, `prune_prediction_cache` keeps exactly one set: the current token's directory,
+# and in it one prediction per keyframe id -- the latest pixels each keyframe was predicted
+# from, recorded in the token's own index (`PREDICTION_INDEX`). Removed, and recorded in
+# `prediction_cache.pruned`: every other token's set, a prediction no keyframe's latest
+# pixels name any more, and a dead writer's staging file. The index is per keyframe, not
+# per `align.json`, on purpose: the draws of a consensus pose different keyframes and each
+# rewrites `align.json`, so pruning by the last draw's record would remove the predictions
+# of the frames only the chosen draw posed -- the very frames a re-gate of it reads. The
+# bound is therefore the walk's keyframes, once. A re-finish's set-aside copy leaves
+# `predictions/` out (`world_refinish.py`).
 PREDICTIONS_DIRNAME = "predictions"
-PREDICTION_CACHE_SCHEMA = 1
+# Schema 2: the token also names the weights revision, the moge and torch versions, the
+# device and fp16 (review V9, LOW). Every schema-1 set is another token's set and is pruned.
+PREDICTION_CACHE_SCHEMA = 2
+PREDICTION_INDEX = "index.json"
 # SHORT NAMES, BECAUSE OF MAX_PATH. A world root under a Tower's data directory is already
 # ~135 characters deep at `dense/<session>/`, and the atomic write adds `.p<pid>.<nonce>.tmp`:
 # a 40-hex name under a 16-hex token measured 263 characters on a scratch copy and failed
@@ -676,13 +714,102 @@ PREDICTION_INPUT_HEX = 20
 
 def prediction_token(backend, fov_x) -> tuple[str, dict]:
     """(token, what it stands for): the network and every parameter of the call that
-    changes its output, beyond the pixels. `PREDICTION_TOKEN_HEX` hex."""
+    changes its output, beyond the pixels. `PREDICTION_TOKEN_HEX` hex.
+
+    Beyond the network's name and call: the weights revision the hub resolves it to (when
+    it can be read), the moge and torch versions, the device and whether the call runs in
+    fp16 (`token_runtime`). MoGe's `infer` autocasts to float16 by default, per device
+    type, so a prediction made on the CPU, or by another release, is another prediction
+    (review V9, LOW)."""
     doc = {"schema": PREDICTION_CACHE_SCHEMA, "backend": getattr(backend, "name", None),
            "model_id": getattr(backend, "model_id", None), "kind": getattr(backend, "kind", None),
            "resolution_level": getattr(backend, "resolution_level", None),
-           "fov_x": None if fov_x is None else round(float(fov_x), 6)}
+           "fov_x": None if fov_x is None else round(float(fov_x), 6),
+           **token_runtime(backend)}
     token = hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:PREDICTION_TOKEN_HEX]
     return token, doc
+
+
+def token_runtime(backend) -> dict:
+    """What the prediction was made WITH, beyond the network's name: `weights_revision`,
+    `moge`, `torch`, `device`, `fp16`. A backend's own attribute wins (`revision`,
+    `device`, `use_fp16`, or the loaded MoGe backend's `_revision` / `_device`); else what
+    this process would load and run it on. None where it cannot be known. Never raises."""
+    revision = getattr(backend, "revision", None) or getattr(backend, "_revision", None)
+    if revision is None:
+        revision = _hub_revision(getattr(backend, "model_id", None))
+    device = getattr(backend, "device", None) or getattr(backend, "_device", None)
+    if device is None:
+        device = _default_device()
+    fp16 = getattr(backend, "use_fp16", None)
+    if fp16 is None and _is_moge(backend):
+        fp16 = _moge_infer_fp16()
+    return {"weights_revision": revision, "moge": _package_version("moge"),
+            "torch": _package_version("torch"), "device": None if device is None else str(device),
+            "fp16": None if fp16 is None else bool(fp16)}
+
+
+def _is_moge(backend) -> bool:
+    return (type(backend).__name__ == "MoGeBackend"
+            or str(getattr(backend, "model_id", "") or "").startswith("Ruicheng/moge"))
+
+
+def _hub_revision(model_id) -> str | None:
+    """The commit the hub cache resolves `model_id`'s `main` to -- what `from_pretrained`
+    without a revision loads -- or None."""
+    if not model_id:
+        return None
+    try:
+        from tower.world_builder.dense import hub_model_cache  # noqa: PLC0415
+
+        cache = hub_model_cache(str(model_id))
+        ref = cache / "refs" / "main" if cache is not None else None
+        if ref is None or not ref.is_file():
+            return None
+        return ref.read_text(encoding="utf-8").strip() or None
+    except Exception:  # noqa: BLE001 -- unknown is a field of the token, not an error
+        return None
+
+
+_RUNTIME_CACHE: dict = {}
+
+
+def _package_version(dist: str) -> str | None:
+    if dist not in _RUNTIME_CACHE:
+        try:
+            from importlib.metadata import version  # noqa: PLC0415
+
+            _RUNTIME_CACHE[dist] = version(dist)
+        except Exception:  # noqa: BLE001
+            _RUNTIME_CACHE[dist] = None
+    return _RUNTIME_CACHE[dist]
+
+
+def _default_device() -> str | None:
+    """The device a depth backend loaded now would run on: the backends' own rule."""
+    if "device" not in _RUNTIME_CACHE:
+        try:
+            import torch  # noqa: PLC0415
+
+            _RUNTIME_CACHE["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:  # noqa: BLE001
+            _RUNTIME_CACHE["device"] = None
+    return _RUNTIME_CACHE["device"]
+
+
+def _moge_infer_fp16() -> bool | None:
+    """MoGe's `infer(use_fp16=...)` default, which `MoGeBackend.predict` relies on."""
+    if "moge_fp16" not in _RUNTIME_CACHE:
+        try:
+            import inspect  # noqa: PLC0415
+
+            from moge.model.v2 import MoGeModel  # noqa: PLC0415
+
+            default = inspect.signature(MoGeModel.infer).parameters["use_fp16"].default
+            _RUNTIME_CACHE["moge_fp16"] = None if default is inspect.Parameter.empty else bool(default)
+        except Exception:  # noqa: BLE001
+            _RUNTIME_CACHE["moge_fp16"] = None
+    return _RUNTIME_CACHE["moge_fp16"]
 
 
 def prediction_cache_dir(root: Path, backend, fov_x) -> Path:
@@ -699,11 +826,37 @@ def network_input_sha1(rgb: np.ndarray) -> str:
     return h.hexdigest()[:PREDICTION_INPUT_HEX]
 
 
-def _cached_prediction(path: Path) -> np.ndarray | None:
+def _cached_prediction(path: Path, shape=None) -> np.ndarray | None:
+    """The kept prediction at `path` as float32, or None: a miss. Anything but a whole
+    float16 array of `shape` (the network input's height and width) is a miss -- an empty
+    file (`EOFError`), a truncated or foreign one, an archive, a wrong shape -- and is
+    logged; the network runs and its prediction replaces the file (review V9, LOW)."""
     try:
-        return np.load(path).astype(np.float32) if path.is_file() else None
-    except (OSError, ValueError):
-        return None       # a torn or foreign file is a miss; the network runs
+        if not path.is_file():
+            return None
+    except OSError:
+        return None
+    try:
+        arr = np.load(path, allow_pickle=False)
+    except Exception as exc:  # noqa: BLE001 -- EOFError, ValueError, a zip error: a miss
+        _log_bad_prediction(path, f"{type(exc).__name__}: {exc}")
+        return None
+    if not isinstance(arr, np.ndarray):
+        close = getattr(arr, "close", None)
+        if close is not None:
+            close()
+        _log_bad_prediction(path, "it is not an array")
+        return None
+    if arr.dtype != np.float16 or arr.ndim != 2 or (shape is not None and arr.shape != tuple(shape)):
+        _log_bad_prediction(path, f"a {arr.dtype} array of shape {arr.shape}, not float16 of "
+                                  f"{None if shape is None else tuple(shape)}")
+        return None
+    return arr.astype(np.float32)
+
+
+def _log_bad_prediction(path: Path, why: str) -> None:
+    logger.warning("[Tower][WorldBuilder][dense] the kept prediction %s is unusable (%s); it is a "
+                   "miss, predicted again and rewritten", Path(path).name, why)
 
 
 def _cache_prediction(path: Path, disp16: np.ndarray) -> None:
@@ -711,6 +864,93 @@ def _cache_prediction(path: Path, disp16: np.ndarray) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     write_bytes_atomic(path, lambda handle: np.save(handle, disp16))
+
+
+def _read_prediction_index(token_dir: Path) -> dict | None:
+    """{keyframe id: input digest} of a token's set, {} when it has none, None when it
+    exists and cannot be read (nothing is pruned on the strength of an unreadable index)."""
+    path = Path(token_dir) / PREDICTION_INDEX
+    try:
+        if not path.is_file():
+            return {}
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        keyframes = doc.get("keyframes") if isinstance(doc, dict) else None
+        if not isinstance(keyframes, dict):
+            return None
+        return {str(k): str(v) for k, v in keyframes.items()}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def prune_prediction_cache(root: Path, token: str, current: dict) -> dict:
+    """Keep ONE prediction set: `token`'s, and in it the latest prediction of every
+    keyframe (see "GROWTH" above). `current` is {keyframe id: input digest} of the depth
+    stage that just COMPLETED. Returns what was removed. Never raises.
+
+    Removed: every other token's directory (its predictions, its index, its dead writers'
+    staging files; a live writer's file is left, and so is its directory); in `token`'s,
+    every prediction that no keyframe's latest input names, and every dead writer's
+    staging file. The index is updated first and written atomically; when it cannot be
+    written, or an existing one cannot be read, nothing in `token`'s set is removed."""
+    from tower.storage import sweep_abandoned_staging, write_json_atomic  # noqa: PLC0415
+
+    base = Path(root) / PREDICTIONS_DIRNAME
+    out = {"sets": 0, "files": 0, "bytes": 0, "staging": 0}
+
+    def remove(path: Path) -> bool:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            return False
+        out["files"] += 1
+        out["bytes"] += int(size)
+        return True
+
+    try:
+        others = [d for d in base.iterdir() if d.is_dir() and d.name != token] if base.is_dir() else []
+    except OSError:
+        others = []
+    for other in others:
+        try:
+            out["staging"] += sweep_abandoned_staging(other)
+            for f in list(other.iterdir()):
+                if f.is_file() and f.suffix == ".npy":
+                    remove(f)
+            (other / PREDICTION_INDEX).unlink(missing_ok=True)
+            other.rmdir()
+            out["sets"] += 1
+        except OSError:
+            # A live writer's staging file, a file held open, or a file this cache never
+            # writes (not ours to judge): the directory stays, and is tried next time.
+            continue
+    here = base / token
+    if not here.is_dir():
+        return out
+    try:
+        out["staging"] += sweep_abandoned_staging(here)
+    except OSError:
+        pass
+    index = _read_prediction_index(here)
+    if index is None:
+        out["kept_because"] = "the set's index is unreadable"
+        return out
+    index.update({str(k): str(v) for k, v in current.items()})
+    try:
+        write_json_atomic(here / PREDICTION_INDEX, {"schema": PREDICTION_CACHE_SCHEMA, "token": token,
+                                                   "keyframes": dict(sorted(index.items()))})
+    except OSError:
+        out["kept_because"] = "the set's index could not be written"
+        return out
+    named = set(index.values())
+    try:
+        files = [f for f in here.iterdir() if f.is_file() and f.suffix == ".npy"]
+    except OSError:
+        files = []
+    for f in files:
+        if f.stem not in named:
+            remove(f)
+    return out
 
 
 def run_depth_stage(
@@ -807,10 +1047,14 @@ def run_depth_stage(
         fov_x = float(np.degrees(2.0 * np.arctan(W / (2.0 * float(cam["fx"])))))
     fov_record = {"known_fov": round(fov_x, 6)} if fov_x is not None else {}
     cache_dir = cache_record = None
+    # {keyframe id: network input digest} of every frame this stage predicted or read from
+    # the cache: the set's index, for `prune_prediction_cache`.
+    cache_inputs: dict = {}
     if prediction_cache:
         token, token_doc = prediction_token(backend, fov_x)
         cache_dir = Path(root) / PREDICTIONS_DIRNAME / token
-        cache_record = {"token": token, "network": token_doc, "hits": 0, "predicted": 0}
+        cache_record = {"token": token, "network": token_doc, "hits": 0, "predicted": 0,
+                        "write_failed": 0}
     kids = solution.keyframe_ids
     targets = []
     for i, kid in enumerate(kids):
@@ -962,8 +1206,10 @@ def run_depth_stage(
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         disp = cached_path = None
         if cache_dir is not None:
-            cached_path = cache_dir / f"{network_input_sha1(rgb)}.npy"
-            disp = _cached_prediction(cached_path)
+            input_sha1 = network_input_sha1(rgb)
+            cached_path = cache_dir / f"{input_sha1}.npy"
+            cache_inputs[kid] = input_sha1
+            disp = _cached_prediction(cached_path, rgb.shape[:2])
             if disp is not None:
                 cache_record["hits"] += 1
         if disp is None:
@@ -974,8 +1220,17 @@ def run_depth_stage(
                 # it from the cache fits it exactly as this one does.
                 disp16 = np.asarray(disp).astype(np.float16)
                 disp = disp16.astype(np.float32)
-                _cache_prediction(cached_path, disp16)
                 cache_record["predicted"] += 1
+                try:
+                    _cache_prediction(cached_path, disp16)
+                except OSError as exc:
+                    # Never a reason to lose the depth (review V9, M-11): the stage goes
+                    # on with the float16 prediction it has, and says it kept none.
+                    cache_record["write_failed"] += 1
+                    if cache_record["write_failed"] == 1:
+                        logger.warning("[Tower][WorldBuilder][dense] could not keep a depth "
+                                       "prediction (%s: %s); the depth stage goes on without "
+                                       "keeping it", type(exc).__name__, exc)
         # Saved BEFORE the fit, under its own name, so a frame whose fit fails
         # against this solve -- too few sparse points yet -- still has its
         # prediction for the next solve to fit against.
@@ -1008,6 +1263,13 @@ def run_depth_stage(
                    if redactor is not None and redactor.available else None),
                **fov_record}
     if cache_record is not None:
+        # The stage COMPLETED: keep one set, the latest prediction of each keyframe (M-12).
+        try:
+            cache_record["pruned"] = prune_prediction_cache(root, cache_record["token"], cache_inputs)
+        except Exception as exc:  # noqa: BLE001 -- pruning a cache never fails its stage
+            logger.warning("[Tower][WorldBuilder][dense] could not prune the kept predictions "
+                           "(%s: %s)", type(exc).__name__, exc)
+            cache_record["pruned"] = {"failed": type(exc).__name__}
         payload["prediction_cache"] = cache_record
     _write_json(root / "align.json", payload)
     return payload
@@ -1555,6 +1817,18 @@ def densify(
         logger.info("[Tower][WorldBuilder][dense] %s/%s: %s",
                     world_id, session_id, detail)
         return DenseResult(state=STATE_UNAVAILABLE, detail=detail)
+    # THE SESSION'S SURFACE LOCK TOO (review V9, Q8; `_DenseLock`): the surface's and the
+    # evidence gate's depth stages write this directory under it. Refused like the densify
+    # lock above -- nothing written, because the holder owns `dense/<session>/` right now.
+    from tower.world_builder.surface_pipeline import _SurfaceLock, surface_dir  # noqa: PLC0415
+
+    surface_lock = _SurfaceLock(surface_dir(store, world_id, session_id))
+    if not surface_lock.acquire():
+        lock.release()
+        detail = ("a surface build or the evidence gate of this session holds its lock, and "
+                  "writes dense/<session>/ under it")
+        logger.info("[Tower][WorldBuilder][dense] %s/%s: %s", world_id, session_id, detail)
+        return DenseResult(state=STATE_UNAVAILABLE, detail=detail)
 
     # From here to the `finally` at the end, every exit path is inside the
     # lock. The three "unavailable" returns below used to sit OUTSIDE it, so
@@ -1774,6 +2048,10 @@ def densify(
         return DenseResult(state=STATE_FAILED, detail=f"{type(exc).__name__}: {exc}",
                            seconds=seconds)
     finally:
+        # The lock's directory, `surface/<session>/`, is left even when this made it (as the
+        # gate's depth stage leaves it): removing it could race a surface build's own
+        # `mkdir` and lock creation. Nothing reads an empty one as a surface.
+        surface_lock.release()
         lock.release()
 
 

@@ -314,6 +314,11 @@ def key_digest(key: dict) -> str:
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
 
+def _log_bad_cache_file(path, why: str) -> None:
+    logger.warning("[Tower][WorldBuilder][transients] the cached mask %s is unreadable (%s); "
+                   "it is a miss, computed again and rewritten", Path(path).name, why)
+
+
 def write_component(path: Path, key: dict, hand: np.ndarray, phone: np.ndarray, *,
                     image_sha1: str | None, seconds: float | None = None) -> None:
     """Atomically: a reader sees the old file or the whole new one."""
@@ -332,16 +337,32 @@ def write_component(path: Path, key: dict, hand: np.ndarray, phone: np.ndarray, 
 
 def read_component(path: Path, key: dict | None = None, shape=None):
     """(hand, phone, record) when the file exists, reads, and was made under
-    `key` (and has `shape`); else None. A missing mask is never an empty one."""
+    `key` (and has `shape`); else None. A missing mask is never an empty one.
+
+    A file that exists but cannot be read whole -- empty, truncated, not an
+    archive, missing an array, arrays of the wrong shape -- is a MISS like a
+    missing one, and says so in the log: the caller computes the mask again and
+    `write_component` replaces the file (review V9, LOW). An empty file raised
+    `EOFError` and a torn archive `BadZipFile`, neither of which was caught, so
+    one bad file failed every later mask step of its session for good."""
+    try:
+        if not Path(path).is_file():
+            return None
+    except OSError:
+        return None
     try:
         with np.load(path, allow_pickle=False) as z:
             record = json.loads(bytes(z["key"]).decode())
             hs, ws = (int(v) for v in z["shape"])
             hand = np.unpackbits(z["hand"], axis=-1)[..., :ws].astype(bool)
             phone = np.unpackbits(z["phone"], axis=-1)[..., :ws].astype(bool)
-    except (OSError, ValueError, KeyError):
+        if not isinstance(record, dict):
+            raise ValueError("its key is not a record")
+    except Exception as exc:  # noqa: BLE001 -- EOFError, BadZipFile, zlib, ValueError, ...: a miss
+        _log_bad_cache_file(path, f"{type(exc).__name__}: {exc}")
         return None
     if hand.shape != (hs, ws) or phone.shape != (hs, ws):
+        _log_bad_cache_file(path, f"its masks are not the {hs}x{ws} it records")
         return None
     if shape is not None and (hs, ws) != tuple(shape):
         return None

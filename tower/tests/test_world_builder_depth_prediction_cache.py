@@ -141,13 +141,6 @@ def test_the_fit_is_to_this_solve(world):
 def test_other_pixels_or_another_network_parameter_is_a_miss(world, monkeypatch):
     store, net, dense = world
     _gate_depth(store)
-    # another field of view (the solve's camera) is another token
-    sol = GS.load_solution(store, WORLD, SESSION)
-    wider = dc.replace(sol, camera=dict(sol.camera, fx=sol.camera["fx"] * 0.8,
-                                        fy=sol.camera["fy"] * 0.8))
-    again, _, _ = _gate_depth(store, wider)
-    assert again["prediction_cache"]["predicted"] == 8
-    assert len(list((dense / DP.PREDICTIONS_DIRNAME).iterdir())) == 2
     # one keyframe's pixels changed: that frame alone is predicted again
     images = store.images_dir(WORLD, SESSION)
     first = sorted(images.glob("*.jpg"))[0]
@@ -155,9 +148,18 @@ def test_other_pixels_or_another_network_parameter_is_a_miss(world, monkeypatch)
     img[:4, :4] = 0
     first.write_bytes(cv2.imencode(".png", img)[1].tobytes())
     calls = net.calls
-    third, _, _ = _gate_depth(store)
+    second, _, _ = _gate_depth(store)
     assert net.calls == calls + 1
-    assert third["prediction_cache"] == dict(third["prediction_cache"], hits=7, predicted=1)
+    assert second["prediction_cache"] == dict(second["prediction_cache"], hits=7, predicted=1)
+    # another field of view (the solve's camera) is another token
+    sol = GS.load_solution(store, WORLD, SESSION)
+    wider = dc.replace(sol, camera=dict(sol.camera, fx=sol.camera["fx"] * 0.8,
+                                        fy=sol.camera["fy"] * 0.8))
+    again, _, _ = _gate_depth(store, wider)
+    assert again["prediction_cache"]["predicted"] == 8
+    # One set is kept (review V9, M-12): the other token's was pruned once this stage completed.
+    assert [d.name for d in (dense / DP.PREDICTIONS_DIRNAME).iterdir()] == [again["prediction_cache"]["token"]]
+    assert again["prediction_cache"]["pruned"]["sets"] == 1
 
 
 def test_a_torn_cache_file_is_a_miss(world):
@@ -170,11 +172,15 @@ def test_a_torn_cache_file_is_a_miss(world):
     assert np.load(victim).dtype == np.float16, "and it is written again, whole"
 
 
-def test_the_token_names_the_network_and_its_call():
+def test_the_token_names_the_network_and_its_call(monkeypatch):
+    runtime = {"weights_revision": "39c4d5e957afe587e04eec59dc2bcc3be5ecd968", "moge": "3.0.0",
+               "torch": "2.13.0+cu132", "device": "cuda", "fp16": True}
+    monkeypatch.setattr(DP, "token_runtime", lambda backend: dict(runtime))
     net = _Network()
     t1, doc = DP.prediction_token(net, 42.0)
-    assert doc == {"schema": 1, "backend": "moge2-vitl", "model_id": "Ruicheng/moge-2-vitl",
-                   "kind": "depth", "resolution_level": 9, "fov_x": 42.0}
+    # Schema 2 (review V9, LOW): what the prediction was made WITH, beyond the network's name.
+    assert doc == {"schema": 2, "backend": "moge2-vitl", "model_id": "Ruicheng/moge-2-vitl",
+                   "kind": "depth", "resolution_level": 9, "fov_x": 42.0, **runtime}
     assert DP.prediction_token(net, 42.0000001)[0] == t1
     assert DP.prediction_token(net, 42.1)[0] != t1 and DP.prediction_token(net, None)[0] != t1
     net.resolution_level = 8

@@ -50,6 +50,13 @@ from tower.world_builder import transients as T
 H, W = 48, 64
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_pause(monkeypatch):
+    """A broken image is retried once after `RETRY_PAUSE_S` (review V9, M-8); these tests
+    break images on purpose and do not need to wait for it."""
+    monkeypatch.setattr(SM, "RETRY_PAUSE_S", 0.0)
+
+
 def _workspace(tmp_path, n=4):
     root = tmp_path / "solve"
     images = root / "images"

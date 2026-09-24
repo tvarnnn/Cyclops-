@@ -93,6 +93,23 @@ the filtered database still carried its unmasked matches. The cost now is that
 image, which is left unposed. The causes are an unreadable or mis-sized solver
 image, or one another process held while it was hashed: the backends emit a
 mask for every image they are given.
+
+EXCLUSION HAS A BOUND AND A SIGNAL (review V9, M-8). Excluding is silent by
+construction -- the record stays `applied` -- so without a bound, 9 unreadable
+images of 10 read exactly like a clean solve. Now:
+
+  * a hash or a read that fails is tried ONCE more, after one pause for the
+    whole batch (`RETRY_PAUSE_S`): a file another process holds (a scanner, a
+    concurrent replace) is usually let go within it;
+  * every excluded image says why (`excluded_reasons`, `REASON_*`);
+  * `exclusion_notice_due` is true once `images_excluded` reaches
+    max(3, 2 % of the images) -- the finalization notice says so (CON's
+    sentence, `coherence_publish`);
+  * when NOT ONE image could be masked, for reasons that are the images' own,
+    the record is `unavailable` with `cause: images-unmaskable`, `none_masked:
+    true` and a `detail` counting the reasons -- the images are named as the
+    owner of the problem, not the detector (an operator cannot fix a file;
+    an owner's re-finish can).
 """
 
 from __future__ import annotations
@@ -108,7 +125,7 @@ from typing import Callable
 
 import numpy as np
 
-from tower.storage import read_json_closed, write_bytes_atomic, write_json_atomic
+from tower.storage import REPLACE_BUDGET_S, read_json_closed, write_bytes_atomic, write_json_atomic
 from tower.world_builder import transients as T
 
 logger = logging.getLogger(__name__)
@@ -159,8 +176,32 @@ OFF_DETAIL = ("transient masks on the final solve are off (TOWER_WORLD_SOLVE_MAS
 # `SolverMasks.cause`: why the masks are not applied, for a program.
 CAUSE_GPU_OOM = "gpu-oom"
 CAUSE_DETECTOR_FAILED = "detector-failed"
+# Not one solver image could be masked, and each for a reason of its OWN (`REASON_*` below
+# other than `no-mask`): the detector could run, the images could not be given to it. The
+# record says `none_masked: true` exactly then (review V9, M-8).
+CAUSE_IMAGES_UNMASKABLE = "images-unmaskable"
 # Causes a later run can be expected to clear by itself.
 RETRYABLE_CAUSES = (CAUSE_GPU_OOM,)
+
+# WHY an image was excluded (`excluded_reasons`, review V9 M-8). A fixed vocabulary, never
+# an exception's text: the record reaches the phone through the notice.
+REASON_HASH_FAILED = "hash-failed"     # could not be opened to hash it, twice (held, vanished)
+REASON_READ_FAILED = "read-failed"     # hashed, but could not be opened for the detector, twice
+REASON_UNDECODABLE = "undecodable"     # opened, but not a decodable image, twice
+REASON_WRONG_SIZE = "wrong-size"       # decoded, but not the solver camera's size
+REASON_NO_MASK = "no-mask"             # read, but no mask of it came back
+IMAGE_REASONS = (REASON_HASH_FAILED, REASON_READ_FAILED, REASON_UNDECODABLE, REASON_WRONG_SIZE)
+
+# The one retry's pause, once per batch of failures (not per image): storage's measured bound
+# on how long a reader that is still making progress holds a file on this Tower
+# (`tower.storage.REPLACE_BUDGET_S`, the same hazard from the other side).
+RETRY_PAUSE_S = REPLACE_BUDGET_S
+
+# `exclusion_notice_due`: images_excluded >= max(EXCLUSION_NOTICE_MIN, EXCLUSION_NOTICE_FRACTION
+# x images). The lead's bound (V9-REVIEW.md, M-8 disposition), not a measured one -- OPEN: no
+# corpus rate of held or unreadable solver images exists to calibrate it against.
+EXCLUSION_NOTICE_MIN = 3
+EXCLUSION_NOTICE_FRACTION = 0.02
 
 MASKING_FILTERED = "walk-database-filtered"
 MASKING_REEXTRACTED = "re-extracted"
@@ -279,16 +320,32 @@ def file_sha1(path) -> str:
     return h.hexdigest()
 
 
-def _read_rgb(path) -> np.ndarray | None:
+def _read_solver_image(path) -> tuple[np.ndarray | None, str | None]:
+    """(RGB, None), or (None, why): `REASON_READ_FAILED` when the file could not be
+    opened (held by another process, vanished), `REASON_UNDECODABLE` when its bytes
+    are not an image."""
     import cv2  # noqa: PLC0415
 
     try:
-        bgr = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        data = np.fromfile(str(path), dtype=np.uint8)
     except (OSError, ValueError):
-        return None
+        return None, REASON_READ_FAILED
+    try:
+        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except (cv2.error, ValueError):
+        bgr = None
     if bgr is None:
-        return None
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return None, REASON_UNDECODABLE
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), None
+
+
+def _read_rgb(path) -> np.ndarray | None:
+    return _read_solver_image(path)[0]
+
+
+def _pause() -> None:
+    """The one retry's pause (`RETRY_PAUSE_S`), taken once per batch of failures."""
+    time.sleep(RETRY_PAUSE_S)
 
 
 def cuda_unavailable_reason() -> str | None:
@@ -336,16 +393,41 @@ class SolverMasks:
     seconds: dict = field(default_factory=dict)
     gpu_peak_mb: float | None = None
     # WHY the masks are not applied, as a code a program can act on (`CAUSE_*`),
-    # beside the sentence in `detail`. `gpu-oom` is TRANSIENT: the finisher
-    # treats a gated session whose final solve lost its masks to it as owed a
-    # re-solve (review V5, M1-2); every other cause is the machine's and stays.
+    # beside the sentence in `detail`. `gpu-oom` is TRANSIENT and the record says
+    # so (`retryable`); NOTHING re-solves unattended (review V7, H2): the finisher
+    # leaves such a solve as it is, and the row and the finalization notice say
+    # an owner can re-finish the walk, attended. `images-unmaskable` names the
+    # images, not the machine; every other cause is the machine's and stays.
     cause: str | None = None
     retries: int = 0
+    # image name -> `REASON_*`, for every image left unmasked (review V9, M-8).
+    unmasked_reasons: dict = field(default_factory=dict)
+    # How many hashes and reads failed once and were tried again.
+    retried: dict = field(default_factory=lambda: {"hash": 0, "read": 0})
 
     @property
     def available(self) -> bool:
         """Whether extraction is given these masks."""
         return self.state == STATE_OK and bool(self.masked)
+
+    @property
+    def excluded_reasons(self) -> dict:
+        """{reason: count} over the EXCLUDED images; the counts sum to `images_excluded`."""
+        out: dict = {}
+        for name in self.excluded:
+            why = self.unmasked_reasons.get(name, REASON_NO_MASK)
+            out[why] = out.get(why, 0) + 1
+        return dict(sorted(out.items()))
+
+    @property
+    def exclusion_notice_due(self) -> bool:
+        """Enough images were excluded that the owner is told (review V9, M-8)."""
+        return len(self.excluded) >= max(EXCLUSION_NOTICE_MIN, EXCLUSION_NOTICE_FRACTION * self.images)
+
+    @property
+    def none_masked(self) -> bool:
+        """Not one image could be masked, each for a reason of its own (`CAUSE_IMAGES_UNMASKABLE`)."""
+        return self.cause == CAUSE_IMAGES_UNMASKABLE
 
     @property
     def record_state(self) -> str:
@@ -394,9 +476,14 @@ class SolverMasks:
             "images_masked": len(self.masked),
             "images_unmasked": len(self.unmasked),
             "unmasked_examples": list(self.unmasked[:10]),
-            # The unmasked images kept out of the solve (review V8, M2b).
+            # The unmasked images kept out of the solve (review V8, M2b), why each
+            # was, and whether that is enough to tell the owner (review V9, M-8).
             "images_excluded": len(self.excluded),
             "excluded_examples": list(self.excluded)[:10],
+            "excluded_reasons": self.excluded_reasons,
+            "exclusion_notice_due": self.exclusion_notice_due,
+            "none_masked": self.none_masked,
+            "retried": dict(self.retried),
             "cache_hits": self.cache_hits,
             "computed": self.computed,
             "device": self.device,
@@ -457,14 +544,31 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
     shape = tuple(int(v) for v in shape) if shape is not None else None
 
     # -- the cheap pass: hash every image, find which components are cached --
-    images = []
-    unhashed = []
+    # A hash that fails is tried once more, after ONE pause for all of them (review V9,
+    # M-8): an image another process held is usually let go by then.
+    sha_of: dict = {}
+    failed = []
     for name in names:
         try:
-            images.append((name, images_dir / name, file_sha1(images_dir / name)))
+            sha_of[name] = file_sha1(images_dir / name)
         except OSError:
-            out.unmasked.append(name)
-            unhashed.append(name)
+            failed.append(name)
+    if failed:
+        out.retried["hash"] = len(failed)
+        _pause()
+        for name in failed:
+            try:
+                sha_of[name] = file_sha1(images_dir / name)
+            except OSError:
+                pass
+    images = [(name, images_dir / name, sha_of[name]) for name in names if name in sha_of]
+    unhashed = [name for name in names if name not in sha_of]
+    for name in unhashed:
+        out.unmasked.append(name)
+        out.unmasked_reasons[name] = REASON_HASH_FAILED
+    if failed:
+        logger.warning("[Tower][WorldBuilder][solve-masks] %d solver image(s) could not be hashed; "
+                       "%d still could not be after one retry", len(failed), len(unhashed))
     missing: dict = {c: [] for c in params.components}
     for name, path, sha1 in images:
         any_missing = False
@@ -513,12 +617,39 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
             backend = backends.get(c) or factory(c)
             t1 = time.time()
             items, by_index = [], {}
-            for i, (name, path, sha1) in enumerate(todo):
-                rgb = _read_rgb(path)
-                if rgb is None or (shape is not None and rgb.shape[:2] != shape):
-                    continue
+            retry = []
+
+            def take(i, name, sha1, rgb, why):
+                if rgb is None:
+                    return why
+                if shape is not None and rgb.shape[:2] != shape:
+                    return REASON_WRONG_SIZE
                 items.append((i, rgb, np.zeros(rgb.shape[:2], bool)))
                 by_index[i] = (name, sha1)
+                return None
+
+            for i, (name, path, sha1) in enumerate(todo):
+                if name in out.unmasked_reasons:
+                    continue            # failed twice already, for an earlier component
+                rgb, why = _read_solver_image(path)
+                if rgb is None:
+                    retry.append((i, name, path, sha1))
+                    continue
+                why = take(i, name, sha1, rgb, why)
+                if why:
+                    out.unmasked_reasons[name] = why
+            if retry:
+                # Once more, after ONE pause for all of them (review V9, M-8).
+                out.retried["read"] += len(retry)
+                _pause()
+                for i, name, path, sha1 in retry:
+                    why = take(i, name, sha1, *_read_solver_image(path))
+                    if why:
+                        out.unmasked_reasons[name] = why
+                items.sort(key=lambda it: it[0])
+                logger.warning("[Tower][WorldBuilder][solve-masks] %d solver image(s) could not be "
+                               "read for the %s detector; %d still could not be after one retry",
+                               len(retry), c, sum(1 for r in retry if r[1] in out.unmasked_reasons))
             out.seconds[f"{c}.read"] = round(time.time() - t1, 3)
             emitted = computed.setdefault(c, set())
 
@@ -592,6 +723,7 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
             # everything") it used to get, so none of its features reaches a
             # re-extracted solve; the walk-database filter drops its matches.
             out.unmasked.append(name)
+            out.unmasked_reasons.setdefault(name, REASON_NO_MASK)
             _exclude(out, png_path, name, sha1, shape)
             continue
         H, W = parts[0][0].shape
@@ -613,12 +745,29 @@ def ensure_solver_masks(workspace, names, *, keyframe_ids: dict | None = None, s
     out.seconds["total"] = round(time.time() - t0, 3)
     if not out.masked:
         out.state = STATE_UNAVAILABLE
-        out.detail = out.detail or "no solver image could be masked"
+        reasons = [out.unmasked_reasons.get(name, REASON_NO_MASK) for name in out.unmasked]
+        if out.images and reasons and all(r in IMAGE_REASONS for r in reasons):
+            # Every image failed for a reason of its own: say so, and name the images as
+            # the problem, not the detector (review V9, M-8).
+            out.cause = CAUSE_IMAGES_UNMASKABLE
+            out.detail = _none_masked_detail(out.images, reasons)
+        else:
+            out.detail = out.detail or "no solver image could be masked"
     logger.info("[Tower][WorldBuilder][solve-masks] %d of %d solver images masked "
                 "(%d cached, %d computed) under %s in %.1f s",
                 len(out.masked), out.images, out.cache_hits, out.computed,
                 params.mode, out.seconds["total"])
     return out
+
+
+def _none_masked_detail(images: int, reasons) -> str:
+    """The sentence for `CAUSE_IMAGES_UNMASKABLE`: counts and reasons, never a path."""
+    counts: dict = {}
+    for why in reasons:
+        counts[why] = counts.get(why, 0) + 1
+    how = ", ".join(f"{n} {why}" for why, n in sorted(counts.items()))
+    return (f"no solver image could be masked: {len(reasons)} of {images} solver images were "
+            f"unusable ({how})")
 
 
 def is_gpu_oom(exc: BaseException) -> bool:
@@ -747,6 +896,15 @@ def masked_database(workspace, masks: SolverMasks, *, all_names=()) -> tuple[Pat
         if changed is not None:
             stale_reason = stale_reason or f"{changed} was extracted under a different image or mask"
             continue
+        # An image that has LEFT the solve is still in that database, with whatever features
+        # it was extracted with. Extracted whole (no mask: `[sha, None]`, `[None, None]`), its
+        # unmasked evidence would ride along into this solve -- the filtered path excludes an
+        # image the mask step never saw, and so does this one (review V9, M-8 LOW).
+        left = next((name for name, entry in (previous.get("images") or {}).items()
+                     if name not in current and not _extracted_under_a_mask(entry)), None)
+        if left is not None:
+            stale_reason = stale_reason or f"{left} has left the solve and was extracted unmasked"
+            continue
         source, held = candidate, dict(previous.get("images") or {})
         break
     if source is not None:
@@ -770,6 +928,11 @@ def masked_database(workspace, masks: SolverMasks, *, all_names=()) -> tuple[Pat
                 "reused_from": source.name if source is not None else None,
                 "rebuilt_because": None if source is not None else stale_reason,
                 "swept": swept}
+
+
+def _extracted_under_a_mask(entry) -> bool:
+    """Whether a masked database's record entry `[image_sha1, mask_sha1]` names a mask."""
+    return isinstance(entry, (list, tuple)) and len(entry) == 2 and bool(entry[1])
 
 
 def _connect_read_only(path):
