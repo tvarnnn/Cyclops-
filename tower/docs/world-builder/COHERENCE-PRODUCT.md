@@ -637,12 +637,17 @@ Read §2.2 for what each one means.
     (`coherence_publish.client_safe_finalization`; the row since `6ae08c1`, `/ws` since
     `a5001ab`). `notice` is included, and each text is at most 700 characters, the phone
     guard's own bound.
-  - The scrub runs in bounded time: V12 RV12-B LOW-A and LOW-B, fixed in P3.10. Before the
-    fix, one crafted 100,000-character text stalled the whole Tower for about a minute. Now
-    the text is cut to `SCRUB_MAX_CHARS` (4000) before it is scrubbed, the backslash
-    pattern is anchored to a token start, and no pattern backtracks exponentially. Every
-    output on shorter text is unchanged: 62,366 texts compared with `a5001ab`, no
-    difference.
+  - The scrub runs in bounded time: V12 RV12-B LOW-A and LOW-B, fixed in P3.10 and P3.11
+    (`60b0704`, `8eb2cc3`). Before the fix, one crafted 100,000-character text stalled the
+    whole Tower for about a minute.
+    - A line over `SCRUB_MAX_CHARS` (4000) is cut to whole words
+      (`coherence_publish._bounded`). Traceback frames, quoted paths and this machine's user
+      names are removed from the whole line first, so the cut splits no name or path
+      (V13 LOW-1).
+    - The backslash pattern is anchored to a token start, and no pattern backtracks
+      exponentially.
+    - Every output on shorter text is unchanged: 62,366 texts compared with `a5001ab`, no
+      difference.
   - On an interrupted session, `lifecycle.reason` quotes it owner-facing, with no class name
     and no square brackets ("a path", "a user name"), and the phone shows that reason
     (`coherence_publish.owner_facing_detail`).
