@@ -57,11 +57,13 @@ def test_a_scale_shortfall_with_depth_in_hand_says_what_is_missing_and_who_can_f
     assert result.record["depth"]["state"] == CP.DEPTH_OK
     notice = _notice(result)
     assert notice is not None
-    assert "10 of 50" in notice, "what is missing: the cameras with a metric level"
     assert "re-capture" in notice, "who can fix it: an owner, with a new walk"
     assert "re-runs" not in notice, "nothing is promised that will not happen"
-    assert notice == CP.NOTICE_SCALE_SHORT.format(
-        why=result.record["evidence"]["metric_scale"])
+    # The closed set (review V9, M-4): the camera counts are not the owner's; they are the detail's.
+    assert notice == CP.NOTICE_SENTENCES["scale-short"]
+    detail = CP.publish_detail({"gate": result.record, "transients": APPLIED})
+    assert "10 of 50" in detail, "what is missing: the cameras with a metric level"
+    assert detail == CP.NOTICE_SCALE_SHORT.format(why=result.record["evidence"]["metric_scale"])
 
 
 def test_a_scale_shortfall_with_depth_in_hand_is_not_retryable(monkeypatch, tmp_path):
@@ -84,7 +86,8 @@ def test_a_scale_shortfall_with_depth_in_hand_is_not_retryable(monkeypatch, tmp_
 def test_no_metric_ratio_at_all_with_depth_in_hand_is_the_same_notice(monkeypatch):
     _, result = _run(monkeypatch, cross=TRIANGLE, metric_fn=_few_levels(0))
     notice = _notice(result)
-    assert notice is not None and "0 of 50" in notice and "re-capture" in notice
+    assert notice == CP.NOTICE_SENTENCES["scale-short"] and "re-capture" in notice
+    assert "0 of 50" in CP.publish_detail({"gate": result.record, "transients": APPLIED})
 
 
 def test_a_depth_failure_still_owes_a_re_gate_and_says_so(monkeypatch):
@@ -108,15 +111,16 @@ MASKS_CASES = {
     "off": ({"state": "unavailable", "requested": False, "outcome": "off",
              "detail": SM.OFF_DETAIL}, CP.NOTICE_MASKS_OFF),
     "absent": (None, CP.NOTICE_MASKS_OFF),
+    # The closed set (review V9, M-4): a fixed phrase, never the detail's text (which stays in
+    # `publish_detail`, below).
     "no-gpu": ({"state": "unavailable", "requested": True, "outcome": "unavailable",
                 "detail": "no CUDA device, and no CPU fallback", "cause": None,
                 "retryable": False},
-               CP.NOTICE_MASKS_UNAVAILABLE.format(why="no CUDA device, and no CPU fallback")),
+               CP.NOTICE_SENTENCES["masks-no-gpu"]),
     "detector-failed": ({"state": "unavailable", "requested": True, "outcome": "failed",
                          "detail": "the gdsam detector failed (RuntimeError: device lost)",
                          "cause": SM.CAUSE_DETECTOR_FAILED, "retryable": False},
-                        CP.NOTICE_MASKS_UNAVAILABLE.format(
-                            why="the gdsam detector failed (RuntimeError: device lost)")),
+                        CP.NOTICE_SENTENCES["masks-detector-failed"]),
     "gpu-oom": ({"state": "unavailable", "requested": True, "outcome": "failed",
                  "detail": "the oneformer detector failed (OutOfMemoryError)",
                  "cause": SM.CAUSE_GPU_OOM, "retryable": True}, CP.NOTICE_MASKS_OOM),
@@ -148,13 +152,18 @@ def test_every_masks_fail_safe_carries_a_notice_with_its_owner(monkeypatch, case
     notice = CP.publish_notice({"gate": result.record, "transients": transients})
     assert notice == expected
     assert any(who in notice for who in ("an owner can re-finish", "an operator can"))
+    if case in ("no-gpu", "detector-failed"):
+        detail = CP.publish_detail({"gate": result.record, "transients": transients})
+        assert transients["detail"] in detail, "the raw text stays in the detail"
 
 
-@pytest.mark.parametrize("case", sorted(MASKS_CASES))
-def test_the_transient_retryable_flag_is_only_for_a_gpu_out_of_memory(case):
-    transients, _ = MASKS_CASES[case]
-    assert bool((transients or {}).get("retryable")) is (
-        (transients or {}).get("cause") == SM.CAUSE_GPU_OOM)
+@pytest.mark.parametrize("cause", [None, SM.CAUSE_DETECTOR_FAILED, SM.CAUSE_GPU_OOM])
+def test_the_transient_retryable_flag_is_only_for_a_gpu_out_of_memory(cause):
+    """The record the masks stage writes (review V9 LOW: this used to check this file's own fixture)."""
+    for state in (SM.STATE_FAILED, SM.STATE_UNAVAILABLE):
+        record = SM.SolverMasks(state=state, params=SM.solver_params(), requested_rule="union",
+                                detail="x", cause=cause).record()
+        assert record["retryable"] is (cause == SM.CAUSE_GPU_OOM)
 
 
 def test_a_notice_names_every_fail_safe_that_applies(monkeypatch):
@@ -164,7 +173,7 @@ def test_a_notice_names_every_fail_safe_that_applies(monkeypatch):
                      metric_fn=_few_levels(10))
     notice = CP.publish_notice({"gate": result.record, "transients": transients})
     masks = MASKS_CASES["no-gpu"][1]
-    scale = CP.NOTICE_SCALE_SHORT.format(why=result.record["evidence"]["metric_scale"])
+    scale = CP.NOTICE_SENTENCES["scale-short"]
     assert notice == f"{masks}; {scale}"
 
 
@@ -198,12 +207,17 @@ def test_a_failed_gate_keeps_its_own_notice(monkeypatch):
 
     _, result = _run(monkeypatch, metric_fn=broken)
     notice = _notice(result)
-    assert notice == CP.NOTICE_GATE_FAILED.format(why="ZeroDivisionError: a bug")
+    # The closed set (review V9, M-4): the exception is the detail's, never the notice's.
+    assert notice == CP.NOTICE_SENTENCES["gate-failed"]
+    assert "ZeroDivisionError" not in notice
+    assert CP.publish_detail({"gate": result.record, "transients": APPLIED}) == \
+        CP.NOTICE_GATE_FAILED.format(why="ZeroDivisionError: a bug")
 
 
 def test_every_notice_is_one_line_with_no_metric_figure():
-    """The row's sentence: one line; and contract §2.4 rule 6 -- no metre figure."""
-    for text in (CP.NOTICE_MASKS_OOM, CP.NOTICE_MASKS_OFF, CP.NOTICE_MASKS_UNAVAILABLE,
-                 CP.NOTICE_MASKS_FALLBACK, CP.NOTICE_MASKS_PARTIAL, CP.NOTICE_SCALE_SHORT,
-                 CP.NOTICE_REGATE, CP.NOTICE_GATE_FAILED):
+    """The row's sentence: one line; and contract §2.4 rule 6 -- no metre figure. Every sentence of the
+    closed set (review V9, M-4: this used to check the unformatted templates, whose `{why}` then carried
+    raw text; the FORMATTED notices are checked in `test_world_builder_notice_closed_set.py`)."""
+    for text in CP.NOTICE_SENTENCES.values():
         assert "\n" not in text and " m " not in text and "metre" not in text
+        assert "{why}" not in text

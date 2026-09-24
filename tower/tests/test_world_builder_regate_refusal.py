@@ -49,6 +49,16 @@ def _shape(tmp_path, shape):
         ws.solution_path.unlink()
         ws.arrays_path.unlink()
         return store
+    if shape in ("consensus-without-camera", "consensus-with-camera"):
+        # A solve that asked for a consensus: the re-gate maps its draws, with the solve's camera
+        # (or the workspace's camera.json). This fixture's solution has no camera (review V9 LOW).
+        gate = dict(DEPTH_LOST, consensus={"state": "deferred", "requested": 3, "seeds": [7, 8, 9]})
+        store = _gated(tmp_path, stages=ROOM_OK, gate=gate)
+        if shape == "consensus-with-camera":
+            workspace_for(store, "w1", "s1").camera_path.write_text(
+                '{"fx": 300.0, "fy": 300.0, "cx": 160.0, "cy": 120.0, "width": 320, "height": 240}',
+                encoding="utf-8")
+        return store
     if shape in ("named-database-present", "named-database-gone"):
         # The solve mapped a per-solve masked database: that is the one a re-gate needs.
         store = _gated(tmp_path, stages=ROOM_OK)
@@ -63,7 +73,22 @@ def _shape(tmp_path, shape):
 
 
 SHAPES = ("accepted", "database-gone", "solution-will-not-load", "ungated-solution", "no-solution",
-          "named-database-present", "named-database-gone")
+          "named-database-present", "named-database-gone", "consensus-without-camera", "consensus-with-camera")
+# THE ANSWERS, stated independently of the code under test (review V9 LOW: the finisher's-copy test
+# compared the function with itself once the finisher called it).
+EXPECTED = {
+    "accepted": None,
+    "database-gone": "the solve's database database.db is gone; an owner can re-finish this walk",
+    "solution-will-not-load": "no gated solution is published for this session",
+    "ungated-solution": "no gated solution is published for this session",
+    "no-solution": "no gated solution is published for this session",
+    "named-database-present": None,
+    "named-database-gone": ("the solve's database database.masked.p1.0123abcd.db is gone; an owner can "
+                            "re-finish this walk"),
+    "consensus-without-camera": ("the solve has no camera to map its consensus draws with; an owner can "
+                                 "re-finish this walk"),
+    "consensus-with-camera": None,
+}
 
 
 def _what_regate_published_does(store) -> str | None:
@@ -87,14 +112,14 @@ def _what_regate_published_does(store) -> str | None:
 @pytest.mark.parametrize("shape", SHAPES)
 def test_the_read_only_refusal_is_regate_publisheds_own_answer(tmp_path, shape):
     store = _shape(tmp_path, shape)
-    assert CP.regate_refusal(store, "w1", "s1") == _what_regate_published_does(store)
+    assert CP.regate_refusal(store, "w1", "s1") == _what_regate_published_does(store) == EXPECTED[shape]
 
 
 @pytest.mark.parametrize("shape", SHAPES)
 def test_the_finishers_copy_gives_the_same_answer(tmp_path, shape):
-    """Until the lead switches `world_finish_pending` over, its restated copy must agree."""
+    """The finisher's read-only answer, against the independent statement of it."""
     store = _shape(tmp_path, shape)
-    assert wfp._regate_refusal(store, "w1", "s1") == CP.regate_refusal(store, "w1", "s1")
+    assert wfp._regate_refusal(store, "w1", "s1") == EXPECTED[shape]
 
 
 @pytest.mark.parametrize("shape", SHAPES)

@@ -216,10 +216,12 @@ def test_withholding_bars_a_group_from_the_room_and_says_seed_unstable(world):
     assert sorted(x) == sorted(_name(int(k[-8:])) for k in _piece_kids("X"))
     (piece,) = [c for c in held["components"] if c["state"] == "unplaced"]
     assert piece["reasons"] == [CG.REASON_SEED_UNSTABLE], "the only reason"
-    # the room's anchor group cannot be withheld: it is the reference, never "attached"
+    # A withheld REFERENCE is sealed too (review V9, H-1): nothing joins it. The consensus never withholds its
+    # room's anchor -- `decide_consensus` decides it `anchor`, and `gate_by_consensus` drops it defensively.
     anchor = next(g["first_camera"] for g in room_groups if g["reference"])
-    assert CG.apply_gate(model, links, metric, link_rotations=rots, masks_applied=True,
-                         withhold={anchor})["labels"] == plain["labels"]
+    sealed = CG.apply_gate(model, links, metric, link_rotations=rots, masks_applied=True, withhold={anchor})
+    anchor_round = next(rd for rd in sealed["rounds"] if rd["reference_group"]["first_camera"] == anchor)
+    assert anchor_round["kept_groups"] == 1 and anchor_round["withheld"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +306,9 @@ def test_a_draw_that_cannot_be_mapped_does_not_vote(world):
                                   keyframes=world.keyframes)
     c = result.record["consensus"]
     assert c["draws"][1]["failed"] == "RuntimeError: the mapper crashed"
-    assert c["votes"]["draws"] == 2 and c["state"] == CP.CONSENSUS_APPLIED
+    # Fewer voting draws than requested is `partial`, with the count (review V9, M-1 / RV9-A F5): two draws
+    # voting is unanimity, not the majority of three that was asked for.
+    assert c["votes"]["draws"] == 2 and c["state"] == CP.CONSENSUS_PARTIAL and "2 of 3" in c["why"]
 
 
 @pytest.mark.parametrize("case", ["masks", "depth", "unseeded"])
@@ -340,7 +344,8 @@ def test_the_decision_is_pure_and_reads_only_the_draws():
         groups = [{"label": 0, "reference": True, "first_camera": "A", "members": ["A", "B"]}]
         if "c" in room:
             groups.append({"label": 0, "reference": False, "first_camera": "C", "members": ["C"]})
-        return CP.GateResult(solution=sol, record={"state": state}, components=None, gated={"groups": groups})
+        return CP.GateResult(solution=sol, record={"state": state, "attach": True}, components=None,
+                             gated={"groups": groups})
 
     kid_of_name = {"A": "a", "B": "b", "C": "c", "D": "d"}
     out = CP.decide_consensus([draw({"a", "b", "c"}), draw({"a", "b"}), draw({"a", "b", "c"}, state="failed")],
@@ -371,8 +376,8 @@ def test_flips_inside_the_published_anchor_are_reported_as_pieces():
         sol = types.SimpleNamespace(poses=poses, keyframe_ids=kids)
         groups = [{"label": 0, "reference": True, "first_camera": "A",
                    "members": [k.upper() for k in kids if k in room]}]
-        return CP.GateResult(solution=sol, record={"state": CP.GATE_STATE_APPLIED}, components=None,
-                             gated={"groups": groups})
+        return CP.GateResult(solution=sol, record={"state": CP.GATE_STATE_APPLIED, "attach": True},
+                             components=None, gated={"groups": groups})
 
     draws = [draw(set(kids), {}),
              draw({"a", "b", "y1", "y2"}, {"c": 1, "x1": 2, "x2": 2}),

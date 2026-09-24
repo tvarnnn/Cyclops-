@@ -363,17 +363,25 @@ def _rot_deg(R) -> float:
 
 
 def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotations: dict,
-               masks_applied: bool, params: GateParams | None = None, withhold=None) -> dict:
+               masks_applied: bool, params: GateParams | None = None, withhold=None, room=None) -> dict:
     """The rule (module docstring) on one solve.
 
     links: {(name_a, name_b): inliers} (`read_verified_links`); link_rotations: {(name_a, name_b): R_b_from_a}
     (`read_link_rotations`); metric_log: {name: log(z_sfm / z_metric)} (cameras without a finite ratio are
     simply absent); masks_applied: False when the solve's transient masks were not (all) applied.
 
-    withhold: the CONSENSUS's hook (`coherence_publish.gate_by_consensus`), no rule of its own: candidate groups,
-    named by their first camera (`groups[*].first_camera` of an earlier call on the same solve), that may not be
-    attached in the first round of their solver component -- the room's round. A withheld group is still a round's
-    reference when its turn comes, and its label's only reason is `seed-unstable`. None or empty: today's gate.
+    THE CONSENSUS'S HOOKS (`coherence_publish.gate_by_consensus`), no rule of their own. Groups are named by their
+    first camera (`groups[*].first_camera` of an earlier call on the same solve, whose groups these are: the
+    groups do not depend on either hook). None or empty, both: today's gate, exactly.
+
+      withhold: groups that are SEALED (review V9, H-1). A withheld group joins no round's kept set, in ANY round
+        (the room need not be its component's first round), and when its turn as a reference comes nothing joins
+        it: it is a piece of its own, and its label's only reason is `seed-unstable`. Sealed both ways, so that
+        neither the withheld group nor another piece takes the other's reasons.
+      room: the ALLOW-LIST (review V9, H-1): the groups of the room the withhold is applied to, its anchor
+        included. In a round whose reference is one of them, only they may join -- so a re-gate with a group
+        withheld can never attach a group the room did not hold, whatever the withheld group did to the kept
+        set's metric level or to the routes through it. The caller still checks the outcome per keyframe.
 
     Returns {"labels": {name: label}, "components": [...], "rounds": [...], "groups": [...], "evidence": {...},
     "params": ..., "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is
@@ -382,6 +390,7 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
     `reference`."""
     params = params or GateParams()
     withheld_names = frozenset(withhold or ())
+    room_names = frozenset(room) if room else None
     names = model.names
     idx = model.index()
     C = _shared_counts(model)
@@ -452,6 +461,11 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
         first_round = True
         while pending:
             reference = pending.pop(0)
+            reference_name = names[int(reference.min())]
+            # A withheld reference is a piece of its own; a reference of the allow-listed room admits
+            # only the room's groups (the consensus's hooks; both empty on every other call).
+            sealed = reference_name in withheld_names
+            allowed = room_names if room_names is not None and reference_name in room_names else None
             kept = [reference]
             kept_set = set(int(i) for i in reference)
             decisions = []
@@ -487,10 +501,13 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                         "coupled": bool(coupled), "scale_ok": differ is not True,
                         "scale_factor": (math.exp(lg - lk) if lg is not None and lk is not None else None),
                     }
-                    held = first_round and names[int(g.min())] in withheld_names
+                    held = names[int(g.min())] in withheld_names
                     if held:
                         d["withheld"] = True
-                    if attach and not held and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
+                    barred = held or sealed or (allowed is not None and names[int(g.min())] not in allowed)
+                    if barred and not held:
+                        d["barred"] = "withheld reference" if sealed else "not a group of the room"
+                    if attach and not barred and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
                         best, best_n = j, len(cross)
                 if best is not None:
                     g = pending.pop(best)
@@ -512,7 +529,9 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
             rounds.append({"source_component": comp, "label": next_label,
                            "reference_group": {"cameras": int(len(reference)),
                                                "first_camera": names[int(reference.min())]},
-                           "kept_groups": len(kept), "kept_cameras": int(len(ids)), "decisions": decisions})
+                           "kept_groups": len(kept), "kept_cameras": int(len(ids)), "decisions": decisions,
+                           **({"withheld": True} if sealed else {}),
+                           **({"room_allow_list": len(allowed)} if allowed is not None else {})})
             next_label += 1
             first_round = False
         rest = members[~supported[members]]
@@ -538,15 +557,16 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
         return [REASON_MASKS_UNAVAILABLE]
     if not metric_available:
         return [REASON_SCALE_UNAVAILABLE]
+    if round_.get("withheld"):
+        # A group the consensus withheld, sealed as a piece of its own (`withhold`): its only
+        # reason (contract §2.2), in whatever round it came up.
+        return [REASON_SEED_UNSTABLE]
     if round_["source_component"] != room_component or round_["reference_group"] is None:
         return [REASON_SOLVED_SEPARATELY]
     first = round_["reference_group"]["first_camera"]
     d = next((v for v in group_decisions.values() if v.get("first_camera") == first), None)
     if d is None:
         return [REASON_NO_VERIFIED_LINK]
-    if d.get("withheld"):
-        # Withheld by the consensus (`withhold`): its only reason.
-        return [REASON_SEED_UNSTABLE]
     out = []
     if not d.get("redundant", False):
         if d.get("cross_links_all", d.get("cross_links", 0)) == 0:

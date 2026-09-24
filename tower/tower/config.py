@@ -963,25 +963,39 @@ def world_solve_gate_setting() -> bool:
 # The evidence gate's CONSENSUS (`world_builder/coherence_publish.gate_by_consensus`;
 # review V8 H2, manager 019): the number of mapper-seed draws a gated, seeded final
 # solve maps on its one frozen database and gates, deciding attachment to the room per
-# group by strict majority. 1 -- the default, and anything that is not an integer
-# above 1 -- is today's single draw exactly. Each extra draw costs one single-thread
-# mapping and one gate, no GPU (the gate's depth predictions are kept, R3): measured
-# ~3 min per draw on a 700-keyframe walk (RUN P3-PF var/map, P3-H2). Read by the solve.
+# group by strict majority. 1 -- the default -- is today's single draw exactly. Each
+# extra draw costs one single-thread mapping and one gate, no GPU (the gate's depth
+# predictions are kept, R3): measured ~3 min per draw on a 700-keyframe walk (RUN P3-PF
+# var/map, P3-H2), all of it under the world's writer lock. Read by the solve.
 WORLD_SOLVE_CONSENSUS_ENV = "TOWER_WORLD_SOLVE_CONSENSUS"
+# The values it accepts (review V9, M-3): ODD, so a strict majority never ties, and at
+# most 7, so a typo (30 for 3: about 2 h under the lock) cannot multiply a finish. The
+# cap is a bound on the cost, not a measured optimum; the run measured 3 (manager 025).
+WORLD_SOLVE_CONSENSUS_VALUES = (1, 3, 5, 7)
 
 
 def world_solve_consensus_setting() -> int:
     """`TOWER_WORLD_SOLVE_CONSENSUS`: the number of consensus draws. 1 (off).
 
-    Unset, blank, garbage, zero or negative is 1: a typo never multiplies a finish."""
+    Accepts the odd values 1 to 7 (`WORLD_SOLVE_CONSENSUS_VALUES`). Unset or blank is 1,
+    silently. Anything else -- garbage, zero, negative, even, or above 7 -- is 1 and is
+    logged: a typo never multiplies a finish, and it is still visible."""
     value = os.environ.get(WORLD_SOLVE_CONSENSUS_ENV)
     if value is None or not value.strip():
         return 1
     try:
         parsed = int(value.strip())
     except ValueError:
-        return 1
-    return parsed if parsed > 1 else 1
+        parsed = None
+    if parsed in WORLD_SOLVE_CONSENSUS_VALUES:
+        return parsed
+    logger.warning(
+        "[Tower][Config] %s=%r is not one of %s (odd, at most 7); treating it as 1, "
+        "the single draw",
+        WORLD_SOLVE_CONSENSUS_ENV, value,
+        ", ".join(str(v) for v in WORLD_SOLVE_CONSENSUS_VALUES),
+    )
+    return 1
 
 
 # The AREA builds (`world_builder/area_build.py`, WORLD-BUILDER-COMPONENTS.md

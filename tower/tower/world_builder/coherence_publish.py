@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import time
@@ -486,16 +487,19 @@ def retire_components(workspace_root) -> bool:
 def gate_final_solution(store, world_id: str, session_id: str, solution, *, database_path, keyframes,
                         should_stop=None, params: "CG.GateParams | None" = None,
                         depth_runner: Callable | None = None, metric_fn: Callable | None = None,
-                        withhold=None) -> GateResult:
+                        withhold=None, room=None, link_reader: Callable | None = None) -> GateResult:
     """Steps 1-4 of the module docstring on the candidate; never raises. `depth_runner` and `metric_fn`
     replace `run_gate_depth` / `measure_metric_scale` (tests, and the consensus, which gates a draw again
-    with the depth and scale it already has). `withhold`: `coherence_gate.apply_gate`'s consensus hook."""
+    with the depth and scale it already has). `withhold` and `room`: `coherence_gate.apply_gate`'s consensus
+    hooks. `link_reader(database_path, camera, min_inliers) -> (links, rotations)` replaces `read_links`
+    (the consensus reads the one frozen database once for all its draws)."""
     params = params or CG.GateParams()
     started = time.perf_counter()
     try:
         return _gate(store, world_id, session_id, solution, database_path=database_path, keyframes=keyframes,
                      should_stop=should_stop, params=params, depth_runner=depth_runner or run_gate_depth,
-                     metric_fn=metric_fn or measure_metric_scale, started=started, withhold=withhold)
+                     metric_fn=metric_fn or measure_metric_scale, started=started, withhold=withhold,
+                     room=room, link_reader=link_reader or read_links)
     except Exception as exc:  # noqa: BLE001 -- a broken gate publishes today's solve and says so
         logger.exception("[Tower][WorldBuilder] the evidence gate failed on %s/%s; the final solve is "
                          "published as the solver returned it, with no components record",
@@ -508,8 +512,14 @@ def gate_final_solution(store, world_id: str, session_id: str, solution, *, data
             "seconds": round(time.perf_counter() - started, 3)})
 
 
+def read_links(database_path, camera, min_inliers: int) -> tuple[dict, dict]:
+    """The solve database's verified links and their two-view rotations (`coherence_gate`'s readers)."""
+    return (CG.read_verified_links(database_path, min_inliers=min_inliers),
+            CG.read_link_rotations(database_path, camera, min_inliers=min_inliers))
+
+
 def _gate(store, world_id, session_id, solution, *, database_path, keyframes, should_stop, params,
-          depth_runner, metric_fn, started, withhold=None) -> GateResult:
+          depth_runner, metric_fn, started, withhold=None, room=None, link_reader=read_links) -> GateResult:
     transients = solution.transients or {}
     masks_state = transients.get("state")
     masks_applied = masks_state == "applied"
@@ -556,11 +566,11 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
 
     # 3. the gate
     t = time.perf_counter()
-    links = CG.read_verified_links(database_path, min_inliers=params.min_link_inliers)
-    rotations = CG.read_link_rotations(database_path, solution.camera, min_inliers=params.min_link_inliers)
+    links, rotations = link_reader(database_path, solution.camera, params.min_link_inliers)
     model = solve_model(solution, name_of)
+    hooks = {"withhold": withhold, "room": room} if withhold else {}
     result = CG.apply_gate(model, links, metric_log, link_rotations=rotations, masks_applied=masks_applied,
-                           params=params, **({"withhold": withhold} if withhold else {}))
+                           params=params, **hooks)
     gate_seconds = round(time.perf_counter() - t, 3)
 
     # 4. relabel
@@ -621,31 +631,64 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
 # THE RULE (no threshold of its own). With `TOWER_WORLD_SOLVE_CONSENSUS` = N >= 2 on a gated, seeded final solve:
 #   1. DRAWS: N candidates on the SAME frozen database, masks and depth predictions, mapper seeds s, s+1, ...
 #      (DRAW_UNIT: PF's decomposition put the flips on the mapper seed alone). Draw 0 is the solve's own.
-#   2. Each draw is gated as usual (`gate_final_solution`; its depth stage re-fits the kept predictions).
-#   3. VOTES: per published keyframe, "attached to the room" in each draw; consensus = a strict majority.
+#   2. Each draw is gated as usual (`gate_final_solution`; its depth stage re-fits the kept predictions; the
+#      database's links and rotations are read once for every draw).
+#   3. VOTES (review V9, M-1): only a draw whose gate ATTACHED votes (`attach: true`). A draw whose gate took a
+#      fail-safe (depth unavailable or stopped, a metric fraction under half), failed, could not be mapped or was
+#      skipped has no attachment to vote with -- counting it would vote every piece "detached". Per published
+#      keyframe, "attached to the room" in each voting draw; consensus = a strict majority of the VOTING draws.
+#      Fewer voting draws than requested: `partial`, with the count; fewer than 2: draw 0 is published as one
+#      draw would be. A stop that cost a draw its vote: draw 0 is published, `deferred` (the re-gate in place
+#      runs the consensus).
 #   4. PUBLISH the draw whose attach vector agrees with the consensus on the most keyframes (ties: the lowest
 #      seed). Its GROUPS -- the gate's own candidate groups in its room, and each of its unplaced components --
 #      are voted on by keyframe overlap (a group is attached in a draw when most of its keyframes are). A group
-#      of its room that fewer than a strict majority of draws attached is WITHHELD: the draw is gated again
-#      (the same depth and scale, CPU only) with that group barred from the room, and it is published as its
-#      own piece, reason `seed-unstable`. The room's anchor group is never withheld. A group the majority
-#      attached but the published draw did not stays unplaced: no geometry is invented.
-#   5. RECORD `gate.consensus` (additive, Tower-internal §2.5), and each draw's per-round gate decisions in
+#      of its room that fewer than a strict majority of draws attached is WITHHELD, unless one of its keyframes
+#      was attached by EVERY voting draw: a keyframe every draw attached is never withheld (review V9, RV9-A P6),
+#      and the group -- the gate's unit -- stays, decision `kept`. The room's anchor group is never withheld. A
+#      group the majority attached but the published draw did not stays unplaced: no geometry is invented.
+#   5. THE WITHHOLD RE-GATE (review V9, H-1). The chosen draw is gated again (the same depth and scale, CPU only)
+#      with the withheld groups SEALED (each a piece of its own; `coherence_gate.apply_gate(withhold=...)`) and the
+#      room ALLOW-LISTED (only the chosen room's groups may join it: `room=...`). It is published only if, per
+#      published keyframe, (a) no keyframe outside the chosen room is attached, (b) the room is exactly the chosen
+#      room minus the withheld groups, (c) every withheld keyframe's only reason is `seed-unstable`, and (d) every
+#      piece outside the chosen room is the chosen draw's, published with the reasons the chosen draw gave it
+#      (`keep_outside_pieces`: re-decided against the smaller room, a piece the allow-list bars would read
+#      `no-verified-link` whatever its links). Otherwise the consensus is `not-applied`, with why, and the chosen
+#      draw is published as it was gated.
+#   6. RECORD `gate.consensus` (additive, Tower-internal §2.5), and each draw's per-round gate decisions in
 #      `solve/<session>/consensus.json` (review V8 LOW: "gate per-round decisions not persisted").
 # A consensus whose first draw took a fail-safe (nothing attached) has nothing to vote on: `not-needed`, or
 # `deferred` when that fail-safe is owed a re-gate -- the re-gate in place then runs the consensus.
+#
+# HELD AGAINST THE MAJORITY (review V9, M-2; manager 025, decision 2; reporting only, no rule).
+# `gate.consensus.held_against_majority` counts the published keyframes in the PUBLISHED room that a strict
+# majority of the VOTING draws did not attach -- anchor-absorbed keyframes included, which no group names and the
+# consensus cannot withhold (the anchor is never withheld), and a `kept` group's minority keyframes. It is the
+# visible size of the residual risk: marginal pieces inside the anchor block are not re-verified by the vote.
 
 CONSENSUS_FILENAME = "consensus.json"
 CONSENSUS_RECORD = "wb-gate-consensus/1"
 DRAW_UNIT_MAPPER_SEED = "mapper-seed"
-CONSENSUS_APPLIED = "applied"          # the draws ran and voted; `detached` may be empty
+CONSENSUS_APPLIED = "applied"          # every requested draw voted; `detached` may be empty
+CONSENSUS_PARTIAL = "partial"          # fewer draws voted than were requested (`votes.draws`, `why`)
 CONSENSUS_NOT_NEEDED = "not-needed"    # the first draw's gate attached nothing (a fail-safe)
-CONSENSUS_DEFERRED = "deferred"        # that fail-safe is owed a re-gate, which runs the consensus
+# Owed to the re-gate in place, which runs the consensus: the first draw's fail-safe is
+# retryable, or a stop was asked for before the further draws voted (draw 0 is published).
+CONSENSUS_DEFERRED = "deferred"
 CONSENSUS_NOT_RUN = "not-run"          # it could not run (`why`)
+CONSENSUS_NOT_APPLIED = "not-applied"  # the withhold re-gate failed its checks; the chosen draw is published
+# `gate.cause` of a published draw 0 whose consensus a stop deferred (`gate.retryable`).
+CAUSE_CONSENSUS_DEFERRED = "consensus-deferred"
+WHY_STOPPED = ("a stop was asked for before the further draws voted; draw 0 is published as one draw would "
+               "be, and the re-gate in place runs the consensus")
 DECISION_ANCHOR = "anchor"
 DECISION_ATTACHED = "attached"
 DECISION_SEED_UNSTABLE = CG.REASON_SEED_UNSTABLE
 DECISION_UNPLACED = "unplaced"
+# A room group fewer than a strict majority of draws attached, kept because some of its keyframes every voting
+# draw attached (`unanimous_keyframes`): a keyframe every draw attached is never withheld (step 4).
+DECISION_KEPT = "kept"
 
 
 @dataclasses.dataclass
@@ -673,13 +716,21 @@ def _room_kids(solution, min_obs: int) -> set:
             if int(p.get("component", 0)) == 0 and int(p.get("observations", 0)) >= min_obs}
 
 
+def draw_votes(result) -> bool:
+    """Whether a gated draw votes (review V9, M-1): its gate ran (`applied`, with its groups) and ATTACHED --
+    not a fail-safe, whose room is the anchor block alone whatever the evidence says."""
+    record = getattr(result, "record", None) or {}
+    return (record.get("state") == GATE_STATE_APPLIED and getattr(result, "gated", None) is not None
+            and record.get("attach") is True)
+
+
 def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> dict:
     """The votes, the published draw and its groups' decisions, from the gated draws (`GateResult`s in draw
-    order). Pure: no IO. Draws whose gate failed do not vote. Returns {"voting", "chosen", "agreement",
-    "keyframes", "consensus_attached", "unanimous", "groups", "withhold"}; `withhold` names the groups (by
-    their first camera) `coherence_gate.apply_gate` must bar from the room."""
-    voting = [k for k, r in enumerate(results) if (r.record or {}).get("state") == GATE_STATE_APPLIED
-              and r.gated is not None]
+    order). Pure: no IO. Only draws whose gate attached vote (`draw_votes`). Returns {"voting", "chosen",
+    "agreement", "keyframes", "consensus_attached", "unanimous", "groups", "withhold", "pieces", "tally"};
+    `withhold` names the groups (by their first camera) `coherence_gate.apply_gate` must seal, `tally` is
+    {keyframe: attached votes} (in memory only)."""
+    voting = [k for k, r in enumerate(results) if draw_votes(r)]
     n = len(voting)
     attached = {k: _room_kids(results[k].solution, min_obs) for k in voting}
     universe = set().union(*(_published_kids(results[k].solution, min_obs) for k in voting)) if voting else set()
@@ -689,10 +740,10 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
     chosen = max(voting, key=lambda k: (agreement[k], -k)) if voting else 0
     groups: list[dict] = []
     withhold: list[str] = []
+    units: list[dict] = []
     if voting:
         best = results[chosen]
         order = {kid: i for i, kid in enumerate(best.solution.keyframe_ids)}
-        units = []
         for g in best.gated.get("groups") or []:
             if g.get("label") != 0:
                 continue
@@ -715,17 +766,23 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
             per_draw = [2 * len(set(kids) & attached[k]) > len(kids) for k in voting]
             yes = sum(per_draw)
             majority = 2 * yes > n
+            extra: dict = {}
             if u["anchor"]:
                 decision = DECISION_ANCHOR
+            elif u["in_room"] and majority:
+                decision = DECISION_ATTACHED
             elif u["in_room"]:
-                decision = DECISION_ATTACHED if majority else DECISION_SEED_UNSTABLE
+                unanimous = sum(1 for kid in kids if votes.get(kid, 0) == n)
+                decision = DECISION_KEPT if unanimous else DECISION_SEED_UNSTABLE
+                if unanimous:
+                    extra["unanimous_keyframes"] = unanimous
             else:
                 decision = DECISION_UNPLACED
             if decision == DECISION_SEED_UNSTABLE:
                 withhold.append(u["first_camera"])
             groups.append({"first_keyframe": kids[0], "keyframes": len(kids), "in_room": u["in_room"],
                            "votes": per_draw, "attached_votes": yes, "draws": n,
-                           "ambiguous": 0 < yes < n, "decision": decision,
+                           "ambiguous": 0 < yes < n, "decision": decision, **extra,
                            **({"label": u["label"]} if "label" in u else {})})
     # THE FLIPS THE PUBLISHED DRAW'S GROUPS CANNOT SHOW (reporting only). A piece another draw left out of
     # its room may sit inside the published draw's anchor block (6839fb8f's closet: its own piece in mapper
@@ -736,11 +793,11 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
     if voting:
         best = results[chosen]
         order = {kid: i for i, kid in enumerate(best.solution.keyframe_ids)}
-        seen = {frozenset(g_kids) for g_kids in ([u["kids"] for u in units] if voting else [])}
+        seen = {frozenset(u["kids"]) for u in units}
         for k in voting:
             if k == chosen:
                 continue
-            by_label: dict = {}
+            by_label = {}
             for kid, p in results[k].solution.poses.items():
                 lab = int(p.get("component", 0))
                 if lab != 0 and int(p.get("observations", 0)) >= min_obs:
@@ -762,7 +819,22 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
     return {"voting": voting, "chosen": chosen, "agreement": agreement, "keyframes": len(universe),
             "consensus_attached": len(consensus),
             "unanimous": sum(1 for v in votes.values() if v in (0, n)),
-            "groups": groups, "withhold": withhold, "pieces": pieces}
+            "groups": groups, "withhold": withhold, "pieces": pieces, "tally": votes}
+
+
+def held_against_majority(room_kids, tally: dict, voting_draws: int) -> int:
+    """How many keyframes of a published room a strict majority of the VOTING draws did not attach (review
+    V9, M-2): `2 * (n - attached votes) > n`. Anchor-absorbed keyframes count like any other."""
+    n = int(voting_draws)
+    return sum(1 for kid in room_kids if 2 * (n - int(tally.get(kid, 0))) > n)
+
+
+def _owe_consensus(result: GateResult) -> GateResult:
+    """Draw 0's gate result, owed the consensus a stop deferred: `retryable` with the cause
+    `consensus-deferred`, so the finisher's re-gate in place (contract §7 rule 5: only a record
+    that says `retryable`) runs it. Everything else is the draw's own record, as N = 1 publishes."""
+    result.record = dict(result.record, retryable=True, cause=CAUSE_CONSENSUS_DEFERRED)
+    return result
 
 
 def _room_anchor(result) -> str | None:
@@ -770,22 +842,100 @@ def _room_anchor(result) -> str | None:
                  if g.get("label") == 0 and g.get("reference")), None)
 
 
+def withhold_refusal(chosen: GateResult, regated: GateResult, withheld_kids: set, *, min_obs: int) -> str | None:
+    """Why the withhold re-gate may NOT be published (review V9, H-1), or None when it may: per published
+    keyframe, it attaches nothing outside the chosen room, its room is exactly the chosen room minus the
+    withheld groups, and every withheld keyframe is published with `seed-unstable` as its only reason."""
+    if regated.record.get("state") != GATE_STATE_APPLIED or regated.components is None:
+        return "the re-gate did not publish a components record"
+    before = _room_kids(chosen.solution, min_obs)
+    after = _room_kids(regated.solution, min_obs)
+    added = after - before
+    if added:
+        return f"the re-gate attached {len(added)} keyframes that the chosen draw's room did not hold"
+    expected = before - set(withheld_kids)
+    if after != expected:
+        return (f"the re-gate's room is not the chosen room minus the withheld groups: {len(expected - after)} "
+                "further keyframes left it")
+    reasons = {kid: list(e.get("reasons") or []) for e in regated.components.get("components") or []
+               for kid in e.get("keyframe_ids") or []}
+    published = _published_kids(regated.solution, min_obs)
+    wrong = [kid for kid in withheld_kids if kid in published
+             and reasons.get(kid) != [CG.REASON_SEED_UNSTABLE]]
+    if wrong:
+        return (f"{len(wrong)} withheld keyframes were not published with seed-unstable as their only "
+                "reason")
+    return None
+
+
+def keep_outside_pieces(chosen: GateResult, regated: GateResult, withheld_kids: set, *,
+                        min_obs: int) -> str | None:
+    """A piece outside the chosen room is published as the chosen draw published it: the same keyframes, and
+    the REASONS the chosen draw's gate gave it (patched into `regated`'s components record and its solution's
+    `components[*].gate_reasons`). The re-gate re-decides such a piece against the smaller room, and a group
+    the allow-list bars would otherwise read `no-verified-link` whatever its links (RV9 probe, case 1). Returns
+    why not (the re-gate changed such a piece's keyframes), or None when every one was kept."""
+    if chosen.components is None or regated.components is None:
+        return "a draw has no components record"
+    src_of = {kid: e for e in chosen.components.get("components") or [] for kid in e.get("keyframe_ids") or []}
+    kept: dict = {}
+    for e in regated.components.get("components") or []:
+        kids = set(e.get("keyframe_ids") or [])
+        if kids & set(withheld_kids) and not kids <= set(withheld_kids):
+            return "a withheld group was published in one piece with other keyframes"
+        if e.get("state") == CG_PLACED or not kids or kids & set(withheld_kids):
+            continue
+        src = src_of.get(next(iter(sorted(kids))))
+        if src is None or set(src.get("keyframe_ids") or []) != kids:
+            return "a piece outside the chosen room changed its keyframes"
+        kept[e["id"]] = (list(src.get("reasons") or []), src.get("reason"))
+    for e in regated.components.get("components") or []:
+        if e.get("id") in kept:
+            e["reasons"], e["reason"] = kept[e["id"]]
+    reasons_of = {kid: kept[e["id"]][0] for e in regated.components.get("components") or [] if e.get("id") in kept
+                  for kid in e.get("keyframe_ids") or []}
+    poses = regated.solution.poses or {}
+    for comp in getattr(regated.solution, "components", None) or []:
+        members = [kid for kid, p in poses.items()
+                   if int(p.get("component", 0)) == int(comp.get("index", -1))
+                   and int(p.get("observations", 0)) >= min_obs]
+        if members and members[0] in reasons_of:
+            comp["gate_reasons"] = list(reasons_of[members[0]])
+    return None
+
+
 def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: ConsensusPlan, database_path,
                       keyframes, should_stop=None, params: "CG.GateParams | None" = None,
-                      gate_runner: Callable | None = None) -> GateResult:
+                      gate_runner: Callable | None = None, stopped: bool = False) -> GateResult:
     """The consensus (see above) on `solution`, draw 0. Never raises: a draw that cannot be mapped or gated
     does not vote, and with nothing to vote on the first draw is published exactly as `gate_final_solution`
     gave it. The published result's record carries `consensus`; `consensus_detail` holds what
-    `after_publish` persists. `gate_runner` replaces `gate_final_solution` (tests)."""
+    `after_publish` persists. `gate_runner` replaces `gate_final_solution` (tests).
+
+    `stopped` (review V9, M-3; the solve's draw loop): a stop was asked for before the further draws -- none
+    is mapped, and draw 0 is published as N = 1 publishes it, `deferred`. `should_stop` is also asked between
+    draws, with the same outcome: a stop never loses the finish, and the re-gate in place owes the consensus."""
     from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
 
     params = params or CG.GateParams()
     run = gate_runner or gate_final_solution
     started = time.perf_counter()
     seeds = plan.seeds()
-    base = {"record": CONSENSUS_RECORD, "requested": int(plan.draws), "unit": plan.unit, "seeds": seeds}
+    requested = int(plan.draws)
+    base = {"record": CONSENSUS_RECORD, "requested": requested, "unit": plan.unit, "seeds": seeds}
+    # THE ONE FROZEN DATABASE IS READ ONCE (review V9 LOW, per-draw waste): every draw has the same links and
+    # two-view rotations; only its poses differ.
+    link_cache: dict = {}
+
+    def link_reader(database, camera, min_inliers):
+        key = (str(database), json.dumps(camera, sort_keys=True, default=str), int(min_inliers))
+        if key not in link_cache:
+            link_cache[key] = read_links(database, camera, min_inliers)
+        return link_cache[key]
 
     def gate(candidate, **kw):
+        if gate_runner is None:
+            kw.setdefault("link_reader", link_reader)
         return run(store, world_id, session_id, candidate, database_path=database_path, keyframes=keyframes,
                    should_stop=should_stop, params=params, **kw)
 
@@ -806,13 +956,19 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
             "why": ("the gate could not finish on the first draw; the re-gate in place runs the consensus"
                     if owed else "the gate attached nothing to the room (a fail-safe): there is nothing to "
                                  "vote on")})
+    if stopped:
+        # A STOP BEFORE THE FURTHER DRAWS (review V9, M-1 and M-3): draw 0 is published as N = 1
+        # would publish it, and the consensus is owed to the re-gate in place.
+        return done(_owe_consensus(first), {"state": CONSENSUS_DEFERRED, "why": WHY_STOPPED})
     name_of = _image_names(keyframes)
     kid_of_name = {v: k for k, v in name_of.items()}
     results = [first]
     draws = [{"draw": 0, "seed": seeds[0], "map_s": None, "gate_s": first.record.get("seconds")}]
-    for k in range(1, int(plan.draws)):
+    stop_cost_a_vote = False
+    for k in range(1, requested):
         if should_stop is not None and should_stop():
             draws.append({"draw": k, "seed": seeds[k], "skipped": "a stop was asked for"})
+            stop_cost_a_vote = True
             break
         t = time.perf_counter()
         try:
@@ -826,8 +982,11 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
         result = gate(candidate)
         results.append(result)
         draws.append({"draw": k, "seed": seeds[k], "map_s": map_s, "gate_s": result.record.get("seconds")})
+        if not draw_votes(result) and (result.record.get("depth") or {}).get("state") == DEPTH_STOPPED:
+            stop_cost_a_vote = True          # the stop reached this draw's depth stage: it cannot vote
     mapped = [d for d in draws if "map_s" in d]          # one per entry of `results`, in draw order
     decision = decide_consensus(results, kid_of_name=kid_of_name, min_obs=params.min_obs)
+    voting = decision["voting"]
     for i, (info, result) in enumerate(zip(mapped, results)):
         info.update({"solver": getattr(result.candidate, "solver", None),
                      "gate_state": result.record.get("state"), "attach": result.record.get("attach"),
@@ -836,37 +995,71 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
                      "published_keyframes": len(_published_kids(result.solution, params.min_obs)),
                      "components": result.record.get("components"),
                      "predictions": (result.record.get("depth") or {}).get("predictions"),
-                     "votes": i in decision["voting"], "agreement": decision["agreement"].get(i)})
+                     "votes": i in voting, "agreement": decision["agreement"].get(i)})
+
+    def detail_of(published):
+        return {"record": CONSENSUS_RECORD, "session_id": session_id,
+                "solve_identity": solve_identity(published.solution),
+                "draws": [dict(info, rounds=(r.gated or {}).get("rounds")) for info, r in zip(mapped, results)]}
+
+    if stop_cost_a_vote and len(voting) < requested:
+        # A stop cost a draw its vote (review V9, M-1): draw 0, as one draw publishes it; owed.
+        published = _owe_consensus(first)
+        return done(published, {"state": CONSENSUS_DEFERRED, "why": WHY_STOPPED, "draws": draws,
+                                "votes": {"draws": len(voting)}, "chosen": {"draw": 0, "seed": seeds[0]}},
+                    detail_of(published))
+    if len(voting) < 2:
+        # Nothing to vote with but draw 0 (review V9, M-1): published unchanged, not owed.
+        return done(first, {"state": CONSENSUS_PARTIAL, "draws": draws, "votes": {"draws": len(voting)},
+                            "chosen": {"draw": 0, "seed": seeds[0]}, "groups": [], "pieces": [],
+                            "detached": [], "ambiguous": [], "held_against_majority": 0,
+                            "why": (f"{len(voting)} of {requested} draws voted (a draw votes only when its gate "
+                                    "attached); with fewer than 2 there is no vote, so draw 0 is published as "
+                                    "one draw would be")}, detail_of(first))
     chosen = results[decision["chosen"]]
-    record = {"state": CONSENSUS_APPLIED, "draws": draws,
-              "votes": {"draws": len(decision["voting"]), "keyframes": decision["keyframes"],
+    groups = decision["groups"]
+    ambiguous = [g["first_keyframe"] for g in groups if g["ambiguous"]]
+    for p in decision["pieces"]:
+        if p["first_keyframe"] not in ambiguous:
+            ambiguous.append(p["first_keyframe"])       # M-2: a disputed piece is ambiguous too
+    record = {"state": CONSENSUS_APPLIED if len(voting) == requested else CONSENSUS_PARTIAL,
+              "draws": draws,
+              "votes": {"draws": len(voting), "keyframes": decision["keyframes"],
                         "consensus_attached": decision["consensus_attached"],
                         "unanimous": decision["unanimous"]},
               "chosen": {"draw": mapped[decision["chosen"]]["draw"], "seed": mapped[decision["chosen"]]["seed"]},
-              "groups": decision["groups"],
+              "groups": groups,
               "pieces": [dict(p, from_draw=mapped[p["from_draw"]]["draw"]) for p in decision["pieces"]],
-              "detached": [g["first_keyframe"] for g in decision["groups"]
-                           if g["decision"] == DECISION_SEED_UNSTABLE],
-              "ambiguous": [g["first_keyframe"] for g in decision["groups"] if g["ambiguous"]]}
+              "detached": [g["first_keyframe"] for g in groups if g["decision"] == DECISION_SEED_UNSTABLE],
+              "ambiguous": ambiguous}
+    if record["state"] == CONSENSUS_PARTIAL:
+        record["why"] = (f"{len(voting)} of {requested} draws voted (a draw votes only when its gate attached); "
+                         "the strict majority is of the draws that voted")
     published = chosen
-    if decision["withhold"]:
+    withhold = [c for c in decision["withhold"] if c != _room_anchor(chosen)]
+    if withhold:
         depth = chosen.depth or {}
+        room_groups = [g["first_camera"] for g in (chosen.gated or {}).get("groups") or [] if g.get("label") == 0]
+        withheld_kids = {kid_of_name[nm] for g in (chosen.gated or {}).get("groups") or []
+                         if g.get("label") == 0 and g["first_camera"] in withhold
+                         for nm in g["members"] if nm in kid_of_name}
         regated = gate(chosen.candidate,
                        depth_runner=lambda *a, **kw: (depth.get("align"), depth.get("work"), depth.get("dparams")),
-                       metric_fn=lambda *a, **kw: chosen.scale, withhold=decision["withhold"])
-        if (regated.record.get("state") == GATE_STATE_APPLIED and regated.components is not None
-                and _room_anchor(regated) == _room_anchor(chosen)):
+                       metric_fn=lambda *a, **kw: chosen.scale, withhold=withhold, room=room_groups)
+        refusal = (withhold_refusal(chosen, regated, withheld_kids, min_obs=params.min_obs)
+                   or keep_outside_pieces(chosen, regated, withheld_kids, min_obs=params.min_obs))
+        if refusal is None:
             published = regated
             published.record = dict(published.record, depth=chosen.record.get("depth"),
                                     metric_scale=chosen.record.get("metric_scale"))
         else:
-            record["state"] = "not-applied"
-            record["why"] = ("barring the seed-unstable groups from the room changed which piece is the room; "
-                             "the chosen draw is published as it was gated")
+            record["state"] = CONSENSUS_NOT_APPLIED
+            record["why"] = (f"withholding the seed-unstable groups failed its check ({refusal}); the chosen "
+                             "draw is published as it was gated")
             record["detached"] = []
-    detail = {"record": CONSENSUS_RECORD, "session_id": session_id,
-              "solve_identity": solve_identity(published.solution),
-              "draws": [dict(info, rounds=(r.gated or {}).get("rounds")) for info, r in zip(mapped, results)]}
+    record["held_against_majority"] = held_against_majority(
+        _room_kids(published.solution, params.min_obs), decision["tally"], len(voting))
+    detail = detail_of(published)
     if published is not chosen:
         detail["published_rounds"] = (published.gated or {}).get("rounds")
     return done(published, record, detail)
@@ -901,7 +1094,8 @@ def after_publish(store, world_id: str, session_id: str, workspace_root, solutio
 
 def gate_and_publish(store, world_id: str, session_id: str, workspace, solution, *, final: bool,
                      gate: bool | None = None, database_path, keyframes, write: Callable,
-                     should_stop=None, consensus: ConsensusPlan | None = None) -> tuple[object, dict | None]:
+                     should_stop=None, consensus: ConsensusPlan | None = None,
+                     stopped: bool = False) -> tuple[object, dict | None]:
     """The final solve's publish step, in one call (`global_solve.solve` makes it in place of
     `write_solution`): the gate when `gate_setting_for(final, gate)`, then `write(workspace, solution)`,
     then the record and the depth hand-off. Returns (the published solution, its gate record or None).
@@ -910,13 +1104,15 @@ def gate_and_publish(store, world_id: str, session_id: str, workspace, solution,
     left by an earlier gated solve is moved aside: it does not describe this solve.
 
     `consensus`: a plan of two or more draws (`TOWER_WORLD_SOLVE_CONSENSUS`) gates by `gate_by_consensus`;
-    None, the default, is the single gate of today."""
+    None, the default, is the single gate of today. `stopped`: `gate_by_consensus`'s -- a stop was asked
+    for before the further draws: draw 0 is published as N = 1 would, the consensus `deferred`. Ignored
+    without a consensus plan."""
     result = None
     if gate_setting_for(final, gate):
         if consensus is not None and int(consensus.draws) >= 2:
             result = gate_by_consensus(store, world_id, session_id, solution, plan=consensus,
                                        database_path=database_path, keyframes=keyframes,
-                                       should_stop=should_stop)
+                                       should_stop=should_stop, stopped=stopped)
         else:
             result = gate_final_solution(store, world_id, session_id, solution, database_path=database_path,
                                          keyframes=keyframes, should_stop=should_stop)
@@ -976,12 +1172,44 @@ class RegateRefused(RuntimeError):
 
 REFUSAL_NO_GATED_SOLUTION = "no gated solution is published for this session"
 REFUSAL_DATABASE_GONE = "the solve's database {name} is gone; an owner can re-finish this walk"
+REFUSAL_NO_DRAW_CAMERA = ("the solve has no camera to map its consensus draws with; an owner can "
+                          "re-finish this walk")
+
+
+def _owed_consensus(solution) -> tuple[int, int | None]:
+    """(draws requested, draw 0's seed) of the consensus the published solve asked for; (1, None)
+    when it asked for none, or its record is not readable as one."""
+    owed = (getattr(solution, "gate", None) or {}).get("consensus") or {}
+    try:
+        requested = int(owed.get("requested") or 1)
+    except (TypeError, ValueError):
+        requested = 1
+    seeds = owed.get("seeds")
+    seed = seeds[0] if isinstance(seeds, list) and seeds else None
+    return requested, (seed if isinstance(seed, int) and not isinstance(seed, bool) else None)
+
+
+def _draw_camera_readable(solution, workspace) -> bool:
+    """Whether `global_solve.frozen_draw_mapper` finds the camera it maps each draw with: the
+    solution's own, else the workspace's `camera.json`. Reads only."""
+    from tower.storage import read_json_closed  # noqa: PLC0415
+    from tower.world_builder.global_solve import PinholeCamera  # noqa: PLC0415
+
+    try:
+        PinholeCamera.from_json_dict(solution.camera or read_json_closed(workspace.camera_path))
+    except Exception:  # noqa: BLE001 -- missing, unreadable or malformed: the draws cannot be mapped
+        return False
+    return True
 
 
 def _regate_inputs(store, world_id: str, session_id: str):
     """(the published solution, its workspace, the feature database it was solved from), or
     `RegateRefused` saying why a re-gate cannot start. Reads only. The ONE statement of the
-    refusals: `regate_published` and `regate_refusal` both ask it."""
+    refusals: `regate_published` and `regate_refusal` both ask it.
+
+    A consensus the re-gate will run (`requested` >= 2, seeded) needs the camera its draws are
+    mapped with: without one it is refused here, read-only, rather than raising inside
+    `regate_published` after the finisher has counted the attempt (review V9 LOW)."""
     from tower.world_builder.global_solve import load_solution, workspace_for  # noqa: PLC0415
 
     solution = load_solution(store, world_id, session_id)
@@ -992,6 +1220,9 @@ def _regate_inputs(store, world_id: str, session_id: str):
     database = workspace.root / name
     if not database.is_file():
         raise RegateRefused(REFUSAL_DATABASE_GONE.format(name=name))
+    requested, seed = _owed_consensus(solution)
+    if requested >= 2 and seed is not None and not _draw_camera_readable(solution, workspace):
+        raise RegateRefused(REFUSAL_NO_DRAW_CAMERA)
     return solution, workspace, database
 
 
@@ -1020,17 +1251,18 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
     previous = {k: solution.gate.get(k) for k in ("state", "cause", "metric_available", "params_digest")}
     keyframes = store.read_keyframes(world_id, session_id)
     candidate = solver_candidate(solution)
-    owed = (solution.gate or {}).get("consensus") or {}
-    if owed.get("state") == CONSENSUS_DEFERRED and int(owed.get("requested") or 1) >= 2:
-        # The consensus the solve asked for and could not run (its first draw was owed this
-        # re-gate): its draws are mapped now, on the database the published solve mapped.
+    requested, seed = _owed_consensus(solution)
+    if requested >= 2:
+        # A solve that asked for a consensus is re-gated BY consensus (review V9, M-1), whatever
+        # its record says -- `deferred` by its first draw's fail-safe or by a stop, or anything
+        # else: a single gate here would publish one draw where the solve asked for N. Its draws
+        # are mapped now, on the database the published solve mapped.
         from tower.world_builder.global_solve import frozen_draw_mapper  # noqa: PLC0415
 
-        seeds = owed.get("seeds") or [None]
-        plan = ConsensusPlan(draws=int(owed["requested"]), seed=seeds[0],
-                             map_draw=None if seeds[0] is None else frozen_draw_mapper(
+        plan = ConsensusPlan(draws=requested, seed=seed,
+                             map_draw=None if seed is None else frozen_draw_mapper(
                                  store, world_id, session_id, database, candidate, keyframes=keyframes),
-                             refusal=None if seeds[0] is not None else "the solve was not seeded")
+                             refusal=None if seed is not None else "the solve was not seeded")
         result = gate_by_consensus(store, world_id, session_id, candidate, plan=plan, database_path=database,
                                    keyframes=keyframes, should_stop=should_stop, gate_runner=gate_runner)
     else:
@@ -1046,32 +1278,132 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
     return {"gate": {k: record.get(k) for k in ("state", "retryable", "cause", "metric_available",
                                                   "attach", "components")},
             "publish": out,
-            # The row's sentence after the re-gate (None when nothing is owed any more).
-            "notice": publish_notice({"gate": record, "transients": published.transients})}
+            # The row's sentence after the re-gate (None when nothing is owed any more): the
+            # closed set for `finalization.notice`, and its diagnostic twin for `detail`.
+            "notice": publish_notice({"gate": record, "transients": published.transients}),
+            "detail": publish_detail({"gate": record, "transients": published.transients})}
 
 
 # ---------------------------------------------------------------------------
-# what the row says (review V7, H2 and L-c)
+# what the row says (review V7, H2 and L-c; review V9, M-4 and M-8; manager 025, decision 3)
 
 #
 # EVERY FAIL-SAFE SAYS SO (review V8, M2). A published gated solve that is not "masks
 # applied and metric scale available" attaches nothing to the room, and the row says
 # what is missing and WHO can fix it -- the idle Tower (a re-gate in place), an owner
 # (a re-finish, or a new walk), or an operator first (a Tower that cannot run the
-# masks) -- in contract §2.2's order: masks, then scale. One sentence per cause, in the
-# style of §2.2's own example (*masks were not applied (GPU out of memory); an owner can
-# re-finish this walk*). No metric figure (§2.4 rule 6).
+# masks) -- in contract §2.2's order: masks, then scale. No metric figure (§2.4 rule 6).
+#
+# A CLOSED SET (review V9, M-4). `finalization.notice` is shown on the phone word for word,
+# and contract §3.1 says the notice never carries an error string: `<why>` is a short
+# Tower-written phrase. So every sentence a notice can hold is one of `NOTICE_SENTENCES`,
+# keyed by its cause, and a notice is some of them joined by "; " in §2.2's order. The raw
+# text a cause was recorded with -- an exception, a path, a memory figure -- stays where it
+# was recorded (`gate.detail`, `gate.depth.detail`, `transients.detail` in solution.json)
+# and in `publish_detail`, the diagnostic twin for the finalization's `detail`, which the
+# phone does not show. The only numbers a sentence carries are IMAGE counts, which an owner
+# can read ("12 of 400 images"); the camera counts behind a scale shortfall stay in the
+# detail. Every sentence is one line, with no slash or backslash, and far under the phone's
+# 700-character guard (Mac tip de1b045).
 
-NOTICE_MASKS_OOM = ("masks were not applied (GPU out of memory); an owner can re-finish this walk")
-NOTICE_MASKS_OFF = ("masks were not applied (they are off on this Tower: TOWER_WORLD_SOLVE_MASKS); "
-                    "an operator can turn them on, then an owner can re-finish this walk")
+_BY_OWNER = "an owner can re-finish this walk"
+_BY_OPERATOR = ("an operator can make the transient detector run on this Tower, then an owner "
+                "can re-finish this walk")
+_BY_IDLE_TOWER = "the Tower re-runs it when it is idle"
+_BY_IDLE_REGATE = "the Tower re-runs the gate when it is idle"
+_MASKS_NOT_APPLIED = "masks were not applied ({})"
+_GATE_FAILED = "the evidence gate failed ({})"
+_NO_SCALE = "the evidence gate could not measure metric scale ({})"
+
+# cause -> the short, fixed phrase that names it (`notice_cause_phrase`): what the sentence
+# says in its parentheses, and what the finisher's given-up sentence says.
+NOTICE_PHRASES: dict[str, str] = {
+    # the masks (a `transients` record)
+    "masks-gpu-oom": "GPU out of memory",
+    "masks-off": "they are off on this Tower: TOWER_WORLD_SOLVE_MASKS",
+    "masks-no-gpu": "no GPU could run the transient detector",
+    "masks-not-installed": "the transient detector is not installed on this Tower",
+    "masks-detector-failed": "the transient detector failed",
+    "masks-step-failed": "the mask step failed",
+    "masks-no-image": "no solver image could be masked",
+    "masks-none": "no solver image could be masked",
+    "masks-unavailable": "the transient detector could not run",
+    "masks-fallback": "only OneFormer could run",
+    "masks-partial": "some images were not masked",
+    "masks-partial-uncounted": "some images were not masked",
+    "masks-excluded": "some images could not be masked",
+    "masks-excluded-uncounted": "some images could not be masked",
+    # the gate (a `gate` record)
+    "gate-failed": "an internal error",
+    "gate-failed-database": "the solve's feature database could not be read",
+    "gate-failed-memory": "out of memory",
+    "depth-unavailable": "the depth stage did not finish",
+    "depth-stopped": "the depth stage was stopped",
+    "depth-gpu-oom": "GPU out of memory",
+    "depth-model-missing": "the depth model is not installed on this Tower",
+    "depth-surface-busy": "another surface build of this walk was running",
+    "depth-no-intrinsics": "the walk has no camera intrinsics",
+    "depth-no-camera": "the solve has no camera",
+    "scale-short": "too few images had a metric depth",
+    "consensus-deferred": "the consensus of mapper seeds was stopped before its draws voted",
+}
+
+
+def _clause(cause: str) -> str:
+    phrase = NOTICE_PHRASES[cause]
+    if cause.startswith("masks-"):
+        return _MASKS_NOT_APPLIED.format(phrase)
+    if cause.startswith("gate-failed"):
+        return _GATE_FAILED.format(phrase)
+    return _NO_SCALE.format(phrase)
+
+
+# cause -> the clause that says what happened, without who fixes it: `regate_clause`, and the
+# finisher's given-up sentence (`world_finish_pending.regate_given_up_notice`).
+NOTICE_CLAUSES: dict[str, str] = {
+    **{c: _clause(c) for c in NOTICE_PHRASES if c.startswith(("masks-", "gate-failed", "depth-"))},
+    "masks-fallback": ("masks were applied by OneFormer alone, not by the union rule the evidence "
+                       "gate needs"),
+    "masks-partial": "masks were not applied to {unmasked} of {images} images",
+    "masks-partial-uncounted": "masks were not applied to some of its images",
+    "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve",
+    "masks-excluded-uncounted": "some images could not be masked and were left out of the solve",
+    "scale-short": "the evidence gate had too little metric scale to place pieces by it",
+    "consensus-deferred": ("the evidence gate's consensus of mapper seeds was stopped before its "
+                           "draws voted"),
+}
+
+_OWNERS: dict[str, str] = {
+    **{c: _BY_OPERATOR for c in ("masks-no-gpu", "masks-not-installed", "masks-detector-failed",
+                                 "masks-step-failed", "masks-no-image", "masks-unavailable")},
+    **{c: _BY_OWNER for c in ("masks-gpu-oom", "masks-none", "masks-partial", "masks-partial-uncounted",
+                              "masks-excluded", "masks-excluded-uncounted")},
+    "masks-off": "an operator can turn them on, then an owner can re-finish this walk",
+    "masks-fallback": ("an operator can make Grounding DINO and SAM available on this Tower, then an "
+                       "owner can re-finish this walk"),
+    **{c: _BY_IDLE_TOWER for c in ("gate-failed", "gate-failed-database", "gate-failed-memory",
+                                   "consensus-deferred")},
+    **{c: _BY_IDLE_REGATE for c in NOTICE_PHRASES if c.startswith("depth-")},
+    "scale-short": ("the depth stage ran to the end, so re-running the gate would not change this; "
+                    "an owner can re-capture this walk"),
+}
+
+# THE CLOSED SET: cause -> the sentence `finalization.notice` may carry. `{unmasked}`,
+# `{images}` and `{excluded}` are image counts, the only fields.
+NOTICE_SENTENCES: dict[str, str] = {c: f"{NOTICE_CLAUSES[c]}; {_OWNERS[c]}" for c in NOTICE_PHRASES}
+
+NOTICE_MASKS_OOM = NOTICE_SENTENCES["masks-gpu-oom"]
+NOTICE_MASKS_OFF = NOTICE_SENTENCES["masks-off"]
+NOTICE_MASKS_FALLBACK = NOTICE_SENTENCES["masks-fallback"]
+NOTICE_MASKS_PARTIAL = NOTICE_SENTENCES["masks-partial"]
+NOTICE_MASKS_NONE = NOTICE_SENTENCES["masks-none"]
+NOTICE_MASKS_EXCLUDED = NOTICE_SENTENCES["masks-excluded"]
+NOTICE_SCALE_SHORT_FIXED = NOTICE_SENTENCES["scale-short"]
+NOTICE_CONSENSUS_DEFERRED = NOTICE_SENTENCES["consensus-deferred"]
+# The DIAGNOSTIC templates (`publish_detail`, the finalization's `detail`): `{why}` is the raw
+# text the cause was recorded with. Never in a notice.
 NOTICE_MASKS_UNAVAILABLE = ("masks were not applied ({why}); an operator can make the transient "
                             "detector run on this Tower, then an owner can re-finish this walk")
-NOTICE_MASKS_FALLBACK = ("masks were applied by OneFormer alone, not by the union rule the "
-                         "evidence gate needs; an operator can make Grounding DINO and SAM "
-                         "available on this Tower, then an owner can re-finish this walk")
-NOTICE_MASKS_PARTIAL = ("masks were not applied to {unmasked} of {images} images; "
-                        "an owner can re-finish this walk")
 NOTICE_REGATE = ("the evidence gate could not measure metric scale ({why}); "
                  "the Tower re-runs the gate when it is idle")
 NOTICE_SCALE_SHORT = ("the evidence gate had too little metric scale to place pieces by it "
@@ -1079,26 +1411,131 @@ NOTICE_SCALE_SHORT = ("the evidence gate had too little metric scale to place pi
                       "change this; an owner can re-capture this walk")
 NOTICE_GATE_FAILED = "the evidence gate failed ({why}); the Tower re-runs it when it is idle"
 
+_GATE_CAUSES = (CAUSE_DEPTH_UNAVAILABLE, CAUSE_GATE_FAILED, CAUSE_CONSENSUS_DEFERRED)
 
-def _masks_notice(transients: dict, gate: dict) -> str | None:
-    """The masks fail-safe's sentence, or None. The GPU-out-of-memory one is said whatever
-    the gate did (as before); every other only when the gate ran and did not have masks."""
+
+def _count(value) -> int | None:
+    """An image count as the record holds it, or None when it is not one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _is_oom(low: str) -> bool:
+    return "out of memory" in low or "outofmemory" in low
+
+
+def _masks_cause_unavailable(transients: dict) -> str:
+    """Which fixed phrase names a masks record that is not `partial`: by its code first
+    (`cause`, `outcome`), then by the Tower's own wording of the few details it writes."""
+    low = str(transients.get("detail") or "").strip().lower()
+    cause = transients.get("cause")
+    if cause == "gpu-oom":
+        return "masks-gpu-oom"
+    if low == "no solver image could be masked":
+        # Written before `none_masked` existed (review V9, M-8): absent keys, today's sentence.
+        return "masks-no-image"
+    if cause == "detector-failed":
+        return "masks-detector-failed"
+    if transients.get("outcome") == "failed":
+        return "masks-step-failed"         # the mask step itself raised (`failed_record`)
+    if _is_oom(low):
+        return "masks-gpu-oom"
+    if "no cuda device" in low or "cuda probe failed" in low:
+        return "masks-no-gpu"
+    if any(s in low for s in ("not installed", "not importable", "cannot load", "hugging face cache")):
+        return "masks-not-installed"
+    return "masks-unavailable"
+
+
+def _masks_cause(transients: dict, gate: dict) -> str | None:
+    """The masks fail-safe's cause (a key of `NOTICE_SENTENCES`), or None. The GPU-out-of-memory
+    one is said whatever the gate did (as before); every other only when the gate ran without
+    masks: applied with `masks_applied` False, or FAILED on a solve whose masks were not applied
+    (review V9 LOW: a failed gate used to drop the masks cause)."""
     if transients.get("retryable") and transients.get("cause") == "gpu-oom":
-        return NOTICE_MASKS_OOM
-    if gate.get("state") != GATE_STATE_APPLIED or gate.get("masks_applied") is not False:
+        return "masks-gpu-oom"
+    if gate.get("state") == GATE_STATE_APPLIED:
+        if gate.get("masks_applied") is not False:
+            return None
+    elif gate.get("state") == GATE_STATE_FAILED:
+        if not transients or transients.get("state") == "applied":
+            return None
+    else:
         return None
     state = transients.get("state")
     if not transients or transients.get("requested") is False:
-        return NOTICE_MASKS_OFF
+        return "masks-off"
     if state == "applied":
         return None                 # an inconsistent record: nothing true to say
+    if transients.get("none_masked"):
+        # No image could be masked (review V9, M-8): the images' owner, not the detector's.
+        return "masks-none"
     if state == "partial":
         if transients.get("rule_fallback"):
-            return NOTICE_MASKS_FALLBACK
-        return NOTICE_MASKS_PARTIAL.format(unmasked=transients.get("images_unmasked", "some"),
-                                           images=transients.get("images", "its"))
-    return NOTICE_MASKS_UNAVAILABLE.format(
-        why=transients.get("detail") or transients.get("cause") or "the detector did not run")
+            return "masks-fallback"
+        if _count(transients.get("images_unmasked")) is not None and _count(transients.get("images")):
+            return "masks-partial"
+        return "masks-partial-uncounted"
+    return _masks_cause_unavailable(transients)
+
+
+def _exclusion_cause(transients: dict, gate: dict) -> str | None:
+    """Images left out of the solve because they could not be masked, once there are enough of
+    them to say so (`transients.exclusion_notice_due`, review V9 M-8: at least max(3, 2 %) of the
+    images; the masks stage decides it). Absent: today's behaviour, nothing said. Only for a
+    solve the gate ran on, like every masks sentence but the OOM one."""
+    if not transients.get("exclusion_notice_due") or transients.get("none_masked"):
+        return None
+    if gate.get("state") not in (GATE_STATE_APPLIED, GATE_STATE_FAILED):
+        return None
+    if _count(transients.get("images_excluded")) and _count(transients.get("images")):
+        return "masks-excluded"
+    return "masks-excluded-uncounted"
+
+
+def _gate_failed_cause(detail) -> str:
+    low = str(detail or "").lower()
+    if any(s in low for s in ("databaseerror", "operationalerror", "not a database", "sqlite")):
+        return "gate-failed-database"
+    if "memoryerror" in low or _is_oom(low):
+        return "gate-failed-memory"
+    return "gate-failed"
+
+
+def _depth_cause(detail) -> str:
+    """Which fixed phrase names a depth stage that did not give the gate its depth
+    (`run_gate_depth`'s `DepthUnavailable` text, kept in `gate.depth.detail`)."""
+    text = str(detail or "").strip()
+    low = text.lower()
+    if not text:
+        return "depth-unavailable"
+    if low.startswith(DEPTH_STOPPED):
+        return "depth-stopped"
+    if "no intrinsics" in low:
+        return "depth-no-intrinsics"
+    if "has no camera" in low:
+        return "depth-no-camera"
+    if "holds its lock" in low:
+        return "depth-surface-busy"
+    if _is_oom(low):
+        return "depth-gpu-oom"
+    if any(s in low for s in ("depthmodelunavailable", "not installed", "hugging face cache",
+                              "modulenotfounderror", "importerror")):
+        return "depth-model-missing"
+    return "depth-unavailable"
+
+
+def _gate_cause(gate: dict) -> str | None:
+    """The gate's own cause (a key of `NOTICE_SENTENCES`), or None when it owes nothing and took
+    no fail-safe a sentence is for."""
+    if gate.get("state") == GATE_STATE_FAILED:
+        return _gate_failed_cause(gate.get("detail"))
+    if gate.get("retryable"):
+        if gate.get("cause") == CAUSE_CONSENSUS_DEFERRED:
+            return "consensus-deferred"
+        return _depth_cause((gate.get("depth") or {}).get("detail"))
+    if _scale_short_with_depth(gate):
+        return "scale-short"
+    return None
 
 
 def _scale_short_with_depth(gate: dict) -> bool:
@@ -1108,25 +1545,106 @@ def _scale_short_with_depth(gate: dict) -> bool:
             and (gate.get("depth") or {}).get("state") == DEPTH_OK)
 
 
-def publish_notice(summary: dict | None) -> str | None:
-    """One sentence for the session's finalization `detail` (the row carries it), when the
-    published solve owes something an owner, an operator or the idle Tower will do, or
-    took a fail-safe nobody can undo but a new walk, else None."""
+def notice_causes(summary: dict | None) -> list[str]:
+    """The causes the notice names, in contract §2.2's order (masks, then scale): keys of
+    `NOTICE_SENTENCES`. Empty when nothing is owed and no fail-safe was taken."""
     if not isinstance(summary, dict):
-        return None
+        return []
     transients = summary.get("transients") or {}
     gate = summary.get("gate") or {}
+    if not isinstance(transients, dict) or not isinstance(gate, dict):
+        return []
+    causes = [c for c in (_masks_cause(transients, gate), _exclusion_cause(transients, gate),
+                          _gate_cause(gate)) if c]
+    return causes
+
+
+def _sentence(cause: str, transients: dict) -> str:
+    return NOTICE_SENTENCES[cause].format(
+        unmasked=_count(transients.get("images_unmasked")),
+        images=_count(transients.get("images")),
+        excluded=_count(transients.get("images_excluded")))
+
+
+def publish_notice(summary: dict | None) -> str | None:
+    """The session's `finalization.notice` (the phone shows it word for word), when the published
+    solve owes something an owner, an operator or the idle Tower will do, or took a fail-safe
+    nobody can undo but a new walk, else None. Only sentences of the closed set
+    `NOTICE_SENTENCES`: no exception text, path or figure but an image count (review V9, M-4)."""
+    causes = notice_causes(summary)
+    if not causes:
+        return None
+    transients = (summary or {}).get("transients") or {}
+    return "; ".join(_sentence(c, transients) for c in causes)
+
+
+def publish_detail(summary: dict | None) -> str | None:
+    """The same sentences as `publish_notice`, with the raw text each cause was recorded with in
+    place of its fixed phrase: the DIAGNOSTIC twin, for the finalization's `detail` (which the
+    phone does not show). What `publish_notice` said before review V9, M-4. None exactly when
+    `publish_notice` is None."""
+    causes = notice_causes(summary)
+    if not causes:
+        return None
+    transients = (summary or {}).get("transients") or {}
+    gate = (summary or {}).get("gate") or {}
     parts = []
-    masks = _masks_notice(transients, gate)
-    if masks:
-        parts.append(masks)
-    if gate.get("state") == GATE_STATE_FAILED:
-        parts.append(NOTICE_GATE_FAILED.format(why=gate.get("detail") or "an error"))
-    elif gate.get("retryable"):
-        why = (gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"
-        parts.append(NOTICE_REGATE.format(why=why))
-    elif _scale_short_with_depth(gate):
-        why = ((gate.get("evidence") or {}).get("metric_scale")
-               or "too few cameras had a metric level")
-        parts.append(NOTICE_SCALE_SHORT.format(why=why))
-    return "; ".join(parts) or None
+    for c in causes:
+        if c in ("masks-no-gpu", "masks-not-installed", "masks-detector-failed", "masks-step-failed",
+                 "masks-no-image", "masks-unavailable"):
+            parts.append(NOTICE_MASKS_UNAVAILABLE.format(
+                why=transients.get("detail") or transients.get("cause") or "the detector did not run"))
+        elif c == "masks-none" and transients.get("detail"):
+            parts.append(f"{_MASKS_NOT_APPLIED.format(transients.get('detail'))}; {_BY_OWNER}")
+        elif c.startswith("gate-failed"):
+            parts.append(NOTICE_GATE_FAILED.format(why=gate.get("detail") or "an error"))
+        elif c.startswith("depth-"):
+            parts.append(NOTICE_REGATE.format(
+                why=(gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"))
+        elif c == "scale-short":
+            parts.append(NOTICE_SCALE_SHORT.format(
+                why=(gate.get("evidence") or {}).get("metric_scale") or "too few cameras had a metric level"))
+        else:
+            parts.append(_sentence(c, transients))
+    return "; ".join(parts)
+
+
+def masks_notice(transients: dict | None, gate: dict | None) -> str | None:
+    """The masks sentences alone (the masks fail-safe, then the excluded images), exactly as
+    `publish_notice` words them for the same records, or None: for the finisher's given-up
+    sentence, which keeps them and replaces the gate's."""
+    t = transients if isinstance(transients, dict) else {}
+    g = gate if isinstance(gate, dict) else {}
+    causes = [c for c in (_masks_cause(t, g), _exclusion_cause(t, g)) if c]
+    return "; ".join(_sentence(c, t) for c in causes) or None
+
+
+def _is_gate_record(record: dict) -> bool:
+    return (record.get("state") == GATE_STATE_FAILED or record.get("cause") in _GATE_CAUSES
+            or any(k in record for k in ("gate", "depth", "evidence", "masks_applied", "metric_available",
+                                         "params_digest", "consensus")))
+
+
+def notice_cause_phrase(record: dict | None) -> str:
+    """The fixed phrase (`NOTICE_PHRASES`) that names the cause of a GATE record (`solution.gate`)
+    or a TRANSIENTS record (`solution.transients`): never the record's raw text. For the
+    finisher's given-up sentence (review V9, M-4). A gate record that failed, or owes a re-gate,
+    always has one; a record with nothing to say gives "" (a caller asks only about a cause)."""
+    r = record if isinstance(record, dict) else {}
+    if not r:
+        return ""
+    if _is_gate_record(r):
+        cause = _gate_cause(r)
+    else:
+        cause = (_masks_cause(r, {"state": GATE_STATE_APPLIED, "masks_applied": False})
+                 or _exclusion_cause(r, {"state": GATE_STATE_APPLIED}))
+    return NOTICE_PHRASES.get(cause, "") if cause else ""
+
+
+def regate_clause(gate: dict | None) -> str:
+    """What happened to a gate that owes a re-gate, as a fixed clause of `NOTICE_CLAUSES` --
+    "the evidence gate failed (...)", "... could not measure metric scale (...)", or the consensus
+    a stop deferred -- for the finisher's given-up sentence, which puts its own ending after it."""
+    g = gate if isinstance(gate, dict) else {}
+    cause = _gate_cause(g) or ("gate-failed" if g.get("state") == GATE_STATE_FAILED else "depth-unavailable")
+    return NOTICE_CLAUSES[cause]
