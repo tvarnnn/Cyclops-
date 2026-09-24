@@ -340,7 +340,7 @@ def test_the_allow_list_admits_only_the_rooms_groups_and_the_hooks_off_are_today
 
 
 # ---------------------------------------------------------------------------
-# RV9-A P6: a keyframe every draw attached is never withheld
+# RV9-A P6 -> review V10, MED-4: the GROUP-level vote decides; `unanimous_keyframes` is recorded, for audit
 
 
 def _pure_draw(kids, room, room_groups, outside):
@@ -356,11 +356,12 @@ def _rng(prefix, n, start=0):
     return [f"{prefix}{i:04d}" for i in range(start, start + n)]
 
 
-def test_p6_a_group_holding_keyframes_every_draw_attached_is_kept_not_withheld():
+def test_p6_a_group_holding_keyframes_every_draw_attached_is_withheld_whole_and_says_how_many():
     """G (40 kf) in the published draw's room: 15 of its keyframes are in every draw's anchor block, 25 only in
-    draw 0's room. Voted as one unit G gets [T, F, F], and it used to be withheld whole -- 15 unanimous keyframes
-    published `seed-unstable`, and nothing said so. Decided: the gate's unit stays, decision `kept`, with the
-    count of its unanimous keyframes; its 25 minority keyframes are held against the majority."""
+    draw 0's room. Voted as one unit G gets [T, F, F]. P3.6 kept it whole (`kept`) because it held a unanimous
+    keyframe -- and with it 25 keyframes 2 of 3 draws did not attach (review V10, MED-4). Decided (P3.7): the
+    group-level vote decides, as at 6d4b567: G is withheld, `seed-unstable`; RV9-A P6's cost (15 unanimous
+    keyframes withheld with it) is accepted as conservative, and recorded as `unanimous_keyframes`."""
     A, Ga, Gb, P, Q = _rng("a", 100), _rng("g", 25), _rng("g", 15, 25), _rng("p", 50), _rng("q", 50)
     kids = A + Ga + Gb + P + Q
     d0 = _pure_draw(kids, set(kids), [(A[0], A, True), (Ga[0], Ga + Gb, False), (P[0], P, False),
@@ -373,10 +374,9 @@ def test_p6_a_group_holding_keyframes_every_draw_attached_is_kept_not_withheld()
     assert out["chosen"] == 0
     g = next(x for x in out["groups"] if x["first_keyframe"] == Ga[0])
     assert g["votes"] == [True, False, False] and g["keyframes"] == 40
-    assert g["decision"] == CP.DECISION_KEPT and g["unanimous_keyframes"] == 15
-    assert out["withhold"] == []
-    room = set(kids)
-    assert CP.held_against_majority(room, out["tally"], len(out["voting"])) == 25
+    assert g["decision"] == CP.DECISION_SEED_UNSTABLE and g["unanimous_keyframes"] == 15
+    assert out["withhold"] == [Ga[0].upper()]
+    assert not hasattr(CP, "DECISION_KEPT")
 
 
 def test_a_group_with_no_unanimous_keyframe_is_still_withheld():
@@ -387,7 +387,7 @@ def test_a_group_with_no_unanimous_keyframe_is_still_withheld():
     d2 = _pure_draw(kids, set(A + P), [(A[0], A, True), (P[0], P, False)], {**{k: 1 for k in G}, **{k: 2 for k in Q}})
     out = CP.decide_consensus([d0, d1, d2], kid_of_name={k.upper(): k for k in kids}, min_obs=30)
     g = next(x for x in out["groups"] if x["first_keyframe"] == G[0])
-    assert g["decision"] == CP.DECISION_SEED_UNSTABLE and "unanimous_keyframes" not in g
+    assert g["decision"] == CP.DECISION_SEED_UNSTABLE and g["unanimous_keyframes"] == 0
     assert out["withhold"] == [G[0].upper()]
 
 

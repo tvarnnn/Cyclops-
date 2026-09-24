@@ -68,6 +68,22 @@ def _depth(monkeypatch, *, fail_calls=(), detail=OOM, stop=None, stop_on_call=No
     return calls
 
 
+def _short_scale(monkeypatch, *, short_calls=()):
+    """The metric scale: the n-th call (1-based) in `short_calls` measures no camera -- the scale fail-safe WITH
+    DEPTH IN HAND, which is not retryable (a re-gate would reproduce it). Review V10, L-1 made a RETRYABLE
+    non-voting draw defer the consensus, so a non-voting draw that leaves it `partial` is this one."""
+    real = CP.measure_metric_scale
+    calls = {"n": 0}
+
+    def metric(solution, name_of, db, work):
+        calls["n"] += 1
+        out = real(solution, name_of, db, work)
+        return dict(out, metric_log={}) if calls["n"] in short_calls else out
+
+    monkeypatch.setattr(CP, "measure_metric_scale", metric)
+    return calls
+
+
 def _single(world):
     return CP.gate_final_solution(_Store(), "w1", SID, _candidate(world.pieces), database_path="db",
                                   keyframes=world.keyframes)
@@ -82,10 +98,11 @@ def _without(record, *keys):
 
 
 def test_a_draw_whose_gate_took_a_fail_safe_does_not_vote(world, monkeypatch):
-    """Three identical draws; draw 2's depth stage runs out of GPU memory, so its gate attaches nothing. It used to
-    vote every piece "detached" -- every group ambiguous 2-1. It does not vote: two draws do, unanimously, and
-    the consensus says `partial`, 2 of 3."""
-    _depth(monkeypatch, fail_calls=(3,))
+    """Three identical draws; draw 2's gate measures too little metric scale (depth in hand: not retryable), so it
+    attaches nothing. It used to vote every piece "detached" -- every group ambiguous 2-1. It does not vote: two
+    draws do, unanimously, and the consensus says `partial`, 2 of 3. (A RETRYABLE fail-safe -- a depth stage out of
+    GPU memory -- defers the consensus instead: review V10, L-1, `test_world_builder_consensus_v10.py`.)"""
+    _short_scale(monkeypatch, short_calls=(3,))
     result, calls = _consensus(world, [(), (), ()])
     c = result.record["consensus"]
     assert calls == [8, 9]
@@ -98,11 +115,11 @@ def test_a_draw_whose_gate_took_a_fail_safe_does_not_vote(world, monkeypatch):
 
 
 def test_with_one_voting_draw_draw_0_is_published_unchanged(world, monkeypatch):
-    """Draws 1 and 2 both take the fail-safe. The fail-safe draw -- its room the anchor block -- used to agree best
-    with a "consensus" of fail-safes and be PUBLISHED. With one voting draw there is no vote: draw 0, as the
-    single gate publishes it."""
+    """Draws 1 and 2 both take the (non-retryable) fail-safe. The fail-safe draw -- its room the anchor block --
+    used to agree best with a "consensus" of fail-safes and be PUBLISHED. With one voting draw there is no vote:
+    draw 0, as the single gate publishes it."""
     single = _single(world)
-    _depth(monkeypatch, fail_calls=(2, 3))
+    _short_scale(monkeypatch, short_calls=(2, 3))
     result, _ = _consensus(world, [(), (), ()])
     c = result.record["consensus"]
     assert c["state"] == CP.CONSENSUS_PARTIAL and c["votes"]["draws"] == 1

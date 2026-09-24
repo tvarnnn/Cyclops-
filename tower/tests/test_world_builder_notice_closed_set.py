@@ -185,13 +185,18 @@ def test_the_closed_set_passes_the_phones_guard_verbatim():
 
 
 @pytest.mark.parametrize("name", sorted(RAW))
-def test_the_raw_text_stays_in_the_detail_and_the_record(name):
+def test_the_raw_text_stays_in_the_record_and_the_detail_quotes_it_client_safe(name):
+    """The record keeps the raw text; the finalization's `detail` quotes it as `client_safe_detail` makes it --
+    the exception class and a short message, no path, one line (review V10, MED-5: `detail` reaches the phone and
+    the unauthenticated socket, so the P3.6 "raw text in the detail" was a leak)."""
     transients, gate, _ = RAW[name]
     before = copy.deepcopy((transients, gate))
     detail = CP.publish_detail({"transients": transients, "gate": gate})
     raw = gate.get("detail") or (gate.get("depth") or {}).get("detail") or transients.get("detail")
     if CP.notice_causes({"transients": transients, "gate": gate})[0] not in ("masks-gpu-oom", "masks-off"):
-        assert raw in detail, "the diagnostics are the detail's"
+        assert CP.client_safe_detail(raw, max_chars=CP.WHY_MAX_CHARS) in detail, "the diagnostics are the detail's"
+    assert "\n" not in detail and "Traceback" not in detail and not re.search(r"[A-Za-z]:[\\/]", detail)
+    assert "\\" not in detail and "tvllo" not in detail
     assert (transients, gate) == before, "the records keep their text"
 
 

@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -176,7 +177,7 @@ def _depth_params():
 
 
 def run_gate_depth(store, world_id: str, session_id: str, solution, intrinsics, *,
-                   should_stop=None) -> tuple[dict, Path, object]:
+                   should_stop=None, hold: list | None = None) -> tuple[dict, Path, object]:
     """The product depth stage on the candidate solve: `(align, work_dir, dparams)`.
 
     Under the session's surface lock (`surface_pipeline._SurfaceLock`), the one every writer of
@@ -189,7 +190,12 @@ def run_gate_depth(store, world_id: str, session_id: str, solution, intrinsics, 
     consensus read the prediction the first gated build made, and only the fit to THIS solve is redone.
     The older reuse path (`reusable_predictions`, offered from a previous `align.json`) is not taken
     here: a prediction it offers may predate the cache, and then two builds of one walk could disagree
-    on it."""
+    on it.
+
+    `hold` (review V10, L-17): a list the caller owns. On success the surface lock is NOT released
+    here but appended to it, and the caller releases it once it has READ `work/` -- the gate, after
+    its metric scale (`_gate`). Released here, a densify could replace `work/<ki>_pred.npy` between
+    this stage and that read. On failure the lock is always released here."""
     from tower.world_builder.dense_pipeline import (  # noqa: PLC0415
         dense_dir,
         run_depth_stage,
@@ -206,20 +212,31 @@ def run_gate_depth(store, world_id: str, session_id: str, solution, intrinsics, 
     lock = _SurfaceLock(surface_dir(store, world_id, session_id))
     if not lock.acquire():
         raise DepthUnavailable("another surface build of this session holds its lock")
+    handed_on = False
     try:
-        align = run_depth_stage(store, world_id, session_id, _all_posed_in_component_zero(solution),
-                                intrinsics, dparams, root, should_stop=should_stop, prior=None,
-                                prediction_cache=True)
-    except DepthUnavailable:
-        raise
-    except Exception as exc:  # noqa: BLE001 -- model missing, CUDA OOM, a camera mismatch: all "no depth"
-        raise DepthUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        try:
+            align = run_depth_stage(store, world_id, session_id, _all_posed_in_component_zero(solution),
+                                    intrinsics, dparams, root, should_stop=should_stop, prior=None,
+                                    prediction_cache=True)
+        except DepthUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- model missing, CUDA OOM, a camera mismatch: all "no depth"
+            raise DepthUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        if align.get("stopped_after") is not None:
+            raise DepthUnavailable(f"{DEPTH_STOPPED}: the depth stage was stopped after "
+                                   f"{align.get('stopped_after')} frames")
+        if hold is not None:
+            hold.append(lock)
+            handed_on = True
     finally:
-        lock.release()
-    if align.get("stopped_after") is not None:
-        raise DepthUnavailable(f"{DEPTH_STOPPED}: the depth stage was stopped after "
-                               f"{align.get('stopped_after')} frames")
+        if not handed_on:
+            lock.release()
     return align, root / "work", dparams
+
+
+# The product depth stage itself, for `_gate` to tell it from a caller's `depth_runner` (a test's fake, or the
+# consensus's re-use of a draw's depth): only the product stage is handed the surface lock to keep (L-17).
+_PRODUCT_DEPTH_RUNNER = run_gate_depth
 
 
 def measure_metric_scale(solution, name_of: dict[str, str], database_path, work) -> dict:
@@ -526,43 +543,57 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
     name_of = _image_names(keyframes)
     session = store.read_session(world_id, session_id)
 
-    # 1. depth before publish
-    t = time.perf_counter()
-    depth = None
-    depth_record: dict = {"state": DEPTH_OK}
+    # 1. depth before publish, and 2. the metric scale that reads its predictions -- both under the
+    # session's surface lock when the product depth stage runs (review V10, L-17: it used to be released
+    # between them, so a densify could replace `work/` before the scale read it).
+    held: list = []
     try:
-        align, work, dparams = depth_runner(store, world_id, session_id, solution, session.intrinsics,
-                                            should_stop=should_stop)
-        depth = {"align": align, "work": work, "dparams": dparams}
-        depth_record.update({"backend": align.get("backend"), "known_fov": align.get("known_fov"),
-                             "frames": align.get("targets"), "image_origins": align.get("image_origins")})
-        cache = align.get("prediction_cache")
-        if isinstance(cache, dict):
-            # Where the predictions came from (R3): the cache, or the network this time.
-            depth_record["predictions"] = {"token": cache.get("token"), "cached": cache.get("hits"),
-                                           "predicted": cache.get("predicted")}
-    except DepthUnavailable as exc:
-        detail = str(exc)
-        depth_record = {"state": DEPTH_STOPPED if detail.startswith(DEPTH_STOPPED) else DEPTH_UNAVAILABLE,
-                        "detail": detail}
-        logger.warning("[Tower][WorldBuilder] gate %s/%s: no metric depth (%s); the gate attaches nothing "
-                       "(scale-unavailable)", world_id, session_id, detail)
-    depth_record["seconds"] = round(time.perf_counter() - t, 3)
+        t = time.perf_counter()
+        depth = None
+        depth_record: dict = {"state": DEPTH_OK}
+        try:
+            if depth_runner is _PRODUCT_DEPTH_RUNNER:
+                align, work, dparams = depth_runner(store, world_id, session_id, solution, session.intrinsics,
+                                                    should_stop=should_stop, hold=held)
+            else:
+                align, work, dparams = depth_runner(store, world_id, session_id, solution, session.intrinsics,
+                                                    should_stop=should_stop)
+            depth = {"align": align, "work": work, "dparams": dparams}
+            depth_record.update({"backend": align.get("backend"), "known_fov": align.get("known_fov"),
+                                 "frames": align.get("targets"), "image_origins": align.get("image_origins")})
+            cache = align.get("prediction_cache")
+            if isinstance(cache, dict):
+                # Where the predictions came from (R3): the cache, or the network this time -- and how many
+                # could not be written to the cache (review V10, L-18; absent from a stage that predates it).
+                depth_record["predictions"] = {"token": cache.get("token"), "cached": cache.get("hits"),
+                                               "predicted": cache.get("predicted")}
+                if "write_failed" in cache:
+                    depth_record["predictions"]["write_failed"] = cache.get("write_failed")
+        except DepthUnavailable as exc:
+            detail = str(exc)
+            depth_record = {"state": DEPTH_STOPPED if detail.startswith(DEPTH_STOPPED) else DEPTH_UNAVAILABLE,
+                            "detail": detail}
+            logger.warning("[Tower][WorldBuilder] gate %s/%s: no metric depth (%s); the gate attaches nothing "
+                           "(scale-unavailable)", world_id, session_id, detail)
+        depth_record["seconds"] = round(time.perf_counter() - t, 3)
 
-    # 2. metric scale
-    t = time.perf_counter()
-    metric_log: dict = {}
-    scale = None
-    scale_record: dict = {"scale": CS.SCALE_ID, "params": CS.ScaleParams().to_json(),
-                          "params_digest": CS.ScaleParams().digest()}
-    if depth is not None:
-        scale = metric_fn(solution, name_of, database_path, depth["work"])
-        metric_log = scale["metric_log"]
-        scale_record.update({k: scale.get(k) for k in ("cameras_published", "cameras_measured", "pairs_used",
-                                                        "inliers_total", "inliers_gated",
-                                                        "frames_without_prediction")})
-    scale_record["state"] = "measured" if metric_log else "unavailable"
-    scale_record["seconds"] = round(time.perf_counter() - t, 3)
+        # 2. metric scale
+        t = time.perf_counter()
+        metric_log: dict = {}
+        scale = None
+        scale_record: dict = {"scale": CS.SCALE_ID, "params": CS.ScaleParams().to_json(),
+                              "params_digest": CS.ScaleParams().digest()}
+        if depth is not None:
+            scale = metric_fn(solution, name_of, database_path, depth["work"])
+            metric_log = scale["metric_log"]
+            scale_record.update({k: scale.get(k) for k in ("cameras_published", "cameras_measured",
+                                                            "pairs_used", "inliers_total", "inliers_gated",
+                                                            "frames_without_prediction")})
+        scale_record["state"] = "measured" if metric_log else "unavailable"
+        scale_record["seconds"] = round(time.perf_counter() - t, 3)
+    finally:
+        for lock in held:
+            lock.release()
 
     # 3. the gate
     t = time.perf_counter()
@@ -638,14 +669,16 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
 #      skipped has no attachment to vote with -- counting it would vote every piece "detached". Per published
 #      keyframe, "attached to the room" in each voting draw; consensus = a strict majority of the VOTING draws.
 #      Fewer voting draws than requested: `partial`, with the count; fewer than 2: draw 0 is published as one
-#      draw would be. A stop that cost a draw its vote: draw 0 is published, `deferred` (the re-gate in place
-#      runs the consensus).
+#      draw would be. A stop that cost a draw its vote, or a further draw whose gate could not finish for a
+#      RETRYABLE cause (review V10, L-1): draw 0 is published, `deferred` (the re-gate in place runs the
+#      consensus) -- never a vote of the draws that happened to finish.
 #   4. PUBLISH the draw whose attach vector agrees with the consensus on the most keyframes (ties: the lowest
-#      seed). Its GROUPS -- the gate's own candidate groups in its room, and each of its unplaced components --
+#      draw). Its GROUPS -- the gate's own candidate groups in its room, and each of its unplaced components --
 #      are voted on by keyframe overlap (a group is attached in a draw when most of its keyframes are). A group
-#      of its room that fewer than a strict majority of draws attached is WITHHELD, unless one of its keyframes
-#      was attached by EVERY voting draw: a keyframe every draw attached is never withheld (review V9, RV9-A P6),
-#      and the group -- the gate's unit -- stays, decision `kept`. The room's anchor group is never withheld. A
+#      of its room that fewer than a strict majority of draws attached is WITHHELD whole, whatever its unanimous
+#      keyframes (review V10, MED-4: the `kept` exception of P3.6 let one boundary keyframe keep a minority group
+#      in the room; RV9-A P6's cost is accepted as conservative). The count of its keyframes every voting draw
+#      attached is recorded (`unanimous_keyframes`), for audit only. The room's anchor group is never withheld. A
 #      group the majority attached but the published draw did not stays unplaced: no geometry is invented.
 #   5. THE WITHHOLD RE-GATE (review V9, H-1). The chosen draw is gated again (the same depth and scale, CPU only)
 #      with the withheld groups SEALED (each a piece of its own; `coherence_gate.apply_gate(withhold=...)`) and the
@@ -657,15 +690,23 @@ def _gate(store, world_id, session_id, solution, *, database_path, keyframes, sh
 #      `no-verified-link` whatever its links). Otherwise the consensus is `not-applied`, with why, and the chosen
 #      draw is published as it was gated.
 #   6. RECORD `gate.consensus` (additive, Tower-internal §2.5), and each draw's per-round gate decisions in
-#      `solve/<session>/consensus.json` (review V8 LOW: "gate per-round decisions not persisted").
+#      `solve/<session>/consensus.json` (review V8 LOW: "gate per-round decisions not persisted"). Every state
+#      carries the vote keys (`groups`, `pieces`, `detached`, `ambiguous`, `held_against_majority`; empty when it
+#      did not vote -- review V10, L-4). On `not-applied` a group the vote would have withheld reads `not-withheld`.
 # A consensus whose first draw took a fail-safe (nothing attached) has nothing to vote on: `not-needed`, or
 # `deferred` when that fail-safe is owed a re-gate -- the re-gate in place then runs the consensus.
+#
+# A STOP NEVER REACHES DRAW 0 OF A STOPPED CONSENSUS (review V10, MED-1b). With `stopped` (the solve's draw loop,
+# and its early publish), draw 0 is gated as N = 1 gates it -- WITHOUT the stop, which would otherwise stop draw
+# 0's own depth stage and publish its scale fail-safe. And a writer that already published this solve
+# (`regate_published`; `gate_and_publish(keep_on_stop=True)`) writes NOTHING when a stop reached draw 0's depth
+# stage: a published room is never replaced by an anchor-only fail-safe because a capture started.
 #
 # HELD AGAINST THE MAJORITY (review V9, M-2; manager 025, decision 2; reporting only, no rule).
 # `gate.consensus.held_against_majority` counts the published keyframes in the PUBLISHED room that a strict
 # majority of the VOTING draws did not attach -- anchor-absorbed keyframes included, which no group names and the
-# consensus cannot withhold (the anchor is never withheld), and a `kept` group's minority keyframes. It is the
-# visible size of the residual risk: marginal pieces inside the anchor block are not re-verified by the vote.
+# consensus cannot withhold (the anchor is never withheld). It is the visible size of the residual risk: marginal
+# pieces inside the anchor block are not re-verified by the vote.
 
 CONSENSUS_FILENAME = "consensus.json"
 CONSENSUS_RECORD = "wb-gate-consensus/1"
@@ -682,13 +723,32 @@ CONSENSUS_NOT_APPLIED = "not-applied"  # the withhold re-gate failed its checks;
 CAUSE_CONSENSUS_DEFERRED = "consensus-deferred"
 WHY_STOPPED = ("a stop was asked for before the further draws voted; draw 0 is published as one draw would "
                "be, and the re-gate in place runs the consensus")
+# Review V10, L-1: a further draw's gate could not finish for a cause a re-run can cure (its depth stage: GPU
+# memory, the surface lock, the network; or the gate itself failed), so it could not vote.
+WHY_DRAW_UNFINISHED = ("a further draw's gate could not finish (a cause the re-gate in place can cure), so it "
+                       "could not vote; draw 0 is published as one draw would be, and the re-gate in place runs "
+                       "the consensus")
+# Review V10, MED-1(a) (the solve's early publish, `stopped=True, why_deferred=WHY_PUBLISHED_FIRST`): draw 0 is
+# published before any further draw is mapped, so a kill during the draws still leaves a finished world.
+WHY_PUBLISHED_FIRST = ("draw 0 is published first, before the further draws are mapped; the consensus replaces "
+                       "it once they have voted, and if they never do the re-gate in place runs it")
+# Review V10, MED-1(b): what `gate_and_publish(keep_on_stop=True)` and `regate_published` say when a stop reached
+# draw 0's own depth stage and they therefore wrote nothing.
+WHY_KEPT_ON_STOP = ("a stop reached draw 0's depth stage, so nothing was published; the solve published before "
+                    "stands")
 DECISION_ANCHOR = "anchor"
 DECISION_ATTACHED = "attached"
 DECISION_SEED_UNSTABLE = CG.REASON_SEED_UNSTABLE
 DECISION_UNPLACED = "unplaced"
-# A room group fewer than a strict majority of draws attached, kept because some of its keyframes every voting
-# draw attached (`unanimous_keyframes`): a keyframe every draw attached is never withheld (step 4).
-DECISION_KEPT = "kept"
+# Review V10, L-4: the vote would have withheld this room group (`seed-unstable`), but the withhold re-gate failed
+# its checks (consensus `not-applied`), so the chosen draw is published as it was gated -- the group in its room.
+DECISION_NOT_WITHHELD = "not-withheld"
+
+
+def _no_vote() -> dict:
+    """The vote keys every consensus record carries, whatever its state (review V10, L-4): a state that did not
+    vote has them empty, so no reader needs a per-state key list."""
+    return {"groups": [], "pieces": [], "detached": [], "ambiguous": [], "held_against_majority": 0}
 
 
 @dataclasses.dataclass
@@ -701,8 +761,13 @@ class ConsensusPlan:
     map_draw: Callable | None = None
     refusal: str | None = None
     unit: str = DRAW_UNIT_MAPPER_SEED
+    # The draws' seeds in draw order, when they are not `seed, seed + 1, ...` (review V10, L-5: a re-gate of a
+    # published draw k maps its own seed as draw 0 and the others' after it). None: `seed + k`.
+    seed_list: list | None = None
 
     def seeds(self) -> list:
+        if self.seed_list is not None:
+            return [int(s) for s in list(self.seed_list)[:int(self.draws)]]
         return [None if self.seed is None else int(self.seed) + k for k in range(int(self.draws))]
 
 
@@ -772,10 +837,13 @@ def decide_consensus(results: list, *, kid_of_name: dict, min_obs: int = 30) -> 
             elif u["in_room"] and majority:
                 decision = DECISION_ATTACHED
             elif u["in_room"]:
-                unanimous = sum(1 for kid in kids if votes.get(kid, 0) == n)
-                decision = DECISION_KEPT if unanimous else DECISION_SEED_UNSTABLE
-                if unanimous:
-                    extra["unanimous_keyframes"] = unanimous
+                # THE GROUP-LEVEL VOTE DECIDES (review V10, MED-4): a room group fewer than a strict majority
+                # of the voting draws attached is withheld whole, whatever its unanimous keyframes -- the gate's
+                # unit is the group, and one boundary keyframe every seed happens to hold must not keep a
+                # minority attachment in the room (RV9-A P6's cost is accepted as conservative). How many of its
+                # keyframes every voting draw attached is recorded, for audit only.
+                decision = DECISION_SEED_UNSTABLE
+                extra["unanimous_keyframes"] = sum(1 for kid in kids if votes.get(kid, 0) == n)
             else:
                 decision = DECISION_UNPLACED
             if decision == DECISION_SEED_UNSTABLE:
@@ -909,17 +977,34 @@ def keep_outside_pieces(chosen: GateResult, regated: GateResult, withheld_kids: 
     return None
 
 
+def draw_0_stopped(result) -> bool:
+    """Whether a stop reached the depth stage of the gate that produced `result` (draw 0's, for a consensus:
+    only draw 0's record is published with its own depth). Such a result is the scale fail-safe, and a writer
+    that already published this solve must not replace it with that (review V10, MED-1b)."""
+    record = getattr(result, "record", None) or {}
+    depth = record.get("depth")
+    return (record.get("state") == GATE_STATE_APPLIED and isinstance(depth, dict)
+            and depth.get("state") == DEPTH_STOPPED)
+
+
 def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: ConsensusPlan, database_path,
                       keyframes, should_stop=None, params: "CG.GateParams | None" = None,
-                      gate_runner: Callable | None = None, stopped: bool = False) -> GateResult:
+                      gate_runner: Callable | None = None, stopped: bool = False,
+                      why_deferred: str | None = None) -> GateResult:
     """The consensus (see above) on `solution`, draw 0. Never raises: a draw that cannot be mapped or gated
     does not vote, and with nothing to vote on the first draw is published exactly as `gate_final_solution`
     gave it. The published result's record carries `consensus`; `consensus_detail` holds what
     `after_publish` persists. `gate_runner` replaces `gate_final_solution` (tests).
 
     `stopped` (review V9, M-3; the solve's draw loop): a stop was asked for before the further draws -- none
-    is mapped, and draw 0 is published as N = 1 publishes it, `deferred`. `should_stop` is also asked between
-    draws, with the same outcome: a stop never loses the finish, and the re-gate in place owes the consensus."""
+    is mapped, and draw 0 is published as N = 1 publishes it, `deferred`. Draw 0 is then gated WITHOUT
+    `should_stop` (review V10, MED-1b), exactly as N = 1 gates it: handed on, the stop reached draw 0's own
+    depth stage and published its scale fail-safe, so this branch was unreachable. `why_deferred` replaces
+    the record's `why` (`WHY_STOPPED`) -- the solve's early publish says `WHY_PUBLISHED_FIRST`.
+
+    `should_stop` is asked between the further draws and reaches their gates: a stop there publishes draw 0,
+    `deferred`, and the re-gate in place owes the consensus. So does a further draw whose gate could not
+    finish for a retryable cause (review V10, L-1)."""
     from tower.world_builder.global_solve import solve_identity  # noqa: PLC0415
 
     params = params or CG.GateParams()
@@ -941,12 +1026,17 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
     def gate(candidate, **kw):
         if gate_runner is None:
             kw.setdefault("link_reader", link_reader)
+        kw.setdefault("should_stop", should_stop)
         return run(store, world_id, session_id, candidate, database_path=database_path, keyframes=keyframes,
-                   should_stop=should_stop, params=params, **kw)
+                   params=params, **kw)
 
-    first = gate(solution)
+    # A stop already asked for does not reach draw 0 (MED-1b): it is gated as N = 1 gates it.
+    first = gate(solution, should_stop=None) if stopped else gate(solution)
 
     def done(result, record, detail=None):
+        record = dict(record)
+        for key, empty in _no_vote().items():
+            record.setdefault(key, empty)
         result.record = dict(result.record, consensus=dict(
             base, **record, seconds=round(time.perf_counter() - started, 3)))
         result.consensus_detail = detail
@@ -964,12 +1054,13 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
     if stopped:
         # A STOP BEFORE THE FURTHER DRAWS (review V9, M-1 and M-3): draw 0 is published as N = 1
         # would publish it, and the consensus is owed to the re-gate in place.
-        return done(_owe_consensus(first), {"state": CONSENSUS_DEFERRED, "why": WHY_STOPPED})
+        return done(_owe_consensus(first), {"state": CONSENSUS_DEFERRED, "why": why_deferred or WHY_STOPPED})
     name_of = _image_names(keyframes)
     kid_of_name = {v: k for k, v in name_of.items()}
     results = [first]
     draws = [{"draw": 0, "seed": seeds[0], "map_s": None, "gate_s": first.record.get("seconds")}]
     stop_cost_a_vote = False
+    unfinished = False          # a further draw's gate could not finish, for a retryable cause (L-1)
     for k in range(1, requested):
         if should_stop is not None and should_stop():
             draws.append({"draw": k, "seed": seeds[k], "skipped": "a stop was asked for"})
@@ -989,6 +1080,11 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
         draws.append({"draw": k, "seed": seeds[k], "map_s": map_s, "gate_s": result.record.get("seconds")})
         if not draw_votes(result) and (result.record.get("depth") or {}).get("state") == DEPTH_STOPPED:
             stop_cost_a_vote = True          # the stop reached this draw's depth stage: it cannot vote
+        elif not draw_votes(result) and result.record.get("retryable"):
+            # Its gate could not finish for a cause a re-run can cure -- GPU memory, the surface lock, the
+            # network, or the gate itself failing (review V10, L-1). A vote of the draws that did finish
+            # would publish a smaller electorate for good (with 2 voters a strict majority is unanimity).
+            unfinished = True
     mapped = [d for d in draws if "map_s" in d]          # one per entry of `results`, in draw order
     decision = decide_consensus(results, kid_of_name=kid_of_name, min_obs=params.min_obs)
     voting = decision["voting"]
@@ -1007,10 +1103,12 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
                 "solve_identity": solve_identity(published.solution),
                 "draws": [dict(info, rounds=(r.gated or {}).get("rounds")) for info, r in zip(mapped, results)]}
 
-    if stop_cost_a_vote and len(voting) < requested:
-        # A stop cost a draw its vote (review V9, M-1): draw 0, as one draw publishes it; owed.
+    if (stop_cost_a_vote or unfinished) and len(voting) < requested:
+        # A stop cost a draw its vote (review V9, M-1), or a draw's gate could not finish for a retryable
+        # cause (review V10, L-1): draw 0, as one draw publishes it; owed to the re-gate in place.
         published = _owe_consensus(first)
-        return done(published, {"state": CONSENSUS_DEFERRED, "why": WHY_STOPPED, "draws": draws,
+        why = WHY_STOPPED if stop_cost_a_vote else WHY_DRAW_UNFINISHED
+        return done(published, {"state": CONSENSUS_DEFERRED, "why": why, "draws": draws,
                                 "votes": {"draws": len(voting)}, "chosen": {"draw": 0, "seed": seeds[0]}},
                     detail_of(published))
     if len(voting) < 2:
@@ -1062,6 +1160,10 @@ def gate_by_consensus(store, world_id: str, session_id: str, solution, *, plan: 
             record["why"] = (f"withholding the seed-unstable groups failed its check ({refusal}); the chosen "
                              "draw is published as it was gated")
             record["detached"] = []
+            # The groups the vote would have withheld are published in the room (review V10, L-4): their
+            # decision says so, and their votes still say why they were in dispute.
+            record["groups"] = [dict(g, decision=DECISION_NOT_WITHHELD) if g["decision"] == DECISION_SEED_UNSTABLE
+                                else g for g in groups]
     record["held_against_majority"] = held_against_majority(
         _room_kids(published.solution, params.min_obs), decision["tally"], len(voting))
     detail = detail_of(published)
@@ -1100,7 +1202,8 @@ def after_publish(store, world_id: str, session_id: str, workspace_root, solutio
 def gate_and_publish(store, world_id: str, session_id: str, workspace, solution, *, final: bool,
                      gate: bool | None = None, database_path, keyframes, write: Callable,
                      should_stop=None, consensus: ConsensusPlan | None = None,
-                     stopped: bool = False) -> tuple[object, dict | None]:
+                     stopped: bool = False, why_deferred: str | None = None,
+                     keep_on_stop: bool = False) -> tuple[object, dict | None]:
     """The final solve's publish step, in one call (`global_solve.solve` makes it in place of
     `write_solution`): the gate when `gate_setting_for(final, gate)`, then `write(workspace, solution)`,
     then the record and the depth hand-off. Returns (the published solution, its gate record or None).
@@ -1109,18 +1212,29 @@ def gate_and_publish(store, world_id: str, session_id: str, workspace, solution,
     left by an earlier gated solve is moved aside: it does not describe this solve.
 
     `consensus`: a plan of two or more draws (`TOWER_WORLD_SOLVE_CONSENSUS`) gates by `gate_by_consensus`;
-    None, the default, is the single gate of today. `stopped`: `gate_by_consensus`'s -- a stop was asked
-    for before the further draws: draw 0 is published as N = 1 would, the consensus `deferred`. Ignored
-    without a consensus plan."""
+    None, the default, is the single gate of today. `stopped` and `why_deferred`: `gate_by_consensus`'s -- a
+    stop was asked for before the further draws (or the solve publishes draw 0 first, review V10 MED-1a):
+    draw 0 is gated without the stop and published as N = 1 would, the consensus `deferred`. Ignored
+    without a consensus plan.
+
+    `keep_on_stop` (review V10, MED-1b; for a caller that ALREADY published this solve, such as the solve's
+    second pass after its early publish): when a stop reached the depth stage of draw 0's gate, nothing is
+    written -- not the solution, not the record, not the depth -- and `(None, record)` is returned, the
+    record's `publish` saying so (`{"written": False, "why": WHY_KEPT_ON_STOP}`). False, the default, is
+    today's: such a result is published (a stop never loses a finish that has nothing published yet)."""
     result = None
     if gate_setting_for(final, gate):
         if consensus is not None and int(consensus.draws) >= 2:
             result = gate_by_consensus(store, world_id, session_id, solution, plan=consensus,
                                        database_path=database_path, keyframes=keyframes,
-                                       should_stop=should_stop, stopped=stopped)
+                                       should_stop=should_stop, stopped=stopped, why_deferred=why_deferred)
         else:
             result = gate_final_solution(store, world_id, session_id, solution, database_path=database_path,
                                          keyframes=keyframes, should_stop=should_stop)
+        if keep_on_stop and draw_0_stopped(result):
+            logger.info("[Tower][WorldBuilder] %s/%s: a stop reached draw 0's depth stage; nothing is "
+                        "published, and the solve published before stands", world_id, session_id)
+            return None, dict(result.record, publish={"written": False, "why": WHY_KEPT_ON_STOP})
         solution = result.solution
         if hasattr(solution, "gate"):
             solution.gate = result.record
@@ -1181,17 +1295,43 @@ REFUSAL_NO_DRAW_CAMERA = ("the solve has no camera to map its consensus draws wi
                           "re-finish this walk")
 
 
-def _owed_consensus(solution) -> tuple[int, int | None]:
-    """(draws requested, draw 0's seed) of the consensus the published solve asked for; (1, None)
-    when it asked for none, or its record is not readable as one."""
-    owed = (getattr(solution, "gate", None) or {}).get("consensus") or {}
-    try:
-        requested = int(owed.get("requested") or 1)
-    except (TypeError, ValueError):
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _owed_consensus(solution) -> tuple[int, list | None]:
+    """(draws requested, the draws' seeds in draw order) of the consensus the published solve asked
+    for; (1, None) when it asked for none, or its record is not readable as one. The seeds are None
+    when the record names none (an unseeded solve).
+
+    CAPPED (review V10, L-5) by the setting's own rule (`config.WORLD_SOLVE_CONSENSUS_VALUES`: 1, 3, 5
+    or 7): a record that asked for anything else -- an old record with N = 30 -- is re-gated as one
+    draw, and logged, exactly as `TOWER_WORLD_SOLVE_CONSENSUS` would treat that value today.
+
+    THE PUBLISHED SOLVE IS DRAW 0 (review V10, L-5). A consensus may publish its draw k (seed s + k),
+    and then `solver_candidate` of the published solve IS draw k. Its own seed (`solve.seed`) goes
+    first, and the others of the record's seeds follow in their order: draw k's seed is never mapped a
+    second time, and seed s is not skipped."""
+    from tower.config import WORLD_SOLVE_CONSENSUS_VALUES  # noqa: PLC0415
+
+    gate = getattr(solution, "gate", None)
+    owed = gate.get("consensus") if isinstance(gate, dict) else None
+    owed = owed if isinstance(owed, dict) else {}
+    raw = owed.get("requested")
+    requested = int(raw) if _is_int(raw) else 1
+    if requested not in WORLD_SOLVE_CONSENSUS_VALUES:
+        logger.warning("[Tower][WorldBuilder] the published solve asked for a consensus of %r draws, which "
+                       "is not one of %s; it is re-gated as one draw", raw,
+                       ", ".join(str(v) for v in WORLD_SOLVE_CONSENSUS_VALUES))
         requested = 1
     seeds = owed.get("seeds")
-    seed = seeds[0] if isinstance(seeds, list) and seeds else None
-    return requested, (seed if isinstance(seed, int) and not isinstance(seed, bool) else None)
+    if not isinstance(seeds, list) or not seeds or not all(_is_int(s) for s in seeds):
+        return requested, None
+    own = (getattr(solution, "solve", None) or {}).get("seed")
+    order = list(dict.fromkeys(([own] if _is_int(own) and own in seeds else []) + seeds))
+    while len(order) < requested:
+        order.append(max(order) + 1)
+    return requested, order[:requested]
 
 
 def _draw_camera_readable(solution, workspace) -> bool:
@@ -1225,8 +1365,8 @@ def _regate_inputs(store, world_id: str, session_id: str):
     database = workspace.root / name
     if not database.is_file():
         raise RegateRefused(REFUSAL_DATABASE_GONE.format(name=name))
-    requested, seed = _owed_consensus(solution)
-    if requested >= 2 and seed is not None and not _draw_camera_readable(solution, workspace):
+    requested, seeds = _owed_consensus(solution)
+    if requested >= 2 and seeds is not None and not _draw_camera_readable(solution, workspace):
         raise RegateRefused(REFUSAL_NO_DRAW_CAMERA)
     return solution, workspace, database
 
@@ -1249,31 +1389,49 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
     moved aside, the solve itself is not redone. The caller holds the world's writer lock.
     Publishes the relabelled solution and its components record (or retires the record if
     the gate fails again). Raises `RegateRefused` before doing anything it cannot finish
-    (`regate_refusal` is the same test, read-only)."""
+    (`regate_refusal` is the same test, read-only).
+
+    A STOP THAT REACHED DRAW 0'S DEPTH STAGE WRITES NOTHING (review V10, MED-1b). Its gate took
+    the scale fail-safe -- the anchor block alone -- only because a capture started; published, it
+    replaced a room the solve had already published (a `consensus-deferred` world's attached draw
+    0). So nothing is written, and the result says `stopped: True` with the published record's
+    own `notice` and `detail`: the row is unchanged, the re-gate is still owed, and the attempt is
+    the stop's (the finisher gives back an attempt a stop ended, `forgive_attempt`)."""
     from tower.world_builder.global_solve import write_solution  # noqa: PLC0415
 
     solution, workspace, database = _regate_inputs(store, world_id, session_id)
     previous = {k: solution.gate.get(k) for k in ("state", "cause", "metric_available", "params_digest")}
     keyframes = store.read_keyframes(world_id, session_id)
     candidate = solver_candidate(solution)
-    requested, seed = _owed_consensus(solution)
+    requested, seeds = _owed_consensus(solution)
     if requested >= 2:
         # A solve that asked for a consensus is re-gated BY consensus (review V9, M-1), whatever
         # its record says -- `deferred` by its first draw's fail-safe or by a stop, or anything
         # else: a single gate here would publish one draw where the solve asked for N. Its draws
-        # are mapped now, on the database the published solve mapped.
+        # are mapped now, on the database the published solve mapped; the published solve is
+        # draw 0, with its own seed (L-5).
         from tower.world_builder.global_solve import frozen_draw_mapper  # noqa: PLC0415
 
-        plan = ConsensusPlan(draws=requested, seed=seed,
-                             map_draw=None if seed is None else frozen_draw_mapper(
+        plan = ConsensusPlan(draws=requested, seed=None if seeds is None else seeds[0], seed_list=seeds,
+                             map_draw=None if seeds is None else frozen_draw_mapper(
                                  store, world_id, session_id, database, candidate, keyframes=keyframes),
-                             refusal=None if seed is not None else "the solve was not seeded")
+                             refusal=None if seeds is not None else "the solve was not seeded")
         result = gate_by_consensus(store, world_id, session_id, candidate, plan=plan, database_path=database,
                                    keyframes=keyframes, should_stop=should_stop, gate_runner=gate_runner)
     else:
         result = (gate_runner or gate_final_solution)(store, world_id, session_id, candidate,
                                                       database_path=database, keyframes=keyframes,
                                                       should_stop=should_stop)
+    if draw_0_stopped(result):
+        logger.info("[Tower][WorldBuilder] %s/%s: a stop reached the re-gate's draw-0 depth stage; nothing "
+                    "is written, and the re-gate is still owed", world_id, session_id)
+        kept = {"gate": solution.gate, "transients": solution.transients}
+        return {"gate": {k: solution.gate.get(k) for k in ("state", "retryable", "cause", "metric_available",
+                                                             "attach", "components")},
+                "publish": {"written": False, "why": WHY_KEPT_ON_STOP},
+                "stopped": True,
+                "notice": publish_notice(kept),
+                "detail": publish_detail(kept)}
     published = result.solution
     record = dict(result.record, regate={"at": time.time(), "previous": previous})
     published.gate = record
@@ -1304,12 +1462,16 @@ def regate_published(store, world_id: str, session_id: str, *, should_stop=None,
 # Tower-written phrase. So every sentence a notice can hold is one of `NOTICE_SENTENCES`,
 # keyed by its cause, and a notice is some of them joined by "; " in §2.2's order. The raw
 # text a cause was recorded with -- an exception, a path, a memory figure -- stays where it
-# was recorded (`gate.detail`, `gate.depth.detail`, `transients.detail` in solution.json)
-# and in `publish_detail`, the diagnostic twin for the finalization's `detail`, which the
-# phone does not show. The only numbers a sentence carries are IMAGE counts, which an owner
-# can read ("12 of 400 images"); the camera counts behind a scale shortfall stay in the
-# detail. Every sentence is one line, with no slash or backslash, and far under the phone's
-# 700-character guard (Mac tip de1b045).
+# was recorded (`gate.detail`, `gate.depth.detail`, `transients.detail` in solution.json).
+# `publish_detail`, the diagnostic twin for the finalization's `detail`, carries it only as
+# `client_safe_detail` makes it: one line, no path, no traceback, short (review V10, MED-5 --
+# `detail` DOES reach the phone and the unauthenticated socket, inside `lifecycle.finalization`
+# and, for an interrupted session, inside `lifecycle.reason`). The only numbers a sentence
+# carries are IMAGE counts, which an owner can read ("12 of 400 images"); the camera counts
+# behind a scale shortfall stay in the detail. Every sentence is one line, with no slash or
+# backslash, no exception class name, no `key=value` pair, and far under the phone's
+# 700-character guard (Mac tips de1b045 and 3bb4431: `WorldTowerText` swaps any Tower text
+# that has one of those for a generic sentence; `NOTICE_SENTENCES` must never trip it).
 
 _BY_OWNER = "an owner can re-finish this walk"
 _BY_OPERATOR = ("an operator can make the transient detector run on this Tower, then an owner "
@@ -1350,7 +1512,9 @@ NOTICE_PHRASES: dict[str, str] = {
     "depth-no-intrinsics": "the walk has no camera intrinsics",
     "depth-no-camera": "the solve has no camera",
     "scale-short": "too few images had a metric depth",
-    "consensus-deferred": "the consensus of mapper seeds was stopped before its draws voted",
+    # Review V10, L-1: owed by a stop, by a further draw's retryable failure, or by the solve's early
+    # publish of draw 0 (MED-1a) -- "did not finish" is true of each; "was stopped" was not.
+    "consensus-deferred": "the consensus of mapper seeds did not finish",
 }
 
 
@@ -1374,8 +1538,7 @@ NOTICE_CLAUSES: dict[str, str] = {
     "masks-excluded": "{excluded} of {images} images could not be masked and were left out of the solve",
     "masks-excluded-uncounted": "some images could not be masked and were left out of the solve",
     "scale-short": "the evidence gate had too little metric scale to place pieces by it",
-    "consensus-deferred": ("the evidence gate's consensus of mapper seeds was stopped before its "
-                           "draws voted"),
+    "consensus-deferred": "the evidence gate's consensus of mapper seeds did not finish",
 }
 
 _OWNERS: dict[str, str] = {
@@ -1389,6 +1552,15 @@ _OWNERS: dict[str, str] = {
     **{c: _BY_IDLE_TOWER for c in ("gate-failed", "gate-failed-database", "gate-failed-memory",
                                    "consensus-deferred")},
     **{c: _BY_IDLE_REGATE for c in NOTICE_PHRASES if c.startswith("depth-")},
+    # NO IDLE RE-RUN ALONE CAN FIX THESE (review V10, L-19b): the gate is re-run on the same walk and the
+    # same solve, which still have no intrinsics or no camera, on a Tower that still has no depth model. So
+    # the sentence names who can: an owner (a new walk; a re-finish, which solves again and so has a
+    # camera), or an operator first -- once the model is installed, the idle re-run the record still owes
+    # does fix it.
+    "depth-no-intrinsics": "re-running the gate would not change this; an owner can re-capture this walk",
+    "depth-no-camera": "re-running the gate would not change this; an owner can re-finish this walk",
+    "depth-model-missing": ("an operator can install the depth model on this Tower, then the Tower re-runs "
+                            "the gate when it is idle"),
     "scale-short": ("the depth stage ran to the end, so re-running the gate would not change this; "
                     "an owner can re-capture this walk"),
 }
@@ -1417,6 +1589,140 @@ NOTICE_SCALE_SHORT = ("the evidence gate had too little metric scale to place pi
 NOTICE_GATE_FAILED = "the evidence gate failed ({why}); the Tower re-runs it when it is idle"
 
 _GATE_CAUSES = (CAUSE_DEPTH_UNAVAILABLE, CAUSE_GATE_FAILED, CAUSE_CONSENSUS_DEFERRED)
+
+
+def _dict(value) -> dict:
+    """A record's sub-record, or {} when it is absent or not a dict (review V10, L-19d: a malformed
+    `gate.depth` made `publish_notice` raise)."""
+    return value if isinstance(value, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# raw text made client-safe (review V10, MED-5)
+#
+# `finalization.detail` reaches the phone and the unauthenticated `/ws` socket (inside
+# `lifecycle.finalization`, and inside `lifecycle.reason` for an interrupted session), so the raw
+# text it quotes is made client-safe the way `logging_config.client_safe_reason` makes an exception
+# client-safe, but for TEXT, which is what a record holds: no path (and so no user name: the paths
+# that carry one are home directories), no traceback, one line. The full text stays in the
+# Tower's log and in solution.json's own records (`gate.detail`, `gate.depth.detail`,
+# `transients.detail`), which are Tower-internal. Text with none of those comes back unchanged, so
+# an old record whose detail is already clean renders byte for byte as before.
+
+# A `why` in `publish_detail` is the exception class and a SHORT message. OPEN: a presentation
+# bound, not a measured one -- torch's CUDA out-of-memory message runs to about 500 characters,
+# and its first sentence, the part an operator acts on, to about 100.
+WHY_MAX_CHARS = 200
+PATH_PLACEHOLDER = "[path]"
+_TRACEBACK = "Traceback (most recent call last)"
+# An exception class: a CamelCase name ending as Python's own do, optionally dotted (`torch.OutOfMemoryError`).
+_EXCEPTION_NAME = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception|Interrupt|Exit|Warning)\b")
+# A CamelCase name directly followed by ": " -- how `f"{type(exc).__name__}: {exc}"` begins, whatever the
+# suffix (`DepthModelUnavailable: ...`).
+_CLASS_PREFIX = re.compile(r"\b(?:[A-Za-z_]\w*\.)*[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+:\s")
+_WIN_ERROR = re.compile(r"\[WinError -?\d+\]\s*")
+# The words after a space that are still the same path (`C:\Users\John Smith\x`): each holds a separator.
+_PATH_TAIL = r"""(?:\s+[^\s'"]*[\\/][^\s'"]*)*"""
+_PATHS = (
+    # quoted, any form: 'C:\Users\x\a b.py', "/home/x/y", '\\server\share', '~/x'
+    (re.compile(r"""(['"])(?:[A-Za-z]:[\\/]|\\\\|~[\w.-]*[\\/]|/)[^'"\r\n]*\1"""), r"\1" + PATH_PLACEHOLDER + r"\1"),
+    # a drive path (C:\... or C:/...), not the scheme of a URL
+    (re.compile(r"""(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    # a home path: ~/x, ~user/x
+    (re.compile(r"""(?<![\w.-])~[\w.-]*[\\/][^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    # an absolute POSIX path of two or more parts (not a URL's: its slashes follow ':' or '/' or a host)
+    (re.compile(r"""(?<![\w:/.-])/(?:[\w.@+-]+/)+[\w.@+-]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+    # anything else with a backslash in it: a UNC path, a relative Windows path
+    (re.compile(r"""[^\s'"]*\\[^\s'"]*""" + _PATH_TAIL), PATH_PLACEHOLDER),
+)
+
+
+USER_PLACEHOLDER = "[user]"
+
+
+def _user_names() -> set[str]:
+    """This machine's user names -- the account's and its home directory's -- for the one place a user name can
+    outlive the path scrub: a message that names the user outside a path. Names under 3 characters are left
+    alone (they would match ordinary words)."""
+    import getpass  # noqa: PLC0415
+
+    names = set()
+    for read in (getpass.getuser, lambda: Path.home().name):
+        try:
+            name = str(read() or "").strip()
+        except Exception:  # noqa: BLE001 -- no user name is readable: nothing to scrub
+            continue
+        if len(name) >= 3:
+            names.add(name)
+    return names
+
+
+def _one_line(text: str) -> str:
+    """One line of `text`: a traceback becomes the text before it and its last line (the exception
+    itself); other multi-line text its first line."""
+    at = text.find(_TRACEBACK)
+    if at >= 0:
+        head = " ".join(text[:at].split()).rstrip(" :;,-(")
+        rest = text[at + len(_TRACEBACK):]
+        lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
+        if len(lines) > 1:
+            last = lines[-1]
+        else:
+            hits = list(_EXCEPTION_NAME.finditer(rest))
+            last = rest[hits[-1].start():].strip() if hits else ""
+        return ": ".join(part for part in (head, last) if part) or "a traceback"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[0] if lines else ""
+
+
+def _shorten(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max(1, max_chars - 3)]
+    if " " in cut[max_chars // 2:]:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ,;:(") + "..."
+
+
+def client_safe_detail(text, *, max_chars: int | None = None) -> str:
+    """Raw diagnostic text made safe for a client (review V10, MED-5): ONE line (a traceback is
+    reduced to the text before it and its last line, the exception; other multi-line text to its
+    first line), NO PATH (drive, UNC, home and absolute POSIX paths, quoted or not, become
+    `PATH_PLACEHOLDER`, and with them the user names they carry), NO USER NAME left anywhere else
+    (this machine's, `USER_PLACEHOLDER`), and, with `max_chars`, at most that long. The exception
+    class and its message stay: this is the diagnostic text. "" for no text. Single-line text with
+    none of those, at most `max_chars` long, is returned unchanged."""
+    if text is None:
+        return ""
+    text = str(text)
+    if "\n" in text or "\r" in text or _TRACEBACK in text:
+        text = _one_line(text)
+    for pattern, replacement in _PATHS:
+        text = pattern.sub(replacement, text)
+    for name in _user_names():
+        text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", USER_PLACEHOLDER, text, flags=re.IGNORECASE)
+    if max_chars is not None:
+        text = _shorten(text, int(max_chars))
+    return text
+
+
+def owner_facing_detail(text) -> str:
+    """`client_safe_detail`, then without the exception class names -- for a sentence an OWNER reads
+    (`lifecycle.reason`, the phone's `model_state_reason`; review V10, MED-5, and the lead's
+    preference given the Mac's `WorldTowerText` guard of 3bb4431, which swaps any Tower text holding a
+    class name for a generic sentence). "RuntimeError: CUDA out of memory" reads "CUDA out of
+    memory". Text with no path, traceback, line break or class name is returned unchanged."""
+    safe = client_safe_detail(text)
+    owner = _WIN_ERROR.sub("", safe)
+    owner = _CLASS_PREFIX.sub("", owner)
+    owner = _EXCEPTION_NAME.sub("", owner)
+    if owner == safe:
+        return safe
+    owner = re.sub(r"\(\s*\)", "", owner)          # "(KeyboardInterrupt)" leaves "()"
+    owner = re.sub(r"\(\s+", "(", owner)
+    owner = re.sub(r"\s+([);,])", r"\1", owner)
+    owner = re.sub(r"\s{2,}", " ", owner)
+    return owner.strip(" :;,")
 
 
 def _count(value) -> int | None:
@@ -1537,7 +1843,7 @@ def _gate_cause(gate: dict) -> str | None:
     if gate.get("retryable"):
         if gate.get("cause") == CAUSE_CONSENSUS_DEFERRED:
             return "consensus-deferred"
-        return _depth_cause((gate.get("depth") or {}).get("detail"))
+        return _depth_cause(_dict(gate.get("depth")).get("detail"))
     if _scale_short_with_depth(gate):
         return "scale-short"
     return None
@@ -1547,7 +1853,7 @@ def _scale_short_with_depth(gate: dict) -> bool:
     """The gate ran with its depth stage in hand and still had no usable metric scale."""
     return (gate.get("state") == GATE_STATE_APPLIED and gate.get("metric_available") is False
             and not gate.get("retryable")
-            and (gate.get("depth") or {}).get("state") == DEPTH_OK)
+            and _dict(gate.get("depth")).get("state") == DEPTH_OK)
 
 
 def notice_causes(summary: dict | None) -> list[str]:
@@ -1591,24 +1897,35 @@ def publish_detail(summary: dict | None) -> str | None:
     causes = notice_causes(summary)
     if not causes:
         return None
-    transients = (summary or {}).get("transients") or {}
-    gate = (summary or {}).get("gate") or {}
+    transients = _dict((summary or {}).get("transients"))
+    gate = _dict((summary or {}).get("gate"))
+
+    def why(*values, default: str) -> str:
+        # The raw text, CLIENT-SAFE (review V10, MED-5): one line, no path, no traceback, short. It
+        # keeps the exception class and its message -- the diagnostics -- and nothing that names a
+        # file, a directory or the user whose home it is.
+        raw = next((v for v in values if v), None)
+        return client_safe_detail(raw, max_chars=WHY_MAX_CHARS) or default if raw else default
+
     parts = []
     for c in causes:
         if c in ("masks-no-gpu", "masks-not-installed", "masks-detector-failed", "masks-step-failed",
                  "masks-no-image", "masks-unavailable"):
             parts.append(NOTICE_MASKS_UNAVAILABLE.format(
-                why=transients.get("detail") or transients.get("cause") or "the detector did not run"))
+                why=why(transients.get("detail"), transients.get("cause"), default="the detector did not run")))
         elif c == "masks-none" and transients.get("detail"):
-            parts.append(f"{_MASKS_NOT_APPLIED.format(transients.get('detail'))}; {_BY_OWNER}")
+            parts.append(f"{_MASKS_NOT_APPLIED.format(why(transients.get('detail'), default='no image'))}; "
+                         f"{_BY_OWNER}")
         elif c.startswith("gate-failed"):
-            parts.append(NOTICE_GATE_FAILED.format(why=gate.get("detail") or "an error"))
+            parts.append(NOTICE_GATE_FAILED.format(why=why(gate.get("detail"), default="an error")))
         elif c.startswith("depth-"):
-            parts.append(NOTICE_REGATE.format(
-                why=(gate.get("depth") or {}).get("detail") or gate.get("cause") or "no depth"))
+            # Who fixes it is the cause's (review V10, L-19b): the idle re-gate, or an owner or operator.
+            text = why(_dict(gate.get("depth")).get("detail"), gate.get("cause"), default="no depth")
+            parts.append(f"{_NO_SCALE.format(text)}; {_OWNERS[c]}")
         elif c == "scale-short":
             parts.append(NOTICE_SCALE_SHORT.format(
-                why=(gate.get("evidence") or {}).get("metric_scale") or "too few cameras had a metric level"))
+                why=why(_dict(gate.get("evidence")).get("metric_scale"),
+                        default="too few cameras had a metric level")))
         else:
             parts.append(_sentence(c, transients))
     return "; ".join(parts)

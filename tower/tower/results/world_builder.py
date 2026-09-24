@@ -1750,6 +1750,38 @@ def _lifecycle(*, holder, stopped, session, geometry_current, has_manifest,
     return _still_building(base, building, unobservable, photographic)
 
 
+def _owner_facing_detail(detail) -> str | None:
+    """`finalization.detail` as `lifecycle.reason` may quote it, or None when there is none.
+
+    THE DETAIL IS RAW DIAGNOSTIC TEXT (review V10, MED-5). Its writers put exception text in it --
+    `"{type(exc).__name__}: {exc}"`, `"final solve failed: ..."`, the gate's raw depth failure -- and
+    `lifecycle.reason` becomes the phone's `model_state_reason`, shown word for word on an
+    interrupted session and sent on the unauthenticated `/ws`. Quoted raw, it carried a
+    `C:\\Users\\<user>\\...` path to both. So it is quoted as
+    `coherence_publish.owner_facing_detail` makes it: one line, no path, no traceback, and no
+    exception class name -- an owner reads "CUDA out of memory", not "RuntimeError: ..." (and the
+    phone's own guard, `WorldTowerText` at Mac 3bb4431, would swap a sentence holding a class name
+    for a generic one). A detail with none of those is quoted exactly as before."""
+    if not detail:
+        return None
+    from tower.world_builder.coherence_publish import owner_facing_detail  # noqa: PLC0415
+
+    return owner_facing_detail(detail) or None
+
+
+def _client_safe_finalization(finalization):
+    """The session's `finalization` record as `lifecycle.finalization` carries it on `/ws`: a COPY whose
+    `detail` is `coherence_publish.client_safe_detail` of the record's (review V10, MED-5 -- one line,
+    no path; the exception class stays, this is the diagnostic field). The record on disk is not
+    touched, and a record whose detail has nothing to scrub is returned as it is, the same object."""
+    if not isinstance(finalization, dict) or not isinstance(finalization.get("detail"), str):
+        return finalization
+    from tower.world_builder.coherence_publish import client_safe_detail  # noqa: PLC0415
+
+    safe = client_safe_detail(finalization["detail"])
+    return finalization if safe == finalization["detail"] else dict(finalization, detail=safe)
+
+
 def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
                               has_manifest, has_session_geometry,
                               has_readable_figures: bool = False) -> dict:
@@ -1800,7 +1832,7 @@ def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
     multi-session world unopenable -- measured, on two synthetic sessions
     in one world with both trees on disk.
     """
-    finalization = session.finalization
+    finalization = _client_safe_finalization(session.finalization)
     alive = holder is not None and holder["alive"]
     lock_dead = holder is not None and not holder["alive"]
 
@@ -1917,7 +1949,7 @@ def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
             "finalization": finalization,
         }
     if session.end_reason in ("error", "interrupted"):
-        detail = (finalization or {}).get("detail")
+        detail = _owner_facing_detail((finalization or {}).get("detail"))
         return {
             "state": LIFECYCLE_INTERRUPTED,
             "evidence": f"the session recorded end_reason={session.end_reason!r}",
@@ -1941,6 +1973,7 @@ def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
             "finalization": finalization,
         }
     if finalization is not None and finalization.get("state") != "complete":
+        detail = _owner_facing_detail(finalization.get("detail"))
         return {
             "state": LIFECYCLE_INTERRUPTED,
             "evidence": (
@@ -1950,7 +1983,7 @@ def _lifecycle_from_the_record(*, holder, stopped, session, geometry_current,
             "reason": (
                 "finalization did not complete; the geometry stored is the last "
                 "build that finished"
-                + (f": {finalization.get('detail')}" if finalization.get("detail") else "")
+                + (f": {detail}" if detail else "")
             ),
             "build_in_progress": False,
             "build_in_progress_unavailable_reason": None,
