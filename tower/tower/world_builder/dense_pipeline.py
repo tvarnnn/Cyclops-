@@ -663,16 +663,26 @@ def redaction_fill_mask(image, raw=None, fill_value: int = 0,
 # caller): the stage is byte for byte what it was.
 PREDICTIONS_DIRNAME = "predictions"
 PREDICTION_CACHE_SCHEMA = 1
+# SHORT NAMES, BECAUSE OF MAX_PATH. A world root under a Tower's data directory is already
+# ~135 characters deep at `dense/<session>/`, and the atomic write adds `.p<pid>.<nonce>.tmp`:
+# a 40-hex name under a 16-hex token measured 263 characters on a scratch copy and failed
+# (`FileNotFoundError`), which the gate took as "no depth". 12 + 20 hex keeps the whole
+# relative name, staging suffix included, near 70 characters -- the transient-mask cache's
+# convention (`solve_masks.component_path`, SHA-1[:12]). 80 bits of the pixel digest is far
+# beyond any collision a walk's few thousand frames could meet.
+PREDICTION_TOKEN_HEX = 12
+PREDICTION_INPUT_HEX = 20
 
 
 def prediction_token(backend, fov_x) -> tuple[str, dict]:
     """(token, what it stands for): the network and every parameter of the call that
-    changes its output, beyond the pixels. 16 hex."""
+    changes its output, beyond the pixels. `PREDICTION_TOKEN_HEX` hex."""
     doc = {"schema": PREDICTION_CACHE_SCHEMA, "backend": getattr(backend, "name", None),
            "model_id": getattr(backend, "model_id", None), "kind": getattr(backend, "kind", None),
            "resolution_level": getattr(backend, "resolution_level", None),
            "fov_x": None if fov_x is None else round(float(fov_x), 6)}
-    return hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16], doc
+    token = hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:PREDICTION_TOKEN_HEX]
+    return token, doc
 
 
 def prediction_cache_dir(root: Path, backend, fov_x) -> Path:
@@ -681,11 +691,12 @@ def prediction_cache_dir(root: Path, backend, fov_x) -> Path:
 
 
 def network_input_sha1(rgb: np.ndarray) -> str:
-    """The SHA-1 of the pixels a depth network is shown (shape and dtype included)."""
+    """The SHA-1 of the pixels a depth network is shown (shape and dtype included),
+    `PREDICTION_INPUT_HEX` hex."""
     rgb = np.ascontiguousarray(rgb)
     h = hashlib.sha1(f"{rgb.shape}|{rgb.dtype.str}|".encode())
     h.update(rgb.tobytes())
-    return h.hexdigest()
+    return h.hexdigest()[:PREDICTION_INPUT_HEX]
 
 
 def _cached_prediction(path: Path) -> np.ndarray | None:

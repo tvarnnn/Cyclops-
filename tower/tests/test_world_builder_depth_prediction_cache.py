@@ -184,6 +184,21 @@ def test_the_token_names_the_network_and_its_call():
     assert DP.network_input_sha1(a) == DP.network_input_sha1(a.copy())
 
 
+def test_a_kept_prediction_stays_clear_of_max_path(world):
+    """A 263-character cache name failed on a scratch copy of a real world (FileNotFoundError, which the gate
+    took as no depth). Beneath `dense/<session>/` the name -- with the atomic write's staging suffix -- stays
+    short enough for a world root under any Tower's data directory."""
+    from tower.storage import staging_path
+
+    store, net, dense = world
+    _gate_depth(store)
+    (kept,) = sorted((dense / DP.PREDICTIONS_DIRNAME).rglob("*.npy"))[:1]
+    relative = staging_path(kept).relative_to(dense)
+    assert len(str(relative)) <= 72, relative
+    # a Tower's world root (data\\world_builder) is ~62 characters deep; a world and session add 72 more
+    assert 62 + 72 + len(str(relative)) < 240
+
+
 def test_off_the_depth_stage_is_todays(world):
     """Every caller but the gate: no cache is read or written, no key is added, and the
     fit uses the network's own float32 output, as it always did."""
