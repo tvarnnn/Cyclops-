@@ -464,10 +464,11 @@ def test_the_final_solve_matches_the_relocalizers_revisit_links(session, colmap,
         return [("00000000.jpg", "00000003.jpg"), ("00000001.jpg", "not-a-solver-image.jpg")]
 
     monkeypatch.setattr(relocalizer, "revisit_pairs", links)
+    # (P3.6 SOL, review V9 M-9: the floor judges only what the import created, `created`.)
     monkeypatch.setattr(global_solve, "_apply_revisit_floor",
-                        lambda db, pairs, floor, overlap: {"verified": len(pairs),
+                        lambda db, pairs, floor, created: {"verified": len(pairs),
                                                            "removed_below_floor": 0,
-                                                           "kept_as_sequential": 0})
+                                                           "kept_existing": 0})
     _stub_the_gate(monkeypatch)
     if masked:
         summary = _masked(session, StubDetector(), seed=seed, gate=gated)
@@ -491,9 +492,10 @@ def test_the_final_solve_matches_the_relocalizers_revisit_links(session, colmap,
     order = [e[1] for e in colmap.log if e[0] == "call"]
     assert order.index("match_sequential") < order.index("match_image_pairs") < \
         order.index("global_mapping")
+    # The fake's database is an empty file: nothing is seen created, and the floor's fake counts.
     assert record == {"listed": 1, "verified": 1, "detail": None, "imported": True,
-                      "min_inliers": global_solve.revisit_floor(), "removed_below_floor": 0,
-                      "kept_as_sequential": 0}
+                      "min_inliers": global_solve.revisit_floor(), "created_by_import": 0,
+                      "removed_below_floor": 0, "kept_existing": 0}
 
 
 def test_revisit_links_are_for_the_final_solve_only(session, colmap, monkeypatch):

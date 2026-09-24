@@ -156,6 +156,31 @@ def test_any_change_matches_again_and_freezes_the_new_state(walked, colmap, chan
     assert _calls(colmap) == [] and again["solve"]["matching"] == GS.MATCHING_FROZEN
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_a_walk_database_written_after_the_freeze_check_is_not_called_frozen(walked, colmap,
+                                                                             monkeypatch, masked):
+    """Review V9 Q1: the freeze check reads the walk database before extraction; the mask
+    filter copies it (unmasked: the mapper reads it) later. A hand-run `world_solve.py
+    --final` takes no writer lock and can write it in between. Such a solve is not
+    `frozen`: what it mapped is not the frozen matching, and it says so."""
+    run = (lambda: _masked(walked, StubDetector(), seed=7)) if masked else \
+        (lambda: _solve(walked, final=True, seed=7))
+    run()
+    checked = GS._frozen_matching_refusal
+
+    def check_then_another_solve_writes(*a, **kw):
+        out = checked(*a, **kw)
+        _change_the_database(walked)          # the other solve, inside the window
+        return out
+
+    monkeypatch.setattr(GS, "_frozen_matching_refusal", check_then_another_solve_writes)
+    colmap.log.clear()
+    summary = run()
+    assert _calls(colmap) == [], "nothing was matched: the check had passed"
+    assert summary["solve"]["matching"] == GS.MATCHING_MATCHED
+    assert summary["solve"]["matching_detail"] == GS.FROZEN_REFUSAL_CHANGED_UNDER_THE_SOLVE
+
+
 def test_a_new_pycolmap_matches_again(walked, colmap):
     _solve(walked, final=True, seed=7)
     colmap.__version__ = "fake-2"
@@ -165,24 +190,90 @@ def test_a_new_pycolmap_matches_again(walked, colmap):
     assert "(pycolmap)" in summary["solve"]["matching_detail"]
 
 
-def test_new_revisit_links_match_again(walked, colmap, monkeypatch):
-    """The imported links are part of the key: the frozen database holds what they
-    added, and a different list asks for different matching."""
+def test_revisit_links_leave_the_walk_databases_frozen_matching_alone(walked, colmap, monkeypatch):
+    """Review V9 M-10: the imported links never enter the walk database, so they are not in
+    its key. A frozen walk database STAYS frozen when the relocalizer lists links; they are
+    matched into the solve's own filtered copy, on every solve, and never into the walk's."""
     from tower.world_builder import coherence_publish as CP
 
     monkeypatch.setattr(CP, "gate_final_solution", lambda store, w, s, solution, **kw: CP.GateResult(
         solution=solution, components=None, record={"state": CP.GATE_STATE_APPLIED, "seconds": 0.0}))
     _masked(walked, StubDetector(), seed=7, gate=True)
+    assert "revisit_pairs" not in _record(walked)["key"] and "revisit_pairs" not in _record(walked)
     monkeypatch.setattr(relocalizer, "revisit_pairs",
                         lambda session_dir: [("00000000.jpg", "00000003.jpg")])
+    for _ in range(2):
+        colmap.log.clear()
+        summary = _masked(walked, StubDetector(), seed=7, gate=True)
+        assert _calls(colmap) == ["match_image_pairs"], "frozen: only the import, into the copy"
+        assert summary["solve"]["matching"] == GS.MATCHING_FROZEN
+        assert colmap.calls("match_image_pairs")[0][2] == summary["solve"]["database"] != "database.db"
+        assert summary["solve"]["revisit_pairs"]["listed"] == 1
+        # ... on one thread when seeded: the copy is made again, import included, every solve
+        assert colmap.calls("match_image_pairs")[0][3] == (
+            "matching_options", "pairing_options", "verification_options")
+
+
+@pytest.mark.parametrize("imported", [False, True])
+def test_a_record_frozen_before_v9_m10(walked, colmap, imported):
+    """A record written at 6d4b567 carries `revisit_pairs` in its key. Without an import the
+    walk database it describes is exactly what today's key describes, and it stays frozen;
+    with one, the walk database holds imported pairs and the freeze is refused, with why."""
+    _solve(walked, final=True, seed=7)
+    path = walked.workspace.root / GS.FROZEN_MATCHING_FILENAME
+    record = _record(walked)
+    record["key"]["revisit_pairs"] = {"imported": imported, "count": int(imported),
+                                      "sha1": "0" * 40 if imported else None,
+                                      "min_inliers": 50 if imported else None}
+    record["revisit_pairs"] = [["00000000.jpg", "00000003.jpg"]] if imported else []
+    path.write_text(json.dumps(record), encoding="utf-8")
     colmap.log.clear()
-    summary = _masked(walked, StubDetector(), seed=7, gate=True)
-    assert _calls(colmap) == ["extract_features", "match_sequential", "match_image_pairs"]
-    assert "(revisit_pairs)" in summary["solve"]["matching_detail"]
-    colmap.log.clear()
-    again = _masked(walked, StubDetector(), seed=7, gate=True)
-    assert _calls(colmap) == [] and again["solve"]["matching"] == GS.MATCHING_FROZEN
-    assert again["solve"]["revisit_pairs"]["listed"] == 1
+    summary = _solve(walked, final=True, seed=7)
+    if imported:
+        assert summary["solve"]["matching"] == GS.MATCHING_MATCHED
+        assert summary["solve"]["matching_detail"].startswith(GS.FROZEN_REFUSAL_LEGACY_IMPORT)
+    else:
+        assert _calls(colmap) == [] and summary["solve"]["matching"] == GS.MATCHING_FROZEN
+
+
+def test_the_verification_seed_stays_in_the_key_and_says_why():
+    """Review V9 LOW: a different two-view RANSAC seed verifies differently, so a database
+    matched under one seed is not frozen for another -- kept, and documented."""
+    key = GS.matching_key(camera_params="1,1,1,1", overlap=20, loop_detection=True, seed=3,
+                          pycolmap_version="x")
+    assert key["verification_seed"] == 3 and "revisit_pairs" not in key
+    assert "verifies the same" in GS.matching_key.__doc__
+
+
+# ---------------------------------------------------------------------------
+# an unreadable solver image refuses the freeze, not the solve (review V9, LOW; RV9-B P3)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_an_unreadable_solver_image_refuses_the_freeze_and_the_solve_goes_on(walked, colmap,
+                                                                             monkeypatch, masked):
+    from tower.world_builder import solve_masks as SM
+
+    real = SM.file_sha1
+    locked = walked.workspace.images_dir / "00000002.jpg"
+
+    def file_sha1(path):
+        if Path(path) == locked:
+            raise PermissionError(13, "The process cannot access the file", str(path))
+        return real(path)
+
+    monkeypatch.setattr(SM, "file_sha1", file_sha1)
+    if masked:
+        summary = _masked(walked, StubDetector(), seed=7)
+    else:
+        summary = _solve(walked, final=True, seed=7)
+    assert summary["solved"] is True
+    assert summary["solve"]["matching"] == GS.MATCHING_MATCHED
+    detail = summary["solve"]["matching_detail"]
+    assert "00000002.jpg could not be read to freeze" in detail and "PermissionError" in detail
+    assert detail.endswith("this solve's matching is not frozen")
+    assert not (walked.workspace.root / GS.FROZEN_MATCHING_FILENAME).exists()
+    assert _calls(colmap)[:2] == ["extract_features", "match_sequential"]
 
 
 def test_an_unreadable_database_is_matched_and_not_frozen(session, colmap):
@@ -231,6 +322,62 @@ def test_the_digest_is_of_content_not_bytes(tmp_path):
     assert GS.database_digest(tmp_path / "absent.db") is None
     (tmp_path / "empty.db").write_bytes(b"")
     assert GS.database_digest(tmp_path / "empty.db") is None
+
+
+def _geometry_db(path, F, t, q=(1.0, 0.0, 0.0, 0.0)):
+    con = sqlite3.connect(str(path))
+    con.execute("create table images (image_id integer primary key, name text)")
+    con.execute("create table two_view_geometries (pair_id integer primary key, rows integer, "
+                "cols integer, data blob, config integer, F blob, E blob, H blob, qvec blob, "
+                "tvec blob)")
+    con.executemany("insert into images values (?, ?)", [(1, "a.jpg"), (2, "b.jpg")])
+    F = np.asarray(F, np.float64)
+    con.execute("insert into two_view_geometries values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (1 * _B + 2, 1, 2, np.zeros(2, np.uint32).tobytes(), 2, F.tobytes(), F.tobytes(),
+                 F.tobytes(), np.asarray(q, np.float64).tobytes(),
+                 np.asarray(t, np.float64).tobytes()))
+    con.commit()
+    con.close()
+    return GS.database_digest(path)
+
+
+def test_the_stated_digest_is_up_to_scale_with_nothing_appended(tmp_path):
+    """Review V9, LOW (RV9-B D1): F, E, H, qvec and tvec are defined up to scale, as
+    `DATABASE_DIGEST_RULE` says, so a pure rescale of every matrix leaves the stated digest
+    unchanged -- it appended the magnitude, so F and 2F digested differently. F, E, H and
+    qvec are also up to sign; tvec keeps its sign. `content` stays exact."""
+    rng = np.random.default_rng(0)
+    F = rng.normal(size=9) * np.array([1e-7, 1e-6, 1e-3, 1e-6, 1e-7, 1e-3, 1e-3, 1e-3, 1.0])
+    t = np.array([0.2, -0.1, 0.97])
+    q = np.array([0.9, 0.1, -0.3, 0.2])
+    base = _geometry_db(tmp_path / "a.db", F, t, q)
+    for i, (Fs, ts, qs) in enumerate([(2 * F, 2 * t, q), (1e-3 * F, 7.5 * t, q),
+                                      (-F, t, -q), (-3 * F, 0.5 * t, -q)]):
+        other = _geometry_db(tmp_path / f"b{i}.db", Fs, ts, qs)
+        assert other["stated"] == base["stated"], i
+        assert other["content"] != base["content"], i
+    flipped = _geometry_db(tmp_path / "c.db", F, -t, q)
+    assert flipped["stated"] != base["stated"], "tvec's sign is kept"
+    for up_to_sign in (True, False):
+        assert GS._stated_bytes((5 * F).tobytes(), up_to_sign=up_to_sign) == \
+            GS._stated_bytes(F.tobytes(), up_to_sign=up_to_sign)
+        assert len(GS._stated_bytes(F.tobytes(), up_to_sign=up_to_sign)) == F.nbytes
+
+
+def test_an_opposite_sign_tie_for_the_pivot_does_not_flip_the_digest():
+    """RV9-B D3: `[t]x` holds +1 and -1; one ulp on either used to move the pivot to the other
+    entry and flip the sign of the whole normalised matrix."""
+    E = np.array([0, 0, 0, 0, 0, -1.0, 0, 1.0, 0])
+    for k, toward in ((5, -2.0), (7, 2.0)):
+        E2 = E.copy()
+        E2[k] = np.nextafter(E[k], toward)
+        assert GS._stated_bytes(E.tobytes(), up_to_sign=True) == \
+            GS._stated_bytes(E2.tobytes(), up_to_sign=True), k
+    q = np.array([np.sqrt(0.5), -np.sqrt(0.5), 0, 0])
+    q2 = q.copy()
+    q2[1] = np.nextafter(q[1], -1.0)
+    assert GS._stated_bytes(q.tobytes(), up_to_sign=True) == \
+        GS._stated_bytes(q2.tobytes(), up_to_sign=True)
 
 
 # ---------------------------------------------------------------------------

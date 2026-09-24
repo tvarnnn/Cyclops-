@@ -403,9 +403,39 @@ def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=N
     exactly as before. `sources.json` (the builder's, or a re-finish's by
     capture identity) is asked first and is never ambiguous.
     """
-    recorded = resolve_source_path((sources or {}).get(keyframe.keyframe_id))
+    return planned_solver_source(keyframe, session_dir, capture_dirs, sources, ambiguous)[0]
+
+
+# THE SOLVER-IMAGE PROVENANCE RECORD (review V9 M-7; the format is agreed with the re-finish,
+# `scripts/world_refinish.py`, which writes it when it carries solver images back):
+#
+#     {"record": "wb-solver-image-provenance/1",
+#      "images": {"<image name>": {"keyframe_id", "source": "raw" | "redacted", "frame", "sha1"}}}
+#
+# `source`: undistorted from a raw capture frame, or from the session's stored (redacted)
+# keyframe. `frame`: the raw frame's path as `sources.json` records it (or as the capture
+# directory lookup found it), compared after `resolve_source_path`; the keyframe's
+# `image_relpath` for a stored copy. `sha1`: the solver image file's. One entry per image
+# NAME: the first keyframe in keyframe order. ABSENT FILE = TODAY'S BEHAVIOUR: an existing
+# image is kept and nothing is written -- a walk's own solves never write it, so every
+# default solve is what it was. See `prepare_images` for what a present record does.
+SOLVER_IMAGE_PROVENANCE_FILENAME = "images.provenance.json"
+SOLVER_IMAGE_PROVENANCE_RECORD = "wb-solver-image-provenance/1"
+IMAGE_SOURCE_RAW = "raw"
+IMAGE_SOURCE_REDACTED = "redacted"
+
+
+def planned_solver_source(keyframe: Keyframe, session_dir: Path, capture_dirs=(), sources=None,
+                          ambiguous: list | None = None) -> tuple[Path, str, str]:
+    """(the file this keyframe's solver image is undistorted from, its provenance `source`,
+    its provenance `frame`) -- `_source_frame`'s rule, with what the provenance record says
+    about it: the `sources.json` entry's raw frame when that file exists (`frame` as
+    recorded), else the one capture directory holding the name (`frame` that path), else
+    the session's stored copy (`redacted`, `frame` the keyframe's `image_relpath`)."""
+    recorded_as = (sources or {}).get(keyframe.keyframe_id)
+    recorded = resolve_source_path(recorded_as)
     if recorded is not None and recorded.is_file():
-        return recorded
+        return recorded, IMAGE_SOURCE_RAW, str(recorded_as)
     name = keyframe_image_name(keyframe)
     found = []
     for capture_dir in capture_dirs:
@@ -414,20 +444,70 @@ def _source_frame(keyframe: Keyframe, session_dir: Path, capture_dirs, sources=N
                 found.append(candidate)
                 break
     if len(found) == 1:
-        return found[0]
+        return found[0], IMAGE_SOURCE_RAW, str(found[0])
     if found and ambiguous is not None:
         ambiguous.append(keyframe.keyframe_id)
-    return session_dir / keyframe.image_relpath
+    return session_dir / keyframe.image_relpath, IMAGE_SOURCE_REDACTED, keyframe.image_relpath
+
+
+def read_image_provenance(workspace: SolveWorkspace) -> dict | None:
+    """image name -> provenance entry, or None when the workspace has NO record (today's
+    behaviour). A record that exists but cannot be read, or is not this format, is present
+    and names nothing: every image in it is then of unknown provenance."""
+    path = workspace.root / SOLVER_IMAGE_PROVENANCE_FILENAME
+    if not path.exists():
+        return None
+    try:
+        record = read_json_closed(path)
+    except (OSError, ValueError):
+        return {}
+    if (not isinstance(record, dict) or record.get("record") != SOLVER_IMAGE_PROVENANCE_RECORD
+            or not isinstance(record.get("images"), dict)):
+        return {}
+    return {k: v for k, v in record["images"].items() if isinstance(v, dict)}
+
+
+def write_image_provenance(workspace: SolveWorkspace, images: dict) -> None:
+    write_json_atomic(workspace.root / SOLVER_IMAGE_PROVENANCE_FILENAME,
+                      {"record": SOLVER_IMAGE_PROVENANCE_RECORD,
+                       "images": {name: images[name] for name in sorted(images)}})
+
+
+def _same_file_path(a, b) -> bool:
+    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+
+def provenance_matches(entry, source: str, frame: str, image_sha1: str | None) -> bool:
+    """Whether a provenance entry says the image on disk (`image_sha1`) was undistorted from
+    exactly the frame this solve plans (`source`, `frame`)."""
+    if not isinstance(entry, dict) or entry.get("source") != source:
+        return False
+    if image_sha1 is None or entry.get("sha1") != image_sha1:
+        return False
+    if source == IMAGE_SOURCE_RAW:
+        held, planned = resolve_source_path(entry.get("frame")), resolve_source_path(frame)
+        return held is not None and planned is not None and _same_file_path(held, planned)
+    return str(entry.get("frame") or "").replace("\\", "/") == str(frame).replace("\\", "/")
 
 
 def prepare_images(
     store, world_id: str, session_id: str, keyframes: list[Keyframe], *, capture_dirs=(),
-    ambiguous: list | None = None,
+    ambiguous: list | None = None, rewritten: list | None = None,
 ) -> tuple[PinholeCamera, int]:
     """Undistort every keyframe not yet in the workspace. Returns the pinhole
     camera and how many images were written this call. `ambiguous` collects the
     keyframes whose name more than one capture directory holds (`_source_frame`):
-    they were undistorted from the session's stored copy."""
+    they were undistorted from the session's stored copy.
+
+    PROVENANCE (review V9 M-7). With a provenance record in the workspace (a re-finish's,
+    `SOLVER_IMAGE_PROVENANCE_FILENAME`), an existing image is kept only when its entry names
+    the frame this solve plans for it -- raw frame X, or the stored copy -- and its SHA-1 is
+    the file's. An image recorded from another frame (raw vs redacted, or another raw
+    frame), or of unknown provenance (no entry), is REWRITTEN from the planned frame and its
+    entry set; `rewritten` collects the names whose bytes that changed, so `solve` can clear
+    their stale features from the walk database. The mask cache and the frozen matching are
+    keyed by the image's SHA-1, so a rewritten image misses both, as it must. Without a
+    record, an existing image is kept and nothing is written, exactly as before."""
     import cv2
 
     workspace = workspace_for(store, world_id, session_id)
@@ -458,9 +538,14 @@ def prepare_images(
             # trusted. The rmtree stays as the cheap path; correctness no
             # longer depends on it succeeding.
             sources_before = read_sources(workspace)
+            had_provenance = read_image_provenance(workspace) is not None
             shutil.rmtree(workspace.root, ignore_errors=True)
             workspace.images_dir.mkdir(parents=True, exist_ok=True)
             recalibrated = True
+            if had_provenance:
+                # A re-finished workspace keeps its provenance record (review V9 M-7):
+                # emptied, since every image is undistorted again below and recorded.
+                write_image_provenance(workspace, {})
             if sources_before:
                 # `sources.json` maps each keyframe to the RAW capture frame
                 # it came from, and the builder that observed those frames is
@@ -489,12 +574,29 @@ def prepare_images(
     # interrupted pass self-healing, because the next call still sees a
     # mismatch and tries again.
     sources = read_sources(workspace)
+    provenance = read_image_provenance(workspace)
+    provenance_changed = False
+    handled: set = set()
     written = 0
     for keyframe in keyframes:
-        target = workspace.images_dir / keyframe_image_name(keyframe)
-        if target.exists() and not recalibrated:
-            continue
-        source = _source_frame(keyframe, session_dir, capture_dirs, sources, ambiguous)
+        name = keyframe_image_name(keyframe)
+        if provenance is not None and name in handled:
+            continue      # a name two keyframes share: the first one's image, one entry
+        target = workspace.images_dir / name
+        old_sha1 = None
+        if provenance is None:
+            if target.exists() and not recalibrated:
+                continue
+            source = _source_frame(keyframe, session_dir, capture_dirs, sources, ambiguous)
+        else:
+            source, kind, frame = planned_solver_source(keyframe, session_dir, capture_dirs,
+                                                        sources, ambiguous)
+            if target.exists():
+                old_sha1 = _file_sha1_or_none(target)
+                if not recalibrated and provenance_matches(provenance.get(name), kind, frame,
+                                                           old_sha1):
+                    handled.add(name)
+                    continue
         image = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if image is None:
             logger.warning("global solve: unreadable frame %s", source)
@@ -537,8 +639,71 @@ def prepare_images(
         finally:
             tmp.unlink(missing_ok=True)
         written += 1
+        if provenance is not None:
+            handled.add(name)
+            new_sha1 = _file_sha1_or_none(target)
+            provenance[name] = {"keyframe_id": keyframe.keyframe_id, "source": kind,
+                                "frame": frame, "sha1": new_sha1}
+            provenance_changed = True
+            if (rewritten is not None and old_sha1 is not None and not recalibrated
+                    and new_sha1 != old_sha1):
+                rewritten.append(name)
+    if provenance is not None and provenance_changed:
+        write_image_provenance(workspace, provenance)
     write_json_atomic(workspace.camera_path, camera.to_json_dict())
     return camera, written
+
+
+def _file_sha1_or_none(path) -> str | None:
+    from tower.world_builder.solve_masks import file_sha1  # noqa: PLC0415
+
+    try:
+        return file_sha1(path)
+    except OSError:
+        return None
+
+
+def _clear_image_features(database_path, names) -> dict:
+    """The walk database's keypoints and descriptors of every image in `names`, and every
+    match and two-view geometry touching one, removed (review V9 M-7): COLMAP's extractor
+    skips a name that still has keypoints and its matcher a pair that still has matches, so
+    a solver image rewritten on disk would otherwise be solved with the OLD image's features.
+    The image rows stay, so the solve extracts and matches it afresh. Never raises; returns
+    what it removed, or {"detail": why}."""
+    import sqlite3  # noqa: PLC0415
+
+    path = Path(database_path)
+    out = {"images": 0, "pairs": 0}
+    if not path.is_file() or path.stat().st_size == 0:
+        return out
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            tables = {n for (n,) in con.execute("select name from sqlite_master where type = 'table'")}
+            if "images" not in tables:
+                return out
+            ids = dict(con.execute("select name, image_id from images"))
+            targets = sorted({int(ids[n]) for n in names if n in ids})
+            base = 2147483647
+            for iid in targets:
+                for table in ("keypoints", "descriptors"):
+                    if table in tables:
+                        con.execute(f'delete from "{table}" where image_id = ?', (iid,))
+                for table in ("matches", "two_view_geometries"):
+                    if table not in tables:
+                        continue
+                    # pair_id = min_id * base + max_id: the image as either member.
+                    cursor = con.execute(
+                        f'delete from "{table}" where (pair_id % ?) = ? or (pair_id / ?) = ?',
+                        (base, iid, base, iid))
+                    out["pairs"] += int(cursor.rowcount or 0) if table == "matches" else 0
+            out["images"] = len(targets)
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return dict(out, detail=f"{type(exc).__name__}: {exc}")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -871,9 +1036,17 @@ def solve(
     mask_device_probe=None,
     gate: bool | None = None,
     consensus: int | None = None,
+    should_stop=None,
 ) -> dict:
     """Run the recipe over the session's current keyframes and persist the
     solution. Returns a summary dict (what the CLI prints).
+
+    `should_stop`: the caller's stop (the builder's, the finisher's), asked by the publish
+    step (review V9 M-3): by the gate's depth stage, and by a consensus BETWEEN its draws. A
+    stop before or between the further draws never loses the finish: draw 0 is published as
+    one draw would publish it, its consensus `deferred`, which the re-gate in place runs later
+    (`coherence_publish.gate_by_consensus`, `stopped`). None, the default, is today's solve,
+    which nothing stops but the process's end.
 
     `gate`: the evidence gate before publish (`coherence_publish.py`). None
     reads `TOWER_WORLD_SOLVE_GATE` for a FINAL solve (off by default) and is
@@ -937,12 +1110,18 @@ def solve(
     workspace = workspace_for(store, world_id, session_id)
     try:
         ambiguous_frames: list = []
+        rewritten_images: list = []
         camera, written = prepare_images(
             store, world_id, session_id, keyframes, capture_dirs=capture_dirs,
-            ambiguous=ambiguous_frames,
+            ambiguous=ambiguous_frames, rewritten=rewritten_images,
         )
     except UndistortionUnavailable as exc:
         return {"solved": False, "reason": f"cannot undistort: {exc}"}
+    # A solver image REWRITTEN because its provenance was not this solve's (review V9 M-7;
+    # only with a re-finish's provenance record): the walk database's features for it are
+    # the old image's, and COLMAP would keep them. They go, so it is extracted afresh.
+    features_cleared = (_clear_image_features(workspace.database_path, rewritten_images)
+                        if rewritten_images else None)
     prepared = time.perf_counter()
 
     names = [keyframe_image_name(k) for k in keyframes]
@@ -1015,13 +1194,17 @@ def solve(
     freeze = bool(final and seeded and masking != _MASKING_REEXTRACTED)
     frozen_refusal = None
     frozen = False
+    images = None
     if freeze:
         key = matching_key(camera_params=reader.camera_params, overlap=overlap,
-                           loop_detection=wanted, seed=seed, revisit_pairs=revisit_list,
-                           revisit_min_inliers=floor,
+                           loop_detection=wanted, seed=seed,
                            pycolmap_version=getattr(pycolmap, "__version__", None))
-        images = _image_digests(workspace, present)
-        frozen_refusal = _frozen_matching_refusal(workspace, database_path, key, images)
+        # GUARDED (review V9, LOW): one solver image the OS will not let us read (another
+        # process holding it) refuses the FREEZE, with the reason, and the solve goes on
+        # matching as an unseeded one would. It used to raise out of the whole solve.
+        images, unreadable = _image_digests(workspace, present)
+        frozen_refusal = (unreadable if images is None
+                          else _frozen_matching_refusal(workspace, database_path, key, images))
         frozen = frozen_refusal is None
     froze = time.perf_counter()
 
@@ -1051,16 +1234,16 @@ def solve(
         verification.ransac.random_seed = seed
     if not frozen:
         _match_sequential(pycolmap, database_path, matching, pairing, verification)
-        if revisit_list:
-            revisits = _match_revisit_pairs(
-                pycolmap, store, world_id, session_id, workspace, database_path, present,
-                matching, verification, pairs=revisit_list)
+        # NOT the revisit links (review V9 M-10). They were matched here, into the walk's
+        # own database, before the mask filter copied it: the floor then applied only in
+        # the copy, and every later solve -- unmasked, ungated, a re-finish -- mapped the
+        # imported pairs at COLMAP's 15 inliers while recording `imported: false`. They are
+        # matched below, into the database this solve maps and nowhere else.
         if freeze:
-            not_frozen = _freeze_matching(workspace, database_path, key, images, revisit_list)
+            not_frozen = (_freeze_matching(workspace, database_path, key, images)
+                          if images is not None else "this solve's matching is not frozen")
             frozen_refusal = (f"{frozen_refusal}; this solve's matching is frozen now"
                               if not_frozen is None else f"{frozen_refusal}; {not_frozen}")
-    elif revisit_list:
-        revisits = {"listed": len(revisit_list), "verified": 0, "detail": None}
     if masking == _MASKING_FILTERED:
         try:
             database_path, masks_record = _filter_walk_database(
@@ -1079,21 +1262,45 @@ def solve(
                 extraction_options=extraction,
             )
             _match_sequential(pycolmap, database_path, matching, pairing, verification)
-            if revisit_list:
-                revisits = _match_revisit_pairs(
-                    pycolmap, store, world_id, session_id, workspace, database_path, present,
-                    matching, verification, pairs=revisit_list)
         masks_record["database"] = database_path.name
     if masking is not None:
         masks_record["masking"] = masking
         masks_record["walk_database"] = walk_database
-    if revisit_list and database_path != workspace.database_path:
-        # M4's floor, in the database the solve maps (never the walk's own).
-        revisits = dict(revisits, imported=True, min_inliers=floor,
-                        **_apply_revisit_floor(database_path, revisit_list, floor=floor,
-                                               overlap=overlap))
+    imports_cleared = 0
+    if masking is not None and database_path != workspace.database_path:
+        # The revisit links, ONLY INTO THE DATABASE THIS SOLVE MAPS (review V9 M-10): the
+        # filtered copy of the walk database, or this solve's re-extracted one. First, what
+        # an EARLIER solve imported into a re-extracted database this one was seeded from
+        # (`solve_masks.masked_database` copies the newest) is taken out again, so a solve
+        # that imports nothing maps nothing imported, and one that imports re-imports it
+        # under its own floor.
+        imports_cleared = _clear_earlier_revisit_imports(database_path)
+        if revisit_list:
+            revisits = _import_revisit_pairs(
+                pycolmap, store, world_id, session_id, workspace, database_path, present,
+                revisit_list, matching=matching, verification=verification,
+                masks=masks if masking == _MASKING_FILTERED else None, floor=floor,
+                one_thread=seeded)
+    elif revisit_list:
+        # Unreachable (a solve imports only when its masks are applied, and then it maps
+        # its own database), and refused rather than written into the walk's own.
+        revisits = {"listed": len(revisit_list), "verified": 0, "imported": False,
+                    "detail": REVISIT_IMPORT_WALK_DATABASE}
     # What the mapper reads, by content (seeded final solves: `database_digest`).
     mapped_digest = database_digest(database_path) if (final and seeded) else None
+    if frozen and final and seeded:
+        # THE WINDOW BETWEEN THE FREEZE CHECK AND WHAT IS MAPPED (review V9 Q1). The check
+        # read the walk database's digest before extraction; the mask filter copies it (or,
+        # unmasked, the mapper reads it) later, and a hand-run `world_solve.py --final` takes
+        # no writer lock, so it can extract or match into it in between. The walk database is
+        # read again -- about 0.5 s at 690 keyframes (RUN P3-SOL, `q3_configs.py`) -- and a
+        # solve whose copy may hold another solve's writes does not call itself frozen.
+        walk_now = (mapped_digest if database_path == workspace.database_path
+                    else database_digest(workspace.database_path))
+        held = (read_frozen_matching(workspace) or {}).get("database_digest") or {}
+        if (walk_now or {}).get("content") != held.get("content"):
+            frozen = False
+            frozen_refusal = FROZEN_REFUSAL_CHANGED_UNDER_THE_SOLVE
     matched = time.perf_counter()
 
     # ONE thread when seeded: GLOMAP is reproducible only then (D1 §2.4).
@@ -1143,6 +1350,17 @@ def solve(
         # (`_source_frame`). Only when it happened, so every other solution is as it was.
         solution.solve["frames_ambiguous_by_name"] = {
             "count": len(ambiguous_frames), "examples": ambiguous_frames[:10]}
+    if imports_cleared:
+        # Revisit pairs an earlier solve imported into the re-extracted database this one
+        # was seeded from, taken out before this solve's own import (review V9 M-10).
+        solution.solve["revisit_imports_cleared"] = imports_cleared
+    if rewritten_images:
+        # Solver images rewritten from the planned frame because their provenance was not
+        # this solve's (review V9 M-7), and their stale features cleared. Only when it
+        # happened, so every other solution is as it was.
+        solution.solve["solver_images_rewritten"] = {
+            "count": len(rewritten_images), "examples": rewritten_images[:10],
+            "features_cleared": features_cleared}
     if final and seeded:
         # Reproducibility (review V8 H2): was the matching this solve mapped frozen or
         # made now, why, and exactly which database content the mapper read. Only on
@@ -1181,9 +1399,21 @@ def solve(
             refusal=None if seeded else (
                 "the solve is not seeded (TOWER_WORLD_SOLVE_SEED): a consensus of mapper seeds "
                 "needs one"))
+    # THE STOP (review V9 M-3). Asked here, after draw 0 was mapped and before any further
+    # draw: a stop already asked for maps none of them, and draw 0 is published `deferred`
+    # (`stopped`). The consensus asks `should_stop` again between its draws, with the same
+    # outcome. Without a caller's stop both are exactly today's call -- and so is a single
+    # draw (N = 1): the stop is handed on only when a consensus of 2 or more draws runs, so
+    # today's gate never sees a `should_stop` it did not get before (CON, P3.6).
+    stop_kw = {}
+    if should_stop is not None and plan is not None:
+        stop_kw["should_stop"] = should_stop
+        if plan is not None and should_stop():
+            stop_kw["stopped"] = True
     solution, _gate_record = coherence_publish.gate_and_publish(
         store, world_id, session_id, workspace, solution, final=final, gate=gate,
-        database_path=database_path, keyframes=keyframes, write=write_solution, consensus=plan)
+        database_path=database_path, keyframes=keyframes, write=write_solution, consensus=plan,
+        **stop_kw)
     return {
         "solved": True,
         "solver": solver,
@@ -1310,9 +1540,20 @@ def frozen_draw_mapper(store, world_id: str, session_id: str, database_path, bas
                        keyframes=None, min_image_observations: int = MIN_IMAGE_OBSERVATIONS):
     """`seed -> candidate`: one further consensus draw on `database_path` -- the database the
     published solve mapped, frozen -- with every seed set and one mapper thread, exactly as
-    the seeded final solve maps. The candidate carries `base`'s records (transients, solve,
-    timing: the same masks, matching and database). The final solve and a re-gate in place
-    both map their draws through this."""
+    the seeded final solve maps. The final solve and a re-gate in place both map their draws
+    through this.
+
+    WHAT A DRAW CARRIES (review V9, LOW). `base`'s records for what the draws share -- the
+    transients (the same masks), and the solve's matching, database and verification seed --
+    but ITS OWN mapper seed as `solve.seed` and its own mapping time as `timing.map_s`. It
+    inherited draw 0's, so a published draw k != 0 named the wrong mapping.
+
+    ITS SCRATCH IS REMOVED AS SOON AS IT IS READ (review V9, LOW). A draw maps into
+    `sparse-draws/seed-<k>`; once `_map_candidate` has turned that model into the candidate,
+    nothing reads it again, so it is removed there and then (about 17 MB a draw, and it was
+    never cleaned). `sparse-draws/` itself -- this module's own scratch inside the workspace --
+    is cleared when a mapper is made, taking anything a killed consensus left behind. `sparse/`
+    keeps draw 0's model, as every solve's."""
     import pycolmap  # noqa: PLC0415
 
     _quiet_pycolmap()
@@ -1320,15 +1561,26 @@ def frozen_draw_mapper(store, world_id: str, session_id: str, database_path, bas
     keyframes = keyframes if keyframes is not None else store.read_keyframes(world_id, session_id)
     camera = PinholeCamera.from_json_dict(base.camera or read_json_closed(workspace.camera_path))
     draw_root = workspace.root / CONSENSUS_SPARSE_DIRNAME
+    shutil.rmtree(draw_root, ignore_errors=True)
 
     def map_draw(seed: int) -> Solution:
-        candidate = _map_candidate(
-            pycolmap, database_path, workspace, draw_root / f"seed-{int(seed)}", keyframes,
-            seed=int(seed), threads=1, input_digest=base.input_digest,
-            min_image_observations=min_image_observations, camera=camera)
+        sparse = draw_root / f"seed-{int(seed)}"
+        started = time.perf_counter()
+        try:
+            candidate = _map_candidate(
+                pycolmap, database_path, workspace, sparse, keyframes,
+                seed=int(seed), threads=1, input_digest=base.input_digest,
+                min_image_observations=min_image_observations, camera=camera)
+        finally:
+            shutil.rmtree(sparse, ignore_errors=True)
+            try:
+                draw_root.rmdir()
+            except OSError:
+                pass      # absent, or another draw's still there
+        map_s = round(time.perf_counter() - started, 3)
         candidate.transients = base.transients
-        candidate.solve = base.solve
-        candidate.timing = dict(base.timing or {})
+        candidate.solve = None if base.solve is None else dict(base.solve, seed=int(seed))
+        candidate.timing = dict(base.timing or {}, map_s=map_s)
         return candidate
 
     return map_draw
@@ -1373,16 +1625,31 @@ REVISIT_VERIFIED_MIN_INLIERS = 15
 # relocalizer is off by default, `TOWER_WORLD_RELOCALIZER`) records exactly what it
 # always did: `{"listed": 0, "verified": 0, "detail": None}`.
 #
-# THE FLOOR. An imported pair counts only at `relocalizer.REVISIT_MIN_INLIERS`
-# (50) verified inliers IN THE DATABASE THE SOLVE MAPS -- after the masks -- and a
-# pair of this source below it is REMOVED from that database (its matches and its
-# geometry), so nothing under the floor from the relocalizer reaches the mapper.
-# "Of this source" means a listed pair the sequential matcher would not have
-# proposed anyway (further apart than the pairing overlap in COLMAP's name order):
-# a listed pair inside the overlap is a sequential pair first, held to COLMAP's 15
-# like every other. The walk's own `database.db` is never modified: the mapped
-# database of a masked solve is always this solve's own (the filtered copy, or the
-# re-extracted database).
+# WHERE THEY ARE MATCHED (review V9 M-10). Only into the database the solve MAPS -- the
+# mask filter's copy of the walk database, or the solve's own re-extracted one -- after
+# the masks, and never into the walk's own `database.db`. They used to be matched into
+# the walk database before the filter copied it, so every later solve of the walk
+# (unmasked, ungated, a re-finish) mapped them at COLMAP's 15 inliers while recording
+# `imported: false`. In the filtered copy a pair the import creates is matched on every
+# keypoint, so its matches touching a mask are removed and it is re-verified, exactly as
+# the filter treats the walk's own pairs (`_mask_imported_pairs`). A seeded solve matches
+# them on one thread: the frozen matching makes the walk database reproducible, and the
+# copy is then made again, import included, on every solve.
+#
+# THE FLOOR, ON WHAT THE IMPORT CREATED (review V9 M-9). An imported pair counts only at
+# `relocalizer.REVISIT_MIN_INLIERS` (50) verified inliers in the mapped database, after
+# the masks, and a pair THE IMPORT ITSELF CREATED below it is REMOVED from that database
+# (its matches and its geometry), so nothing under the floor from the relocalizer
+# reaches the mapper. A listed pair the database already held -- the sequential matcher's,
+# loop detection's (on in every final solve) or an earlier solve's -- is not the
+# import's: it is not matched again and stays exactly as COLMAP left it, at COLMAP's 15.
+# The floor used to judge every listed pair outside the sequential overlap, so switching
+# the relocalizer on DELETED a loop-closure pair loop detection had verified at 30.
+# `created_by_import` counts the pairs the import made, `removed_below_floor` those of
+# them it took out again, `kept_existing` the listed pairs below the floor it did not
+# make. The pairs it made and kept are listed in the mapped database's own table
+# `REVISIT_IMPORTED_TABLE`, so a later solve seeded from that database takes them out
+# first (`_clear_earlier_revisit_imports`).
 
 REVISIT_IMPORT_UNMASKED = ("not imported: the relocalizer's revisit links go only into a "
                            "masked, gated final solve (review V8 M4), and this solve's masks "
@@ -1390,6 +1657,13 @@ REVISIT_IMPORT_UNMASKED = ("not imported: the relocalizer's revisit links go onl
 REVISIT_IMPORT_UNGATED = ("not imported: the relocalizer's revisit links go only into a "
                           "masked, gated final solve (review V8 M4), and this solve is not "
                           "gated (TOWER_WORLD_SOLVE_GATE)")
+REVISIT_IMPORT_WALK_DATABASE = ("not imported: the database this solve maps is the walk's own, "
+                                "and revisit links go only into a solve's own copy (review V9 "
+                                "M-10)")
+# The pairs a revisit import created and kept, in the mapped database itself (a
+# re-extracted database seeds the next one by copy, and this travels with it).
+REVISIT_IMPORTED_TABLE = "wb_revisit_imported"
+REVISIT_REVERIFY_FILENAME = "revisit_pairs.reverify.txt"
 
 
 def revisit_floor() -> int:
@@ -1428,34 +1702,262 @@ def _pair_id(a: int, b: int) -> int:
     return lo * 2147483647 + hi   # COLMAP's kMaxNumImages
 
 
-def _apply_revisit_floor(database_path, pairs, *, floor: int, overlap: int) -> dict:
-    """In the database the solve maps: remove every listed pair of this source below
-    `floor` verified inliers (matches and geometry), and count those at or above it.
-    Returns {"verified", "removed_below_floor", "kept_as_sequential"} or {"detail": why}
-    when the database cannot be read. The caller never passes the walk's database."""
+def _listed_pairs_held(database_path, pairs) -> set | None:
+    """The pair ids of `pairs` (image names) the database already holds -- a `matches` or a
+    `two_view_geometries` row -- or None when it cannot be read. Read-only."""
     import sqlite3  # noqa: PLC0415
 
-    out = {"verified": 0, "removed_below_floor": 0, "kept_as_sequential": 0}
+    path = Path(database_path)
+    if not path.is_file():
+        return None
     try:
-        con = sqlite3.connect(str(database_path))
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             ids = {name: iid for iid, name in con.execute("select image_id, name from images")}
-            rank = {name: i for i, name in enumerate(sorted(ids))}
+            held = set()
             for a, b in pairs:
                 if a not in ids or b not in ids:
                     continue
                 pid = _pair_id(ids[a], ids[b])
+                if (con.execute("select 1 from matches where pair_id = ?", (pid,)).fetchone()
+                        or con.execute("select 1 from two_view_geometries where pair_id = ?",
+                                       (pid,)).fetchone()):
+                    held.add(pid)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return held
+
+
+def _clear_earlier_revisit_imports(database_path) -> int:
+    """Take the pairs an earlier solve's revisit import created out of this solve's own
+    mapped database (`REVISIT_IMPORTED_TABLE`, carried in by a re-extracted database's
+    seed copy), and the table with them. Returns how many; 0 when there is no table or
+    the database cannot be written. Never given the walk's database."""
+    import sqlite3  # noqa: PLC0415
+
+    path = Path(database_path)
+    if not path.is_file():
+        return 0
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            if con.execute("select 1 from sqlite_master where type = 'table' and name = ?",
+                           (REVISIT_IMPORTED_TABLE,)).fetchone() is None:
+                return 0
+            pids = [int(p) for (p,) in con.execute(
+                f'select pair_id from "{REVISIT_IMPORTED_TABLE}"')]
+            for pid in pids:
+                con.execute("delete from matches where pair_id = ?", (pid,))
+                con.execute("delete from two_view_geometries where pair_id = ?", (pid,))
+            con.execute(f'drop table "{REVISIT_IMPORTED_TABLE}"')
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        logger.warning("global solve: earlier revisit imports in %s could not be cleared (%s)",
+                       path.name, exc)
+        return 0
+    return len(pids)
+
+
+def _import_revisit_pairs(pycolmap, store, world_id, session_id, workspace, database_path,
+                          present, pairs, *, matching, verification, masks, floor: int,
+                          one_thread: bool) -> dict:
+    """The revisit links, into `database_path` -- the database this solve maps, never the
+    walk's own (review V9 M-10) -- held to `floor` where the import created them (M-9).
+    `masks`: the solve's `SolverMasks` when `database_path` is the mask filter's copy (the
+    pairs the import makes there are matched on every keypoint), None when it is a
+    re-extracted database (its features are masked already). Never raises: a failure
+    costs the links, and the record says so."""
+    record = {"listed": len(pairs), "verified": 0, "detail": None, "imported": True,
+              "min_inliers": floor, "created_by_import": 0, "removed_below_floor": 0,
+              "kept_existing": 0}
+    held = _listed_pairs_held(database_path, pairs)
+    ids = _image_ids(database_path)
+    # Only the pairs the database does not hold go to COLMAP: the import creates, it never
+    # re-matches or re-verifies what sequential matching, loop detection or an earlier
+    # solve put there. Unreadable, every listed pair is asked for, as before.
+    wanted = [(a, b) for a, b in pairs
+              if held is None or ids is None or a not in ids or b not in ids
+              or _pair_id(ids[a], ids[b]) not in held]
+    if wanted:
+        options = matching
+        if one_thread:
+            options = pycolmap.FeatureMatchingOptions()
+            options.num_threads = 1
+        matched = _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace,
+                                       database_path, present, options, verification,
+                                       pairs=wanted)
+        if matched.get("detail"):
+            record["detail"] = matched["detail"]
+            return record
+    after = _listed_pairs_held(database_path, pairs)
+    created = (after or set()) - (held or set())
+    record["created_by_import"] = len(created)
+    if created and masks is not None:
+        try:
+            record["reverified_after_masks"] = _mask_imported_pairs(
+                pycolmap, workspace, database_path, created, masks, verification)
+        except Exception as exc:  # noqa: BLE001 -- unmasked evidence must not reach the mapper
+            logger.exception("global solve: masking the imported revisit pairs failed; they "
+                             "are taken out again")
+            _remove_pairs(database_path, created)
+            record["detail"] = (f"the imported pairs could not be masked "
+                                f"({type(exc).__name__}: {exc}); they were taken out again")
+            record["removed_unmasked"] = len(created)
+            created = set()
+    record.update(_apply_revisit_floor(database_path, pairs, floor=floor, created=created))
+    return record
+
+
+def _image_ids(database_path) -> dict | None:
+    import sqlite3  # noqa: PLC0415
+
+    path = Path(database_path)
+    if not path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return {name: iid for iid, name in con.execute("select image_id, name from images")}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def _remove_pairs(database_path, pids) -> None:
+    import sqlite3  # noqa: PLC0415
+
+    try:
+        con = sqlite3.connect(str(database_path))
+        try:
+            for pid in pids:
+                con.execute("delete from matches where pair_id = ?", (int(pid),))
+                con.execute("delete from two_view_geometries where pair_id = ?", (int(pid),))
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        logger.warning("global solve: imported pairs could not be removed from %s (%s)",
+                       Path(database_path).name, exc)
+
+
+def _mask_imported_pairs(pycolmap, workspace, database_path, created, masks, verification) -> int:
+    """In the mask filter's copy: remove every match of a pair the revisit import created
+    that touches a masked keypoint, drop its geometry, and re-verify it from what is left
+    -- the rule `solve_masks.filter_walk_database` applies to the walk's own pairs (a
+    keypoint on a mask pixel is masked; an image without a mask is excluded, every
+    keypoint masked). Returns how many pairs were re-verified."""
+    import sqlite3  # noqa: PLC0415
+
+    import cv2  # noqa: PLC0415
+
+    from tower.world_builder.solve_masks import masks_dir  # noqa: PLC0415
+
+    mdir = masks_dir(workspace)
+    masked_names = set(getattr(masks, "masked", None) or ())
+    base = 2147483647
+    relist = []
+    con = sqlite3.connect(str(database_path))
+    try:
+        names = dict(con.execute("select image_id, name from images"))
+        hits: dict = {}
+
+        def in_mask(iid):
+            if iid in hits:
+                return hits[iid]
+            row = con.execute("select rows, cols, data from keypoints where image_id = ?",
+                              (iid,)).fetchone()
+            rows = int(row[0] or 0) if row is not None else 0
+            name = names.get(iid)
+            if name not in masked_names:
+                hit = np.ones(rows, bool)            # excluded: no feature of it is evidence
+            elif not rows or row[2] is None:
+                hit = np.zeros(0, bool)
+            else:
+                png = cv2.imread(str(mdir / f"{name}.png"), cv2.IMREAD_GRAYSCALE)
+                if png is None:
+                    raise OSError(f"the COLMAP mask of {name} is unreadable")
+                xy = np.frombuffer(row[2], np.float32).reshape(rows, int(row[1]))[:, :2]
+                x = np.clip(np.floor(xy[:, 0]).astype(np.int64), 0, png.shape[1] - 1)
+                y = np.clip(np.floor(xy[:, 1]).astype(np.int64), 0, png.shape[0] - 1)
+                hit = png[y, x] == 0
+            hits[iid] = hit
+            return hit
+
+        for pid in sorted(created):
+            row = con.execute("select rows, cols, data from matches where pair_id = ?",
+                              (int(pid),)).fetchone()
+            if row is None or not row[0] or row[2] is None:
+                continue
+            second = int(pid) % base
+            first = (int(pid) - second) // base
+            matches = np.frombuffer(row[2], np.uint32).reshape(int(row[0]), int(row[1]))
+            bad = np.zeros(len(matches), bool)
+            for col, hit in ((0, in_mask(first)), (1, in_mask(second))):
+                idx = matches[:, col].astype(np.int64)
+                outside = idx >= len(hit)
+                bad |= outside
+                bad[~outside] |= hit[idx[~outside]]
+            if not bad.any():
+                continue
+            keep = np.ascontiguousarray(matches[~bad])
+            con.execute("update matches set rows = ?, data = ? where pair_id = ?",
+                        (int(len(keep)), keep.tobytes(), int(pid)))
+            con.execute("delete from two_view_geometries where pair_id = ?", (int(pid),))
+            if names.get(first) and names.get(second):
+                relist.append((names[first], names[second]))
+        con.commit()
+    finally:
+        con.close()
+    if relist:
+        path = Path(workspace.root) / REVISIT_REVERIFY_FILENAME
+        data = "".join(f"{a} {b}\n" for a, b in relist).encode("utf-8")
+        write_bytes_atomic(path, lambda handle: handle.write(data))
+        options = verification if verification is not None else pycolmap.TwoViewGeometryOptions()
+        pycolmap.verify_matches(database_path, path, options=options)
+    return len(relist)
+
+
+def _apply_revisit_floor(database_path, pairs, *, floor: int, created) -> dict:
+    """In the database the solve maps: remove every pair the import CREATED (`created`,
+    pair ids) that has fewer than `floor` verified inliers -- matches and geometry -- and
+    keep every other listed pair as COLMAP left it (review V9 M-9). Records the created
+    pairs it kept in `REVISIT_IMPORTED_TABLE`. Returns {"verified" (listed pairs at or above
+    the floor, whoever made them), "removed_below_floor", "kept_existing"} or {"detail": why}
+    when the database cannot be read. The caller never passes the walk's database."""
+    import sqlite3  # noqa: PLC0415
+
+    created = {int(p) for p in created or ()}
+    out = {"verified": 0, "removed_below_floor": 0, "kept_existing": 0}
+    try:
+        con = sqlite3.connect(str(database_path))
+        try:
+            ids = {name: iid for iid, name in con.execute("select image_id, name from images")}
+            kept_created = []
+            for pid in sorted({_pair_id(ids[a], ids[b]) for a, b in pairs
+                               if a in ids and b in ids}):
                 row = con.execute("select rows, config from two_view_geometries where pair_id = ?",
                                   (pid,)).fetchone()
                 inliers = int(row[0] or 0) if row is not None and row[1] not in (0, 1) else 0
                 if inliers >= floor:
                     out["verified"] += 1
-                elif abs(rank[a] - rank[b]) <= overlap:
-                    out["kept_as_sequential"] += 1   # the sequential matcher's pair too
-                else:
+                    if pid in created:
+                        kept_created.append(pid)
+                elif pid in created:
                     con.execute("delete from two_view_geometries where pair_id = ?", (pid,))
                     con.execute("delete from matches where pair_id = ?", (pid,))
                     out["removed_below_floor"] += 1
+                else:
+                    out["kept_existing"] += 1     # COLMAP's own pair: not the import's to judge
+            if kept_created:
+                con.execute(f'create table if not exists "{REVISIT_IMPORTED_TABLE}" '
+                            "(pair_id integer primary key not null)")
+                con.executemany(f'insert or replace into "{REVISIT_IMPORTED_TABLE}" values (?)',
+                                [(p,) for p in kept_created])
             con.commit()
         finally:
             con.close()
@@ -1471,8 +1973,9 @@ def _apply_revisit_floor(database_path, pairs, *, floor: int, overlap: int) -> d
 # with loop detection on and the two-view RANSAC seeded, two one-thread runs differed
 # by 2 + 2 verified pairs and two default-thread runs by 5 + 7 (RUN P3-PF, var step 2),
 # and a final solve matches INTO the walk's database, so every re-finish started from a
-# different one. So a SEEDED final solve freezes it: after its matching (sequential,
-# loop detection, the revisit links) it writes `database.matching.json` beside the walk
+# different one. So a SEEDED final solve freezes it: after its matching (sequential and
+# loop detection; the revisit links never enter the walk database, review V9 M-10) it
+# writes `database.matching.json` beside the walk
 # database -- the keyframe image names and the SHA-1 of every solver image, everything
 # that decides what is matched (the key), the pycolmap version, and the database's
 # content digest. A later seeded final solve whose images, key and database all match
@@ -1507,20 +2010,33 @@ DATABASE_DIGEST_RULE = ("sha1 of every table but descriptors, row by row in key 
                         "each matrix's largest-magnitude entry")
 
 
+# Two entries whose magnitudes agree to this relative tolerance are a TIE for the pivot,
+# broken by position: `[t]x` holds +a and -a, and a 1-ulp difference used to pick the
+# other one and flip the sign of the whole normalised matrix (review V9, RV9-B D3).
+_DIGEST_PIVOT_TIE = 1e-9
+
+
 def _stated_bytes(value, *, up_to_sign: bool) -> bytes:
     """A float64 blob at the stated precision, or the blob itself when it is not one.
-    `up_to_sign`: the blob means the same thing negated (F, E, H, a quaternion)."""
+    `up_to_sign`: the blob means the same thing negated (F, E, H, a quaternion).
+
+    UP TO SCALE, WITH NOTHING APPENDED (review V9, LOW). F, E, H, qvec and tvec are all
+    defined only up to scale (`DATABASE_DIGEST_RULE`), so a matrix is digested as itself
+    divided by its pivot -- the first entry, in position order, whose magnitude is the
+    largest to `_DIGEST_PIVOT_TIE` -- rounded to `_DIGEST_STATED_DECIMALS`: signed for F, E,
+    H and qvec (the matrix and its negation are one), by magnitude for tvec (whose sign
+    means something). The pivot's own magnitude used to be appended, so `F` and `2F`
+    digested differently, contradicting the rule's own words."""
     raw = bytes(value)
     if not raw or len(raw) % 8:
         return raw
     arr = np.frombuffer(raw, dtype=np.float64)
     if not np.all(np.isfinite(arr)) or not np.any(arr):
         return raw
-    pivot = float(arr[int(np.argmax(np.abs(arr)))])
+    mags = np.abs(arr)
+    pivot = float(arr[int(np.argmax(mags >= mags.max() * (1.0 - _DIGEST_PIVOT_TIE)))])
     scale = pivot if up_to_sign else abs(pivot)
-    q = np.round(arr / scale, _DIGEST_STATED_DECIMALS) + 0.0  # + 0.0: no negative zero
-    # The matrix's own magnitude, at the same number of significant digits.
-    return q.tobytes() + f"|{abs(pivot):.{_DIGEST_STATED_DECIMALS - 1}e}".encode("ascii")
+    return (np.round(arr / scale, _DIGEST_STATED_DECIMALS) + 0.0).tobytes()  # + 0.0: no -0
 
 
 def database_digest(path) -> dict | None:
@@ -1589,20 +2105,37 @@ def database_digest(path) -> dict | None:
             "verified_pairs": len(lines)}
 
 
-def _image_digests(workspace: SolveWorkspace, names) -> dict:
+def _image_digests(workspace: SolveWorkspace, names) -> tuple[dict | None, str | None]:
+    """({image name: SHA-1}, None), or (None, why) when a solver image cannot be read --
+    another process holding it, a permission -- which refuses the freeze and nothing else
+    (review V9, LOW: it used to raise out of every seeded final solve)."""
     from tower.world_builder.solve_masks import file_sha1  # noqa: PLC0415
 
-    return {name: file_sha1(workspace.images_dir / name) for name in names}
+    out = {}
+    for name in names:
+        try:
+            out[name] = file_sha1(workspace.images_dir / name)
+        except OSError as exc:
+            return None, (f"solver image {name} could not be read to freeze the matching "
+                          f"({type(exc).__name__})")
+    return out, None
 
 
 def matching_key(*, camera_params: str, overlap: int, loop_detection: bool, seed,
-                 revisit_pairs, revisit_min_inliers, pycolmap_version) -> dict:
-    """Everything that decides WHAT a final solve's matching puts in the database, beyond
-    the images. Thread counts are not in it: they change how, not what is asked for. The
-    pycolmap version pins every option this module leaves at its default."""
-    import hashlib  # noqa: PLC0415
+                 pycolmap_version) -> dict:
+    """Everything that decides WHAT a final solve's matching puts in the WALK database,
+    beyond the images. Thread counts are not in it: they change how, not what is asked for.
+    The pycolmap version pins every option this module leaves at its default.
 
-    listed = "".join(f"{a} {b}\n" for a, b in revisit_pairs or ())
+    THE VERIFICATION SEED IS IN IT, deliberately (review V9, LOW). It is the two-view RANSAC
+    seed (`TwoViewGeometryOptions.ransac.random_seed`), and a different seed verifies the same
+    raw matches into different inlier sets -- so a database matched under seed s is not the
+    database a solve seeded s' would have made, and mapping it under s' would claim a
+    reproducibility it does not have. The cost is that a re-finish with a new seed matches
+    again (into the walk database, where loop detection may add pairs) and freezes the result.
+
+    THE REVISIT LINKS ARE NOT IN IT (review V9 M-10): they are matched only into the copy a
+    solve maps, never into the walk database this key describes."""
     return {
         "pycolmap": pycolmap_version,
         "camera_model": "PINHOLE",
@@ -1612,13 +2145,17 @@ def matching_key(*, camera_params: str, overlap: int, loop_detection: bool, seed
         "quadratic_overlap": False,
         "loop_detection": bool(loop_detection),
         "verification_seed": seed,
-        "revisit_pairs": {
-            "imported": bool(revisit_pairs),
-            "count": len(revisit_pairs or ()),
-            "sha1": hashlib.sha1(listed.encode("utf-8")).hexdigest() if revisit_pairs else None,
-            "min_inliers": revisit_min_inliers if revisit_pairs else None,
-        },
     }
+
+
+# A record frozen before review V9 M-10 carries `revisit_pairs` in its key. With `imported`
+# false the walk database it describes holds no import, and the key is otherwise today's.
+_LEGACY_KEY_REVISIT = "revisit_pairs"
+FROZEN_REFUSAL_LEGACY_IMPORT = ("the walk database was frozen holding revisit pairs imported "
+                                "into it before review V9 M-10")
+FROZEN_REFUSAL_CHANGED_UNDER_THE_SOLVE = (
+    "the walk database changed after its frozen matching was checked (another solve wrote "
+    "it while this one ran): what this solve mapped is not the frozen matching")
 
 
 def read_frozen_matching(workspace: SolveWorkspace) -> dict | None:
@@ -1638,9 +2175,12 @@ def _frozen_matching_refusal(workspace, database_path, key, images) -> str | Non
         return "no frozen matching record"
     if record.get("database") != Path(database_path).name:
         return f"the record is for {record.get('database')!r}"
-    if record.get("key") != key:
-        changed = sorted(k for k in set(key) | set(record.get("key") or {})
-                         if (record.get("key") or {}).get(k) != key.get(k))
+    held_key = dict(record.get("key") or {})
+    legacy = held_key.pop(_LEGACY_KEY_REVISIT, None)
+    if isinstance(legacy, dict) and legacy.get("imported"):
+        return FROZEN_REFUSAL_LEGACY_IMPORT
+    if held_key != key:
+        changed = sorted(k for k in set(key) | set(held_key) if held_key.get(k) != key.get(k))
         return f"the matching parameters changed ({', '.join(changed)})"
     held = record.get("images") or {}
     if set(held) != set(images):
@@ -1655,9 +2195,10 @@ def _frozen_matching_refusal(workspace, database_path, key, images) -> str | Non
     return None
 
 
-def _freeze_matching(workspace, database_path, key, images, revisit_pairs) -> str | None:
+def _freeze_matching(workspace, database_path, key, images) -> str | None:
     """Write the record of the matching this solve just did. None when written, else why
-    not (a database that cannot be read cannot be frozen, and the solve goes on)."""
+    not (a database that cannot be read cannot be frozen, and the solve goes on). The walk
+    database holds no revisit link (review V9 M-10), so the record lists none."""
     digest = database_digest(database_path)
     if digest is None:
         return "the database could not be read to freeze its matching"
@@ -1667,7 +2208,6 @@ def _freeze_matching(workspace, database_path, key, images, revisit_pairs) -> st
         "frozen_at": time.time(),
         "key": key,
         "images": images,
-        "revisit_pairs": [list(p) for p in revisit_pairs or ()],
         "database_digest": digest,
     })
     return None
@@ -1676,9 +2216,9 @@ def _freeze_matching(workspace, database_path, key, images, revisit_pairs) -> st
 def _match_revisit_pairs(pycolmap, store, world_id, session_id, workspace, database_path,
                          present, matching, verification, *, pairs=None) -> dict:
     """Match the live relocalizer's revisit links (`relocalizer.revisit_pairs`)
-    explicitly, in the final solve's database, with its matching and
-    verification options -- and its masks, which apply to every pair because
-    they applied at extraction.
+    explicitly, into `database_path` -- which `solve` makes the database it MAPS,
+    never the walk's own (review V9 M-10; `_import_revisit_pairs` masks and floors
+    what this adds) -- with its matching and verification options.
 
     Sequential matching reaches 20 keyframes either side and loop detection
     queries every tenth keyframe; a look-back revisit is exactly the pair
