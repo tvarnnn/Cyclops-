@@ -12,6 +12,7 @@
 		3BFF591BCC38E53334D7805F /* MockTowerServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7687C89BFB8192F1673EBEB1 /* MockTowerServer.swift */; };
 		4E8D7950967282CF51E8CBE3 /* WorldGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */; };
 		4B8ABCE8956142C6BB5B21E6 /* WorldPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */; };
+		5C0A7E500000000000000005 /* WorldLookBackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0A7E500000000000000006 /* WorldLookBackTests.swift */; };
 		5C0A7E500000000000000003 /* WorldComponentsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0A7E500000000000000004 /* WorldComponentsTests.swift */; };
 		5C0A7E500000000000000001 /* WorldPhotographicTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C0A7E500000000000000002 /* WorldPhotographicTests.swift */; };
 		7F2D5E31A94C0B6683DF12A4 /* ObjectMemoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A17E9B0D3F42A85B61E77C /* ObjectMemoryTests.swift */; };
@@ -46,6 +47,7 @@
 /* Begin PBXFileReference section */
 		0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldGeometryTests.swift; sourceTree = "<group>"; };
 		FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldPresentationTests.swift; sourceTree = "<group>"; };
+		5C0A7E500000000000000006 /* WorldLookBackTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldLookBackTests.swift; sourceTree = "<group>"; };
 		5C0A7E500000000000000004 /* WorldComponentsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldComponentsTests.swift; sourceTree = "<group>"; };
 		5C0A7E500000000000000002 /* WorldPhotographicTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorldPhotographicTests.swift; sourceTree = "<group>"; };
 		C4A17E9B0D3F42A85B61E77C /* ObjectMemoryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ObjectMemoryTests.swift; sourceTree = "<group>"; };
@@ -161,6 +163,7 @@
 				E3014A1B5D2A01699D4E7403 /* WorldBuilderIntegrationTests.swift */,
 				0EBE6B82C2538A025B0E3C4C /* WorldGeometryTests.swift */,
 				FA7100E367E142E8A56BDC61 /* WorldPresentationTests.swift */,
+				5C0A7E500000000000000006 /* WorldLookBackTests.swift */,
 				5C0A7E500000000000000004 /* WorldComponentsTests.swift */,
 				5C0A7E500000000000000002 /* WorldPhotographicTests.swift */,
 			);
@@ -334,6 +337,7 @@
 				D7881F037A369AE591F64540 /* WorldBuilderIntegrationTests.swift in Sources */,
 				4E8D7950967282CF51E8CBE3 /* WorldGeometryTests.swift in Sources */,
 				4B8ABCE8956142C6BB5B21E6 /* WorldPresentationTests.swift in Sources */,
+				5C0A7E500000000000000005 /* WorldLookBackTests.swift in Sources */,
 				5C0A7E500000000000000003 /* WorldComponentsTests.swift in Sources */,
 				5C0A7E500000000000000001 /* WorldPhotographicTests.swift in Sources */,
 			);
