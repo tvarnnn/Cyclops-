@@ -117,6 +117,7 @@ import collections
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -128,6 +129,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.world_build_session import (  # noqa: E402
     StopRequest,
     final_surface_stages,
+    published_consensus_solve,
 )
 from tower.artifact_paths import artifact_root_arg  # noqa: E402
 from tower.native_prewarm import prewarm_world_builder  # noqa: E402
@@ -135,6 +137,8 @@ from tower.results.world_builder_render import session_build_running  # noqa: E4
 from tower.storage import read_json_closed, write_json_atomic  # noqa: E402
 from tower.world_builder.engine import WorldBuilderEngine  # noqa: E402
 from tower.world_builder.records import (  # noqa: E402
+    FINAL_SOLVE_FAILED,
+    FINAL_SOLVE_SKIPPED,
     FINAL_SOLVE_SOLVED,
     FINALIZATION_COMPLETE,
     STAGE_APPEARANCE,
@@ -670,9 +674,16 @@ def assess(
             f"finalization is {finalization.get('state')!r}, not "
             f"{FINALIZATION_COMPLETE!r}; there is no finished world to build from"
         )
-    if finalization.get("final_solve") != FINAL_SOLVE_SOLVED:
+    if (finalization.get("final_solve") != FINAL_SOLVE_SOLVED
+            and stale_final_solve(store, world_id, session_id, finalization) is None):
         # `final_surface_stages` refuses without a solve and records
         # `unavailable`. Queuing it would take a lock to write that down again.
+        #
+        # EXCEPT A ROW THAT SAYS SO FALSELY (review V11, MED-A; `stale_final_solve`): the
+        # builder's final-solve child published a consensus solve's draw 0 and was then
+        # ended, and the row was written as if it had published nothing. That session is
+        # assessed as the solved session it is -- its owed consensus first -- and the
+        # finisher's first write under the lock puts the row right (`_heal_final_solve`).
         return no(
             "no-final-solve",
             f"the final solve is {finalization.get('final_solve')!r}; a surface "
@@ -1030,6 +1041,97 @@ def _published_meta(store: WorldStore, world_id: str, session_id: str) -> dict:
     except (OSError, ValueError):
         return {}
     return meta if isinstance(meta, dict) else {}
+
+
+# -- a final solve the row says was not published (review V11, MED-A) ----------------
+#
+# A consensus final solve publishes its draw 0 FIRST, `consensus-deferred` and owed, and
+# only then maps its further draws (`global_solve._publish_draw_0_first`) -- minutes in
+# which the builder's final-solve CHILD has published and is still working. Until P3.8 a
+# hard stop that terminated it was recorded `skipped`, "... the last background solution
+# stands", and a child that exited without a summary `failed`, "world_solve.py exited
+# <n>", whatever it had published. `assess` then answered `no-final-solve`: the consensus
+# the published solve owes never ran, the room was never built, and the row said
+# something false. The builder now records `solved` (`world_build_session.run_final`).
+#
+# A SESSION ALREADY IN THAT STATE is recognised by both halves of it, each written by one
+# path only:
+# - THE ROW: the builder's own sentence for that child (`STALE_FINAL_SOLVE_DETAILS`, word
+#   for word) -- this finalization launched the final-solve child, and it ended without
+#   reporting;
+# - THE DISK: the session's published solve is a gated CONSENSUS final solve that loads
+#   (`world_build_session.published_consensus_solve`), which no background solve writes.
+# It is assessed as the solved session it is, and the finisher's first write under the
+# lock rewrites the row as the builder now writes it (`_heal_final_solve`). Not by time:
+# the row keeps no launch time, and the two halves are each unique to this path. An
+# owner's `--skip-solve` repair (`skipped`, its own sentence), a single-draw or ungated
+# solve, and every other row take today's path exactly.
+STALE_FINAL_SOLVE_DETAILS = {
+    FINAL_SOLVE_SKIPPED: re.compile(r"final solve terminated: hard stop \(.*\) during "
+                                    r"finalization; the last background solution stands"),
+    FINAL_SOLVE_FAILED: re.compile(r"final solve failed: world_solve\.py exited -?\d+"),
+}
+
+
+def stale_final_solve(store: WorldStore, world_id: str, session_id: str,
+                      finalization) -> dict | None:
+    """The published consensus final solve (`published_consensus_solve`'s summary) under a
+    row that says the final solve published nothing, or None. See above. Reads only."""
+    fin = finalization if isinstance(finalization, dict) else {}
+    if fin.get("state") != FINALIZATION_COMPLETE:
+        return None
+    pattern = STALE_FINAL_SOLVE_DETAILS.get(fin.get("final_solve"))
+    detail = fin.get("detail")
+    if pattern is None or not isinstance(detail, str) or not pattern.fullmatch(detail):
+        return None
+    return published_consensus_solve(store, world_id, session_id)
+
+
+def _final_solve_word(store: WorldStore, world_id: str, session_id: str, fin: dict):
+    """The `final_solve` a finisher re-mark writes: `solved` for a row `stale_final_solve`
+    recognises, else what the row says."""
+    if (fin.get("final_solve") != FINAL_SOLVE_SOLVED
+            and stale_final_solve(store, world_id, session_id, fin) is not None):
+        return FINAL_SOLVE_SOLVED
+    return fin.get("final_solve")
+
+
+def _heal_final_solve(store: WorldStore, engine, world_id: str, session_id: str) -> dict | None:
+    """Under the caller's lock: a row `stale_final_solve` recognises is rewritten as the builder
+    now writes it for the same solve -- `final_solve: solved`, `detail` the published record's
+    `publish_detail`, `notice` its `publish_notice` (the consensus it owes). What was written,
+    or None when there was nothing to heal."""
+    from tower.world_builder import coherence_publish as CP  # noqa: PLC0415
+
+    fin = store.read_session(world_id, session_id).finalization or {}
+    published = stale_final_solve(store, world_id, session_id, fin)
+    if published is None:
+        return None
+    summary = {"gate": published["gate"], "transients": published.get("transients") or {}}
+    notice = CP.publish_notice(summary)
+    engine.mark_finalization(world_id, session_id, state=fin["state"],
+                             final_solve=FINAL_SOLVE_SOLVED, detail=CP.publish_detail(summary),
+                             notice=notice)
+    logger.warning("[Tower][WorldBuilder] %s/%s: the row said the final solve was %r (%s), but it "
+                   "had published a consensus solve before it ended; recorded as solved",
+                   world_id, session_id, fin.get("final_solve"), fin.get("detail"))
+    return {"final_solve": FINAL_SOLVE_SOLVED, "was": fin.get("final_solve"),
+            "was_detail": fin.get("detail"), "notice": notice}
+
+
+def _heal_quietly(store: WorldStore, engine, verdict, report: dict) -> None:
+    """`_heal_final_solve`, never fatal: a record fix is not worth the run's work. A row it
+    could not heal is still recognised next time (it is unchanged)."""
+    try:
+        healed = _heal_final_solve(store, engine, verdict.world_id, verdict.session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Tower][WorldBuilder] could not put the final solve of %s/%s right on "
+                       "its row: %s: %s", verdict.world_id, verdict.session_id,
+                       type(exc).__name__, exc)
+        report["final_solve_heal_error"] = f"{type(exc).__name__}: {exc}"
+        return
+    if healed is not None:
+        report["final_solve_healed"] = healed
 
 
 def _regate_refusal(store: WorldStore, world_id: str, session_id: str) -> str | None:
@@ -1533,7 +1635,8 @@ def _reconcile_regate_notice(store: WorldStore, engine, world_id: str,
     if fin.get("notice") == notice and fin.get("detail") == detail:
         return None
     engine.mark_finalization(world_id, session_id, state=fin["state"],
-                             final_solve=fin.get("final_solve"), detail=detail, notice=notice)
+                             final_solve=_final_solve_word(store, world_id, session_id, fin),
+                             detail=detail, notice=notice)
     logger.info("[Tower][WorldBuilder] %s/%s: the re-gate's notice was not written after its "
                 "publish; written now", world_id, session_id)
     return {"notice": notice, "was": fin.get("notice")}
@@ -1571,6 +1674,13 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
     try:
         if _refinish_under_the_lock(store, verdict, report):
             return report
+        # A row that says the final solve published nothing, over the consensus solve it did
+        # publish (review V11, MED-A), is put right first. Decided before the re-gate
+        # rewrites the record, so the re-mark below keeps `solved` even if this write fails.
+        stale = stale_final_solve(store, verdict.world_id, verdict.session_id,
+                                  store.read_session(verdict.world_id,
+                                                     verdict.session_id).finalization) is not None
+        _heal_quietly(store, engine, verdict, report)
         try:
             report["attempts"] = record_attempt(store, verdict.world_id, key,
                                                 detail="re-running the evidence gate in place")
@@ -1635,7 +1745,8 @@ def finish_regate(store: WorldStore, verdict: Verdict, *, appearance: bool, prun
             result = report["regate"] or {}
             notice = result.get("notice")
             engine.mark_finalization(verdict.world_id, verdict.session_id, state=fin["state"],
-                                     final_solve=fin.get("final_solve"),
+                                     final_solve=(FINAL_SOLVE_SOLVED if stale
+                                                  else fin.get("final_solve")),
                                      detail=result.get("detail", notice), notice=notice)
         if stop_request.asked:
             # The room stays `stopped` -- owed -- and the next run rebuilds it from the new
@@ -1737,6 +1848,7 @@ def finish_areas(store: WorldStore, verdict: Verdict, *, appearance: bool,
     try:
         if _refinish_under_the_lock(store, verdict, report):
             return report
+        _heal_quietly(store, engine, verdict, report)      # review V11, MED-A (see `finish`)
         try:
             report["attempts"] = record_attempt(store, verdict.world_id, key,
                                                 detail="finishing this session's areas")
@@ -1835,7 +1947,10 @@ def _retire_regate(store: WorldStore, verdict: Verdict, max_attempts: int) -> di
         fin = store.read_session(verdict.world_id, verdict.session_id).finalization or {}
         WorldBuilderEngine(store).mark_finalization(
             verdict.world_id, verdict.session_id, state=fin["state"],
-            final_solve=fin.get("final_solve"), detail=detail, notice=notice)
+            # `solved` for a row that said the published solve was not (V11, MED-A): the
+            # given-up sentence replaces its detail, so it would not be recognised again.
+            final_solve=_final_solve_word(store, verdict.world_id, verdict.session_id, fin),
+            detail=detail, notice=notice)
         out["notice"] = notice
     finally:
         store.release_writer_lock(verdict.world_id)
@@ -2011,6 +2126,9 @@ def finish(
     try:
         if _refinish_under_the_lock(store, verdict, report):
             return report
+        # A row that says the final solve published nothing, over the consensus solve it did
+        # publish (review V11, MED-A): put right before the room is built from that solve.
+        _heal_quietly(store, engine, verdict, report)
         # A re-gate that published and could not write its notice left this room marked;
         # its sentence is put right before the room is rebuilt (review V9, LOW). A record
         # fix, so never fatal: the room is what this run is for.
@@ -2060,7 +2178,8 @@ def finish(
         report["stages"] = final_surface_stages(
             store, verdict.world_id, verdict.session_id,
             # Guaranteed by `assess`: a session is not owed unless its
-            # finalization recorded a SOLVED final solve.
+            # finalization recorded a SOLVED final solve -- or one the row
+            # denied, healed above (`stale_final_solve`, review V11 MED-A).
             solved=True,
             appearance=appearance,
             prune_depth_work=prune_depth_work,
