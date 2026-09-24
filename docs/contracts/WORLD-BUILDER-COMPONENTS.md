@@ -13,6 +13,8 @@
 > accepted: review V8 says READY WITH CHANGES and its fix round is open (the
 > Mac gate G1 passed at `1111bb9`, manager 020), and the physical A/B test has
 > not run. v6 (2026-09-24) adds `finalization.notice` (§3.1, §8).
+> v7 (2026-09-24) adds the reason `seed-unstable` (§2.2; consensus, §2.5), frozen
+> matching, the depth-prediction cache and the re-finish's raw frames by capture identity (§7 rule 4).
 > Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
@@ -91,6 +93,7 @@ placed whatever its level, so the link reasons come first.
 | `single-unconfirmed-link` | It has verified links to the room, but they are **one point of failure**: a single pair, or several pairs through one image whose other ends are not themselves linked (no closed triangle) — `redundant_links()` false with ≥ 1 link | target bathroom: one non-redundant link; 991e5a15 kf 13–25: one floor-level pair, 55° off in image-only roll |
 | `link-contradicted` | It has verified links to the room, but the solve **contradicts** them: each pair's own two-view rotation disagrees with the solve's relative rotation by more than the control-measured bound (`max_link_disagreement_deg`, the control's p90 of link-vs-solve disagreement, 16.8°), so they are not evidence that it was placed right. Reported when setting those links aside is what left the piece without redundant links; otherwise the link reason above applies | 6839fb8f kf 92–98: four UNCALIBRATED 15–18-inlier links, contradicted by 34–96° (precondition b, lane `9ffe043`) |
 | `scale-mismatch` | Its metric level (per-camera MoGe TRI ratio, median over ≥ 10 cameras on each side) differs from the room's by more than ×1.25 — including a part the gate split off its own group at an internal scale step | target bathroom: ×4.27 |
+| `seed-unstable` | **Consensus** (v7, manager 019): the final solve was mapped N times (`TOWER_WORLD_SOLVE_CONSENSUS`, default 1 = off; the acceptance runs use 3), with mapper seeds `s … s+N-1` on ONE frozen matched database, the same masks and the same depth. Each draw was gated, and each keyframe voted attached or not. The published draw attached this piece, but fewer than a strict majority of draws did, so the evidence placing it is marginal and it is withheld from the room. For such a piece this is the **only** reason. It comes last in precedence, so no existing reason moves. The room's anchor group is never withheld | 6839fb8f: the walk-in closet (138 kf) is attached in 4 of 5 mapper seeds on one database, and detached by seed 2 (PF) |
 
 **Why τ is the control's p90 (16.8°), not its p95 (25.2°).** Both were
 derived from the known-good control alone and both were declared before any
@@ -101,11 +104,13 @@ the two pre-declared values is the default (manager 011). It is a named
 parameter, `max_link_disagreement_deg`, recorded in the gate's params digest
 and in the solve manifest, so a physical test or a later world can audit it.
 
-**Not reasons, deliberately.** `seed-unstable`: the seed-stability test is
-dropped from the product gate (its 0.075 threshold was set by the target alone,
-V4a; one seeded single-thread solve replaces the ensemble). `too-small-to-build`
-(proposed by P2-PX): size is not a placement decision, and is `shown_as`'s
-business (§2.3), so a small piece still says *why* it was not placed.
+**Not reasons, deliberately.** `too-small-to-build` (proposed by P2-PX): size is
+not a placement decision, and is `shown_as`'s business (§2.3), so a small piece
+still says *why* it was not placed. (`seed-unstable` was listed here until v6.
+The old seed-stability test had a 0.075 threshold set by the target alone (V4a),
+and it stays dropped. The v7 reason is a strict majority of N mapper-seed draws
+on one frozen database, which has no tuned threshold. Evidence: PF on 6839fb8f,
+where a majority of 3 gave 0 flips of a ≥ 30-kf group over 45 triple pairs.)
 
 ### 2.3 `shown_as` — the room, an area, or counted only
 
@@ -178,6 +183,11 @@ reader, the physical test or the harness can tell what produced `components`:
 | `gate.masks_applied`, `gate.metric_available`, `gate.attach` | whether the masks were applied (`transients.state == "applied"`), whether any camera had a metric ratio, and so whether any piece could be attached at all |
 | `gate.evidence`, `gate.depth`, `gate.metric_scale`, `gate.components_file` | what the gate saw (links, honoured links, cameras with a ratio), the depth stage it used (told the solve camera's field of view), and the record it wrote |
 | `solve.seed`, `solve.threads` | the seeded single-thread solve that produced the model |
+| `solve.matching`, `solve.matching_detail`, `solve.database_digest`, `solve.verified_pairs` | **Frozen matching** (v7, V8 H2): PF measured that matching is not deterministic even on one thread. After a seeded final solve matches, `database.matching.json` beside the walk database records the key: pycolmap version, camera, max features, overlap, loop detection, verification seed and revisit list, plus the image names with their SHA-1 and the walk database's content digest. A later seeded final solve with the same key, images and content skips extraction and matching (`matching: frozen`); anything else matches and re-freezes (`matched`, with `matching_detail`). `database_digest` is the SHA-1 of the database that was mapped, with its two-view matrices at the stated precision named in `database_digest_rule`: F, E, H and qvec up to scale and sign, tvec up to scale, at 10 decimals. Two same-seed re-finishes gave one F as -F and last-bit noise elsewhere, on planar pairs where F is unused. An unseeded solve reads and writes none of this |
+| `solve.revisit_pairs` | The live relocalizer's revisit links (§6). They are imported only when the masks are `applied` and the solve is gated; otherwise `imported: false`, and `detail` says why. A link counts only at ≥ 50 inliers per leg (`relocalizer.REVISIT_MIN_INLIERS`, the per-leg floor of tri2_50, §6.3), and the floor is applied in the mapped database after the mask filter. With no links the record is exactly `{listed: 0, verified: 0, detail: null}` |
+| `gate.consensus` | **Consensus** (v7): `requested` (N), `unit: mapper-seed`, `seeds`, `state` (`applied`, `not-needed`, `deferred`, `not-run` or `not-applied`, with why), per-draw summaries (seed, seconds, `solve_identity`, room keyframes, votes, agreement), the chosen draw, and per group its votes, `ambiguous` (not unanimous) and its decision (`anchor`, `attached`, `seed-unstable` or `unplaced`). Each draw's per-round gate decisions are in `solve/<s>/consensus.json`. A minority piece inside the published anchor block cannot be withheld (the anchor is never withheld) and is reported in `gate.consensus.pieces`. Absent when N = 1 |
+| `solve.frames_ambiguous_by_name` | Present only when > 0: keyframes whose raw frame name was found in more than one capture directory, so the stored keyframe was used instead of a guess (v7). The re-finish never reaches this lookup: it assigns raw frames by capture identity (`source_seq` + `received_at`, section 7 rule 4) |
+| `gate.depth.predictions` | `{token, cached, predicted}`. The gate's MoGe predictions are cached per exact input pixels under `dense/<s>/predictions/<token>/` (v7, V8 H2), so a re-finish does not recompute them on the GPU. The fit to this solve is always recomputed |
 
 ## 3. Where `components` appears
 
@@ -698,6 +708,23 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
    (the gate may move pieces out of it), so the room's revision changes and an
    open viewer offers *A newer reconstruction is ready* under IOS §10's existing
    rules. (Settled 2026-09-23, contract v3; Tower-internal, no wire change.)
+   **v7 (V8 M3, H2):**
+   - **The solver's frames** are the walk's raw capture frames when they exist. Each keyframe's frame is
+     found by its own capture identity (`source_seq` + `received_at` in that capture's `frames.jsonl`),
+     never by name. A keyframe that is ambiguous or not found uses its stored redacted copy. The captures
+     searched: `--capture-dir`, or else
+     `TOWER_CAPTURE_ROOT/captures/<capture_id>` and every capture that `continues_capture` it (a walk that
+     reconnected lives in 2–3 captures). Otherwise they are the stored redacted keyframes. `--no-capture`
+     forces the latter, and the ledger's `solver_frames` says which was used. The raw frames never leave
+     the Tower.
+   - **Carried back:** the walk database, its matching record (`database.matching.json`) and the mask cache,
+     so a second re-finish with the same seed maps the same database and uses the same masks and depth
+     predictions.
+   - **Rollback:** any error after the set-aside restores the previous result, and the ledger records
+     `restored-after-an-error` or `restore-incomplete`. The ledger records the re-finish's process, so the
+     finisher stays out of a live re-finish and not out of a dead one.
+   - **Stop the Tower first**, or at least its finisher (`TOWER_WORLD_FINISH_PENDING=false`); see
+     `tower/docs/world-builder/COHERENCE-PRODUCT.md`.
 5. **The finisher never computes components for a world that has none.** (It re-runs the gate in place only for a session whose own gate record says `retryable`, §2.5; it never re-solves.) `world_finish_pending.py` and
    the Tower's idle and start-up finishing treat `components: null` as owing
    **nothing**: no world is rebuilt into components on Tower start or when idle.
