@@ -180,6 +180,7 @@ class WorldBuilderEngine:
         clock=time.time,
         redactor_factory=None,
         relocalizer: str | None = None,
+        monotonic=None,
     ) -> None:
         self._store = store
         # The look-back relocalizer's mode (`off` / `prompt` / `silent`,
@@ -189,6 +190,13 @@ class WorldBuilderEngine:
         # journaled, and every journal is byte-identical to before.
         self._relocalizer_mode = relocalizer
         self._reloc = None
+        # The relocalizer's DURATION clock (review V5 M4-4): its prompt,
+        # cooldown and timeout never see a wall-clock step. `time.monotonic`
+        # with the real Tower clock; an injected clock (tests, replays) is
+        # used for both unless a monotonic one is injected too.
+        if monotonic is None:
+            monotonic = time.monotonic if clock is time.time else clock
+        self._mono = monotonic
         self._policy = policy or KeyframePolicy()
         self._backend_name = backend_name
         # A factory rather than an instance: a redactor holds a loaded
@@ -420,22 +428,25 @@ class WorldBuilderEngine:
             if self._live is not None:
                 self._live.close_segment(self._segment_index)
             self._note_rejected(decision.reason)
-            lost = self._events.append(
+            self._events.append(
                 "tracking_lost", {"segment_index": self._segment_index}
             )
             # The look-back relocalizer: a loss with no episode open opens
             # one (the lost frame is its first scan); one inside an open
             # episode joins it. Never waits on the matcher.
+            # Durations run on the MONOTONIC clock (review V5 M4-4); the
+            # journal line above carries the Tower-clock `at` the wire uses.
+            now = self._mono()
             self._recovery(
-                lambda r: r.note_lost(lost.at)
-                + r.note_frame(gray, source_seq, None, self._clock())
+                lambda r: r.note_lost(now)
+                + r.note_frame(gray, source_seq, None, now)
             )
             return self._result(decision.outcome, decision.reason)
 
         if not decision.accepted:
             self._note_rejected(decision.reason)
             self._recovery(
-                lambda r: r.note_frame(gray, source_seq, None, self._clock())
+                lambda r: r.note_frame(gray, source_seq, None, self._mono())
             )
             return self._result(decision.outcome, decision.reason)
 
@@ -543,7 +554,7 @@ class WorldBuilderEngine:
             lambda r: (
                 r.note_keyframe(keyframe.keyframe_id, source_seq, gray)
                 or r.note_frame(
-                    gray, source_seq, keyframe.keyframe_id, self._clock()
+                    gray, source_seq, keyframe.keyframe_id, self._mono()
                 )
             )
         )
@@ -618,9 +629,10 @@ class WorldBuilderEngine:
         if capture_end_reason is not None:
             stopped_payload["capture_end_reason"] = capture_end_reason
         # An episode still open when the walk ends can no longer recover:
-        # it is closed `timed_out` (why: session_stopped) BEFORE the stop
-        # line, so a stopped session never reads "searching" forever.
-        self._recovery(lambda r: r.close(self._clock()))
+        # it is closed `timed_out` (why: session_stopped) and
+        # `relocalizer_stopped` written BEFORE the stop line, so a stopped
+        # session never reads "searching" forever.
+        self._recovery(lambda r: r.close(self._mono()))
         self._reloc = None
         self._events.append("session_stopped", stopped_payload)
         if not hold_lock:
@@ -1177,7 +1189,7 @@ class WorldBuilderEngine:
         """
         if self._reloc is not None:
             try:
-                self._reloc.close(self._clock())
+                self._reloc.close(self._mono())  # a previous session's; not journaled here
             except Exception:
                 logger.exception("[Tower][WorldBuilder] closing a stale relocalizer failed")
             self._reloc = None
@@ -1216,16 +1228,27 @@ class WorldBuilderEngine:
             return
         try:
             events = step(reloc)
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "[Tower][WorldBuilder] look-back relocalizer failed; it is off "
                 "for the rest of this session"
             )
             self._reloc = None
+            # Review V5 M4-1: the drop is JOURNALED. An open episode is closed
+            # `timed_out` and `relocalizer_stopped {why: error}` is the last
+            # relocalizer line, so the recovery block can never read
+            # "searching" for the rest of the walk. If even the handle's
+            # close raises, the pure machine's close cannot.
             try:
-                reloc.close(self._clock())
+                events = reloc.close(self._mono(), why="error")
             except Exception:
-                pass
+                logger.exception("[Tower][WorldBuilder] closing the failed relocalizer failed")
+                events = reloc.machine.close(self._mono(), why="relocalizer_stopped")
+                events.append(("relocalizer_stopped", {"why": "error"}))
+            for kind, payload in events:
+                if kind == "relocalizer_stopped":
+                    payload = {**payload, "error": type(error).__name__}
+                self._events.append(kind, payload)
             return
         for kind, payload in events or ():
             self._events.append(kind, payload)

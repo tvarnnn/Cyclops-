@@ -101,17 +101,26 @@ def synchronous(monkeypatch):
     )
 
 
-def _walk(root, frames, *, relocalizer, step=0.3, intrinsics=None):
+def _walk(root, frames, *, relocalizer, step=0.3, intrinsics=None, monotonic=None, engine_cls=None):
+    """Drive a real engine. `frames` is [(jpeg, dt)] with dt the step of the
+    Tower clock (None: `step`), or [(jpeg, dt, mono_dt)] to step a separate
+    monotonic clock differently (a wall-clock step)."""
     clock = _Clock()
-    engine = WorldBuilderEngine(WorldStore(root), clock=clock, relocalizer=relocalizer)
+    mono = _Clock(50.0) if monotonic else None
+    engine = (engine_cls or WorldBuilderEngine)(
+        WorldStore(root), clock=clock, relocalizer=relocalizer, monotonic=mono)
     world_id = engine.create_world("reloc")
     session_id = engine.start_session(
         world_id, intrinsics=intrinsics or _intrinsics(), frame_source="synthetic",
         declared_size=(WIDTH, HEIGHT),
     )
     outcomes = []
-    for seq, (jpeg, dt) in enumerate(frames):
-        clock.t += dt if dt is not None else step
+    for seq, frame in enumerate(frames):
+        jpeg, dt = frame[0], frame[1]
+        dt = dt if dt is not None else step
+        clock.t += dt
+        if mono is not None:
+            mono.t += frame[2] if len(frame) > 2 else dt
         outcomes.append(engine.observe(jpeg, source_seq=seq, wire_seq=seq).outcome)
     engine.stop_session()
     store = WorldStore(root)
@@ -465,8 +474,8 @@ def test_a_revisit_after_a_loss_is_a_verified_link_the_final_solve_can_match(
 
 def _lost_for_good(room_frames):
     room, noise = room_frames
-    # One second per frame after the loss: only unrelated views for 25 s.
-    return [(f, 0.3) for f in room] + [(noise[i % len(noise)], 1.0) for i in range(26)]
+    # A frame every 0.4 s after the loss: only unrelated views for ~25 s.
+    return [(f, 0.3) for f in room] + [(noise[i % len(noise)], 0.4) for i in range(64)]
 
 
 def test_an_unrecovered_loss_prompts_once_then_times_out(tmp_path, room_frames, synchronous):
@@ -478,12 +487,16 @@ def test_an_unrecovered_loss_prompts_once_then_times_out(tmp_path, room_frames, 
     lost = next(e for e in events if e["kind"] == "tracking_lost")
     assert prompt["payload"] == {"prompt_id": 1, "episode": 1}
     assert prompt["at"] - lost["at"] >= 5.0
+    assert prompt["at"] - lost["at"] <= 5.0 + 0.5  # never late (review V5 M4-2)
     timed = next(e for e in events if e["kind"] == "recovery_timed_out")
     assert timed["payload"] == {"episode": 1}
     assert timed["at"] - lost["at"] >= 20.0
     block = R.recovery_block(events)
     assert block["prompt"]["id"] == 1 and block["state"] == "timed_out"
-    # Every episode is resolved by the time the session record is closed.
+    # Every episode is resolved, and the relocalizer's terminal line
+    # written, before the session record is closed.
+    assert kinds[-2:] == ["relocalizer_stopped", "session_stopped"]
+    assert events[-2]["payload"] == {"why": "session_stopped"}
     assert kinds.index("session_stopped") > max(
         i for i, k in enumerate(kinds) if k == "recovery_timed_out")
 
@@ -511,13 +524,48 @@ def test_the_setting_defaults_to_off_and_garbage_is_off(monkeypatch):
         assert world_relocalizer_setting() == expected
 
 
+class _EngineWithoutTheHooks(WorldBuilderEngine):
+    """The engine as it was before the relocalizer: both hooks are no-ops."""
+
+    def _start_relocalizer(self, session):
+        return None
+
+    def _recovery(self, step):
+        return None
+
+
+def _comparable(store, world_id, session_id, events):
+    """Every journal line and keyframe record, minus the random session id."""
+    sid = session_id
+
+    def scrub(value):
+        if isinstance(value, str):
+            return value.replace(sid, "<session>")
+        if isinstance(value, dict):
+            return {k: scrub(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+
+    keyframes = [json.loads(line) for line in
+                 store.keyframes_path(world_id, session_id).read_text().splitlines()]
+    return scrub(events), scrub(keyframes)
+
+
 def test_an_engine_without_the_setting_journals_exactly_what_it_did(tmp_path, room_frames, monkeypatch):
+    """Exact equality with the engine minus its two relocalizer hooks: every
+    journal line (kind, time, payload, id) and every keyframe record."""
     monkeypatch.delenv("TOWER_WORLD_RELOCALIZER", raising=False)
-    _, _, _, events, _ = _walk(tmp_path, _lost_then_revisit(room_frames), relocalizer=None)
-    kinds = {e["kind"] for e in events}
-    assert "tracking_lost" in kinds  # the walk did lose tracking
-    assert kinds <= OLD_EVENT_KINDS
-    assert R.recovery_block(events) is None
+    walk = _lost_then_revisit(room_frames)
+    default = _walk(tmp_path / "default", walk, relocalizer=None)
+    off = _walk(tmp_path / "off", walk, relocalizer="off")
+    before = _walk(tmp_path / "before", walk, relocalizer="prompt", engine_cls=_EngineWithoutTheHooks)
+    assert "tracking_lost" in {e["kind"] for e in default[3]}  # the walk did lose tracking
+    expected = _comparable(before[0], before[1], before[2], before[3])
+    assert _comparable(default[0], default[1], default[2], default[3]) == expected
+    assert _comparable(off[0], off[1], off[2], off[3]) == expected
+    assert default[4] == before[4]  # every observe() outcome
+    assert R.recovery_block(default[3]) is None
 
 
 def test_turning_it_on_moves_no_keyframe_decision(tmp_path, room_frames, synchronous):
@@ -624,3 +672,254 @@ def test_the_worker_is_idle_until_a_loss():
         assert reloc.note_frame(gray, i, f"k{i}", float(i)) == []
     assert reloc._thread is None and reloc.attempts == 0
     reloc.close(40.0)
+
+
+# -- review V5 M4-1: a relocalizer that raises is closed in the journal ------------------------
+
+
+def _raising_factory(state):
+    real = R.from_session
+
+    def factory(intrinsics, *, mode, **kw):
+        reloc = real(intrinsics, mode=mode, synchronous=True, **kw)
+        orig = reloc.note_frame
+
+        def note_frame(gray, seq, kid, now):
+            if state["armed"] and reloc.machine.is_open:
+                raise RuntimeError("injected: cv2.error in the relocalizer")
+            return orig(gray, seq, kid, now)
+
+        reloc.note_frame = note_frame
+        return reloc
+
+    return factory
+
+
+def test_a_relocalizer_that_raises_is_journaled_closed_and_stays_off(tmp_path, room_frames, monkeypatch):
+    """The reviewer's engine_drop_path.py, as a test: walk, loss (the step
+    raises inside the open episode), walk again, a second loss, stop."""
+    room, noise = room_frames
+    state = {"armed": False}
+    monkeypatch.setattr(R, "from_session", _raising_factory(state))
+
+    class _Arming(WorldBuilderEngine):
+        def observe(self, raw, **kw):
+            if kw["source_seq"] == len(room):
+                state["armed"] = True
+            return super().observe(raw, **kw)
+
+    walk = ([(f, None) for f in room] + [(n, None) for n in noise[:3]]
+            + [(f, None) for f in room] + [(n, None) for n in noise[3:]])
+    _, _, _, events, _ = _walk(tmp_path, walk, relocalizer="prompt", engine_cls=_Arming)
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("tracking_lost") >= 2
+    stopped = [e for e in events if e["kind"] == "relocalizer_stopped"]
+    assert [e["payload"] for e in stopped] == [{"why": "error", "error": "RuntimeError"}]
+    timed = [e for e in events if e["kind"] == "recovery_timed_out"]
+    assert [e["payload"] for e in timed] == [{"episode": 1, "why": "relocalizer_stopped"}]
+    # Nothing relocalizer-shaped after the terminal line, however many losses follow.
+    after = kinds[kinds.index("relocalizer_stopped") + 1:]
+    assert not [k for k in after if k.startswith(("recovery_", "relocalizer_"))]
+    assert "tracking_lost" in after
+    block = R.recovery_block(events)
+    assert block["state"] == "timed_out" and block["episode"] == 1
+    assert block["resolved_at"] is not None and block["counts"]["timed_out"] == 1
+
+
+def test_the_reader_closes_an_open_episode_when_the_session_or_relocalizer_stops():
+    base = [_started(), _ev("tracking_lost", 10.0)]
+    # A builder that died after writing session_stopped but not its close.
+    crash = R.recovery_block(base + [_ev("session_stopped", 12.0)])
+    assert crash["state"] == "timed_out" and crash["resolved_at"] == 12.0
+    assert crash["counts"]["timed_out"] == 1
+    # relocalizer_stopped alone closes it too, and no episode opens after it.
+    dropped = R.recovery_block(base + [_ev("relocalizer_stopped", 11.0, {"why": "error"}),
+                                       _ev("tracking_lost", 30.0), _ev("tracking_lost", 50.0)])
+    assert dropped["state"] == "timed_out" and dropped["episode"] == 1
+    assert dropped["counts"]["episodes"] == 1
+    # A closed episode is not closed twice.
+    normal = R.recovery_block(base + [_ev("recovery_timed_out", 11.0, {"episode": 1, "why": "session_stopped"}),
+                                      _ev("relocalizer_stopped", 11.0, {"why": "session_stopped"}),
+                                      _ev("session_stopped", 11.0)])
+    assert normal["counts"]["timed_out"] == 1 and normal["resolved_at"] == 11.0
+
+
+def test_close_is_idempotent_and_always_terminal():
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT),
+                                  prompts_enabled=True, verifier=_SlowVerifier(0.0))
+    gray = np.zeros((HEIGHT, WIDTH), np.uint8)
+    reloc.note_keyframe("k0", 0, gray)
+    reloc.note_lost(1.0)
+    first = reloc.close(2.0, why="error")
+    assert _kinds(first) == ["recovery_timed_out", "relocalizer_stopped"]
+    assert first[-1][1] == {"why": "error"}
+    assert reloc.close(3.0) == []
+
+
+# -- review V5 M4-2: no late prompts after a stream stall ---------------------------------------
+
+
+@pytest.mark.parametrize("gap, expected", [
+    (5.4, ["recovery_prompted"]),     # within one scan period of prompt_after: on time
+    (12.0, ["recovery_withheld"]),    # the reviewer's stall_demo, first case
+    (25.0, ["recovery_timed_out"]),   # past the timeout: closes, never prompts
+])
+def test_a_stall_never_produces_a_late_prompt(gap, expected):
+    m = R.RecoveryStateMachine(LIM, prompts_enabled=True, late_grace_s=0.5)
+    m.lost(1000.0)
+    assert m.tick(1000.1) == []            # the last frame before the stall
+    ev = m.tick(1000.0 + gap)               # the first frame after it
+    assert _kinds(ev) == expected
+    if expected == ["recovery_withheld"]:
+        assert ev[0][1] == {"episode": 1, "why": "late", "layer": None}
+        assert m.withheld_late == 1 and m.counts["withheld_by_limiter"] == 0
+    # A late or timed-out episode never spends the cooldown: the next,
+    # timely loss prompts.
+    if expected != ["recovery_prompted"]:
+        m.tick(1000.0 + max(gap, 20.0))  # the episode has timed out
+        assert m.state == "timed_out"
+        t = 1000.0 + max(gap, 20.0) + 1.0
+        assert m.lost(t)[0]
+        assert _kinds(m.tick(t + 5.0)) == ["recovery_prompted"]
+
+
+def test_fuzzed_stalls_never_prompt_late_and_never_prompt_on_timeout():
+    """A cut-down fuzz_limiter.py: random losses, acceptances and stalls."""
+    import random
+
+    for seed in range(20):
+        rnd = random.Random(seed)
+        m = R.RecoveryStateMachine(LIM, prompts_enabled=True, late_grace_s=0.5)
+        t, prompts = 1000.0, []
+        while t < 1000.0 + 30 * 60:
+            t += 0.1 if rnd.random() > 0.002 else rnd.uniform(5, 40)
+            if rnd.random() < 0.01:
+                m.lost(t)
+            if m.is_open and rnd.random() < 0.003:
+                m.accepted(t, R.BY_TRIANGLE, {})
+            if m.is_open:
+                lost_at = m.lost_at
+                kinds = _kinds(m.tick(t))
+                if "recovery_prompted" in kinds:
+                    prompts.append(t)
+                    assert t - lost_at <= LIM.prompt_after_s + 0.5
+                    assert "recovery_timed_out" not in kinds
+        assert _max_in_closed_window(prompts, 60.0) <= 2
+
+
+def test_an_engine_stall_withholds_late(tmp_path, room_frames, synchronous):
+    """A real engine: the loss, then the stream stalls for 10 s."""
+    room, noise = room_frames
+    walk = [(f, 0.3) for f in room] + [(noise[0], 0.3), (noise[1], 10.0)] + [(n, 0.4) for n in noise[2:]]
+    _, _, _, events, _ = _walk(tmp_path, walk, relocalizer="prompt")
+    withheld = [e["payload"] for e in events if e["kind"] == "recovery_withheld"]
+    assert "recovery_prompted" not in [e["kind"] for e in events]
+    assert withheld and withheld[0]["why"] == "late"
+    assert R.recovery_block(events)["counts"]["withheld_by_limiter"] == 0
+
+
+# -- review V5 M4-3: an episode that cannot be accepted never prompts ---------------------------
+
+
+def test_no_reference_keyframes_withholds_no_references():
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT),
+                                  prompts_enabled=True, verifier=_SlowVerifier(0.0))
+    gray = np.zeros((HEIGHT, WIDTH), np.uint8)
+    events = reloc.note_lost(0.0)
+    for i in range(1, 30):
+        events += reloc.note_frame(gray, i, None, i * 0.25)
+    assert ("recovery_withheld", {"episode": 1, "why": "no-references", "layer": None}) in events
+    assert "recovery_prompted" not in _kinds(events)
+    assert reloc._thread is None and reloc.attempts == 0  # no scan was even attempted
+    assert reloc.machine.withheld_no_references == 1
+    reloc.close(10.0)
+
+
+def test_frames_at_another_size_withhold_no_references():
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT),
+                                  prompts_enabled=True, verifier=_SlowVerifier(0.0))
+    reloc.note_keyframe("k0", 0, np.zeros((HEIGHT, WIDTH), np.uint8))
+    other = np.zeros((HEIGHT * 2, WIDTH * 2), np.uint8)
+    events = reloc.note_lost(1.0)
+    for i in range(1, 30):
+        events += reloc.note_frame(other, i, None, 1.0 + i * 0.25)
+    kinds = _kinds(events)
+    assert "recovery_prompted" not in kinds and "recovery_withheld" in kinds
+    assert dict(events[kinds.index("recovery_withheld")][1])["why"] == "no-references"
+    reloc.close(10.0)
+
+
+def test_withholds_the_limiter_never_saw_are_not_counted_as_the_limiters():
+    journal = [_started(), _ev("tracking_lost", 10.0),
+               _ev("recovery_withheld", 17.0, {"episode": 1, "why": "late", "layer": None}),
+               _ev("recovery_timed_out", 30.0, {"episode": 1}),
+               _ev("tracking_lost", 40.0),
+               _ev("recovery_withheld", 45.0, {"episode": 2, "why": "no-references", "layer": None})]
+    counts = R.recovery_block(journal)["counts"]
+    assert counts["withheld_by_limiter"] == 0 and counts["withheld_disabled"] == 0
+    assert set(counts) == CONTRACT_COUNT_KEYS
+
+
+# -- review V5 M4-4: durations run on the monotonic clock ----------------------------------------
+
+
+def test_the_builder_default_duration_clock_is_monotonic(tmp_path):
+    engine = WorldBuilderEngine(WorldStore(tmp_path))
+    assert engine._mono is time.monotonic
+
+
+def test_a_wall_clock_step_moves_no_transition(tmp_path, room_frames, synchronous):
+    """The Tower clock jumps back an hour mid-episode; the monotonic clock
+    does not. The prompt still comes 5 s after the loss, on time, and its
+    wire times are the Tower clock's."""
+    room, noise = room_frames
+    walk = ([(f, 0.3) for f in room] + [(noise[0], 0.3)]
+            + [(noise[1], -3600.0, 0.4)]            # the wall-clock step
+            + [(n, 0.4) for n in (noise[2:] * 12)])
+    _, _, _, events, _ = _walk(tmp_path, walk, relocalizer="prompt", monotonic=True)
+    prompts = [e for e in events if e["kind"] == "recovery_prompted"]
+    assert len(prompts) == 1
+    lost = next(e for e in events if e["kind"] == "tracking_lost")
+    # On the wire: Tower-clock times (the step shows), never the monotonic 50.x.
+    assert prompts[0]["at"] < lost["at"] - 3000
+    block = R.recovery_block(events)
+    assert block["prompt"]["issued_at"] == prompts[0]["at"]
+    assert block["prompt"]["speak_until"] == prompts[0]["at"] + block["limiter"]["speak_window_s"]
+
+
+# -- mac-002 item 6: what the phone assumes whenever recovery is non-null ------------------------
+
+
+def _phone_assumptions(block, envelope_has_tower_sent_at=True):
+    assert isinstance(block["prompts_enabled"], bool)
+    if block["prompt"] is not None:
+        assert block["prompt"]["kind"] == "look-back"
+        assert isinstance(block["prompt"]["issued_at"], float)
+        assert block["prompt"]["speak_until"] == pytest.approx(
+            block["prompt"]["issued_at"] + block["limiter"]["speak_window_s"])
+        assert block["limiter"]["speak_window_s"] <= 5.0
+
+
+@pytest.mark.parametrize("journal", [
+    [_ev("relocalizer_started", 1.0, {})],  # a malformed start line still yields a bool
+    [_ev("relocalizer_started", 1.0, {"prompts_enabled": 1})],
+] + [[_started(p), _ev("tracking_lost", 10.0),
+      _ev("recovery_prompted", 15.0, {"prompt_id": 1, "episode": 1}),
+      _ev("session_stopped", 20.0)] for p in (True, False)])
+def test_whenever_recovery_is_non_null_the_phone_can_read_it(journal):
+    from tower.results.world_builder import _summarise_events, _tracking_block
+
+    block = _tracking_block(_summarise_events(journal))["recovery"]
+    assert block is not None
+    _phone_assumptions(block)
+
+
+def test_on_the_wire_the_prompt_is_what_the_phone_speaks(monkeypatch, tmp_path, room_frames, synchronous):
+    _walk(tmp_path, _lost_for_good(room_frames), relocalizer="prompt")
+    envelope = _envelope(monkeypatch, tmp_path)
+    assert isinstance(envelope["tower_sent_at"], (int, float))
+    block = envelope["payload"]["tracking"]["recovery"]
+    assert block["prompt"] is not None
+    _phone_assumptions(block)
+    # Tower clock: the same clock as the journal line that issued it.
+    assert block["prompt"]["issued_at"] > 1000.0

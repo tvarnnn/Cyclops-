@@ -57,15 +57,19 @@ EVENT_KINDS = frozenset(
         #   recovery_accepted   {episode, by, links, closure_deg, frame, anchor}
         #   recovery_timed_out  {episode[, why: session_stopped]}
         #   recovery_anchored   {episode, frame, anchor, links}
-        # The last is not a state change: an accepted scan frame that was not
-        # a keyframe, tied afterwards to a keyframe the final solve can match
-        # (relocalizer.revisit_pairs). The payload block ignores it.
+        #   relocalizer_stopped {why: session_stopped|error[, error]}
+        # `recovery_anchored` is not a state change: an accepted scan frame
+        # that was not a keyframe, tied afterwards to a keyframe the final
+        # solve can match (relocalizer.revisit_pairs). The payload block
+        # ignores it. `relocalizer_stopped` is terminal: no episode opens
+        # after it, and one still open is closed.
         "relocalizer_started",
         "recovery_prompted",
         "recovery_withheld",
         "recovery_accepted",
         "recovery_timed_out",
         "recovery_anchored",
+        "relocalizer_stopped",
     }
 )
 

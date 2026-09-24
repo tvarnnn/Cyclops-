@@ -38,9 +38,10 @@ the ENGINE on the frame thread -- the worker never touches the journal:
 
   relocalizer_started {acceptance, limiter, prompts_enabled}   session start
   recovery_prompted   {prompt_id, episode}
-  recovery_withheld   {episode, why: limiter|disabled, layer}
+  recovery_withheld   {episode, why: limiter|disabled|late|no-references, layer}
   recovery_accepted   {episode, by, links, frame, anchor, ...}
   recovery_timed_out  {episode[, why]}
+  relocalizer_stopped {why: session_stopped|error[, error]}   terminal
   recovery_anchored   {episode, frame, anchor, links}      after an accept
 
 An accepted relocalization is a VERIFIED REVISIT LINK between keyframes the
@@ -84,6 +85,9 @@ PROMPT_KIND_LOOK_BACK = "look-back"
 
 WITHHELD_LIMITER = "limiter"
 WITHHELD_DISABLED = "disabled"
+# Review V5: withholds the limiter never sees and `counts` has no key for.
+WITHHELD_LATE = "late"
+WITHHELD_NO_REFERENCES = "no-references"
 
 MECHANISM_COOLDOWN = "cooldown"
 
@@ -101,6 +105,11 @@ EVENT_TIMED_OUT = "recovery_timed_out"
 # Not a state change: the keyframe an accepted-but-unanchored link was tied
 # to afterwards. Only `revisit_pairs` reads it.
 EVENT_ANCHORED = "recovery_anchored"
+# Terminal (review V5 M4-1): the relocalizer is gone for the rest of the
+# session -- `why: session_stopped` at a normal stop, `error` when it raised.
+# An episode still open is closed `timed_out` before it; the reader closes
+# one itself if the line never came (a builder that died).
+EVENT_STOPPED = "relocalizer_stopped"
 RECOVERY_EVENT_KINDS = (
     EVENT_STARTED, EVENT_PROMPTED, EVENT_WITHHELD, EVENT_ACCEPTED, EVENT_TIMED_OUT,
 )
@@ -260,11 +269,40 @@ class RecoveryStateMachine:
     machine pure is what lets the same code be replayed on the frozen walks
     (RUN/experiments/P3-PR/scripts/replay_prompts.py) and unit-tested with
     a fake clock.
+
+    THE CLOCK IS MONOTONIC (review V5 M4-4). Every `at`/`now` handed to this
+    machine is a duration clock (`time.monotonic` in the builder); the
+    Tower-clock times on the wire come from the journal lines themselves,
+    never from here, so a wall-clock step cannot open, prompt or time out an
+    episode.
+
+    ORDER OF A TICK (review V5 M4-2). The timeout is evaluated FIRST, and a
+    prompt is issued only while `now - lost_at <= prompt_after_s +
+    late_grace_s`, `late_grace_s` being one scan period. A frame that
+    arrives later than that -- a stalled stream, a reconnect -- withholds
+    the prompt as `late`, which the limiter never sees: a late "look back"
+    is wrong advice, and it must not spend the cooldown of the next,
+    timely one. An episode whose first frame after a stall is already past
+    `timeout_s` simply times out, unprompted.
+
+    AN EPISODE THAT CANNOT BE ACCEPTED (review V5 M4-3) -- no reference
+    keyframes before the loss -- withholds its prompt as `no-references`:
+    asking the wearer to look back at nothing is a prompt with no possible
+    success.
     """
 
-    def __init__(self, limiter: LimiterParams, *, prompts_enabled: bool) -> None:
+    def __init__(
+        self,
+        limiter: LimiterParams,
+        *,
+        prompts_enabled: bool,
+        late_grace_s: float | None = None,
+    ) -> None:
         self.limiter_params = limiter
         self.prompts_enabled = bool(prompts_enabled)
+        self.late_grace_s = (
+            1.0 / AcceptanceParams().scan_hz if late_grace_s is None else float(late_grace_s)
+        )
         self._limiter = PromptLimiter(limiter)
         self.state = STATE_NONE
         self.episode = 0
@@ -274,13 +312,18 @@ class RecoveryStateMachine:
         self.prompt_id = 0
         self.prompt_episode: int | None = None
         self.counts = _zero_counts()
+        # Withholds the contract's `counts` has no key for; journaled with
+        # their `why`, counted here for tests and diagnostics only.
+        self.withheld_late = 0
+        self.withheld_no_references = 0
         self._prompt_decided = False
+        self._can_accept = True
 
     @property
     def is_open(self) -> bool:
         return self.state in OPEN_STATES
 
-    def lost(self, at: float) -> tuple[bool, list]:
+    def lost(self, at: float, *, can_accept: bool = True) -> tuple[bool, list]:
         """A journaled `tracking_lost` at `at`. Returns (opened, events)."""
         if self.is_open:
             return False, []  # joins the open episode
@@ -291,7 +334,13 @@ class RecoveryStateMachine:
         self.resolved_at = None
         self.recovered_by = None
         self._prompt_decided = False
+        self._can_accept = bool(can_accept)
         return True, []
+
+    def cannot_accept(self) -> None:
+        """The open episode can no longer be accepted (e.g. no usable frame)."""
+        if self.is_open:
+            self._can_accept = False
 
     def accepted(self, at: float, by: str, detail: dict | None = None) -> list:
         if not self.is_open:
@@ -312,40 +361,49 @@ class RecoveryStateMachine:
         if not self.is_open:
             return []
         p = self.limiter_params
-        events = []
-        if not self._prompt_decided and now - self.lost_at >= p.prompt_after_s:
+        elapsed = now - self.lost_at
+        if elapsed >= p.timeout_s:
+            # FIRST: a frame this late never prompts, it only closes.
             self._prompt_decided = True
-            if not self.prompts_enabled:
-                self.counts["withheld_disabled"] += 1
-                events.append((EVENT_WITHHELD, {
-                    "episode": self.episode, "why": WITHHELD_DISABLED, "layer": None,
-                }))
-            else:
-                layer = self._limiter.refusal(now)
-                if layer is not None:
-                    # Never issued later: a late "look back" is wrong advice.
-                    self.counts["withheld_by_limiter"] += 1
-                    events.append((EVENT_WITHHELD, {
-                        "episode": self.episode, "why": WITHHELD_LIMITER, "layer": layer,
-                    }))
-                else:
-                    self._limiter.record(now)
-                    self.prompt_id += 1
-                    self.prompt_episode = self.episode
-                    self.counts["prompts"] += 1
-                    self.state = STATE_PROMPTING
-                    events.append((EVENT_PROMPTED, {
-                        "prompt_id": self.prompt_id, "episode": self.episode,
-                    }))
-        if now - self.lost_at >= p.timeout_s:
-            events.extend(self._time_out(now, why=None))
-        return events
+            return self._time_out(now, why=None)
+        if self._prompt_decided or elapsed < p.prompt_after_s:
+            return []
+        self._prompt_decided = True
+        if not self.prompts_enabled:
+            self.counts["withheld_disabled"] += 1
+            return [(EVENT_WITHHELD, {
+                "episode": self.episode, "why": WITHHELD_DISABLED, "layer": None,
+            })]
+        if not self._can_accept:
+            self.withheld_no_references += 1
+            return [(EVENT_WITHHELD, {
+                "episode": self.episode, "why": WITHHELD_NO_REFERENCES, "layer": None,
+            })]
+        if elapsed > p.prompt_after_s + self.late_grace_s:
+            self.withheld_late += 1
+            return [(EVENT_WITHHELD, {
+                "episode": self.episode, "why": WITHHELD_LATE, "layer": None,
+            })]
+        layer = self._limiter.refusal(now)
+        if layer is not None:
+            # Never issued later: a late "look back" is wrong advice.
+            self.counts["withheld_by_limiter"] += 1
+            return [(EVENT_WITHHELD, {
+                "episode": self.episode, "why": WITHHELD_LIMITER, "layer": layer,
+            })]
+        self._limiter.record(now)
+        self.prompt_id += 1
+        self.prompt_episode = self.episode
+        self.counts["prompts"] += 1
+        self.state = STATE_PROMPTING
+        return [(EVENT_PROMPTED, {"prompt_id": self.prompt_id, "episode": self.episode})]
 
-    def close(self, now: float) -> list:
-        """The session stopped: an open episode can no longer recover."""
+    def close(self, now: float, *, why: str = "session_stopped") -> list:
+        """The session stopped (or the relocalizer did): an open episode can
+        no longer recover."""
         if not self.is_open:
             return []
-        return self._time_out(now, why="session_stopped")
+        return self._time_out(now, why=why)
 
     def _time_out(self, now: float, *, why: str | None) -> list:
         self.state = STATE_TIMED_OUT
@@ -381,6 +439,7 @@ class RecoveryJournalReader:
         self._recovered_by = None
         self._prompt: dict | None = None
         self._counts = _zero_counts()
+        self._stopped = False
 
     def feed(self, event: dict) -> None:
         kind = event.get("kind")
@@ -394,9 +453,20 @@ class RecoveryJournalReader:
         if not self.recorded:
             return
         at = _number(event.get("at"))
-        if kind == "tracking_lost":
+        if kind in (EVENT_STOPPED, "session_stopped"):
+            # Review V5 M4-1: nothing can resolve an open episode after the
+            # relocalizer or the session is gone. The builder journals the
+            # close itself; this covers a builder that died before it could,
+            # so the block never reads "searching" forever.
             if self._state in OPEN_STATES:
-                return  # joins the open episode
+                self._state = STATE_TIMED_OUT
+                self._resolved_at = at
+                self._counts["timed_out"] += 1
+            self._stopped = True
+            return
+        if kind == "tracking_lost":
+            if self._stopped or self._state in OPEN_STATES:
+                return  # no relocalizer any more, or joins the open episode
             self._episode += 1
             self._counts["episodes"] += 1
             self._state = STATE_SEARCHING
@@ -426,10 +496,13 @@ class RecoveryJournalReader:
                 "speak_until": None if at is None else at + float(speak_window),
             }
         elif kind == EVENT_WITHHELD:
-            if payload.get("why") == WITHHELD_DISABLED:
+            why = payload.get("why")
+            if why == WITHHELD_DISABLED:
                 self._counts["withheld_disabled"] += 1
-            else:
+            elif why == WITHHELD_LIMITER:
                 self._counts["withheld_by_limiter"] += 1
+            # `late` and `no-references` are neither: the limiter never saw
+            # them, and the contract's counts carry no key for them.
         elif kind == EVENT_ACCEPTED:
             by = payload.get("by")
             if self._state == STATE_PROMPTING:
@@ -816,7 +889,10 @@ class LookBackRelocalizer:
     * `note_keyframe(keyframe_id, source_seq, gray)` on every acceptance;
     * `note_lost(at)` on every journaled `tracking_lost`;
     * `note_frame(gray, source_seq, keyframe_id, now)` on every decoded frame;
-    * `close(now)` at stop.
+    * `close(now, why=...)` at stop, or when the engine drops it.
+
+    Every time handed in is the builder's MONOTONIC clock (review V5
+    M4-4); the Tower-clock times on the wire are the journal lines' own.
 
     Each returns the journal events to write, in order. Only while an
     episode is open (or an accepted link still waits for its anchor) does
@@ -837,7 +913,11 @@ class LookBackRelocalizer:
     ) -> None:
         self.acceptance = acceptance or AcceptanceParams()
         self.limiter = limiter or LimiterParams()
-        self.machine = RecoveryStateMachine(self.limiter, prompts_enabled=prompts_enabled)
+        # One scan period of lateness is tolerated before a prompt is `late`.
+        self.machine = RecoveryStateMachine(
+            self.limiter, prompts_enabled=prompts_enabled,
+            late_grace_s=1.0 / self.acceptance.scan_hz,
+        )
         self._verifier = verifier or SiftVerifier(camera_matrix, dist_coeffs)
         self._size = tuple(frame_size)  # (width, height)
         self._refs: deque = deque(maxlen=self.acceptance.reference_keyframes)
@@ -851,7 +931,12 @@ class LookBackRelocalizer:
         self._pending_anchor: _PendingAnchor | None = None
         self._results: deque = deque()
         self._stop = False
+        self._closed = False
         self._thread: threading.Thread | None = None
+        # A frame at a size the calibration does not describe was seen: no
+        # scan can run, so no episode can be accepted (review V5 M4-3).
+        self._size_mismatch = False
+        self._said_no_references = False
         # Measured, per scan attempt, on the worker thread.
         self.attempts = 0
         self.attempt_wall_s: list[float] = []
@@ -867,8 +952,12 @@ class LookBackRelocalizer:
             "prompts_enabled": self.machine.prompts_enabled,
         }
 
+    def _fits(self, gray) -> bool:
+        return tuple(gray.shape[:2]) == (self._size[1], self._size[0])
+
     def note_keyframe(self, keyframe_id: str, source_seq: int, gray) -> None:
-        if tuple(gray.shape[:2]) != (self._size[1], self._size[0]):
+        if not self._fits(gray):
+            self._size_mismatch = True
             return  # a frame this calibration does not describe
         ep = self._episode
         with self._lock:
@@ -881,7 +970,9 @@ class LookBackRelocalizer:
         self._refs.append((keyframe_id, gray))
 
     def note_lost(self, at: float) -> list:
-        opened, events = self.machine.lost(at)
+        """`at` is the builder's MONOTONIC time of the journaled loss."""
+        can_accept = bool(self._refs) and not self._size_mismatch
+        opened, events = self.machine.lost(at, can_accept=can_accept)
         if opened:
             with self._lock:
                 if self._episode is not None:
@@ -889,25 +980,50 @@ class LookBackRelocalizer:
                 self._episode = _Episode(number=self.machine.episode, refs=list(self._refs))
                 self._pending = None
             self._last_submit = None
+            if not can_accept:
+                self._say_no_references()
         return events
 
     def note_frame(self, gray, source_seq: int, keyframe_id: str | None, now: float) -> list:
+        """`now` is the builder's MONOTONIC time of this frame."""
         events = self._drain(now)
         if self.machine.is_open:
-            due = self._last_submit is None or now - self._last_submit >= 1.0 / self.acceptance.scan_hz
-            if due and tuple(gray.shape[:2]) == (self._size[1], self._size[0]):
-                self._last_submit = now
-                self._submit(_Job(self.machine.episode, source_seq, keyframe_id, gray))
-                events += self._drain(now)  # synchronous mode answers at once
+            if not self._fits(gray):
+                if not self._size_mismatch:
+                    self._size_mismatch = True
+                self.machine.cannot_accept()
+                self._say_no_references()
+            elif self._episode is not None and self._episode.refs:
+                due = self._last_submit is None or now - self._last_submit >= 1.0 / self.acceptance.scan_hz
+                if due:
+                    self._last_submit = now
+                    self._submit(_Job(self.machine.episode, source_seq, keyframe_id, gray))
+                    events += self._drain(now)  # synchronous mode answers at once
         if self.machine.is_open:
             events += self.machine.tick(now)
         if not self.machine.is_open:
             self._finish_episode()
         return events
 
-    def close(self, now: float) -> list:
-        events = self._drain(now)
-        events += self.machine.close(now)
+    def close(self, now: float, *, why: str = "session_stopped") -> list:
+        """Stop for good: close an open episode, then `relocalizer_stopped`.
+
+        `why` is `session_stopped` at a normal stop and `error` when the
+        engine drops a relocalizer that raised (review V5 M4-1). Idempotent:
+        a second call journals nothing.
+        """
+        if self._closed:
+            return []
+        self._closed = True
+        events = []
+        try:
+            events += self._drain(now)
+        except Exception:  # the terminal lines below must be written regardless
+            logger.exception("[Tower][WorldBuilder] relocalizer: collecting results at close failed")
+        events += self.machine.close(
+            now, why="session_stopped" if why == "session_stopped" else "relocalizer_stopped"
+        )
+        events.append((EVENT_STOPPED, {"why": why}))
         self._finish_episode()
         with self._lock:
             self._stop = True
@@ -917,6 +1033,18 @@ class LookBackRelocalizer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         return events
+
+    def _say_no_references(self) -> None:
+        if self._said_no_references:
+            return
+        self._said_no_references = True
+        logger.warning(
+            "[Tower][WorldBuilder] look-back relocalizer: a tracking loss with "
+            "nothing to relocalize against (%s); its prompt is withheld as "
+            "no-references",
+            "frames at a size the calibration does not describe"
+            if self._size_mismatch else "no keyframe accepted before it",
+        )
 
     def cpu_summary(self) -> dict:
         def med(xs):
