@@ -186,6 +186,14 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
    - It refuses when :8000 is taken, HEAD is not `<SHA>` or the tree is dirty, the `.env`
      lacks a switch, `import tower` does not load the worktree, the run's GPU lock is held,
      or the finisher finds owed work on his worlds.
+   - **A pre-approved restart loop must check the mailbox for a hold** (manager 070 §4). Such a
+     loop waits for an idle window and then stops and starts the Tower. It must re-read
+     `RUN\mailbox\to-lead` for a hold before it acts, or expire 30 minutes after launch. It is
+     never left armed across a manager message.
+     - **Why:** on 2026-09-25 such a loop reached `stop-test-tower` at 00:06:50, during walk
+       3's finalization, 10 minutes after a hold (066) it had not read.
+     - `stop-test-tower` refused on the live walk worker, and nothing was stopped. The
+       refusal is the last line of defence, not the plan.
 6. **Confirm that the Tower is on the right SHA and switches:**
    - `git -C C:\Users\tvllo\Projects\Glasses-worktrees\wb-live-visualization-v1 rev-parse HEAD`
      prints `<SHA>`.
@@ -625,6 +633,9 @@ everything, so nothing runs after a failure:
      independence.
 3. **Redactor precision:** measure it on the frozen worlds and fix the false positives
    (manager 021).
+   - **And recall:** in walk 3 (`4f5d0b15`), keyframes 780–786 show the wearer's reflection
+     in the bathroom mirror, with the head not blotched in some frames. These frames stay
+     local (manager 081 §5).
 4. **Builder keyframe-id collision on reconnect.** Ids come from `source_seq`, so a
    reconnect that restarts numbering duplicates 20 ids on adc75972 and overwrites their
    stored images (`V8-REVIEW.md`, backlog). A re-finish gives those keyframes their
@@ -716,6 +727,28 @@ everything, so nothing runs after a failure:
       default** (review F2). A long-range link to a look-alike place can survive COLMAP's
       re-verification just as it fooled SIFT live. Score every `historical: true` link of
       the HISTORY arm against the final solve, with an image-only check.
+    - **Walk 3 (held out; `RUN\lead\reloc3\DIAGNOSIS.md`): 0 of 9 prompted episodes recovered
+      across walks 2 and 3.**
+      - In 7 of 9 the user did not return to a reference view. The whip-pan was a turn to walk
+        somewhere else, and the prompt found him there.
+      - In 2 the references were unusable (the turn's own blurred frames; "the last 10" span
+        only 0.6–4.1 s before the loss).
+      - Reading the banner puts the phone in the camera's view, and its screen matches screen
+        to screen.
+      - The final solve links the stretch anyway in 7 of 9.
+      - Neither a lower floor nor a longer window is supported.
+      - **So the prompt is OFF by default: walk 4 runs the relocalizer `silent`**, with
+        HISTORY=20 and SUMMARY=on (manager 081 §2).
+    - **RELOC3's candidates move to the UX phase's capture-guidance design** (081 §2). Each is
+      measured on the pre-walk-3 corpus first:
+      - references drawn from sharp, stable keyframes;
+      - the phone screen kept out of the relocalizer's matches;
+      - withholding a prompt the reference set cannot satisfy;
+      - **showing which view to return to**;
+      - starting the episode clock at the loss frame's receipt.
+    - **HISTORY=20 out of sample on walk 3** (`RUN\lead\reloc2\TABLE_w3.md`):
+      - 4 prompted episodes recovered, against base's 1;
+      - **1 wrong historical leg** (9.6°, 52 inliers, 68 kf older).
     - **RV-RELOC's remaining nits** (re-check of `08b1e09`, clean):
       - `events.py:78-81`'s summary-key comment omits `history_preempted`;
       - `recovery_anchored` links carry no historical mark;
