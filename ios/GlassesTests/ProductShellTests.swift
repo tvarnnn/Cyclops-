@@ -2577,9 +2577,6 @@ final class ScriptedWearables: WearablesInterface, @unchecked Sendable {
     func addRegistrationStateListener(_ listener: @escaping @Sendable (RegistrationState) -> Void) -> any AnyListenerToken { Token() }
     func addDevicesListener(_ listener: @escaping @Sendable ([DeviceIdentifier]) -> Void) -> any AnyListenerToken { Token() }
     func deviceForIdentifier(_ identifier: DeviceIdentifier) -> Device? { nil }
-    func deviceStateStream(for identifier: DeviceIdentifier) -> AsyncStream<DeviceState> {
-        AsyncStream { $0.finish() }
-    }
     func requestPermission(_ permission: Permission) async throws(PermissionError) -> PermissionStatus { .granted }
     func startRegistration() async throws(RegistrationError) {}
     func startUnregistration() async throws(UnregistrationError) {}
