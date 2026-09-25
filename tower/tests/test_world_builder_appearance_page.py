@@ -360,6 +360,56 @@ class TestThePage:
         assert len(config["cameras"]) == len(built.kids)
         assert config["up"] is None or len(config["up"]) == 3
 
+    def test_it_walks_and_levels_to_the_room_component_only(self, built):
+        """Walk 1 (`ee48aae3`, 2026-09-24). A split walk's solution keeps every
+        component's poses, and the room page opened on, walked and levelled to
+        all of them: 103 cameras for a 73-keyframe room, the scale-mismatched
+        area's 30 about 40 room radii away (its up tilted 11 degrees), and on
+        `6e6d3fc3` five separately solved components in gauges of their own."""
+        import dataclasses
+
+        from tower.world_builder.appearance_render import build_appearance_config
+        from tower.world_builder.surface_render import _camera_up
+
+        room = build_appearance_config(built.store, WORLD, SESSION)
+        up = _camera_up(built.store, WORLD, SESSION)
+        stray = f"{SESSION}:{999:08d}"
+        # another component, in another gauge: far away and rolled 90 degrees
+        poses = {**built.poses, stray: {"component": 1, "observations": 50,
+                                        "rotation": [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                                        "translation": [40.0, -3.0, 25.0]}}
+        built._write_solution(built._workspace, dataclasses.replace(
+            built.solution, keyframe_ids=[*built.kids, stray], poses=poses))
+        split = build_appearance_config(built.store, WORLD, SESSION)
+        assert len(split["cameras"]) == len(built.kids)
+        assert split["cameras"] == room["cameras"], "the room's walk is the room's cameras"
+        assert _camera_up(built.store, WORLD, SESSION) == up, "and so is its vertical"
+
+    def test_a_solution_without_a_room_component_still_walks_and_bad_components_do_not_raise(self, built):
+        """Codex review of the room-only filter (HIGH, MED): a solution whose poses
+        carry no component 0 walks every pose, as before the filter, rather than
+        nothing; a component that is not a number is not the room's and raises
+        nothing while the page is composed."""
+        import dataclasses
+
+        from tower.world_builder.appearance_render import build_appearance_config
+        from tower.world_builder.surface_render import _room_poses
+
+        room = build_appearance_config(built.store, WORLD, SESSION)
+        shifted = {kid: {**p, "component": 1} for kid, p in built.poses.items()}
+        built._write_solution(built._workspace, dataclasses.replace(built.solution, poses=shifted))
+        assert build_appearance_config(built.store, WORLD, SESSION)["cameras"] == room["cameras"]
+        odd = {**built.poses, "x:1": {**next(iter(built.poses.values())), "component": None},
+               "x:2": {**next(iter(built.poses.values())), "component": "room"}}
+        kept = _room_poses(dataclasses.replace(built.solution, poses=odd))
+        assert "x:1" not in kept and "x:2" not in kept and len(kept) == len(built.poses)
+
+    def test_the_scene_unit_is_clamped(self):
+        from tower.world_builder.appearance_render import viewer_template_path
+
+        text = viewer_template_path().read_text(encoding="utf-8")
+        assert "sceneUnit: (u => u > 0 && isFinite(u) ? Math.min(1e3, Math.max(1e-3, u)) : 1)" in text
+
     def test_the_template_is_installed_with_its_tokens(self):
         from tower.world_builder.appearance_render import TOKEN_CONFIG, TOKEN_CSP, viewer_template_path
 
@@ -1233,7 +1283,7 @@ class TestTheCapturesOwnLook:
         # meets, and 1.0 on a world whose median scene depth is 4.7 was a fifth
         # of the room. The page's own default must agree with the served one.
         assert config["standoff"] == R.STANDOFF == 0.6
-        assert 'OPT.standoff) || 0.6;' in _template(), "and the page's fallback is the same number"
+        assert 'OPT.standoff) || 0.6) * UNIT;' in _template(), "and the page's fallback is the same number"
         assert config["crack_fill_px"] == R.CRACK_FILL_PX > 0
         assert config["void_fog"] == R.VOID_FOG and config["void_wide_fade"] == R.VOID_WIDE_FADE
         text = _template()
@@ -1344,7 +1394,7 @@ assert.strictEqual(NAV.nextPose(q, 3, -1, 0.8).index, 0);
 
     def test_overview_is_a_distinct_vantage(self):
         over = _section(_template(), "const OVERVIEW_AWAY", "function overview(){")
-        assert "< OVERVIEW_AWAY) continue;" in over
+        assert "< OVERVIEW_AWAY * OPT.sceneUnit) continue;" in over
         assert "r.dist < OVERVIEW_DEPTH * ref" in over and "0.4 + 0.6 * Math.min(1, r.distance / (1.5 * ref))" in over
 
     def test_the_look_is_limited_by_the_neck_and_not_by_the_capture(self):
@@ -2634,7 +2684,7 @@ assert.ok(NAV.R_SOFT / NAV.R_MAX <= 0.51, "half the tube is still free of resist
         Measured on the canonical world: 3,851 voxels at 0.5 over the old tube,
         5,914 at 0.6 and 4,259 at 0.7 over the new one."""
         nav = _nav_source()
-        assert "const SPACING = 0.7," in nav
+        assert "const SPACING = 0.7 * UNIT," in nav
 
 
 class TestTheBestViewStaysWhereItPutsYou:
@@ -3122,3 +3172,112 @@ for (let i = 0; i < 400; i++) cam = NAV.step(F4, path, cam, released, 16, V);
 assert.ok(dist(cam.p, p0) < 1e-9,
           "a camera outside the standoff is not moved by it: " + dist(cam.p, p0));
 """)
+
+
+# NAV_ROOM at any scale `S`, under a NAV built for a given `OPT` (`mkNAV`).
+NAV_ROOM_AT = r"""
+function room(NAV, S){
+  const up = [0, 1, 0], cams = [];
+  for (let i = 0; i <= 10; i++) cams.push([i * 0.5 * S, 0, 0, 0, 0, 1]);
+  const path = NAV.makePath(cams, up);
+  const samples = [], off = [0], idx = [];
+  for (let x = -4; x <= 9; x += 0.1) for (let y = -2.5; y <= 2.5; y += 0.1){
+    samples.push(x * S, y * S, 3 * S);
+    for (let k = 0; k < cams.length; k++) idx.push(k);
+    off.push(idx.length);
+  }
+  const centres = Float32Array.from(cams.flatMap(c => [c[0], c[1], c[2]]));
+  const F = NAV.fieldJob({samples: Float32Array.from(samples), seenOff: Int32Array.from(off),
+                          seenIdx: Int32Array.from(idx), centres, path});
+  while (!NAV.fieldWork(F, 50)) {}
+  const dir = (yaw, pitch) => [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+  const V = {dir, up, fy: 1.25, aspect: 1.2};
+  const sup = (p, yaw) => NAV.support(F, p, dir(yaw, 0), up, V.fy, V.aspect).s;
+  return {NAV, S, F, path, V, sup, at: [2.5 * S, 0, 0]};
+}
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const released = {look: [0, 0], move: [0, 0, 0], held: false};
+"""
+
+
+class TestASmallRoomIsTheSameRoomSmaller:
+    """Walk 1 (`ee48aae3`, 2026-09-24): "it keeps snapping me to a view from the
+    top-left of the desk, says nothing was photographed this way, and snaps back
+    whenever I move". A solve's gauge has no scale, and that room came out with a
+    median scene depth of 0.174 against the 4.7 every length on the page was
+    measured on: its whole proxy (0.47 x 0.51 x 0.46) sat inside the 0.6 standoff,
+    so every released camera was eased 0.6 out of the room -- all 53 recorded
+    phone poses, 3.4 scene depths each. Every length is now a multiple of the
+    scene's own unit (`OPT.sceneUnit`, median scene depth / 4.7)."""
+
+    U = 0.1741 / 4.7
+
+    def _run(self, script):
+        import subprocess
+
+        program = ("const assert = require('assert');\n"
+                   "const mkNAV = OPT => {\n" + _nav_source() + "\nreturn NAV;\n};\n"
+                   + NAV_ROOM_AT + f"\nconst u = {self.U!r};\n" + script
+                   + "\nconsole.log('nav ok');\n")
+        r = subprocess.run([_node(), "-"], input=program, capture_output=True, text=True,
+                           timeout=120)
+        assert r.returncode == 0 and "nav ok" in r.stdout, (r.stdout + r.stderr)[-3000:]
+
+    def test_the_small_room_moves_exactly_as_the_reference_room_scaled(self):
+        self._run(r"""
+const ref = room(mkNAV({standoff: 0.6, sceneUnit: 1}), 1);
+const small = room(mkNAV({standoff: 0.6, sceneUnit: u}), u);
+assert.ok(Math.abs(small.NAV.D_MIN - 0.6 * u) < 1e-12 && Math.abs(small.NAV.R_MAX - 2.2 * u) < 1e-12);
+// the same support field, point for point (to rounding: this room's samples sit
+// on a regular grid, so some fall exactly on a direction cell's edge)
+for (const [p, yaw] of [[[2.5, 0, 0], 0], [[2.5, 0, 0], 1.2], [[1.1, 0.3, -0.5], 0.4], [[4.2, -0.2, 1.3], -0.3]]){
+  const a = ref.sup(p, yaw), b = small.sup(p.map(x => x * u), yaw);
+  assert.ok(Math.abs(a - b) < 0.02, "support " + p + " @" + yaw + ": " + a + " vs " + b);
+}
+assert.ok(small.sup(small.at, 0) > 0.95 && small.sup(small.at, Math.PI) === 0);
+// the same hands make the same walk: a push into the wall (the standoff and the
+// tube both stop it), then released (the drift back to the soft edge)
+function walk(R){
+  let cam = {p: R.at.slice(), yaw: 0, pitch: 0, floor: 1};
+  const out = [];
+  for (let i = 0; i < 120; i++)
+    cam = R.NAV.step(R.F, R.path, cam, {look: [0, 0], move: [0, 0, 0.05 * R.S], held: true}, 16, R.V);
+  out.push(cam.p.map(x => x / R.S));
+  for (let i = 0; i < 300; i++){ cam = R.NAV.step(R.F, R.path, cam, released, 16, R.V); out.push(cam.p.map(x => x / R.S)); }
+  return out;
+}
+const a = walk(ref), b = walk(small);
+assert.ok(a[0][2] > 1.5, "the push went somewhere: " + a[0]);
+for (let i = 0; i < a.length; i++) assert.ok(dist(a[i], b[i]) < 1e-4, "frame " + i + ": " + a[i] + " vs " + b[i]);
+// and a recorded pose, 3 scene units from the wall it faced, is where the camera stays
+let cam = {p: small.at.slice(), yaw: 0, pitch: 0, floor: 1, aimed: true};
+for (let i = 0; i < 300; i++) cam = small.NAV.step(small.F, small.path, cam, released, 16, small.V);
+assert.ok(dist(cam.p, small.at) < 1e-12, "the wearer's pose is left alone: " + dist(cam.p, small.at));
+assert.ok(cam.dark < 0.1, "and facing what they photographed is not called dark: " + cam.dark);
+""")
+
+    def test_without_the_unit_the_small_room_throws_the_camera_out(self):
+        """The mechanism, pinned: the page as it was at 4b4b444 (no unit)."""
+        self._run(r"""
+const blind = room(mkNAV({standoff: 0.6, sceneUnit: 1}), u);
+let cam = {p: blind.at.slice(), yaw: 0, pitch: 0, floor: 1, aimed: true};
+for (let i = 0; i < 300; i++) cam = blind.NAV.step(blind.F, blind.path, cam, released, 16, blind.V);
+assert.ok(dist(cam.p, blind.at) > 3 * u, "eased out past the wall's own distance: " + dist(cam.p, blind.at));
+""")
+
+    def test_the_page_takes_its_unit_from_the_scene_it_serves(self):
+        text = _template().replace("\r\n", "\n")
+        assert ('sceneUnit: (u => u > 0 && isFinite(u) ? Math.min(1e3, Math.max(1e-3, u)) : 1)'
+                '(+(Q.get("su") ?? (CONFIG.median_scene_depth || 4.7) / 4.7)),') in text
+        assert "const UNIT = (typeof OPT === \"object\" && OPT && OPT.sceneUnit > 0) ? OPT.sceneUnit : 1;" in text
+        # the lengths outside NAV: a finger's travel, the hole reach, the source
+        # tests, the near plane, the Best view's own distances
+        for length in ("const MOVE_PER_PX = 0.004 * OPT.sceneUnit, PINCH_UNITS = 2.0 * OPT.sceneUnit;",
+                       "const KEY_SPEED = 1.1 / 1000 * OPT.sceneUnit;",
+                       "ctl.move[2] += -e.deltaY * 0.0025 * OPT.sceneUnit;",
+                       "const HOLE_PERIMETER = 0.8 * OPT.sceneUnit, HOLE_REACH = 0.35 * OPT.sceneUnit;",
+                       "return z <= zs * 1.03 + 0.03 * OPT.sceneUnit;",
+                       "near: Math.max(0.02 * OPT.sceneUnit, diag * 0.0015)",
+                       "if (rise < 0.15 * OPT.sceneUnit) continue;"):
+            assert length in text, length
+        assert text.count("if (z < 0.05 * OPT.sceneUnit) continue;") == 2

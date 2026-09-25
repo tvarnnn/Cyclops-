@@ -312,6 +312,37 @@ def build_surface_payload(store, world_id: str, session_id: str, *,
     return raw, config
 
 
+# The solve's component the room's own stages build: the depth stage's default
+# (`dense.DenseParams.component`), so the surface and the appearance -- and
+# therefore everything this page draws -- are made of this component's frames.
+# An area's own solve (`areas/<id>/solve`) holds only its own frames, all 0.
+ROOM_COMPONENT = 0
+
+
+def _room_poses(solution):
+    """The solution's poses of the room component only.
+
+    A split walk's solution keeps every component's poses: an area the gate cut
+    off for a scale mismatch sits in the room's frame at the wrong scale (walk 1
+    `ee48aae3`: 30 cameras ~40 room radii away), and one solved separately sits
+    in a gauge of its own. Neither is where the wearer stood in THIS room, and
+    the page opened on, walked and levelled to them all.
+
+    A pose whose component is not a number is not the room's. A solution with no
+    room-component pose at all gets every pose, as before this filter: the page
+    walks something rather than nothing (Codex review of the fix, HIGH/MED)."""
+    poses = solution.poses or {}
+
+    def _in_room(pose) -> bool:
+        try:
+            return int(pose.get("component", ROOM_COMPONENT)) == ROOM_COMPONENT
+        except (TypeError, ValueError):
+            return False
+
+    room = {kid: p for kid, p in poses.items() if _in_room(p)}
+    return room or dict(poses)
+
+
 def _camera_path(store, world_id: str, session_id: str) -> list:
     """Where the wearer stood, so the viewer can open there and walk it.
 
@@ -329,9 +360,10 @@ def _camera_path(store, world_id: str, session_id: str) -> list:
         return []
     import numpy as np
 
+    poses = _room_poses(solution)
     out = []
     for kid in (solution.keyframe_ids or []):
-        pose = (solution.poses or {}).get(kid)
+        pose = poses.get(kid)
         if pose is None:
             continue
         R = np.array(pose["rotation"], float).reshape(3, 3)
@@ -438,12 +470,13 @@ def _camera_up(store, world_id: str, session_id: str) -> list | None:
         solution = load_solution(store, world_id, session_id)
     except Exception:  # noqa: BLE001 -- the page can estimate its own
         return None
-    if solution is None or not solution.poses:
+    poses = _room_poses(solution) if solution is not None else {}
+    if not poses:
         return None
     import numpy as np
 
     ups = []
-    for pose in solution.poses.values():
+    for pose in poses.values():
         R = np.array(pose["rotation"], float).reshape(3, 3)
         ups.append(R.T @ np.array([0.0, -1.0, 0.0]))
     mean = np.mean(ups, axis=0)
