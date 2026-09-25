@@ -41,7 +41,7 @@ final class TowerSettingsUITests: XCTestCase {
         // Leave nothing saved for the next run, even after a failure half-way:
         // a launch with the reset argument clears it before anything reads it.
         let cleanup = XCUIApplication()
-        cleanup.launchArguments = ["-UITestResetTowerAddress"]
+        cleanup.launchArguments = ["-UITestResetTowerAddress", "-UITestSkipOnboarding"]
         cleanup.launchEnvironment["GLASSES_TOWER_AUTHORITY"] = closedAuthority
         cleanup.launch()
         cleanup.terminate()
@@ -165,6 +165,8 @@ final class TowerSettingsUITests: XCTestCase {
 
     private func launch(override: String?, reset: Bool) -> XCUIApplication {
         let app = XCUIApplication()
+        // The first-run cards would cover the banner and the toolbar.
+        app.launchArguments.append("-UITestSkipOnboarding")
         if reset { app.launchArguments.append("-UITestResetTowerAddress") }
         if let size = env("U02_CONTENT_SIZE") {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", size]

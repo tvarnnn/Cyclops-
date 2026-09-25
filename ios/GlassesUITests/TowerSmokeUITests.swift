@@ -45,6 +45,8 @@ final class TowerSmokeUITests: XCTestCase {
             throw XCTSkip("Set GLASSES_UITEST_TOWER_AUTHORITY=host:port to run against a Tower.")
         }
         app = XCUIApplication()
+        // The first-run cards would cover every screen these tests drive.
+        app.launchArguments.append("-UITestSkipOnboarding")
         app.launchEnvironment["GLASSES_TOWER_AUTHORITY"] = authority
         // A system alert (location, notifications) would otherwise sit over
         // the app and every wait below would time out on it.

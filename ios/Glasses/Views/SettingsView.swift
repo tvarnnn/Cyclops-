@@ -237,13 +237,27 @@ final class TowerSettingsModel: ObservableObject {
 
 // MARK: - Views
 
+/// "How Glasses works" in Settings: whether it can open now, and what opens it.
+///
+/// Handed in by whoever presents Settings, because the cards are shown by the
+/// shell (`ContentView`) and never over a capture. Where Settings is reached
+/// from somewhere that cannot show them -- Connections' pushed Settings, or
+/// Settings opened from the cards themselves -- there is no entry and no row.
+struct HowGlassesWorksEntry {
+    /// False while a capture is running or starting.
+    let isAvailable: Bool
+    let open: () -> Void
+}
+
 /// Settings, presented as a sheet from the shell.
 struct SettingsSheet: View {
+    var howItWorks: HowGlassesWorksEntry?
+
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            SettingsView()
+            SettingsView(howItWorks: howItWorks)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Done") { dismiss() }
@@ -261,6 +275,11 @@ struct SettingsView: View {
     /// Built fresh on each appearance, from what is saved now.
     @StateObject private var model = TowerSettingsModel()
     @FocusState private var isEditingAddress: Bool
+    private let howItWorks: HowGlassesWorksEntry?
+
+    init(howItWorks: HowGlassesWorksEntry? = nil) {
+        self.howItWorks = howItWorks
+    }
 
     var body: some View {
         List {
@@ -316,6 +335,21 @@ struct SettingsView: View {
                         )
                     )
                     .accessibilityIdentifier("tower-override-notice")
+                }
+            }
+
+            // Last, so the Tower section stays the first thing on the screen.
+            if let howItWorks {
+                Section {
+                    Button(action: howItWorks.open) {
+                        Label(OnboardingText.settingsRow, systemImage: "questionmark.circle")
+                    }
+                    .disabled(!howItWorks.isAvailable)
+                    .accessibilityIdentifier("settings-how-it-works")
+                } footer: {
+                    if !howItWorks.isAvailable {
+                        Text(OnboardingText.settingsRowUnavailable)
+                    }
                 }
             }
         }

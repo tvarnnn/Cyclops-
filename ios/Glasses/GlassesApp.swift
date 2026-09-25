@@ -17,6 +17,10 @@ struct GlassesApp: App {
         if ProcessInfo.processInfo.arguments.contains(TowerAddressStore.uiTestResetArgument) {
             TowerAddressStore().clear()
         }
+        // Before the root view decides whether to show the first-run cards.
+        if ProcessInfo.processInfo.arguments.contains(OnboardingStore.uiTestResetArgument) {
+            OnboardingStore().reset()
+        }
         #endif
         do {
             try Wearables.configure()
