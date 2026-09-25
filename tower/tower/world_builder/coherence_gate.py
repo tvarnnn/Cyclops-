@@ -282,11 +282,17 @@ def _disjoint_blocks(n: int, blocks: list[set]) -> list[np.ndarray]:
     return out
 
 
-def redundant_links(cross: list[tuple[int, int]], adj: list[set]) -> bool:
+def redundant_links(cross: list[tuple[int, int]], adj: list[set], units: list | None = None) -> bool:
     """`cross` = links (group camera, kept camera). Redundant when two share no image, or share an image and
-    their other ends are themselves linked (a closed triangle)."""
+    their other ends are themselves linked (a closed triangle).
+
+    `units` (the anchor verification's part (i), RUN P4-IV RULE.md section 7; None = today): each link's EVIDENCE
+    UNIT, parallel to `cross`. Two links count together only when they come from DIFFERENT units -- the pairs one
+    relocalizer import created are one unit, so one import is one link however many pairs it wrote."""
     for i in range(len(cross)):
         for j in range(i + 1, len(cross)):
+            if units is not None and units[i] == units[j]:
+                continue
             (a1, b1), (a2, b2) = cross[i], cross[j]
             if a1 != a2 and b1 != b2:
                 return True
@@ -353,6 +359,42 @@ def _scale_split(g: np.ndarray, r: np.ndarray, rank: np.ndarray, params: GatePar
     return [g]
 
 
+def _seal_pieces(sup: np.ndarray, sealed_local: set, adj: list[set], names: list[str],
+                 seal_of: dict) -> list[tuple[np.ndarray, str]]:
+    """The `seal` hook's pieces in one component: each connected set of sealed cameras (local indices into `sup`)
+    that share a reason and are joined by honoured links (`adj`). Ordered by size, then first camera."""
+    out = []
+    seen: set = set()
+    for k in sorted(sealed_local):
+        if k in seen:
+            continue
+        why = seal_of[names[int(sup[k])]]
+        comp, stack = [], [k]
+        seen.add(k)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for w in sorted(adj[u]):
+                if w in sealed_local and w not in seen and seal_of[names[int(sup[w])]] == why:
+                    seen.add(w)
+                    stack.append(w)
+        out.append((np.asarray(sorted(int(sup[c]) for c in comp), dtype=np.int64), why))
+    out.sort(key=lambda p: (-len(p[0]), int(p[0].min())))
+    return out
+
+
+def _room_sides(g: np.ndarray, names: list[str], room_cams: frozenset) -> list[np.ndarray]:
+    """A group split into its cameras in the room and its cameras outside it (the seal re-gate's allow-list)."""
+    inside = np.fromiter((names[int(v)] in room_cams for v in g), dtype=bool, count=len(g))
+    return [part for part in (g[inside], g[~inside]) if len(part)]
+
+
+def _unit(units_of: dict, names: list[str], a: int, b: int):
+    """A link's evidence unit (`link_units`): the one it is named with, else the link itself."""
+    key = tuple(sorted((names[a], names[b])))
+    return units_of.get(key, ("link",) + key)
+
+
 def _rot_deg(R) -> float:
     c = (float(np.trace(R)) - 1.0) / 2.0
     return math.degrees(math.acos(min(1.0, max(-1.0, c))))
@@ -363,7 +405,8 @@ def _rot_deg(R) -> float:
 
 
 def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotations: dict,
-               masks_applied: bool, params: GateParams | None = None, withhold=None, room=None) -> dict:
+               masks_applied: bool, params: GateParams | None = None, withhold=None, room=None, seal=None,
+               link_units=None) -> dict:
     """The rule (module docstring) on one solve.
 
     links: {(name_a, name_b): inliers} (`read_verified_links`); link_rotations: {(name_a, name_b): R_b_from_a}
@@ -383,6 +426,19 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
         withheld can never attach a group the room did not hold, whatever the withheld group did to the kept
         set's metric level or to the routes through it. The caller still checks the outcome per keyframe.
 
+    THE ANCHOR VERIFICATION'S HOOKS (`anchor_verify.py`, RUN P4-IV RULE.md sections 1 and 7; only with
+    `TOWER_WORLD_ANCHOR_VERIFY` on). None or empty, both: today's gate, exactly.
+
+      seal: {camera name: reason}. SEALED CAMERAS leave the candidate graph before its blocks are formed. Each
+        connected set of sealed cameras that share a reason and are joined by honoured links is ONE piece, sealed
+        both ways as a withheld group is (it joins no kept set; nothing joins it), and that reason is its only
+        reason. Pieces come up as references after every other group. A group attached only THROUGH sealed
+        cameras loses that attachment by the gate's own rule (collateral; it keeps the gate's own reasons). With a
+        seal, `room` names the room's CAMERAS, enforced camera by camera: every group is split into its room and
+        non-room parts, and a group joins only a reference on its own side (no non-room camera enters the room).
+      link_units: {(name_a, name_b) sorted: unit}. The redundancy test counts two links together only when their
+        units differ (`redundant_links`); a link it does not name is a unit of its own.
+
     Returns {"labels": {name: label}, "components": [...], "rounds": [...], "groups": [...], "evidence": {...},
     "params": ..., "params_digest": ...}. Label 0 is the room (most supported cameras); every other label is
     unplaced, with `reason` / `reasons` from the contract's vocabulary. `groups` are the candidate groups the rounds
@@ -391,6 +447,15 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
     params = params or GateParams()
     withheld_names = frozenset(withhold or ())
     room_names = frozenset(room) if room else None
+    seal_of = {str(k): str(v) for k, v in (seal or {}).items()}
+    units_of = dict(link_units) if link_units else None
+    room_cams = None
+    if seal_of and room_names is not None:
+        # With a seal the room is named by its CAMERAS, and it is enforced CAMERA BY CAMERA: the groups re-form
+        # without the sealed cameras (a block or scale segment can then mix room and non-room cameras -- RUN P4-IV
+        # phase 2), so every group is split into its room part and its non-room part, and a group joins only a
+        # reference on its own side of the room.
+        room_cams, room_names = room_names, None
     names = model.names
     idx = model.index()
     C = _shared_counts(model)
@@ -454,18 +519,35 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
             if a in local and b in local:
                 adj_all[local[a]].add(local[b])
                 adj_all[local[b]].add(local[a])
-        groups = [sup[g] for g in _disjoint_blocks(len(sup), biconnected_blocks(adj))] if len(sup) else []
+        sealed_local = {k for k, v in enumerate(sup) if names[int(v)] in seal_of} if seal_of else set()
+        adj_blocks = adj
+        if sealed_local:
+            # Sealed cameras leave the candidate graph before its blocks are formed (the `seal` hook).
+            adj_blocks = [set() if k in sealed_local else {w for w in adj[k] if w not in sealed_local}
+                          for k in range(len(sup))]
+        groups = [sup[g] for g in _disjoint_blocks(len(sup), biconnected_blocks(adj_blocks))] if len(sup) else []
+        if sealed_local:
+            groups = [g for g in groups if not (len(g) == 1 and local[int(g[0])] in sealed_local)]
         groups = [part for g in groups for part in scale_split(g, r, rank, params)]
+        if room_cams is not None:
+            groups = [part for g in groups for part in _room_sides(g, names, room_cams)]
         groups.sort(key=lambda g: (-len(g), int(g.min())))
+        pieces = _seal_pieces(sup, sealed_local, adj, names, seal_of)
+        seal_pieces = {int(g.min()): why for g, why in pieces}
+        groups += [g for g, _ in pieces]
         pending = list(groups)
         first_round = True
         while pending:
             reference = pending.pop(0)
             reference_name = names[int(reference.min())]
             # A withheld reference is a piece of its own; a reference of the allow-listed room admits
-            # only the room's groups (the consensus's hooks; both empty on every other call).
-            sealed = reference_name in withheld_names
+            # only the room's groups (the consensus's hooks; both empty on every other call). So is a
+            # sealed piece (the anchor verification's `seal` hook; empty on every other call).
+            held_ref = reference_name in withheld_names
+            piece_ref = seal_pieces.get(int(reference.min()))
+            sealed = held_ref or piece_ref is not None
             allowed = room_names if room_names is not None and reference_name in room_names else None
+            ref_in_room = room_cams is not None and names[int(reference.min())] in room_cams
             kept = [reference]
             kept_set = set(int(i) for i in reference)
             decisions = []
@@ -477,17 +559,26 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                 for j, g in enumerate(pending):
                     gs = set(int(i) for i in g)
                     cross, cross_all = [], []
+                    units, units_all = ([], []) if units_of is not None else (None, None)
                     for ea, eb in edges:
                         if ea in gs and eb in kept_set:
                             cross.append((local[ea], local[eb]))
                         elif eb in gs and ea in kept_set:
                             cross.append((local[eb], local[ea]))
+                        else:
+                            continue
+                        if units is not None:
+                            units.append(_unit(units_of, names, ea, eb))
                     for ea, eb in edges_all:
                         if ea in gs and eb in kept_set:
                             cross_all.append((local[ea], local[eb]))
                         elif eb in gs and ea in kept_set:
                             cross_all.append((local[eb], local[ea]))
-                    redundant = redundant_links(cross, adj)
+                        else:
+                            continue
+                        if units_all is not None:
+                            units_all.append(_unit(units_of, names, ea, eb))
+                    redundant = redundant_links(cross, adj, units)
                     coupled = len(cross) > 0 or bool(C[sorted(gs)][:, sorted(kept_set)].nnz)
                     kept_idx = np.fromiter(kept_set, dtype=np.int64)
                     differ = scale_levels_differ(r, kept_idx, g, params)
@@ -497,16 +588,23 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
                         "cameras": int(len(g)), "first_camera": names[int(g.min())],
                         "cross_links": len(cross), "cross_links_all": len(cross_all),
                         "redundant": bool(redundant),
-                        "redundant_without_honouring": bool(redundant_links(cross_all, adj_all)),
+                        "redundant_without_honouring": bool(redundant_links(cross_all, adj_all, units_all)),
                         "coupled": bool(coupled), "scale_ok": differ is not True,
                         "scale_factor": (math.exp(lg - lk) if lg is not None and lk is not None else None),
                     }
                     held = names[int(g.min())] in withheld_names
                     if held:
                         d["withheld"] = True
-                    barred = held or sealed or (allowed is not None and names[int(g.min())] not in allowed)
-                    if barred and not held:
-                        d["barred"] = "withheld reference" if sealed else "not a group of the room"
+                    piece = seal_pieces.get(int(g.min()))
+                    if piece is not None:
+                        d["sealed"] = piece
+                    other_side = room_cams is not None and (names[int(g.min())] in room_cams) != ref_in_room
+                    barred = (held or piece is not None or sealed
+                              or (allowed is not None and names[int(g.min())] not in allowed) or other_side)
+                    if barred and not held and piece is None:
+                        d["barred"] = (("withheld reference" if held_ref else "sealed reference") if sealed
+                                       else "a group of the room" if other_side and not ref_in_room
+                                       else "not a group of the room")
                     if attach and not barred and redundant and coupled and d["scale_ok"] and len(cross) > best_n:
                         best, best_n = j, len(cross)
                 if best is not None:
@@ -525,13 +623,17 @@ def apply_gate(model: SolveModel, links: dict, metric_log: dict, *, link_rotatio
             for i, g in enumerate(kept):
                 group_members.append({"first_camera": names[int(g.min())], "label": next_label,
                                       "reference": i == 0, "source_component": comp,
-                                      "members": [names[int(v)] for v in g]})
+                                      "members": [names[int(v)] for v in g],
+                                      **({"sealed": seal_pieces[int(g.min())]}
+                                         if int(g.min()) in seal_pieces else {})})
             rounds.append({"source_component": comp, "label": next_label,
                            "reference_group": {"cameras": int(len(reference)),
                                                "first_camera": names[int(reference.min())]},
                            "kept_groups": len(kept), "kept_cameras": int(len(ids)), "decisions": decisions,
-                           **({"withheld": True} if sealed else {}),
-                           **({"room_allow_list": len(allowed)} if allowed is not None else {})})
+                           **({"withheld": True} if held_ref else {}),
+                           **({"sealed": piece_ref} if piece_ref is not None else {}),
+                           **({"room_allow_list": len(allowed)} if allowed is not None else {}),
+                           **({"room_allow_list": len(room_cams)} if ref_in_room else {})})
             next_label += 1
             first_round = False
         rest = members[~supported[members]]
@@ -561,6 +663,9 @@ def _reasons(round_: dict, room_component: int, group_decisions: dict, masks_app
         # A group the consensus withheld, sealed as a piece of its own (`withhold`): its only
         # reason (contract §2.2), in whatever round it came up.
         return [REASON_SEED_UNSTABLE]
+    if round_.get("sealed"):
+        # A piece the anchor verification sealed (`seal`): its only reason, in whatever round it came up.
+        return [round_["sealed"]]
     if round_["source_component"] != room_component or round_["reference_group"] is None:
         return [REASON_SOLVED_SEPARATELY]
     first = round_["reference_group"]["first_camera"]
@@ -591,8 +696,12 @@ def _finish(model, labels, supported, rounds, group_decisions, masks_applied, me
     for rd in rounds:
         rd["final_label"] = remap.get(rd["label"])
     groups = [dict(g, label=remap.get(g["label"])) for g in group_members]
-    room_round = next(rd for rd in rounds if rd["final_label"] == 0)
-    room_component = room_round["source_component"]
+    # NO ROOM ROUND (the lead's 01:42 live case: a false-start walk, 3 keyframes, 0 posed): a solve with no
+    # camera has no label at all, so no round is the room's. That is a clean, empty result -- no component, so
+    # no room and nothing unplaced (`components_document` then publishes `components: null`, as for a solve
+    # whose cameras are all unsupported) -- never a StopIteration. Every solve with a camera has a room round.
+    room_round = next((rd for rd in rounds if rd["final_label"] == 0), None)
+    room_component = room_round["source_component"] if room_round is not None else None
     comps = []
     for lab in range(len(order)):
         sel = final == lab
