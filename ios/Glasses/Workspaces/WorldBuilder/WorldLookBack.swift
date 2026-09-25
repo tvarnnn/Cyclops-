@@ -3,8 +3,8 @@
 //  Glasses
 //
 
-import AVFoundation
-import Foundation
+import SwiftUI
+import UIKit
 
 // MARK: - What the live relocalizer reports
 
@@ -113,16 +113,18 @@ nonisolated struct WorldRecoveryReport: Equatable, Sendable {
     }
 }
 
-// MARK: - Speaking each prompt exactly once (§6.5)
 
-/// The phone's rule, pure: whether to speak `recovery.prompt` now.
+// MARK: - Showing each prompt exactly once (§6.5)
+
+/// The phone's rule, pure: whether `recovery.prompt` is a new prompt to show
+/// now.
 ///
 /// All four of §6.5's conditions, and C1 E1's: only while following the live
 /// session (unpinned) and bound to it. A pinned subscription is never bound
 /// (`TowerWorldBuilderClient.isCaptureBracketOpen`) and receives another
 /// world's payload, so opening Saved Worlds mid-walk silences prompts until
 /// *Back to live*; a Release build is never bound at all (no capture path,
-/// C1 M14), so it never speaks.
+/// C1 M14), so it never shows one.
 enum WorldLookBackRule {
     static func promptToSpeak(
         recovery: WorldRecoveryReport?,
@@ -140,7 +142,7 @@ enum WorldLookBackRule {
             prompt.episode == recovery.episode,
             prompt.kind == WorldLookBackPrompt.lookBackKind
         else { return nil }
-        // 3. Never spoken before in this session; `lastSpoken` only rises.
+        // 3. Never shown before in this session; `lastSpoken` only rises.
         if let lastSpoken, prompt.id <= lastSpoken { return nil }
         // 4. Not stale, on the Tower's own clock. No `tower_sent_at` is no
         //    way to know, and a late "look back" is wrong advice.
@@ -149,27 +151,60 @@ enum WorldLookBackRule {
     }
 }
 
-/// Something that can say the prompt aloud. A protocol so the rule and the
-/// ledger are tested without audio.
-@MainActor
-protocol WorldLookBackVoice: AnyObject {
-    /// Get ready while the walk is live, so the first prompt does not pay for
-    /// loading a voice. Idempotent.
-    func prepare()
-    /// Say `text`, for prompt `promptID`. Returns whether speech was started;
-    /// a prompt not spoken (no Bluetooth route, the session refused) is logged
-    /// by the voice and never retried.
-    @discardableResult
-    func speak(_ text: String, promptID: Int) -> Bool
+/// What the World Builder live screen shows for the look-back prompt.
+///
+/// **Shown, never spoken** (walk 1 at `4b4b444`, 2026-09-24): speech to the
+/// glasses over A2DP ended the DAT camera session ~3 s later -- *"Session
+/// ended by device"* -- and the walk's stream with it. Nothing in this path
+/// may touch the audio session, speech, or the Bluetooth audio route;
+/// `WorldLookBackAudioFreeTests` fails the build's tests if it does.
+nonisolated enum WorldLookBackBanner: Equatable, Sendable {
+    /// Prompt `promptID` is live: the wearer should look back.
+    case lookBack(promptID: Int)
+    /// The episode that prompted was recovered; shown briefly, then gone.
+    case backOnTrack
+
+    var text: String {
+        switch self {
+        case .lookBack: return WorldLookBackPrompter.sentence
+        case .backOnTrack: return WorldLookBackPrompter.recoveredSentence
+        }
+    }
 }
 
-/// The ledger and the rule, wired to a voice. Held by
+/// The one non-visual cue that goes with a new banner. A protocol so the
+/// ledger is tested without a device. **No audio of any kind**: a haptic uses
+/// no audio session and never reaches the glasses.
+@MainActor
+protocol WorldLookBackCue: AnyObject {
+    /// A new look-back banner, for prompt `promptID`, has just appeared.
+    func alert(promptID: Int)
+}
+
+/// One `UINotificationFeedbackGenerator` `.warning`, only while the app is
+/// foreground-active (a feedback generator does nothing otherwise, and a
+/// silent no-op is logged rather than guessed at).
+@MainActor
+final class WorldHapticLookBackCue: WorldLookBackCue {
+    func alert(promptID: Int) {
+        guard UIApplication.shared.applicationState == .active else {
+            WorldLookBackLog.write("prompt \(promptID) shown; no haptic: the app is not foreground-active")
+            return
+        }
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        WorldLookBackLog.write("prompt \(promptID) shown with a haptic")
+    }
+}
+
+/// The ledger and the rule, driving the banner. Held by
 /// `TowerWorldBuilderClient`, which hands it every report.
 @MainActor
 final class WorldLookBackPrompter {
-    /// The words. The phone owns them (§8, C1 E14): short, because every extra
-    /// word is more Bluetooth audio during the look-back.
-    static let sentence = "Look back the way you came."
+    /// The banner's words. The phone owns them (§8, C1 E14).
+    static let sentence = "Tracking lost — slowly look back the way you came."
+    /// Shown briefly when the prompting episode is recovered.
+    static let recoveredSentence = "Back on track"
+    static let backOnTrackSeconds: TimeInterval = 3
 
     /// Defence in depth only (§6.4): the Tower's limiter is the design, and
     /// the phone never delays a prompt. It refuses a third inside 60 s of its
@@ -177,19 +212,32 @@ final class WorldLookBackPrompter {
     static let localCap = 2
     static let localWindow: TimeInterval = 60
 
-    private let voice: WorldLookBackVoice
-    /// `lastSpoken[(world, session)]`: in memory only (C1 M4). A relaunch
-    /// closes the capture bracket, so the binding already refuses a repeat,
-    /// and rule 4 bounds what is left to `speak_window_s`.
+    private let cue: WorldLookBackCue
+    /// `lastSpoken[(world, session)]`: the last prompt id shown. In memory
+    /// only (C1 M4). A relaunch closes the capture bracket, so the binding
+    /// already refuses a repeat, and rule 4 bounds what is left to
+    /// `speak_window_s`.
     private(set) var lastSpoken: [String: Int] = [:]
-    private var spokenAt: [Date] = []
+    private var shownAt: [Date] = []
     var clock: () -> Date = { Date() }
 
-    init(voice: WorldLookBackVoice) {
-        self.voice = voice
+    /// What the live screen shows now, or `nil`. `onChange` hears every
+    /// change.
+    private(set) var banner: WorldLookBackBanner? {
+        didSet {
+            guard banner != oldValue else { return }
+            onChange?(banner)
+        }
+    }
+    var onChange: ((WorldLookBackBanner?) -> Void)?
+    private var bannerDeadline: Date?
+    private var expiry: Task<Void, Never>?
+
+    init(cue: WorldLookBackCue) {
+        self.cue = cue
     }
 
-    /// Consider one report. Speaks at most once per prompt id, per session.
+    /// Consider one report. Shows each prompt id at most once per session.
     func consider(
         recovery: WorldRecoveryReport?,
         binding: WorldSessionBinding,
@@ -198,134 +246,86 @@ final class WorldLookBackPrompter {
         worldID: String?,
         sessionID: String?
     ) {
-        guard followingLive, case .bound = binding, let worldID, let sessionID else { return }
-        voice.prepare()
+        guard followingLive, case .bound = binding, let worldID, let sessionID else {
+            dismiss()
+            return
+        }
+        // The banner follows the episode: gone once it stops prompting, and
+        // "Back on track" for a moment if it was recovered.
+        if case .lookBack = banner, recovery?.state != .prompting {
+            if recovery?.state == .recovered {
+                show(.backOnTrack, for: Self.backOnTrackSeconds)
+            } else {
+                dismiss()
+            }
+        }
         let key = "\(worldID)/\(sessionID)"
         guard let prompt = WorldLookBackRule.promptToSpeak(
             recovery: recovery, binding: binding, followingLive: followingLive,
             towerSentAt: towerSentAt, lastSpoken: lastSpoken[key])
         else { return }
-        // Recorded BEFORE speech starts (§6.5): a heartbeat carrying the same
-        // id, or a second report arriving while the voice is still talking,
-        // never speaks it again.
+        // Recorded BEFORE it is shown (§6.5): a heartbeat carrying the same
+        // id never shows it again.
         lastSpoken[key] = prompt.id
         let now = clock()
-        spokenAt = spokenAt.filter { now.timeIntervalSince($0) < Self.localWindow }
-        guard spokenAt.count < Self.localCap else {
-            WorldLookBackLog.write("prompt \(prompt.id) not spoken: a third inside 60 s on this phone's clock")
+        shownAt = shownAt.filter { now.timeIntervalSince($0) < Self.localWindow }
+        guard shownAt.count < Self.localCap else {
+            WorldLookBackLog.write("prompt \(prompt.id) not shown: a third inside 60 s on this phone's clock")
             return
         }
-        spokenAt.append(now)
-        voice.speak(Self.sentence, promptID: prompt.id)
+        shownAt.append(now)
+        // For `speak_window_s` (`speak_until - issued_at`), or until the
+        // episode stops prompting, whichever is first.
+        show(.lookBack(promptID: prompt.id), for: max(0, prompt.speakUntil - prompt.issuedAt))
+        cue.alert(promptID: prompt.id)
+    }
+
+    /// Take the banner down now: pinned, unbound, or the walk ended.
+    func dismiss() {
+        expiry?.cancel()
+        expiry = nil
+        bannerDeadline = nil
+        banner = nil
+    }
+
+    /// Take the banner down if its time is up on `clock`. Called by the
+    /// banner's own timer; public so a test drives it with a fake clock.
+    func expireIfDue() {
+        guard let bannerDeadline, clock() >= bannerDeadline else { return }
+        dismiss()
+    }
+
+    private func show(_ next: WorldLookBackBanner, for seconds: TimeInterval) {
+        expiry?.cancel()
+        banner = next
+        bannerDeadline = clock().addingTimeInterval(seconds)
+        expiry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds + 0.05))
+            guard !Task.isCancelled else { return }
+            self?.expireIfDue()
+        }
     }
 }
 
-// MARK: - The voice: AVSpeechSynthesizer over A2DP (C1 E6)
+/// The banner itself: at the top of the World Builder screen, large and
+/// coloured, because the wearer glances at it mid-walk.
+struct WorldLookBackBannerView: View {
+    let banner: WorldLookBackBanner
 
-/// Speaks through the glasses over **A2DP only, never HFP**
-/// (`WORLD-BUILDER-COMPONENTS.md` §6.5 "How the phone speaks"):
-///
-/// - category `.playback`, mode `.voicePrompt`, option `.duckOthers`,
-///   activated around each utterance and deactivated with
-///   `.notifyOthersOnDeactivation` when it ends. HFP would switch the glasses
-///   off A2DP and, the DAT docs say, must be configured before the camera
-///   stream starts -- so it is never touched;
-/// - only when the current output route is Bluetooth (A2DP or LE): a phone
-///   speaker in a pocket is useless to the wearer and audible to others. A
-///   prompt not spoken for want of a route is logged, never retried;
-/// - the app declares the `audio` background mode, so speech can start with
-///   the phone locked in a pocket.
-///
-/// Three things only a device settles, and the physical test measures them:
-/// audible on the glasses with the phone locked; the camera's frame rate and
-/// resolution while speaking (A2DP shares the Bluetooth Classic link with the
-/// camera stream); and the latency from `issued_at` to audible. The DEBUG log
-/// lines below give the phone's half of the last one.
-@MainActor
-final class WorldSpeechLookBackVoice: NSObject, WorldLookBackVoice, AVSpeechSynthesizerDelegate {
-    /// Created on first `prepare()`, and held strongly: a synthesizer that is
-    /// released mid-utterance stops talking.
-    private var synthesizer: AVSpeechSynthesizer?
-    private var voice: AVSpeechSynthesisVoice?
-    private var startedSpeakingAt: [ObjectIdentifier: (promptID: Int, asked: Date)] = [:]
-
-    func prepare() {
-        guard synthesizer == nil else { return }
-        let synthesizer = AVSpeechSynthesizer()
-        synthesizer.delegate = self
-        // The app's own session, so the category below governs it.
-        synthesizer.usesApplicationAudioSession = true
-        self.synthesizer = synthesizer
-        voice = AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
-    }
-
-    /// Whether `route` has a Bluetooth output the glasses can play on.
-    nonisolated static func isBluetoothOutput(_ route: AVAudioSessionRouteDescription) -> Bool {
-        route.outputs.contains { $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE }
-    }
-
-    @discardableResult
-    func speak(_ text: String, promptID: Int) -> Bool {
-        prepare()
-        guard let synthesizer else { return false }
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, mode: .voicePrompt, options: [.duckOthers])
-        } catch {
-            WorldLookBackLog.write("prompt \(promptID) not spoken: the audio category was refused (\(error.localizedDescription))")
-            return false
-        }
-        guard Self.isBluetoothOutput(session.currentRoute) else {
-            let ports = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
-            WorldLookBackLog.write("prompt \(promptID) not spoken: no Bluetooth output route (\(ports))")
-            return false
-        }
-        do {
-            try session.setActive(true)
-        } catch {
-            WorldLookBackLog.write("prompt \(promptID) not spoken: the audio session did not activate (\(error.localizedDescription))")
-            return false
-        }
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = voice
-        startedSpeakingAt[ObjectIdentifier(utterance)] = (promptID, Date())
-        synthesizer.speak(utterance)
-        let ports = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
-        WorldLookBackLog.write("prompt \(promptID) asked to speak on \(ports)")
-        return true
-    }
-
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        let id = ObjectIdentifier(utterance)
-        Task { @MainActor in
-            guard let entry = self.startedSpeakingAt[id] else { return }
-            let ms = Int(Date().timeIntervalSince(entry.asked) * 1000)
-            WorldLookBackLog.write("prompt \(entry.promptID) speech started \(ms) ms after it was asked")
-        }
-    }
-
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        let id = ObjectIdentifier(utterance)
-        Task { @MainActor in self.finish(id, how: "finished") }
-    }
-
-    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        let id = ObjectIdentifier(utterance)
-        Task { @MainActor in self.finish(id, how: "cancelled") }
-    }
-
-    private func finish(_ id: ObjectIdentifier, how: String) {
-        if let entry = startedSpeakingAt.removeValue(forKey: id) {
-            WorldLookBackLog.write("prompt \(entry.promptID) speech \(how)")
-        }
-        guard startedSpeakingAt.isEmpty else { return }
-        // Give the route back so ducked audio returns.
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    var body: some View {
+        let isLookBack: Bool = { if case .lookBack = banner { return true } else { return false } }()
+        Label(banner.text, systemImage: isLookBack ? "arrow.uturn.backward.circle.fill" : "checkmark.circle.fill")
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(isLookBack ? Color.orange : Color.green, in: .rect(cornerRadius: 14))
+            .accessibilityIdentifier(isLookBack ? "world-lookback-banner" : "world-back-on-track-banner")
+            .transition(.move(edge: .top).combined(with: .opacity))
     }
 }
 
-/// One line per prompt decision, DEBUG only: the phone's half of the latency
-/// the physical test measures.
+/// One line per prompt decision, DEBUG only.
 nonisolated enum WorldLookBackLog {
     static func write(_ line: String) {
         #if DEBUG

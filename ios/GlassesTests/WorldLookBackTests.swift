@@ -2,31 +2,23 @@
 //  WorldLookBackTests.swift
 //  GlassesTests
 //
-//  `tracking.recovery` and the spoken look-back prompt
-//  (`WORLD-BUILDER-COMPONENTS.md` §6, contract v2 @ bb80b2c; C1 E1, E2, E6,
-//  E7, E14, M4, M5, M14). The Tower's relocalizer does not exist yet (P3.2);
-//  the blocks below are written from §6.2's table.
+//  `tracking.recovery` and the look-back prompt (`WORLD-BUILDER-COMPONENTS.md`
+//  §6, contract v2 @ bb80b2c; C1 E1, E2, E7, E14, M4, M5, M14), as amended
+//  after walk 1 at `4b4b444`: the prompt is SHOWN on the phone with a haptic
+//  and never spoken, because speech to the glasses ended the DAT camera
+//  session ("Session ended by device").
 //
 
-import AVFoundation
 import XCTest
 
 @testable import Glasses
 
-/// Records what would be said, instead of saying it.
+/// Records the haptic, instead of firing it.
 @MainActor
-final class RecordingLookBackVoice: WorldLookBackVoice {
-    private(set) var spoken: [(text: String, promptID: Int)] = []
-    private(set) var prepared = 0
-    var answers = true
+final class RecordingLookBackCue: WorldLookBackCue {
+    private(set) var alerts: [Int] = []
 
-    func prepare() { prepared += 1 }
-
-    @discardableResult
-    func speak(_ text: String, promptID: Int) -> Bool {
-        spoken.append((text, promptID))
-        return answers
-    }
+    func alert(promptID: Int) { alerts.append(promptID) }
 }
 
 @MainActor
@@ -160,48 +152,38 @@ final class WorldLookBackPrompterTests: XCTestCase {
 
     private let bound = WorldSessionBinding.bound(captureID: "cap-1")
 
-    private func report(id: Int, episode: Int? = nil) -> WorldRecoveryReport {
-        WorldRecoveryReport(state: .prompting, episode: episode ?? id, promptsEnabled: true,
+    private func report(id: Int, episode: Int? = nil, state: WorldRecoveryState = .prompting) -> WorldRecoveryReport {
+        WorldRecoveryReport(state: state, episode: episode ?? id, promptsEnabled: true,
                             prompt: WorldLookBackPrompt(id: id, episode: episode ?? id, issuedAt: 100, speakUntil: 104))
     }
 
-    private func consider(_ prompter: WorldLookBackPrompter, _ report: WorldRecoveryReport,
+    private func consider(_ prompter: WorldLookBackPrompter, _ report: WorldRecoveryReport?,
                           session: String = "s1", binding: WorldSessionBinding? = nil, followingLive: Bool = true) {
         prompter.consider(recovery: report, binding: binding ?? bound, followingLive: followingLive,
                           towerSentAt: 101, worldID: "w1", sessionID: session)
     }
 
-    func testEachPromptIsSpokenOncePerSession() {
-        let voice = RecordingLookBackVoice()
-        let prompter = WorldLookBackPrompter(voice: voice)
+    func testEachPromptIsShownOncePerSessionWithOneHaptic() {
+        let cue = RecordingLookBackCue()
+        let prompter = WorldLookBackPrompter(cue: cue)
         consider(prompter, report(id: 1))
         consider(prompter, report(id: 1))
         consider(prompter, report(id: 1))
-        XCTAssertEqual(voice.spoken.map(\.promptID), [1])
-        XCTAssertEqual(voice.spoken.first?.text, "Look back the way you came.")
+        XCTAssertEqual(cue.alerts, [1])
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        XCTAssertEqual(prompter.banner?.text, "Tracking lost — slowly look back the way you came.")
         XCTAssertEqual(prompter.lastSpoken["w1/s1"], 1)
 
         // Another session is another key.
         consider(prompter, report(id: 1), session: "s2")
-        XCTAssertEqual(voice.spoken.map(\.promptID), [1, 1])
-    }
-
-    /// `lastSpoken` is set BEFORE speech starts: a voice that could not speak
-    /// (no Bluetooth route) is not asked again for the same id.
-    func testAPromptTheVoiceCouldNotSayIsNotRetried() {
-        let voice = RecordingLookBackVoice()
-        voice.answers = false
-        let prompter = WorldLookBackPrompter(voice: voice)
-        consider(prompter, report(id: 1))
-        consider(prompter, report(id: 1))
-        XCTAssertEqual(voice.spoken.count, 1)
+        XCTAssertEqual(cue.alerts, [1, 1])
     }
 
     /// Defence in depth (§6.4): a third inside 60 s of the phone's own clock
     /// is refused; the Tower's limiter is the design.
     func testTheLocalCapRefusesAThirdInsideAMinute() {
-        let voice = RecordingLookBackVoice()
-        let prompter = WorldLookBackPrompter(voice: voice)
+        let cue = RecordingLookBackCue()
+        let prompter = WorldLookBackPrompter(cue: cue)
         var now = Date(timeIntervalSince1970: 1_000)
         prompter.clock = { now }
         consider(prompter, report(id: 1))
@@ -209,29 +191,147 @@ final class WorldLookBackPrompterTests: XCTestCase {
         consider(prompter, report(id: 2))
         now += 10
         consider(prompter, report(id: 3))
-        XCTAssertEqual(voice.spoken.map(\.promptID), [1, 2])
+        XCTAssertEqual(cue.alerts, [1, 2])
         now += 45
         consider(prompter, report(id: 4))
-        XCTAssertEqual(voice.spoken.map(\.promptID), [1, 2, 4], "the window moved on")
+        XCTAssertEqual(cue.alerts, [1, 2, 4], "the window moved on")
     }
 
-    /// Nothing is prepared, let alone spoken, for a pinned or unbound phone.
-    func testAPinnedOrUnboundPhoneDoesNotEvenPrepare() {
-        let voice = RecordingLookBackVoice()
-        let prompter = WorldLookBackPrompter(voice: voice)
+    /// Nothing is shown for a pinned or unbound phone, and a banner that was
+    /// up comes down the moment the phone stops following the live walk.
+    func testAPinnedOrUnboundPhoneShowsNothing() {
+        let cue = RecordingLookBackCue()
+        let prompter = WorldLookBackPrompter(cue: cue)
         consider(prompter, report(id: 1), followingLive: false)
         consider(prompter, report(id: 1), binding: WorldSessionBinding.none)
-        XCTAssertEqual(voice.prepared, 0)
-        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertNil(prompter.banner)
+        XCTAssertTrue(cue.alerts.isEmpty)
+
         consider(prompter, report(id: 1))
-        XCTAssertEqual(voice.prepared, 1)
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        consider(prompter, report(id: 1), followingLive: false)
+        XCTAssertNil(prompter.banner, "a pinned phone kept the live walk's banner")
+        XCTAssertEqual(cue.alerts, [1])
     }
 
-    /// The real voice's route rule: A2DP or LE only, never the phone speaker
-    /// and never HFP (C1 E6).
-    func testTheVoiceSpeaksOnlyOnABluetoothPlaybackRoute() {
-        XCTAssertFalse(WorldSpeechLookBackVoice.isBluetoothOutput(AVAudioSession.sharedInstance().currentRoute),
-                       "the Simulator's route is not Bluetooth")
-        XCTAssertEqual(WorldLookBackPrompter.sentence, "Look back the way you came.")
+    /// The banner lasts `speak_window_s` (`speak_until - issued_at`, 4 s here)
+    /// on the phone's clock, and no longer.
+    func testTheBannerLastsTheSpeakWindow() {
+        let prompter = WorldLookBackPrompter(cue: RecordingLookBackCue())
+        var now = Date(timeIntervalSince1970: 1_000)
+        prompter.clock = { now }
+        consider(prompter, report(id: 1))
+        now += 3.9
+        prompter.expireIfDue()
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        now += 0.2
+        prompter.expireIfDue()
+        XCTAssertNil(prompter.banner)
+    }
+
+    /// Leaving `prompting` takes the banner down at once; `recovered` says
+    /// "Back on track" for a moment first.
+    func testTheBannerFollowsTheEpisode() {
+        let prompter = WorldLookBackPrompter(cue: RecordingLookBackCue())
+        var now = Date(timeIntervalSince1970: 1_000)
+        prompter.clock = { now }
+
+        consider(prompter, report(id: 1))
+        consider(prompter, report(id: 1, state: .searching))
+        XCTAssertNil(prompter.banner, "still up after the episode stopped prompting")
+
+        consider(prompter, report(id: 2))
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 2))
+        consider(prompter, report(id: 2, state: .recovered))
+        XCTAssertEqual(prompter.banner, .backOnTrack)
+        XCTAssertEqual(prompter.banner?.text, "Back on track")
+        now += WorldLookBackPrompter.backOnTrackSeconds + 0.1
+        prompter.expireIfDue()
+        XCTAssertNil(prompter.banner)
+
+        // A recovery with no banner up shows nothing.
+        consider(prompter, report(id: 2, state: .recovered))
+        XCTAssertNil(prompter.banner)
+    }
+
+    /// Every change reaches the screen through `onChange`.
+    func testEveryBannerChangeIsPublished() {
+        let prompter = WorldLookBackPrompter(cue: RecordingLookBackCue())
+        var seen: [WorldLookBackBanner?] = []
+        prompter.onChange = { seen.append($0) }
+        consider(prompter, report(id: 1))
+        consider(prompter, report(id: 1))
+        consider(prompter, report(id: 1, state: .recovered))
+        prompter.dismiss()
+        XCTAssertEqual(seen, [.lookBack(promptID: 1), .backOnTrack, nil])
+    }
+}
+
+/// **The invariant from walk 1:** the look-back path, and the app as a whole,
+/// never touches the audio session, speech, or the Bluetooth audio route.
+/// Speech to the glasses over A2DP ended the DAT camera session ~3 s later.
+///
+/// Read from the sources beside this file: the Simulator runs on the host,
+/// which is where the tests run. A run that cannot see them skips rather
+/// than passes.
+final class WorldLookBackAudioFreeTests: XCTestCase {
+
+    /// Anything that configures, activates, or plays through the audio system.
+    static let audioAPIs = [
+        "import AVFoundation", "import AVFAudio", "import AudioToolbox", "import MediaPlayer",
+        "AVAudioSession", "AVSpeechSynthesizer", "AVSpeechUtterance", "AVAudioPlayer", "AVAudioEngine",
+        "AVPlayer", "AudioServicesPlay", "overrideOutputAudioPort", "setPreferredInput",
+    ]
+
+    private var appSources: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Glasses")
+    }
+
+    private func swiftFiles(under root: URL) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: root.path) else {
+            throw XCTSkip("the app's sources are not readable from this run (\(root.path))")
+        }
+        let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+        return (walker?.allObjects as? [URL] ?? []).filter { $0.pathExtension == "swift" }
+    }
+
+    private func offences(in file: URL) throws -> [String] {
+        let text = try String(contentsOf: file, encoding: .utf8)
+        return Self.audioAPIs.filter { text.contains($0) }
+    }
+
+    func testThePromptPathTouchesNoAudioAPI() throws {
+        let file = appSources.appendingPathComponent("Workspaces/WorldBuilder/WorldLookBack.swift")
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            throw XCTSkip("WorldLookBack.swift is not readable from this run")
+        }
+        XCTAssertEqual(try offences(in: file), [], "the look-back path references an audio API")
+    }
+
+    /// Wider than the prompt: nothing else in the app plays audio either, so
+    /// nothing can move the glasses' Bluetooth route mid-stream.
+    func testNoAppSourceTouchesTheAudioSystem() throws {
+        var found: [String: [String]] = [:]
+        for file in try swiftFiles(under: appSources) {
+            let hits = try offences(in: file)
+            if !hits.isEmpty { found[file.lastPathComponent] = hits }
+        }
+        XCTAssertEqual(found, [:], "an app source references an audio API")
+    }
+
+    /// The `audio` background mode existed only for the spoken prompt.
+    func testTheAppDeclaresNoAudioBackgroundMode() throws {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        XCTAssertFalse(modes.contains("audio"), "UIBackgroundModes still declares audio: \(modes)")
+        XCTAssertTrue(modes.contains("bluetooth-central"), "read the host app's Info.plist, not another bundle's")
+    }
+
+    /// The prompter's only non-visual seam is a haptic cue.
+    @MainActor
+    func testTheDefaultCueIsTheHaptic() {
+        let cue: WorldLookBackCue = WorldHapticLookBackCue()
+        XCTAssertTrue(cue is WorldHapticLookBackCue)
     }
 }
