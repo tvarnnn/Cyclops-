@@ -34,6 +34,7 @@ struct DeveloperToolsView: View {
                 deviceHealthSection
                 mockDeviceSection
                 captureResolutionSection
+                motionProbeSection
                 rawStateSection
                 towerSection
                 placeholderSection
@@ -258,6 +259,26 @@ struct DeveloperToolsView: View {
             return "A capture session is still held — including while it is paused or stopping. DAT fixes the resolution when the stream is created and cannot renegotiate it, so changing this now could not take effect. Stop capture and wait for it to finish."
         }
         return "Applies when capture next starts, and resets to Low when the app relaunches. Low is the rung every existing measurement was taken at. Raising it harms World Builder tracking and helps Document Memory's OCR — but the axis that matters most is privacy: frames reach the Tower at this resolution and are never downscaled, and while the Tower's dataset recorder is armed every one is written to disk unredacted. A higher rung means more identifiable bystanders in that recording. It is a developer control, not a product setting."
+    }
+
+    // MARK: Motion (experimental)
+
+    /// The DAT 1.0.0 Motion spike: a switch and a readout, nothing more.
+    ///
+    /// Locked on `isCaptureSessionClaimed` for the same reason the resolution
+    /// picker is: Motion is attached once, when capture starts, so a change
+    /// while a session is held could not take effect and must not look as if
+    /// it had.
+    private var motionProbeSection: some View {
+        Section {
+            Toggle("Start Motion with capture", isOn: $glasses.motionProbeEnabled)
+                .disabled(glasses.isCaptureSessionClaimed)
+            MotionProbeRows(probe: glasses.motionProbe)
+        } header: {
+            Text("Motion (experimental)")
+        } footer: {
+            Text("DAT 1.0.0's experimental IMU capability, started beside the camera at 30 Hz when capture next starts. Off by default and off again after a relaunch. Samples stay on this phone: nothing is sent to the Tower and nothing is shown to the wearer. \"Received\" is measured on the phone's clock, \"Measured\" on the glasses' own; gyro is angular speed in rad/s.")
+        }
     }
 
     // MARK: Raw state
@@ -514,6 +535,35 @@ struct DeveloperToolsView: View {
         } footer: {
             Text("Placeholder type. Never assigned, so these never change. The real streaming state is Camera Stream above. Kept here rather than on the dashboard, where it contradicted the live frame counter.")
         }
+    }
+}
+
+/// The Motion readout, as its own view so only these rows redraw when the
+/// probe republishes; the rest of Developer Tools does not observe it.
+private struct MotionProbeRows: View {
+    @ObservedObject var probe: MotionProbe
+
+    var body: some View {
+        let s = probe.snapshot
+        LabeledContent("Motion state", value: s.state)
+        if let error = s.lastError {
+            LabeledContent("Motion error", value: error)
+        }
+        LabeledContent("Samples", value: "\(s.samplesInWindow) in window, \(s.totalReceived) total")
+        LabeledContent("Received", value: Self.hz(s.arrivalRateHz))
+        LabeledContent("Measured", value: Self.hz(s.deviceRateHz))
+        LabeledContent("Gyro now", value: Self.radiansPerSecond(s.latestGyroMagnitude))
+        LabeledContent("Gyro peak (window)", value: Self.radiansPerSecond(s.peakGyroMagnitude))
+    }
+
+    private static func hz(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.1f Hz", value)
+    }
+
+    private static func radiansPerSecond(_ value: Float?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.2f rad/s", value)
     }
 }
 
