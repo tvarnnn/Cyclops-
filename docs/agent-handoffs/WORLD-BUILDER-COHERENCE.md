@@ -8,8 +8,8 @@ the next run's starting point.
 |---|---|
 | Integration | `world-builder/live-world-visualization-v1` at `<SHA>`, its tip at hand-over (the test runs this). A commit cannot name its own SHA, so the lead records it in `RUN\physical-test\TEST-SHA.txt`; every `<SHA>` below means that value |
 | Tower lane | `world-builder/coherence-product-v1` (worktree `Glasses-worktrees\wb-coherence-product`) |
-| iOS lane | `ios/wb-coherence-areas-v1`, at the Mac tip merged into `<SHA>` (`0e1c78d`, manager 035 §5) |
-| Contract | `docs/contracts/WORLD-BUILDER-COMPONENTS.md` (v9) |
+| iOS lane | `ios/wb-coherence-areas-v1`, at the Mac tip merged into `<SHA>`: `a72e366` (the banner-and-haptic prompt plus LB2, manager 060); walk 1 ran on `0e1c78d`, walk 2 on the `f33bdfe` DEBUG build |
+| Contract | `docs/contracts/WORLD-BUILDER-COMPONENTS.md` (v10: the prompt is shown, not spoken) |
 | Operator detail | `tower/docs/world-builder/COHERENCE-PRODUCT.md` (switches, re-finish, validation Tower) |
 | Run root (`RUN`) | `C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23` |
 
@@ -564,6 +564,19 @@ everything, so nothing runs after a failure:
 9. **Two cold computations are one draw.** Whether two fresh mask computations, or two fresh
    depth predictions, agree bit for bit is unmeasured. The caches make that matter only
    for a walk's first finish.
+10. **What the physical test's first walks found (2026-09-24)** (`RUN\physical-test\TEST-LOG.md`):
+    - **Walk 1 (PARTIAL): speech ends the stream.** A spoken prompt over A2DP made the
+      glasses end the camera session: the frame stream stalled 0.47 s after the prompt was
+      issued. The prompt is now a banner and a haptic (§5.7). Walk 2's frame rate held at
+      about 12 fps through both prompts.
+    - **The viewer's lengths were absolute.** Walk 1's solve came out 27× smaller than other
+      rooms, and the photographic page pushed the camera out of the room ("Nothing was
+      photographed this way"). **Fixed at `57f56b5`:** the lengths are multiples of the
+      scene's unit, and the room page walks the room's cameras only.
+    - **The look-back did not re-link in walk 2:** verdict (d), no look-back returned to a
+      reference view. A view from 2–4 m does not match close-up references, and the window
+      runs 20 s from the loss, so about 15 s after the prompt (§6 #17).
+    - **Acceptance on 6839fb8f: FAIL on thin evidence** (§5.3).
 
 ## 6. Next-run backlog, ranked
 
@@ -676,3 +689,23 @@ everything, so nothing runs after a failure:
       from 2–4 m does not re-link.
     - **For the next run:** reference diversity and distance, and the prompt's wording.
       Measure a lower inlier floor's wrong-match rate before considering it.
+    - **The candidates** (manager 058), measured offline with an exact replay of the
+      relocalizer (`RUN\lead\reloc1\`, `reloc2\`), acceptance rule unchanged:
+      - the window runs from the prompt;
+      - references include a time- and viewpoint-spread sample of earlier keyframes;
+      - the per-episode summary event.
+18. **Speed.**
+    - Compute masks and depth *during* the walk (per keyframe, as frames arrive), so the
+      Stop-time solve does not start from zero.
+    - Run the 3-draw vote in parallel where the GPU allows.
+    - Walks took 8.8–11.2 min from Stop to settled tonight.
+19. **Incremental world building** (Tristan's idea): extend the map live and correct
+    earlier poses when later data links back, instead of re-solving at Stop. A staged
+    design is owed; Codex's design note is deferred by its quota.
+20. **A resolution test.** Measure what the 640×360 live frames cost the look-back matcher
+    and the final solve, against higher resolutions.
+21. **MockDevice duplicate classes** (Mac lane): the duplicate test-double classes in
+    GlassesTests, reported by the Mac.
+22. **The pocketed-prompt notification** (Tristan's decision): a locked phone cannot show
+    the banner or fire the haptic. Any notification must not route audio to the glasses
+    (§5.7).

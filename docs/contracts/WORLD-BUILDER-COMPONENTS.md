@@ -17,6 +17,7 @@
 > matching, the depth-prediction cache and the re-finish's raw frames by capture identity (§7 rule 4).
 > v8 (2026-09-24): `finalization.notice` is a closed set of sentences (§3.1); P3.6 manifest keys (§2.5).
 > v9 (2026-09-24): four closed-set sentences revised; `detail` client-safe (§3.1).
+> v10 (2026-09-24, after physical-test walk 1): the look-back prompt is SHOWN with one haptic, never spoken; a prompt arriving while the app is inactive is held, not consumed; the banner lasts the window left at delivery (§6.5, §6.6, §8, M3). Nothing on the wire changes (Mac draft 054a; iOS `a72e366`).
 > Every "OPEN" reference in the text is a question
 > the drafter could not settle: M-numbers are addressed to the Mac (§10),
 > T-numbers to the Tower lane, P3.2 (§11).
@@ -583,7 +584,7 @@ and every older world. `null` means *not recorded*, never *no losses*.
 | `prompt.episode` | int | The episode it was issued in |
 | `prompt.kind` | `"look-back"` | The only kind. The phone owns the words (§8) |
 | `prompt.issued_at` | number | Tower clock |
-| `prompt.speak_until` | number | Tower clock: `issued_at + limiter.speak_window_s`. After it the prompt is stale and is never spoken |
+| `prompt.speak_until` | number | Tower clock: `issued_at + limiter.speak_window_s`. After it the prompt is stale and is never shown |
 | `counts` | object | This session: `{episodes, recovered, recovered_after_prompt, timed_out, prompts, withheld_by_limiter, withheld_disabled}`, all int |
 | `limiter` | object | Read-only (§6.4): `{max_prompts, window_s, mechanism, cooldown_s, prompt_after_s, timeout_s, speak_window_s}` |
 | `acceptance` | object | Read-only (§6.3): `{matcher, reference_keyframes, scan_hz, triangle: {min_links, min_link_inliers, max_closure_deg}, strong_link: {min_inliers}}` |
@@ -650,52 +651,47 @@ Because the parameters and the counts are on the wire, the guarantee is visible:
 `window_s`. The phone does not rate-limit or delay a prompt; it may refuse a
 third within 60 s of its own clock as a defence in depth, never as the design.
 
-### 6.5 Speaking each prompt exactly once — the phone's rule
+### 6.5 Showing each prompt exactly once — the phone's rule
 
-Speak `prompt` if and only if **all** hold:
+Show `prompt` if and only if **all** hold:
 
 1. the session is **live and is the one this phone is streaming to**: IOS §9's
    `WorldSessionBinding` is `.bound` (camera bracket open; the Tower says
    `receiving`, `ended_at: null`, `frame_source: "live-capture"`), **while the
    phone follows the live session (unpinned)** (C1 E1). A pinned subscription
-   never speaks: its binding is always `.none` (IOS, `TowerWorldBuilderClient`
+   never shows one: its binding is always `.none` (IOS, `TowerWorldBuilderClient`
    `isCaptureBracketOpen`), and it receives the pinned world's payload, not the
    live one — so opening Saved Worlds mid-walk silences prompts until *Back to
    live*. Never under `.none`, `.awaiting` or `.foreign`, so never for a
    stopped, finalizing or historical session;
 2. `recovery.state == "prompting"`, `prompt.episode == recovery.episode`, and
-   `prompt.kind` is one the phone knows (an unknown kind is never spoken);
+   `prompt.kind` is one the phone knows (an unknown kind is never shown);
 3. `prompt.id` is **greater than** `lastSpoken[(world_id, session_id)]`;
 4. the envelope's `tower_sent_at ≤ prompt.speak_until`. (C1 E2: the phone must
    decode the envelope's `tower_sent_at`, which `CARTRIDGE-RESULTS.md` §4 already
    sends; today's decoder reads only `seq`, `revision`, `revision_changed`,
    `coalesced` and `snapshot`.)
 
-**How the phone speaks (C1 E6).** Through A2DP only, never HFP: audio session
-category `.playback`, mode `.voicePrompt`, option `.duckOthers`, activated
-around each utterance; and only when the current output route is Bluetooth
-(A2DP or LE) — a phone speaker in a pocket is useless to the wearer and audible
-to others; a prompt not spoken for want of a route is logged, never retried.
-The app declares the `audio` background mode. The wearer locks the phone **on
-the World Builder screen** (leaving it stops the cartridge session). Only a
-device settles three facts, and the physical test measures them: (i) speech is
-audible on the glasses with the phone locked; (ii) the camera's frame rate and
-resolution while speaking (A2DP shares the Bluetooth Classic link with the
-camera stream); (iii) the latency from `issued_at` to audible. Prompts exist
-only in DEBUG builds, because Release has no capture path (C1 M14): the
-physical test runs a DEBUG build.
+**How the phone shows it (amended after walk 1, 2026-09-24).** On the phone, never as audio.
 
-Then set `lastSpoken` to `prompt.id` **before** speech starts. Heartbeats
-(`revision_changed: false`) and coalesced snapshots carry the same id, so they
-never speak twice. `lastSpoken` only ever rises: an id at or below it is never
-spoken.
+- The World Builder live screen shows a prominent banner: *Tracking lost — slowly look back the way you came.*
+- The banner stays for what is left of the window at delivery, `speak_until − tower_sent_at` (the pair rule 4 compares), counted from receipt and clamped at 0. It comes down sooner if `recovery.state` leaves `prompting`.
+- A prompt that arrives while the app is not foreground-active (the phone locked) is **held, not consumed**: nothing is shown and `lastSpoken` does not advance. It is presented when the app becomes active, or on the next report that repeats it, provided its window has not ended. It is dropped when the window ends, when the episode stops prompting, or when the phone stops following the live walk. No notification or sound is used to reach a locked phone.
+- When the state becomes `recovered`, the banner reads *Back on track* for about 3 s and is then dismissed.
+- When the banner appears, the phone fires one haptic (`UINotificationFeedbackGenerator`, `.warning`), and only if the app is foreground-active.
+- **The prompt path never touches the audio session, speech, or the Bluetooth audio route.** Walk 1 spoke through A2DP (`.playback` / `.voicePrompt` / `.duckOthers`), and the glasses ended the DAT camera session about 3 s later ("Session ended by device").
+- The app declares no `audio` background mode.
+- A haptic cannot fire while the phone is locked, and a banner cannot be seen in a pocket. On a walk the prompt is therefore visible only when the wearer looks at the phone. That is the accepted cost of keeping the camera stream alive.
+- Prompts exist only in DEBUG builds, because Release has no capture path (C1 M14).
+
+Then, when the prompt is presented in the foreground, set `lastSpoken` to `prompt.id` **before** the banner is shown. Heartbeats (`revision_changed: false`) and coalesced snapshots carry the same id, so they never show it twice. `lastSpoken` only ever rises: an id at or below it is never shown.
 
 ### 6.6 Reconnect, relaunch, stale ids
 
 - **Reconnect** is re-subscribe: a complete snapshot with `seq: 1`
   (`CARTRIDGE-RESULTS.md` §6). §6.5 applies unchanged, and `lastSpoken` survives,
   because it is keyed by world and session, not by subscription. A prompt issued
-  while the socket was down is spoken only if it is still before `speak_until`.
+  while the socket was down is shown only if it is still before `speak_until`.
 - **Relaunch.** A `lastSpoken` held only in memory is lost; rule 4 then bounds
   a repeat to a relaunch within `speak_window_s` of the issue. Persisting it per
   session (one integer, no imagery) makes it exact (OPEN M4).
@@ -703,7 +699,7 @@ spoken.
 - **Coalescing** cannot hide a prompt during a connected walk: prompts are
   spaced by the mechanism and by the cap, and the channel polls every 0.5 s.
 - `recovery: null`, `prompts_enabled: false`, or any state but `prompting`:
-  nothing is spoken.
+  nothing is shown.
 
 ### 6.7 Producer notes (Tower-internal, for P3.2)
 
@@ -726,7 +722,7 @@ relocalizer costs 0.3–0.8 of one core, only while an episode is open.
    serving the whole session's rung ladder for it, byte for byte as today.
 2. `null` is **not computed**, never "zero areas". A phone must never render
    "0 more areas" or an empty footer.
-3. `tracking.recovery` is `null` on every older session; nothing is spoken.
+3. `tracking.recovery` is `null` on every older session; nothing is shown.
 4. **The re-finish path — referenced, specified by P3.2.** One documented
    command rebuilds a saved session with the product pipeline (masks, the
    seeded solve, depth before publishing, the evidence gate, components, room
@@ -799,9 +795,9 @@ It says what the Tower could not do for this walk and who can fix it (§3.1). It
 No arrow toward the room, no distance, no size, no name, no position — none of
 them is known.
 
-**The spoken prompt** (`prompt.kind: "look-back"`): the phone owns the words:
-*Look back the way you came.* (C1 E14; about 1.5 s — every extra word is more
-Bluetooth audio during the look-back.) Spans are `m:ss` with an en dash
+**The look-back banner** (`prompt.kind: "look-back"`): the phone owns the words:
+*Tracking lost — slowly look back the way you came.* and, on `recovered`, *Back on
+track*. Shown with one haptic, never spoken (§6.5). Spans are `m:ss` with an en dash
 (`0:29–0:33`); minutes are not wrapped past 59 and hours are never used.
 
 **`tracking.recovery` on the world screen** (accepted by C1; shown only while
@@ -853,6 +849,7 @@ phone sends no `viewer` on area routes; M13 needs `scope` and
   audio route during a DAT streaming session, with the phone locked in a pocket?
   Does it need the `audio` background mode, and does speech interrupt or duck
   anything the session depends on? What is the speech latency?
+- **M3, superseded (walk 1, 2026-09-24):** speech to the glasses during a DAT stream ends the stream. The prompt is visual and haptic only (§6.5).
 - **M4 — `lastSpoken` persistence.** Persist it per session, or accept one
   repeat on a relaunch within `speak_window_s`?
 - **M5 — where `recovery` is read.** It sits on the payload's `tracking` block,
