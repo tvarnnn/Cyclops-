@@ -297,25 +297,32 @@ final class GlassesConnection: ObservableObject {
     /// guidance — calling earlier throws `DeviceSessionError.noEligibleDevice`.
     @Published private(set) var hasActiveDevice = false
 
-    /// The glasses' own thermal pressure, straight from
-    /// `WearablesInterface.deviceStateStream(for:)`.
+    /// The glasses' own thermal pressure, straight from the active device's
+    /// `Device.addDeviceStateListener(_:)`.
     ///
-    /// This is the *only* proactive health signal DAT 0.9.0 exposes for the
-    /// device: `DeviceState` has exactly one property, `thermalLevel`. Battery
-    /// level, charging state, hinge state and any numeric temperature are not
-    /// in the 0.9.0 API at all — battery was present in 0.2, was removed, and
-    /// Meta has said it lands in a later release. Everything else health-shaped
-    /// is *reactive*: `DeviceSessionError` and `StreamError` carry
-    /// `thermalCritical`, `thermalEmergency`, `peakPowerShutdown` and
-    /// `batteryCritical`, but those arrive at the moment the stream is already
-    /// dying. See docs/05-DAT-INTEGRATION.md.
+    /// Through DAT 0.9.0 this was the *only* proactive health signal DAT
+    /// exposed for the device. 1.0.0 adds battery level, charging, don and
+    /// hinge state to `DeviceState`; this app does not read them yet, so they
+    /// stay absent rather than shown. No numeric temperature exists in either
+    /// release. Everything else health-shaped is *reactive*:
+    /// `DeviceSessionError` carries `thermalCritical`, `thermalEmergency`,
+    /// `peakPowerShutdown` and `batteryCritical`, and 1.0.0's `StreamError`
+    /// carries `thermalHot`, `peakPowerLimit` and `batteryLow`, but those
+    /// arrive at the moment the stream is already dying. See
+    /// docs/05-DAT-INTEGRATION.md.
     ///
-    /// `nil` until the stream yields, which is also what it stays if no device
-    /// is active. Nothing here estimates or interpolates a temperature — Rule
-    /// 3: unknown values remain unavailable.
+    /// `nil` until the listener delivers, which is also what it stays if no
+    /// device is active. Nothing here estimates or interpolates a temperature
+    /// — Rule 3: unknown values remain unavailable.
     @Published private(set) var glassesThermalLevel: ThermalLevel?
 
-    private var deviceStateTask: Task<Void, Never>?
+    /// The device-state listener for whichever device is active. Replaced, not
+    /// added to, when the active device changes — see `observeDeviceState`.
+    private let deviceStateTokenBag = ListenerTokenBag()
+    /// The device the listener above belongs to. A delivery already queued for
+    /// the main actor when the device changed is dropped by comparing against
+    /// this, so the old glasses' reading cannot land on the new ones.
+    private var deviceStateIdentifier: DeviceIdentifier?
 
     /// Fires once when the camera stream is confirmed live (`StreamState
     /// .streaming`) — the earliest point it's true that a session "has
@@ -416,7 +423,7 @@ final class GlassesConnection: ObservableObject {
         // the task owns `self`, the retain cycle is closed, and the
         // `isolated deinit` below (which stops the camera and the device
         // session) can never run. Inside, the strong reference lasts one
-        // iteration. `deviceStateTask` already does it this way.
+        // iteration.
         activeDeviceTask = Task { [weak self] in
             for await activeDeviceId in selector.activeDeviceStream() {
                 guard let self else { return }
@@ -471,7 +478,7 @@ final class GlassesConnection: ObservableObject {
         deviceStreamTask?.cancel()
         #if DEBUG
         activeDeviceTask?.cancel()
-        deviceStateTask?.cancel()
+        deviceStateTokenBag.clear()
         camera?.stop()
         deviceSession?.stop()
         #endif
@@ -1197,38 +1204,34 @@ final class GlassesConnection: ObservableObject {
         cameraStreamState = .stopped
     }
 
-    /// Follows `deviceStateStream(for:)` for whichever device is currently
-    /// active, replacing any previous observation.
+    /// Follows `Device.addDeviceStateListener(_:)` for whichever device is
+    /// currently active, replacing any previous observation.
     ///
-    /// Restarted rather than kept because the stream is bound to one
-    /// `DeviceIdentifier`: leaving the old one running would keep publishing a
-    /// thermal level for glasses that are no longer the ones in use, which is
-    /// worse than publishing nothing.
+    /// DAT 1.0.0 removed `Wearables.deviceStateStream(for:)`; device state now
+    /// lives on `Device`, whose listener delivers the current state at once and
+    /// then every change. Restarted rather than kept because a listener is
+    /// bound to one device: leaving the old one registered would keep
+    /// publishing a thermal level for glasses that are no longer the ones in
+    /// use, which is worse than publishing nothing.
     private func observeDeviceState(for identifier: DeviceIdentifier?) {
-        deviceStateTask?.cancel()
-        deviceStateTask = nil
+        deviceStateTokenBag.clear()
+        deviceStateIdentifier = identifier
         // Cleared before the new observation starts, so the previous device's
         // last reading cannot linger on screen as if it described the new one.
-        // It stays nil until the new stream actually yields.
+        // It stays nil until the new listener actually delivers — and stays nil
+        // if DAT has no `Device` for the identifier, as the stream did.
         glassesThermalLevel = nil
 
-        guard let identifier else { return }
-        // `wearables` is hoisted out so the task body never needs `guard let
-        // self`. That guard would promote the weak capture to a strong one for
-        // the whole unbounded life of the stream, making `self` own the task
-        // that owns `self` — a cycle in which the `deinit` that cancels the
-        // task can never run. The `self?.` form keeps the reference weak
-        // throughout.
-        let wearables = self.wearables
-        deviceStateTask = Task { [weak self] in
-            for await state in wearables.deviceStateStream(for: identifier) {
-                self?.glassesThermalLevel = state.thermalLevel
+        guard let identifier, let device = wearables.deviceForIdentifier(identifier) else { return }
+        // `[weak self]` throughout: the bag that owns the listener is owned by
+        // `self`, so a strong capture would be a cycle.
+        device.addDeviceStateListener { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self, self.deviceStateIdentifier == identifier else { return }
+                self.glassesThermalLevel = state.thermalLevel
                 print("[Glasses][Health] glasses thermalLevel: \(state.thermalLevel)")
             }
-            // The stream finishing is not itself a reading. Whatever the last
-            // value was, it is no longer being maintained.
-            if !Task.isCancelled { self?.glassesThermalLevel = nil }
-        }
+        }.store(in: deviceStateTokenBag)
     }
 
     private static func pixelDimensions(for frame: VideoFrame) -> (width: Int, height: Int)? {

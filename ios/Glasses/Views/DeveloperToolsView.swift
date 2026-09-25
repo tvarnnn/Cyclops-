@@ -164,7 +164,7 @@ struct DeveloperToolsView: View {
         } header: {
             Text("Device Health")
         } footer: {
-            Text("Glasses thermal is DAT's ThermalLevel — the only device-health value the pinned 0.9.0 SDK exposes. Glasses battery, charging state and any numeric temperature are not in that API, so they are absent rather than estimated. \"iPhone thermal\" at Serious or above means the system is throttling, which shows up in the sender rows above as encode and hop times growing.")
+            Text("Glasses thermal is DAT's ThermalLevel. The pinned 1.0.0 SDK also reports glasses battery and charging state, which this screen does not read yet, and no numeric temperature at all — so those are absent rather than estimated. \"iPhone thermal\" at Serious or above means the system is throttling, which shows up in the sender rows above as encode and hop times growing.")
         }
     }
 
