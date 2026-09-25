@@ -226,9 +226,9 @@ final class WorldHapticLookBackCue: WorldLookBackCue {
 @MainActor
 final class WorldLookBackPrompter {
     /// The banner's words. The phone owns them (§8, C1 E14).
-    static let sentence = "Tracking lost — slowly look back the way you came."
+    nonisolated static let sentence = "Tracking lost — slowly look back the way you came."
     /// Shown briefly when the prompting episode is recovered.
-    static let recoveredSentence = "Back on track"
+    nonisolated static let recoveredSentence = "Back on track"
     static let backOnTrackSeconds: TimeInterval = 3
 
     /// Defence in depth only (§6.4): the Tower's limiter is the design, and
