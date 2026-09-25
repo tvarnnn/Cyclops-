@@ -17,8 +17,8 @@ import SwiftUI
 /// `Wearables.configure()`, so `GlassesConnection` would touch the DAT SDK
 /// before it is configured.
 ///
-/// Everything else — the cartridge tray, the connection sheet, the developer
-/// tools, and now the workspace — is presented *over* or *inside* this view
+/// Everything else — the cartridge tray, the connection sheet, Settings, the
+/// developer tools, and now the workspace — is presented *over* or *inside* this view
 /// rather than replacing it, so the graph is never torn down.
 /// `GlassesConnection.deinit` stops the camera and the device session, which
 /// would kill a live stream. `GlassesConnection.init` logs
@@ -66,6 +66,7 @@ struct ContentView: View {
     private enum Destination: Int, Identifiable {
         case cartridges
         case connections
+        case settings
         #if DEBUG
         case developer
         #endif
@@ -253,7 +254,8 @@ struct ContentView: View {
                 glasses: project.glassesConnection,
                 tower: project.towerClient,
                 senderMetrics: project.senderMetrics,
-                onOpenConnections: { destination = .connections }
+                onOpenConnections: { destination = .connections },
+                onOpenSettings: { destination = .settings }
             )
         }
     }
@@ -269,6 +271,17 @@ struct ContentView: View {
                 Label("Cartridges", systemImage: "square.grid.2x2")
             }
             .accessibilityLabel("Cartridges")
+        }
+
+        // Every build, every workspace: the one way to change the Tower's
+        // address, which is what "Tower unreachable" usually needs.
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                destination = .settings
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .accessibilityLabel("Settings")
         }
 
         #if DEBUG
@@ -301,6 +314,8 @@ struct ContentView: View {
                 tower: project.towerClient
             )
             .presentationDetents([.medium, .large])
+        case .settings:
+            SettingsSheet()
         #if DEBUG
         case .developer:
             DeveloperToolsView(

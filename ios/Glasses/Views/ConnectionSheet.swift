@@ -73,6 +73,18 @@ struct ConnectionSheet: View {
                             }
                         }
                     )
+                    // Where "can't reach the Tower" is fixed when the address
+                    // is wrong for this network: Connect can only retry it.
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        LabeledContent("Tower address") {
+                            Text(TowerConfiguration.authority)
+                                .font(.footnote.monospaced())
+                        }
+                    }
+                    .accessibilityHint("Opens Settings, to change or test the Tower's address")
+                    .accessibilityIdentifier("connections-tower-address")
                 } header: {
                     Text("Connections")
                 } footer: {
@@ -107,9 +119,9 @@ struct ConnectionSheet: View {
         }
     }
 
-    /// Names the endpoint. It is a hardcoded address that the configuration
-    /// itself expects to change between networks, so "can't reach the Tower" is
-    /// an unactionable mystery without it and a fixable problem with it.
+    /// Names the endpoint. The address changes between networks, so "can't
+    /// reach the Tower" is an unactionable mystery without it and a fixable
+    /// problem with it — fixed in Settings, one row up.
     private var towerFooter: String {
         let endpoint = TowerConfiguration.webSocketURL.absoluteString
         if case .failed(let message) = tower.status {

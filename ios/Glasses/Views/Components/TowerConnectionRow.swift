@@ -54,10 +54,9 @@ enum CVTowerConnectionLabel {
 /// ## What it offers
 ///
 /// The state in one of four words with the shell's colour mapping, the
-/// failure detail when there is one, the compiled-in endpoint — a hardcoded
-/// address the configuration itself expects to change between networks, so
-/// "cannot reach the Tower" is a mystery without it and a fixable problem with
-/// it — and the one action `ConnectionSheet` would offer for the same state.
+/// failure detail when there is one, the endpoint in use — an address that
+/// changes between networks (Settings sets it), so "cannot reach the Tower" is
+/// a mystery without it and a fixable problem with it — and the one action `ConnectionSheet` would offer for the same state.
 /// Nothing here that the sheet does not do; it is here so a person running an
 /// experiment does not have to leave the Lab to do it.
 struct TowerConnectionRow: View {
