@@ -121,6 +121,7 @@ never touched.
 | `TOWER_WORLD_RELOCALIZER_HISTORY` | `0` | `0` through walk 3; `20` for the arm after it (manager 064, 067) | 4 to 20 older keyframes added to each episode's 10 references. They are consulted only when the recent ones decide nothing, as spare-cycle work that yields to a newer frame. A link through one carries `historical: true` in the journal. Out-of-range values read as `0` and are logged |
 | `TOWER_WORLD_RELOCALIZER_SUMMARY` | `off` | `off` through walk 3; `on` with HISTORY | one `recovery_summary` line per episode, **in the journal only**; it never reaches the phone |
 | `TOWER_WORLD_ANCHOR_VERIFY` | `off` | `on` for walk 4 (manager 087) | P4 (`anchor_verify.py`; `RUN\experiments\P4-IV\RULE.md`, `RULE-a2.md`): runs once, on the chosen draw's published room, after the consensus. `images` = the masked image-only check, sealing contradicted groups as `link-contradicted`, plus one relocalizer import counting as one link; `scale` = the anchor block's capture runs split by `scale_split`, sealed `scale-mismatch` when their sign-test level CIs are more than ×1.25 apart; `motion` = physical-motion cut points only; `on` = all of them. Unset is byte-identical to before. After a walk, check `gate.anchor_verify.state == applied` and `pair_set.pairs > 0` |
+| `TOWER_WORLD_FRAME_QUALITY_LOG` | `off` | `off` for walk 4; `on` for walk 5 (the IMU walk; manager 091 B3) | one line per observed frame in `sessions\<sid>\frames_quality.jsonl`: the selector's sharpness, motion, tracker state, outcome and reason, and the keyframe id. Values are copied only, never recomputed; about 1.5 MB for a 5-minute walk. It is a new file: no existing byte changes, and nothing reaches the phone. Product `8a6ca35`; integrated after walk 4 |
 | `TOWER_WORLD_RELOCALIZER_WINDOW` | `loss` | `loss` | `prompt` would start a prompted episode's timeout at the prompt. It was measured worse in the replay (`RUN\lead\reloc2\`) and is not deployed |
 | `TOWER_WORLD_FINISH_PENDING` | `true` | `true` | finishes areas, owed re-gates and deferred consensus |
 | `TOWER_WORLD_SOLVE`, `_SURFACE` | `true` | `true` | the finisher runs only with these two and `TOWER_WORLD_FINISH_PENDING` on (`tower/tower/main.py`, `_world_finish_spec`) |
@@ -640,6 +641,23 @@ everything, so nothing runs after a failure:
        - LOW-4: the early publish runs the pair build first;
        - LOW-5: the contract wording of `link-contradicted` (it goes to the UX phase).
      - **The image evidence must be masked:** the phone in the wearer's hand makes unmasked pairs report "no rotation".
+     - **The 6839 residual (manager 091 B2 / 092; `RUN\experiments\P4-IV\RESIDUAL-6839.md`):** decision (A), keep (b) as
+       shipped. **Close criterion 2 on 6839fb8f is not achievable from image evidence.**
+       - Of c10's 35 unsealed bed kf, 21 have no masked evidence (low texture and viewpoint, not the masks).
+       - 27 are left by (b)'s peeling order.
+       - The seed-10 island (4127, 4163–4173) has no image link at all.
+     - **Candidate: the orphan clause** (digest `3483a8b1ba910eda`, no new constant). A group contradicted in an earlier
+       round and then left without evidence is sealed.
+       - Corpus: c10 46 of 54 (all 45 GT-misplaced) plus 10 room-side kf of unknown correctness; w10 7 of 14.
+       - It never fires on the control, so its false-seal rate is unmeasurable there.
+       - **Its first test is a held-out world where (b) contradicts something** (walk 4, else walk 5). Score it there
+         before any adoption.
+     - **Backlog for (b): the tie-break.** When two partners are equally contradicted (6839: the same 31 pairs, 10.36°),
+       the earlier camera is sealed first, a deterministic but arbitrary choice. Candidate: when partners tie, seal
+       neither, and mark both unverifiable with a reason.
+     - **The path forward is capture-time evidence:** views that revisit the bed from room viewpoints (the protocol) and,
+       for new walks, **the gyro's rotation check** (`Glasses-scratch\ux-phase\research\gyro-integration.md` §2 (c)).
+       The bed stretch is 10–33° off in rotation, which a gyro check at Δt ≤ 10 s would catch.
    - **Decide how the gate counts a relocalizer import (manager 064).** One accepted
      triangle imports two pairs through one anchor image whose other ends are consecutive
      keyframes already linked to each other. That is exactly the gate's "two pairs through
