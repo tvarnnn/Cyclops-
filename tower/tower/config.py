@@ -1135,6 +1135,33 @@ def world_relocalizer_options() -> dict:
     return options
 
 
+# P5-SHARP (manager 091 B3): the per-frame quality log, `sessions/<sid>/frames_quality.jsonl`
+# (`world_builder/frame_quality.py`) -- one line per observed frame with the frontend's own
+# sharpness, the tracker's motion measure and the keyframe selector's decision, for the IMU
+# walk's turn-governor calibration. Read by the BUILDER process at each session start, like
+# the relocalizer. Off, and off is today exactly: no file is created and every other output
+# is byte-identical (tests/golden/world_builder_frame_quality_ceb203a.json).
+WORLD_FRAME_QUALITY_LOG_ENV = "TOWER_WORLD_FRAME_QUALITY_LOG"
+
+
+def world_frame_quality_log_setting() -> bool:
+    """`TOWER_WORLD_FRAME_QUALITY_LOG`: the per-frame quality log. Off.
+
+    On is `_flag`'s set (`1`, `true`, `yes`, `on`). Unset, blank, `0`, `false`, `no` and
+    `off` are off, silently. Anything else is off and logged: a typo never starts writing a
+    line per frame, and it is still visible.
+    """
+    if _flag(WORLD_FRAME_QUALITY_LOG_ENV, default=False):
+        return True
+    value = (os.environ.get(WORLD_FRAME_QUALITY_LOG_ENV) or "").strip()
+    if value and value.lower() not in ("0", "false", "no", "off"):
+        logger.warning(
+            "[Tower][Config] %s=%r is not on or off; treating it as off",
+            WORLD_FRAME_QUALITY_LOG_ENV, value,
+        )
+    return False
+
+
 def _torch_threads(value: str | None) -> int | str:
     """"auto", or a non-negative integer. Garbage is "auto", not a crash.
 

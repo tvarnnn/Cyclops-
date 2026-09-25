@@ -33,6 +33,7 @@ from tower.confidence import Confidence
 from tower.world_builder.backend import KeyframeInput
 from tower.world_builder.backends import BACKEND_AUTO, select_backend
 from tower.world_builder.events import EventLog, WorldEvent
+from tower.world_builder import frame_quality
 from tower.world_builder.frontend import FrameTracker, analyse_frame, decode_gray
 from tower.world_builder.keyframes import (
     KeyframePolicy,
@@ -188,8 +189,14 @@ class WorldBuilderEngine:
         relocalizer: str | None = None,
         monotonic=None,
         relocalizer_options: dict | None = None,
+        frame_quality_log: bool | None = None,
     ) -> None:
         self._store = store
+        # The per-frame quality log (frame_quality.py, P5-SHARP). None reads
+        # `TOWER_WORLD_FRAME_QUALITY_LOG` at each session start, like the
+        # relocalizer's mode; unset is off, and off writes nothing at all.
+        self._frame_quality_log = frame_quality_log
+        self._frame_log: frame_quality.FrameQualityLog | None = None
         # The RELOC2 options (config.world_relocalizer_options): None reads
         # the environment at each session start like the mode; `{}` or an
         # unset environment builds the relocalizer exactly as before.
@@ -317,6 +324,7 @@ class WorldBuilderEngine:
         self._barren_segments = 0
         self._segments_used: set[int] = set()
         self._rejected = {}
+        self._open_frame_quality_log(session)
         self._events.append("session_started", {"frame_source": frame_source})
         self._start_relocalizer(session)
         self._open_live_solve(session)
@@ -381,6 +389,7 @@ class WorldBuilderEngine:
             self._note_rejected("malformed_frame")
             self._events.append("frame_rejected", {"reason": "malformed_frame"})
             self._recovery_tick()
+            self._log_frame(source_seq, received_at, "reject", "malformed_frame")
             return self._result("reject", "malformed_frame")
 
         # A FRAME OF A DIFFERENT SIZE IS REJECTED, NOT TRACKED.
@@ -417,12 +426,22 @@ class WorldBuilderEngine:
                 "received": list(gray.shape[:2]),
             })
             self._recovery_tick()
+            self._log_frame(source_seq, received_at, "reject", "frame_size_changed")
             return self._result("reject", "frame_size_changed")
 
         quality = analyse_frame(gray)
         self._selector.note_frame(quality)
         motion = self._tracker.measure(gray)
         decision = self._selector.evaluate(quality, motion)
+        # For the per-frame quality log: what `evaluate` saw, read before a
+        # loss or an accept moves either on. Off, this is one comparison and
+        # nothing is read, built or written.
+        measured = {
+            "quality": quality,
+            "motion": motion,
+            "frames_since_keyframe": self._selector.frames_since_keyframe,
+            "segment_index": self._segment_index,
+        } if self._frame_log is not None else None
 
         if decision.lost:
             # A new segment: poses either side are NOT in a common frame,
@@ -454,12 +473,18 @@ class WorldBuilderEngine:
                 lambda r: r.note_lost(now)
                 + r.note_frame(gray, source_seq, None, now)
             )
+            self._log_frame(
+                source_seq, received_at, decision.outcome, decision.reason, measured
+            )
             return self._result(decision.outcome, decision.reason)
 
         if not decision.accepted:
             self._note_rejected(decision.reason)
             self._recovery(
                 lambda r: r.note_frame(gray, source_seq, None, self._mono())
+            )
+            self._log_frame(
+                source_seq, received_at, decision.outcome, decision.reason, measured
             )
             return self._result(decision.outcome, decision.reason)
 
@@ -571,6 +596,10 @@ class WorldBuilderEngine:
                 )
             )
         )
+        self._log_frame(
+            source_seq, received_at, decision.outcome, decision.reason, measured,
+            keyframe_id=keyframe.keyframe_id,
+        )
         return self._result(
             decision.outcome, decision.reason, keyframe_id=keyframe.keyframe_id
         )
@@ -601,6 +630,10 @@ class WorldBuilderEngine:
         if self._session is None:
             raise SessionNotActiveError("stop_session() requires an active session")
 
+        # The per-frame quality log is closed -- so flushed -- before anything
+        # below can raise: every frame is in, and a walk that ended in error
+        # reaches here too (world_build_session.py). Never raises.
+        self._close_frame_quality_log()
         now = self._clock()
         finalization = None
         if hold_lock:
@@ -1314,6 +1347,55 @@ class WorldBuilderEngine:
                 # limiter keeps these, not a reading of its own, so the cap
                 # holds exactly on the wire (review V8 LOW-3).
                 reloc.prompt_journaled(event.at)
+
+    def _open_frame_quality_log(self, session) -> None:
+        """The session's per-frame quality log, when the setting asks for one.
+
+        Off -- the default -- opens nothing, creates no file and writes
+        nothing for the whole session (frame_quality.py). On, one handle for
+        the session; `FrameQualityLog` never raises, and a log it could not
+        open is simply off.
+        """
+        self._close_frame_quality_log()  # a previous session's, never stopped
+        enabled = self._frame_quality_log
+        if enabled is None:
+            from tower.config import world_frame_quality_log_setting
+
+            enabled = world_frame_quality_log_setting()
+        if not enabled:
+            return
+        self._frame_log = frame_quality.FrameQualityLog(
+            frame_quality.frames_quality_path(
+                self._store, session.world_id, session.session_id
+            )
+        )
+
+    def _close_frame_quality_log(self) -> None:
+        log, self._frame_log = self._frame_log, None
+        if log is not None:
+            log.close()
+
+    def _log_frame(
+        self, source_seq, received_at, outcome, reason, measured=None,
+        keyframe_id=None,
+    ) -> None:
+        """One line of the per-frame quality log; nothing at all when it is off.
+
+        `measured` is what `evaluate` saw (quality, motion, the selector's
+        frames-since-keyframe and the segment), or None for a frame the
+        frontend never scored. Copies only: no measurement is repeated.
+        """
+        log = self._frame_log
+        if log is None:
+            return
+        log.write(frame_quality.frame_row(
+            source_seq=source_seq,
+            received_at=received_at,
+            outcome=outcome,
+            reason=reason,
+            keyframe_id=keyframe_id,
+            **(measured or {}),
+        ))
 
     def _recovery_tick(self) -> None:
         """A frame rejected before tracking still moves the recovery

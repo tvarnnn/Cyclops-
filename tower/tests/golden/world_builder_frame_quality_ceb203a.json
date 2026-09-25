@@ -1,0 +1,209 @@
+{
+ "cv2": "5.0.0",
+ "decisions": [
+  [
+   "accept",
+   "session_seed",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "accept",
+   "parallax",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "reject",
+   "blurred",
+   false
+  ],
+  [
+   "reject",
+   "blurred",
+   false
+  ],
+  [
+   "reject",
+   "blurred",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "accept",
+   "parallax",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "reject",
+   "malformed_frame",
+   false
+  ],
+  [
+   "reject",
+   "frame_size_changed",
+   false
+  ],
+  [
+   "tracking_lost",
+   "tracking_lost",
+   false
+  ],
+  [
+   "accept",
+   "session_seed",
+   true
+  ],
+  [
+   "tracking_lost",
+   "tracking_lost",
+   false
+  ],
+  [
+   "accept",
+   "session_seed",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "accept",
+   "parallax",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ],
+  [
+   "accept",
+   "parallax",
+   true
+  ],
+  [
+   "skip",
+   "insufficient_motion",
+   false
+  ]
+ ],
+ "files": {
+  "sessions/ID/events.jsonl": {
+   "bytes": 2552,
+   "sha256": "e4cc6a5a7809086808bea0ca3edefc46416dfa2d62e6f565ae2a700defa4a240",
+   "text": "{\"schema_version\": 1, \"event_id\": 0, \"kind\": \"session_started\", \"at\": 5000.5, \"time_basis\": \"tower-receipt\", \"payload\": {\"frame_source\": \"synthetic\"}}\r\n{\"schema_version\": 1, \"event_id\": 1, \"kind\": \"keyframe_accepted\", \"at\": 5000.625, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000010\", \"reason\": \"session_seed\", \"segment_index\": 0}}\r\n{\"schema_version\": 1, \"event_id\": 2, \"kind\": \"keyframe_accepted\", \"at\": 5000.75, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000013\", \"reason\": \"parallax\", \"segment_index\": 0}}\r\n{\"schema_version\": 1, \"event_id\": 3, \"kind\": \"keyframe_accepted\", \"at\": 5000.875, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000021\", \"reason\": \"parallax\", \"segment_index\": 0}}\r\n{\"schema_version\": 1, \"event_id\": 4, \"kind\": \"frame_rejected\", \"at\": 5001.0, \"time_basis\": \"tower-receipt\", \"payload\": {\"reason\": \"malformed_frame\"}}\r\n{\"schema_version\": 1, \"event_id\": 5, \"kind\": \"frame_rejected\", \"at\": 5001.125, \"time_basis\": \"tower-receipt\", \"payload\": {\"reason\": \"frame_size_changed\", \"expected\": [360, 480], \"received\": [180, 240]}}\r\n{\"schema_version\": 1, \"event_id\": 6, \"kind\": \"tracking_lost\", \"at\": 5001.25, \"time_basis\": \"tower-receipt\", \"payload\": {\"segment_index\": 1}}\r\n{\"schema_version\": 1, \"event_id\": 7, \"kind\": \"keyframe_accepted\", \"at\": 5001.5, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000027\", \"reason\": \"session_seed\", \"segment_index\": 1}}\r\n{\"schema_version\": 1, \"event_id\": 8, \"kind\": \"tracking_lost\", \"at\": 5001.625, \"time_basis\": \"tower-receipt\", \"payload\": {\"segment_index\": 2}}\r\n{\"schema_version\": 1, \"event_id\": 9, \"kind\": \"keyframe_accepted\", \"at\": 5001.875, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000029\", \"reason\": \"session_seed\", \"segment_index\": 2}}\r\n{\"schema_version\": 1, \"event_id\": 10, \"kind\": \"keyframe_accepted\", \"at\": 5002.0, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000032\", \"reason\": \"parallax\", \"segment_index\": 2}}\r\n{\"schema_version\": 1, \"event_id\": 11, \"kind\": \"keyframe_accepted\", \"at\": 5002.125, \"time_basis\": \"tower-receipt\", \"payload\": {\"keyframe_id\": \"ID:00000038\", \"reason\": \"parallax\", \"segment_index\": 2}}\r\n{\"schema_version\": 1, \"event_id\": 12, \"kind\": \"session_stopped\", \"at\": 5002.375, \"time_basis\": \"tower-receipt\", \"payload\": {\"end_reason\": \"stop\"}}\r\n"
+  },
+  "sessions/ID/images/00000010.jpg": {
+   "bytes": 49390,
+   "sha256": "a59a421bdba15ecfbe41c49077d10eefe1bdc05f31aa8a4c7bc4e7f7010b5fa9"
+  },
+  "sessions/ID/images/00000013.jpg": {
+   "bytes": 49259,
+   "sha256": "df049d926a0309ebb026ea75cae57950e761b178d8d113dc13baafff8dbc3b1d"
+  },
+  "sessions/ID/images/00000021.jpg": {
+   "bytes": 49030,
+   "sha256": "1d64c88ffdbfe48e173596e41f519e01e048fb2b6f83f87b7bb960d9120d856c"
+  },
+  "sessions/ID/images/00000027.jpg": {
+   "bytes": 156032,
+   "sha256": "451fa6f8946d05c1255de0c537a9a32e9c157efaebf2ab3a5806a0024124972e"
+  },
+  "sessions/ID/images/00000029.jpg": {
+   "bytes": 48877,
+   "sha256": "d3933a46f89f7e9a60e9373ae23b466c8c5752485c9caf7916efdc597a8990a7"
+  },
+  "sessions/ID/images/00000032.jpg": {
+   "bytes": 47851,
+   "sha256": "755bb6b287413e65f812a455fdf7e25185b4e4e91264e150e4c3fada42395808"
+  },
+  "sessions/ID/images/00000038.jpg": {
+   "bytes": 48877,
+   "sha256": "d3933a46f89f7e9a60e9373ae23b466c8c5752485c9caf7916efdc597a8990a7"
+  },
+  "sessions/ID/keyframes.jsonl": {
+   "bytes": 4749,
+   "sha256": "42dfe79f947d8a03e63d528261ee9686267416e144e9b3857dd69cd2ab6ed6db",
+   "text": "{\"schema_version\": 1, \"keyframe_id\": \"ID:00000010\", \"session_id\": \"ID\", \"source_seq\": 10, \"wire_seq\": 0, \"tx_seq\": null, \"received_at\": 1000.0, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000010.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 49390, \"segment_index\": 0, \"sharpness\": 710.8201860893761, \"feature_count\": null, \"selection_reason\": \"session_seed\", \"median_parallax_px\": null, \"overlap_ratio\": null, \"survival_ratio\": null, \"tracked_count\": null, \"homography_residual_px\": null, \"quality\": \"unknown\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000013\", \"session_id\": \"ID\", \"source_seq\": 13, \"wire_seq\": 3, \"tx_seq\": null, \"received_at\": 1000.75, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000013.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 49259, \"segment_index\": 0, \"sharpness\": 676.9826765729152, \"feature_count\": 600, \"selection_reason\": \"parallax\", \"median_parallax_px\": 23.272924423217773, \"overlap_ratio\": 0.8833333333333333, \"survival_ratio\": 0.885, \"tracked_count\": 531, \"homography_residual_px\": 0.42035797238349915, \"quality\": \"high\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000021\", \"session_id\": \"ID\", \"source_seq\": 21, \"wire_seq\": 11, \"tx_seq\": null, \"received_at\": 1002.75, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000021.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 49030, \"segment_index\": 0, \"sharpness\": 671.6166925528067, \"feature_count\": 600, \"selection_reason\": \"parallax\", \"median_parallax_px\": 23.594703674316406, \"overlap_ratio\": 0.8683333333333333, \"survival_ratio\": 0.8683333333333333, \"tracked_count\": 521, \"homography_residual_px\": 0.7962460517883301, \"quality\": \"high\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000027\", \"session_id\": \"ID\", \"source_seq\": 27, \"wire_seq\": 17, \"tx_seq\": null, \"received_at\": 1004.25, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000027.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 156032, \"segment_index\": 1, \"sharpness\": 49005.470649703115, \"feature_count\": null, \"selection_reason\": \"session_seed\", \"median_parallax_px\": null, \"overlap_ratio\": null, \"survival_ratio\": null, \"tracked_count\": null, \"homography_residual_px\": null, \"quality\": \"unknown\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000029\", \"session_id\": \"ID\", \"source_seq\": 29, \"wire_seq\": 19, \"tx_seq\": null, \"received_at\": 1004.75, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000029.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 48877, \"segment_index\": 2, \"sharpness\": 669.214135339506, \"feature_count\": null, \"selection_reason\": \"session_seed\", \"median_parallax_px\": null, \"overlap_ratio\": null, \"survival_ratio\": null, \"tracked_count\": null, \"homography_residual_px\": null, \"quality\": \"unknown\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000032\", \"session_id\": \"ID\", \"source_seq\": 32, \"wire_seq\": 22, \"tx_seq\": null, \"received_at\": 1005.5, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000032.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 47851, \"segment_index\": 2, \"sharpness\": 622.8255969455963, \"feature_count\": 580, \"selection_reason\": \"parallax\", \"median_parallax_px\": 23.853775024414062, \"overlap_ratio\": 0.8793103448275862, \"survival_ratio\": 0.8879310344827587, \"tracked_count\": 515, \"homography_residual_px\": 0.8142107725143433, \"quality\": \"high\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n{\"schema_version\": 1, \"keyframe_id\": \"ID:00000038\", \"session_id\": \"ID\", \"source_seq\": 38, \"wire_seq\": 28, \"tx_seq\": null, \"received_at\": 1007.0, \"time_basis\": \"tower-receipt\", \"image_relpath\": \"images/00000038.jpg\", \"width\": 480, \"height\": 360, \"byte_count\": 48877, \"segment_index\": 2, \"sharpness\": 669.214135339506, \"feature_count\": 570, \"selection_reason\": \"parallax\", \"median_parallax_px\": 23.770532608032227, \"overlap_ratio\": 0.9122807017543859, \"survival_ratio\": 0.9122807017543859, \"tracked_count\": 520, \"homography_residual_px\": 0.6117483377456665, \"quality\": \"high\", \"frame_revision\": 1, \"spatial_ref\": null, \"external_refs\": []}\r\n"
+  },
+  "sessions/ID/session.json": {
+   "bytes": 1112,
+   "sha256": "e03a64a798bae4dfa44a198439106f698ff223b18e53967e6781d4ca153abcc2",
+   "text": "{\"schema_version\": 1, \"session_id\": \"ID\", \"world_id\": \"ID\", \"capture_id\": null, \"started_at\": 5000.25, \"ended_at\": 5002.25, \"end_reason\": \"stop\", \"time_basis\": \"tower-receipt\", \"frame_source\": \"synthetic\", \"declared_width\": 480, \"declared_height\": 360, \"intrinsics\": {\"source\": \"self_calibrated\", \"model\": \"pinhole\", \"fx\": 288.0, \"fy\": 288.0, \"cx\": 240.0, \"cy\": 180.0, \"dist_coeffs\": null, \"calibrated_width\": 480, \"calibrated_height\": 360, \"reprojection_rms_px\": null, \"view_count\": null, \"calibrated_at\": null, \"scales_linearly_across_resolutions\": null}, \"backend_id\": null, \"backend_requires_intrinsics\": null, \"backend_downgraded_from\": null, \"backend_downgrade_reason\": null, \"frames_observed\": 30, \"keyframes_accepted\": 7, \"rejected_by_reason\": {\"insufficient_motion\": 16, \"blurred\": 3, \"malformed_frame\": 1, \"frame_size_changed\": 1, \"tracking_lost\": 2}, \"retains_raw_imagery\": true, \"privacy_tags\": [\"raw-imagery\", \"first-person\"], \"redaction\": \"faces-detected-and-filled/yunet-2023mar@0.30+plausibility1\", \"finalization\": null, \"stages\": null}"
+  },
+  "world.json": {
+   "bytes": 655,
+   "sha256": "b183e0dc14f8a455641a151ce260e6d33f38fd3f8b367484801d4fa74c083aa6",
+   "text": "{\"schema_version\": 1, \"world_id\": \"ID\", \"display_name\": \"golden\", \"created_at\": 5000.125, \"updated_at\": 5000.375, \"frame_revision\": 1, \"pose_convention\": {\"pose_type\": \"T_world_camera\", \"quaternion_order\": \"wxyz\", \"handedness\": \"right\", \"camera_axes\": \"opencv_x_right_y_down_z_forward\", \"translation_units\": \"world\", \"world_axes_origin\": \"first_keyframe_camera\", \"up_axis\": \"unknown\", \"pose_dtype\": \"float64\", \"point_dtype\": \"float32\"}, \"scale\": {\"state\": \"unknown\", \"meters_per_unit\": null, \"method\": null, \"confidence\": \"unknown\", \"history\": []}, \"session_ids\": [\"ID\"], \"images_purged\": false}"
+  }
+ },
+ "frames": 30,
+ "numpy": "2.5.2",
+ "product_tree_dirty": "",
+ "recorded_from": "ceb203a: tower/tower/world_builder (product tree, TOWER_WORLD_* unset)"
+}
