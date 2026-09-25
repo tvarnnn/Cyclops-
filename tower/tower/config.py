@@ -998,6 +998,45 @@ def world_solve_consensus_setting() -> int:
     return 1
 
 
+# THE ANCHOR VERIFICATION (`world_builder/anchor_verify.py`; RUN P4-IV RULE.md, digest
+# 8efd726d8a1548d8): after the gate and the consensus, the published room of the chosen
+# draw is re-checked -- (a) `scale`: the anchor block's own metric scale steps, (b)
+# `images`: masked image-only two-view evidence per capture-order group, (c) `motion`: a
+# physical-motion flag that only adds cut points to (a) and (b), (i) `imports`: one
+# relocalizer import counts as one link in the gate's redundancy test. A comma list of
+# those words, or `on` for all four. `images` brings `imports` with it (manager 086: walk 4
+# runs `images`, "exactly (b), plus the seal re-gate and the imports rule"). Unset, blank
+# and `off` are OFF, and OFF is today's gate byte for byte. Read by the solve (and by the
+# re-gate in place).
+WORLD_ANCHOR_VERIFY_ENV = "TOWER_WORLD_ANCHOR_VERIFY"
+WORLD_ANCHOR_VERIFY_PARTS = ("scale", "images", "motion", "imports")
+
+
+def world_anchor_verify_setting() -> frozenset:
+    """`TOWER_WORLD_ANCHOR_VERIFY`: the parts of the anchor verification that are on.
+
+    The empty set (off) when unset, blank or `off`. `on` is every part; `images` brings
+    `imports` with it (manager 086), and nothing else. Anything else --
+    an unknown word, or `off`/`on` mixed with other words -- is off, and logged: a typo
+    never seals a piece of a room, and it is still visible."""
+    value = os.environ.get(WORLD_ANCHOR_VERIFY_ENV)
+    if value is None or not value.strip():
+        return frozenset()
+    words = [w.strip().lower() for w in value.split(",") if w.strip()]
+    if words == ["off"]:
+        return frozenset()
+    if words == ["on"]:
+        return frozenset(WORLD_ANCHOR_VERIFY_PARTS)
+    if words and all(w in WORLD_ANCHOR_VERIFY_PARTS for w in words):
+        # `images` implies `imports` (manager 086), never `scale` or `motion`.
+        return frozenset(words) | ({"imports"} if "images" in words else frozenset())
+    logger.warning(
+        "[Tower][Config] %s=%r is not off, on, or a comma list of %s; treating it as off",
+        WORLD_ANCHOR_VERIFY_ENV, value, ", ".join(WORLD_ANCHOR_VERIFY_PARTS),
+    )
+    return frozenset()
+
+
 # The AREA builds (`world_builder/area_build.py`, WORLD-BUILDER-COMPONENTS.md
 # §5.4): a surface and an appearance for each component the gate showed as an
 # area, built by `scripts/world_finish_pending.py` at the Tower's next idle
