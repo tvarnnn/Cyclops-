@@ -13,6 +13,7 @@ import MWDATCore
 import CoreMedia
 import MWDATCamera
 import MWDATMockDevice
+import MWDATMotion
 import UIKit
 #endif
 
@@ -324,6 +325,33 @@ final class GlassesConnection: ObservableObject {
     /// this, so the old glasses' reading cannot land on the new ones.
     private var deviceStateIdentifier: DeviceIdentifier?
 
+    // MARK: Motion probe (DAT 1.0.0 spike; DEBUG-only, default OFF)
+
+    /// Whether the **next** capture session also starts DAT's experimental
+    /// Motion capability, at `motionProbeConfiguration`'s rate.
+    ///
+    /// Follows `captureResolution`'s pattern exactly: a developer control, not
+    /// a product setting; written by Developer Tools; not persisted, so it is
+    /// OFF again after every relaunch; and read once, when the camera starts,
+    /// so changing it never disturbs a running session. It is a spike to prove
+    /// the samples arrive. Nothing here sends them anywhere, shows them to a
+    /// wearer, or acts on them.
+    @Published var motionProbeEnabled = false
+
+    /// 30 Hz: DAT's "responsive head-motion input" rate. The default is 10 Hz.
+    static let motionProbeConfiguration = MotionConfiguration(samplingRate: .hz30)
+
+    /// The samples, for the Developer Tools readout. Its own object so that
+    /// the IMU rate never reaches this one's observers.
+    let motionProbe = MotionProbe()
+
+    private var motion: Motion?
+    private var motionSamplesTask: Task<Void, Never>?
+    private let motionTokenBag = ListenerTokenBag()
+
+    /// Whether a Motion capability is attached to the current session.
+    var isMotionAttached: Bool { motion != nil }
+
     /// Fires once when the camera stream is confirmed live (`StreamState
     /// .streaming`) — the earliest point it's true that a session "has
     /// successfully started and is about to begin forwarding frames".
@@ -479,6 +507,8 @@ final class GlassesConnection: ObservableObject {
         #if DEBUG
         activeDeviceTask?.cancel()
         deviceStateTokenBag.clear()
+        motionSamplesTask?.cancel()
+        motion?.stop()
         camera?.stop()
         deviceSession?.stop()
         #endif
@@ -1027,6 +1057,11 @@ final class GlassesConnection: ObservableObject {
             cameraStreamState = .starting
             newCamera.stream.start()
             print("[Glasses][Camera] stream.start() called")
+            // After the camera, and only once it is up: the camera path above is
+            // the product, and nothing about Motion may stand in its way.
+            if motionProbeEnabled {
+                startMotionProbe(on: session)
+            }
         } catch {
             print("[Glasses][Camera] addCamera failed: \(error.localizedDescription)")
             abandonSessionAfterFailedStart(
@@ -1171,10 +1206,74 @@ final class GlassesConnection: ObservableObject {
         }.store(in: streamTokenBag)
     }
 
+    /// Attaches DAT 1.0.0's experimental Motion capability to a started
+    /// session and feeds its samples to `motionProbe`.
+    ///
+    /// Every failure here is logged and shown in the probe's own readout, and
+    /// deliberately **not** written to `errorMessage`: that one presents a
+    /// modal alert, and a developer probe must never interrupt a capture that
+    /// is otherwise working. Nor does a failure end the session.
+    private func startMotionProbe(on session: DeviceSession) {
+        guard motion == nil else { return }
+        motionProbe.reset()
+        do {
+            guard let newMotion = try session.addMotion(configuration: Self.motionProbeConfiguration) else {
+                print("[Glasses][Motion] addMotion returned nil (session not started)")
+                motionProbe.noteFailure("addMotion returned nil")
+                return
+            }
+            motion = newMotion
+            let probe = motionProbe
+            newMotion.statePublisher.listen { state in
+                Task { @MainActor in
+                    probe.noteState(state.description)
+                    print("[Glasses][Motion] MotionState changed: \(state)")
+                }
+            }.store(in: motionTokenBag)
+            newMotion.errorPublisher.listen { error in
+                Task { @MainActor in
+                    probe.noteFailure(error.description)
+                    print("[Glasses][Motion] motion error: \(error.description)")
+                }
+            }.store(in: motionTokenBag)
+            // Detached so the receipt time is read as the sample leaves DAT's
+            // stream, before the hop to the main actor adds its own queueing
+            // — the same reason `FramePTSProbe` samples on DAT's thread. The
+            // stream finishes when the session tears down; the task is also
+            // cancelled in `cleanupCameraSession()`.
+            let samples = newMotion.samples
+            motionSamplesTask = Task.detached {
+                for await sample in samples {
+                    let received = MotionProbeSample(sample, receivedAt: MonotonicClock.now)
+                    await probe.record(received)
+                }
+            }
+            newMotion.start()
+            print("[Glasses][Motion] motion.start() called (\(Self.motionProbeConfiguration.samplingRate))")
+        } catch {
+            print("[Glasses][Motion] addMotion failed: \(error.description)")
+            motionProbe.noteFailure(error.description)
+        }
+    }
+
+    /// Detaches the Motion probe. The session tears its capabilities down
+    /// with it, so this only releases this app's references and listeners.
+    private func stopMotionProbe() {
+        motionSamplesTask?.cancel()
+        motionSamplesTask = nil
+        motionTokenBag.clear()
+        guard let motion else { return }
+        motion.stop()
+        self.motion = nil
+        motionProbe.noteState("off")
+        print("[Glasses][Motion] motion probe stopped")
+    }
+
     private func cleanupCameraSession() {
         print("[Glasses][Camera] session cleanup")
         FramePTSProbe.shared.reportFinal(reason: "session cleanup")
         let hadCamera = camera != nil
+        stopMotionProbe()
         sessionTokenBag.clear()
         streamTokenBag.clear()
         deviceSession = nil

@@ -26,6 +26,14 @@ import XCTest
 // The app imports MWDATCamera only under DEBUG, and everything here that names
 // it is DEBUG-only for the same reason.
 import MWDATCamera
+// For the DAT 1.0.0 Motion spike at the end of this file: Mock Device Kit's
+// `MockMotionKit`. It declares its own `MotionSample` and `Vector3`, distinct
+// from MWDATMotion's, so the tests qualify them.
+import MWDATMockDevice
+// Test-only, and only to write a silent, video-only file for the mock camera
+// feed in that same suite. The audio-free invariant is about the app: its
+// sources under Glasses/ and its built binaries, which this file is neither.
+import AVFoundation
 #endif
 
 @testable import Glasses
@@ -3031,6 +3039,276 @@ final class CaptureSessionClaimTests: XCTestCase {
         XCTAssertEqual(
             GlassesConnection.captureClaim(session: .stopped, stream: .stopping), .ending
         )
+    }
+}
+#endif
+
+// MARK: - Motion probe (DAT 1.0.0 spike)
+
+#if DEBUG
+/// The probe's buffer arithmetic, from fixed numbers. No DAT involved.
+final class MotionSampleRingTests: XCTestCase {
+
+    /// `i`-th sample of a stream whose device clock and receipt clock both
+    /// tick at `hz`.
+    private func sample(_ i: Int, hz: Double = 30, gyro: Float? = 1) -> MotionProbeSample {
+        MotionProbeSample(
+            deviceTimestampNs: Int64((Double(i) / hz * 1_000_000_000).rounded()),
+            receivedAt: 100 + Double(i) / hz,
+            gyroMagnitude: gyro
+        )
+    }
+
+    /// The two rates come from two different clocks and must not be blended:
+    /// the glasses measured at 30 Hz, the phone received at 25 Hz.
+    func testEachRateComesFromItsOwnClock() throws {
+        var ring = MotionSampleRing()
+        for i in 0..<60 {
+            ring.append(MotionProbeSample(
+                deviceTimestampNs: Int64(i) * 33_333_333,
+                receivedAt: 100 + Double(i) / 25,
+                gyroMagnitude: 0.5
+            ))
+        }
+        XCTAssertEqual(try XCTUnwrap(ring.deviceRateHz), 30, accuracy: 0.01)
+        XCTAssertEqual(try XCTUnwrap(ring.arrivalRateHz), 25, accuracy: 0.01)
+    }
+
+    /// Ten seconds in, only the last three are kept; the total still counts
+    /// everything.
+    func testTheBufferKeepsOnlyTheLastFewSeconds() throws {
+        var ring = MotionSampleRing(window: 3)
+        for i in 0..<300 { ring.append(sample(i)) }
+        XCTAssertEqual(ring.totalReceived, 300)
+        XCTAssertTrue((90...91).contains(ring.samples.count), "kept \(ring.samples.count)")
+        let first = try XCTUnwrap(ring.samples.first), last = try XCTUnwrap(ring.samples.last)
+        XCTAssertLessThanOrEqual(last.receivedAt - first.receivedAt, 3 + 1e-9)
+        XCTAssertEqual(try XCTUnwrap(ring.arrivalRateHz), 30, accuracy: 0.01)
+    }
+
+    /// A burst faster than any configured rate cannot grow it without bound.
+    func testABurstIsCappedAtTheCapacity() {
+        var ring = MotionSampleRing()
+        for i in 0..<1_000 {
+            ring.append(MotionProbeSample(deviceTimestampNs: Int64(i), receivedAt: 100, gyroMagnitude: nil))
+        }
+        XCTAssertEqual(ring.samples.count, MotionSampleRing.capacity)
+        XCTAssertEqual(ring.samples.last?.deviceTimestampNs, 999, "the newest samples are the ones kept")
+        XCTAssertNil(ring.arrivalRateHz, "no receipt interval, so no receipt rate")
+    }
+
+    /// A sample without a gyroscope reading is missing, not zero.
+    func testAMissingGyroscopeIsNeverReadAsZero() {
+        var ring = MotionSampleRing()
+        XCTAssertNil(ring.latestGyroMagnitude)
+        XCTAssertNil(ring.deviceRateHz)
+        ring.append(sample(0, gyro: 2.5))
+        ring.append(sample(1, gyro: 0.25))
+        ring.append(sample(2, gyro: nil))
+        XCTAssertEqual(ring.latestGyroMagnitude, 0.25)
+        XCTAssertEqual(ring.peakGyroMagnitude, 2.5)
+    }
+}
+
+/// End to end through DAT 1.0.0's Mock Device Kit: a real `DeviceSession`, a
+/// real `Motion` capability, and `MockMotionKit` replaying a recording.
+///
+/// The recording is synthesized, not captured -- no glasses IMU recording
+/// exists in this repository yet -- in the shape DAT documents: accelerometer
+/// at rest reads gravity (`mockMotionGravityMetersPerSecondSquared`), and a
+/// 1.5 s head turn about the vertical axis peaks at 3 rad/s. Mock replay
+/// "follows the configured sampling rate rather than the intervals between
+/// recorded timestamps", so what the app receives measures the app's
+/// configuration, not the recording's.
+///
+/// `MockMotionKit.isStreaming` is the independent witness for both tests: it is
+/// the mock glasses' own statement that a Motion capability is streaming from
+/// them, read from outside `GlassesConnection`.
+@MainActor
+final class MotionProbeMockDeviceTests: XCTestCase {
+
+    private var mockGlasses: (any MockGlasses)?
+
+    override func setUp() async throws {
+        MockDeviceKit.shared.enable()
+        let glasses = try MockDeviceKit.shared.pairGlasses(model: .rayBanMeta)
+        glasses.powerOn()
+        glasses.don()
+        mockGlasses = glasses
+    }
+
+    override func tearDown() async throws {
+        if let mockGlasses {
+            await MockDeviceKit.shared.unpairDevice(mockGlasses)
+        }
+        await MockDeviceKit.shared.disable()
+        mockGlasses = nil
+    }
+
+    static let recordingHz = 30.0
+
+    static func headTurnRecording(seconds: Double = 6) -> [MWDATMockDevice.MotionSample] {
+        let gravity = mockMotionGravityMetersPerSecondSquared
+        return (0..<Int(recordingHz * seconds)).map { i in
+            let t = Double(i) / recordingHz
+            let turning = t >= 1.5 && t < 3.0
+            let yawRate = turning ? Float(3 * sin((t - 1.5) / 1.5 * .pi)) : 0
+            return MWDATMockDevice.MotionSample(
+                timestampNs: Int64((t * 1_000_000_000).rounded()),
+                accelerometer: MWDATMockDevice.Vector3(x: 0, y: gravity, z: 0),
+                gyroscope: MWDATMockDevice.Vector3(x: 0, y: yawRate, z: 0),
+                source: .glasses
+            )
+        }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval,
+        _ condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    /// Brings a `GlassesConnection` on the real `Wearables.shared` to the
+    /// point where a Start is a real start, then starts capture.
+    private func startCapture(_ connection: GlassesConnection) async throws {
+        let ready = await waitUntil(timeout: 15) {
+            connection.hasActiveDevice && connection.cameraPermissionStatus == .granted
+        }
+        XCTAssertTrue(ready, "mock glasses never became an active device with camera permission (active=\(connection.hasActiveDevice), permission=\(String(describing: connection.cameraPermissionStatus)))")
+        connection.startCameraSession()
+        XCTAssertNil(connection.lastCaptureStartRefusal, "start was refused: \(String(describing: connection.lastCaptureStartRefusal))")
+        let started = await waitUntil(timeout: 15) {
+            connection.deviceSessionState == .started && connection.cameraStreamState == .streaming
+        }
+        XCTAssertTrue(started, "session \(connection.deviceSessionState), camera \(connection.cameraStreamState), refusal \(String(describing: connection.lastCaptureStartRefusal))")
+    }
+
+    /// A short, silent, video-only clip for `MockCameraKit.setCameraFeed`, so
+    /// the mock camera really streams while Motion runs. Without a feed the
+    /// Simulator's mock camera fails its stream at once ("Critical error"),
+    /// which would leave "beside the camera" unproven. Four seconds of 24 fps
+    /// at DAT's `.low` size, each frame a different grey. HEVC, because the
+    /// mock camera reads "H.265 frames from video file".
+    static func makeCameraFeed() async throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("motion-probe-feed-\(UUID().uuidString).mov")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: 360,
+            AVVideoHeightKey: 640,
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: 360,
+            kCVPixelBufferHeightKey as String: 640,
+        ])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting(), "could not start the feed writer: \(String(describing: writer.error))")
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<96 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, try XCTUnwrap(adaptor.pixelBufferPool), &buffer)
+            let pixels = try XCTUnwrap(buffer)
+            CVPixelBufferLockBaseAddress(pixels, [])
+            memset(CVPixelBufferGetBaseAddress(pixels), Int32(frame * 2 % 256), CVPixelBufferGetDataSize(pixels))
+            CVPixelBufferUnlockBaseAddress(pixels, [])
+            adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 24))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, "feed writer: \(String(describing: writer.error))")
+        return url
+    }
+
+    private func stopCapture(_ connection: GlassesConnection) async {
+        connection.stopCameraSession()
+        _ = await waitUntil(timeout: 10) { connection.captureClaim == .unclaimed }
+    }
+
+    /// The proof: with the developer switch on, Motion starts beside the camera
+    /// at 30 Hz and the app receives the replayed samples at about that rate,
+    /// carrying the recording's gyroscope values.
+    func testWithTheSwitchOnTheAppReceivesMotionAtTheConfiguredRate() async throws {
+        let glasses = try XCTUnwrap(mockGlasses)
+        let recording = Self.headTurnRecording()
+        // Staged first: on iOS a feed set while Motion is streaming is ignored.
+        glasses.services.motion.setMotionFeed(recording)
+        let feed = try await Self.makeCameraFeed()
+        defer { try? FileManager.default.removeItem(at: feed) }
+        glasses.services.camera.setCameraFeed(fileURL: feed)
+
+        let connection = GlassesConnection()
+        connection.motionProbeEnabled = true
+        try await startCapture(connection)
+
+        let streaming = await waitUntil(timeout: 12) { glasses.services.motion.isStreaming }
+        XCTAssertTrue(streaming, "the mock glasses never reported Motion streaming (probe: \(connection.motionProbe.snapshot))")
+        XCTAssertTrue(connection.isMotionAttached)
+
+        let framesAtMotionStart = connection.frameCount
+        let received = await waitUntil(timeout: 15) { connection.motionProbe.totalReceived >= 90 }
+        let samples = connection.motionProbe.samples
+        let framesDuringMotion = connection.frameCount - framesAtMotionStart
+        let cameraState = connection.cameraStreamState
+        XCTAssertTrue(received, "received \(connection.motionProbe.totalReceived) samples (probe: \(connection.motionProbe.snapshot))")
+        // Beside the camera, not instead of it: frames kept arriving over the
+        // same seconds the samples did, and the stream is still up.
+        XCTAssertGreaterThan(framesDuringMotion, 0, "no camera frames arrived while Motion was streaming")
+        XCTAssertEqual(cameraState, .streaming, "the camera stream was \(cameraState) while Motion ran")
+        await stopCapture(connection)
+
+        // The rate the app received them at, measured on the phone's clock over
+        // what the probe kept. Generous bounds: this is a Simulator, and the
+        // claim is "at about the configured rate", not a timing benchmark.
+        var ring = MotionSampleRing(window: .infinity)
+        samples.forEach { ring.append($0) }
+        let arrival = try XCTUnwrap(ring.arrivalRateHz)
+        XCTAssertEqual(arrival, 30, accuracy: 6, "configured 30 Hz, received \(arrival) Hz")
+
+        // The values are the recording's, not something else's.
+        let recorded = Set(recording.compactMap { $0.gyroscope.map { abs($0.y) } })
+        let magnitudes = samples.compactMap(\.gyroMagnitude)
+        XCTAssertEqual(magnitudes.count, samples.count, "every replayed sample carried a gyroscope reading")
+        for magnitude in magnitudes {
+            XCTAssertTrue(recorded.contains { abs($0 - magnitude) < 1e-4 }, "gyro |\(magnitude)| is not in the recording")
+        }
+
+        // Evidence for the report, not assertions: the device-clock rate and
+        // the first timestamps, which say whether the mock re-stamps samples.
+        print("[MotionProbeTest] cameraFramesDuringMotion=\(framesDuringMotion) received=\(connection.motionProbe.totalReceived) arrivalHz=\(arrival) deviceHz=\(String(describing: ring.deviceRateHz)) firstDeviceNs=\(samples.prefix(3).map(\.deviceTimestampNs)) peakGyro=\(String(describing: ring.peakGyroMagnitude))")
+    }
+
+    /// And the other half: with the switch at its default, OFF, a capture
+    /// session starts with no Motion capability at all.
+    func testWithTheSwitchOffNoMotionCapabilityIsStarted() async throws {
+        let glasses = try XCTUnwrap(mockGlasses)
+        glasses.services.motion.setMotionFeed(Self.headTurnRecording())
+        let feed = try await Self.makeCameraFeed()
+        defer { try? FileManager.default.removeItem(at: feed) }
+        glasses.services.camera.setCameraFeed(fileURL: feed)
+
+        let connection = GlassesConnection()
+        XCTAssertFalse(connection.motionProbeEnabled, "the Motion switch must default to OFF")
+        try await startCapture(connection)
+
+        // Long enough for a Motion start to have reached the glasses: the ON
+        // test sees `isStreaming` well inside this.
+        let everStreamed = await waitUntil(timeout: 3) { glasses.services.motion.isStreaming }
+        XCTAssertFalse(everStreamed, "a Motion capability streamed with the switch off")
+        XCTAssertFalse(connection.isMotionAttached, "a Motion capability was attached with the switch off")
+        XCTAssertEqual(connection.motionProbe.totalReceived, 0)
+        XCTAssertEqual(connection.motionProbe.snapshot.state, "off")
+
+        await stopCapture(connection)
     }
 }
 #endif
