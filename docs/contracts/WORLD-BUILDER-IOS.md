@@ -517,11 +517,13 @@ own state is the whole answer, which is correct: a build with no capture cannot
 be looking at the wrong one.
 
 **Look-back prompts are DEBUG-only (C1 M14/E9, PROPOSED 2026-09-23).** A prompt
-is spoken only under a `.bound` binding while following live
+is shown only under a `.bound` binding while following live
 (`WORLD-BUILDER-COMPONENTS.md` §6.5), which Release never reaches. The physical
-A/B test therefore runs a DEBUG build installed from Xcode. The `audio`
-background mode the prompt needs (§6.5 there) is declared in the shared
-Info.plist; it matters for App Review only if Release is ever submitted.
+A/B test therefore runs a DEBUG build installed from Xcode. The prompt is a
+banner plus one haptic, and never audio. Walk 1 showed that speech to the glasses
+over A2DP ends the DAT camera session. The app declares no `audio` background
+mode, and a unit test (`WorldLookBackAudioFreeTests`) fails if any app source
+references an audio API.
 
 ## 10. The saved-world picture (`WorldRenderViewer.swift`)
 

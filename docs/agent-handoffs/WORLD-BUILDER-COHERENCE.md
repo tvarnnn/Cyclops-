@@ -8,8 +8,8 @@ the next run's starting point.
 |---|---|
 | Integration | `world-builder/live-world-visualization-v1` at `<SHA>`, its tip at hand-over (the test runs this). A commit cannot name its own SHA, so the lead records it in `RUN\physical-test\TEST-SHA.txt`; every `<SHA>` below means that value |
 | Tower lane | `world-builder/coherence-product-v1` (worktree `Glasses-worktrees\wb-coherence-product`) |
-| iOS lane | `ios/wb-coherence-areas-v1`, at the Mac tip merged into `<SHA>` (`0e1c78d`, manager 035 §5) |
-| Contract | `docs/contracts/WORLD-BUILDER-COMPONENTS.md` (v9) |
+| iOS lane | `ios/wb-coherence-areas-v1`, at the Mac tip merged into `<SHA>`: `a72e366` (the banner-and-haptic prompt plus LB2, manager 060); walk 1 ran on `0e1c78d`, walk 2 on the `f33bdfe` DEBUG build |
+| Contract | `docs/contracts/WORLD-BUILDER-COMPONENTS.md` (v10: the prompt is shown, not spoken) |
 | Operator detail | `tower/docs/world-builder/COHERENCE-PRODUCT.md` (switches, re-finish, validation Tower) |
 | Run root (`RUN`) | `C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23` |
 
@@ -67,7 +67,7 @@ the walk joins the room only on independent, consistent evidence. Anything else 
 | **Components and areas** | Every piece of the walk is listed with the reason it was not placed. A piece of ≥ 30 keyframes or ≥ 5 s is built as its own levelled **area**, shown on its own routes and never positioned into the room. Smaller pieces are only counted | `components.py`, `area_build.py`, `tower/tower/routes/geometry.py`, `tower/tower/results/world_builder_library.py`, `tower/tower/results/world_builder_render.py` |
 | **Consensus, N = 3** | The final solve is mapped with 3 mapper seeds on one database. A group of the room joins only if a strict majority of the draws attach it; otherwise it is withheld (`seed-unstable`). The chosen draw's room is never enlarged by the vote | `coherence_publish.py` (`gate_by_consensus`), `global_solve.py` |
 | **Frozen matching and caches** | A seeded final solve freezes its matched feature database (`database.matching.json`). Masks are cached per image, and depth predictions per input pixels. A second finish of the same walk with the same seed maps the same database | `global_solve.py`, `solve_masks.py`, `dense_pipeline.py` |
-| **Relocalizer and look-back prompt** | While live, after a tracking loss, the builder looks for the view it lost. If it cannot find it within 5 s, the phone says *"Look back the way you came."* (at most 2 prompts a minute). A found view becomes a verified revisit link that the final solve may import | `relocalizer.py`, `engine.py`, `tower/tower/results/world_builder.py` (`tracking.recovery`); iOS speaks it |
+| **Relocalizer and look-back prompt** | While live, after a tracking loss, the builder looks for the view it lost. If it cannot find it within 5 s, the phone shows *"Look back the way you came."* on screen with a haptic (at most 2 prompts a minute). It was spoken until walk 1 of the physical test, where speaking over A2DP made the glasses end the camera session (manager 044). A found view becomes a verified revisit link that the final solve may import | `relocalizer.py`, `engine.py`, `tower/tower/results/world_builder.py` (`tracking.recovery`); iOS shows it (the Mac lane's banner-and-haptic build) |
 | **Fail-safes and notices** | If masks or metric depth are missing, the gate attaches nothing beyond the room's core, and says why. Each walk's row carries `finalization.notice`: a fixed sentence from a closed set saying what the Tower could not do and who can fix it. The idle finisher re-runs a gate or a consensus that is owed | `coherence_publish.py` (`NOTICE_SENTENCES`), `tower/scripts/world_finish_pending.py` |
 | **The re-finish command** | `tower/scripts/world_refinish.py` rebuilds one saved walk the new way. It sets the previous result aside under `refinish\<stamp>\`, deletes nothing, finds raw frames by capture identity, and rolls back on failure | `tower/scripts/world_refinish.py` |
 | **G0** | The surface stage refuses depth fits that are not physical. This removed the flying wall sheets (voxel coarsening on the target 2.03× → 1.00×) [earlier: 1813 §1] | `surface_pipeline.py` (integrated at `17e6d3d`) |
@@ -208,10 +208,15 @@ $D = 'C:\Users\tvllo\Projects\Glasses-scratch\wb-coherence-run-2026-09-23\lead\d
 
 **The phone:**
 
-- the **DEBUG build** from Xcode, at the Mac tip merged into `<SHA>`. A Release build cannot
-  capture or speak (contract §6.5);
-- start each walk **on the World Builder screen**, and lock the phone there;
-- do **not** open Saved Worlds during a walk: a pinned view never speaks.
+- the **DEBUG build** from Xcode. A Release build cannot capture or prompt (contract §6.5).
+  - Walk 1 ran on the build at the Mac tip merged into `<SHA>`, which spoke the prompt. The
+    prompt-ON walks after it run on the **Mac lane's banner-and-haptic DEBUG build**
+    (manager 044), which is not yet merged into `<SHA>`.
+  - The Tower is the same `<SHA>` for both builds: nothing Tower-side changed.
+- start each walk **on the World Builder screen**, and **hold the phone unlocked on it**. At
+  each doorway, glance at it for the banner. It no longer speaks: speaking over A2DP while
+  the glasses stream made them end the camera session (walk 1; manager 044);
+- do **not** open Saved Worlds during a walk: a pinned view never prompts.
 
 ### 3.2 What Tristan sees on the re-finished 06:01 walk
 
@@ -321,15 +326,15 @@ such as tiredness and light, are a known limitation.
 
 | # | measure | how |
 |---|---|---|
-| M-a | the prompt is **audible on the glasses with the phone locked** | Tristan says "heard" aloud at each prompt. The phone's DEBUG log records `didStart`/`didFinish` and the output route, which must be A2DP or LE |
-| M-b | the **camera's frame rate and resolution while speech plays** | the Tower's received-frame rate and resolution in the ±5 s around each prompt, against the walk's median, from the capture |
-| M-c | the **latency from issue to audible** | the Tower's `prompt.issued_at`, then the envelope's `tower_sent_at`, then the phone's receipt and `didStart` (DEBUG log). Report the median and the maximum |
+| M-a | the **banner is visible and the haptic is felt** (manager 044; the prompt is no longer spoken) | Tristan says "seen" aloud at each prompt. The phone's DEBUG log records the banner shown and the haptic fired |
+| M-b | the **camera's frame rate and resolution around each prompt**, which should now show no change | the Tower's received-frame rate and resolution in the ±5 s around each prompt, against the walk's median, from the capture. Walk 1's spoken prompt stalled the stream 0.47 s after issue and ended the session (`RUN\mailbox\to-manager\20260924-2019-walk1-prompt-timing.md`) |
+| M-c | the **latency from issue to banner** | the Tower's `prompt.issued_at`, then the envelope's `tower_sent_at`, then the phone's receipt and the banner shown (DEBUG log). Report the median and the maximum |
 
 ### 3.6 What to report back, and where the logs land
 
 **Per walk, Tristan notes** the label (W-A1 … W-B3), the clock time at start and end, how
-many prompts he heard and whether each was audible (M-a), any stutter while one played, and
-anything odd.
+many prompt banners he saw, and whether he felt each haptic (M-a), any stutter around one,
+and anything odd.
 
 **After each walk settles,** he takes a screenshot of the world page (the room caption,
 the areas row and any notice) and opens each area once.
@@ -503,10 +508,28 @@ everything, so nothing runs after a failure:
        paths left out
        [acc: `RUN\dchk\logs`; `RUN\lead\dchk\compare_dchk.py`].
      - Its re-run at `a5001ab` gave the same result [acc: `RUN\dchk2\logs`].
-3. **Marginal pieces inside the anchor block** (V9 M-2). The vote never withholds the
-   room's anchor group, so a marginal piece absorbed into it is not re-verified. This is a
-   named residual risk (manager 025, decision 2). `gate.consensus.held_against_majority`
-   counts such keyframes: 0 in all 10 control and target runs [acc].
+3. **Marginal pieces inside the anchor block (V9 M-2): OBSERVED. This is acceptance's FAIL.**
+   - **The mechanism.** The vote never withholds the room's anchor group, so a stretch
+     absorbed into it is never re-verified.
+   - **Where it happened.** On 6839fb8f, a walk of the same bedroom, a revisit stretch of
+     the bed can be drawn **inside the room, about 15° off**: 14 keyframes in run w10, and
+     the whole 54-keyframe bed block in c10.
+     - It happened in **2 of 5 runs**, both on the seed-10 matching database, and in 0 of 9
+       draws on the seed-0 and seed-20 databases. The verification draw decides it.
+     - The independent evidence says it is misplaced: the GT atom is MIS (14.5°, ×0.72), and
+       two-hop image chains show a median of 32° against the control's 2.8°.
+     - The solver's own database honours homography links that the harness contradicts by
+       up to 31° (room-side cameras 3745–3835).
+     - `held_against_majority` does not see it: every draw held these keyframes.
+   - **Recorded** as **FAIL (attach direction)** by managers 042 and 053
+     [acc: `RUN\lead\acc2-6839fb8f-flipcheck.md`; `RUN\acc2\RULINGS.json`].
+   - **A second finding on the same world.** 14 closet-edge keyframes detach in one run
+     only, and their attached placement cannot be verified. They are labelled
+     **UNVERIFIED**, which is not a pass.
+   - **The scorer now closes this hole:**
+     - it reports "hidden MIS", an MIS atom whose majority lies outside the room;
+     - an ambiguous report no longer excuses an attachment that independent evidence
+       contradicts (manager 053).
 4. **τ against image noise.** The gate honours a link within τ = 16.8°, the control's p90 of
    link-against-solve disagreement. That is about twice the control's image-only
    pair-rotation noise (p95 7.83°). GT still counted 40 misplaced keyframes attached across
@@ -525,9 +548,14 @@ everything, so nothing runs after a failure:
    frames were lost at 42 % against 14 % [earlier:
    `RUN\mailbox\to-manager\20260924-0105-017-abc-h1-decision.md` B].
    It damages any solve without raw frames, and the redacted appearance everywhere.
-7. **Release builds cannot capture.** Only a DEBUG build records walks and speaks the
+7. **Release builds cannot capture.** Only a DEBUG build records walks and shows the
    prompt (contract §6.5; C1 M14), and the Release build hardcodes its Tower address
    (`DEPLOY-PLAN.md` §6).
+   - **No audio to the glasses while they stream.** Speaking the prompt over A2DP made the
+     glasses end the camera session ("Session ended by device") about 3 s into the speech.
+     Walk 1 of the physical test was aborted that way.
+   - The prompt is now a banner and a haptic on the phone (manager 044; Tristan's decision).
+     The Tower-side events (`recovery_prompted`, `tracking.recovery`) are unchanged.
 8. **The cost per walk.** A re-finish holds the GPU for a median of 20 min cold and 15.6 min
    warm on the control (a 398-keyframe walk; its room is 383), and 14.5 min cold on the
    target [acc]. Consensus 3 adds
@@ -536,6 +564,19 @@ everything, so nothing runs after a failure:
 9. **Two cold computations are one draw.** Whether two fresh mask computations, or two fresh
    depth predictions, agree bit for bit is unmeasured. The caches make that matter only
    for a walk's first finish.
+10. **What the physical test's first walks found (2026-09-24)** (`RUN\physical-test\TEST-LOG.md`):
+    - **Walk 1 (PARTIAL): speech ends the stream.** A spoken prompt over A2DP made the
+      glasses end the camera session: the frame stream stalled 0.47 s after the prompt was
+      issued. The prompt is now a banner and a haptic (§5.7). Walk 2's frame rate held at
+      about 12 fps through both prompts.
+    - **The viewer's lengths were absolute.** Walk 1's solve came out 27× smaller than other
+      rooms, and the photographic page pushed the camera out of the room ("Nothing was
+      photographed this way"). **Fixed at `57f56b5`:** the lengths are multiples of the
+      scene's unit, and the room page walks the room's cameras only.
+    - **The look-back did not re-link in walk 2:** verdict (d), no look-back returned to a
+      reference view. A view from 2–4 m does not match close-up references, and the window
+      runs 20 s from the loss, so about 15 s after the prompt (§6 #17).
+    - **Acceptance on 6839fb8f: FAIL on thin evidence** (§5.3).
 
 ## 6. Next-run backlog, ranked
 
@@ -563,8 +604,16 @@ everything, so nothing runs after a failure:
      generic, but with p ≈ 5/9 it does not stabilise this case.
    - **(iii) ≥ 2 distinct room cameras** before a group attaches. It trades coverage for
      determinism, so decide it with numbers.
-2. **Anchor-absorbed marginal pieces (M-2):** per-group image-only verification inside the
-   anchor block (manager 025).
+2. **THE TOP ITEM (manager 042): per-group image-only verification inside the anchor block.**
+   - **The goal:** detach a stretch whose independent image evidence contradicts the solve,
+     even when the solver's own links honour it.
+   - **The motivating evidence:** 6839fb8f (§5.3). It is a FAIL in 2 of 5 runs, with up to
+     54 keyframes drawn about 15° off. The solver database and the harness disagree by up to
+     31° on the same camera pairs.
+   - **How to build it:** calibrate from the control only, and make a failing group an
+     honest separate area.
+   - **A Codex (gpt-5.6-sol) design note is in** `RUN\review\codex\design-anchor-verification-*.md`.
+     Treat it as leads to verify.
 3. **Redactor precision:** measure it on the frozen worlds and fix the false positives
    (manager 021).
 4. **Builder keyframe-id collision on reconnect.** Ids come from `source_seq`, so a
@@ -605,6 +654,58 @@ everything, so nothing runs after a failure:
 14. **Test flakes on Windows:**
     - `test_capture_continuity::test_finding_a_successor_does_not_read_every_capture_on_the_disk`:
       1 of 8 isolated runs, and once in the `8cca192` suite;
-    - the finisher-chore survives-its-kill test.
+    - the finisher-chore survives-its-kill test;
+    - `test_world_builder_coherence_publish::test_the_components_reader_refuses_a_record_of_another_solve`:
+      2 of 6 isolated runs, **already at `4b4b444`**. `solve_identity` is exact, so the
+      likely cause is a reader keyed on the solution's mtime, with two writes inside one
+      Windows clock tick. Worth a real look: a stale components record should never survive
+      a newer solve;
+    - `test_result_channel_truthfulness::test_a_dead_builder_is_reported_as_interrupted_not_as_receiving`:
+      only under heavy CPU load.
 
-    Both are timing-dependent, in code this run did not change.
+    All are timing-dependent, in code this run did not change.
+15. **Publish every solve at metric scale** (manager 052). An SfM gauge is arbitrary: walk
+    1 of the physical test (`ee48aae3`) came out 27× smaller than other rooms. The viewer
+    now measures its lengths in the scene's own unit (`57f56b5`).
+    - Normalising the published solve with the gate's metric estimate, where it is available
+      and flagged, would make every downstream constant mean metres: viewer, voxel size and
+      bounds.
+    - The viewer's remaining absolute shader thresholds and its standoff on genuinely deep
+      scenes (RV-VIEW F2–F4; the Codex failure-mode review) belong here too.
+16. **Latent artefact-currency risks** (Codex's map of the viewer):
+    - appearance and surface "currency" is reported but not enforced;
+    - `input_digest` does not see a different draw over the same keyframe set;
+    - an open page does not refresh `CONFIG.cameras` when a new revision arrives;
+    - an area id stays stable across parent draws.
+
+    None of these caused tonight's bug.
+17. **Relocalizer observability and look-back design** (walk 2; manager 056;
+    `RUN\mailbox\to-manager\20260924-2203-walk2-relocalizer-diagnosis.md`).
+    - **What the Tower records:** no scan-level detail. Add a per-episode summary event
+      (reference ids, attempts, best legs and closure, losses joined).
+    - **The window** runs 20 s from the loss, so only about 15 s after the prompt. A timeout
+      discards the episode's references.
+    - **Walk 2's look-backs** never revisited a close-up reference view from nearby; a view
+      from 2–4 m does not re-link.
+    - **For the next run:** reference diversity and distance, and the prompt's wording.
+      Measure a lower inlier floor's wrong-match rate before considering it.
+    - **The candidates** (manager 058), measured offline with an exact replay of the
+      relocalizer (`RUN\lead\reloc1\`, `reloc2\`), acceptance rule unchanged:
+      - the window runs from the prompt;
+      - references include a time- and viewpoint-spread sample of earlier keyframes;
+      - the per-episode summary event.
+18. **Speed.**
+    - Compute masks and depth *during* the walk (per keyframe, as frames arrive), so the
+      Stop-time solve does not start from zero.
+    - Run the 3-draw vote in parallel where the GPU allows.
+    - Walks took 8.8–11.2 min from Stop to settled tonight.
+19. **Incremental world building** (Tristan's idea): extend the map live and correct
+    earlier poses when later data links back, instead of re-solving at Stop. A staged
+    design is owed; Codex's design note is deferred by its quota.
+20. **A resolution test.** Measure what the 640×360 live frames cost the look-back matcher
+    and the final solve, against higher resolutions.
+21. **MockDevice duplicate classes** (Mac lane): the duplicate test-double classes in
+    GlassesTests, reported by the Mac.
+22. **The pocketed-prompt notification** (Tristan's decision): a locked phone cannot show
+    the banner or fire the haptic. Any notification must not route audio to the glasses
+    (§5.7).
