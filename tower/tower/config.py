@@ -1046,14 +1046,20 @@ def world_relocalizer_setting() -> str:
 # is byte-identical. Read by the BUILDER process at each session start.
 #   TOWER_WORLD_RELOCALIZER_WINDOW   `loss` (default) | `prompt`: a prompted
 #                                    episode's timeout runs from the prompt.
-#   TOWER_WORLD_RELOCALIZER_HISTORY  0 (default) .. 40: historical reference
-#                                    keyframes added to each episode's 10.
+#   TOWER_WORLD_RELOCALIZER_HISTORY  0 (default), or 4 .. 20: historical
+#                                    reference keyframes added to each
+#                                    episode's 10. 20 is the most the replay
+#                                    measured (review F3); below 4 the spread
+#                                    rule degenerates (review F7).
 #   TOWER_WORLD_RELOCALIZER_SUMMARY  off (default) | on: one
 #                                    `recovery_summary` line per episode.
 WORLD_RELOCALIZER_WINDOW_ENV = "TOWER_WORLD_RELOCALIZER_WINDOW"
 WORLD_RELOCALIZER_HISTORY_ENV = "TOWER_WORLD_RELOCALIZER_HISTORY"
 WORLD_RELOCALIZER_SUMMARY_ENV = "TOWER_WORLD_RELOCALIZER_SUMMARY"
-WORLD_RELOCALIZER_HISTORY_MAX = 40
+# Mirrors relocalizer.HISTORY_MIN_KEYFRAMES / HISTORY_MAX_KEYFRAMES (a test
+# pins the pair); config does not import the builder's modules.
+WORLD_RELOCALIZER_HISTORY_MIN = 4
+WORLD_RELOCALIZER_HISTORY_MAX = 20
 
 
 def world_relocalizer_options() -> dict:
@@ -1077,13 +1083,13 @@ def world_relocalizer_options() -> dict:
             n = int(history)
         except ValueError:
             n = -1
-        if 0 <= n <= WORLD_RELOCALIZER_HISTORY_MAX:
-            if n:
-                options["history_keyframes"] = n
-        else:
+        if WORLD_RELOCALIZER_HISTORY_MIN <= n <= WORLD_RELOCALIZER_HISTORY_MAX:
+            options["history_keyframes"] = n
+        elif n != 0:
             logger.warning(
-                "[Tower][Config] %s=%r is not an integer 0..%d; treating it as 0",
-                WORLD_RELOCALIZER_HISTORY_ENV, history, WORLD_RELOCALIZER_HISTORY_MAX,
+                "[Tower][Config] %s=%r is not 0 or an integer %d..%d; treating it as 0",
+                WORLD_RELOCALIZER_HISTORY_ENV, history,
+                WORLD_RELOCALIZER_HISTORY_MIN, WORLD_RELOCALIZER_HISTORY_MAX,
             )
     if _flag(WORLD_RELOCALIZER_SUMMARY_ENV, default=False):
         options["summary_events"] = True

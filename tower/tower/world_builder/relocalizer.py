@@ -139,6 +139,15 @@ WINDOW_FROM_LOSS = "loss"
 WINDOW_FROM_PROMPT = "prompt"
 WINDOW_FROMS = (WINDOW_FROM_LOSS, WINDOW_FROM_PROMPT)
 
+# HISTORY's measured range (RELOC2 candidate 2; review F3/F7). 20 is the
+# largest budget the replay measured (hist20: 30 references, CPU/scan
+# median ~0.19 s, p95 ~1.1 s on the 9-walk corpus); more was never
+# measured and would overrun the 0.5 s scan budget. Below 4 (two groups of
+# two) the spread rule degenerates to "the keyframes just before the recent
+# window" -- see `_History`.
+HISTORY_MIN_KEYFRAMES = 4
+HISTORY_MAX_KEYFRAMES = 20
+
 
 @dataclass(frozen=True)
 class AcceptanceParams:
@@ -1037,6 +1046,8 @@ class _Episode:
     best_triangle: dict | None = None  # the closest triangle evaluated at the floor
     dropped_at_open: int = 0
     cache_pruned: bool = False  # the worker trimmed the feature cache to these refs
+    history_next: int = 0  # where the next scan's history pass resumes (worker only)
+    history_preempted: int = 0  # history passes cut short by a newer frame
 
 
 class _History:
@@ -1060,6 +1071,15 @@ class _History:
     def __init__(self, capacity: int, group: int) -> None:
         self.capacity = int(capacity)
         self.group = max(1, int(group))
+        # Review F7: below two groups the stride rule cannot spread anything
+        # -- only the newest group survives, i.e. keyframes just older than
+        # the recent window, which is no history at all. Refused, not
+        # silently degenerate.
+        if self.capacity < max(HISTORY_MIN_KEYFRAMES, 2 * self.group):
+            raise ValueError(
+                f"history capacity {self.capacity} is below two groups of {self.group} "
+                f"(minimum {max(HISTORY_MIN_KEYFRAMES, 2 * self.group)})"
+            )
         self.stride = 1
         self._next = 0
         # [(number, [(keyframe_id, source_seq, gray), ...]), ...] oldest first
@@ -1077,7 +1097,9 @@ class _History:
             self._next += 1
         while sum(len(m) for _, m in self.groups) > self.capacity:
             if len(self.groups) <= 2:
-                self.groups.pop(0)  # a budget below two groups: oldest out
+                # Unreachable with capacity >= 2 groups (checked above);
+                # kept so the loop always terminates.
+                self.groups.pop(0)
                 continue
             self.stride *= 2
             newest = self.groups[-1]
@@ -1292,7 +1314,7 @@ class LookBackRelocalizer:
         if self.machine.is_open:
             events += self.machine.tick(now)
         if not self.machine.is_open:
-            events += self._summaries()
+            events += self._safe_summaries()
             self._finish_episode()
         return events
 
@@ -1311,7 +1333,7 @@ class LookBackRelocalizer:
         if self.machine.is_open:
             events += self.machine.tick(now)
         if not self.machine.is_open:
-            events += self._summaries()
+            events += self._safe_summaries()
             self._finish_episode()
         return events
 
@@ -1343,10 +1365,7 @@ class LookBackRelocalizer:
         events += self.machine.close(
             now, why="session_stopped" if stopped["why"] == "session_stopped" else "relocalizer_stopped"
         )
-        try:
-            events += self._summaries()
-        except Exception:  # observability must never cost the terminal line
-            logger.exception("[Tower][WorldBuilder] relocalizer: the episode summary at close failed")
+        events += self._safe_summaries()  # never costs the terminal line
         events.append((EVENT_STOPPED, stopped))
         self._finish_episode()
         with self._lock:
@@ -1384,18 +1403,32 @@ class LookBackRelocalizer:
 
     # -- internals -------------------------------------------------------------
 
+    def _safe_summaries(self) -> list:
+        """`_summaries`, never raising (review F5): a summary that fails is
+        logged and given up for that episode -- once, not on every frame --
+        and the lines around it (the acceptance or timeout that resolved the
+        episode, `relocalizer_stopped`) are journaled regardless."""
+        m = self.machine
+        if not self.summary_events or m.is_open or m.episode == 0 or self._summarised >= m.episode:
+            return []  # nothing due: the common case costs one comparison
+        try:
+            return self._summaries()
+        except Exception:
+            logger.exception("[Tower][WorldBuilder] relocalizer: the episode summary failed")
+            self._summarised = max(self._summarised, self.machine.episode)
+            return []
+
     def _summaries(self) -> list:
         """`recovery_summary` for the episode that just resolved, once.
 
         Called on the frame thread right after the line that resolved the
         episode; empty when the setting is off, while an episode is open, or
         when this episode was already summarised. Numbers and keyframe ids
-        only, never imagery.
+        only, never imagery. Call it through `_safe_summaries`.
         """
         m = self.machine
         if not self.summary_events or m.is_open or m.episode == 0 or self._summarised >= m.episode:
             return []
-        self._summarised = m.episode
         ep = self._episode if self._episode is not None and self._episode.number == m.episode else None
         with self._lock:
             refs = [] if ep is None else [kid for kid, _ in ep.refs]
@@ -1410,6 +1443,7 @@ class LookBackRelocalizer:
                 else round(m.resolved_at - m.lost_at, 3),
                 "references": refs,
                 "history_references": 0 if ep is None else ep.n_history,
+                "history_preempted": 0 if ep is None else ep.history_preempted,
                 "attempts": 0 if ep is None else ep.attempts,
                 "dropped": 0 if ep is None else max(0, self.dropped_frames - ep.dropped_at_open),
                 "best_links": [
@@ -1419,6 +1453,8 @@ class LookBackRelocalizer:
                 "best_pair": None if ep is None or ep.best_pair is None else dict(ep.best_pair),
                 "best_triangle": None if ep is None or ep.best_triangle is None else dict(ep.best_triangle),
             }
+        # Only once the payload exists (review F5): "summarised" means written.
+        self._summarised = m.episode
         return [(EVENT_SUMMARY, payload)]
 
     def _note_scan(self, ep: _Episode, job: _Job, links: dict, refref) -> None:
@@ -1537,6 +1573,13 @@ class LookBackRelocalizer:
                 with self._lock:
                     self._consecutive_failures = 0
 
+    def _newer_job_waiting(self) -> bool:
+        """A newer scan is waiting in the mailbox (worker thread): the history
+        pass yields to it. Never true in synchronous mode, where each scan is
+        answered on the frame it was given."""
+        with self._lock:
+            return self._pending is not None
+
     def _raise_if_worker_failed(self) -> None:
         """On the frame thread: the worker gave up, so the relocalizer stops."""
         with self._lock:
@@ -1564,41 +1607,97 @@ class LookBackRelocalizer:
             for kid in [k for k in cache if k not in wanted]:
                 del cache[kid]
             ep.cache_pruned = True
-        for kid, gray in ep.refs:
-            if self._stop or ep.done:
-                return  # resolved or stopped meanwhile: stop spending CPU
-            if kid not in ep.ref_features:
-                hit = cache.get(kid) if cache is not None else None
-                ep.ref_features[kid] = hit if hit is not None else v.features(gray)
-                if cache is not None:
-                    cache[kid] = ep.ref_features[kid]
-        frame = v.features(job.gray)
-        links = {}
-        for kid, _ in ep.refs:
-            if self._stop or ep.done:
-                return
-            if kid == job.keyframe_id:
-                continue
-            link = v.verify(ep.ref_features[kid], frame, self._size)
-            if link is not None:
-                links[kid] = link
+        # The recent references, then -- only if they decide nothing -- the
+        # historical ones (RELOC2 review F1: history is PURELY ADDITIVE).
+        n_recent = len(ep.refs) - ep.n_history
+        recent, historical = ep.refs[:n_recent], ep.refs[n_recent:]
+
+        def extract(refs) -> bool:
+            for kid, gray in refs:
+                if self._stop or ep.done:
+                    return False  # resolved or stopped meanwhile: stop spending CPU
+                if kid not in ep.ref_features:
+                    hit = cache.get(kid) if cache is not None else None
+                    ep.ref_features[kid] = hit if hit is not None else v.features(gray)
+                    if cache is not None:
+                        cache[kid] = ep.ref_features[kid]
+            return True
+
+        def verify_all(refs, frame, links) -> bool:
+            for kid, _ in refs:
+                if self._stop or ep.done:
+                    return False
+                if kid == job.keyframe_id:
+                    continue
+                link = v.verify(ep.ref_features[kid], frame, self._size)
+                if link is not None:
+                    links[kid] = link
+            return True
 
         def refref(k1, k2):
             key = (k1, k2)
             if key not in ep.refref:
+                if self._stop or ep.done:
+                    return None  # closing: no verify into finalization, nothing cached
                 ep.refref[key] = v.verify(ep.ref_features[k1], ep.ref_features[k2], self._size)
             return ep.refref[key]
 
+        if not extract(recent):
+            return
+        frame = v.features(job.gray)
+        links = {}
+        if not verify_all(recent, frame, links):
+            return
+        # Exactly today's decision over exactly today's references.
         decision = evaluate_acceptance(links, refref, self.acceptance)
+        if decision is None and historical:
+            # Only a scan the recent references leave undecided consults
+            # history. Its decision, if any, necessarily uses a historical
+            # reference: every recent-only strong link or triangle was
+            # already refused above. So every decision today's code makes
+            # for a scan is made unchanged, and never replaced.
+            #
+            # And history is SPARE-CYCLE work: it stops the moment a newer
+            # frame is waiting, so it never delays the next scan of the
+            # recent references by more than one extraction or verify --
+            # the frames today's code would scan are the frames scanned
+            # (RELOC2 review F1: at twice the CPU cost, a history pass that
+            # ran to completion made the worker skip the frame today's code
+            # accepted, and a later frame accepted two wrong links). Where a
+            # pass stops, the next scan resumes, so every historical
+            # reference is reached in turn.
+            n_hist = len(historical)
+            start = ep.history_next % n_hist
+            done_here = 0
+            for i in range(n_hist):
+                if self._stop or ep.done:
+                    return
+                if self._newer_job_waiting():
+                    with self._lock:
+                        ep.history_preempted += 1
+                    break
+                kid, gray = historical[(start + i) % n_hist]
+                if not extract([(kid, gray)]) or not verify_all([(kid, gray)], frame, links):
+                    return
+                done_here += 1
+            ep.history_next = (start + done_here) % n_hist
+            decision = evaluate_acceptance(links, refref, self.acceptance)
         if self.summary_events:
             # Before the result is published, so the summary written when it
-            # is collected already counts this scan.
-            self._note_scan(ep, job, links, refref)
+            # is collected already counts this scan. Observability must never
+            # cost an accept (review F5).
+            try:
+                self._note_scan(ep, job, links, refref)
+            except Exception:
+                logger.exception("[Tower][WorldBuilder] relocalizer: the scan summary failed")
         result = None
         if decision is not None:
             by, used, closure = decision
             anchor = self._anchor(ep, job, frame)
-            result = ("accepted", job.episode, by, _accept_detail(job, links, used, closure, anchor))
+            result = ("accepted", job.episode, by, _accept_detail(
+                job, links, used, closure, anchor,
+                historical={kid for kid, _ in historical} if historical else None,
+            ))
             if anchor is None:
                 with self._lock:
                     self._pending_anchor = _PendingAnchor(
@@ -1687,7 +1786,11 @@ def _at_revisit_floor(link) -> bool:
     return link is not None and int(link.n_inliers) >= REVISIT_MIN_INLIERS
 
 
-def _accept_detail(job: _Job, links: dict, used: list, closure, anchor) -> dict:
+def _accept_detail(job: _Job, links: dict, used: list, closure, anchor, historical=None) -> dict:
+    """`recovery_accepted`'s detail. `historical`: the episode's historical
+    reference ids when HISTORY is on (None off); a link to one of them is
+    marked `historical: true` -- in the journal only: the payload block
+    carries no links, and `revisit_pairs` reads only ids and inliers."""
     import numpy as np
 
     anchor_R = None
@@ -1706,6 +1809,8 @@ def _accept_detail(job: _Job, links: dict, used: list, closure, anchor) -> dict:
         }
         if anchor is not None:
             entry["R_anchor_ref"] = _mat(R if anchor_R is None else anchor_R @ R)
+        if historical and kid in historical:
+            entry["historical"] = True
         out_links.append(entry)
     return {
         "links": out_links,
@@ -1739,8 +1844,10 @@ def options_kwargs(options: dict | None) -> dict:
     if window_from != WINDOW_FROM_LOSS:
         kwargs["limiter"] = LimiterParams(window_from=window_from)
     history = int(options.get("history_keyframes", 0) or 0)
-    if history < 0:
-        raise ValueError("history_keyframes must be >= 0")
+    if history and not HISTORY_MIN_KEYFRAMES <= history <= HISTORY_MAX_KEYFRAMES:
+        raise ValueError(
+            f"history_keyframes must be 0 or {HISTORY_MIN_KEYFRAMES}..{HISTORY_MAX_KEYFRAMES}, not {history}"
+        )
     if history:
         kwargs["acceptance"] = AcceptanceParams(history_keyframes=history)
     if options.get("summary_events"):

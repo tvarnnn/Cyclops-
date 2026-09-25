@@ -88,8 +88,24 @@ def test_options_are_on_the_wire_only_when_on():
 def test_bad_options_are_refused():
     with pytest.raises(ValueError):
         R.options_kwargs({"window_from": "never"})
+    for n in (-1, 1, 3, 21, 40):
+        with pytest.raises(ValueError):
+            R.options_kwargs({"history_keyframes": n})
+    for n in (4, 20):
+        assert R.options_kwargs({"history_keyframes": n})["acceptance"].history_keyframes == n
+
+
+def test_the_history_bounds_are_one_pair_of_numbers():
+    """config mirrors the relocalizer's measured range without importing it."""
+    assert (config.WORLD_RELOCALIZER_HISTORY_MIN, config.WORLD_RELOCALIZER_HISTORY_MAX) == (
+        R.HISTORY_MIN_KEYFRAMES, R.HISTORY_MAX_KEYFRAMES) == (4, 20)
+
+
+@pytest.mark.parametrize("capacity, group", [(3, 1), (2, 2), (3, 2), (5, 3)])
+def test_a_history_below_two_groups_is_refused(capacity, group):
+    """Review F7: below two groups nothing can be spread."""
     with pytest.raises(ValueError):
-        R.options_kwargs({"history_keyframes": -1})
+        R._History(capacity=capacity, group=group)
 
 
 def test_the_summary_is_a_journal_kind():
@@ -354,8 +370,13 @@ def test_the_payload_block_ignores_the_summary():
     ({"TOWER_WORLD_RELOCALIZER_WINDOW": "prompt"}, {"window_from": "prompt"}),
     ({"TOWER_WORLD_RELOCALIZER_WINDOW": "sometimes"}, {}),
     ({"TOWER_WORLD_RELOCALIZER_HISTORY": "20"}, {"history_keyframes": 20}),
+    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "4"}, {"history_keyframes": 4}),
     ({"TOWER_WORLD_RELOCALIZER_HISTORY": "0"}, {}),
-    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "41"}, {}),
+    # review F3: 20 is the most the replay measured; F7: below 4 degenerates
+    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "21"}, {}),
+    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "40"}, {}),
+    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "3"}, {}),
+    ({"TOWER_WORLD_RELOCALIZER_HISTORY": "-4"}, {}),
     ({"TOWER_WORLD_RELOCALIZER_HISTORY": "lots"}, {}),
     ({"TOWER_WORLD_RELOCALIZER_SUMMARY": "on"}, {"summary_events": True}),
     ({"TOWER_WORLD_RELOCALIZER_SUMMARY": "off"}, {}),
@@ -494,3 +515,319 @@ def test_without_history_there_is_no_cross_episode_cache():
     assert len([m for m in verifier.extracted if m != 202]) == 10  # all ten again, as today
     assert reloc._feature_cache == {}
     reloc.close(32.0)
+
+
+# -- review round 3 (RV-RELOC) -------------------------------------------------------------------------
+#
+# F1: history is PURELY ADDITIVE -- a scan the recent references decide is
+# decided exactly as today, and never consults history.
+
+
+class _Tracing(_Scripted):
+    def __init__(self, table):
+        super().__init__(table)
+        self.verified = []
+
+    def verify(self, a, b, size):
+        self.verified.append((int(a.xy[0, 0]), int(b.xy[0, 0])))
+        return super().verify(a, b, size)
+
+
+def _with_history(table):
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT), prompts_enabled=True,
+                                  verifier=_Tracing(table), synchronous=True,
+                                  acceptance=R.AcceptanceParams(history_keyframes=6))
+    _walk_keyframes(reloc, 40)  # recent: k30..k39; history holds k0, k1, ...
+    assert [k for k, _ in reloc._history.members()][:2] == ["k0", "k1"]
+    return reloc
+
+
+def test_a_recent_decision_is_never_replaced_by_a_stronger_historical_one():
+    """Recent k38/k39 close a triangle (60/55); historical k0 would be a
+    STRONG link (150), which the rule prefers over any triangle when both are
+    evaluated together. Additive: the recent triangle stands."""
+    table = {(38, 39): 90, (38, 200): 60, (39, 200): 55, (0, 200): 150, (0, 1): 120, (1, 200): 70}
+    reloc = _with_history(table)
+    ev = reloc.note_lost(10.0) + reloc.note_frame(_gray(200), 200, None, 10.0)
+    acc = [p for k, p in ev if k == "recovery_accepted"][0]
+    assert acc["by"] == "triangle" and [l["ref_keyframe_id"] for l in acc["links"]] == ["k38", "k39"]
+    assert not any(l.get("historical") for l in acc["links"])
+    # ...and the historical references were never even verified against it.
+    assert not any(a in (0, 1) or b in (0, 1) for a, b in reloc._verifier.verified)
+    reloc.close(11.0)
+
+
+class _Rotating(_Tracing):
+    """`table[(a, b)] = (inliers, degrees)`: R is a rotation about z."""
+
+    def verify(self, a, b, size):
+        self.verified.append((int(a.xy[0, 0]), int(b.xy[0, 0])))
+        key = (int(a.xy[0, 0]), int(b.xy[0, 0]))
+        v = self.table.get(key) or self.table.get(key[::-1])
+        if not v:
+            return None
+        n, deg = v
+        c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+        return R.Link(n_inliers=n, n_matches=n, R=np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]]),
+                      t=np.array([1.0, 0, 0]), model="essential")
+
+
+def test_a_recent_triangle_is_never_replaced_by_a_tighter_mixed_one():
+    """The triangle rule keeps the LOWEST closure across all pairs. Recent
+    k38/k39 close within 5 deg; the mixed pair k38/k0 would close within 0 deg
+    and win if history were evaluated with them. Additive: k38/k39 stands."""
+    table = {(38, 39): (90, 0.0), (38, 200): (60, 0.0), (39, 200): (55, 5.0),
+             (0, 38): (80, 0.0), (0, 200): (70, 0.0)}
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT), prompts_enabled=True,
+                                  verifier=_Rotating(table), synchronous=True,
+                                  acceptance=R.AcceptanceParams(history_keyframes=6))
+    _walk_keyframes(reloc, 40)
+    ev = reloc.note_lost(10.0) + reloc.note_frame(_gray(200), 200, None, 10.0)
+    acc = [p for k, p in ev if k == "recovery_accepted"][0]
+    assert [l["ref_keyframe_id"] for l in acc["links"]] == ["k38", "k39"] and acc["closure_deg"] == 5.0
+    reloc.close(11.0)
+    # The same scan with everything evaluated together (the reviewed code)
+    # would have taken the mixed pair: the rule itself, on the union.
+    links = {"k38": R.Link(60, 60, np.eye(3), np.zeros(3), "essential"),
+             "k39": _Rotating(table).verify(R.Features(np.array([[39.0, 0]]), None),
+                                            R.Features(np.array([[200.0, 0]]), None), None),
+             "k0": R.Link(70, 70, np.eye(3), np.zeros(3), "essential")}
+    ids = {"k38": 38, "k39": 39, "k0": 0}
+    union = R.evaluate_acceptance(
+        links, lambda a, b: _Rotating(table).verify(R.Features(np.array([[float(ids[a]), 0]]), None),
+                                                    R.Features(np.array([[float(ids[b]), 0]]), None), None),
+        R.AcceptanceParams())
+    assert union[0] == "triangle" and set(union[1]) == {"k38", "k0"}
+
+
+def test_history_is_consulted_only_when_the_recent_references_decide_nothing():
+    """A single recent leg (k39, 60) decides nothing; with history it closes a
+    MIXED triangle with k0 -- marked historical in the journal (F2)."""
+    table = {(39, 200): 60, (0, 200): 70, (0, 39): 90}
+    reloc = _with_history(table)
+    ev = reloc.note_lost(10.0) + reloc.note_frame(_gray(200), 200, None, 10.0)
+    acc = [p for k, p in ev if k == "recovery_accepted"][0]
+    by_ref = {l["ref_keyframe_id"]: l for l in acc["links"]}
+    assert set(by_ref) == {"k39", "k0"}
+    assert by_ref["k0"]["historical"] is True and "historical" not in by_ref["k39"]
+    reloc.close(11.0)
+
+
+def test_a_newer_frame_preempts_the_history_pass_and_the_next_scan_resumes_it():
+    """History is spare-cycle work (F1, the scan-schedule half): once a newer
+    frame waits, the pass stops -- so today's scans are never delayed by more
+    than one verify -- and the next scan picks up where it stopped."""
+    reloc = _with_history({})  # nothing links: every scan is undecided
+    reloc.note_lost(10.0)
+    ep = reloc._episode
+    hist = [kid for kid, _ in ep.refs[10:]]
+    budget = {"n": 3}
+
+    def waiting():  # a newer frame arrives after three historical references
+        budget["n"] -= 1
+        return budget["n"] < 0
+    reloc._newer_job_waiting = waiting
+    v = reloc._verifier
+    v.verified.clear()
+    reloc._run(R._Job(ep.number, 200, None, _gray(200)))
+    first = [a for a, b in v.verified if b == 200 and a < 30]
+    assert first == [int(k[1:]) for k in hist[:3]] and ep.history_preempted == 1
+    budget["n"] = 100
+    v.verified.clear()
+    reloc._run(R._Job(ep.number, 201, None, _gray(201)))
+    second = [a for a, b in v.verified if b == 201 and a < 30]
+    assert second == [int(k[1:]) for k in hist[3:] + hist[:3]]  # resumed, then wrapped
+    # ...and the recent references were verified in full both times, first.
+    assert [a for a, b in v.verified if b == 201][:10] == list(range(30, 40))
+    reloc.close(11.0)
+
+
+def test_with_history_off_no_link_is_marked():
+    reloc = _reloc({(8, 9): 90, (8, 200): 60, (9, 200): 55})
+    _walk_keyframes(reloc, 10)
+    ev = reloc.note_lost(10.0) + reloc.note_frame(_gray(200), 200, None, 10.0)
+    acc = [p for k, p in ev if k == "recovery_accepted"][0]
+    assert all("historical" not in l for l in acc["links"])
+    reloc.close(11.0)
+
+
+def test_the_historical_mark_stays_in_the_journal():
+    """F2: journal-only. The payload block carries no links at all."""
+    acc_payload = {"episode": 1, "by": "triangle", "closure_deg": 1.0,
+                   "links": [{"ref_keyframe_id": "s:00000001", "inliers": 70, "historical": True}],
+                   "frame": {"source_seq": 9, "keyframe_id": "s:00000009"},
+                   "anchor": {"keyframe_id": "s:00000009", "identity": True, "inliers": None}}
+    started = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT),
+                                    prompts_enabled=True).started_payload()
+    journal = [{"kind": "relocalizer_started", "at": 1.0, "payload": started},
+               {"kind": "tracking_lost", "at": 2.0, "payload": {}},
+               {"kind": "recovery_accepted", "at": 3.0, "payload": acc_payload}]
+    block = R.recovery_block(journal)
+    assert block["state"] == "recovered" and "historical" not in json.dumps(block)
+
+
+# F5: observability never costs an accept or a line.
+
+
+def test_a_failing_scan_summary_never_costs_the_accept(monkeypatch):
+    reloc = _reloc({(8, 9): 90, (8, 200): 60, (9, 200): 55}, summary_events=True)
+    _walk_keyframes(reloc, 10)
+
+    def boom(*a, **k):
+        raise RuntimeError("injected")
+    monkeypatch.setattr(reloc, "_note_scan", boom)
+    ev = reloc.note_lost(10.0) + reloc.note_frame(_gray(200), 200, None, 10.0)
+    assert "recovery_accepted" in _kinds(ev)
+    reloc.close(11.0)
+
+
+@pytest.mark.parametrize("path", ["note_frame", "tick", "close"])
+def test_a_failing_episode_summary_never_drops_a_line_and_is_not_retried(monkeypatch, path):
+    reloc = _reloc({(8, 9): 90, (8, 200): 60, (9, 200): 55}, summary_events=True)
+    _walk_keyframes(reloc, 10)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("injected")
+    monkeypatch.setattr(reloc, "_summaries", boom)
+    ev = reloc.note_lost(10.0)
+    if path == "note_frame":
+        ev += reloc.note_frame(_gray(200), 200, None, 10.0)
+        assert "recovery_accepted" in _kinds(ev)
+        ev += reloc.note_frame(_gray(201), 201, None, 10.1)
+        ev += reloc.tick(10.2)
+    elif path == "tick":
+        ev += reloc.tick(31.0)  # times out on a rejected frame's tick
+        assert "recovery_timed_out" in _kinds(ev)
+        ev += reloc.tick(31.1)
+    ev += reloc.close(40.0)
+    assert _kinds(ev)[-1] == "relocalizer_stopped"
+    assert len(calls) == 1  # given up for that episode, not retried on every frame
+
+
+def test_summarised_is_set_only_once_the_payload_is_built():
+    reloc = _reloc({}, summary_events=True)
+    _walk_keyframes(reloc, 10)
+    reloc.note_lost(10.0)
+    reloc.machine.close(11.0)  # resolved; nothing written yet
+    assert reloc._summarised == 0
+    assert _kinds(reloc._summaries()) == ["recovery_summary"] and reloc._summarised == 1
+    assert reloc._summaries() == []
+    reloc.close(12.0)
+
+
+# F6: a closing relocalizer does not verify into finalization.
+
+
+def test_nothing_is_verified_once_stopped():
+    table = {(38, 39): 90, (38, 200): 60, (39, 200): 55}
+    reloc = _reloc(table)
+    _walk_keyframes(reloc, 40)
+    reloc.note_lost(10.0)
+    ep = reloc._episode
+    reloc._stop = True
+    reloc._run(R._Job(ep.number, 200, None, _gray(200)))
+    assert ep.refref == {} and reloc.attempts == 0 and not reloc._results
+    reloc._stop = False
+    reloc.close(11.0)
+
+
+def test_refref_refuses_to_verify_or_cache_once_stopping():
+    """Stopping DURING a scan: the frame's links are in, then close() lands
+    before the triangle's reference-reference verify."""
+    table = {(38, 39): 90, (38, 200): 60, (39, 200): 55}
+
+    class _StopsMidScan(_Scripted):
+        def __init__(self, table, reloc_box):
+            super().__init__(table)
+            self.box = reloc_box
+
+        def verify(self, a, b, size):
+            pair = (int(a.xy[0, 0]), int(b.xy[0, 0]))
+            if pair == (39, 200):
+                self.box[0]._stop = True  # close() lands here
+            return super().verify(a, b, size)
+
+    box = []
+    reloc = R.LookBackRelocalizer(camera_matrix=np.eye(3), frame_size=(WIDTH, HEIGHT), prompts_enabled=True,
+                                  verifier=_StopsMidScan(table, box), synchronous=True)
+    box.append(reloc)
+    _walk_keyframes(reloc, 40)
+    reloc.note_lost(10.0)
+    ep = reloc._episode
+    reloc._run(R._Job(ep.number, 200, None, _gray(200)))
+    # (39, 200) was the last recent verify; the triangle's reference-reference
+    # verify that would follow is refused: nothing cached, nothing accepted.
+    assert ep.refref == {} and not reloc._results
+    reloc._stop = False
+    reloc.close(11.0)
+
+
+# F9: the GOLDEN journal. With every option unset, HEAD journals exactly
+# what 9f4766a (before RELOC2) journaled -- recorded from that commit's
+# relocalizer.py / engine.py / events.py by RUN/lead/reloc2/golden/
+# golden_record.py (RV-RELOC's module swap), ids masked.
+
+GOLDEN = __import__("pathlib").Path(__file__).parent / "golden" / "world_builder_relocalizer_9f4766a.json"
+
+
+def _golden_frames(name):
+    """KEEP IN STEP with golden_record.py: the recorded walks."""
+    K = ss.camera_matrix(WIDTH, HEIGHT)
+    room = [ss.encode_jpeg(i) for i in ss.render_sequence(ss.furnished_room(), ss.strafe(12, step=0.09), K, WIDTH, HEIGHT)]
+    rng = np.random.default_rng(0)
+    noise = [ss.encode_jpeg(rng.integers(0, 255, (HEIGHT, WIDTH, 3), dtype=np.uint8)) for _ in range(8)]
+    if name == "rv":  # RV-RELOC's cmp_old_new.py walk
+        return room + noise[:6] + room[::-1][:6] + noise * 3 + room[:8] + noise * 10 + room[::-1] + noise[:3] + room[:5]
+    if name == "timeout":  # a prompt that times out, then a later loss that re-links
+        return room + noise * 9 + room[:6] + noise * 9 + room[::-1] + noise[:2] + room[:4]
+    raise KeyError(name)
+
+
+def _round_floats(line, places=3):
+    def walk(x):
+        if isinstance(x, float):
+            return round(x, places)
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        return x
+    return walk(json.loads(line))
+
+
+def _engine_walk_golden(root, frames):
+    K = ss.camera_matrix(WIDTH, HEIGHT)
+    intr = CameraIntrinsics(source="self_calibrated", model="pinhole", fx=float(K[0, 0]), fy=float(K[1, 1]),
+                            cx=float(K[0, 2]), cy=float(K[1, 2]), calibrated_width=WIDTH, calibrated_height=HEIGHT)
+    clock = _Clock()
+    engine = WorldBuilderEngine(WorldStore(root), clock=clock, relocalizer="prompt")  # options: the environment
+    wid = engine.create_world("golden")
+    sid = engine.start_session(wid, intrinsics=intr, frame_source="synthetic", declared_size=(WIDTH, HEIGHT))
+    for seq, jpeg in enumerate(frames):
+        clock.t += 0.3
+        engine.observe(jpeg, source_seq=seq, wire_seq=seq)
+    engine.stop_session()
+    return WorldStore(root).events_path(wid, sid).read_text().splitlines()
+
+
+@pytest.mark.parametrize("scenario", ["rv", "timeout"])
+def test_golden_the_default_journal_is_the_pre_reloc2_journal(tmp_path, monkeypatch, scenario):
+    import re
+
+    import cv2
+
+    for name in ("TOWER_WORLD_RELOCALIZER_WINDOW", "TOWER_WORLD_RELOCALIZER_HISTORY",
+                 "TOWER_WORLD_RELOCALIZER_SUMMARY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(R, "from_session", _synchronous(R.from_session))
+    golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    expected = golden["scenarios"][scenario]
+    kinds = [json.loads(l)["kind"] for l in expected]
+    assert "recovery_accepted" in kinds and "relocalizer_stopped" in kinds  # it exercises the relocalizer
+    lines = [re.sub(r"[0-9a-f]{32}", "ID", line) for line in _engine_walk_golden(tmp_path, _golden_frames(scenario))]
+    if (golden["cv2"], golden["numpy"]) == (cv2.__version__, np.__version__):
+        assert lines == expected  # byte for byte
+    else:  # another OpenCV/NumPy build: RANSAC's last digits may move, nothing else may
+        assert [_round_floats(l) for l in lines] == [_round_floats(l) for l in expected]
