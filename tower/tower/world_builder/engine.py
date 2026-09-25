@@ -436,12 +436,10 @@ class WorldBuilderEngine:
         # For the per-frame quality log: what `evaluate` saw, read before a
         # loss or an accept moves either on. Off, this is one comparison and
         # nothing is read, built or written.
-        measured = {
-            "quality": quality,
-            "motion": motion,
-            "frames_since_keyframe": self._selector.frames_since_keyframe,
-            "segment_index": self._segment_index,
-        } if self._frame_log is not None else None
+        measured = (
+            self._frame_measured(quality, motion)
+            if self._frame_log is not None else None
+        )
 
         if decision.lost:
             # A new segment: poses either side are NOT in a common frame,
@@ -1375,6 +1373,23 @@ class WorldBuilderEngine:
         if log is not None:
             log.close()
 
+    def _frame_measured(self, quality, motion) -> dict | None:
+        """What `evaluate` saw, for the log. Guarded like the log's own writes
+        (review V16 MED-1): a failure here turns the log off, never the walk."""
+        log = self._frame_log
+        if log is None or not log.active:
+            return None
+        try:
+            return {
+                "quality": quality,
+                "motion": motion,
+                "frames_since_keyframe": self._selector.frames_since_keyframe,
+                "segment_index": self._segment_index,
+            }
+        except Exception as error:  # noqa: BLE001 -- a log line is never worth a frame
+            log.fail("read the measurements for", error)
+            return None
+
     def _log_frame(
         self, source_seq, received_at, outcome, reason, measured=None,
         keyframe_id=None,
@@ -1383,19 +1398,21 @@ class WorldBuilderEngine:
 
         `measured` is what `evaluate` saw (quality, motion, the selector's
         frames-since-keyframe and the segment), or None for a frame the
-        frontend never scored. Copies only: no measurement is repeated.
+        frontend never scored. Copies only: no measurement is repeated. The
+        row is BUILT inside the log's guard (`FrameQualityLog.record`), so no
+        exception from here reaches `observe()` (review V16 MED-1).
         """
         log = self._frame_log
-        if log is None:
+        if log is None or not log.active:
             return
-        log.write(frame_quality.frame_row(
+        log.record(
+            measured,
             source_seq=source_seq,
             received_at=received_at,
             outcome=outcome,
             reason=reason,
             keyframe_id=keyframe_id,
-            **(measured or {}),
-        ))
+        )
 
     def _recovery_tick(self) -> None:
         """A frame rejected before tracking still moves the recovery

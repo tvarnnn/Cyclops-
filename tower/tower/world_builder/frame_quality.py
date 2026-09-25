@@ -35,10 +35,9 @@ EVERY VALUE IS ONE THE BUILDER ALREADY COMPUTED on the live path; nothing here d
 measures or re-derives anything. A line holds (null where the value does not exist):
 
   v                       FRAME_QUALITY_VERSION
-  source_seq              the builder's sequence number -- the keyframe record's, renumbered
-                          if the sender restarted (engine.observe); `received_at` joins the
-                          capture's own `frames.jsonl`
-  received_at             as observe() received it
+  source_seq              the builder's sequence number, the keyframe record's -- NOT always
+                          the capture's (see JOINS below)
+  received_at             as observe() received it: the capture record's own value
   sharpness               `FrameQuality.sharpness`, the variance of the Laplacian: THE number
                           `KeyframeSelector._is_sharp_enough` compares, full float precision
   tracker                 `reference` (motion was measured against the current reference
@@ -60,6 +59,16 @@ measures or re-derives anything. A line holds (null where the value does not exi
                           engine's own reject for an unscored frame
   keyframe_id             the persisted keyframe's id, or null: whether it became a keyframe
 
+JOINS USE `received_at`, NEVER `source_seq`. When the sender restarts inside a capture lineage
+its sequence starts again, and the builder RENUMBERS from there onto a monotonic sequence
+(engine.observe; the journal says `source_seq_restarted`) so no keyframe is overwritten. From
+that frame on, this file's `source_seq` is the builder's number -- equal to `keyframes.jsonl`'s,
+different from the capture's `frames.jsonl`. `received_at` is passed through untouched from the
+capture record (capture.py's follower), so it joins the capture, and an IMU clock, exactly. (A
+source with no recorded timestamp -- a directory of loose JPEGs -- gets the engine's receipt
+time instead, as the keyframe record does.) Within this file and against `keyframes.jsonl`,
+`keyframe_id` is the join.
+
 THE BLUR VERDICT IS REPRODUCIBLE FROM THIS FILE ALONE. The ratio test compares `sharpness`
 against the median (`sorted(w)[len(w) // 2]`) of the last `KeyframePolicy.sharpness_window`
 (30) scored frames INCLUDING this one, once at least 5 are held; the absolute floor is
@@ -69,9 +78,20 @@ the lines with a non-null `sharpness`, in order, rebuild it exactly (a test pins
 WRITING NEVER COSTS THE WALK ANYTHING. One handle per session, opened at session start and
 buffered (`io.DEFAULT_BUFFER_SIZE`, 8 KB: about 20 lines per system call), no fsync; closed --
 so flushed -- first thing in `stop_session`, which also runs when a walk ends in error. Any
-failure, opening or writing or flushing, is logged ONCE and turns the log off for the rest of
-that session; the builder never sees an exception from here. The price of buffering is that a
-builder killed outright loses the unflushed tail: at most one buffer, under 2 s at 12 fps.
+failure -- building a line (`FrameQualityLog.record` builds it inside the guard), opening,
+writing or flushing -- is logged ONCE and turns the log off for the rest of that session; the
+builder never sees an exception from here.
+
+THE PRICE OF BUFFERING, and what a reader must tolerate. A builder killed outright loses the
+unflushed tail: at most one buffer, 8 KB, about 20 lines -- under 2 s at 12 fps, but about 6 s
+at today's ~3.3 fps delivery. And the buffer reaches the disk in 8 KB pieces cut at byte
+boundaries, not at line ends, so such a kill can also leave the LAST LINE TORN. Readers must
+skip a torn line rather than fail on it: `read_frames_quality` does (as `read_raw_jsonl` does for
+every journal here), and a log opened on a file whose last line is torn starts on a fresh line
+first, so the tear never fuses with the next record. Flushing per line would close that window
+at the cost of a system call per frame; for a calibration series the tolerant reader is the
+cheaper answer.
+
 MEASURED (RUN/experiments/P5-SHARP, this host): 5.3 us per line for the row, the JSON and the
 buffered write (perf.py), against an 83 ms frame interval at 12 fps. Replaying a real frozen
 1,251-frame capture (0892c308, replay_real.py) twice each way, observe()'s median was
@@ -90,7 +110,10 @@ only, never imagery.
 import io
 import json
 import logging
+import os
 from pathlib import Path
+
+from tower.storage import read_raw_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +127,18 @@ TRACKER_NO_REFERENCE = "no_reference"
 def frames_quality_path(store, world_id: str, session_id: str) -> Path:
     """Where a session's log lives. Beside `events.jsonl`, never inside it."""
     return store.session_dir(world_id, session_id) / FRAMES_QUALITY_FILENAME
+
+
+def read_frames_quality(path) -> list[dict]:
+    """A session's lines, in order, for analysis. Nothing in the Tower calls this.
+
+    An absent file is `[]`: every world written before this module, and every world written
+    with the switch off. A torn line -- the last one, after a builder was killed mid-buffer
+    (see the module docstring) -- is skipped with a warning, never raised: `read_raw_jsonl`'s
+    rule for every journal here. Only JSON objects are returned.
+    """
+    records, _ = read_raw_jsonl(Path(path))
+    return [record for record in records if isinstance(record, dict)]
 
 
 def frame_row(
@@ -153,6 +188,13 @@ class FrameQualityLog:
         self._closed = False
         self._lines = 0
         try:
+            # A torn last line (a killed builder) is ended before anything is appended,
+            # so it never fuses with the next record -- `append_jsonl`'s rule.
+            torn = False
+            if self._path.exists() and self._path.stat().st_size > 0:
+                with self._path.open("rb") as tail:
+                    tail.seek(-1, os.SEEK_END)
+                    torn = tail.read(1) != b"\n"
             # Append, never truncate: a session id is fresh, so the file is new, and if it
             # somehow is not, nothing already in it is destroyed. "\n" on every platform,
             # so the bytes (and the size quoted above) do not depend on the host.
@@ -160,8 +202,10 @@ class FrameQualityLog:
                 self._path, "a", encoding="utf-8", newline="\n",
                 buffering=io.DEFAULT_BUFFER_SIZE,
             )
+            if torn:
+                self._handle.write("\n")
         except Exception as error:  # noqa: BLE001 -- a log is never worth a walk
-            self._fail("open", error)
+            self.fail("open", error)
 
     @property
     def path(self) -> Path:
@@ -180,6 +224,29 @@ class FrameQualityLog:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def active(self) -> bool:
+        """Still writing: opened, not failed, not closed. Off, callers skip the work."""
+        return self._handle is not None
+
+    def record(self, measured: dict | None = None, **fields) -> None:
+        """Build one line from `frame_row`'s fields AND write it, both inside the guard.
+
+        This is the engine's entry point (review V16 MED-1): an exception from building the
+        row -- a renamed attribute on a `FrameQuality` or `MotionSummary`, a field the row
+        does not take, a field given twice -- is the log's failure like any I/O error: logged
+        once, the log off for the session, and nothing reaches `observe()`. `measured` (what
+        `evaluate` saw) is merged in here rather than at the call, for the same reason.
+        """
+        if self._handle is None:
+            return
+        try:
+            row = frame_row(**fields, **(measured or {}))
+        except Exception as error:  # noqa: BLE001 -- see the module docstring
+            self.fail("build a line for", error)
+            return
+        self.write(row)
+
     def write(self, row: dict) -> None:
         handle = self._handle
         if handle is None:
@@ -187,7 +254,7 @@ class FrameQualityLog:
         try:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         except Exception as error:  # noqa: BLE001 -- see the module docstring
-            self._fail("write", error)
+            self.fail("write", error)
             return
         self._lines += 1
 
@@ -200,10 +267,13 @@ class FrameQualityLog:
         try:
             handle.close()
         except Exception as error:  # noqa: BLE001 -- the flush is a write too
-            self._fail("flush", error)
+            self.fail("flush", error)
 
-    def _fail(self, doing: str, error: BaseException) -> None:
-        """Log once, drop the handle, stay off for the rest of the session."""
+    def fail(self, doing: str, error: BaseException) -> None:
+        """Log once, drop the handle, stay off for the rest of the session. Never raises.
+
+        Public so the engine can hand the log a failure of its own side of the line (reading
+        what `evaluate` saw) under the same rule."""
         handle, self._handle = self._handle, None
         already = self._failed
         self._failed = True

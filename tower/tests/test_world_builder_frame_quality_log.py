@@ -469,6 +469,128 @@ def test_a_log_that_raises_anything_costs_no_frame(tmp_path, monkeypatch, caplog
     assert files[LOG_NAME]["bytes"] == 0  # opened, never written, closed
 
 
+def _raise(*_, **__):
+    raise AttributeError("'MotionSummary' object has no attribute 'seeded_count'")
+
+
+@pytest.mark.parametrize("where", ["frame_row", "the selector's counter"])
+def test_building_a_line_that_raises_never_reaches_observe(
+        tmp_path, monkeypatch, caplog, frames, golden, where):
+    """Review V16 MED-1: an exception while BUILDING a line -- a future attribute rename in
+    `frame_row`, or on the selector the engine reads -- is the log's failure, logged once;
+    `observe()` never sees it and the walk's outputs are the log-off outputs exactly."""
+    monkeypatch.setenv(ENV, "on")
+    if where == "frame_row":
+        monkeypatch.setattr(FQ, "frame_row", _raise)
+    else:
+        monkeypatch.setattr(KeyframeSelector, "frames_since_keyframe", property(_raise))
+    with caplog.at_level(logging.WARNING, logger=FQ.__name__):
+        engine, world_id, _, results = golden_walk(tmp_path, frames, stop=False)
+        log = engine._frame_log
+        summary = engine.stop_session()
+    assert _decisions(results) == golden["decisions"]
+    assert summary.frames_observed == len(frames) and summary.keyframes_accepted == 7
+    files = snapshot(tmp_path, world_id)
+    assert sorted(set(files) - set(golden["files"])) == [LOG_NAME]
+    _assert_matches_golden(files, golden)
+    assert files[LOG_NAME]["bytes"] == 0
+    assert log.failed and log.closed and not log.active and log.lines == 0
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1 and "AttributeError" in warnings[0].getMessage()
+
+
+# -- readers, re-opens, and the values that are easy to get subtly wrong ------------------------
+
+
+def _row(seq):
+    return FQ.frame_row(source_seq=seq, received_at=1758790123.4567891 + seq,
+                        outcome="skip", reason="insufficient_motion")
+
+
+def test_the_reader_skips_a_torn_last_line(tmp_path):
+    """Review V16 LOW-1: a builder killed mid-buffer leaves the last line cut at a byte."""
+    path = tmp_path / FQ.FRAMES_QUALITY_FILENAME
+    whole = "".join(json.dumps(_row(s), separators=(",", ":")) + "\n" for s in (1, 2, 3))
+    torn = json.dumps(_row(4), separators=(",", ":"))[:57]
+    path.write_bytes((whole + torn).encode("utf-8"))
+    assert [r["source_seq"] for r in FQ.read_frames_quality(path)] == [1, 2, 3]
+    # a complete last line that merely lacks its newline is a line, not a tear
+    path.write_bytes(whole.encode("utf-8").rstrip(b"\n"))
+    assert [r["source_seq"] for r in FQ.read_frames_quality(path)] == [1, 2, 3]
+    # absent: every world before this, and every world written with the switch off
+    assert FQ.read_frames_quality(tmp_path / "absent.jsonl") == []
+
+
+def test_a_reopen_appends_and_ends_a_torn_line_first(tmp_path):
+    """Review V16 LOW-2 ("a", never "w") and LOW-1 (a tear never fuses with the next record)."""
+    path = tmp_path / FQ.FRAMES_QUALITY_FILENAME
+    first = "".join(json.dumps(_row(s), separators=(",", ":")) + "\n" for s in (1, 2))
+    torn = json.dumps(_row(3), separators=(",", ":"))[:40]
+    path.write_bytes((first + torn).encode("utf-8"))
+    log = FQ.FrameQualityLog(path)
+    log.record(source_seq=9, received_at=2.5, outcome="skip", reason="insufficient_motion")
+    log.close()
+    data = path.read_bytes().decode("utf-8")
+    assert data.startswith(first + torn + "\n"), "a re-open destroyed or fused what was there"
+    assert [r["source_seq"] for r in FQ.read_frames_quality(path)] == [1, 2, 9]
+    # and a clean file is appended to as it is, with no blank line
+    log = FQ.FrameQualityLog(path)
+    log.record(source_seq=10, received_at=3.5, outcome="skip", reason="insufficient_motion")
+    log.close()
+    assert [r["source_seq"] for r in FQ.read_frames_quality(path)] == [1, 2, 9, 10]
+    assert "\n\n" not in path.read_bytes().decode("utf-8")
+
+
+def test_segment_index_is_the_segment_each_frame_was_measured_in(tmp_path, monkeypatch, frames):
+    """Review V16 LOW-2: the segment of EVERY scored line, not only the keyframes', rebuilt
+    independently from the journal: a loss line is still in the old segment, and the next
+    frame is in the new one; a solve chain break moves it on after its keyframe."""
+    monkeypatch.setenv(ENV, "on")
+    _, world_id, session_id, _ = golden_walk(tmp_path, frames)
+    store = WorldStore(tmp_path)
+    events = store.read_events(world_id, session_id)
+    breakers = {
+        events[i + 1]["payload"]["keyframe_id"] for i, e in enumerate(events[:-1])
+        if e["kind"] == "solve_chain_broken"
+    }
+    losses = [e["payload"]["segment_index"] for e in events if e["kind"] == "tracking_lost"]
+    expected, seen_later = 0, []
+    for line in _log_lines(tmp_path, world_id, session_id):
+        if line["tracker"] is None:
+            assert line["segment_index"] is None
+            continue
+        assert line["segment_index"] == expected, line["source_seq"]
+        if line["keyframe_id"] is None and expected > 0:
+            seen_later.append(line["source_seq"])
+        if line["outcome"] == "tracking_lost":
+            expected += 1
+            assert losses.pop(0) == expected  # the journal names the NEW segment
+        elif line["keyframe_id"] in breakers:
+            expected += 1
+    assert losses == [] and expected == 2
+    assert seen_later, "no non-keyframe line after a loss: the walk would not catch an off-by-one"
+
+
+def test_received_at_and_source_seq_are_kept_exactly(tmp_path, monkeypatch, frames):
+    """Review V16 LOW-2: non-round times, so rounding (to 3 places, or to float32) is caught."""
+    monkeypatch.setenv(ENV, "on")
+    engine = WorldBuilderEngine(WorldStore(tmp_path), clock=Clock(), redactor_factory=NoFaceRedactor)
+    world_id = engine.create_world("times")
+    session_id = engine.start_session(world_id, intrinsics=_intrinsics(), frame_source="synthetic")
+    times = [1758790123.4567891 + i * 0.0833337 + (i % 3) * 1.1e-5 for i in range(12)]
+    seqs = [7 + 3 * i for i in range(12)]
+    for payload, t, seq in zip(frames[:12], times, seqs):
+        engine.observe(payload, received_at=t, source_seq=seq)
+    engine.stop_session()
+    lines = _log_lines(tmp_path, world_id, session_id)
+    assert [line["received_at"] for line in lines] == times
+    assert [round(t, 3) for t in times] != times  # the check has teeth
+    assert [line["source_seq"] for line in lines] == seqs
+    keyframes = WorldStore(tmp_path).read_keyframes(world_id, session_id)
+    by_seq = {line["source_seq"]: line for line in lines}
+    assert keyframes and all(by_seq[k.source_seq]["received_at"] == k.received_at for k in keyframes)
+
+
 # -- the saved world ---------------------------------------------------------------------------
 
 
