@@ -34,6 +34,10 @@ import MWDATMockDevice
 // feed in that same suite. The audio-free invariant is about the app: its
 // sources under Glasses/ and its built binaries, which this file is neither.
 import AVFoundation
+// For the IMU recorder suite: UIKit's protected-data notification names, which
+// the recorder restates by value, and `MotionSamplingRate`.
+import UIKit
+import MWDATMotion
 #endif
 
 @testable import Glasses
@@ -3194,8 +3198,9 @@ final class MotionProbeMockDeviceTests: XCTestCase {
     /// Simulator's mock camera fails its stream at once ("Critical error"),
     /// which would leave "beside the camera" unproven. Four seconds of 24 fps
     /// at DAT's `.low` size, each frame a different grey. HEVC, because the
-    /// mock camera reads "H.265 frames from video file".
-    static func makeCameraFeed() async throws -> URL {
+    /// mock camera reads "H.265 frames from video file". `seconds` lengthens
+    /// it for a suite that streams longer than four seconds.
+    static func makeCameraFeed(seconds: Int = 4) async throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("motion-probe-feed-\(UUID().uuidString).mov")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -3213,7 +3218,7 @@ final class MotionProbeMockDeviceTests: XCTestCase {
         writer.add(input)
         XCTAssertTrue(writer.startWriting(), "could not start the feed writer: \(String(describing: writer.error))")
         writer.startSession(atSourceTime: .zero)
-        for frame in 0..<96 {
+        for frame in 0..<(24 * seconds) {
             while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
             var buffer: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, try XCTUnwrap(adaptor.pixelBufferPool), &buffer)
@@ -3359,6 +3364,871 @@ final class DATNonblockingWarningTests: XCTestCase {
         XCTAssertTrue(GlassesConnection.isNonblockingWarning(DeviceSessionError.dwaOutOfStuRange))
         XCTAssertTrue(GlassesConnection.isNonblockingWarning(DeviceSessionError.dwaOutOfStuRange as any Error))
         XCTAssertFalse(GlassesConnection.isNonblockingWarning(CocoaError(.fileNoSuchFile) as any Error))
+    }
+}
+#endif
+
+// MARK: - IMU recorder (walk-5 evidence)
+
+#if DEBUG
+/// Shared by the IMU recorder suites: reading a log back.
+enum IMULogTestSupport {
+    static func temporaryBase() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("imu-rec-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    static func lines(_ url: URL) throws -> [[String: Any]] {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(text.isEmpty || text.hasSuffix("\n"), "the log ends mid-line")
+        return try text.split(separator: "\n").map { line in
+            let object = try JSONSerialization.jsonObject(with: Data(line.utf8))
+            return try XCTUnwrap(object as? [String: Any], "not a JSON object: \(line)")
+        }
+    }
+
+    static func logFiles(under base: URL) -> [URL] {
+        let folder = base.appendingPathComponent(IMURecorder.directoryName)
+        return ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "jsonl" }
+    }
+
+    static func header(glassesModel: String? = "rayBanMeta", actualHz: Int? = 60, recorder: IMURecorder) -> IMULogHeader {
+        IMULogHeader(
+            sessionID: recorder.sessionID,
+            fileName: recorder.relativePath,
+            startMonoNs: recorder.startMonoNs,
+            startWall: recorder.startWall,
+            motionRequestedHz: 60,
+            motionActualHz: actualHz,
+            motionAttempts: [IMUMotionAttempt(hz: 60, error: nil)],
+            glassesModel: glassesModel,
+            captureResolution: "low",
+            cameraFPSRequested: 24,
+            towerTargetFPS: 12
+        )
+    }
+
+    static func reading(_ i: Int, hz: Int = 60, source: IMUMotionReading.Source = .glasses) -> IMUMotionReading {
+        IMUMotionReading(
+            timestampNs: Int64(i) * 1_000_000_000 / Int64(hz),
+            accelerometer: SIMD3(0, 9.80665, 0),
+            gyroscope: SIMD3(0.01, Float(i) * 0.001, -0.02),
+            orientation: SIMD4(1, 0, 0, 0),
+            source: source
+        )
+    }
+
+    /// Closes and waits for the file to be final.
+    static func close(_ recorder: IMURecorder, reason: String = "test") -> IMURecorderSummary {
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: IMURecorderSummary?
+        recorder.close(reason: reason) { summary in
+            result = summary
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 10)
+        return result!
+    }
+
+    /// A real `CMSampleBuffer` carrying `pts`, as DAT's `VideoFrame` does.
+    static func sampleBuffer(pts: CMTime) throws -> CMSampleBuffer {
+        var pixels: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 36, 64, kCVPixelFormatType_32BGRA, nil, &pixels)
+        let image = try XCTUnwrap(pixels)
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &format)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 24), presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+        var buffer: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: nil, imageBuffer: image, formatDescription: try XCTUnwrap(format),
+            sampleTiming: &timing, sampleBufferOut: &buffer
+        )
+        return try XCTUnwrap(buffer)
+    }
+}
+
+/// The four line types, from fixed numbers.
+final class IMULogFormatTests: XCTestCase {
+
+    func testAMotionLineCarriesBothClocksAndWritesAMissingSensorAsNull() throws {
+        let reading = IMUMotionReading(
+            timestampNs: 1_234_567_890_123,
+            accelerometer: SIMD3(0.5, 9.80665, -0.25),
+            gyroscope: nil,
+            orientation: SIMD4(0.9, 0.1, 0.2, 0.3),
+            source: .glasses
+        )
+        let line = IMULogFormat.motionLine(reading, rxMonoNs: 987_654_321)
+        XCTAssertTrue(line.hasPrefix(#"{"t":"m","ts_ns":1234567890123,"rx_mono_ns":987654321,"#), line)
+        XCTAssertTrue(line.hasSuffix("}\n"))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        // Written in Float's shortest exact form, which reads back as the same Float.
+        XCTAssertEqual((object["a"] as? [Double])?.map { Float($0) }, [0.5, 9.80665, -0.25])
+        XCTAssertTrue(object["g"] is NSNull, "a missing gyroscope must be null, never zero")
+        XCTAssertEqual((object["q"] as? [Double])?.map { Float($0) }, [0.9, 0.1, 0.2, 0.3], "q is [w,x,y,z]")
+        XCTAssertEqual(object["src"] as? String, "glasses")
+    }
+
+    func testAFrameLineCarriesPTSEpochReceiptSentAndSeq() throws {
+        let epoch = UUID()
+        let line = IMULogFormat.frameLine(IMUFrameStamp(ptsUs: 41_666, rxMonoNs: 5_000), epoch: epoch, sent: true, seq: 7)
+        XCTAssertEqual(line, #"{"t":"f","pts_us":41666,"epoch":"\#(epoch.uuidString)","rx_mono_ns":5000,"sent":true,"seq":7}"# + "\n")
+        let missing = IMULogFormat.frameLine(IMUFrameStamp(ptsUs: nil, rxMonoNs: 1), epoch: nil, sent: false, seq: 8)
+        XCTAssertEqual(missing, #"{"t":"f","pts_us":null,"epoch":null,"rx_mono_ns":1,"sent":false,"seq":8}"# + "\n")
+    }
+
+    /// The PTS is `CMSampleBufferGetPresentationTimeStamp`, in microseconds.
+    func testTheFrameStampReadsTheSampleBuffersPTSInMicroseconds() throws {
+        let buffer = try IMULogTestSupport.sampleBuffer(pts: CMTime(value: 12_345, timescale: 24))
+        let stamp = IMUFrameStamp(sampleBuffer: buffer, rxMonoNs: 42)
+        XCTAssertEqual(stamp.ptsUs, 514_375_000, "12345/24 s")
+        XCTAssertEqual(stamp.rxMonoNs, 42)
+        XCTAssertEqual(IMUFrameStamp.microseconds(CMTime(value: 1_500, timescale: 1_000_000_000)), 2, "rounded, not truncated")
+        XCTAssertNil(IMUFrameStamp.microseconds(.invalid))
+        XCTAssertNil(IMUFrameStamp.microseconds(.indefinite))
+    }
+
+    func testStringsAreEscapedAndNonFiniteNumbersAreNull() throws {
+        let line = IMULogFormat.eventLine("x", monoNs: 1, fields: [
+            ("s", .string("a \"quoted\"\nline\\ \u{01}")),
+            ("nan", .float(.nan)),
+            ("inf", .double(.infinity)),
+        ])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        XCTAssertEqual(object["s"] as? String, "a \"quoted\"\nline\\ \u{01}")
+        XCTAssertTrue(object["nan"] is NSNull)
+        XCTAssertTrue(object["inf"] is NSNull)
+        XCTAssertEqual(object["ev"] as? String, "x")
+        XCTAssertEqual(object["mono_ns"] as? Int, 1)
+    }
+
+    /// The header names the build, the SDK, both Motion rates and both clocks
+    /// at start -- and the SDK version is read from the linked framework, and
+    /// agrees with the project's pin.
+    func testTheHeaderRecordsBuildSDKRatesAndClocks() throws {
+        var header = IMULogHeader(
+            sessionID: UUID(), fileName: "imu-logs/x.jsonl", startMonoNs: 123, startWall: Date(timeIntervalSince1970: 1_790_000_000.25),
+            motionRequestedHz: 60, motionActualHz: 30,
+            motionAttempts: [IMUMotionAttempt(hz: 60, error: "refused"), IMUMotionAttempt(hz: 30, error: nil)],
+            glassesModel: "rayBanMeta", captureResolution: "low", cameraFPSRequested: 24, towerTargetFPS: 12
+        )
+        header.build = IMULogHeader.BuildInfo(
+            appBuildSHA: "abc1234", appVersion: "1.0 (1)", appBinaryModified: nil,
+            datSDKVersion: "1.0.0", datMotionVersion: "1.0.0", phoneModel: "iPhone17,1", phoneOS: "Version 26.5"
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(header.line().utf8)) as? [String: Any])
+        XCTAssertEqual(object["t"] as? String, "header")
+        XCTAssertEqual(object["app_build_sha"] as? String, "abc1234")
+        XCTAssertEqual(object["dat_sdk_version"] as? String, "1.0.0")
+        XCTAssertEqual(object["motion_rate_requested_hz"] as? Int, 60)
+        XCTAssertEqual(object["motion_rate_actual_hz"] as? Int, 30)
+        XCTAssertEqual((object["motion_rate_attempts"] as? [[String: Any]])?.first?["error"] as? String, "refused")
+        XCTAssertEqual(object["phone_model"] as? String, "iPhone17,1")
+        XCTAssertEqual(object["start_mono_ns"] as? Int, 123)
+        XCTAssertEqual(object["start_wall_unix_ms"] as? Int, 1_790_000_000_250)
+        XCTAssertNotNil(object["start_wall_iso"] as? String)
+        XCTAssertNotNil(object["seq_semantics"] as? String)
+
+        // The live values, as a phone would write them.
+        let live = IMULogHeader.BuildInfo.current
+        XCTAssertEqual(live.datSDKVersion, "1.0.0", "read from MWDATCore's own Info.plist")
+        XCTAssertEqual(live.datMotionVersion, "1.0.0")
+        XCTAssertNotNil(live.phoneModel)
+        let project = try String(
+            contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Glasses.xcodeproj/project.pbxproj"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(project.contains("version = \(live.datSDKVersion ?? "?");"), "the linked DAT is not the pinned one")
+    }
+
+    func testTheRecordingIndicatorFollowsTheStatus() {
+        var status = IMURecorderStatus()
+        XCTAssertEqual(IMURecordingIndicator(status), .off)
+        status.phase = .recording
+        XCTAssertEqual(IMURecordingIndicator(status), .writing)
+        status.capReason = "duration"
+        XCTAssertEqual(IMURecordingIndicator(status), .stopped("duration cap"))
+        status.phase = .failed("disk")
+        XCTAssertEqual(IMURecordingIndicator(status), .stopped("error"))
+        status.phase = .closed
+        XCTAssertEqual(IMURecordingIndicator(status), .off)
+    }
+
+    @MainActor
+    func testTheProtectedDataNamesAreUIKits() {
+        XCTAssertEqual(IMURecorder.protectedDataWillBecomeUnavailable, UIApplication.protectedDataWillBecomeUnavailableNotification)
+        XCTAssertEqual(IMURecorder.protectedDataDidBecomeAvailable, UIApplication.protectedDataDidBecomeAvailableNotification)
+    }
+}
+
+/// The recorder against a real file in a temporary directory: ordering, caps,
+/// epochs, the locked phone, and where the I/O runs.
+final class IMURecorderFileTests: XCTestCase {
+
+    private var base: URL!
+
+    override func setUpWithError() throws {
+        base = try IMULogTestSupport.temporaryBase()
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: base)
+    }
+
+    func testTheHeaderIsFirstOnDiskEvenWhenSamplesArriveBeforeIt() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        // Samples before the header, as Motion can deliver before `open`.
+        for i in 0..<5 { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(1_000 + i)) }
+        recorder.noteCameraStart(reason: "stream.start()")
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        for seq in 1...10 {
+            recorder.recordFrame(IMUFrameStamp(ptsUs: Int64(seq) * 41_667, rxMonoNs: UInt64(seq)), seq: seq, sent: seq % 2 == 1)
+        }
+        let summary = IMULogTestSupport.close(recorder)
+        let url = try XCTUnwrap(summary.fileURL)
+        XCTAssertTrue(url.lastPathComponent.hasSuffix("-\(recorder.sessionID.uuidString.prefix(8)).jsonl"))
+        XCTAssertEqual(url.deletingLastPathComponent().lastPathComponent, "imu-logs")
+
+        let lines = try IMULogTestSupport.lines(url)
+        XCTAssertEqual(lines.first?["t"] as? String, "header")
+        XCTAssertEqual(lines.filter { $0["t"] as? String == "header" }.count, 1)
+        XCTAssertEqual(lines.filter { $0["t"] as? String == "m" }.count, 5)
+        let frames = lines.filter { $0["t"] as? String == "f" }
+        XCTAssertEqual(frames.compactMap { $0["seq"] as? Int }, Array(1...10))
+        XCTAssertEqual(frames.filter { $0["sent"] as? Bool == true }.count, 5)
+        XCTAssertEqual(lines.last?["ev"] as? String, "close")
+        XCTAssertEqual(summary.counts.frames, 10)
+        XCTAssertEqual(summary.counts.framesSent, 5)
+        XCTAssertEqual(summary.bytesHeld, 0)
+        XCTAssertEqual(summary.bytesWritten, try Data(contentsOf: url).count)
+    }
+
+    /// Every file operation ran on the recorder's own queue and none on the
+    /// main thread, although every call into the recorder came from it.
+    func testEveryFileOperationRunsOnTheRecordersQueueNotTheMainThread() throws {
+        XCTAssertTrue(Thread.isMainThread, "this test drives the recorder from the main thread on purpose")
+        let recorder = IMURecorder(baseDirectory: base, limits: {
+            var limits = IMURecorder.Limits()
+            limits.flushThresholdBytes = 512
+            return limits
+        }())
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.noteCameraStart(reason: "test")
+        for i in 0..<400 {
+            recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i))
+            if i % 3 == 0 { recorder.recordFrame(IMUFrameStamp(ptsUs: Int64(i) * 13_889, rxMonoNs: UInt64(i)), seq: i / 3 + 1, sent: true) }
+        }
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertGreaterThan(summary.io.operations, 10, "the threshold flushes did not happen")
+        XCTAssertEqual(summary.io.onMainThread, 0, "file I/O ran on the main thread")
+        XCTAssertEqual(summary.io.offQueue, 0, "file I/O ran off the recorder's queue")
+        XCTAssertNil(summary.failure)
+    }
+
+    /// Private by construction: complete protection, and never in a backup.
+    func testTheFileIsProtectedAndExcludedFromBackup() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        let url = try XCTUnwrap(IMULogTestSupport.close(recorder).fileURL)
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(
+            try url.deletingLastPathComponent().resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup,
+            true
+        )
+        let protection = try FileManager.default.attributesOfItem(atPath: url.path)[.protectionKey] as? FileProtectionType
+        // The Simulator does not always report a class; when it does, it must be this one.
+        if let protection { XCTAssertEqual(protection, .complete) }
+    }
+
+    func testSamplesFromAnotherSourceAreCountedNotWritten() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.recordMotion(IMULogTestSupport.reading(0), rxMonoNs: 1)
+        recorder.recordMotion(IMULogTestSupport.reading(1, source: .neuralBand), rxMonoNs: 2)
+        recorder.recordMotion(IMULogTestSupport.reading(2, source: .unknown), rxMonoNs: 3)
+        recorder.recordMotion(IMULogTestSupport.reading(3, source: .neuralBand), rxMonoNs: 4)
+        let summary = IMULogTestSupport.close(recorder)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        XCTAssertEqual(lines.filter { $0["t"] as? String == "m" }.count, 1)
+        XCTAssertEqual(summary.counts.motionOtherBySource, ["neural_band": 2, "unknown": 1])
+        XCTAssertEqual(lines.filter { $0["ev"] as? String == "first_non_glasses_sample" }.count, 1)
+        let counts = try XCTUnwrap(lines.last { $0["ev"] as? String == "counts" })
+        XCTAssertEqual(counts["m_other"] as? Int, 3)
+    }
+
+    func testAGapOnTheGlassesClockIsCountedAsMissingSamples() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.noteMotionStart(hz: 60, requestedHz: 60, attempts: [])
+        for i in [0, 1, 2, 6, 7] { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i)) }
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.counts.motionGapEvents, 1)
+        XCTAssertEqual(summary.counts.motionEstimatedMissing, 3)
+    }
+
+    /// 200 MB in the app; 8 KB here. Data lines stop at the cap, it is logged,
+    /// and the closing lines still land.
+    func testTheSizeCapStopsDataLinesAndSaysSo() throws {
+        var limits = IMURecorder.Limits()
+        limits.maxBytes = 8 * 1024
+        limits.eventReserveBytes = 2 * 1024
+        let recorder = IMURecorder(baseDirectory: base, limits: limits)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        for i in 0..<500 { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i)) }
+        let summary = IMULogTestSupport.close(recorder)
+        let url = try XCTUnwrap(summary.fileURL)
+        let size = try Data(contentsOf: url).count
+        XCTAssertLessThanOrEqual(size, limits.maxBytes)
+        XCTAssertEqual(summary.capReason, "size")
+        XCTAssertGreaterThan(summary.counts.droppedAfterCap, 0)
+        let lines = try IMULogTestSupport.lines(url)
+        let cap = try XCTUnwrap(lines.first { $0["ev"] as? String == "cap_reached" })
+        XCTAssertEqual(cap["cap"] as? String, "size")
+        XCTAssertEqual(lines.last?["ev"] as? String, "close", "the closing line was lost to the cap")
+        XCTAssertLessThan(lines.filter { $0["t"] as? String == "m" }.count, 500)
+    }
+
+    /// 30 minutes in the app; a fraction of a second here.
+    func testTheDurationCapStopsDataLinesAndSaysSo() throws {
+        var limits = IMURecorder.Limits()
+        limits.maxDuration = 0.2
+        let recorder = IMURecorder(baseDirectory: base, limits: limits)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.recordMotion(IMULogTestSupport.reading(0), rxMonoNs: 1)
+        recorder.waitUntilIdle()
+        Thread.sleep(forTimeInterval: 0.3)
+        recorder.recordMotion(IMULogTestSupport.reading(1), rxMonoNs: 2)
+        recorder.recordFrame(IMUFrameStamp(ptsUs: 1, rxMonoNs: 3), seq: 1, sent: true)
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.capReason, "duration")
+        XCTAssertEqual(summary.counts.motionGlasses, 1)
+        XCTAssertEqual(summary.counts.frames, 0)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        XCTAssertEqual(lines.first { $0["ev"] as? String == "cap_reached" }?["cap"] as? String, "duration")
+    }
+
+    /// 1 GB for the folder in the app. A file opens with whatever budget is
+    /// left, and not at all when there is none.
+    func testTheFolderCapBoundsANewFileAndRefusesOneWithNoRoom() throws {
+        let folder = base.appendingPathComponent(IMURecorder.directoryName)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(count: 20_000).write(to: folder.appendingPathComponent("older.jsonl"))
+
+        var limits = IMURecorder.Limits()
+        limits.folderMaxBytes = 20_000 + 12 * 1024
+        limits.eventReserveBytes = 2 * 1024
+        let recorder = IMURecorder(baseDirectory: base, limits: limits)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        for i in 0..<500 { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i)) }
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.capReason, "folder")
+        XCTAssertEqual(summary.effectiveMaxBytes, 12 * 1024)
+        XCTAssertLessThanOrEqual(IMULogStore.totalBytes(in: folder), limits.folderMaxBytes)
+
+        limits.folderMaxBytes = IMULogStore.totalBytes(in: folder) + 1_000
+        let refused = IMURecorder(baseDirectory: base, limits: limits)
+        refused.open(header: IMULogTestSupport.header(recorder: refused))
+        refused.recordMotion(IMULogTestSupport.reading(0), rxMonoNs: 1)
+        let refusal = IMULogTestSupport.close(refused)
+        XCTAssertNotNil(refusal.failure, "a full folder must refuse the new file")
+        XCTAssertNil(refusal.fileURL)
+        XCTAssertEqual(IMULogStore.logFiles(in: folder).count, 2, "a file was created in a full folder")
+    }
+
+    /// A fresh epoch at each camera start, and at a return to streaming after a
+    /// pause; frames carry the epoch they arrived in.
+    func testTheEpochChangesAtEveryCameraStartAndResume() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        var seq = 0
+        func frames(_ n: Int) {
+            for _ in 0..<n {
+                seq += 1
+                recorder.recordFrame(IMUFrameStamp(ptsUs: Int64(seq) * 41_667, rxMonoNs: UInt64(seq)), seq: seq, sent: false)
+            }
+        }
+        recorder.noteCameraStart(reason: "stream.start()")
+        recorder.noteStreamState("starting")
+        recorder.noteStreamState("streaming")   // the first streaming is not a restart
+        frames(3)
+        recorder.noteStreamState("paused")
+        recorder.noteStreamState("streaming")   // resume: a new epoch
+        frames(3)
+        recorder.noteCameraStart(reason: "stream.start()")   // a camera restart
+        frames(3)
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.epochs, 3)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        let starts = lines.filter { $0["ev"] as? String == "camera_start" }
+        XCTAssertEqual(starts.count, 3)
+        let epochs = starts.compactMap { $0["epoch"] as? String }
+        XCTAssertEqual(Set(epochs).count, 3, "an epoch was reused")
+        let frameEpochs = lines.filter { $0["t"] as? String == "f" }.compactMap { $0["epoch"] as? String }
+        XCTAssertEqual(frameEpochs, [String](repeating: epochs[0], count: 3) + [String](repeating: epochs[1], count: 3) + [String](repeating: epochs[2], count: 3))
+        XCTAssertEqual(starts[1]["reason"] as? String, "resume from paused")
+        XCTAssertEqual(starts[1]["prev_epoch"] as? String, epochs[0])
+    }
+
+    func testAPTSThatRunsBackwardsIsLoggedAsADiscontinuity() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.noteCameraStart(reason: "test")
+        for (seq, pts) in [(1, 100_000), (2, 141_667), (3, 50_000), (4, 91_667)] {
+            recorder.recordFrame(IMUFrameStamp(ptsUs: Int64(pts), rxMonoNs: UInt64(seq)), seq: seq, sent: true)
+        }
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.counts.ptsDiscontinuities, 1)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        XCTAssertEqual(lines.first { $0["ev"] as? String == "pts_discontinuity" }?["seq"] as? Int, 3)
+    }
+
+    /// `.complete` protection makes the file unwritable while the phone is
+    /// locked. Lines are held in memory then, written at the unlock, and a close
+    /// asked for while locked waits for it rather than dropping them.
+    func testALockedPhoneHoldsLinesAndWritesThemAtTheUnlock() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        for i in 0..<10 { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i)) }
+        recorder.protectedDataWillBecomeUnavailable()
+        for i in 10..<30 { recorder.recordMotion(IMULogTestSupport.reading(i), rxMonoNs: UInt64(i)) }
+
+        let closed = expectation(description: "closed after the unlock")
+        recorder.close(reason: "locked") { _ in closed.fulfill() }
+        recorder.waitUntilIdle()
+        let whileLocked = recorder.summary()
+        XCTAssertFalse(whileLocked.closed, "a close while locked must wait for the unlock")
+        XCTAssertGreaterThan(whileLocked.bytesHeld, 0)
+        let url = try XCTUnwrap(whileLocked.fileURL)
+        XCTAssertEqual(try IMULogTestSupport.lines(url).filter { $0["t"] as? String == "m" }.count, 10,
+                       "lines were written while the file was locked")
+
+        recorder.protectedDataDidBecomeAvailable()
+        wait(for: [closed], timeout: 5)
+        let lines = try IMULogTestSupport.lines(url)
+        XCTAssertEqual(lines.filter { $0["t"] as? String == "m" }.count, 30)
+        XCTAssertNotNil(lines.first { $0["ev"] as? String == "protected_data_unavailable" })
+        XCTAssertNotNil(lines.first { $0["ev"] as? String == "protected_data_available" })
+        XCTAssertEqual(lines.last?["ev"] as? String, "close")
+        XCTAssertEqual(recorder.summary().bytesHeld, 0)
+    }
+
+    /// The camera path's cost. What the frame listener adds per frame is a
+    /// PTS read and a clock read on DAT's thread, and on the main actor one
+    /// `recordFrame` -- a single enqueue. Both are measured here, from the main
+    /// thread, against a real `CMSampleBuffer`.
+    func testTheRecordersPerFrameCostOnTheCallingThread() throws {
+        let recorder = IMURecorder(baseDirectory: base)
+        recorder.open(header: IMULogTestSupport.header(recorder: recorder))
+        recorder.noteCameraStart(reason: "bench")
+        recorder.waitUntilIdle()
+        let buffer = try IMULogTestSupport.sampleBuffer(pts: CMTime(value: 1, timescale: 24))
+        let n = 20_000
+
+        var stamps: [IMUFrameStamp] = []
+        stamps.reserveCapacity(n)
+        let stampStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<n {
+            stamps.append(IMUFrameStamp(sampleBuffer: buffer, rxMonoNs: DispatchTime.now().uptimeNanoseconds))
+        }
+        let stampNs = Double(DispatchTime.now().uptimeNanoseconds - stampStart) / Double(n)
+
+        var worst: UInt64 = 0
+        var perCall: [UInt64] = []
+        perCall.reserveCapacity(n)
+        let recordStart = DispatchTime.now().uptimeNanoseconds
+        for (i, stamp) in stamps.enumerated() {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            recorder.recordFrame(stamp, seq: i + 1, sent: i % 2 == 0)
+            let dt = DispatchTime.now().uptimeNanoseconds - t0
+            perCall.append(dt)
+            worst = max(worst, dt)
+        }
+        let recordNs = Double(DispatchTime.now().uptimeNanoseconds - recordStart) / Double(n)
+        perCall.sort()
+        let p99 = perCall[n * 99 / 100]
+
+        // And what the recorder's own queue spends per frame line, off the main thread.
+        let drainStart = DispatchTime.now().uptimeNanoseconds
+        recorder.waitUntilIdle()
+        let drainNs = Double(DispatchTime.now().uptimeNanoseconds - drainStart)
+        let summary = IMULogTestSupport.close(recorder)
+        XCTAssertEqual(summary.counts.frames, n)
+
+        print(String(format: "[IMURecBench] per frame: stamp on DAT's thread %.0f ns; recordFrame on the calling thread mean %.0f ns, p99 %llu ns, worst %llu ns; queue drain after the loop %.1f ms", stampNs, recordNs, p99, worst, drainNs / 1_000_000))
+        // A frame arrives every 41.7 ms. Generous bounds for a Debug build on a
+        // shared Simulator host; the printed numbers are the report.
+        XCTAssertLessThan(stampNs, 5_000)
+        XCTAssertLessThan(recordNs, 20_000)
+    }
+}
+
+/// The purge: local, confirmed in the UI, and refused while a log is open.
+@MainActor
+final class IMULogPurgeTests: XCTestCase {
+
+    func testThePurgeDeletesEveryLogAndNothingElse() async throws {
+        let base = try IMULogTestSupport.temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let folder = base.appendingPathComponent(IMURecorder.directoryName)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for i in 0..<3 { try Data(count: 1_000 * (i + 1)).write(to: folder.appendingPathComponent("\(i).jsonl")) }
+        let bystander = base.appendingPathComponent("not-a-log.txt")
+        try Data("keep".utf8).write(to: bystander)
+
+        let glasses = GlassesConnection(wearables: ScriptedWearables(permissionResults: []))
+        glasses.imuLogBaseDirectory = base
+        let deleted = await glasses.purgeIMULogs()
+        XCTAssertEqual(deleted, IMULogInventory(files: 3, bytes: 6_000))
+        XCTAssertEqual(glasses.imuLogInventory, IMULogInventory(files: 0, bytes: 0))
+        XCTAssertTrue(IMULogStore.logFiles(in: folder).isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bystander.path), "the purge reached outside imu-logs")
+    }
+}
+
+/// End to end on Mock Device Kit: a real `DeviceSession`, a real `Camera` and
+/// `Motion`, the real `GlassesConnection`, and -- in the first test -- the real
+/// `ProjectManager` bridge to a `TowerClient` on a local mock Tower, so the
+/// log's `seq` is compared with what actually went out on the wire.
+@MainActor
+final class IMURecorderMockDeviceTests: XCTestCase {
+
+    private var mockGlasses: (any MockGlasses)?
+    private var base: URL!
+
+    override func setUp() async throws {
+        base = try IMULogTestSupport.temporaryBase()
+        MockDeviceKit.shared.enable()
+        let glasses = try MockDeviceKit.shared.pairGlasses(model: .rayBanMeta)
+        glasses.powerOn()
+        glasses.don()
+        mockGlasses = glasses
+    }
+
+    override func tearDown() async throws {
+        if let mockGlasses {
+            await MockDeviceKit.shared.unpairDevice(mockGlasses)
+        }
+        await MockDeviceKit.shared.disable()
+        mockGlasses = nil
+        try? FileManager.default.removeItem(at: base)
+    }
+
+    /// A 60 Hz recording: mock replay follows the configured rate, so a
+    /// recording at any other rate would put the glasses' clock at that rate.
+    static func recording(hz: Double = 60, seconds: Double = 20) -> [MWDATMockDevice.MotionSample] {
+        let gravity = mockMotionGravityMetersPerSecondSquared
+        return (0..<Int(hz * seconds)).map { i in
+            let t = Double(i) / hz
+            let yawRate = Float(2 * sin(t * .pi / 2))
+            return MWDATMockDevice.MotionSample(
+                timestampNs: Int64((t * 1_000_000_000).rounded()),
+                accelerometer: MWDATMockDevice.Vector3(x: 0, y: gravity, z: 0),
+                gyroscope: MWDATMockDevice.Vector3(x: 0, y: yawRate, z: 0),
+                source: .glasses
+            )
+        }
+    }
+
+    private func waitUntil(timeout: TimeInterval, _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    private func startCapture(_ connection: GlassesConnection) async throws {
+        let ready = await waitUntil(timeout: 15) {
+            connection.hasActiveDevice && connection.cameraPermissionStatus == .granted
+        }
+        XCTAssertTrue(ready, "mock glasses never became an active device with camera permission")
+        connection.startCameraSession()
+        XCTAssertNil(connection.lastCaptureStartRefusal)
+        let started = await waitUntil(timeout: 15) {
+            connection.deviceSessionState == .started && connection.cameraStreamState == .streaming
+        }
+        XCTAssertTrue(started, "session \(connection.deviceSessionState), camera \(connection.cameraStreamState)")
+    }
+
+    /// Stops capture and returns the closed log's summary.
+    private func stopCapture(_ connection: GlassesConnection, recorder: IMURecorder?) async -> IMURecorderSummary? {
+        connection.stopCameraSession()
+        _ = await waitUntil(timeout: 10) { connection.captureClaim == .unclaimed }
+        guard let recorder else { return nil }
+        _ = await waitUntil(timeout: 10) { recorder.summary().closed }
+        return recorder.summary()
+    }
+
+    private func streamingConnection(feedSeconds: Int = 12, motionFeed: Bool = true) async throws -> (GlassesConnection, URL) {
+        let glasses = try XCTUnwrap(mockGlasses)
+        if motionFeed { glasses.services.motion.setMotionFeed(Self.recording()) }
+        let feed = try await MotionProbeMockDeviceTests.makeCameraFeed(seconds: feedSeconds)
+        glasses.services.camera.setCameraFeed(fileURL: feed)
+        let connection = GlassesConnection()
+        connection.imuLogBaseDirectory = base
+        return (connection, feed)
+    }
+
+    private static func rateHz(_ values: [Int]) -> Double? {
+        guard let first = values.first, let last = values.last, values.count >= 2, last > first else { return nil }
+        return Double(values.count - 1) / (Double(last - first) / 1_000_000_000)
+    }
+
+    /// The proof. Switch on: one file, the header first and saying 60 Hz, `m`
+    /// lines at about 60 Hz by both clocks, an `f` line for every frame the
+    /// phone received with rising `pts_us` and `sent` exactly where the frame
+    /// was forwarded -- and every frame the mock Tower received carries a `seq`
+    /// the log marks as sent.
+    func testWithTheSwitchOnTheLogHasHeaderMotionAt60HzAndEveryFrame() async throws {
+        let (connection, feed) = try await streamingConnection()
+        defer { try? FileManager.default.removeItem(at: feed) }
+
+        // The mock Tower, and the app's own bridge to it.
+        let server = try MockTowerServer()
+        let port = try await server.start()
+        let wire = MessageRecorder()
+        server.onText = { text in
+            wire.record(text)
+            if text.contains(#""type":"ping""#) { server.send(text: #"{"type":"pong"}"#) }
+        }
+        defer { server.stop() }
+        let tower = TowerClient()
+        let project = ProjectManager(glassesConnection: connection, towerClient: tower)
+        tower.connect(to: URL(string: "ws://127.0.0.1:\(port)/"))
+        let online = await waitUntil(timeout: 10) { tower.status == .online }
+        XCTAssertTrue(online, "the mock Tower never came online (\(tower.status))")
+
+        // Every frame this connection forwarded, as `ProjectManager` saw it.
+        var forwarded: [Int] = []
+        let sink = connection.$latestCapturedFrame.compactMap { $0?.sequence }.sink { forwarded.append($0) }
+        defer { sink.cancel() }
+
+        connection.imuRecorderEnabled = true
+        try await startCapture(connection)
+        let recorder = try XCTUnwrap(connection.imuRecorder, "the switch was on and no recorder was made")
+        XCTAssertEqual(connection.motionConfiguredRate?.hertz, 60)
+        let enough = await waitUntil(timeout: 20) {
+            let counts = recorder.summary().counts
+            return counts.motionGlasses >= 240 && counts.frames >= 72
+                && wire.all.filter { $0.contains(#""type":"frame""#) }.count >= 10
+        }
+        XCTAssertTrue(enough, "not enough data: \(recorder.summary().counts), tower frames \(wire.all.filter { $0.contains(#""type":"frame""#) }.count)")
+        let badgeWhileRecording = connection.imuRecorderReadout.indicator
+        _ = await stopCapture(connection, recorder: recorder)
+        // Frames DAT delivered before the stop can still be queued for the main
+        // actor; each reaches the closed recorder and is counted there. Wait for
+        // the count to settle, then read the recorder, whose read drains its
+        // queue behind every enqueue already made.
+        var framesReceived = connection.frameCount
+        var settled = false
+        while !settled {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            settled = connection.frameCount == framesReceived
+            framesReceived = connection.frameCount
+        }
+        let summary = recorder.summary()
+        withExtendedLifetime(project) {}
+
+        XCTAssertEqual(badgeWhileRecording, .writing, "no recording badge while the log was written")
+        let files = IMULogTestSupport.logFiles(under: base)
+        XCTAssertEqual(files.count, 1, "one file per capture session")
+        let url = try XCTUnwrap(summary.fileURL)
+        XCTAssertEqual(files.first?.lastPathComponent, url.lastPathComponent)
+        XCTAssertEqual(summary.io.onMainThread, 0)
+        XCTAssertNil(summary.failure)
+        let lines = try IMULogTestSupport.lines(url)
+
+        // Header.
+        let header = try XCTUnwrap(lines.first)
+        XCTAssertEqual(header["t"] as? String, "header")
+        XCTAssertEqual(header["motion_rate_requested_hz"] as? Int, 60)
+        XCTAssertEqual(header["motion_rate_actual_hz"] as? Int, 60)
+        XCTAssertEqual(header["dat_sdk_version"] as? String, "1.0.0")
+        XCTAssertEqual(header["glasses_model"] as? String, "Ray-Ban Meta")
+        XCTAssertNotNil(header["start_mono_ns"] as? Int)
+        XCTAssertNotNil(header["start_wall_unix_ms"] as? Int)
+        XCTAssertNotNil(header["phone_model"] as? String)
+
+        // Motion, at about the configured rate by the glasses' clock and by
+        // the phone's.
+        let motion = lines.filter { $0["t"] as? String == "m" }
+        XCTAssertGreaterThanOrEqual(motion.count, 240)
+        XCTAssertTrue(motion.allSatisfy { $0["src"] as? String == "glasses" })
+        let deviceHz = try XCTUnwrap(Self.rateHz(motion.compactMap { $0["ts_ns"] as? Int }))
+        let arrivalHz = try XCTUnwrap(Self.rateHz(motion.compactMap { $0["rx_mono_ns"] as? Int }))
+        XCTAssertEqual(deviceHz, 60, accuracy: 3, "configured 60 Hz, the glasses' clock says \(deviceHz)")
+        XCTAssertEqual(arrivalHz, 60, accuracy: 12, "configured 60 Hz, received at \(arrivalHz)")
+        XCTAssertTrue(motion.allSatisfy { ($0["g"] as? [Double])?.count == 3 && ($0["a"] as? [Double])?.count == 3 })
+
+        // Frames: every one, in order, with a rising PTS in one epoch.
+        let frames = lines.filter { $0["t"] as? String == "f" }
+        let seqs = frames.compactMap { $0["seq"] as? Int }
+        XCTAssertEqual(seqs, Array(1...seqs.count), "an f line is missing or out of order")
+        XCTAssertEqual(seqs.count + summary.counts.framesAfterClose, framesReceived,
+                       "every received frame is either logged or counted as arriving after the close")
+        let pts = frames.compactMap { $0["pts_us"] as? Int }
+        XCTAssertEqual(pts.count, frames.count, "a frame without a PTS")
+        let discontinuities = lines.filter { $0["ev"] as? String == "pts_discontinuity" }.compactMap { $0["seq"] as? Int }
+        for i in 1..<pts.count where !discontinuities.contains(seqs[i]) {
+            XCTAssertGreaterThan(pts[i], pts[i - 1], "pts_us did not rise at seq \(seqs[i])")
+        }
+        let startEpoch = lines.first { $0["ev"] as? String == "camera_start" }?["epoch"] as? String
+        XCTAssertNotNil(startEpoch)
+        XCTAssertTrue(frames.allSatisfy { $0["epoch"] as? String == startEpoch })
+
+        // `sent` is true exactly for the frames handed to the Tower client.
+        let sent = Set(frames.filter { $0["sent"] as? Bool == true }.compactMap { $0["seq"] as? Int })
+        XCTAssertEqual(sent, Set(forwarded).intersection(Set(seqs)), "sent flags disagree with what was forwarded")
+        XCTAssertGreaterThan(sent.count, 0)
+        XCTAssertLessThan(sent.count, seqs.count, "the 12 fps gate forwarded every frame of a 24 fps stream")
+
+        // And the wire: every frame the Tower received carries a `seq` the log
+        // marks as sent, and no `source_seq`, so the Tower's `frames.py` stores
+        // `source_seq = seq` -- the log's `seq`.
+        let towerFrames = wire.all.compactMap { text -> [String: Any]? in
+            guard text.contains(#""type":"frame""#) else { return nil }
+            return try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        }
+        XCTAssertGreaterThanOrEqual(towerFrames.count, 10)
+        for message in towerFrames {
+            let seq = try XCTUnwrap(message["seq"] as? Int)
+            XCTAssertNil(message["source_seq"], "the app now sends source_seq; the Tower would no longer fall back to seq")
+            XCTAssertTrue(sent.contains(seq), "the Tower received seq \(seq), which the log does not mark as sent")
+        }
+        print("[IMURecTest] 60 Hz: m=\(motion.count) deviceHz=\(deviceHz) arrivalHz=\(arrivalHz) f=\(frames.count) sent=\(sent.count) towerFrames=\(towerFrames.count) towerSeqs=\(towerFrames.compactMap { $0["seq"] as? Int }.prefix(8)) payloadKeys=\(towerFrames.first.map { $0.keys.sorted() } ?? [])")
+
+        // Events.
+        let events = lines.filter { $0["t"] as? String == "ev" }.compactMap { $0["ev"] as? String }
+        for name in ["camera_start", "stream_state", "session_state", "motion_start", "motion_state", "camera_stop", "counts", "close"] {
+            XCTAssertTrue(events.contains(name), "no \(name) event")
+        }
+        XCTAssertEqual(lines.first { $0["ev"] as? String == "motion_start" }?["rate_hz"] as? Int, 60)
+        let badgeAfter = await waitUntil(timeout: 3) { connection.imuRecorderReadout.indicator == .off }
+        XCTAssertTrue(badgeAfter, "the recording badge outlived the log")
+
+        // Opt-in, for checking the Mac-side join against a log this app really
+        // wrote: `TEST_RUNNER_IMU_TEST_KEEP_DIR=<dir>` keeps the log and writes
+        // the frames the mock Tower received as a Tower-shaped frames.jsonl.
+        if let keep = ProcessInfo.processInfo.environment["IMU_TEST_KEEP_DIR"], !keep.isEmpty {
+            let dir = URL(fileURLWithPath: keep, isDirectory: true)
+            let capture = dir.appendingPathComponent("capture", isDirectory: true)
+            try FileManager.default.createDirectory(at: capture, withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(url.lastPathComponent))
+            try FileManager.default.copyItem(at: url, to: dir.appendingPathComponent(url.lastPathComponent))
+            let now = Date().timeIntervalSince1970
+            let journal = towerFrames.map { message -> String in
+                let seq = message["seq"] as? Int ?? -1
+                return #"{"schema_version":1,"source_seq":\#(seq),"wire_seq":\#(seq),"tx_seq":\#(message["tx_seq"] as? Int ?? -1),"received_at":\#(now),"time_basis":"tower-receipt","relpath":"frames/\#(String(format: "%08d", seq)).jpg"}"#
+            }.joined(separator: "\n") + "\n"
+            try journal.write(to: capture.appendingPathComponent("frames.jsonl"), atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Switch off, the default: no file, and no Motion capability at all.
+    func testWithTheSwitchOffThereIsNoFileAndNoMotion() async throws {
+        let (connection, feed) = try await streamingConnection(feedSeconds: 6)
+        defer { try? FileManager.default.removeItem(at: feed) }
+        XCTAssertFalse(connection.imuRecorderEnabled, "the IMU log switch must default to OFF")
+        XCTAssertFalse(connection.motionProbeEnabled)
+        try await startCapture(connection)
+        let everStreamed = await waitUntil(timeout: 3) { self.mockGlasses?.services.motion.isStreaming == true }
+        XCTAssertFalse(everStreamed, "Motion streamed with both switches off")
+        XCTAssertFalse(connection.isMotionAttached)
+        XCTAssertNil(connection.imuRecorder)
+        XCTAssertEqual(connection.imuRecorderReadout.indicator, .off)
+        _ = await stopCapture(connection, recorder: nil)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: base.appendingPathComponent(IMURecorder.directoryName).path),
+                       "an imu-logs folder was created with the switch off")
+    }
+
+    /// 60 Hz refused by `addMotion`: the recorder falls back to 30 Hz, and the
+    /// header and the events say so.
+    func testA60HzRefusalFromAddMotionFallsBackTo30() async throws {
+        let (connection, feed) = try await streamingConnection()
+        defer { try? FileManager.default.removeItem(at: feed) }
+        connection.imuRecorderEnabled = true
+        connection.motionRatesRefusedForTesting = [60]
+        try await startCapture(connection)
+        let recorder = try XCTUnwrap(connection.imuRecorder)
+        XCTAssertEqual(connection.motionConfiguredRate?.hertz, 30)
+        let enough = await waitUntil(timeout: 15) { recorder.summary().counts.motionGlasses >= 90 }
+        XCTAssertTrue(enough)
+        let stopped = await stopCapture(connection, recorder: recorder)
+        let summary = try XCTUnwrap(stopped)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        let header = try XCTUnwrap(lines.first)
+        XCTAssertEqual(header["motion_rate_requested_hz"] as? Int, 60)
+        XCTAssertEqual(header["motion_rate_actual_hz"] as? Int, 30)
+        let attempts = try XCTUnwrap(header["motion_rate_attempts"] as? [[String: Any]])
+        XCTAssertEqual(attempts.compactMap { $0["hz"] as? Int }, [60, 30])
+        XCTAssertNotNil(attempts[0]["error"] as? String)
+        XCTAssertTrue(attempts[1]["error"] is NSNull)
+        // Mock replay paces delivery at the configured rate and passes the
+        // recording's own timestamps through, so the rate to check is arrival.
+        let motion = lines.filter { $0["t"] as? String == "m" }
+        let arrivalHz = try XCTUnwrap(Self.rateHz(motion.compactMap { $0["rx_mono_ns"] as? Int }))
+        XCTAssertEqual(arrivalHz, 30, accuracy: 6, "fell back to 30 Hz, received at \(arrivalHz)")
+        XCTAssertNotNil(lines.first { $0["ev"] as? String == "motion_add_failed" })
+    }
+
+    /// 60 Hz accepted but failing at run time before a single sample: one retry
+    /// at 30 Hz, on the live session -- `removeMotion`, then `addMotion` again
+    /// -- and Motion streams again at the new rate. Delivered through the same
+    /// handler as Motion's own error listener, since Mock Device Kit cannot
+    /// publish a Motion error; the "before any sample" condition is
+    /// `runtimeFallbackRate`'s and is tested below.
+    func testA60HzRefusalAtRunTimeFallsBackTo30Once() async throws {
+        let (connection, feed) = try await streamingConnection()
+        defer { try? FileManager.default.removeItem(at: feed) }
+        connection.imuRecorderEnabled = true
+        try await startCapture(connection)
+        let recorder = try XCTUnwrap(connection.imuRecorder)
+        XCTAssertEqual(connection.motionConfiguredRate?.hertz, 60)
+
+        connection.injectMotionRefusalForTesting()
+        XCTAssertEqual(connection.motionConfiguredRate?.hertz, 30, "no fallback to 30 Hz")
+        XCTAssertTrue(connection.isMotionAttached)
+        connection.injectMotionRefusalForTesting()
+        XCTAssertEqual(connection.motionConfiguredRate?.hertz, 30, "the fallback is taken once, not repeatedly")
+
+        let resumed = await waitUntil(timeout: 15) { connection.motionSamplesSinceAttach >= 60 }
+        XCTAssertTrue(resumed, "Motion did not stream again after the fallback (\(connection.motionSamplesSinceAttach) samples)")
+        let stopped = await stopCapture(connection, recorder: recorder)
+        let summary = try XCTUnwrap(stopped)
+        let lines = try IMULogTestSupport.lines(try XCTUnwrap(summary.fileURL))
+        let fallback = try XCTUnwrap(lines.first { $0["ev"] as? String == "motion_fallback" })
+        XCTAssertEqual(fallback["from_hz"] as? Int, 60)
+        XCTAssertEqual(fallback["to_hz"] as? Int, 30)
+        XCTAssertEqual(lines.filter { $0["ev"] as? String == "motion_start" }.compactMap { $0["rate_hz"] as? Int }, [60, 30])
+        XCTAssertEqual(lines.filter { $0["ev"] as? String == "motion_fallback" }.count, 1)
+        // After the fallback, samples arrive at about 30 Hz.
+        let restartedAt = try XCTUnwrap(lines.last { $0["ev"] as? String == "motion_start" }?["mono_ns"] as? Int)
+        let after = lines.filter { $0["t"] as? String == "m" }.compactMap { $0["rx_mono_ns"] as? Int }.filter { $0 > restartedAt }
+        let arrivalHz = try XCTUnwrap(Self.rateHz(after))
+        XCTAssertEqual(arrivalHz, 30, accuracy: 6, "after the fallback, received at \(arrivalHz)")
+        print("[IMURecTest] runtime fallback: \(after.count) samples after the retry at \(arrivalHz) Hz")
+    }
+
+    /// The decision itself: only with the recorder on, only before any sample,
+    /// only once, only to a later rate.
+    func testTheRunTimeFallbackDecision() {
+        let rates = GlassesConnection.imuRecorderMotionRates
+        func decide(_ rate: MotionSamplingRate, on: Bool = true, fell: Bool = false, samples: Int = 0) -> Int? {
+            GlassesConnection.runtimeFallbackRate(
+                after: rate, in: rates, recorderOn: on, alreadyFellBack: fell, samplesSinceAttach: samples
+            )?.hertz
+        }
+        XCTAssertEqual(rates.map(\.hertz), [60, 30])
+        XCTAssertEqual(decide(.hz60), 30)
+        XCTAssertNil(decide(.hz60, samples: 1), "a rate that delivered was not refused")
+        XCTAssertNil(decide(.hz60, fell: true), "only once")
+        XCTAssertNil(decide(.hz60, on: false), "the probe alone never falls back")
+        XCTAssertNil(decide(.hz30), "nothing after the last rate")
     }
 }
 #endif

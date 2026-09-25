@@ -272,6 +272,12 @@ struct ContentView: View {
         }
 
         #if DEBUG
+        // Shown only while an IMU log is open: the persistent recording sign.
+        // Trailing rather than principal, which would displace the title even
+        // when the badge is empty.
+        ToolbarItem(placement: .topBarTrailing) {
+            IMURecordingBadge(readout: project.glassesConnection.imuRecorderReadout)
+        }
         ToolbarItem(placement: .topBarTrailing) {
             Button {
                 destination = .developer

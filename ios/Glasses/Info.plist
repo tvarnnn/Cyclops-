@@ -41,6 +41,11 @@
 		<string>5W593MH533</string>
 	</dict>
 
+	<!-- The commit this build was made from, for the DEBUG IMU log's header.
+	     Empty unless the build passes GLASSES_BUILD_SHA=<sha> to xcodebuild. -->
+	<key>GlassesBuildSHA</key>
+	<string>$(GLASSES_BUILD_SHA)</string>
+
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

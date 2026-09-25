@@ -15,6 +15,7 @@ import MWDATCamera
 import MWDATMockDevice
 import MWDATMotion
 import UIKit
+import os
 #endif
 
 /// Wraps the Meta Wearables DAT `WearablesInterface` and exposes registration
@@ -373,6 +374,61 @@ final class GlassesConnection: ObservableObject {
     /// Whether a Motion capability is attached to the current session.
     var isMotionAttached: Bool { motion != nil }
 
+    /// The rate Motion was attached at, while it is attached.
+    private(set) var motionConfiguredRate: MotionSamplingRate?
+    /// Every `addMotion` of the current attach, in order, for the IMU log's
+    /// header.
+    private var motionAttempts: [IMUMotionAttempt] = []
+    /// Samples of any source since Motion was last attached. Written by the
+    /// detached sample loop and read here, so it lives behind a lock.
+    private let motionSampleCount = OSAllocatedUnfairLock(initialState: 0)
+    /// Whether the one run-time fallback (60 Hz to 30 Hz) has been used.
+    private var motionFellBack = false
+
+    // MARK: IMU recorder (walk-5 evidence; DEBUG-only, default OFF)
+
+    /// Whether the **next** capture session also records the glasses IMU and
+    /// the timing of every camera frame to `Documents/imu-logs/`, one file per
+    /// session, for an offline join with the Tower's capture.
+    ///
+    /// `motionProbeEnabled`'s pattern exactly: a developer control, written by
+    /// Developer Tools, not persisted (OFF after every relaunch), and read once,
+    /// when the camera starts. When on, Motion starts at 60 Hz (30 Hz if 60 is
+    /// refused) whether or not the probe switch is on. Nothing is sent to the
+    /// Tower.
+    @Published var imuRecorderEnabled = false
+
+    /// The rates the recorder asks Motion for, in order of preference.
+    static let imuRecorderMotionRates: [MotionSamplingRate] = [.hz60, .hz30]
+
+    /// The rate `beginCameraStream` requests from the camera, also written to
+    /// the IMU log's header.
+    static let cameraFrameRate = 24
+
+    /// The recorder's readout, on its own object so the recorder's once-a-second
+    /// report never re-renders the screens that observe this one.
+    let imuRecorderReadout = IMURecorderReadout()
+
+    /// The current capture session's recorder, or `nil`.
+    private(set) var imuRecorder: IMURecorder?
+
+    /// Where `imu-logs/` is created; `nil` is Documents. A test seam.
+    var imuLogBaseDirectory: URL?
+    /// The recorder's bounds. A test seam; the default is 200 MB.
+    var imuRecorderLimits: IMURecorder.Limits = .standard
+
+    /// The glasses' last `DeviceState`, so a recorder that opens mid-life
+    /// starts from the current reading rather than waiting for a change.
+    private var lastDeviceState: IMUDeviceStateSnapshot?
+
+    /// How many IMU logs this phone holds, as last read; `nil` until read.
+    @Published private(set) var imuLogInventory: IMULogInventory?
+
+    /// Test seam: rates `addMotion` is treated as having refused, by hertz, so
+    /// the fallback can be exercised on Mock Device Kit, which grants every
+    /// rate. Empty in the app.
+    var motionRatesRefusedForTesting: Set<Int> = []
+
     /// DAT's nonblocking compatibility warning, if it has been seen. Shown in
     /// Developer Tools instead of as an alert; see `DATNonblockingWarning`.
     @Published private(set) var datNonblockingWarning: DATNonblockingWarning?
@@ -534,6 +590,7 @@ final class GlassesConnection: ObservableObject {
         deviceStateTokenBag.clear()
         motionSamplesTask?.cancel()
         motion?.stop()
+        imuRecorder?.close(reason: "connection released")
         camera?.stop()
         deviceSession?.stop()
         #endif
@@ -1005,6 +1062,7 @@ final class GlassesConnection: ObservableObject {
     /// `deviceSession.stop()` for the full session.
     func stopCameraSession() {
         print("[Glasses][Camera] stopCameraSession called")
+        imuRecorder?.noteEvent("stop_requested")
         if let camera {
             cameraStreamState = .stopping
             camera.stop()
@@ -1030,6 +1088,9 @@ final class GlassesConnection: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.deviceSessionState = state
+                // Pause and resume reach the IMU log here, before a `.stopped`
+                // below closes it.
+                self.imuRecorder?.noteSessionState(state.description)
                 print("[Glasses][Camera] DeviceSessionState changed: \(state)")
                 if state == .started {
                     self.beginCameraStream(on: session)
@@ -1084,6 +1145,10 @@ final class GlassesConnection: ObservableObject {
         warning.source = source
         datNonblockingWarning = warning
         print("[Glasses][Camera] DAT nonblocking warning from \(source), logged and not shown as an alert (seen \(warning.count)x): \(description)")
+        imuRecorder?.noteEvent("dat_warning", fields: [
+            ("error", .string(description)),
+            ("source", .string(source)),
+        ])
     }
 
     /// Adds the camera capability and starts its stream. Requires camera
@@ -1108,7 +1173,7 @@ final class GlassesConnection: ObservableObject {
         let config = StreamConfiguration(
             videoCodec: VideoCodec.raw,
             resolution: requestedResolution.streamingResolution,
-            frameRate: 24
+            frameRate: UInt(Self.cameraFrameRate)
         )
         // Logged because the rung is otherwise invisible in the console, and
         // every frame-dimension line below should be read against it. If the
@@ -1127,14 +1192,36 @@ final class GlassesConnection: ObservableObject {
             }
             camera = newCamera
             print("[Glasses][Camera] addCamera succeeded")
-            setupStreamListeners(for: newCamera.stream)
+            // Created before the stream listeners, which stamp every frame for
+            // it on DAT's thread; `nil` unless the developer switch is on.
+            let recorder = makeIMURecorderIfEnabled()
+            setupStreamListeners(for: newCamera.stream, recorder: recorder)
             cameraStreamState = .starting
+            recorder?.noteCameraStart(reason: "stream.start()")
             newCamera.stream.start()
             print("[Glasses][Camera] stream.start() called")
             // After the camera, and only once it is up: the camera path above is
             // the product, and nothing about Motion may stand in its way.
-            if motionProbeEnabled {
-                startMotionProbe(on: session)
+            if motionProbeEnabled || recorder != nil {
+                startMotion(on: session)
+            }
+            // Last, so the header can say which Motion rate was granted. It is
+            // still the first line on disk: the recorder holds everything noted
+            // before it.
+            if let recorder {
+                recorder.open(header: IMULogHeader(
+                    sessionID: recorder.sessionID,
+                    fileName: recorder.relativePath,
+                    startMonoNs: recorder.startMonoNs,
+                    startWall: recorder.startWall,
+                    motionRequestedHz: Self.imuRecorderMotionRates.first?.hertz,
+                    motionActualHz: motionConfiguredRate?.hertz,
+                    motionAttempts: motionAttempts,
+                    glassesModel: session.device?.deviceType().rawValue,
+                    captureResolution: requestedResolution.rawValue,
+                    cameraFPSRequested: Self.cameraFrameRate,
+                    towerTargetFPS: FrameRateGate.towerTargetFPS
+                ))
             }
         } catch {
             print("[Glasses][Camera] addCamera failed: \(error.localizedDescription)")
@@ -1189,10 +1276,11 @@ final class GlassesConnection: ObservableObject {
         session?.stop()
     }
 
-    private func setupStreamListeners(for stream: MWDATCamera.Stream) {
+    private func setupStreamListeners(for stream: MWDATCamera.Stream, recorder: IMURecorder?) {
         stream.statePublisher.listen { [weak self] state in
             Task { @MainActor [weak self] in
                 self?.cameraStreamState = state
+                recorder?.noteStreamState(Self.name(of: state))
                 print("[Glasses][Camera] StreamState changed: \(state)")
                 if case .streaming = state {
                     self?.cameraStreamDidStart.send(())
@@ -1210,6 +1298,12 @@ final class GlassesConnection: ObservableObject {
             FramePTSProbe.shared.record(
                 sampleBuffer: frame.sampleBuffer, hostNow: MonotonicClock.now
             )
+            // The IMU recorder's two clocks for this frame, read here for the
+            // same reason: receipt before the hop, and the buffer's own PTS.
+            // Two reads, and only while the recorder is on.
+            let imuStamp = recorder.map { _ in
+                IMUFrameStamp(sampleBuffer: frame.sampleBuffer, rxMonoNs: DispatchTime.now().uptimeNanoseconds)
+            }
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -1223,6 +1317,18 @@ final class GlassesConnection: ObservableObject {
                 self.frameCount += 1
                 let sequence = self.frameCount
                 self.metrics.recordCapture(sequence: sequence)
+
+                // Every frame gets an `f` line, on whichever `return` below
+                // ends its journey. `sequence` is the number `CapturedFrame`
+                // carries to `TowerClient.sendFrame` as `seq`, which the Tower
+                // stores as `source_seq`; `forwarded` is set only once the frame
+                // has been handed on. The call is one enqueue.
+                var forwarded = false
+                defer {
+                    if let recorder, let imuStamp {
+                        recorder.recordFrame(imuStamp, seq: sequence, sent: forwarded)
+                    }
+                }
 
                 guard self.frameRateGate.shouldSelect(at: now) else {
                     self.metrics.recordSkip()
@@ -1269,6 +1375,7 @@ final class GlassesConnection: ObservableObject {
                     width: dimensions.width,
                     height: dimensions.height
                 )
+                forwarded = true
             }
         }.store(in: streamTokenBag)
 
@@ -1281,33 +1388,66 @@ final class GlassesConnection: ObservableObject {
     }
 
     /// Attaches DAT 1.0.0's experimental Motion capability to a started
-    /// session and feeds its samples to `motionProbe`.
+    /// session, for the probe's readout, the IMU recorder, or both.
+    ///
+    /// With the recorder on, 60 Hz is asked for first and 30 Hz if `addMotion`
+    /// refuses it; with only the probe, 30 Hz as before. Every attempt is kept
+    /// for the log's header.
     ///
     /// Every failure here is logged and shown in the probe's own readout, and
     /// deliberately **not** written to `errorMessage`: that one presents a
     /// modal alert, and a developer probe must never interrupt a capture that
     /// is otherwise working. Nor does a failure end the session.
-    private func startMotionProbe(on session: DeviceSession) {
+    private func startMotion(on session: DeviceSession) {
         guard motion == nil else { return }
         motionProbe.reset()
+        motionAttempts = []
+        motionFellBack = false
+        let rates = imuRecorder != nil
+            ? Self.imuRecorderMotionRates
+            : [Self.motionProbeConfiguration.samplingRate]
+        for rate in rates where attachMotion(on: session, rate: rate) {
+            break
+        }
+    }
+
+    /// One `addMotion` at `rate`, recorded in `motionAttempts`. Returns whether
+    /// Motion is now attached and started.
+    @discardableResult
+    private func attachMotion(on session: DeviceSession, rate: MotionSamplingRate) -> Bool {
+        let recorder = imuRecorder
+        if motionRatesRefusedForTesting.contains(rate.hertz) {
+            let refusal = "refused by the test seam"
+            print("[Glasses][Motion] addMotion(\(rate.hertz) Hz) \(refusal)")
+            motionAttempts.append(IMUMotionAttempt(hz: rate.hertz, error: refusal))
+            recorder?.noteEvent("motion_add_failed", fields: [("rate_hz", .int(rate.hertz)), ("error", .string(refusal))])
+            return false
+        }
         do {
-            guard let newMotion = try session.addMotion(configuration: Self.motionProbeConfiguration) else {
-                print("[Glasses][Motion] addMotion returned nil (session not started)")
+            guard let newMotion = try session.addMotion(configuration: MotionConfiguration(samplingRate: rate)) else {
+                print("[Glasses][Motion] addMotion(\(rate.hertz) Hz) returned nil (session not started)")
+                motionAttempts.append(IMUMotionAttempt(hz: rate.hertz, error: "addMotion returned nil"))
                 motionProbe.noteFailure("addMotion returned nil")
-                return
+                recorder?.noteEvent("motion_add_failed", fields: [
+                    ("rate_hz", .int(rate.hertz)), ("error", .string("addMotion returned nil")),
+                ])
+                return false
             }
             motion = newMotion
+            motionConfiguredRate = rate
+            motionAttempts.append(IMUMotionAttempt(hz: rate.hertz, error: nil))
+            motionSampleCount.withLock { $0 = 0 }
             let probe = motionProbe
             newMotion.statePublisher.listen { state in
                 Task { @MainActor in
                     probe.noteState(state.description)
+                    recorder?.noteEvent("motion_state", fields: [("state", .string(state.description))])
                     print("[Glasses][Motion] MotionState changed: \(state)")
                 }
             }.store(in: motionTokenBag)
-            newMotion.errorPublisher.listen { error in
-                Task { @MainActor in
-                    probe.noteFailure(error.description)
-                    print("[Glasses][Motion] motion error: \(error.description)")
+            newMotion.errorPublisher.listen { [weak self] error in
+                Task { @MainActor [weak self] in
+                    self?.handleMotionError(error, rate: rate, on: session)
                 }
             }.store(in: motionTokenBag)
             // Detached so the receipt time is read as the sample leaves DAT's
@@ -1315,39 +1455,214 @@ final class GlassesConnection: ObservableObject {
             // — the same reason `FramePTSProbe` samples on DAT's thread. The
             // stream finishes when the session tears down; the task is also
             // cancelled in `cleanupCameraSession()`.
+            //
+            // With the recorder on, the probe's readout is not fed: it awaits
+            // the main actor once per sample, and DAT's stream keeps only the
+            // newest 256 samples, so a busy main actor would cost the log
+            // samples. The recorder's own rows report the rate instead, and its
+            // call is one enqueue.
             let samples = newMotion.samples
+            let counter = motionSampleCount
+            let feedsProbe = recorder == nil
             motionSamplesTask = Task.detached {
                 for await sample in samples {
-                    let received = MotionProbeSample(sample, receivedAt: MonotonicClock.now)
-                    await probe.record(received)
+                    let receivedNs = DispatchTime.now().uptimeNanoseconds
+                    counter.withLock { $0 += 1 }
+                    recorder?.recordMotion(IMUMotionReading(sample), rxMonoNs: receivedNs)
+                    if feedsProbe {
+                        let received = MotionProbeSample(sample, receivedAt: TimeInterval(receivedNs) / 1_000_000_000)
+                        await probe.record(received)
+                    }
                 }
             }
             newMotion.start()
-            print("[Glasses][Motion] motion.start() called (\(Self.motionProbeConfiguration.samplingRate))")
+            recorder?.noteMotionStart(
+                hz: rate.hertz,
+                requestedHz: Self.imuRecorderMotionRates.first?.hertz ?? rate.hertz,
+                attempts: motionAttempts
+            )
+            print("[Glasses][Motion] motion.start() called (\(rate.hertz) Hz)")
+            return true
         } catch {
-            print("[Glasses][Motion] addMotion failed: \(error.description)")
+            print("[Glasses][Motion] addMotion(\(rate.hertz) Hz) failed: \(error.description)")
+            motionAttempts.append(IMUMotionAttempt(hz: rate.hertz, error: error.description))
             motionProbe.noteFailure(error.description)
+            recorder?.noteEvent("motion_add_failed", fields: [
+                ("rate_hz", .int(rate.hertz)), ("error", .string(error.description)),
+            ])
+            return false
         }
     }
 
-    /// Detaches the Motion probe. The session tears its capabilities down
-    /// with it, so this only releases this app's references and listeners.
-    private func stopMotionProbe() {
+    /// A Motion error: logged, shown in the probe's readout, written to the IMU
+    /// log, and never to `errorMessage`. It may trigger the one fallback.
+    private func handleMotionError(
+        _ error: MotionError,
+        rate: MotionSamplingRate,
+        on session: DeviceSession,
+        samplesSinceAttach: Int? = nil
+    ) {
+        motionProbe.noteFailure(error.description)
+        imuRecorder?.noteEvent("motion_error", fields: [
+            ("error", .string(error.description)), ("rate_hz", .int(rate.hertz)),
+        ])
+        print("[Glasses][Motion] motion error: \(error.description)")
+        fallBackIfRateRefused(
+            error, rate: rate, on: session,
+            samplesSinceAttach: samplesSinceAttach ?? motionSampleCount.withLock { $0 }
+        )
+    }
+
+    /// Test seam: delivers `MotionError.sensorUnavailable` exactly as Motion's
+    /// error listener would, for the attached rate, and as though no sample
+    /// had arrived yet. Mock Device Kit can neither publish a Motion error nor
+    /// be kept from replaying samples, so both halves are staged here; the
+    /// sample-count half of the decision is `runtimeFallbackRate`'s, tested on
+    /// its own.
+    func injectMotionRefusalForTesting() {
+        guard let rate = motionConfiguredRate, let session = deviceSession else { return }
+        handleMotionError(.sensorUnavailable, rate: rate, on: session, samplesSinceAttach: 0)
+    }
+
+    /// Whether a Motion error at `rate` earns the one run-time fallback, and to
+    /// what: only with the recorder on, only before any sample arrived (a rate
+    /// that delivered was not refused), only once, and only to a rate the
+    /// recorder lists after this one.
+    nonisolated static func runtimeFallbackRate(
+        after rate: MotionSamplingRate,
+        in rates: [MotionSamplingRate],
+        recorderOn: Bool,
+        alreadyFellBack: Bool,
+        samplesSinceAttach: Int
+    ) -> MotionSamplingRate? {
+        guard recorderOn, !alreadyFellBack, samplesSinceAttach == 0,
+              let index = rates.firstIndex(of: rate), index + 1 < rates.count
+        else { return nil }
+        return rates[index + 1]
+    }
+
+    /// Samples of any source received since Motion was last attached.
+    var motionSamplesSinceAttach: Int { motionSampleCount.withLock { $0 } }
+
+    /// The recorder's 60 Hz refused at run time rather than by `addMotion`:
+    /// a Motion error before a single sample. Retried once, at the next rate,
+    /// so a refusal costs the walk's IMU a moment rather than the whole walk.
+    private func fallBackIfRateRefused(
+        _ error: MotionError, rate: MotionSamplingRate, on session: DeviceSession, samplesSinceAttach: Int
+    ) {
+        guard deviceSession === session, motionConfiguredRate == rate,
+              let next = Self.runtimeFallbackRate(
+                  after: rate, in: Self.imuRecorderMotionRates, recorderOn: imuRecorder != nil,
+                  alreadyFellBack: motionFellBack, samplesSinceAttach: samplesSinceAttach
+              )
+        else { return }
+        motionFellBack = true
+        print("[Glasses][Motion] \(rate.hertz) Hz failed before any sample (\(error.description)); retrying once at \(next.hertz) Hz")
+        imuRecorder?.noteEvent("motion_fallback", fields: [
+            ("from_hz", .int(rate.hertz)), ("to_hz", .int(next.hertz)), ("error", .string(error.description)),
+        ])
+        detachMotion()
+        do {
+            try session.removeMotion()
+        } catch {
+            print("[Glasses][Motion] removeMotion before the fallback failed: \(error.description)")
+        }
+        attachMotion(on: session, rate: next)
+    }
+
+    /// Releases this app's Motion references and listeners.
+    private func detachMotion() {
         motionSamplesTask?.cancel()
         motionSamplesTask = nil
         motionTokenBag.clear()
-        guard let motion else { return }
-        motion.stop()
-        self.motion = nil
+        motion?.stop()
+        motion = nil
+    }
+
+    /// Detaches Motion at session end. The session tears its capabilities down
+    /// with it, so this only releases this app's references and listeners.
+    private func stopMotion() {
+        let wasAttached = motion != nil
+        detachMotion()
+        motionConfiguredRate = nil
+        guard wasAttached else { return }
         motionProbe.noteState("off")
-        print("[Glasses][Motion] motion probe stopped")
+        imuRecorder?.noteEvent("motion_stop")
+        print("[Glasses][Motion] motion stopped")
+    }
+
+    /// A recorder for this capture session, if the developer switch is on.
+    private func makeIMURecorderIfEnabled() -> IMURecorder? {
+        guard imuRecorderEnabled else { return nil }
+        let readout = imuRecorderReadout
+        let recorder = IMURecorder(baseDirectory: imuLogBaseDirectory, limits: imuRecorderLimits) { status in
+            Task { @MainActor in readout.update(status) }
+        }
+        imuRecorder = recorder
+        if let lastDeviceState {
+            recorder.noteDeviceState(lastDeviceState)
+        }
+        print("[Glasses][IMURec] armed for this capture session: \(recorder.relativePath)")
+        return recorder
+    }
+
+    /// Ends this session's log. Frames still queued for the main actor reach
+    /// a closed recorder and are counted there, not written.
+    private func closeIMURecorder(reason: String) {
+        guard let recorder = imuRecorder else { return }
+        imuRecorder = nil
+        recorder.noteCameraStop(reason: reason)
+        recorder.close(reason: reason) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshIMULogInventory() }
+        }
+    }
+
+    /// Re-reads how many logs this phone holds. The read is file I/O, so it
+    /// runs off the main actor.
+    func refreshIMULogInventory() {
+        let base = imuLogBaseDirectory
+        Task.detached { [weak self] in
+            let inventory = IMULogStore.inventory(base: base)
+            await MainActor.run { [weak self] in self?.imuLogInventory = inventory }
+        }
+    }
+
+    /// Deletes every IMU log on this phone, off the main actor, and returns
+    /// what was deleted. Local to this app's own container; nothing else is
+    /// touched. Refused (`nil`) while a capture session holds a recorder, so
+    /// the file being written is never pulled out from under it.
+    @discardableResult
+    func purgeIMULogs() async -> IMULogInventory? {
+        guard imuRecorder == nil else {
+            print("[Glasses][IMURec] purge refused: a recorder is open")
+            return nil
+        }
+        let base = imuLogBaseDirectory
+        let deleted = await Task.detached { IMULogStore.purge(base: base) }.value
+        print("[Glasses][IMURec] purged \(deleted.files) IMU logs (\(deleted.bytes) bytes) from this phone")
+        imuLogInventory = await Task.detached { IMULogStore.inventory(base: base) }.value
+        return deleted
+    }
+
+    /// `StreamState`'s cases, spelled out for the log rather than left to
+    /// `String(describing:)`.
+    nonisolated static func name(of state: MWDATCamera.StreamState) -> String {
+        switch state {
+        case .stopping: return "stopping"
+        case .stopped: return "stopped"
+        case .waitingForDevice: return "waitingForDevice"
+        case .starting: return "starting"
+        case .streaming: return "streaming"
+        case .paused: return "paused"
+        }
     }
 
     private func cleanupCameraSession() {
         print("[Glasses][Camera] session cleanup")
         FramePTSProbe.shared.reportFinal(reason: "session cleanup")
         let hadCamera = camera != nil
-        stopMotionProbe()
+        stopMotion()
+        closeIMURecorder(reason: "session cleanup")
         sessionTokenBag.clear()
         streamTokenBag.clear()
         deviceSession = nil
@@ -1394,6 +1709,7 @@ final class GlassesConnection: ObservableObject {
         // It stays nil until the new listener actually delivers — and stays nil
         // if DAT has no `Device` for the identifier, as the stream did.
         glassesThermalLevel = nil
+        lastDeviceState = nil
 
         guard let identifier, let device = wearables.deviceForIdentifier(identifier) else { return }
         // `[weak self]` throughout: the bag that owns the listener is owned by
@@ -1402,6 +1718,11 @@ final class GlassesConnection: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.deviceStateIdentifier == identifier else { return }
                 self.glassesThermalLevel = state.thermalLevel
+                // Thermal and battery changes, for the IMU log; the recorder
+                // writes one only when it differs from the last.
+                let snapshot = IMUDeviceStateSnapshot(state)
+                self.lastDeviceState = snapshot
+                self.imuRecorder?.noteDeviceState(snapshot)
                 print("[Glasses][Health] glasses thermalLevel: \(state.thermalLevel)")
             }
         }.store(in: deviceStateTokenBag)
