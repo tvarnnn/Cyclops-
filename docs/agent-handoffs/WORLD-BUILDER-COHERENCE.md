@@ -118,6 +118,9 @@ never touched.
 | `TOWER_WORLD_SOLVE_CONSENSUS` | `1` | `3` | mapper-seed draws; accepts 1, 3, 5 or 7 only, and anything else reads as 1 and is logged |
 | `TOWER_WORLD_AREA_BUILDS` | `false` | `true` | the idle finisher builds each area; off shows *could not be built* |
 | `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`, then `silent` | the A/B arm; the builder reads it at each session start |
+| `TOWER_WORLD_RELOCALIZER_HISTORY` | `0` | `0` through walk 3; `20` for the arm after it (manager 064, 067) | 4 to 20 older keyframes added to each episode's 10 references. They are consulted only when the recent ones decide nothing, as spare-cycle work that yields to a newer frame. A link through one carries `historical: true` in the journal. Out-of-range values read as `0` and are logged |
+| `TOWER_WORLD_RELOCALIZER_SUMMARY` | `off` | `off` through walk 3; `on` with HISTORY | one `recovery_summary` line per episode, **in the journal only**; it never reaches the phone |
+| `TOWER_WORLD_RELOCALIZER_WINDOW` | `loss` | `loss` | `prompt` would start a prompted episode's timeout at the prompt. It was measured worse in the replay (`RUN\lead\reloc2\`) and is not deployed |
 | `TOWER_WORLD_FINISH_PENDING` | `true` | `true` | finishes areas, owed re-gates and deferred consensus |
 | `TOWER_WORLD_SOLVE`, `_SURFACE` | `true` | `true` | the finisher runs only with these two and `TOWER_WORLD_FINISH_PENDING` on (`tower/tower/main.py`, `_world_finish_spec`) |
 | `TOWER_WORLD_APPEARANCE` | `true` | `true` | builds the room's and the areas' appearance; for the finisher it only switches `--appearance` |
@@ -614,6 +617,12 @@ everything, so nothing runs after a failure:
      honest separate area.
    - **A Codex (gpt-5.6-sol) design note is in** `RUN\review\codex\design-anchor-verification-*.md`.
      Treat it as leads to verify.
+   - **Decide how the gate counts a relocalizer import (manager 064).** One accepted
+     triangle imports two pairs through one anchor image whose other ends are consecutive
+     keyframes already linked to each other. That is exactly the gate's "two pairs through
+     one image closing a triangle" (`coherence_gate.py:285-297`), so **one live decision
+     counts as two links**. Decide whether one import counts as one link for
+     independence.
 3. **Redactor precision:** measure it on the frozen worlds and fix the false positives
    (manager 021).
 4. **Builder keyframe-id collision on reconnect.** Ids come from `source_seq`, so a
@@ -691,9 +700,29 @@ everything, so nothing runs after a failure:
       Measure a lower inlier floor's wrong-match rate before considering it.
     - **The candidates** (manager 058), measured offline with an exact replay of the
       relocalizer (`RUN\lead\reloc1\`, `reloc2\`), acceptance rule unchanged:
-      - the window runs from the prompt;
-      - references include a time- and viewpoint-spread sample of earlier keyframes;
-      - the per-episode summary event.
+      - the window runs from the prompt: **worse; not deployed** (WINDOW);
+      - references include a time- and viewpoint-spread sample of earlier keyframes:
+        **HISTORY**, landed off by default at `08b1e09`;
+      - the per-episode summary event: **SUMMARY**, landed off by default.
+    - **HISTORY's replay** (9 walks, base against HISTORY=20; `RUN\lead\reloc2\TABLE_out_f1b*.md`):
+      - recoveries went from 35 to 43 at normal cost, and 34 to 40 at double cost;
+      - **0 extra wrong links** at either cost;
+      - **0 of 19 and 0 of 11 historical links wrong.**
+
+      Recent references decide first, and history runs only when they yield nothing, as
+      preemptible spare-cycle work (review F1). With nothing set, the journal is
+      byte-identical to `9f4766a` (the golden test).
+    - **Aliasing on repeated structure must be measured before HISTORY can become a
+      default** (review F2). A long-range link to a look-alike place can survive COLMAP's
+      re-verification just as it fooled SIFT live. Score every `historical: true` link of
+      the HISTORY arm against the final solve, with an image-only check.
+    - **RV-RELOC's remaining nits** (re-check of `08b1e09`, clean):
+      - `events.py:78-81`'s summary-key comment omits `history_preempted`;
+      - `recovery_anchored` links carry no historical mark;
+      - the preemption unit test fakes the mailbox (RV-RELOC's real-thread check,
+        `RUN\lead\rvreloc\async_preempt.py`, covers the gap);
+      - under heavy load history may get no spare time. That is safe, and the summary's
+        `history_preempted` count shows it.
 18. **Speed.**
     - Compute masks and depth *during* the walk (per keyframe, as frames arrive), so the
       Stop-time solve does not start from zero.
@@ -709,3 +738,43 @@ everything, so nothing runs after a failure:
 22. **The pocketed-prompt notification** (Tristan's decision): a locked phone cannot show
     the banner or fire the haptic. Any notification must not route audio to the glasses
     (§5.7).
+
+## 7. Resources this run created or stopped
+
+- **Worktrees:**
+  - `Glasses-worktrees\wb-coherence-product` (`world-builder/coherence-product-v1`, the
+    Tower lane);
+  - `Glasses-worktrees\wb-live-visualization-v1` (`world-builder/live-world-visualization-v1`,
+    the integration; the test Tower reads its code and its `tower\.env`);
+  - `Glasses-worktrees\wb-coherence-v1` (the experiment lane).
+- **Scratch:**
+  - `RUN` itself;
+  - `Glasses-scratch\wbcpt\` holds short pytest base-temps (`s<tag>`, `tf<n>`) and
+    RV-RELOC's synthetic stores (`rvreloc30\`, `rvreloc31\`).
+  - Disposable; nothing outside `Glasses-scratch` was created.
+- **Processes stopped** (manager 063 §3), after checking that their parents were gone and
+  that no other process named their files:
+  - the GPU sampler loop `sh.exe` 8764 and its outer `bash` 37008, which exited with it.
+    Its `gpu_samples.csv` (2.38 MB) is kept;
+  - two `tail.exe` from 2026-09-21 (31608, 31848), and 17 run tails before them. No
+    `tail.exe` is left.
+- **Storage cleanup** (manager 062–064; authority `RUN\storage-audit\AUTHORITY.md`,
+  Tristan's delegation):
+  - **1,174 paths, 166.13 GiB deleted**, only through `RUN\bin\safe-delete.ps1` after a
+    dry run;
+  - every path is in `RUN\storage-audit\DELETED.md`, the guard's ledger is
+    `deletion-ledger.jsonl`, and the manifests and transcripts are in `manifests\`;
+  - the GT functional checks are byte-identical before and after (`functional\`);
+  - `RUN\experiments\REGISTRY.md` lists every deleted or split experiment folder.
+- **`Glasses-scratch\wb-dense` (the dense lane's scratch) was split, not removed** (S7):
+  - **Deleted:** 449 paths, 16.39 GiB. These were the per-world solver databases,
+    `solution.npz` and `sparse\`, plus the `_frames` and `sessions\*\images` directories.
+  - **Kept, 1.015 GiB:** the scripts, logs, per-world JSON records and rendered images
+    (listed in `RUN\storage-audit\split1\S7.keep.tsv`). `walk1_views`, `walk2_views`,
+    `baseline-render` and `viewer-pages` are kept whole.
+  - **The `_frames` were hard links** to the live capture frames, so deleting them freed
+    no capture data. A census of the 12 source captures (15,601 frames) is identical
+    before and after (`RUN\storage-audit\functional\s7_capture_census.*.json`).
+  - **Each deleted `images` directory's source frames were verified present in the live
+    store first** (`S7.report.json`, `source_verification`).
+  - **To rebuild a wb-dense world**, re-stage it from the live captures.
