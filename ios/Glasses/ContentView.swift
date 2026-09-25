@@ -5,6 +5,7 @@
 //  Created by Tristan Varner on 8/18/26.
 //
 
+import Combine
 import SwiftUI
 
 /// Root view, owner of the app's object graph, and the persistent shell.
@@ -76,6 +77,27 @@ struct ContentView: View {
 
     @State private var destination: Destination?
 
+    /// "How Glasses works": which cards are up, if any. All of the rules --
+    /// first launch only, never over a capture, Settings closes first -- are in
+    /// `OnboardingPresentation` and `OnboardingGate`, where they are tested.
+    @State private var onboarding = OnboardingPresentation()
+
+    /// Whether a capture is running or starting, kept current by the
+    /// onboarding `.task` below. Read by Settings' "How Glasses works" row.
+    @State private var isCaptureBusy = false
+
+    /// Connections or Settings, opened from the second card, over the cards.
+    private enum OnboardingLink: Int, Identifiable {
+        case connections
+        case settings
+
+        var id: Int { rawValue }
+    }
+
+    @State private var onboardingLink: OnboardingLink?
+
+    private let onboardingStore = OnboardingStore()
+
     /// The single source of truth for which workspace is showing. An id that is
     /// not in the catalog, or that this build has no workspace for, falls back
     /// to Home rather than showing an empty screen.
@@ -103,8 +125,15 @@ struct ContentView: View {
             .navigationTitle(selectedCartridge?.name ?? "Glasses")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbar }
-            .sheet(item: $destination) { destination in
+            // `onDismiss` is where "How Glasses works" opens: Settings has
+            // to be gone before a full-screen cover can be presented.
+            .sheet(item: $destination, onDismiss: {
+                onboarding.sheetDismissed(isCaptureBusy: isCaptureBusyNow)
+            }) { destination in
                 sheet(for: destination)
+            }
+            .fullScreenCover(item: onboardingShowing) { mode in
+                onboardingCards(mode)
             }
             .modifier(GlassesErrorAlert(glasses: project.glassesConnection))
         }
@@ -114,6 +143,27 @@ struct ContentView: View {
         // the Tower socket; it does not and cannot start the camera.
         .task {
             project.startAutomaticConnections()
+        }
+        // The first-run cards, then the capture watch that keeps them off a
+        // capture. The root is never re-identified, so this runs once per
+        // launch and subscribes once rather than on every `body`; presenting
+        // the cards over it does not cancel it (checked in the Simulator).
+        .task {
+            // Without the slide-up: at a first launch the cards are the first
+            // screen, not something that happened to it.
+            var appearing = Transaction()
+            appearing.disablesAnimations = true
+            withTransaction(appearing) {
+                onboarding.launched(
+                    isSeen: onboardingStore.isSeen,
+                    launchArguments: ProcessInfo.processInfo.arguments,
+                    isCaptureBusy: isCaptureBusyNow
+                )
+            }
+            for await busy in captureBusyUpdates.values {
+                if busy != isCaptureBusy { isCaptureBusy = busy }
+                if busy { onboarding.captureChanged(isBusy: true) }
+            }
         }
     }
 
@@ -315,7 +365,13 @@ struct ContentView: View {
             )
             .presentationDetents([.medium, .large])
         case .settings:
-            SettingsSheet()
+            SettingsSheet(howItWorks: HowGlassesWorksEntry(
+                isAvailable: OnboardingGate.canReopen(isCaptureBusy: isCaptureBusy),
+                open: {
+                    onboarding.requestedFromSettings(isCaptureBusy: isCaptureBusyNow)
+                    self.destination = nil
+                }
+            ))
         #if DEBUG
         case .developer:
             DeveloperToolsView(
@@ -327,6 +383,76 @@ struct ContentView: View {
             )
         #endif
         }
+    }
+}
+
+// MARK: - How Glasses works
+
+extension ContentView {
+    private var onboardingShowing: Binding<OnboardingMode?> {
+        Binding(
+            get: { onboarding.showing },
+            set: { if $0 == nil { onboarding.coverDismissed() } }
+        )
+    }
+
+    /// The cards, with Connections and Settings opening over them from the
+    /// second card. Neither of those can open the cards again: Connections'
+    /// Settings has no entry, and this Settings is given none.
+    private func onboardingCards(_ mode: OnboardingMode) -> some View {
+        OnboardingView(
+            mode: mode,
+            onOpenConnections: { onboardingLink = .connections },
+            onOpenSettings: { onboardingLink = .settings },
+            onEnd: { end in onboarding.ended(end, store: onboardingStore) }
+        )
+        .sheet(item: $onboardingLink) { link in
+            switch link {
+            case .connections:
+                ConnectionSheet(
+                    glasses: project.glassesConnection,
+                    tower: project.towerClient
+                )
+                .presentationDetents([.medium, .large])
+            case .settings:
+                SettingsSheet()
+            }
+        }
+    }
+
+    /// Read when asked rather than observed: observing `GlassesConnection`
+    /// here would re-render the whole shell at the capture rate (see
+    /// `ProjectManager.cancellables`).
+    private var isCaptureBusyNow: Bool {
+        OnboardingGate.isCaptureBusy(
+            claim: currentCaptureClaim,
+            recordingPhase: project.objectMemoryRecording.phase
+        )
+    }
+
+    private var currentCaptureClaim: CaptureClaim {
+        #if DEBUG
+        project.glassesConnection.captureClaim
+        #else
+        // The capture surface is DEBUG-only; a Release build has no capture.
+        .unclaimed
+        #endif
+    }
+
+    /// Every change of `isCaptureBusyNow`, and its value now. Built from the
+    /// published claim and Object Memory's phase, and de-duplicated, so it
+    /// fires when a capture starts or ends, never at the frame rate.
+    private var captureBusyUpdates: AnyPublisher<Bool, Never> {
+        #if DEBUG
+        let claims = project.glassesConnection.captureClaimUpdates
+        #else
+        let claims = Just(CaptureClaim.unclaimed).eraseToAnyPublisher()
+        #endif
+        return claims
+            .combineLatest(project.objectMemoryRecording.$phase)
+            .map { claim, phase in OnboardingGate.isCaptureBusy(claim: claim, recordingPhase: phase) }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
     }
 }
 
