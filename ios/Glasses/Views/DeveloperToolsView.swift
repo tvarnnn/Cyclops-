@@ -27,6 +27,9 @@ struct DeveloperToolsView: View {
 
     @Environment(\.dismiss) private var dismiss
 
+    /// The IMU-log purge asks first: it deletes files, even if only this app's.
+    @State private var isConfirmingIMUPurge = false
+
     var body: some View {
         NavigationStack {
             List {
@@ -35,6 +38,7 @@ struct DeveloperToolsView: View {
                 mockDeviceSection
                 captureResolutionSection
                 motionProbeSection
+                imuRecorderSection
                 rawStateSection
                 towerSection
                 placeholderSection
@@ -277,8 +281,55 @@ struct DeveloperToolsView: View {
         } header: {
             Text("Motion (experimental)")
         } footer: {
-            Text("DAT 1.0.0's experimental IMU capability, started beside the camera at 30 Hz when capture next starts. Off by default and off again after a relaunch. Samples stay on this phone: nothing is sent to the Tower and nothing is shown to the wearer. \"Received\" is measured on the phone's clock, \"Measured\" on the glasses' own; gyro is angular speed in rad/s.")
+            Text("DAT 1.0.0's experimental IMU capability, started beside the camera at 30 Hz when capture next starts. Off by default and off again after a relaunch. Samples stay on this phone: nothing is sent to the Tower and nothing is shown to the wearer. \"Received\" is measured on the phone's clock, \"Measured\" on the glasses' own; gyro is angular speed in rad/s. With the IMU log on, these rows show state only; the log's rows below carry the rate.")
         }
+    }
+
+    // MARK: IMU log (walk-5 evidence)
+
+    /// The IMU recorder: its switch, what it is writing, and the purge.
+    ///
+    /// The switch is locked on `isCaptureSessionClaimed` for the probe's reason:
+    /// the recorder is created once, when capture starts. The purge is locked
+    /// while a recorder exists, so the file being written is never deleted.
+    private var imuRecorderSection: some View {
+        Section {
+            Toggle("Record IMU log with capture", isOn: $glasses.imuRecorderEnabled)
+                .disabled(glasses.isCaptureSessionClaimed)
+            IMURecorderRows(readout: glasses.imuRecorderReadout)
+            LabeledContent("Logs on this phone", value: imuInventoryText)
+            IMUPurgeButton(
+                readout: glasses.imuRecorderReadout,
+                isSessionClaimed: glasses.isCaptureSessionClaimed,
+                isConfirming: $isConfirmingIMUPurge
+            )
+            .confirmationDialog(
+                "Delete every IMU log on this phone?",
+                isPresented: $isConfirmingIMUPurge,
+                titleVisibility: .visible
+            ) {
+                Button("Delete all IMU logs", role: .destructive) {
+                    Task { await glasses.purgeIMULogs() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes Documents/imu-logs from this app on this phone. Copies already pulled to a Mac are not affected.")
+            }
+        } header: {
+            Text("IMU log (walk evidence)")
+        } footer: {
+            Text("Records the glasses' IMU at 60 Hz (30 Hz if 60 is refused) and the timing of every camera frame to one file per capture session in this app's Documents/imu-logs, for an offline join with the Tower's capture. Off by default and off again after a relaunch. Nothing is sent to the Tower. Motion is raw sensor data: the files are encrypted while the phone is locked, excluded from backup, capped at 200 MB or 30 minutes each and 1 GB in all, and a badge shows at the top of the app while one is being written.")
+        }
+        .onAppear { glasses.refreshIMULogInventory() }
+    }
+
+    private var imuInventoryText: String {
+        guard let inventory = glasses.imuLogInventory else { return "—" }
+        return "\(inventory.files) files, \(Self.megabytes(inventory.bytes))"
+    }
+
+    fileprivate static func megabytes(_ bytes: Int) -> String {
+        String(format: "%.1f MB", Double(bytes) / 1_000_000)
     }
 
     // MARK: Raw state
@@ -544,6 +595,58 @@ struct DeveloperToolsView: View {
         } footer: {
             Text("Placeholder type. Never assigned, so these never change. The real streaming state is Camera Stream above. Kept here rather than on the dashboard, where it contradicted the live frame counter.")
         }
+    }
+}
+
+/// The IMU recorder's readout, as its own view for the probe's reason: only
+/// these rows redraw when the recorder reports.
+private struct IMURecorderRows: View {
+    @ObservedObject var readout: IMURecorderReadout
+
+    var body: some View {
+        let s = readout.status
+        LabeledContent("Log state", value: Self.phase(s))
+        if !s.fileName.isEmpty {
+            LabeledContent("File", value: s.fileName)
+        }
+        LabeledContent("Size", value: DeveloperToolsView.megabytes(s.bytes))
+        LabeledContent("Motion lines", value: "\(s.counts.motionGlasses) glasses, \(s.counts.motionOther) other")
+        LabeledContent("Motion rate", value: Self.hz(s.motionRateHz, configured: s.motionConfiguredHz))
+        LabeledContent("Motion gaps", value: "\(s.counts.motionGapEvents) (~\(s.counts.motionEstimatedMissing) missing)")
+        LabeledContent("Frame lines", value: "\(s.counts.frames) (\(s.counts.framesSent) sent)")
+        LabeledContent("Camera epochs", value: "\(s.epochs)")
+    }
+
+    private static func phase(_ s: IMURecorderStatus) -> String {
+        switch s.phase {
+        case .idle: return "Off"
+        case .closed: return "Closed"
+        case .failed(let reason): return "Stopped: \(reason)"
+        case .recording:
+            if let cap = s.capReason { return "Stopped at the \(cap) cap" }
+            return s.heldWhileLocked ? "Recording (held while locked)" : "Recording"
+        }
+    }
+
+    private static func hz(_ measured: Double?, configured: Int?) -> String {
+        let asked = configured.map { "\($0) Hz asked" } ?? "—"
+        guard let measured else { return asked }
+        return String(format: "%.1f Hz, ", measured) + asked
+    }
+}
+
+/// Its own view so it can observe the readout for the badge state without the
+/// whole screen doing so.
+private struct IMUPurgeButton: View {
+    @ObservedObject var readout: IMURecorderReadout
+    let isSessionClaimed: Bool
+    @Binding var isConfirming: Bool
+
+    var body: some View {
+        Button("Delete all IMU logs…", role: .destructive) {
+            isConfirming = true
+        }
+        .disabled(isSessionClaimed || readout.indicator != .off)
     }
 }
 
