@@ -7,10 +7,30 @@
 
 import Foundation
 
-/// Single source of truth for the development Tower endpoint. The Tower is
-/// currently remote, reached over Tailscale; this hardcoded address is
-/// expected to change across sessions/networks until a discovery or
-/// configuration mechanism is designed.
+/// Single source of truth for the Tower endpoint.
+///
+/// ## Where the address comes from, in order
+///
+/// 1. **`GLASSES_TOWER_AUTHORITY`**, in DEBUG builds only — the developer's
+///    override, which is how the Simulator and `TowerSmokeUITests` reach a
+///    Tower on the Mac (or the read-only proxy in front of a live one).
+/// 2. **The address saved in Settings**, if it passes this build's
+///    `TowerAddressPolicy`.
+/// 3. **`defaultAuthority`**, the development Tower over Tailscale.
+///
+/// With nothing saved and no override this is exactly the compiled-in address
+/// it always was.
+///
+/// ## Fixed for the life of the process, on purpose
+///
+/// Every value here is a `static let`, resolved once at launch, and Settings
+/// does not change it: a saved address takes effect on the **next** launch, and
+/// Settings says so. About twenty clients default their `baseURL` to
+/// `httpBaseURL` when they are built, some of them owned for the whole process
+/// (`ProjectManager.cartridgeClients`), and the socket can be mid-capture.
+/// Changing the address under them would leave frames going to one Tower
+/// while worlds are fetched from another. One address per process is the
+/// guarantee that cannot happen, and it costs one relaunch.
 nonisolated enum TowerConfiguration {
     /// `host:port` of the development Tower.
     static let defaultAuthority = "100.110.156.55:8000"
@@ -26,20 +46,63 @@ nonisolated enum TowerConfiguration {
     ///         booted com.tristanvarner.Glasses
     ///
     /// Read once, in DEBUG only, and only as a `host[:port]`: a value that
-    /// does not form a URL is ignored rather than trusted, so a typo lands on
-    /// the development Tower and not on a crash. Release builds never look.
+    /// does not form a URL is ignored rather than trusted, so a typo falls
+    /// through to the saved address or the development Tower and not to a
+    /// crash. Release builds never look. It wins over a saved address, so a
+    /// test that sets it steers the app whatever the Simulator has saved.
     static let overrideVariable = "GLASSES_TOWER_AUTHORITY"
 
-    /// What every Tower URL below is built from.
-    static let authority: String = {
-        #if DEBUG
-        if let candidate = ProcessInfo.processInfo.environment[overrideVariable],
-           let accepted = acceptedAuthority(candidate) {
-            return accepted
+    /// Where the address in use came from.
+    enum Source: Equatable, Sendable {
+        /// `GLASSES_TOWER_AUTHORITY`, DEBUG only.
+        case developerOverride
+        /// Settings.
+        case saved
+        /// `defaultAuthority`.
+        case builtIn
+    }
+
+    struct Resolution: Equatable, Sendable {
+        let authority: String
+        let source: Source
+    }
+
+    /// The precedence rule, as a pure function so every combination can be
+    /// tested without a launch. A value that is present but unacceptable is
+    /// skipped, never trusted and never fatal.
+    static func resolve(
+        overrideValue: String?,
+        savedValue: String?,
+        policy: TowerAddressPolicy
+    ) -> Resolution {
+        if let overrideValue, let accepted = acceptedAuthority(overrideValue) {
+            return Resolution(authority: accepted, source: .developerOverride)
         }
+        if let savedValue, case .accepted(let accepted) = policy.check(savedValue) {
+            return Resolution(authority: accepted, source: .saved)
+        }
+        return Resolution(authority: defaultAuthority, source: .builtIn)
+    }
+
+    /// `GLASSES_TOWER_AUTHORITY` as this process was launched with it, or
+    /// `nil` — always `nil` in a Release build.
+    static var launchOverrideValue: String? {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment[overrideVariable]
+        #else
+        return nil
         #endif
-        return defaultAuthority
-    }()
+    }
+
+    /// What this process uses, decided once.
+    static let resolution: Resolution = resolve(
+        overrideValue: launchOverrideValue,
+        savedValue: TowerAddressStore().saved,
+        policy: .current
+    )
+
+    /// What every Tower URL below is built from.
+    static let authority: String = resolution.authority
 
     /// `host[:port]` with no scheme, path, credentials or query, or `nil`.
     /// Checked by building the URL that would be built from it and reading
@@ -55,6 +118,9 @@ nonisolated enum TowerConfiguration {
               let host = components.host, !host.isEmpty,
               components.path.isEmpty, components.user == nil
         else { return nil }
+        // A port outside 1...65535 parses, and builds a URL, and can never be
+        // connected to.
+        if let port = components.port, !(1...65535).contains(port) { return nil }
         // An IPv6 literal needs its brackets; Foundation may or may not have
         // kept them on the way through `host`.
         let literal = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host

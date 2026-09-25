@@ -85,26 +85,47 @@ struct SetupRow: View {
 /// A problem the user can act on, stated in full.
 struct FailureBanner: View {
     let text: String
-    /// Shown as a trailing control when the failure has an obvious remedy.
+    /// Shown as a trailing control when the failure has an obvious remedy —
+    /// or under the text at the accessibility sizes, where a trailing column
+    /// is too narrow for a word to fit on a line.
     var actionTitle: String?
     var action: (() -> Void)?
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text(text)
-                .font(.footnote)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            if let actionTitle, let action {
-                Button(actionTitle, action: action)
-                    .font(.footnote.weight(.medium))
-                    .buttonStyle(.borderless)
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 8) {
+                    message
+                    actionButton
+                }
+            } else {
+                message
+                Spacer(minLength: 0)
+                actionButton
             }
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 12))
         .accessibilityElement(children: .contain)
+    }
+
+    private var message: some View {
+        Text(text)
+            .font(.footnote)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if let actionTitle, let action {
+            Button(actionTitle, action: action)
+                .font(.footnote.weight(.medium))
+                .buttonStyle(.borderless)
+        }
     }
 }

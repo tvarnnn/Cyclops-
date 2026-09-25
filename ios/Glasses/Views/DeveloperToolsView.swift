@@ -373,6 +373,7 @@ struct DeveloperToolsView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.trailing)
             }
+            LabeledContent("Endpoint Source", value: "\(TowerConfiguration.resolution.source)")
             LabeledContent("Status", value: "\(tower.status)")
             LabeledContent("Streaming To Tower", value: tower.isStreamingToTower ? "Yes" : "No")
             // Labelled as per-bracket on purpose. It counts replies since the
@@ -404,7 +405,7 @@ struct DeveloperToolsView: View {
     /// A constant, hoisted off the view so it is not rebuilt on every render of
     /// a sheet that redraws at the Tower's reply rate while it is open.
     private static let towerFooter =
-        "The endpoint is compiled in and read-only. A configurable endpoint is a separate task. Everything below \"Frame Results\" is the Tower's own answer to GET /health at the moment the button was pressed — nothing polls, so it does not update on its own. \"\(Self.notSaid)\" means the field was missing from that answer, which is not a no and is not a zero. The dataset recorder is armed by the Tower's own TOWER_CAPTURE_ROOT setting when the Tower starts, and there is no way to arm or stop it from this app — which is why there is no control here, only a reading. While it is recording, every frame this phone sends is written to the Tower's disk unredacted."
+        "The endpoint is chosen once, at launch: GLASSES_TOWER_AUTHORITY if set, else the address saved in Settings, else the built-in one. Everything below \"Frame Results\" is the Tower's own answer to GET /health at the moment the button was pressed — nothing polls, so it does not update on its own. \"\(Self.notSaid)\" means the field was missing from that answer, which is not a no and is not a zero. The dataset recorder is armed by the Tower's own TOWER_CAPTURE_ROOT setting when the Tower starts, and there is no way to arm or stop it from this app — which is why there is no control here, only a reading. While it is recording, every frame this phone sends is written to the Tower's disk unredacted."
 
     // MARK: What the Tower says about itself
 

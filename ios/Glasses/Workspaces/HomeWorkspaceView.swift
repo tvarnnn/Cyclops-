@@ -37,14 +37,17 @@ struct HomeWorkspaceView: View {
     /// this view's refresh rate to the send rate.
     @ObservedObject var senderMetrics: SenderMetrics
     let onOpenConnections: () -> Void
+    /// Settings, where the Tower's address is. A failed Tower is usually the
+    /// wrong address for this network, and "Connections" can only retry it.
+    let onOpenSettings: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
             if let banner = failureBanner {
                 FailureBanner(
                     text: banner,
-                    actionTitle: "Connections",
-                    action: onOpenConnections
+                    actionTitle: "Tower settings",
+                    action: onOpenSettings
                 )
             }
 

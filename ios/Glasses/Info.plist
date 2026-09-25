@@ -68,10 +68,32 @@
 	<string>This app needs camera access to simulate the glasses' camera feed during Mock Device Kit development.</string>
 	<!-- End required section for Device Access Toolkit Apps -->
 
-	<!-- V0.5: allow plain ws:// to the development Tower. NSAllowsLocalNetworking
-	     covers LAN/RFC1918 addresses; the Tailscale address below is in the CGNAT
-	     range (100.64.0.0/10), which that key does not cover, so it needs its own
-	     exception. Remove once the Tower speaks wss://. -->
+	<!-- App Transport Security: plain ws:// and http:// to a Tower. The Tower
+	     does not speak TLS, and Settings says so ("Not encrypted").
+
+	     THIS FILE IS THE RELEASE POLICY. A Release build ships it unchanged:
+	       - NSAllowsLocalNetworking: unqualified names and `.local`;
+	       - NSExceptionDomains, cleartext allowed: RFC 1918 and link-local
+	         IPv4, Tailscale's CGNAT range 100.64.0.0/10, IPv6 unique-local
+	         fc00::/7 (Tailscale's fd7a:115c:a1e0::/48 is inside it), and
+	         MagicDNS names under ts.net. IP and CIDR keys need iOS 17+
+	         (Apple, NSExceptionDomains); this target's minimum is 26.5.
+	       - The development Tower's own address stays listed on its own, so
+	         the default never depends on CIDR matching.
+	     Nothing else: an internet host is refused, and Settings refuses to
+	     save one (TowerAddressPolicy.privateNetworks). The two lists must
+	     agree; TowerSettingsTests reads this file and checks that they do.
+
+	     A DEBUG build allows arbitrary loads, so the Simulator and a developer
+	     can point at any Tower. That is done by the "Derive Info.plist" build
+	     phase (project.pbxproj), which, when GLASSES_ATS_ALLOWS_ARBITRARY_LOADS
+	     is YES (Debug only), writes a copy of this file with
+	     NSAllowsLocalNetworking REMOVED and NSAllowsArbitraryLoads added.
+	     Removed, not merely added to: iOS 10+ ignores NSAllowsArbitraryLoads
+	     whenever NSAllowsLocalNetworking is present (Apple,
+	     NSAllowsArbitraryLoads). A plist cannot be conditional on the
+	     configuration by itself - build settings are substituted into values,
+	     never into keys - hence the phase. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -80,6 +102,43 @@
 		<dict>
 			<key>100.110.156.55</key>
 			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>100.64.0.0/10</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>10.0.0.0/8</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>172.16.0.0/12</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>192.168.0.0/16</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>169.254.0.0/16</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>fc00::/7</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>ts.net</key>
+			<dict>
+				<key>NSIncludesSubdomains</key>
+				<true/>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<true/>
 			</dict>
