@@ -675,3 +675,128 @@ def test_motion_alone_flags_and_seals_nothing(tmp_path, monkeypatch):
     av = record["anchor_verify"]
     assert len(av["motion_flags"]) == 1 and av["sealed_kf"] == 0 and built == []
     assert _by_first(comps) == {0: (60, [], "room")} and "import_units" not in record
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# review V15, MED-2: the finisher's re-gate in place, and the solve's two passes
+
+
+def test_the_finishers_re_gate_in_place_runs_the_verification(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tower.world_builder import global_solve as GS
+    from tower.world_builder.store import WorldStore
+
+    n = 60
+    levels = _levels(n, [(25, 35, L2)])
+    monkeypatch.setenv("TOWER_WORLD_ANCHOR_VERIFY", "scale")
+    store = WorldStore(tmp_path)
+    sol = F.multi_solution((n,), centres=F.line_centres(n))
+    sol.gate = {"state": CP.GATE_STATE_APPLIED, "masks_applied": True, "metric_available": False,
+                "retryable": True, "cause": CP.CAUSE_DEPTH_UNAVAILABLE}
+    ws = GS.workspace_for(store, "w1", F.SID)
+    GS.write_solution(ws, sol)
+    ws.database_path.write_bytes(b"not read: the links are faked")
+    links, rots = F.multi_links((n,), ((10, 45), (10, 46), (11, 46)))
+    F.patch_gate_inputs(monkeypatch, links, rots, list(levels))
+    kfs = F.keyframes(n)
+    monkeypatch.setattr(store, "read_keyframes", lambda w, s: kfs, raising=False)
+    monkeypatch.setattr(store, "read_session", lambda w, s: SimpleNamespace(started_at=1000.0, intrinsics=None),
+                        raising=False)
+    R, C = F.poses_of(sol, n)
+    arrays = F.synthetic_pairs(R, C, F.chain_pairs(n, breaks=(25,)))
+    built = []
+    monkeypatch.setattr(AV, "_default_pair_builder",
+                        lambda root, names, camera: (built.append(Path(root)) or arrays, {"source": "built"}))
+    CP.regate_published(store, "w1", F.SID)
+    again = GS.load_solution(store, "w1", F.SID)
+    av = again.gate["anchor_verify"]
+    assert av["state"] == AV.STATE_APPLIED and av["sealed"][CG.REASON_SCALE_MISMATCH]["keyframes"] == 10
+    assert again.gate["regate"]["previous"]["cause"] == CP.CAUSE_DEPTH_UNAVAILABLE
+    assert built == [ws.root], "the pair cache lives in the solve's own directory"
+    comps = json.loads((ws.root / CP.COMPONENTS_FILENAME).read_text())["components"]
+    assert _by_first(comps) == {0: (50, [], "room"), 25: (10, [CG.REASON_SCALE_MISMATCH], "none")}
+
+
+def test_the_solves_second_pass_neither_gates_nor_verifies_draw_0_again(tmp_path, monkeypatch):
+    from tower.world_builder import global_solve as GS
+    from tower.world_builder.global_solve import SolveWorkspace
+
+    monkeypatch.setenv("TOWER_WORLD_ANCHOR_VERIFY", "on")
+    sizes, n = F.CONSENSUS_SIZES, sum(F.CONSENSUS_SIZES)
+    links, rots = F.multi_links(sizes, F.CONSENSUS_CROSS)
+    F.patch_gate_inputs(monkeypatch, links, rots, [0.0] * n)
+    cands = [F.multi_solution(sizes, o) for o in F.CONSENSUS_OFFSETS]
+    R, C = F.poses_of(cands[0], n)
+    arrays = F.synthetic_pairs(R, C, F.chain_pairs(n, breaks=(30, 50, 70)))
+    monkeypatch.setattr(AV, "_default_pair_builder", lambda root, names, camera: (arrays, {"source": "built"}))
+    depth_runs = []
+    fake_depth = CP.run_gate_depth
+
+    def counting_depth(*a, **kw):
+        depth_runs.append(1)
+        return fake_depth(*a, **kw)
+
+    monkeypatch.setattr(CP, "run_gate_depth", counting_depth)
+    verified, handed = [], []
+    real_verify, real_consensus = AV.verify_published, CP.gate_by_consensus
+
+    def spy_verify(result, **kw):
+        verified.append(result)
+        return real_verify(result, **kw)
+
+    def spy_consensus(*a, **kw):
+        handed.append(kw.get("draw_0"))
+        return real_consensus(*a, **kw)
+
+    monkeypatch.setattr(AV, "verify_published", spy_verify)
+    monkeypatch.setattr(CP, "gate_by_consensus", spy_consensus)
+    plan = CP.ConsensusPlan(draws=3, seed=7, map_draw=lambda seed: cands[seed - 7])
+    ws = SolveWorkspace(tmp_path / "w1" / "solve" / F.SID)
+    published = GS._publish_draw_0_first(F.Store(tmp_path), "w1", F.SID, ws, cands[0], plan, final=True, gate=True,
+                                         database_path="db", keyframes=F.keyframes(n))
+    # draw 0's depth stage and gate ran ONCE (the early publish); the second pass mapped draws 1 and 2 only
+    assert len(depth_runs) == 3
+    assert handed[0] is None and handed[1] is not None
+    assert "anchor_verify" not in handed[1].record, "the second pass is handed draw 0's GATE result, unverified"
+    # one verification per publish: draw 0's early publish, then the consensus's chosen draw
+    assert len(verified) == 2 and verified[0].record["consensus"]["state"] == CP.CONSENSUS_DEFERRED
+    assert published.gate["consensus"]["state"] == CP.CONSENSUS_APPLIED
+    assert published.gate["anchor_verify"]["state"] == AV.STATE_APPLIED
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# review V15, MED-3: the evidence floors
+
+
+def test_a_long_gap_pair_in_the_same_tracker_segment_is_not_revisit_evidence():
+    n = 100
+    s = _solve(n)
+    ends = [(60, 5), (62, 8), (64, 12), (66, 15)]
+    pairs = _pairs(n, ends, s.R, s.C, error_deg={(min(a, b), max(a, b)): 10.0 for a, b in ends})
+    G, P = set(range(60, 70)), set(range(50))
+    one_segment = _world(n)                                      # every pair is > 30 apart and >= 10 s, same segment
+    assert AV.judge(G, P, one_segment, pairs, s, VP)["verdict"] == AV.VERDICT_UNVERIFIABLE
+    assert AV.judge(G, P, _revisit_world(n), pairs, s, VP)["verdict"] == AV.VERDICT_CONTRADICTED
+
+
+def test_a_two_hop_chain_must_cross_a_revisit_pair():
+    n = 100
+    w, s = _revisit_world(n), _solve(n)
+    # a in G -- m=33 or 34 (within 30 of both ends) -- r in P: neither leg is a revisit pair
+    legs = [(60, 33), (62, 33), (64, 34), (33, 5), (33, 8), (34, 12), (34, 15)]
+    pairs = _pairs(n, legs, s.R, s.C, error_deg={(5, 33): 30.0, (8, 33): 30.0, (12, 34): 30.0, (15, 34): 30.0})
+    v = AV.judge(set(range(60, 70)), set(range(50)), w, pairs, s, VP)
+    assert v["verdict"] == AV.VERDICT_UNVERIFIABLE and v["two_hop_ends"] == 0
+
+
+def test_two_hop_needs_three_distinct_revisit_legs():
+    n = 100
+    w, s = _revisit_world(n), _solve(n)
+    # every chain crosses one of TWO revisit legs, (10, 60) and (12, 62): 5 endpoint pairs over 3 group and 5
+    # partner cameras, but only 2 legs -- not independent evidence
+    legs = [(10, 60), (12, 62), (5, 10), (8, 10), (10, 15), (7, 12), (60, 61)]
+    pairs = _pairs(n, legs, s.R, s.C, error_deg={(10, 60): 30.0, (12, 62): 30.0})
+    v = AV.judge(set(range(60, 70)), set(range(50)), w, pairs, s, VP)
+    assert v["direct_pairs"] == 2 and v["two_hop_ends"] == 5 and v["two_hop_legs"] == 2
+    assert v["verdict"] == AV.VERDICT_UNVERIFIABLE

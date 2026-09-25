@@ -129,7 +129,11 @@ FINALIZE_SCRIPT = Path(__file__).resolve().parent / "world_finalize.py"
 # solve its GPU minutes), and the record of the walk database's FROZEN matching
 # (`database.matching.json`, `global_solve.FROZEN_MATCHING_FILENAME`: the seeded
 # final solve that made it maps that database as it is instead of matching again,
-# which is not reproducible -- review V8 H2). NOT `masks/` (the COLMAP masks are
+# which is not reproducible -- review V8 H2), and the anchor verification's masked pair
+# sets (`verify_pairs/`, `anchor_verify.PAIRS_DIRNAME`: each under a key that is the SHA-1 of
+# every image's and mask's bytes, the pair parameters and the descriptor, so an entry is
+# read only for the exact images and masks it was built from -- it saves a re-finish with
+# `TOWER_WORLD_ANCHOR_VERIFY` on 40-160 s; review V15 MED-1). NOT `masks/` (the COLMAP masks are
 # rewritten from that cache on every masked solve), nor `database.masked.*` /
 # `reverify_pairs.txt` (made by a solve, for that solve). See `set_aside`.
 #
@@ -149,7 +153,8 @@ FINALIZE_SCRIPT = Path(__file__).resolve().parent / "world_finalize.py"
 # provenance RECORD proves was undistorted from the keyframe's own raw frame still goes
 # back when that frame is no longer on disk -- see `carry_back_decisions`.
 SOLVE_COPY_BACK = ("database.db", "database.db-wal", "database.db-shm", "images",
-                   "sources.json", "camera.json", "transients", "database.matching.json")
+                   "sources.json", "camera.json", "transients", "database.matching.json",
+                   "verify_pairs")
 
 # THE SOLVER-IMAGE PROVENANCE RECORD (review V9, M-7; the format is agreed with
 # `global_solve.prepare_images`, which honours it when the file exists):
