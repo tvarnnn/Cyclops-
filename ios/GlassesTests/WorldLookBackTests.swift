@@ -9,14 +9,16 @@
 //  session ("Session ended by device").
 //
 
+import UIKit
 import XCTest
 
 @testable import Glasses
 
-/// Records the haptic, instead of firing it.
+/// Records the haptic, instead of firing it, and plays the app's state.
 @MainActor
 final class RecordingLookBackCue: WorldLookBackCue {
     private(set) var alerts: [Int] = []
+    var isForegroundActive = true
 
     func alert(promptID: Int) { alerts.append(promptID) }
 }
@@ -157,10 +159,20 @@ final class WorldLookBackPrompterTests: XCTestCase {
                             prompt: WorldLookBackPrompt(id: id, episode: episode ?? id, issuedAt: 100, speakUntil: 104))
     }
 
+    /// `towerSentAt` 101 against `speak_until` 104: three seconds are left.
     private func consider(_ prompter: WorldLookBackPrompter, _ report: WorldRecoveryReport?,
-                          session: String = "s1", binding: WorldSessionBinding? = nil, followingLive: Bool = true) {
+                          session: String = "s1", binding: WorldSessionBinding? = nil, followingLive: Bool = true,
+                          towerSentAt: Double = 101) {
         prompter.consider(recovery: report, binding: binding ?? bound, followingLive: followingLive,
-                          towerSentAt: 101, worldID: "w1", sessionID: session)
+                          towerSentAt: towerSentAt, worldID: "w1", sessionID: session)
+    }
+
+    /// A prompter on a fake clock, with a private notification center so no
+    /// other test's `didBecomeActive` reaches it.
+    private func prompter(_ cue: RecordingLookBackCue, now: @escaping () -> Date) -> WorldLookBackPrompter {
+        let prompter = WorldLookBackPrompter(cue: cue, notificationCenter: NotificationCenter())
+        prompter.clock = now
+        return prompter
     }
 
     func testEachPromptIsShownOncePerSessionWithOneHaptic() {
@@ -214,19 +226,153 @@ final class WorldLookBackPrompterTests: XCTestCase {
         XCTAssertEqual(cue.alerts, [1])
     }
 
-    /// The banner lasts `speak_window_s` (`speak_until - issued_at`, 4 s here)
-    /// on the phone's clock, and no longer.
-    func testTheBannerLastsTheSpeakWindow() {
-        let prompter = WorldLookBackPrompter(cue: RecordingLookBackCue())
+    /// The banner lasts what is left of the window at delivery,
+    /// `speak_until - tower_sent_at` (3 s here), counted from receipt -- not
+    /// the full `speak_window_s` (4 s).
+    func testTheBannerExpiresWhenTheWindowEnds() {
         var now = Date(timeIntervalSince1970: 1_000)
-        prompter.clock = { now }
+        let prompter = prompter(RecordingLookBackCue()) { now }
         consider(prompter, report(id: 1))
-        now += 3.9
+        now += 2.9
+        prompter.expireIfDue()
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        now += 0.2
+        prompter.expireIfDue()
+        XCTAssertNil(prompter.banner, "the banner outlived speak_until")
+    }
+
+    /// A late delivery (sent 3.5 s into a 4 s window) shows for the 0.5 s
+    /// left, and one sent exactly at `speak_until` for nothing more (clamped
+    /// at 0), though it still counts as shown.
+    func testADelayedPromptShowsOnlyForWhatIsLeftOfItsWindow() {
+        let cue = RecordingLookBackCue()
+        var now = Date(timeIntervalSince1970: 1_000)
+        let prompter = prompter(cue) { now }
+        consider(prompter, report(id: 1), towerSentAt: 103.5)
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        XCTAssertEqual(cue.alerts, [1])
+        now += 0.4
+        prompter.expireIfDue()
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        now += 0.2
+        prompter.expireIfDue()
+        XCTAssertNil(prompter.banner, "a late prompt was shown for its full window")
+
+        consider(prompter, report(id: 2), towerSentAt: 104)
+        XCTAssertEqual(cue.alerts, [1, 2])
+        prompter.expireIfDue()
+        XCTAssertNil(prompter.banner)
+    }
+
+    /// Locked in a pocket: the prompt is held, not consumed -- no banner, no
+    /// haptic, `lastSpoken` untouched, however many heartbeats repeat it --
+    /// and is presented when the app becomes active inside its window, for
+    /// what is left of it.
+    func testAPromptThatArrivesInTheBackgroundIsShownOnBecomingActiveInItsWindow() {
+        let cue = RecordingLookBackCue()
+        cue.isForegroundActive = false
+        var now = Date(timeIntervalSince1970: 1_000)
+        let prompter = prompter(cue) { now }
+        consider(prompter, report(id: 1))
+        now += 0.5
+        consider(prompter, report(id: 1), towerSentAt: 101.5)
+        XCTAssertNil(prompter.banner)
+        XCTAssertTrue(cue.alerts.isEmpty)
+        XCTAssertNil(prompter.lastSpoken["w1/s1"], "a prompt nobody saw was consumed")
+        XCTAssertEqual(prompter.held?.promptID, 1)
+
+        now += 1.5
+        cue.isForegroundActive = true
+        prompter.appDidBecomeActive()
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        XCTAssertEqual(cue.alerts, [1])
+        XCTAssertEqual(prompter.lastSpoken["w1/s1"], 1)
+        XCTAssertNil(prompter.held)
+
+        // Its deadline is the first delivery's: 3 s after receipt, so 1 s
+        // is left.
+        now += 0.9
         prompter.expireIfDue()
         XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
         now += 0.2
         prompter.expireIfDue()
         XCTAssertNil(prompter.banner)
+
+        // Already shown: neither a heartbeat nor another activation repeats it.
+        consider(prompter, report(id: 1), towerSentAt: 103.9)
+        prompter.appDidBecomeActive()
+        XCTAssertEqual(cue.alerts, [1])
+    }
+
+    /// Becoming active after the window ended shows nothing late.
+    func testABackgroundPromptWhoseWindowEndedIsNeverShown() {
+        let cue = RecordingLookBackCue()
+        cue.isForegroundActive = false
+        var now = Date(timeIntervalSince1970: 1_000)
+        let prompter = prompter(cue) { now }
+        consider(prompter, report(id: 1))
+        now += 3.1
+        cue.isForegroundActive = true
+        prompter.appDidBecomeActive()
+        XCTAssertNil(prompter.banner)
+        XCTAssertTrue(cue.alerts.isEmpty)
+        XCTAssertNil(prompter.held)
+    }
+
+    /// While active, the next report that repeats a held prompt presents it
+    /// at once, and the activation that follows does not present it again.
+    func testAHeldPromptIsShownByTheNextReportOnceActive() {
+        let cue = RecordingLookBackCue()
+        cue.isForegroundActive = false
+        var now = Date(timeIntervalSince1970: 1_000)
+        let prompter = prompter(cue) { now }
+        consider(prompter, report(id: 1))
+        now += 1
+        cue.isForegroundActive = true
+        consider(prompter, report(id: 1), towerSentAt: 102)
+        prompter.appDidBecomeActive()
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
+        XCTAssertEqual(cue.alerts, [1])
+    }
+
+    /// A held prompt is dropped when its episode stops prompting, and when the
+    /// phone stops following the live walk.
+    func testAHeldPromptIsDroppedWhenTheEpisodeEndsOrThePhoneStopsFollowing() {
+        let cue = RecordingLookBackCue()
+        cue.isForegroundActive = false
+        let now = Date(timeIntervalSince1970: 1_000)
+        let prompter = prompter(cue) { now }
+
+        consider(prompter, report(id: 1))
+        consider(prompter, report(id: 1, state: .recovered))
+        XCTAssertNil(prompter.held)
+        cue.isForegroundActive = true
+        prompter.appDidBecomeActive()
+        XCTAssertNil(prompter.banner, "a recovered episode's prompt was shown")
+
+        cue.isForegroundActive = false
+        consider(prompter, report(id: 2))
+        consider(prompter, report(id: 2), followingLive: false)
+        XCTAssertNil(prompter.held)
+        cue.isForegroundActive = true
+        prompter.appDidBecomeActive()
+        XCTAssertNil(prompter.banner, "a pinned phone showed the live walk's prompt")
+        XCTAssertTrue(cue.alerts.isEmpty)
+    }
+
+    /// The real wiring: `didBecomeActiveNotification` on the prompter's
+    /// center presents the held prompt.
+    func testTheDidBecomeActiveNotificationPresentsTheHeldPrompt() async {
+        let cue = RecordingLookBackCue()
+        cue.isForegroundActive = false
+        let center = NotificationCenter()
+        let prompter = WorldLookBackPrompter(cue: cue, notificationCenter: center)
+        consider(prompter, report(id: 1))
+        cue.isForegroundActive = true
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        for _ in 0..<50 where cue.alerts.isEmpty { try? await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(cue.alerts, [1])
+        XCTAssertEqual(prompter.banner, .lookBack(promptID: 1))
     }
 
     /// Leaving `prompting` takes the banner down at once; `recovered` says
@@ -271,17 +417,52 @@ final class WorldLookBackPrompterTests: XCTestCase {
 /// never touches the audio session, speech, or the Bluetooth audio route.
 /// Speech to the glasses over A2DP ended the DAT camera session ~3 s later.
 ///
-/// Read from the sources beside this file: the Simulator runs on the host,
-/// which is where the tests run. A run that cannot see them skips rather
-/// than passes.
+/// Two layers, both failing closed on the Simulator (where this suite runs):
+/// the app's Swift sources, read from beside this file, and -- whatever the
+/// sources say, and whatever language added it -- the app's own built
+/// binaries, which must not link an audio framework or reference an audio
+/// class or function.
 final class WorldLookBackAudioFreeTests: XCTestCase {
 
-    /// Anything that configures, activates, or plays through the audio system.
+    /// Anything that configures, activates, or plays through the audio
+    /// system, or posts a notification (which can carry a sound).
     static let audioAPIs = [
         "import AVFoundation", "import AVFAudio", "import AudioToolbox", "import MediaPlayer",
-        "AVAudioSession", "AVSpeechSynthesizer", "AVSpeechUtterance", "AVAudioPlayer", "AVAudioEngine",
-        "AVPlayer", "AudioServicesPlay", "overrideOutputAudioPort", "setPreferredInput",
+        "import CoreAudio", "import AudioUnit", "import UserNotifications",
+        "AVAudioSession", "AVAudioApplication", "AVSpeechSynthesizer", "AVSpeechUtterance", "AVAudioPlayer",
+        "AVAudioEngine", "AVPlayer", "AudioServicesPlay", "SystemSoundID", "AudioComponent",
+        "UNNotificationSound", "UNUserNotificationCenter", "overrideOutputAudioPort", "setPreferredInput",
     ]
+
+    /// Byte markers in a linked Mach-O: an audio framework in a load
+    /// command, or an audio class or function among its symbols. The spoken
+    /// build (`4b4b444`) carries `/AVFAudio.framework/`,
+    /// `_OBJC_CLASS_$_AVAudio` and `_OBJC_CLASS_$_AVSpeech`; `f33bdfe` none.
+    static let binaryMarkers = [
+        "/AVFAudio.framework/", "/AudioToolbox.framework/", "/MediaPlayer.framework/",
+        "/CoreAudio.framework/", "/UserNotifications.framework/",
+        "_OBJC_CLASS_$_AVAudio", "_OBJC_CLASS_$_AVSpeech", "_OBJC_CLASS_$_AVPlayer",
+        "_OBJC_CLASS_$_AVQueuePlayer", "_OBJC_CLASS_$_UNNotificationSound",
+        "_OBJC_CLASS_$_UNUserNotificationCenter", "_AudioServicesPlay",
+        "_AudioServicesCreateSystemSoundID", "_AudioComponentInstanceNew", "_AudioOutputUnitStart",
+    ]
+
+    static func markers(in binary: Data) -> [String] {
+        binaryMarkers.filter { binary.range(of: Data($0.utf8)) != nil }
+    }
+
+    /// Unreadable sources fail on the Simulator, where they are always on
+    /// the host; only a device run skips, and the binary test covers it.
+    private func requireReadable(_ url: URL) throws {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        #if targetEnvironment(simulator)
+        throw NSError(domain: "WorldLookBackAudioFreeTests", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "the app's sources are not readable from this Simulator run (\(url.path))",
+        ])
+        #else
+        throw XCTSkip("sources are not on a device; testTheBuiltAppLinksNoAudio covers it")
+        #endif
+    }
 
     private var appSources: URL {
         URL(fileURLWithPath: #filePath)
@@ -290,9 +471,7 @@ final class WorldLookBackAudioFreeTests: XCTestCase {
     }
 
     private func swiftFiles(under root: URL) throws -> [URL] {
-        guard FileManager.default.fileExists(atPath: root.path) else {
-            throw XCTSkip("the app's sources are not readable from this run (\(root.path))")
-        }
+        try requireReadable(root)
         let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
         return (walker?.allObjects as? [URL] ?? []).filter { $0.pathExtension == "swift" }
     }
@@ -304,9 +483,7 @@ final class WorldLookBackAudioFreeTests: XCTestCase {
 
     func testThePromptPathTouchesNoAudioAPI() throws {
         let file = appSources.appendingPathComponent("Workspaces/WorldBuilder/WorldLookBack.swift")
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            throw XCTSkip("WorldLookBack.swift is not readable from this run")
-        }
+        try requireReadable(file)
         XCTAssertEqual(try offences(in: file), [], "the look-back path references an audio API")
     }
 
@@ -319,6 +496,31 @@ final class WorldLookBackAudioFreeTests: XCTestCase {
             if !hits.isEmpty { found[file.lastPathComponent] = hits }
         }
         XCTAssertEqual(found, [:], "an app source references an audio API")
+    }
+
+    /// The binaries this test's host app was built into: the executable, and
+    /// in a DEBUG build the `Glasses.debug.dylib` beside it that holds the
+    /// app's code. Neither may carry an audio marker.
+    func testTheBuiltAppLinksNoAudio() throws {
+        let executable = try XCTUnwrap(Bundle.main.executableURL, "the host app has no executable")
+        XCTAssertEqual(executable.lastPathComponent, "Glasses", "not the Glasses app's bundle")
+        var binaries = [executable]
+        let debugDylib = Bundle.main.bundleURL.appendingPathComponent("Glasses.debug.dylib")
+        if FileManager.default.fileExists(atPath: debugDylib.path) { binaries.append(debugDylib) }
+        var found: [String: [String]] = [:]
+        for binary in binaries {
+            let hits = Self.markers(in: try Data(contentsOf: binary))
+            if !hits.isEmpty { found[binary.lastPathComponent] = hits }
+        }
+        XCTAssertEqual(found, [:], "the built app links or references audio")
+    }
+
+    /// The binary check is not vacuous: the spoken build's own markers trip it.
+    func testTheBinaryCheckCatchesTheSpokenBuild() {
+        let spoken = Data("x/System/Library/Frameworks/AVFAudio.framework/AVFAudio\0_OBJC_CLASS_$_AVAudioSession\0_OBJC_CLASS_$_AVSpeechSynthesizer\0".utf8)
+        XCTAssertEqual(Self.markers(in: spoken),
+                       ["/AVFAudio.framework/", "_OBJC_CLASS_$_AVAudio", "_OBJC_CLASS_$_AVSpeech"])
+        XCTAssertEqual(Self.markers(in: Data("CoreMedia libswiftAVFoundation".utf8)), [])
     }
 
     /// The `audio` background mode existed only for the spoken prompt.

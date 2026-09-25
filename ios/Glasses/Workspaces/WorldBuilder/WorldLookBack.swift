@@ -3,6 +3,7 @@
 //  Glasses
 //
 
+import Combine
 import SwiftUI
 import UIKit
 
@@ -172,25 +173,30 @@ nonisolated enum WorldLookBackBanner: Equatable, Sendable {
     }
 }
 
-/// The one non-visual cue that goes with a new banner. A protocol so the
-/// ledger is tested without a device. **No audio of any kind**: a haptic uses
-/// no audio session and never reaches the glasses.
+/// The one non-visual cue that goes with a new banner, and the one fact about
+/// the app the ledger needs: whether anyone can see or feel a prompt right
+/// now. A protocol so the ledger is tested without a device. **No audio of
+/// any kind**: a haptic uses no audio session and never reaches the glasses.
 @MainActor
 protocol WorldLookBackCue: AnyObject {
+    /// Whether the app is foreground-active. A prompt is presented -- and
+    /// only then counted as shown -- while this is true; one that arrives
+    /// otherwise is held for its window (`WorldLookBackPrompter`).
+    var isForegroundActive: Bool { get }
     /// A new look-back banner, for prompt `promptID`, has just appeared.
     func alert(promptID: Int)
 }
 
-/// One `UINotificationFeedbackGenerator` `.warning`, only while the app is
-/// foreground-active (a feedback generator does nothing otherwise, and a
-/// silent no-op is logged rather than guessed at).
+/// One `UINotificationFeedbackGenerator` `.warning`. Called only while the
+/// app is foreground-active, the only time a feedback generator does
+/// anything.
 @MainActor
 final class WorldHapticLookBackCue: WorldLookBackCue {
+    var isForegroundActive: Bool {
+        UIApplication.shared.applicationState == .active
+    }
+
     func alert(promptID: Int) {
-        guard UIApplication.shared.applicationState == .active else {
-            WorldLookBackLog.write("prompt \(promptID) shown; no haptic: the app is not foreground-active")
-            return
-        }
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
         WorldLookBackLog.write("prompt \(promptID) shown with a haptic")
     }
@@ -198,6 +204,25 @@ final class WorldHapticLookBackCue: WorldLookBackCue {
 
 /// The ledger and the rule, driving the banner. Held by
 /// `TowerWorldBuilderClient`, which hands it every report.
+///
+/// ## A prompt the wearer cannot see yet
+///
+/// A prompt that arrives while the app is not foreground-active (the phone
+/// locked in a pocket) is **held, not consumed**: nothing is shown, no haptic
+/// fires, and `lastSpoken` is not advanced. It is presented when the app
+/// becomes active -- or on the next report that repeats it while active --
+/// provided its window has not ended; otherwise it is dropped. A held prompt
+/// is also dropped when the episode stops prompting or the phone stops
+/// following the live walk. No notification, sound or other audio is ever
+/// used to reach a locked phone.
+///
+/// ## How long the banner stays
+///
+/// What is left of the window on the Tower's clock at delivery,
+/// `speak_until - tower_sent_at` (§6.5 rule 4 compares the same two), counted
+/// from when this phone received the report, clamped at 0 -- never the full
+/// `speak_window_s` again for a late delivery. It comes down sooner if the
+/// episode stops prompting.
 @MainActor
 final class WorldLookBackPrompter {
     /// The banner's words. The phone owns them (§8, C1 E14).
@@ -213,13 +238,22 @@ final class WorldLookBackPrompter {
     static let localWindow: TimeInterval = 60
 
     private let cue: WorldLookBackCue
-    /// `lastSpoken[(world, session)]`: the last prompt id shown. In memory
-    /// only (C1 M4). A relaunch closes the capture bracket, so the binding
-    /// already refuses a repeat, and rule 4 bounds what is left to
-    /// `speak_window_s`.
+    /// `lastSpoken[(world, session)]`: the last prompt id **presented** in
+    /// the foreground. In memory only (C1 M4). A relaunch closes the capture
+    /// bracket, so the binding already refuses a repeat, and rule 4 bounds
+    /// what is left to `speak_window_s`.
     private(set) var lastSpoken: [String: Int] = [:]
     private var shownAt: [Date] = []
     var clock: () -> Date = { Date() }
+
+    /// A prompt that passed the rule while the app was not foreground-active.
+    struct Held: Equatable {
+        let key: String
+        let promptID: Int
+        /// On `clock`: when its window ends.
+        let deadline: Date
+    }
+    private(set) var held: Held?
 
     /// What the live screen shows now, or `nil`. `onChange` hears every
     /// change.
@@ -232,12 +266,18 @@ final class WorldLookBackPrompter {
     var onChange: ((WorldLookBackBanner?) -> Void)?
     private var bannerDeadline: Date?
     private var expiry: Task<Void, Never>?
+    private var becameActive: AnyCancellable?
 
-    init(cue: WorldLookBackCue) {
+    init(cue: WorldLookBackCue, notificationCenter: NotificationCenter = .default) {
         self.cue = cue
+        becameActive = notificationCenter
+            .publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.appDidBecomeActive() }
+            }
     }
 
-    /// Consider one report. Shows each prompt id at most once per session.
+    /// Consider one report. Presents each prompt id at most once per session.
     func consider(
         recovery: WorldRecoveryReport?,
         binding: WorldSessionBinding,
@@ -251,37 +291,57 @@ final class WorldLookBackPrompter {
             return
         }
         // The banner follows the episode: gone once it stops prompting, and
-        // "Back on track" for a moment if it was recovered.
-        if case .lookBack = banner, recovery?.state != .prompting {
-            if recovery?.state == .recovered {
-                show(.backOnTrack, for: Self.backOnTrackSeconds)
-            } else {
-                dismiss()
+        // "Back on track" for a moment if it was recovered. A held prompt of
+        // an episode that stopped prompting is moot.
+        if recovery?.state != .prompting {
+            held = nil
+            if case .lookBack = banner {
+                if recovery?.state == .recovered {
+                    show(.backOnTrack, for: Self.backOnTrackSeconds)
+                } else {
+                    dismiss()
+                }
             }
         }
         let key = "\(worldID)/\(sessionID)"
-        guard let prompt = WorldLookBackRule.promptToSpeak(
-            recovery: recovery, binding: binding, followingLive: followingLive,
-            towerSentAt: towerSentAt, lastSpoken: lastSpoken[key])
+        guard
+            let prompt = WorldLookBackRule.promptToSpeak(
+                recovery: recovery, binding: binding, followingLive: followingLive,
+                towerSentAt: towerSentAt, lastSpoken: lastSpoken[key]),
+            let towerSentAt
         else { return }
-        // Recorded BEFORE it is shown (§6.5): a heartbeat carrying the same
-        // id never shows it again.
-        lastSpoken[key] = prompt.id
-        let now = clock()
-        shownAt = shownAt.filter { now.timeIntervalSince($0) < Self.localWindow }
-        guard shownAt.count < Self.localCap else {
-            WorldLookBackLog.write("prompt \(prompt.id) not shown: a third inside 60 s on this phone's clock")
+        let deadline = clock().addingTimeInterval(max(0, prompt.speakUntil - towerSentAt))
+        guard cue.isForegroundActive else {
+            if held?.promptID != prompt.id {
+                WorldLookBackLog.write("prompt \(prompt.id) held: the app is not foreground-active")
+            }
+            // A repeat of the same id keeps the deadline of its first
+            // delivery; the window only ever shrinks.
+            if held?.key != key || held?.promptID != prompt.id {
+                held = Held(key: key, promptID: prompt.id, deadline: deadline)
+            }
             return
         }
-        shownAt.append(now)
-        // For `speak_window_s` (`speak_until - issued_at`), or until the
-        // episode stops prompting, whichever is first.
-        show(.lookBack(promptID: prompt.id), for: max(0, prompt.speakUntil - prompt.issuedAt))
-        cue.alert(promptID: prompt.id)
+        present(promptID: prompt.id, key: key, until: deadline)
     }
 
-    /// Take the banner down now: pinned, unbound, or the walk ended.
+    /// The app became foreground-active: present the held prompt if its
+    /// window is still open. Wired to `didBecomeActiveNotification`; public
+    /// so a test drives it.
+    func appDidBecomeActive() {
+        guard let held else { return }
+        self.held = nil
+        guard clock() < held.deadline, (lastSpoken[held.key] ?? 0) < held.promptID else {
+            WorldLookBackLog.write("prompt \(held.promptID) not shown: its window ended before the app became active")
+            return
+        }
+        present(promptID: held.promptID, key: held.key, until: held.deadline)
+    }
+
+    /// Take the banner down now, and drop any held prompt: pinned, unbound,
+    /// or the walk ended.
     func dismiss() {
+        held = nil
         expiry?.cancel()
         expiry = nil
         bannerDeadline = nil
@@ -293,6 +353,24 @@ final class WorldLookBackPrompter {
     func expireIfDue() {
         guard let bannerDeadline, clock() >= bannerDeadline else { return }
         dismiss()
+    }
+
+    /// Show prompt `promptID` until `deadline`, with the haptic. Only ever
+    /// called while the app is foreground-active.
+    private func present(promptID: Int, key: String, until deadline: Date) {
+        held = nil
+        // Recorded BEFORE it is shown (§6.5): a heartbeat carrying the same
+        // id never shows it again.
+        lastSpoken[key] = promptID
+        let now = clock()
+        shownAt = shownAt.filter { now.timeIntervalSince($0) < Self.localWindow }
+        guard shownAt.count < Self.localCap else {
+            WorldLookBackLog.write("prompt \(promptID) not shown: a third inside 60 s on this phone's clock")
+            return
+        }
+        shownAt.append(now)
+        show(.lookBack(promptID: promptID), for: max(0, deadline.timeIntervalSince(now)))
+        cue.alert(promptID: promptID)
     }
 
     private func show(_ next: WorldLookBackBanner, for seconds: TimeInterval) {
