@@ -120,6 +120,7 @@ never touched.
 | `TOWER_WORLD_RELOCALIZER` | `off` | `prompt`, then `silent` | the A/B arm; the builder reads it at each session start |
 | `TOWER_WORLD_RELOCALIZER_HISTORY` | `0` | `0` through walk 3; `20` for the arm after it (manager 064, 067) | 4 to 20 older keyframes added to each episode's 10 references. They are consulted only when the recent ones decide nothing, as spare-cycle work that yields to a newer frame. A link through one carries `historical: true` in the journal. Out-of-range values read as `0` and are logged |
 | `TOWER_WORLD_RELOCALIZER_SUMMARY` | `off` | `off` through walk 3; `on` with HISTORY | one `recovery_summary` line per episode, **in the journal only**; it never reaches the phone |
+| `TOWER_WORLD_ANCHOR_VERIFY` | `off` | `on` for walk 4 (manager 087) | P4 (`anchor_verify.py`; `RUN\experiments\P4-IV\RULE.md`, `RULE-a2.md`): runs once, on the chosen draw's published room, after the consensus. `images` = the masked image-only check, sealing contradicted groups as `link-contradicted`, plus one relocalizer import counting as one link; `scale` = the anchor block's capture runs split by `scale_split`, sealed `scale-mismatch` when their sign-test level CIs are more than ×1.25 apart; `motion` = physical-motion cut points only; `on` = all of them. Unset is byte-identical to before. After a walk, check `gate.anchor_verify.state == applied` and `pair_set.pairs > 0` |
 | `TOWER_WORLD_RELOCALIZER_WINDOW` | `loss` | `loss` | `prompt` would start a prompted episode's timeout at the prompt. It was measured worse in the replay (`RUN\lead\reloc2\`) and is not deployed |
 | `TOWER_WORLD_FINISH_PENDING` | `true` | `true` | finishes areas, owed re-gates and deferred consensus |
 | `TOWER_WORLD_SOLVE`, `_SURFACE` | `true` | `true` | the finisher runs only with these two and `TOWER_WORLD_FINISH_PENDING` on (`tower/tower/main.py`, `_world_finish_spec`) |
@@ -625,6 +626,20 @@ everything, so nothing runs after a failure:
      honest separate area.
    - **A Codex (gpt-5.6-sol) design note is in** `RUN\review\codex\design-anchor-verification-*.md`.
      Treat it as leads to verify.
+   - **LANDED behind a switch (P4, product `7f2fbb9` and `e72ccfe`; integration `f58d890`, the walk-4 build).**
+     `TOWER_WORLD_ANCHOR_VERIFY` (§2) verifies the room's kept set with masked image-only evidence and splits the
+     anchor block by metric scale (`RUN\experiments\P4-IV\`).
+     - **Validated:** control 0 sealed; GT totals unchanged; no acc2 verdict worse; held-out walk 3: 77 of 112 ×3
+       bathroom kf detached, 0 correct kf sealed; phase R identical.
+     - **Still OPEN (manager 087, disclosed):** 6839fb8f's bed stretch is only partly detached (c10 19–33 of 54;
+       21 kf have no masked image evidence, and (a2) misses by 0.0014). Close criterion 2 is not closed by P4 alone.
+     - **V15's LOWs:**
+       - LOW-1: the scale guard is judged per round, not per solve;
+       - LOW-2: a failed verification is visible only in `gate.anchor_verify` and is not retried;
+       - LOW-3: the scale part needs the image pairs to form its runs;
+       - LOW-4: the early publish runs the pair build first;
+       - LOW-5: the contract wording of `link-contradicted` (it goes to the UX phase).
+     - **The image evidence must be masked:** the phone in the wearer's hand makes unmasked pairs report "no rotation".
    - **Decide how the gate counts a relocalizer import (manager 064).** One accepted
      triangle imports two pairs through one anchor image whose other ends are consecutive
      keyframes already linked to each other. That is exactly the gate's "two pairs through
@@ -811,3 +826,13 @@ everything, so nothing runs after a failure:
   - **Each deleted `images` directory's source frames were verified present in the live
     store first** (`S7.report.json`, `source_verification`).
   - **To rebuild a wb-dense world**, re-stage it from the live captures.
+- **Storage round 2 (manager 088/089, 2026-09-25):**
+  - `wb-final-recon\fixit` and 10 run folders: 790 paths, about 97 GB, through the same guard;
+  - SR2's keeps (`review-SR2.md`), among them the relocalizer replay corpus in `P2-R-baselines`;
+  - every kept file re-checked. `wbcpt` is left for a junction-aware round 3;
+  - records: `DELETED.md` (1,963 rows, 262.24 GiB in both rounds), `REGISTRY.md`.
+- **The walk-4 build's temporary resources (2026-09-25), disposable, deletion awaiting approval:**
+  - the code archives `Glasses-scratch\wbce9c02` and `wbcf58d8`;
+  - the E2E world copies `RUN\physical-test\e2e\{control-on, control-onA, control-onA2, control-onB, walk3-on}`;
+  - walk 3's scored copy `RUN\physical-test\scored\4f5d0b15\`;
+  - the pytest base-temps `Glasses-scratch\wbcpt\{sint-*, p4*, v15*, om*, tf*}`.
