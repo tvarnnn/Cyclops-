@@ -3351,17 +3351,17 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
     }
 
     /// Bound to the walk this phone streams, following live: each prompt id is
-    /// spoken once, heartbeats never repeat it, a stale one is never spoken,
-    /// and the canvas line follows the episode.
-    func testALiveBoundWalkSpeaksEachPromptOnce() async throws {
+    /// shown once with one haptic, heartbeats never repeat it, a stale one is
+    /// never shown, and the banner and the canvas line follow the episode.
+    func testALiveBoundWalkShowsEachPromptOnce() async throws {
         let server = try MockTowerServer()
         let port = try await server.start()
         serve(server)
         defer { server.stop() }
 
-        let voice = RecordingLookBackVoice()
+        let cue = RecordingLookBackCue()
         let tower = TowerClient(metrics: SenderMetrics())
-        let client = TowerWorldBuilderClient(tower: tower, lookBackVoice: voice)
+        let client = TowerWorldBuilderClient(tower: tower, lookBackCue: cue)
         tower.connect(to: url(port: port))
         await expect { client.state == .awaitingFirstUpdate }
         tower.sendStreamStart()
@@ -3369,10 +3369,10 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
 
         server.send(text: message(seq: 1, modelState: "receiving", worldID: "w-live", keyframes: 40,
                                   revision: "r1", selection: "live", recovery: prompting(id: 1)))
-        await expect { voice.spoken.count == 1 }
+        await expect { cue.alerts.count == 1 }
         XCTAssertEqual(client.sessionBinding, .bound(captureID: "cap-1"))
-        XCTAssertEqual(voice.spoken.first?.promptID, 1)
-        XCTAssertEqual(voice.spoken.first?.text, "Look back the way you came.")
+        XCTAssertEqual(cue.alerts, [1])
+        XCTAssertEqual(client.lookBackBanner, .lookBack(promptID: 1))
         XCTAssertEqual(client.recovery?.displayLine, "Finding where you are…")
 
         // A heartbeat, and a coalesced snapshot, carry the same id.
@@ -3381,45 +3381,47 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
         server.send(text: message(seq: 3, modelState: "receiving", worldID: "w-live", keyframes: 41,
                                   revision: "r2", selection: "live", recovery: prompting(id: 1)))
         await settle()
-        XCTAssertEqual(voice.spoken.count, 1, "the same prompt id was spoken twice")
+        XCTAssertEqual(cue.alerts.count, 1, "the same prompt id was shown twice")
 
         // A stale prompt (sent after its speak_until) is never spoken.
         server.send(text: message(seq: 4, modelState: "receiving", worldID: "w-live", keyframes: 42,
                                   revision: "r3", selection: "live",
                                   recovery: prompting(id: 2, episode: 2, speakUntil: 1788895030.0)))
         await settle()
-        XCTAssertEqual(voice.spoken.count, 1, "a stale look-back was spoken")
+        XCTAssertEqual(cue.alerts.count, 1, "a stale look-back was shown")
 
         // The next fresh one is.
         server.send(text: message(seq: 5, modelState: "receiving", worldID: "w-live", keyframes: 43,
                                   revision: "r4", selection: "live",
                                   recovery: prompting(id: 3, episode: 3)))
-        await expect { voice.spoken.count == 2 }
-        XCTAssertEqual(voice.spoken.last?.promptID, 3)
+        await expect { cue.alerts.count == 2 }
+        XCTAssertEqual(cue.alerts.last, 3)
+        XCTAssertEqual(client.lookBackBanner, .lookBack(promptID: 3))
 
-        // Recovered: the line changes, nothing is spoken.
+        // Recovered: the line changes, the banner says so, no new haptic.
         server.send(text: message(seq: 6, modelState: "receiving", worldID: "w-live", keyframes: 44,
                                   revision: "r5", selection: "live",
                                   recovery: prompting(id: 3, episode: 3, state: "recovered")))
         await expect { client.recovery?.state == .recovered }
         XCTAssertEqual(client.recovery?.displayLine, "Linked back to what you saw before")
-        XCTAssertEqual(voice.spoken.count, 2)
+        XCTAssertEqual(client.lookBackBanner, .backOnTrack)
+        XCTAssertEqual(cue.alerts.count, 2)
 
         tower.sendStreamStop()
         tower.disconnect()
     }
 
-    /// C1 E1: a pinned subscription never speaks and shows no recovery line,
+    /// C1 E1: a pinned subscription never shows a banner or a recovery line,
     /// and neither does a phone with no capture bracket open (Release has none).
-    func testAPinnedOrUnboundPhoneNeverSpeaks() async throws {
+    func testAPinnedOrUnboundPhoneNeverShowsAPrompt() async throws {
         let server = try MockTowerServer()
         let port = try await server.start()
         serve(server)
         defer { server.stop() }
 
-        let voice = RecordingLookBackVoice()
+        let cue = RecordingLookBackCue()
         let tower = TowerClient(metrics: SenderMetrics())
-        let client = TowerWorldBuilderClient(tower: tower, lookBackVoice: voice)
+        let client = TowerWorldBuilderClient(tower: tower, lookBackCue: cue)
         tower.connect(to: url(port: port))
         await expect { client.state == .awaitingFirstUpdate }
 
@@ -3428,7 +3430,8 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
                                   revision: "r1", selection: "live", recovery: prompting(id: 1)))
         await expect { client.state.isReceivingUpdates }
         await settle()
-        XCTAssertTrue(voice.spoken.isEmpty, "an unbound phone spoke")
+        XCTAssertTrue(cue.alerts.isEmpty, "an unbound phone showed a prompt")
+        XCTAssertNil(client.lookBackBanner)
         XCTAssertNil(client.recovery)
 
         // Bracket open, but pinned to a world by name.
@@ -3440,7 +3443,8 @@ final class TowerWorldBuilderLiveHistoryTests: XCTestCase {
                                   keyframes: 40, revision: "r1", selection: "pinned",
                                   recovery: prompting(id: 2, episode: 2)))
         await settle()
-        XCTAssertTrue(voice.spoken.isEmpty, "a pinned subscription spoke")
+        XCTAssertTrue(cue.alerts.isEmpty, "a pinned subscription showed a prompt")
+        XCTAssertNil(client.lookBackBanner)
         XCTAssertNil(client.recovery)
 
         tower.sendStreamStop()

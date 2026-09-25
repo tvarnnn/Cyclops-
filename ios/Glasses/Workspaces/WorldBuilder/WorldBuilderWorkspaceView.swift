@@ -123,6 +123,13 @@ struct WorldBuilderWorkspaceView: View {
         VStack(spacing: 16) {
             header
 
+            // The look-back prompt (§6.5 as amended after walk 1): shown, with
+            // a haptic, never spoken. `nil` unless following the live walk
+            // this phone streams.
+            if let banner = world.lookBackBanner {
+                WorldLookBackBannerView(banner: banner)
+            }
+
             #if DEBUG
             glassesPanel
             #endif
@@ -156,6 +163,7 @@ struct WorldBuilderWorkspaceView: View {
             // canvas's report, not this line's.
             HelperText(session.footnote)
         }
+        .animation(.easeInOut(duration: 0.25), value: world.lookBackBanner)
         .sheet(isPresented: $isShowingWorlds) {
             WorldPickerView(world: world)
         }

@@ -43,12 +43,6 @@
 
 	<key>UIBackgroundModes</key>
 	<array>
-		<!-- The look-back prompt (WORLD-BUILDER-COMPONENTS.md §6.5, C1 E6): the
-		     wearer locks the phone in a pocket during a walk, and speech cannot
-		     START from the background without this mode. Only a DEBUG build ever
-		     speaks (Release has no capture path, C1 M14); if Release is ever
-		     submitted, App Review will ask what plays in the background. -->
-		<string>audio</string>
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 		<string>external-accessory</string>

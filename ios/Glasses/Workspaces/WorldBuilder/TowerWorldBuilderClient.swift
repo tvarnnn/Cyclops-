@@ -673,7 +673,21 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
         recoverySubject.eraseToAnyPublisher()
     }
 
-    /// Says each look-back prompt once (§6.5). Handed every report in `apply`.
+    /// The look-back banner the live screen shows, or `nil` (§6.5 as amended
+    /// after walk 1: shown on the phone with a haptic, never spoken). Only
+    /// ever while following live and bound, like `recovery`.
+    private(set) var lookBackBanner: WorldLookBackBanner? {
+        didSet {
+            guard lookBackBanner != oldValue else { return }
+            lookBackBannerSubject.send(lookBackBanner)
+        }
+    }
+
+    var lookBackBannerUpdates: AnyPublisher<WorldLookBackBanner?, Never> {
+        lookBackBannerSubject.eraseToAnyPublisher()
+    }
+
+    /// Shows each look-back prompt once (§6.5). Handed every report in `apply`.
     private let lookBack: WorldLookBackPrompter
 
     /// The pin the next `result_subscribe` carries, or `nil` to follow the
@@ -689,6 +703,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private let finalizationSubject = PassthroughSubject<WorldFinalizationReport?, Never>()
     private let photographicSubject = PassthroughSubject<WorldPhotographicReport?, Never>()
     private let recoverySubject = PassthroughSubject<WorldRecoveryReport?, Never>()
+    private let lookBackBannerSubject = PassthroughSubject<WorldLookBackBanner?, Never>()
     /// The geometry address carried by every snapshot that has one — the
     /// heartbeat's included.
     ///
@@ -766,7 +781,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             // unchanged finalization publishes nothing.
             finalization = lastReport?.finalization
             photographic = lastReport?.photographic
-            if lastReport == nil { recovery = nil }
+            if lastReport == nil { recovery = nil; lookBack.dismiss() }
         }
     }
 
@@ -868,12 +883,12 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
     private var resubscribesUsed = 0
     private static let resubscribeBudget = 3
 
-    /// `lookBackVoice` is injectable so a test hears what would be said
-    /// without audio; the default speaks over A2DP (`WorldSpeechLookBackVoice`).
-    init(tower: TowerClient, subscribeAckTimeout: Duration? = nil, lookBackVoice: WorldLookBackVoice? = nil) {
+    /// `lookBackCue` is injectable so a test records the haptic; the default
+    /// is `WorldHapticLookBackCue`. There is no audio in either.
+    init(tower: TowerClient, subscribeAckTimeout: Duration? = nil, lookBackCue: WorldLookBackCue? = nil) {
         self.tower = tower
         self.subscribeAckTimeout = subscribeAckTimeout ?? Self.defaultSubscribeAckTimeout
-        self.lookBack = WorldLookBackPrompter(voice: lookBackVoice ?? WorldSpeechLookBackVoice())
+        self.lookBack = WorldLookBackPrompter(cue: lookBackCue ?? WorldHapticLookBackCue())
 
         // `.receive(on:)` on both, and it is load-bearing rather than
         // stylistic. A `@Published` publisher fires from `willSet`, so a sink
@@ -912,6 +927,8 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.rejudgeLastReport() }
             .store(in: &cancellables)
+
+        lookBack.onChange = { [weak self] banner in self?.lookBackBanner = banner }
     }
 
     // MARK: Availability
@@ -1494,6 +1511,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             let binding = bindingWithNoReport
             sessionBinding = binding
             recovery = nil
+            lookBack.dismiss()
             state = WorldSessionGate.presented(.idle, binding: binding)
             return
         }
@@ -1525,6 +1543,7 @@ final class TowerWorldBuilderClient: WorldBuilderClient {
             recovery = report.recovery
         } else {
             recovery = nil
+            lookBack.dismiss()
         }
         // Assigned unconditionally; the `didSet` publishes only on a real
         // change. That is what keeps the ~2 s heartbeat — which re-sends an

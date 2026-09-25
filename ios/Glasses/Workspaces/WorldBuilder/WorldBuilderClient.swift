@@ -144,6 +144,13 @@ protocol WorldBuilderClient: CartridgeClient {
 
     var recoveryUpdates: AnyPublisher<WorldRecoveryReport?, Never> { get }
 
+    /// The look-back banner for the walk this phone is streaming, or `nil`
+    /// -- never for a saved or foreign world. Shown with a haptic, never
+    /// spoken.
+    var lookBackBanner: WorldLookBackBanner? { get }
+
+    var lookBackBannerUpdates: AnyPublisher<WorldLookBackBanner?, Never> { get }
+
     /// Every value after the one `recentWorld` held when the view model was
     /// built.
     var recentWorldUpdates: AnyPublisher<WorldRecentReference?, Never> { get }
@@ -211,6 +218,13 @@ extension WorldBuilderClient {
     var recovery: WorldRecoveryReport? { nil }
 
     var recoveryUpdates: AnyPublisher<WorldRecoveryReport?, Never> {
+        Empty(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    /// No live walk, no look-back banner.
+    var lookBackBanner: WorldLookBackBanner? { nil }
+
+    var lookBackBannerUpdates: AnyPublisher<WorldLookBackBanner?, Never> {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
 
@@ -349,6 +363,9 @@ final class WorldBuilderViewModel: ObservableObject {
 
     /// The live relocalizer's line, republished from the client.
     @Published private(set) var recovery: WorldRecoveryReport?
+
+    /// The look-back banner, republished from the client.
+    @Published private(set) var lookBackBanner: WorldLookBackBanner?
 
     /// The world whose interactive picture can be opened, or `nil` when none
     /// has been named yet.
@@ -507,6 +524,7 @@ final class WorldBuilderViewModel: ObservableObject {
         self.finalization = client.finalization
         self.photographic = client.photographic
         self.recovery = client.recovery
+        self.lookBackBanner = client.lookBackBanner
         self.geometry = geometry
         self.library = library
 
@@ -570,6 +588,13 @@ final class WorldBuilderViewModel: ObservableObject {
             .sink { [weak self] report in
                 guard let self, self.recovery != report else { return }
                 self.recovery = report
+            }
+            .store(in: &cancellables)
+        client.lookBackBannerUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] banner in
+                guard let self, self.lookBackBanner != banner else { return }
+                self.lookBackBanner = banner
             }
             .store(in: &cancellables)
         client.geometryUpdates
@@ -1264,7 +1289,8 @@ final class WorldBuilderViewModel: ObservableObject {
             account: geometryAccount,
             recoverability: recoverability,
             photographic: photographic,
-            recovery: recovery
+            recovery: recovery,
+            lookBackBanner: lookBackBanner
         )
     }
 

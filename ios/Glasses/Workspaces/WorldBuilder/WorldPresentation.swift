@@ -741,6 +741,8 @@ struct WorldPresentation: Equatable {
     /// (`nil` otherwise: the client only publishes it while following live and
     /// bound).
     var recovery: WorldRecoveryReport?
+    /// The look-back banner, under the same rule as `recovery`.
+    var lookBackBanner: WorldLookBackBanner?
 
     init(
         stage: WorldStage? = nil,
@@ -752,7 +754,8 @@ struct WorldPresentation: Equatable {
         account: WorldGeometryAccount = .undescribed,
         recoverability: WorldRecoverability? = nil,
         photographic: WorldPhotographicReport? = nil,
-        recovery: WorldRecoveryReport? = nil
+        recovery: WorldRecoveryReport? = nil,
+        lookBackBanner: WorldLookBackBanner? = nil
     ) {
         self.stage = stage
         self.evidence = evidence
@@ -762,6 +765,7 @@ struct WorldPresentation: Equatable {
         self.recoverability = recoverability
         self.photographic = photographic
         self.recovery = recovery
+        self.lookBackBanner = lookBackBanner
     }
 
     /// Whether this is a saved world whose photographic build failed: the one
