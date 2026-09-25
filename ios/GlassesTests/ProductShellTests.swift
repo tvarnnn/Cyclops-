@@ -3312,3 +3312,53 @@ final class MotionProbeMockDeviceTests: XCTestCase {
     }
 }
 #endif
+
+// MARK: - DAT 1.0.0's nonblocking compatibility warning
+
+#if DEBUG
+/// `dwaOutOfStuRange` is documented as nonblocking ("the session can
+/// continue"), and it arrives through the same session error listener as the
+/// terminal errors, which present the modal "Something went wrong". It must
+/// reach the log and Developer Tools, and nothing else may change.
+@MainActor
+final class DATNonblockingWarningTests: XCTestCase {
+
+    private func connection() -> GlassesConnection {
+        GlassesConnection(wearables: ScriptedWearables(permissionResults: []))
+    }
+
+    func testTheOutOfRangeWarningIsLoggedNotAlerted() throws {
+        let glasses = connection()
+        glasses.handleSessionError(.dwaOutOfStuRange)
+        XCTAssertNil(glasses.errorMessage, "a nonblocking warning raised the modal alert")
+        let warning = try XCTUnwrap(glasses.datNonblockingWarning, "the warning never reached Developer Tools")
+        XCTAssertEqual(warning.count, 1)
+        XCTAssertEqual(warning.source, "session error listener")
+        XCTAssertEqual(warning.description, DeviceSessionError.dwaOutOfStuRange.description)
+
+        glasses.handleSessionError(.dwaOutOfStuRange)
+        XCTAssertEqual(glasses.datNonblockingWarning?.count, 2, "repeats are counted, not replaced")
+        XCTAssertNil(glasses.errorMessage)
+    }
+
+    /// Every other case behaves exactly as before: `errorMessage`, verbatim.
+    func testEveryOtherSessionErrorStillReachesTheAlert() {
+        let others: [DeviceSessionError] = [
+            .noEligibleDevice, .sessionAlreadyStopped, .sessionAlreadyExists, .sessionIdle,
+            .capabilityAlreadyActive, .capabilityNotFound, .unexpectedError(description: "x"),
+            .thermalCritical, .thermalEmergency, .peakPowerShutdown, .batteryCritical,
+            .datAppOnTheGlassesUpdateRequired, .dwaUnavailable, .insufficientSDKVersion,
+        ]
+        for error in others {
+            let glasses = connection()
+            XCTAssertFalse(GlassesConnection.isNonblockingWarning(error), "\(error) was classed as nonblocking")
+            glasses.handleSessionError(error)
+            XCTAssertEqual(glasses.errorMessage, error.localizedDescription, "\(error) no longer reaches the alert")
+            XCTAssertNil(glasses.datNonblockingWarning, "\(error) was counted as a nonblocking warning")
+        }
+        XCTAssertTrue(GlassesConnection.isNonblockingWarning(DeviceSessionError.dwaOutOfStuRange))
+        XCTAssertTrue(GlassesConnection.isNonblockingWarning(DeviceSessionError.dwaOutOfStuRange as any Error))
+        XCTAssertFalse(GlassesConnection.isNonblockingWarning(CocoaError(.fileNoSuchFile) as any Error))
+    }
+}
+#endif

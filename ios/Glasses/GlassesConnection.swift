@@ -237,6 +237,27 @@ nonisolated enum CaptureStartRefusal: Equatable, Sendable {
     case datRefused(String)
 }
 
+#if DEBUG
+/// A DAT error that DAT documents as **nonblocking**, seen and deliberately not
+/// shown as an alert.
+///
+/// DAT 1.0.0 added `DeviceSessionError.dwaOutOfStuRange`: "the app and glasses
+/// are on versions outside the recommended compatibility range. Not blocking.
+/// The session can continue ... Prompt the user to update occasionally rather
+/// than block the session." It arrives through the same session error listener
+/// as the terminal errors, and that listener wrote every error to
+/// `errorMessage`, which the root view presents as the modal "Something went
+/// wrong" -- mid-capture, for a session that is working. So this one case is
+/// logged and counted here, for Developer Tools, and nothing else changes.
+nonisolated struct DATNonblockingWarning: Equatable, Sendable {
+    let description: String
+    var count: Int
+    var lastSeen: Date
+    /// Where it arrived: the session error listener, or `session.start()`.
+    var source: String
+}
+#endif
+
 @MainActor
 final class GlassesConnection: ObservableObject {
     @Published private(set) var registrationState: RegistrationState
@@ -351,6 +372,10 @@ final class GlassesConnection: ObservableObject {
 
     /// Whether a Motion capability is attached to the current session.
     var isMotionAttached: Bool { motion != nil }
+
+    /// DAT's nonblocking compatibility warning, if it has been seen. Shown in
+    /// Developer Tools instead of as an alert; see `DATNonblockingWarning`.
+    @Published private(set) var datNonblockingWarning: DATNonblockingWarning?
 
     /// Fires once when the camera stream is confirmed live (`StreamState
     /// .streaming`) — the earliest point it's true that a session "has
@@ -952,6 +977,16 @@ final class GlassesConnection: ObservableObject {
             try session.start()
             print("[Glasses][Camera] session.start() called — createSession succeeded with an eligible device present")
         } catch {
+            // DAT documents `dwaOutOfStuRange` as the one version error that
+            // lets a session proceed. Raised by `start()`, the session exists
+            // and is starting, so it is kept and the warning goes to the log
+            // and Developer Tools, not to a modal alert. Raised by
+            // `createSession`, there is no session to keep, so it falls through
+            // to the failure path below like every other error.
+            if deviceSession != nil, Self.isNonblockingWarning(error) {
+                noteNonblockingWarning("\(error)", source: "session.start()")
+                return
+            }
             // Untyped: `createSession` and `start()` throw `DeviceSessionError`
             // and nothing else, so `catch let error as DeviceSessionError` was
             // a test the compiler proves is always true. The clause was already
@@ -1006,10 +1041,49 @@ final class GlassesConnection: ObservableObject {
 
         session.errorPublisher.listen { [weak self] error in
             Task { @MainActor [weak self] in
-                print("[Glasses][Camera] session error: \(error.localizedDescription)")
-                self?.errorMessage = error.localizedDescription
+                self?.handleSessionError(error)
             }
         }.store(in: sessionTokenBag)
+    }
+
+    /// Whether DAT documents this session error as nonblocking: the session
+    /// continues, and the right response is a log line, not an alert. Today
+    /// that is exactly `dwaOutOfStuRange`; every other case is unchanged.
+    nonisolated static func isNonblockingWarning(_ error: DeviceSessionError) -> Bool {
+        if case .dwaOutOfStuRange = error { return true }
+        return false
+    }
+
+    /// The same, for a catch clause whose error type is not spelled out.
+    nonisolated static func isNonblockingWarning(_ error: any Error) -> Bool {
+        (error as? DeviceSessionError).map { isNonblockingWarning($0) } ?? false
+    }
+
+    /// The one route from the session error listener to the screen.
+    ///
+    /// Internal rather than private so a test can drive it: DAT's own session
+    /// cannot be made to publish a chosen error. Everything but a nonblocking
+    /// warning is written to `errorMessage` exactly as before.
+    func handleSessionError(_ error: DeviceSessionError) {
+        if Self.isNonblockingWarning(error) {
+            noteNonblockingWarning(error.description, source: "session error listener")
+            return
+        }
+        print("[Glasses][Camera] session error: \(error.localizedDescription)")
+        errorMessage = error.localizedDescription
+    }
+
+    /// Logs a nonblocking DAT warning and counts it for Developer Tools. Never
+    /// touches `errorMessage`, and never ends the session.
+    private func noteNonblockingWarning(_ description: String, source: String) {
+        let now = Date()
+        var warning = datNonblockingWarning
+            ?? DATNonblockingWarning(description: description, count: 0, lastSeen: now, source: source)
+        warning.count += 1
+        warning.lastSeen = now
+        warning.source = source
+        datNonblockingWarning = warning
+        print("[Glasses][Camera] DAT nonblocking warning from \(source), logged and not shown as an alert (seen \(warning.count)x): \(description)")
     }
 
     /// Adds the camera capability and starts its stream. Requires camera
