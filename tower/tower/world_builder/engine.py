@@ -187,8 +187,13 @@ class WorldBuilderEngine:
         redactor_factory=None,
         relocalizer: str | None = None,
         monotonic=None,
+        relocalizer_options: dict | None = None,
     ) -> None:
         self._store = store
+        # The RELOC2 options (config.world_relocalizer_options): None reads
+        # the environment at each session start like the mode; `{}` or an
+        # unset environment builds the relocalizer exactly as before.
+        self._relocalizer_options = relocalizer_options
         # The look-back relocalizer's mode (`off` / `prompt` / `silent`,
         # relocalizer.py). None reads `TOWER_WORLD_RELOCALIZER` at each
         # session start -- the builder process inherits the Tower's
@@ -1243,11 +1248,18 @@ class WorldBuilderEngine:
         try:
             from tower.world_builder import relocalizer
 
+            options = self._relocalizer_options
+            if options is None:
+                from tower.config import world_relocalizer_options
+
+                options = world_relocalizer_options()
             # `wall_clock` is the clock the journal stamps `at` with: the
             # limiter checks the prompt cap on the wire's own numbers too
-            # (review V8 LOW-3; see `_recovery`).
+            # (review V8 LOW-3; see `_recovery`). `options` only when set,
+            # so the default call is exactly the one before RELOC2.
+            extra = {"options": options} if options else {}
             reloc = relocalizer.from_session(
-                session.intrinsics, mode=mode, wall_clock=self._clock
+                session.intrinsics, mode=mode, wall_clock=self._clock, **extra
             )
         except Exception:
             logger.exception(

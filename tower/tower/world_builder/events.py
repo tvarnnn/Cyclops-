@@ -70,6 +70,16 @@ EVENT_KINDS = frozenset(
         "recovery_timed_out",
         "recovery_anchored",
         "relocalizer_stopped",
+        # One line per resolved episode, written only when
+        # `TOWER_WORLD_RELOCALIZER_SUMMARY` is on (off by default): what the
+        # relocalizer tried -- references, scans, best legs, closest
+        # triangle, losses joined. Not a state change; the payload block and
+        # `revisit_pairs` ignore it (relocalizer.EVENT_SUMMARY).
+        #   recovery_summary {episode, outcome, by, prompted, losses_joined,
+        #                     open_s, references, history_references,
+        #                     attempts, dropped, best_links, best_pair,
+        #                     best_triangle}
+        "recovery_summary",
     }
 )
 

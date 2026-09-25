@@ -119,9 +119,25 @@ EVENT_ANCHORED = "recovery_anchored"
 # An episode still open is closed `timed_out` before it; the reader closes
 # one itself if the line never came (a builder that died).
 EVENT_STOPPED = "relocalizer_stopped"
+# Not a state change (RELOC2, observability, OFF by default): one line per
+# episode, written right after the line that resolved it, recording what the
+# relocalizer tried -- its references, scans, best legs and closest
+# triangle, and the losses it joined. The payload block ignores it; it exists
+# so that "why did this look-back not re-link?" is a lookup, not a replay.
+EVENT_SUMMARY = "recovery_summary"
 RECOVERY_EVENT_KINDS = (
     EVENT_STARTED, EVENT_PROMPTED, EVENT_WITHHELD, EVENT_ACCEPTED, EVENT_TIMED_OUT,
 )
+
+# Where `timeout_s` is measured from (RELOC2 candidate 1). `loss` (the
+# default, contract 6.1): from the loss that opened the episode, so a prompt
+# issued at `prompt_after_s` leaves the wearer `timeout_s - prompt_after_s`.
+# `prompt`: a PROMPTED episode's timeout runs from the prompt instead, so the
+# wearer gets the whole `timeout_s` after being asked; an unprompted episode
+# is unchanged.
+WINDOW_FROM_LOSS = "loss"
+WINDOW_FROM_PROMPT = "prompt"
+WINDOW_FROMS = (WINDOW_FROM_LOSS, WINDOW_FROM_PROMPT)
 
 
 @dataclass(frozen=True)
@@ -150,9 +166,19 @@ class AcceptanceParams:
     triangle_min_link_inliers: int = 50
     triangle_max_closure_deg: float = 8.0
     strong_link_min_inliers: int = 100
+    # HISTORICAL REFERENCES (RELOC2 candidate 2, MISSION Objective 4's
+    # "historical-keyframe matching"; 0 = off, today's behaviour). Up to this
+    # many keyframes OLDER than the last `reference_keyframes`, kept spread
+    # over the session by keyframe order (see `_History`), in runs of
+    # `history_group` consecutive keyframes so a revisited old view can
+    # still close a triangle (two references that are themselves linked).
+    # They are added to an episode's references; the acceptance rule is
+    # untouched.
+    history_keyframes: int = 0
+    history_group: int = 2
 
     def to_wire(self) -> dict:
-        return {
+        wire = {
             "matcher": self.matcher,
             "reference_keyframes": self.reference_keyframes,
             "scan_hz": self.scan_hz,
@@ -163,6 +189,12 @@ class AcceptanceParams:
             },
             "strong_link": {"min_inliers": self.strong_link_min_inliers},
         }
+        if self.history_keyframes:
+            # Only when on: an off relocalizer's journal is byte-identical.
+            wire["history"] = {
+                "keyframes": self.history_keyframes, "group": self.history_group,
+            }
+        return wire
 
 
 # THE REVISIT FLOOR (review V8 M4): the fewest RANSAC inliers any live leg
@@ -224,9 +256,11 @@ class LimiterParams:
     prompt_after_s: float = 5.0
     timeout_s: float = 20.0
     speak_window_s: float = 5.0
+    # RELOC2 candidate 1: `loss` (default) or `prompt`; see WINDOW_FROM_*.
+    window_from: str = WINDOW_FROM_LOSS
 
     def to_wire(self) -> dict:
-        return {
+        wire = {
             "max_prompts": self.max_prompts,
             "window_s": self.window_s,
             "mechanism": self.mechanism,
@@ -235,6 +269,12 @@ class LimiterParams:
             "timeout_s": self.timeout_s,
             "speak_window_s": self.speak_window_s,
         }
+        if self.window_from != WINDOW_FROM_LOSS:
+            # Only when changed: the default journal is byte-identical, and
+            # the payload block's `limiter` keeps exactly the contract keys
+            # (`_LIMITER_KEYS` is the default's).
+            wire["window_from"] = self.window_from
+        return wire
 
 
 # -- the limiter -------------------------------------------------------------
@@ -416,6 +456,10 @@ class RecoveryStateMachine:
         self.withheld_no_references = 0
         self._prompt_decided = False
         self._can_accept = True
+        # The open (or last) episode's prompt time on this machine's clock,
+        # None when it was not prompted; and the losses that joined it.
+        self.prompted_at: float | None = None
+        self.losses_joined = 0
 
     @property
     def is_open(self) -> bool:
@@ -424,6 +468,7 @@ class RecoveryStateMachine:
     def lost(self, at: float, *, can_accept: bool = True) -> tuple[bool, list]:
         """A journaled `tracking_lost` at `at`. Returns (opened, events)."""
         if self.is_open:
+            self.losses_joined += 1
             return False, []  # joins the open episode
         self.episode += 1
         self.counts["episodes"] += 1
@@ -433,6 +478,8 @@ class RecoveryStateMachine:
         self.recovered_by = None
         self._prompt_decided = False
         self._can_accept = bool(can_accept)
+        self.prompted_at = None
+        self.losses_joined = 0
         return True, []
 
     def cannot_accept(self) -> None:
@@ -460,7 +507,12 @@ class RecoveryStateMachine:
             return []
         p = self.limiter_params
         elapsed = now - self.lost_at
-        if elapsed >= p.timeout_s:
+        # The window's start: the loss, or -- `window_from: prompt` and the
+        # episode was prompted -- the prompt (RELOC2 candidate 1).
+        window_start = self.lost_at
+        if p.window_from == WINDOW_FROM_PROMPT and self.prompted_at is not None:
+            window_start = self.prompted_at
+        if now - window_start >= p.timeout_s:
             # FIRST: a frame this late never prompts, it only closes.
             self._prompt_decided = True
             return self._time_out(now, why=None)
@@ -497,6 +549,7 @@ class RecoveryStateMachine:
         self.prompt_episode = self.episode
         self.counts["prompts"] += 1
         self.state = STATE_PROMPTING
+        self.prompted_at = now
         return [(EVENT_PROMPTED, {"prompt_id": self.prompt_id, "episode": self.episode})]
 
     def prompt_journaled(self, at: float) -> None:
@@ -975,6 +1028,64 @@ class _Episode:
     refref: dict = field(default_factory=dict)
     post: list = field(default_factory=list)  # [(keyframe_id, source_seq, gray)]
     done: bool = False
+    # What the worker tried (the summary's evidence; written by the worker
+    # under the lock, read by the frame thread under it).
+    n_history: int = 0
+    attempts: int = 0
+    best_inliers: dict = field(default_factory=dict)  # ref id -> most inliers seen
+    best_pair: dict | None = None  # the scan whose SECOND-best leg was highest
+    best_triangle: dict | None = None  # the closest triangle evaluated at the floor
+    dropped_at_open: int = 0
+    cache_pruned: bool = False  # the worker trimmed the feature cache to these refs
+
+
+class _History:
+    """Keyframes older than the last `reference_keyframes`, spread over the
+    session (RELOC2 candidate 2). Pixels in memory only, like `_refs`.
+
+    Keyframes arrive in acceptance order as they fall out of the recent
+    window, so consecutive arrivals are consecutive keyframes. They are
+    kept in GROUPS of `group` consecutive keyframes (a triangle needs two
+    linked references of one view), numbered 0, 1, 2, ... A STRIDE rule
+    keeps the spread even: only groups whose number is a multiple of
+    `stride` are kept, plus the newest (the most recent old view); when the
+    budget is exceeded the stride doubles. So the held groups are always
+    evenly spaced over the whole walk in keyframe order -- the first group
+    (where the walk began) is never dropped -- at most a factor of 2 apart
+    from perfectly even. Keyframe order stands in for time and viewpoint:
+    the relocalizer holds no poses, and nothing measured says a cheap image
+    descriptor would spread views better.
+    """
+
+    def __init__(self, capacity: int, group: int) -> None:
+        self.capacity = int(capacity)
+        self.group = max(1, int(group))
+        self.stride = 1
+        self._next = 0
+        # [(number, [(keyframe_id, source_seq, gray), ...]), ...] oldest first
+        self.groups: list[tuple[int, list]] = []
+
+    def add(self, keyframe_id: str, source_seq: int, gray) -> None:
+        member = (keyframe_id, source_seq, gray)
+        if self.groups and len(self.groups[-1][1]) < self.group:
+            self.groups[-1][1].append(member)
+        else:
+            # The newest group is complete and settles: kept only on stride.
+            if self.groups and self.groups[-1][0] % self.stride:
+                self.groups.pop()
+            self.groups.append((self._next, [member]))
+            self._next += 1
+        while sum(len(m) for _, m in self.groups) > self.capacity:
+            if len(self.groups) <= 2:
+                self.groups.pop(0)  # a budget below two groups: oldest out
+                continue
+            self.stride *= 2
+            newest = self.groups[-1]
+            self.groups = [g for g in self.groups[:-1] if g[0] % self.stride == 0] + [newest]
+
+    def members(self) -> list:
+        """[(keyframe_id, gray)], oldest first."""
+        return [(kid, gray) for _, m in self.groups for kid, _seq, gray in m]
 
 
 @dataclass
@@ -1055,9 +1166,23 @@ class LookBackRelocalizer:
         verifier=None,
         synchronous: bool = False,
         wall_clock=None,
+        summary_events: bool = False,
     ) -> None:
         self.acceptance = acceptance or AcceptanceParams()
         self.limiter = limiter or LimiterParams()
+        # RELOC2 candidate 3: `recovery_summary` per resolved episode. Off:
+        # not one line is added to the journal.
+        self.summary_events = bool(summary_events)
+        self._summarised = 0  # the last episode a summary was written for
+        self._ref_seq: dict = {}  # recent reference id -> source_seq (history only)
+        # keyframe id -> Features, across episodes; history only; the WORKER
+        # thread alone reads and writes it (see `_run`).
+        self._feature_cache: dict = {}
+        # RELOC2 candidate 2: None when off (today's reference set exactly).
+        self._history = (
+            _History(self.acceptance.history_keyframes, self.acceptance.history_group)
+            if self.acceptance.history_keyframes > 0 else None
+        )
         # One scan period of lateness is tolerated before a prompt is `late`.
         self.machine = RecoveryStateMachine(
             self.limiter, prompts_enabled=prompts_enabled,
@@ -1118,6 +1243,11 @@ class LookBackRelocalizer:
             wants_anchor = self._pending_anchor is not None
         if wants_anchor:
             self._submit_anchor((keyframe_id, source_seq, gray))
+        if self._history is not None:
+            if len(self._refs) == self._refs.maxlen:
+                old_id, old_gray = self._refs[0]  # about to fall out of the window
+                self._history.add(old_id, self._ref_seq.pop(old_id, -1), old_gray)
+            self._ref_seq[keyframe_id] = source_seq
         self._refs.append((keyframe_id, gray))
 
     def note_lost(self, at: float) -> list:
@@ -1126,10 +1256,17 @@ class LookBackRelocalizer:
         can_accept = bool(self._refs) and not self._size_mismatch
         opened, events = self.machine.lost(at, can_accept=can_accept)
         if opened:
+            refs = list(self._refs)
+            history = self._history.members() if self._history is not None and refs else []
             with self._lock:
                 if self._episode is not None:
                     self._episode.done = True
-                self._episode = _Episode(number=self.machine.episode, refs=list(self._refs))
+                # Recent references first, then the historical ones, oldest
+                # first; with history off this is exactly the recent window.
+                self._episode = _Episode(
+                    number=self.machine.episode, refs=refs + history,
+                    n_history=len(history), dropped_at_open=self.dropped_frames,
+                )
                 self._pending = None
             self._last_submit = None
             if not can_accept:
@@ -1155,6 +1292,7 @@ class LookBackRelocalizer:
         if self.machine.is_open:
             events += self.machine.tick(now)
         if not self.machine.is_open:
+            events += self._summaries()
             self._finish_episode()
         return events
 
@@ -1173,6 +1311,7 @@ class LookBackRelocalizer:
         if self.machine.is_open:
             events += self.machine.tick(now)
         if not self.machine.is_open:
+            events += self._summaries()
             self._finish_episode()
         return events
 
@@ -1204,6 +1343,10 @@ class LookBackRelocalizer:
         events += self.machine.close(
             now, why="session_stopped" if stopped["why"] == "session_stopped" else "relocalizer_stopped"
         )
+        try:
+            events += self._summaries()
+        except Exception:  # observability must never cost the terminal line
+            logger.exception("[Tower][WorldBuilder] relocalizer: the episode summary at close failed")
         events.append((EVENT_STOPPED, stopped))
         self._finish_episode()
         with self._lock:
@@ -1240,6 +1383,93 @@ class LookBackRelocalizer:
         }
 
     # -- internals -------------------------------------------------------------
+
+    def _summaries(self) -> list:
+        """`recovery_summary` for the episode that just resolved, once.
+
+        Called on the frame thread right after the line that resolved the
+        episode; empty when the setting is off, while an episode is open, or
+        when this episode was already summarised. Numbers and keyframe ids
+        only, never imagery.
+        """
+        m = self.machine
+        if not self.summary_events or m.is_open or m.episode == 0 or self._summarised >= m.episode:
+            return []
+        self._summarised = m.episode
+        ep = self._episode if self._episode is not None and self._episode.number == m.episode else None
+        with self._lock:
+            refs = [] if ep is None else [kid for kid, _ in ep.refs]
+            best = {} if ep is None else dict(ep.best_inliers)
+            payload = {
+                "episode": m.episode,
+                "outcome": m.state,
+                "by": m.recovered_by if m.state == STATE_RECOVERED else None,
+                "prompted": m.prompted_at is not None,
+                "losses_joined": m.losses_joined,
+                "open_s": None if m.resolved_at is None or m.lost_at is None
+                else round(m.resolved_at - m.lost_at, 3),
+                "references": refs,
+                "history_references": 0 if ep is None else ep.n_history,
+                "attempts": 0 if ep is None else ep.attempts,
+                "dropped": 0 if ep is None else max(0, self.dropped_frames - ep.dropped_at_open),
+                "best_links": [
+                    {"ref_keyframe_id": kid, "inliers": n}
+                    for kid, n in sorted(best.items(), key=lambda kn: (-kn[1], refs.index(kn[0]) if kn[0] in refs else 0))[:3]
+                ],
+                "best_pair": None if ep is None or ep.best_pair is None else dict(ep.best_pair),
+                "best_triangle": None if ep is None or ep.best_triangle is None else dict(ep.best_triangle),
+            }
+        return [(EVENT_SUMMARY, payload)]
+
+    def _note_scan(self, ep: _Episode, job: _Job, links: dict, refref) -> None:
+        """The summary's evidence from one scan (worker thread).
+
+        Costs at most ONE extra verify per new best pair of legs (the
+        reference-reference link, cached per episode, that the closure of a
+        below-floor pair needs); the floor triangles reuse the links
+        `evaluate_acceptance` already computed.
+        """
+        import numpy as np
+
+        legs = sorted(((l.n_inliers, k) for k, l in links.items()), key=lambda nk: -nk[0])
+        with self._lock:
+            ep.attempts += 1
+            for n, k in legs:
+                if n > ep.best_inliers.get(k, 0):
+                    ep.best_inliers[k] = n
+            improves = len(legs) >= 2 and (
+                ep.best_pair is None or legs[1][0] > ep.best_pair["inliers"][1]
+            )
+        if improves:
+            (n1, k1), (n2, k2) = legs[0], legs[1]
+            o = refref(k1, k2)
+            closure = None if o is None else rotation_angle_deg(
+                np.asarray(links[k1].R).T @ np.asarray(links[k2].R) @ np.asarray(o.R))
+            pair = {
+                "refs": [k1, k2], "inliers": [n1, n2], "refs_linked": o is not None,
+                "closure_deg": None if closure is None else round(float(closure), 3),
+                "frame": {"source_seq": int(job.source_seq)},
+            }
+            with self._lock:
+                ep.best_pair = pair
+        # The closest triangle among legs AT the floor: exactly the pairs
+        # `evaluate_acceptance` just verified (cached), so this is free.
+        floor = self.acceptance.triangle_min_link_inliers
+        at_floor = [(k, links[k]) for k in links if links[k].n_inliers >= floor]
+        for i in range(len(at_floor)):
+            for j in range(i + 1, len(at_floor)):
+                (ka, la), (kb, lb) = at_floor[i], at_floor[j]
+                o = ep.refref.get((ka, kb))
+                if o is None:
+                    continue
+                c = rotation_angle_deg(np.asarray(la.R).T @ np.asarray(lb.R) @ np.asarray(o.R))
+                with self._lock:
+                    if ep.best_triangle is None or c < ep.best_triangle["closure_deg"]:
+                        ep.best_triangle = {
+                            "refs": [ka, kb], "inliers": [la.n_inliers, lb.n_inliers],
+                            "closure_deg": round(float(c), 3),
+                            "frame": {"source_seq": int(job.source_seq)},
+                        }
 
     def _finish_episode(self) -> None:
         with self._lock:
@@ -1324,11 +1554,24 @@ class LookBackRelocalizer:
             return
         wall0, cpu0 = time.perf_counter(), time.thread_time()
         v = self._verifier
+        cache = self._feature_cache if self._history is not None else None
+        if cache is not None and not ep.cache_pruned:
+            # WORKER-ONLY state: kept to this episode's references, so the
+            # cache never holds more than `reference_keyframes` +
+            # `history_keyframes` feature sets (RELOC2: a historical
+            # reference is extracted once, not once per episode).
+            wanted = {kid for kid, _ in ep.refs}
+            for kid in [k for k in cache if k not in wanted]:
+                del cache[kid]
+            ep.cache_pruned = True
         for kid, gray in ep.refs:
             if self._stop or ep.done:
                 return  # resolved or stopped meanwhile: stop spending CPU
             if kid not in ep.ref_features:
-                ep.ref_features[kid] = v.features(gray)
+                hit = cache.get(kid) if cache is not None else None
+                ep.ref_features[kid] = hit if hit is not None else v.features(gray)
+                if cache is not None:
+                    cache[kid] = ep.ref_features[kid]
         frame = v.features(job.gray)
         links = {}
         for kid, _ in ep.refs:
@@ -1347,6 +1590,10 @@ class LookBackRelocalizer:
             return ep.refref[key]
 
         decision = evaluate_acceptance(links, refref, self.acceptance)
+        if self.summary_events:
+            # Before the result is published, so the summary written when it
+            # is collected already counts this scan.
+            self._note_scan(ep, job, links, refref)
         result = None
         if decision is not None:
             by, used, closure = decision
@@ -1476,7 +1723,32 @@ def _mat(R) -> list:
     return [[round(float(x), 6) for x in row] for row in R]
 
 
-def from_session(intrinsics, *, mode: str, **kwargs) -> LookBackRelocalizer | None:
+def options_kwargs(options: dict | None) -> dict:
+    """`LookBackRelocalizer` keyword arguments for the RELOC2 options.
+
+    `options` holds only the settings that differ from today's
+    (`config.world_relocalizer_options`): `window_from` (`prompt`),
+    `history_keyframes` (> 0) and `summary_events` (True). Empty or None:
+    no keyword at all, so the relocalizer is built exactly as before.
+    """
+    options = dict(options or {})
+    kwargs: dict = {}
+    window_from = options.get("window_from", WINDOW_FROM_LOSS)
+    if window_from not in WINDOW_FROMS:
+        raise ValueError(f"unknown window_from {window_from!r}")
+    if window_from != WINDOW_FROM_LOSS:
+        kwargs["limiter"] = LimiterParams(window_from=window_from)
+    history = int(options.get("history_keyframes", 0) or 0)
+    if history < 0:
+        raise ValueError("history_keyframes must be >= 0")
+    if history:
+        kwargs["acceptance"] = AcceptanceParams(history_keyframes=history)
+    if options.get("summary_events"):
+        kwargs["summary_events"] = True
+    return kwargs
+
+
+def from_session(intrinsics, *, mode: str, options: dict | None = None, **kwargs) -> LookBackRelocalizer | None:
     """The relocalizer for a session, or None when it cannot or must not run.
 
     `mode` is the setting (`off` / `prompt` / `silent`). A session without a
@@ -1485,9 +1757,11 @@ def from_session(intrinsics, *, mode: str, **kwargs) -> LookBackRelocalizer | No
     `null` ("not recorded"). Frames or keyframes at any size other than the
     calibrated one are ignored by the relocalizer (the engine rejects a
     size change anyway, and the build refuses a calibration mismatch).
+    `options` are the RELOC2 settings (`options_kwargs`); None is today's.
     """
     if mode not in (MODE_PROMPT, MODE_SILENT):
         return None
+    kwargs = {**options_kwargs(options), **kwargs}
     K = intrinsics.camera_matrix() if intrinsics is not None else None
     if K is None:
         logger.warning(

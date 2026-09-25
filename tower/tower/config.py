@@ -1041,6 +1041,55 @@ def world_relocalizer_setting() -> str:
     return "off"
 
 
+# RELOC2 (manager 058): three relocalizer options, each OFF by default, so an
+# unset environment builds the relocalizer exactly as before and its journal
+# is byte-identical. Read by the BUILDER process at each session start.
+#   TOWER_WORLD_RELOCALIZER_WINDOW   `loss` (default) | `prompt`: a prompted
+#                                    episode's timeout runs from the prompt.
+#   TOWER_WORLD_RELOCALIZER_HISTORY  0 (default) .. 40: historical reference
+#                                    keyframes added to each episode's 10.
+#   TOWER_WORLD_RELOCALIZER_SUMMARY  off (default) | on: one
+#                                    `recovery_summary` line per episode.
+WORLD_RELOCALIZER_WINDOW_ENV = "TOWER_WORLD_RELOCALIZER_WINDOW"
+WORLD_RELOCALIZER_HISTORY_ENV = "TOWER_WORLD_RELOCALIZER_HISTORY"
+WORLD_RELOCALIZER_SUMMARY_ENV = "TOWER_WORLD_RELOCALIZER_SUMMARY"
+WORLD_RELOCALIZER_HISTORY_MAX = 40
+
+
+def world_relocalizer_options() -> dict:
+    """The RELOC2 options that differ from today's; `{}` when none do.
+
+    Garbage reads as the default and is logged: a typo must never change
+    what the relocalizer accepts or when it gives up.
+    """
+    options: dict = {}
+    window = (os.environ.get(WORLD_RELOCALIZER_WINDOW_ENV) or "").strip().lower()
+    if window == "prompt":
+        options["window_from"] = "prompt"
+    elif window not in ("", "loss"):
+        logger.warning(
+            "[Tower][Config] %s=%r is not loss or prompt; treating it as loss",
+            WORLD_RELOCALIZER_WINDOW_ENV, window,
+        )
+    history = (os.environ.get(WORLD_RELOCALIZER_HISTORY_ENV) or "").strip()
+    if history:
+        try:
+            n = int(history)
+        except ValueError:
+            n = -1
+        if 0 <= n <= WORLD_RELOCALIZER_HISTORY_MAX:
+            if n:
+                options["history_keyframes"] = n
+        else:
+            logger.warning(
+                "[Tower][Config] %s=%r is not an integer 0..%d; treating it as 0",
+                WORLD_RELOCALIZER_HISTORY_ENV, history, WORLD_RELOCALIZER_HISTORY_MAX,
+            )
+    if _flag(WORLD_RELOCALIZER_SUMMARY_ENV, default=False):
+        options["summary_events"] = True
+    return options
+
+
 def _torch_threads(value: str | None) -> int | str:
     """"auto", or a non-negative integer. Garbage is "auto", not a crash.
 
