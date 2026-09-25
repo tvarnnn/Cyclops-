@@ -1888,6 +1888,10 @@ assert.ok(NAV.C_GRAD_WIDE > NAV.C_GRAD_EPS);
         # comes from the page's own support, not from anything invented
         assert "NAV.ringProfile(navField, at, navView(), RING_BINS)" in cue
         assert "RING_MOVE" in cue
+        # a length like any other: on walk 1's room (ee48aae3) an unscaled 0.22 was
+        # 1.3 scene depths, so the ring a tap turns you by was 10-40 degrees stale
+        # at 16 of 37 recorded poses (RV-VIEW F1)
+        assert "const RING_BINS = 36, RING_MOVE = 0.22 * OPT.sceneUnit;" in cue
         # and everything the cue reads is the pose that is DRAWN, so a
         # verification hook pinning an exact camera does not leave the ring
         # pointing at wherever `cam` happens to be

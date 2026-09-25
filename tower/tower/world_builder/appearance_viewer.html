@@ -2782,7 +2782,7 @@ async function main(){
      pointing where `cam` happens to be while the screen shows somewhere else
      is worse than no compass. On a phone `override` is always null and the
      two are the same object. */
-  const RING_BINS = 36, RING_MOVE = 0.22;
+  const RING_BINS = 36, RING_MOVE = 0.22 * OPT.sceneUnit;
   let ringProf = null, ringAt = null, ringFor = null;
   function shownPose(){
     if (!override) return cam;
