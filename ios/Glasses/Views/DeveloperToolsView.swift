@@ -283,6 +283,14 @@ struct DeveloperToolsView: View {
 
     // MARK: Raw state
 
+    /// DAT's nonblocking compatibility warning, which is logged here rather
+    /// than raised as an alert. "None" is a reading: the listener is live.
+    private var datWarningText: String {
+        guard let warning = glasses.datNonblockingWarning else { return "None" }
+        let time = warning.lastSeen.formatted(date: .omitted, time: .standard)
+        return "\(warning.description) ×\(warning.count), last \(time)"
+    }
+
     private var rawStateSection: some View {
         Section {
             LabeledContent("Registration", value: "\(glasses.registrationState)")
@@ -292,6 +300,7 @@ struct DeveloperToolsView: View {
             LabeledContent("Device Session", value: "\(glasses.deviceSessionState)")
             LabeledContent("Camera Stream", value: "\(glasses.cameraStreamState)")
             LabeledContent("Frames Received", value: "\(glasses.frameCount)")
+            LabeledContent("DAT warnings", value: datWarningText)
 
             Button("Check Camera Permission") {
                 glasses.checkCameraPermission()
